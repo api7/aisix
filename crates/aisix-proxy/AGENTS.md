@@ -28,6 +28,47 @@ interval) so a model that is slow to its first token doesn't look like an
 abandoned connection to a proxy in front. Only for SSE: the same wrapper on an
 opaque binary passthrough (audio, images) corrupts it.
 
+## Turning a buffered relay into a streamed one moves four things, not one
+
+Swapping `resp.bytes()` for `resp.bytes_stream()` is the visible part of the
+change and the least of it. The handler now returns while the response is still
+being delivered, so three request-scoped things that used to be finished by then
+are not — and a fourth rule decides whether the path may stream at all. None of
+the four errors when missed:
+
+- **The reqwest request-level timeout has to go.** `RequestBuilder::timeout`
+  bounds the body read too, so it cuts a long stream off mid-response. Bound the
+  connect phase with `stream_timeout::send_with_deadline` and each chunk with
+  `stream_timeout::with_read_timeout_bytes`, both from the model's `stream`
+  budget (`routing::effective_timeouts`).
+- **The rate-limit reservation has to become a `into_stream_hold()`.** Dropping it
+  at handler return releases the concurrency slot while the stream is still
+  running, which is how a key capped at N serves more than N at once (#450). The
+  terminal token cost then rides `Limiter::add_tokens_post_stream` instead of
+  `commit_tokens`.
+- **The UsageEvent moves into the stream's Drop guard.** Counts that arrive on a
+  terminal SSE event are unknown at handler return, so the guard owns the emit —
+  fired at end-of-stream AND on client disconnect, since SDKs routinely close on
+  the terminal frame. Whatever flag says "the guard owns it" must gate the
+  handler's own emit, or the request is counted twice.
+- **A block- or mask-capable output guardrail keeps the buffered path.** It has to
+  see the whole response before any of it reaches the caller, or the streaming
+  request is a way around the check the same request gets without it. That is
+  `runs_on_output(chain) && chain.stream_output_policy().holds_back()`. A
+  monitor-only chain resolves to `EndOfStreamCheck` and must NOT hold the stream
+  back (AISIX-Cloud#1010) — it takes the live path and scans once at
+  end-of-stream via `guardrail_stream::EosOutputScan`.
+
+Retry semantics change too, and that is intended: the retryable unit ends at the
+status check, because once the first frame is on the wire there is no failing
+over left to do.
+
+An e2e that asserts the response CONTENT cannot see any of this — a buffered relay
+and a streamed one return identical bytes. Assert the delivery shape instead: a
+mock upstream that trickles its response over ~1s, and a client read loop that
+counts chunks and measures first-byte against last-byte
+(`audio-stream-relay-e2e.test.ts`).
+
 ## Every terminal path emits the access log — including the ones that give up early
 
 The access log and `request_metrics::record` are emitted **by the handler**, at

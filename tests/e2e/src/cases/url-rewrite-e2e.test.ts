@@ -154,7 +154,7 @@ describe("url rewrite e2e: proxy.url_rewrites", () => {
     await seed.createApiKey({
       key_hash: sha256(KEY),
       allowed_models: [],
-      allowed_tools: ["*"],
+      mcp_access: { allow: ["*"] },
     });
 
     await waitConfigPropagation(async () => {

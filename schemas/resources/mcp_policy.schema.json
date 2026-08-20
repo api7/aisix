@@ -24,44 +24,18 @@
     }
   ],
   "definitions": {
-    "McpPolicyMode": {
-      "description": "What an MCP access policy grants before `deny` patterns are subtracted.",
-      "oneOf": [
-        {
-          "description": "Grants no MCP tools.",
-          "enum": [
-            "none"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Grants exactly the tools matched by the `allow` patterns.",
-          "enum": [
-            "selected"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Grants every tool on every registered MCP server, including servers and tools added after the policy is created.",
-          "enum": [
-            "all"
-          ],
-          "type": "string"
-        }
-      ]
-    },
     "McpPolicyScope": {
       "description": "Which API keys an MCP access policy applies to.",
       "oneOf": [
         {
-          "description": "The environment-wide default, applied to keys whose team has no enabled policy of its own.",
+          "description": "Applied to every key in the environment.",
           "enum": [
             "env"
           ],
           "type": "string"
         },
         {
-          "description": "A team-level policy, applied to the keys that belong to the team named by `scope_ref`. It replaces the environment default for those keys.",
+          "description": "Applied to the keys belonging to the team named by `scope_ref`, on top of the environment policy rather than in place of it.",
           "enum": [
             "team"
           ],
@@ -72,14 +46,15 @@
   },
   "properties": {
     "allow": {
-      "description": "Namespaced `<server>__<tool>` patterns granted when `mode` is `selected`. Entries are matched as single-`*` globs, the same form as an API key's `allowed_tools`: `\"<server>__*\"` grants every tool on one server and an entry without a `*` matches one tool exactly. Ignored for the other modes.",
+      "default": [],
+      "description": "Namespaced `<server>__<tool>` patterns this layer allows. Entries are matched as single-`*` globs: `\"*\"` allows every tool, `\"<server>__*\"` every tool on one server, and an entry without a `*` matches one tool exactly. An empty list allows nothing, which is how a policy blocks all MCP access; a policy that only means to subtract tools writes `[\"*\"]` here and lists them under `deny`.\n\nThe write path requires the field (the strict schema adds it to `required`), so a layer never allows something by omission. The runtime loader defaults it to empty instead of rejecting the row: a document written before the layered shape would otherwise fail to deserialize, and a skipped `api_key` row stops authenticating altogether rather than merely losing MCP access.",
       "items": {
         "type": "string"
       },
       "type": "array"
     },
     "deny": {
-      "description": "Namespaced `<server>__<tool>` patterns subtracted from the effective grant of every key the policy applies to, using the same single-`*` glob matching as `allow`. Deny always wins: a tool matched here stays unavailable even when a team policy or a key's own configuration would otherwise grant it.",
+      "description": "Namespaced `<server>__<tool>` patterns subtracted from the effective grant of every key the policy applies to, using the same single-`*` glob matching as `allow`. Deny always wins: a tool matched here stays unavailable however the other layers allow it.",
       "items": {
         "type": "string"
       },
@@ -87,16 +62,8 @@
     },
     "enabled": {
       "default": true,
-      "description": "Whether the policy is applied. A disabled policy is kept but ignored. Treated as `true` when omitted.",
+      "description": "Whether the policy is applied. A disabled policy is kept but contributes neither its allow nor its deny side. Treated as `true` when omitted.",
       "type": "boolean"
-    },
-    "mode": {
-      "allOf": [
-        {
-          "$ref": "#/definitions/McpPolicyMode"
-        }
-      ],
-      "description": "What the policy grants: `none`, `selected` (the `allow` patterns), or `all` current and future tools."
     },
     "scope": {
       "allOf": [
@@ -107,7 +74,7 @@
       "description": "Which API keys the policy applies to: the whole environment or one team."
     },
     "scope_ref": {
-      "description": "Team identifier the policy targets. Required when `scope` is `team`; omitted for an environment-default policy.",
+      "description": "Team identifier the policy targets. Required when `scope` is `team`; omitted for an environment policy.",
       "minLength": 1,
       "type": [
         "string",
@@ -116,8 +83,8 @@
     }
   },
   "required": [
-    "mode",
-    "scope"
+    "scope",
+    "allow"
   ],
   "title": "McpPolicy",
   "type": "object"

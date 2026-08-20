@@ -166,7 +166,7 @@ fn is_forwardable_name(name: &str) -> bool {
 
 /// Whether an allowlist pattern admits a header name. Patterns are matched
 /// case-insensitively against the lowercase name, and a single `*` glob is
-/// supported (`"x-trace-*"`), matching how `allowed_models` / `allowed_tools`
+/// supported (`"x-trace-*"`), matching how `allowed_models` / `allowed_agents`
 /// patterns behave elsewhere in the snapshot.
 fn allowlist_admits(patterns: &[String], name: &str) -> bool {
     patterns

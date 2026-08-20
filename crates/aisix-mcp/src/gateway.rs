@@ -40,9 +40,7 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{RoleServer, ServerHandler};
 
-use aisix_core::models::{
-    ApiKey, McpAccessMode, McpPolicy, McpPolicyMode, McpPolicyScope, McpServerType,
-};
+use aisix_core::models::{ApiKey, McpPolicy, McpPolicyScope, McpServerType};
 use aisix_core::{AisixSnapshot, ResourceEntry};
 
 use crate::bridge::{upstream_from_mcp_server, EphemeralBridge, McpBridge};
@@ -93,13 +91,13 @@ pub fn strip_server_prefix<'a>(server: &str, name: &'a str) -> Option<&'a str> {
 /// the environment's / the key's team's MCP access policies, so MCP tool
 /// access is governed by the same key object as LLM access.
 ///
-/// A tool is permitted only when **every** allow layer admits it and **no**
-/// deny pattern matches it. A legacy key (no `mcp_access` block) carries a
-/// single allow layer built from its `allowed_tools`; a policy-driven key
-/// carries the inherited policy grant and, in `restrict` mode, its own
-/// `allow` patterns as a second conjunctive layer — a key can narrow the
-/// inherited grant but never widen it. Deny patterns are unioned across the
-/// environment policy, the team policy, and the key, and always win.
+/// Three layers of identical shape contribute: the environment policy, the
+/// key's team policy, and the key's own `mcp_access` block. A tool is
+/// permitted only when **every present** allow layer admits it and **no**
+/// deny pattern matches it — allow intersects, deny unions, and no layer can
+/// widen what another one already narrowed. A layer that is absent or
+/// disabled contributes nothing; with no allow layer at all the ACL grants
+/// nothing, so MCP access is always granted explicitly.
 #[derive(Clone)]
 pub struct ToolAcl {
     /// Conjunctive allow layers: a tool must match every layer.
@@ -176,12 +174,11 @@ impl ToolAcl {
         self
     }
 
-    /// Build a legacy ACL from an API key's `allowed_tools` list alone:
-    /// `None` or an empty list grants no tools; a list containing `"*"`
-    /// grants all; otherwise the listed patterns. Entries are matched as
-    /// single-`*` globs (see [`ToolAcl::permits`]), mirroring
-    /// `ApiKey::can_access_tool`. Policy deny overlays are NOT applied here —
-    /// any caller serving external traffic uses [`ToolAcl::resolve`].
+    /// Build a single-layer ACL from one allow list: an empty list grants no
+    /// tools, a list containing `"*"` grants all, otherwise the listed
+    /// patterns are matched as single-`*` globs (see [`ToolAcl::permits`]).
+    /// No deny side — any caller serving external traffic resolves the full
+    /// layered ACL with [`ToolAcl::resolve`] instead.
     pub fn from_allowed(allowed: Option<&[String]>) -> Self {
         Self {
             allow: vec![AllowLayer::from_patterns(allowed.unwrap_or(&[]))],
@@ -192,20 +189,15 @@ impl ToolAcl {
     /// Resolve the effective ACL for `key` from the `mcp_policies` in
     /// `snapshot`.
     ///
-    /// - A key without an `mcp_access` block keeps its legacy allow side
-    ///   (`allowed_tools`, no inheritance) — with enabled policies' `deny`
-    ///   patterns still subtracted, since deny applies to every key a policy
-    ///   covers.
-    /// - `deny` mode grants nothing.
-    /// - `inherit` / `restrict` take the base grant from the key's team
-    ///   policy when one is enabled, else the environment-default policy,
-    ///   else nothing; `restrict` intersects the key's own `allow` patterns
-    ///   on top.
-    /// - Deny patterns are unioned across the environment policy, the team
-    ///   policy, and the key — an environment-level deny holds even when a
-    ///   team policy replaces the environment's grant.
+    /// Up to three layers apply, each an `allow`/`deny` pair: the
+    /// environment policy, the key's team policy, and the key's own
+    /// `mcp_access` block. Allow sides intersect (a layer can only narrow
+    /// what the others left), deny sides union and always win. A layer that
+    /// is absent — no row, a disabled row, or no `mcp_access` block —
+    /// contributes neither side.
     ///
-    /// Disabled policies neither grant nor deny.
+    /// With no allow layer at all the ACL grants nothing: MCP access is
+    /// granted explicitly, never by the absence of configuration.
     pub fn resolve(snapshot: &AisixSnapshot, key: &ApiKey) -> Self {
         // Grant side: pick the governing row per scope deterministically
         // (lowest id wins) so a duplicated row — the writer enforces
@@ -238,35 +230,24 @@ impl ToolAcl {
             }
         }
 
-        let Some(access) = &key.mcp_access else {
-            return Self {
-                allow: vec![AllowLayer::from_patterns(
-                    key.allowed_tools.as_deref().unwrap_or(&[]),
-                )],
-                deny,
-            };
-        };
-
-        match access.mode {
-            McpAccessMode::Deny => Self {
-                allow: vec![AllowLayer::Patterns(Vec::new())],
-                deny: Vec::new(),
-            },
-            mode @ (McpAccessMode::Inherit | McpAccessMode::Restrict) => {
-                let governing = team_policy.as_ref().or(env_policy.as_ref());
-                let base = match governing.map(|p| (p.value.mode, &p.value.allow)) {
-                    None | Some((McpPolicyMode::None, _)) => AllowLayer::Patterns(Vec::new()),
-                    Some((McpPolicyMode::All, _)) => AllowLayer::All,
-                    Some((McpPolicyMode::Selected, allow)) => AllowLayer::from_patterns(allow),
-                };
-                let mut allow = vec![base];
-                if mode == McpAccessMode::Restrict {
-                    allow.push(AllowLayer::from_patterns(&access.allow));
-                }
-                deny.extend(access.deny.iter().cloned());
-                Self { allow, deny }
-            }
+        let mut allow: Vec<AllowLayer> = Vec::new();
+        for policy in [env_policy.as_ref(), team_policy.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            allow.push(AllowLayer::from_patterns(&policy.value.allow));
         }
+        if let Some(access) = &key.mcp_access {
+            allow.push(AllowLayer::from_patterns(&access.allow));
+            deny.extend(access.deny.iter().cloned());
+        }
+        // Deny-by-default: an unconfigured key in an unconfigured
+        // environment has no MCP access, rather than the empty conjunction's
+        // "everything".
+        if allow.is_empty() {
+            allow.push(AllowLayer::Patterns(Vec::new()));
+        }
+        Self { allow, deny }
     }
 
     /// Whether `namespaced_tool` is permitted: every allow layer must admit

@@ -1271,6 +1271,20 @@ async fn dispatch(
     *applied_out = applied_guardrails.clone();
     let resolved_chain: std::sync::Arc<dyn aisix_guardrails::Guardrail> =
         std::sync::Arc::new(resolved);
+    // AISIX-Cloud#1331 MVP: the env-injected local-model guardrail joins
+    // AFTER the attachment-resolved chain (its segment masks compose on
+    // the chain's output; nested-chain folds filter their own members, so
+    // wrapping is safe). Deployment-wide + mask-only, not a row: it has no
+    // `applied()` entry and never blocks. MVP wiring is chat-only; the
+    // sibling endpoint families are a tracked gap on the design issue.
+    let resolved_chain: std::sync::Arc<dyn aisix_guardrails::Guardrail> =
+        match state.local_model_guardrail.as_ref() {
+            Some(local) => std::sync::Arc::new(aisix_guardrails::GuardrailChain::new(vec![
+                std::sync::Arc::clone(&resolved_chain),
+                std::sync::Arc::clone(local),
+            ])),
+            None => resolved_chain,
+        };
 
     // Input guardrails. Run before reservation so a blocked prompt
     // doesn't burn an RPM slot — content-policy refusals shouldn't
@@ -1389,12 +1403,8 @@ async fn dispatch(
                 &virtual_entry.value,
                 RoutingRequest {
                     tags: &client.routing_tags,
-                    stability_key: Some(
-                        client
-                            .routing_key
-                            .as_deref()
-                            .unwrap_or(auth.entry.id.as_str()),
-                    ),
+                    headers: Some(&client.headers),
+                    api_key_id: auth.entry.id.as_str(),
                     source_ip: &client.source_ip,
                 },
             )

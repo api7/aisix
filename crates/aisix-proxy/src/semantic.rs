@@ -322,6 +322,8 @@ fn attempt_for_target(snapshot: &AisixSnapshot, alias: &str) -> Result<AttemptMo
     Ok(AttemptModel {
         id: entry.id.clone(),
         model: entry.value.clone(),
+        priority: 0,
+        weight: 1,
     })
 }
 

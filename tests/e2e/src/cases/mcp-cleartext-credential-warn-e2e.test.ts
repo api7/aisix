@@ -72,7 +72,7 @@ describe("mcp cleartext credential warning e2e", () => {
     await seed.createApiKey({
       key_hash: sha256(KEY),
       allowed_models: [],
-      allowed_tools: ["*"],
+      mcp_access: { allow: ["*"] },
     });
 
     await waitConfigPropagation(async () => (await initialize()) === 200);

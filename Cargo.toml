@@ -96,6 +96,18 @@ schemars = "0.8"
 # network access at runtime.
 tiktoken-rs = "0.12"
 
+# Local-model guardrail (AISIX-Cloud#1331): in-process CPU embedding
+# inference over ONNX Runtime. `tls-rustls` (not the default `tls-native`)
+# keeps the build-time binary downloader off OpenSSL, matching the
+# workspace's pure-rustls TLS stance. Offline builds point
+# `ORT_LIB_LOCATION` at a pre-fetched ONNX Runtime; see
+# aisix-guardrails/src/local_model.rs.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "tracing", "download-binaries", "tls-rustls", "copy-dylibs", "api-27"] }
+# HF tokenizer runtime for the model's tokenizer.json. `onig` is the regex
+# engine its pre-tokenizer split patterns need; default `progressbar` /
+# `esaxx_fast` are training/CLI conveniences an inference path never uses.
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+
 # Concurrency primitives
 arc-swap = "1.7"
 dashmap = "6.1"

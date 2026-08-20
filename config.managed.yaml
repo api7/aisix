@@ -165,3 +165,12 @@ upstream:
 downstream:
   idle_timeout_secs: 0
   # sse_keepalive_interval_secs: 15
+
+# Between SIGTERM and exit the gateway keeps accepting for at least
+# `min_drain_secs` while /readyz already reports 503, so the load balancer
+# in front has time to withdraw it, then waits for in-flight requests to
+# finish before closing the listener. Raise it above the detection latency
+# of your balancer's health check. In-flight drain itself is unbounded, so
+# terminationGracePeriodSeconds must cover your longest request.
+shutdown:
+  min_drain_secs: 30

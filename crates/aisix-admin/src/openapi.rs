@@ -1547,15 +1547,31 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "$ref": "#/components/schemas/RateLimit",
             "description": "Request, token, and concurrency limits for this key."
           },
-          "allowed_tools": {
+          "mcp_access": {
             "type": [
-              "array",
+              "object",
               "null"
             ],
-            "items": {
-              "type": "string"
+            "properties": {
+              "allow": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Namespaced `<server>__<tool>` glob patterns this key allows, intersected with the environment and team layers."
+              },
+              "deny": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Namespaced `<server>__<tool>` glob patterns subtracted from this key's effective grant. Deny always wins."
+              }
             },
-            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every tool and `\"<server>__*\"` grants every tool on one server (e.g. `\"github__*\"`); an entry without a `*` matches one tool exactly. When omitted, set to `null`, or set to an empty list, the key has no MCP tool access \u2014 access is granted explicitly."
+            "required": [
+              "allow"
+            ],
+            "description": "This key's own layer of the MCP tool ACL, as namespaced `<server>__<tool>` glob patterns. Intersected with the environment and team MCP access policies: every present layer must allow a tool and no layer may deny it. When omitted the key adds no constraint of its own; with no layer present anywhere the grant is empty."
           },
           "allowed_agents": {
             "type": [
@@ -2172,10 +2188,6 @@ fn add_variant_titles(doc: &mut Value) {
             &["Literal", "Regex"],
         ),
         (
-            "/components/schemas/McpAccessMode/oneOf",
-            &["Inherit", "Restrict", "Deny"],
-        ),
-        (
             "/components/schemas/McpProtocolVersion/oneOf",
             &["MCP 2026-07-28"],
         ),
@@ -2222,12 +2234,16 @@ fn add_variant_titles(doc: &mut Value) {
             "/components/schemas/RoutingStrategy/oneOf",
             &[
                 "Round robin",
-                "Weighted",
+                "Consistent hash",
                 "Failover",
                 "Least cost",
                 "Least latency",
                 "Least busy",
             ],
+        ),
+        (
+            "/components/schemas/HashOnType/oneOf",
+            &["Header", "Cookie", "API key", "Client IP"],
         ),
         (
             "/components/schemas/SlsContentMode/oneOf",

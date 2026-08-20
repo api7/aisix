@@ -11,7 +11,7 @@ import {
 } from "../harness/index.js";
 
 // E2E: passthrough routes are an explicit grant on the API key
-// (`allowed_routes`, mirroring `allowed_tools`/`allowed_agents`). The
+// (`allowed_routes`, mirroring `allowed_agents`). The
 // removed implicit tunnel derived authorization from the key's model ACL
 // (#449); routes carry their own dimension: a key with no grant for the
 // route's name must not reach the route's upstream credential, whatever

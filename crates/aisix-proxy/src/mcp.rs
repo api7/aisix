@@ -10,7 +10,7 @@
 //! live `mcp_servers` set.
 //!
 //! A `tools/call` is governed by the SAME pipeline as an LLM request, keyed on
-//! the caller's API key: per-tool access control (the key's `allowed_tools`),
+//! the caller's API key: per-tool access control (the layered MCP ACL),
 //! rate-limit + budget (`quota::enforce_mcp`, which adds the key's per-MCP-server
 //! limit to the shared layers), guardrails on both the tool arguments (input)
 //! and the tool result (output), and a usage event into the shared sink.
@@ -866,7 +866,7 @@ mod tests {
         let apikey: ApiKey = serde_json::from_value(serde_json::json!({
             "key_hash": key_hash,
             "allowed_models": ["*"],
-            "allowed_tools": ["*"],
+            "mcp_access": { "allow": ["*"] },
             "rate_limit": { "rpm": rpm },
         }))
         .expect("valid apikey");
@@ -937,7 +937,7 @@ mod tests {
             let apikey: ApiKey = serde_json::from_value(serde_json::json!({
                 "key_hash": ApiKey::hash_bearer(token),
                 "allowed_models": ["*"],
-                "allowed_tools": ["*"],
+                "mcp_access": { "allow": ["*"] },
                 "mcp_rate_limits": limits,
             }))
             .expect("valid apikey");
@@ -1095,19 +1095,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_access_deny_mode_rejects_tool_calls_at_the_acl() {
-        // The key's legacy allowlist grants everything, but its mcp_access
-        // block says deny — the policy layer must win. The rejection is the
-        // ACL's neutral "not available" (reached before upstream routing),
-        // not the router's "unknown MCP server", which proves the endpoint
-        // resolves the ACL from the key + policies rather than allowed_tools
-        // alone.
+    async fn empty_key_allow_list_rejects_tool_calls_at_the_acl() {
+        // An `mcp_access` block whose allow side is empty leaves the key no
+        // MCP access even though an env policy grants everything. The
+        // rejection is the ACL's neutral "not available" (reached before
+        // upstream routing), not the router's "unknown MCP server", which
+        // proves the endpoint resolves the layered ACL rather than falling
+        // through to routing.
         let key_hash = ApiKey::hash_bearer(TOKEN);
         let apikey: ApiKey = serde_json::from_value(serde_json::json!({
             "key_hash": key_hash,
             "allowed_models": ["*"],
-            "allowed_tools": ["*"],
-            "mcp_access": { "mode": "deny" },
+            "mcp_access": { "allow": [] },
+        }))
+        .expect("valid apikey");
+        let policy: aisix_core::models::McpPolicy = serde_json::from_value(serde_json::json!({
+            "scope": "env",
+            "allow": ["*"],
+        }))
+        .expect("valid policy");
+        let snapshot = AisixSnapshot::new();
+        snapshot
+            .apikeys
+            .insert(ResourceEntry::new("ak-1", apikey, 1));
+        snapshot
+            .mcp_policies
+            .insert(ResourceEntry::new("p-env", policy, 1));
+
+        let router = router_with(snapshot);
+        let resp = router
+            .oneshot(tools_call_request())
+            .await
+            .expect("router responds");
+        let body = body_json(resp).await;
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("not available"),
+            "a key allowing nothing must be rejected by the ACL, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unconfigured_key_has_no_mcp_access_at_the_endpoint() {
+        // No policy anywhere and no `mcp_access` block: the grant is empty
+        // rather than unrestricted, so the call never reaches routing.
+        let key_hash = ApiKey::hash_bearer(TOKEN);
+        let apikey: ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": key_hash,
+            "allowed_models": ["*"],
         }))
         .expect("valid apikey");
         let snapshot = AisixSnapshot::new();
@@ -1124,26 +1159,25 @@ mod tests {
         let message = body["error"]["message"].as_str().unwrap_or_default();
         assert!(
             message.contains("not available"),
-            "deny-mode key must be rejected by the ACL, got: {body}"
+            "an unconfigured key must have no MCP access, got: {body}"
         );
     }
 
     #[tokio::test]
-    async fn env_policy_deny_overlays_legacy_key_at_the_endpoint() {
-        // A legacy key (no mcp_access block) with a wildcard allowlist, plus
-        // an env policy that denies exactly one tool: the denied tool is
-        // rejected by the ACL while any other name still reaches routing
-        // (and fails as "unknown MCP server" — no upstreams are registered).
+    async fn env_policy_deny_overlays_a_wildcard_key_at_the_endpoint() {
+        // An env policy allowing everything but denying exactly one tool:
+        // the denied tool is rejected by the ACL while any other name still
+        // reaches routing (and fails as "unknown MCP server" — no upstreams
+        // are registered).
         let key_hash = ApiKey::hash_bearer(TOKEN);
         let apikey: ApiKey = serde_json::from_value(serde_json::json!({
             "key_hash": key_hash,
             "allowed_models": ["*"],
-            "allowed_tools": ["*"],
         }))
         .expect("valid apikey");
         let policy: aisix_core::models::McpPolicy = serde_json::from_value(serde_json::json!({
             "scope": "env",
-            "mode": "none",
+            "allow": ["*"],
             "deny": ["ghost__tool"],
         }))
         .expect("valid policy");
@@ -1166,7 +1200,7 @@ mod tests {
         let message = body["error"]["message"].as_str().unwrap_or_default();
         assert!(
             message.contains("not available"),
-            "env-policy deny must subtract from a legacy key, got: {body}"
+            "env-policy deny must subtract from the inherited grant, got: {body}"
         );
 
         let other = router
@@ -1180,7 +1214,7 @@ mod tests {
         let message = body["error"]["message"].as_str().unwrap_or_default();
         assert!(
             message.contains("unknown MCP server"),
-            "a non-denied tool must still pass the ACL for a wildcard legacy key, got: {body}"
+            "a non-denied tool must still pass the ACL, got: {body}"
         );
     }
 
@@ -2181,7 +2215,7 @@ mod tests {
         let apikey: ApiKey = serde_json::from_value(serde_json::json!({
             "key_hash": ApiKey::hash_bearer(TOKEN),
             "allowed_models": ["*"],
-            "allowed_tools": ["*"],
+            "mcp_access": { "allow": ["*"] },
         }))
         .expect("valid apikey");
         let snapshot = AisixSnapshot::new();

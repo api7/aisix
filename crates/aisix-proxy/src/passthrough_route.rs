@@ -484,7 +484,7 @@ async fn dispatch(
     .await
     .map_err(RouteError::pre_auth)?;
 
-    // Route ACL: explicit grant, mirroring allowed_tools / allowed_agents.
+    // Route ACL: explicit grant, mirroring allowed_agents.
     if !auth.key().can_access_route(&route.name) {
         return Err(RouteError::of(
             ProxyError::RouteForbidden(route.name.clone()),

@@ -10,20 +10,22 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: layered MCP access policies against a real gateway + etcd + two real
-// MCP upstreams (official TypeScript SDK servers).
+// E2E: layered MCP access against a real gateway + etcd + two real MCP
+// upstreams (official TypeScript SDK servers). Three layers of the same
+// allow/deny shape intersect on the allow side and union on the deny side.
 //
-//   env default policy    → selected [alpha__*], deny [beta__reverse]
-//   team T1 policy        → selected [beta__*]      (replaces the env grant)
-//   team T2 policy        → all                     (replaces the env grant)
-//   per-key mcp_access    → inherit / restrict / deny; absent = legacy
+//   env policy      → allow [alpha__*, beta__*], deny [beta__reverse]
+//   team T1 policy  → allow [beta__*]
+//   team T2 policy  → allow [*]
+//   key mcp_access  → the key's own layer; absent = no constraint
 //
-// Pinned contract, per key:
-//   - legacy keys keep their allowed_tools allow side (no policy widening),
-//     but policy deny patterns still subtract;
-//   - inherit keys take the team policy when one exists, else the env
-//     default; an env-level deny survives a team policy takeover;
-//   - restrict intersects (narrow-only); deny grants nothing;
+// Pinned contract:
+//   - a key with no block of its own takes the policy layers unchanged;
+//   - a team layer narrows the env layer and can never widen it, and
+//     neither can a key layer;
+//   - an empty allow list on any layer leaves the key nothing;
+//   - a deny on any layer wins over every allow;
+//   - with no layer present at all the grant is empty;
 //   - tools/list hides what tools/call rejects (one ACL, two checkpoints);
 //   - policy edits and deletes propagate through the etcd watch path.
 
@@ -34,13 +36,14 @@ const ENV_POLICY_ID = "11111111-1111-1111-1111-11111111aaaa";
 const T1_POLICY_ID = "11111111-1111-1111-1111-11111111bbbb";
 const T2_POLICY_ID = "11111111-1111-1111-1111-11111111cccc";
 
-const KEY_LEGACY_SCOPED = "sk-mcp-legacy-scoped";
-const KEY_LEGACY_WILD = "sk-mcp-legacy-wild";
-const KEY_INHERIT = "sk-mcp-inherit";
-const KEY_T1 = "sk-mcp-t1-inherit";
-const KEY_T2 = "sk-mcp-t2-inherit";
-const KEY_RESTRICT = "sk-mcp-t2-restrict";
-const KEY_DENY = "sk-mcp-deny";
+const KEY_NO_BLOCK = "sk-mcp-no-block";
+const KEY_SCOPED = "sk-mcp-scoped";
+const KEY_T1 = "sk-mcp-t1";
+const KEY_T1_WIDE = "sk-mcp-t1-wide";
+const KEY_T2 = "sk-mcp-t2";
+const KEY_NARROW = "sk-mcp-t2-narrow";
+const KEY_BLOCKED = "sk-mcp-blocked";
+const KEY_TOMBSTONE = "sk-mcp-tombstone";
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
@@ -56,7 +59,7 @@ interface RpcReply {
   };
 }
 
-describe("mcp access policy e2e: env default + team entitlement + key narrowing", () => {
+describe("mcp access policy e2e: env, team and key layers intersect", () => {
   let app: SpawnedApp | undefined;
   let alpha: McpUpstream | undefined;
   let beta: McpUpstream | undefined;
@@ -154,14 +157,17 @@ describe("mcp access policy e2e: env default + team entitlement + key narrowing"
     );
   };
 
+  const ENV_GRANT = ["alpha__echo", "alpha__reverse", "beta__echo"];
+
   const EXPECTED: Array<[string, string[]]> = [
-    [KEY_LEGACY_SCOPED, ["alpha__echo", "alpha__reverse"]],
-    [KEY_LEGACY_WILD, ["alpha__echo", "alpha__reverse", "beta__echo"]],
-    [KEY_INHERIT, ["alpha__echo", "alpha__reverse"]],
+    [KEY_NO_BLOCK, ENV_GRANT],
+    [KEY_SCOPED, ["alpha__echo", "alpha__reverse"]],
     [KEY_T1, ["beta__echo"]],
-    [KEY_T2, ["alpha__echo", "alpha__reverse", "beta__echo"]],
-    [KEY_RESTRICT, ["alpha__echo"]],
-    [KEY_DENY, []],
+    [KEY_T1_WIDE, ["beta__echo"]],
+    [KEY_T2, ENV_GRANT],
+    [KEY_NARROW, ["alpha__echo"]],
+    [KEY_BLOCKED, []],
+    [KEY_TOMBSTONE, ["alpha__echo", "alpha__reverse"]],
   ];
 
   beforeAll(async () => {
@@ -187,20 +193,18 @@ describe("mcp access policy e2e: env default + team entitlement + key narrowing"
 
     await seed.update("mcp_policies", ENV_POLICY_ID, {
       scope: "env",
-      mode: "selected",
-      allow: ["alpha__*"],
+      allow: ["alpha__*", "beta__*"],
       deny: ["beta__reverse"],
     });
     await seed.update("mcp_policies", T1_POLICY_ID, {
       scope: "team",
       scope_ref: TEAM1,
-      mode: "selected",
       allow: ["beta__*"],
     });
     await seed.update("mcp_policies", T2_POLICY_ID, {
       scope: "team",
       scope_ref: TEAM2,
-      mode: "all",
+      allow: ["*"],
     });
 
     const keyDoc = (
@@ -211,31 +215,32 @@ describe("mcp access policy e2e: env default + team entitlement + key narrowing"
       allowed_models: [],
       ...extra,
     });
+    await seed.createApiKey(keyDoc(KEY_NO_BLOCK, {}));
     await seed.createApiKey(
-      keyDoc(KEY_LEGACY_SCOPED, { allowed_tools: ["alpha__*"] }),
-    );
-    await seed.createApiKey(keyDoc(KEY_LEGACY_WILD, { allowed_tools: ["*"] }));
-    await seed.createApiKey(
-      keyDoc(KEY_INHERIT, { mcp_access: { mode: "inherit" } }),
-    );
-    await seed.createApiKey(
-      keyDoc(KEY_T1, { team_id: TEAM1, mcp_access: { mode: "inherit" } }),
-    );
-    await seed.createApiKey(
-      keyDoc(KEY_T2, { team_id: TEAM2, mcp_access: { mode: "inherit" } }),
-    );
-    await seed.createApiKey(
-      keyDoc(KEY_RESTRICT, {
-        team_id: TEAM2,
-        mcp_access: {
-          mode: "restrict",
-          allow: ["alpha__*"],
-          deny: ["alpha__reverse"],
-        },
+      keyDoc(KEY_SCOPED, {
+        mcp_access: { allow: ["alpha__*", "beta__reverse"] },
       }),
     );
+    await seed.createApiKey(keyDoc(KEY_T1, { team_id: TEAM1 }));
     await seed.createApiKey(
-      keyDoc(KEY_DENY, { allowed_tools: ["*"], mcp_access: { mode: "deny" } }),
+      keyDoc(KEY_T1_WIDE, { team_id: TEAM1, mcp_access: { allow: ["*"] } }),
+    );
+    await seed.createApiKey(keyDoc(KEY_T2, { team_id: TEAM2 }));
+    await seed.createApiKey(
+      keyDoc(KEY_NARROW, {
+        team_id: TEAM2,
+        mcp_access: { allow: ["alpha__*"], deny: ["alpha__reverse"] },
+      }),
+    );
+    await seed.createApiKey(keyDoc(KEY_BLOCKED, { mcp_access: { allow: [] } }));
+    // The exact hybrid document the control plane projects: the layered
+    // shape plus the `"mode": "deny"` tombstone that keeps a 0.9.x DP
+    // loading the row fail-closed. This generation must consume the
+    // tombstone — authenticate the key and enforce the allow/deny half.
+    await seed.createApiKey(
+      keyDoc(KEY_TOMBSTONE, {
+        mcp_access: { mode: "deny", allow: ["alpha__*"] },
+      }),
     );
 
     // Probe EVERY key to its expected steady state: keys are written at
@@ -256,88 +261,103 @@ describe("mcp access policy e2e: env default + team entitlement + key narrowing"
     await beta?.close();
   });
 
-  test("legacy key keeps its allowed_tools scope", async (ctx) => {
+  test("a CP-projected legacy-mode tombstone is consumed, not enforced", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
 
-    await expectList(KEY_LEGACY_SCOPED, ["alpha__echo", "alpha__reverse"]);
-    const ok = await callTool(KEY_LEGACY_SCOPED, "alpha__echo", "hi");
+    // `mode` would mean "no MCP access" one release back; here it must
+    // be inert — the key's own allow intersects the env layer as usual.
+    await expectList(KEY_TOMBSTONE, ["alpha__echo", "alpha__reverse"]);
+    const ok = await callTool(KEY_TOMBSTONE, "alpha__echo", "hi");
     expect(ok).toEqual({ ok: true, text: "alpha:hi" });
-    const rejected = await callTool(KEY_LEGACY_SCOPED, "beta__echo", "hi");
-    expect(rejected.ok).toBe(false);
-    expect(rejected.error).toContain("not available");
-  });
-
-  test("policy deny subtracts from a legacy wildcard key without widening it", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-
-    // beta__reverse is hidden by the env deny even though allowed_tools=["*"].
-    await expectList(KEY_LEGACY_WILD, [
-      "alpha__echo",
-      "alpha__reverse",
-      "beta__echo",
-    ]);
-    const denied = await callTool(KEY_LEGACY_WILD, "beta__reverse", "hi");
+    const denied = await callTool(KEY_TOMBSTONE, "beta__echo", "hi");
     expect(denied.ok).toBe(false);
     expect(denied.error).toContain("not available");
-    const ok = await callTool(KEY_LEGACY_WILD, "beta__echo", "hi");
-    expect(ok).toEqual({ ok: true, text: "beta:hi" });
   });
 
-  test("inherit takes the env default when the key has no team", async (ctx) => {
+  test("a key with no block of its own takes the env layer unchanged", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
 
-    await expectList(KEY_INHERIT, ["alpha__echo", "alpha__reverse"]);
-    const ok = await callTool(KEY_INHERIT, "alpha__reverse", "hi");
+    await expectList(KEY_NO_BLOCK, ENV_GRANT);
+    const ok = await callTool(KEY_NO_BLOCK, "alpha__echo", "hi");
+    expect(ok).toEqual({ ok: true, text: "alpha:hi" });
+    // beta__reverse is allowed by `beta__*` but denied one layer up.
+    const denied = await callTool(KEY_NO_BLOCK, "beta__reverse", "hi");
+    expect(denied.ok).toBe(false);
+    expect(denied.error).toContain("not available");
+  });
+
+  test("the key layer narrows the env layer", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+
+    // The key asks for alpha__* plus beta__reverse; the env deny keeps
+    // beta__reverse out, so only the alpha tools survive.
+    await expectList(KEY_SCOPED, ["alpha__echo", "alpha__reverse"]);
+    const ok = await callTool(KEY_SCOPED, "alpha__reverse", "hi");
     expect(ok).toEqual({ ok: true, text: "ih" });
-    const rejected = await callTool(KEY_INHERIT, "beta__echo", "hi");
-    expect(rejected.ok).toBe(false);
-    expect(rejected.error).toContain("not available");
+    for (const tool of ["beta__echo", "beta__reverse"]) {
+      const rejected = await callTool(KEY_SCOPED, tool, "hi");
+      expect(rejected.ok).toBe(false);
+      expect(rejected.error).toContain("not available");
+    }
   });
 
-  test("a team policy replaces the env grant; the env deny survives", async (ctx) => {
+  test("a team layer narrows the env layer; the env deny survives", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
 
-    // T1 grants beta__*; the env deny on beta__reverse still subtracts.
+    // T1 allows beta__*; intersected with the env layer and minus the env
+    // deny on beta__reverse, one tool is left.
     await expectList(KEY_T1, ["beta__echo"]);
     const ok = await callTool(KEY_T1, "beta__echo", "hi");
     expect(ok).toEqual({ ok: true, text: "beta:hi" });
     const envDenied = await callTool(KEY_T1, "beta__reverse", "hi");
     expect(envDenied.ok).toBe(false);
     expect(envDenied.error).toContain("not available");
-    // The env grant (alpha__*) is replaced, not unioned.
-    const replaced = await callTool(KEY_T1, "alpha__echo", "hi");
-    expect(replaced.ok).toBe(false);
-    expect(replaced.error).toContain("not available");
+    // alpha__* is granted by the env layer but not by T1 — the layers
+    // intersect, so it is not reachable.
+    const narrowed = await callTool(KEY_T1, "alpha__echo", "hi");
+    expect(narrowed.ok).toBe(false);
+    expect(narrowed.error).toContain("not available");
   });
 
-  test("a team `all` grant covers both servers, still minus the env deny", async (ctx) => {
+  test("a wide-open key layer cannot widen the layers above it", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
 
-    await expectList(KEY_T2, ["alpha__echo", "alpha__reverse", "beta__echo"]);
+    // Same team as KEY_T1 but asking for `*`: the result is identical.
+    await expectList(KEY_T1_WIDE, ["beta__echo"]);
+    const rejected = await callTool(KEY_T1_WIDE, "alpha__echo", "hi");
+    expect(rejected.ok).toBe(false);
+    expect(rejected.error).toContain("not available");
+  });
+
+  test("a team layer of `*` leaves the env layer as the only constraint", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+
+    await expectList(KEY_T2, ENV_GRANT);
     const denied = await callTool(KEY_T2, "beta__reverse", "hi");
     expect(denied.ok).toBe(false);
     expect(denied.error).toContain("not available");
   });
 
-  test("restrict narrows the inherited grant and never widens it", async (ctx) => {
+  test("all three layers intersect", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
 
-    // Base is team T2 `all`; the key narrows to alpha__* minus alpha__reverse.
-    await expectList(KEY_RESTRICT, ["alpha__echo"]);
-    const ok = await callTool(KEY_RESTRICT, "alpha__echo", "hi");
+    // env [alpha__*, beta__*] ∩ team T2 [*] ∩ key [alpha__*], minus the
+    // key's own deny on alpha__reverse.
+    await expectList(KEY_NARROW, ["alpha__echo"]);
+    const ok = await callTool(KEY_NARROW, "alpha__echo", "hi");
     expect(ok).toEqual({ ok: true, text: "alpha:hi" });
     for (const tool of ["alpha__reverse", "beta__echo"]) {
-      const rejected = await callTool(KEY_RESTRICT, tool, "hi");
+      const rejected = await callTool(KEY_NARROW, tool, "hi");
       expect(rejected.ok).toBe(false);
       expect(rejected.error).toContain("not available");
     }
   });
 
-  test("deny mode grants nothing, whatever allowed_tools says", async (ctx) => {
+  test("an empty allow list on the key leaves it nothing", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
 
-    await expectList(KEY_DENY, []);
-    const rejected = await callTool(KEY_DENY, "alpha__echo", "hi");
+    await expectList(KEY_BLOCKED, []);
+    const rejected = await callTool(KEY_BLOCKED, "alpha__echo", "hi");
     expect(rejected.ok).toBe(false);
     expect(rejected.error).toContain("not available");
   });
@@ -345,31 +365,26 @@ describe("mcp access policy e2e: env default + team entitlement + key narrowing"
   test("policy edits and deletes propagate through the watch path", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
 
-    // Flip T1 to `none`: its member key loses everything.
+    // Flip T1 to an empty allow list: its member keys lose everything.
     await seed.update("mcp_policies", T1_POLICY_ID, {
       scope: "team",
       scope_ref: TEAM1,
-      mode: "none",
+      allow: [],
     });
     await waitConfigPropagation(() => listMatches(KEY_T1, []));
     const rejected = await callTool(KEY_T1, "beta__echo", "hi");
     expect(rejected.ok).toBe(false);
     expect(rejected.error).toContain("not available");
 
-    // Delete the env policy: its deny stops applying to the legacy
-    // wildcard key (all four tools return), and an inherit key with no
-    // policy left anywhere falls back to no access.
+    // Delete the env policy: its deny stops applying, so the key layer of
+    // KEY_SCOPED finally admits beta__reverse — and a key with no layer
+    // left anywhere drops to no access rather than to everything.
     await seed.delete("mcp_policies", ENV_POLICY_ID);
     await waitConfigPropagation(() =>
-      listMatches(KEY_LEGACY_WILD, [
-        "alpha__echo",
-        "alpha__reverse",
-        "beta__echo",
-        "beta__reverse",
-      ]),
+      listMatches(KEY_SCOPED, ["alpha__echo", "alpha__reverse", "beta__reverse"]),
     );
-    const restored = await callTool(KEY_LEGACY_WILD, "beta__reverse", "hi");
+    const restored = await callTool(KEY_SCOPED, "beta__reverse", "hi");
     expect(restored).toEqual({ ok: true, text: "ih" });
-    await expectList(KEY_INHERIT, []);
+    await expectList(KEY_NO_BLOCK, []);
   });
 });

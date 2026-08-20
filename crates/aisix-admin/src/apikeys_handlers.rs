@@ -23,7 +23,7 @@ pub struct PublicApiKey {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<aisix_core::models::RateLimit>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub allowed_tools: Option<Vec<String>>,
+    pub mcp_access: Option<aisix_core::models::McpAccess>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_agents: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -38,7 +38,7 @@ impl From<ApiKey> for PublicApiKey {
             key_hash: value.key_hash,
             allowed_models: value.allowed_models,
             rate_limit: value.rate_limit,
-            allowed_tools: value.allowed_tools,
+            mcp_access: value.mcp_access,
             allowed_agents: value.allowed_agents,
             expires_at: value.expires_at,
             disabled: value.disabled,

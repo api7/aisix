@@ -92,7 +92,7 @@ fn closes_on_write(resource: &str) -> bool {
 pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
     let mut schema = match resource {
         "model" => model_root_schema(strict),
-        "api_key" => apikey_root_schema(),
+        "api_key" => apikey_root_schema(strict),
         "provider_key" => provider_key_root_schema(),
         "guardrail" => guardrail_root_schema(),
         "guardrail_attachment" => guardrail_attachment_root_schema(),
@@ -100,7 +100,7 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "observability_exporter" => observability_exporter_root_schema(),
         "rate_limit_policy" => rate_limit_policy_root_schema(),
         "mcp_server" => mcp_server_root_schema(),
-        "mcp_policy" => mcp_policy_root_schema(),
+        "mcp_policy" => mcp_policy_root_schema(strict),
         "a2a_agent" => a2a_agent_root_schema(),
         "oidc_provider" => oidc_provider_root_schema(),
         "claim_mapping" => claim_mapping_root_schema(),
@@ -468,8 +468,37 @@ pub fn model_root_schema(strict: bool) -> Value {
 /// `Option` representation so `team_id`/`user_id` keep accepting an explicit
 /// `null` (cp-api sends `null` to clear team/owner), matching the resource's
 /// wire contract.
-pub fn apikey_root_schema() -> Value {
-    struct_root_schema::<crate::models::ApiKey>(true)
+pub fn apikey_root_schema(strict: bool) -> Value {
+    let mut schema = struct_root_schema::<crate::models::ApiKey>(true);
+    if strict {
+        require_property(
+            schema
+                .pointer_mut("/definitions/McpAccess")
+                .expect("api_key schema defines McpAccess"),
+            "allow",
+        );
+    }
+    schema
+}
+
+/// Add `name` to a schema object's `required` list, creating the list
+/// when absent. Used for fields the WRITE path must see spelled out
+/// while the runtime loader defaults them — a stale row has to keep
+/// loading, but a new one must not acquire its meaning by omission.
+fn require_property(schema: &mut Value, name: &str) {
+    let obj = schema
+        .as_object_mut()
+        .expect("schema fragment is a JSON object");
+    match obj.get_mut("required").and_then(Value::as_array_mut) {
+        Some(list) => {
+            if !list.iter().any(|v| v.as_str() == Some(name)) {
+                list.push(json!(name));
+            }
+        }
+        None => {
+            obj.insert("required".to_string(), json!([name]));
+        }
+    }
 }
 
 /// Canonical JSON Schema for the `provider_key` resource, derived from the
@@ -786,14 +815,16 @@ pub fn mcp_auth_settings_root_schema() -> Value {
 /// Canonical JSON Schema for the `mcp_policy` resource, derived from the
 /// [`McpPolicy`](crate::models::McpPolicy) struct. Uses the nullable `Option`
 /// representation (`true`) so `scope_ref` accepts an explicit `null` as
-/// well as being absent. The `scope`/`mode` closed sets come from
-/// the [`McpPolicyScope`](crate::models::McpPolicyScope) /
-/// [`McpPolicyMode`](crate::models::McpPolicyMode) enums, plus the one
+/// well as being absent. The closed `scope` set comes from the
+/// [`McpPolicyScope`](crate::models::McpPolicyScope) enum, plus the one
 /// cross-field invariant `schemars` cannot express: a `team`-scoped policy
 /// must name its team in `scope_ref` (otherwise the row could shadow the
-/// environment default).
-pub fn mcp_policy_root_schema() -> Value {
+/// environment layer).
+pub fn mcp_policy_root_schema(strict: bool) -> Value {
     let mut schema = struct_root_schema::<crate::models::McpPolicy>(true);
+    if strict {
+        require_property(&mut schema, "allow");
+    }
     schema
         .as_object_mut()
         .expect("mcp_policy root schema is a JSON object")
@@ -1908,23 +1939,56 @@ mod tests {
         let v = json!({
             "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
             "allowed_models":["gpt-4o"],
-            "mcp_access": {"mode": "inherit"}
+            "mcp_access": {"allow": ["*"]}
         });
         validate_apikey(&v).unwrap();
         let v = json!({
             "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
             "allowed_models":["gpt-4o"],
-            "mcp_access": {"mode": "restrict", "allow": ["github__*"], "deny": ["github__delete_repo"]}
+            "mcp_access": {"allow": ["github__*"], "deny": ["github__delete_repo"]}
         });
         validate_apikey(&v).unwrap();
     }
 
     #[test]
-    fn apikey_mcp_access_rejects_unknown_mode() {
+    fn apikey_mcp_access_requires_an_explicit_allow_side() {
+        // A block carrying only `deny` would silently grant nothing; the
+        // schema forces the author to say what the key allows.
         let v = json!({
             "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
             "allowed_models":[],
-            "mcp_access": {"mode": "legacy"}
+            "mcp_access": {"deny": ["github__*"]}
+        });
+        assert!(validate_apikey(&v).is_err());
+    }
+
+    #[test]
+    fn apikey_mcp_access_rejects_the_removed_mode_field() {
+        // Write path: `mode` is gone from the authored shape. Read path:
+        // the CP projects `"mode": "deny"` as a tombstone so 0.9.x DPs
+        // load the row fail-closed, and this generation's loader must
+        // keep accepting the hybrid document.
+        let v = json!({
+            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
+            "allowed_models":[],
+            "mcp_access": {"mode": "inherit", "allow": ["*"]}
+        });
+        assert!(validate_apikey(&v).is_err());
+        validate_apikey_lenient(&v).unwrap();
+        validate_apikey_lenient(&json!({
+            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
+            "allowed_models":[],
+            "mcp_access": {"mode": "deny", "allow": ["github__*"], "deny": ["x__y"]}
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn apikey_rejects_the_removed_allowed_tools_field() {
+        let v = json!({
+            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
+            "allowed_models":[],
+            "allowed_tools": ["github__*"]
         });
         assert!(validate_apikey(&v).is_err());
     }
@@ -1933,7 +1997,6 @@ mod tests {
     fn mcp_policy_env_and_team_forms_pass() {
         validate_mcp_policy(&json!({
             "scope": "env",
-            "mode": "selected",
             "allow": ["github__*"],
             "deny": ["github__delete_repo"]
         }))
@@ -1941,7 +2004,7 @@ mod tests {
         validate_mcp_policy(&json!({
             "scope": "team",
             "scope_ref": "team-uuid-1",
-            "mode": "all",
+            "allow": ["*"],
             "enabled": true
         }))
         .unwrap();
@@ -1950,21 +2013,52 @@ mod tests {
     #[test]
     fn mcp_policy_team_scope_requires_scope_ref() {
         // A team row without its team id could shadow the environment
-        // default; the cross-field guard rejects it at the schema gate.
-        assert!(validate_mcp_policy(&json!({"scope": "team", "mode": "all"})).is_err());
+        // layer; the cross-field guard rejects it at the schema gate.
+        assert!(validate_mcp_policy(&json!({"scope": "team", "allow": ["*"]})).is_err());
         assert!(
-            validate_mcp_policy(&json!({"scope": "team", "scope_ref": null, "mode": "all"}))
+            validate_mcp_policy(&json!({"scope": "team", "scope_ref": null, "allow": ["*"]}))
                 .is_err()
         );
-        // The environment default carries no scope_ref.
-        validate_mcp_policy(&json!({"scope": "env", "mode": "none"})).unwrap();
+        // The environment layer carries no scope_ref.
+        validate_mcp_policy(&json!({"scope": "env", "allow": []})).unwrap();
+    }
+
+    #[test]
+    fn the_lenient_schema_still_loads_a_pre_layer_row() {
+        // Documents projected before the layered shape carry a `mode`
+        // and no `allow`. The strict write path rejects them, but the
+        // runtime loader must still accept them: a rejected `api_key`
+        // row is skipped entirely, so the key would stop authenticating
+        // for ALL traffic rather than merely losing MCP access.
+        let key = json!({
+            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
+            "allowed_models":[],
+            "allowed_tools":["github__*"],
+            "mcp_access": {"mode": "inherit"}
+        });
+        validate_apikey_lenient(&key).unwrap();
+        assert!(validate_apikey(&key).is_err());
+
+        let policy = json!({"scope": "env", "mode": "all"});
+        validate_mcp_policy_lenient(&policy).unwrap();
+        assert!(validate_mcp_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn mcp_policy_requires_an_explicit_allow_side() {
+        assert!(validate_mcp_policy(&json!({"scope": "env"})).is_err());
+        assert!(validate_mcp_policy(&json!({"scope": "env", "deny": ["github__*"]})).is_err());
     }
 
     #[test]
     fn mcp_policy_rejects_unknown_fields_and_values() {
-        assert!(validate_mcp_policy(&json!({"scope": "org", "mode": "all"})).is_err());
-        assert!(validate_mcp_policy(&json!({"scope": "env", "mode": "open"})).is_err());
-        assert!(validate_mcp_policy(&json!({"scope": "env", "mode": "all", "rogue": 1})).is_err());
+        assert!(validate_mcp_policy(&json!({"scope": "org", "allow": ["*"]})).is_err());
+        assert!(validate_mcp_policy(&json!({"scope": "env", "allow": ["*"], "rogue": 1})).is_err());
+        // `mode` is gone; a payload still carrying it is a write from a
+        // control plane that has not caught up.
+        assert!(
+            validate_mcp_policy(&json!({"scope": "env", "mode": "all", "allow": ["*"]})).is_err()
+        );
     }
 
     #[test]

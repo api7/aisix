@@ -19,6 +19,17 @@
         "minimum": 400.0
       }
     },
+    "hash_on": {
+      "description": "Where the `consistent_hash` hash key comes from: an ordered chain of sources, the first non-empty value winning. Defaults to the `x-aisix-routing-key` request header, falling back to the caller's API key id. Only valid with `strategy: consistent_hash`.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/definitions/HashOnSource"
+      },
+      "minItems": 1
+    },
     "max_fallbacks": {
       "description": "Max number of later targets to attempt after the initial target fails permanently. When omitted, all later targets may be attempted.",
       "type": [
@@ -39,13 +50,6 @@
     },
     "retry_on_429": {
       "description": "Whether upstream 429 participates in retries and failover.",
-      "type": [
-        "boolean",
-        "null"
-      ]
-    },
-    "sticky": {
-      "description": "Sticky (deterministic) target selection for `weighted` routing — the A/B / canary knob. When `true`, a request's target is chosen by hashing a stability key (the `x-aisix-routing-key` header, else the caller's API key) into the weight distribution, so the same key consistently lands on the same target while the aggregate split still honors the weights. When absent/`false`, `weighted` samples independently per request (the default). Ignored by non-`weighted` strategies.",
       "type": [
         "boolean",
         "null"
@@ -82,20 +86,79 @@
   },
   "additionalProperties": false,
   "definitions": {
+    "HashOnSource": {
+      "description": "One source for the `consistent_hash` hash key. Sources are tried in order; the first one that yields a non-empty value wins.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "description": "The header or cookie name to read. Required for `header` and `cookie` sources; not accepted for `api_key` or `client_ip`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "type": {
+          "description": "Which request attribute supplies the hash key.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/HashOnType"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "HashOnType": {
+      "description": "Which request attribute a [`HashOnSource`] reads the hash key from.",
+      "oneOf": [
+        {
+          "description": "A request header, named by `name`.",
+          "type": "string",
+          "enum": [
+            "header"
+          ]
+        },
+        {
+          "description": "A cookie from the request's `Cookie` header, named by `name`.",
+          "type": "string",
+          "enum": [
+            "cookie"
+          ]
+        },
+        {
+          "description": "The caller's API key id.",
+          "type": "string",
+          "enum": [
+            "api_key"
+          ]
+        },
+        {
+          "description": "The caller's resolved client IP (honouring the trusted-proxy configuration).",
+          "type": "string",
+          "enum": [
+            "client_ip"
+          ]
+        }
+      ]
+    },
     "RoutingStrategy": {
       "oneOf": [
         {
-          "description": "Cycle through targets in declaration order.",
+          "description": "Smooth weighted round-robin over target `weight`s. Equal (or absent) weights degrade to a plain declaration-order cycle.",
           "type": "string",
           "enum": [
             "round_robin"
           ]
         },
         {
-          "description": "Pick targets by configured weight. Missing target weights fall back to 1.",
+          "description": "Ketama-style consistent hashing of the request's hash key (see `hash_on`) over the targets, `weight` scaling each target's share of the ring. The same key keeps landing on the same target while it is healthy; on failure the walk follows the ring so only the failed target's keys move.",
           "type": "string",
           "enum": [
-            "weighted"
+            "consistent_hash"
           ]
         },
         {
@@ -120,7 +183,7 @@
           ]
         },
         {
-          "description": "Rank targets least-loaded-first by the number of in-flight requests currently dispatched to each target, then fall forward.",
+          "description": "Rank targets least-loaded-first by in-flight requests divided by target `weight` (the APISIX least_conn score), then fall forward.",
           "type": "string",
           "enum": [
             "least_busy"
@@ -140,6 +203,14 @@
           "type": "string",
           "minLength": 1
         },
+        "priority": {
+          "description": "Priority tier, default `0`; a higher value is preferred (the APISIX node-priority convention — give backup targets `-1`). The strategy orders targets within each tier; a lower tier is only tried when every higher-tier target failed or is unavailable.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
         "tags": {
           "description": "Tags for tag/metadata-conditional routing. When a request carries routing tags, only targets whose tags intersect the request's are eligible; a target tagged `\"default\"` is the fallback used when nothing matches and for untagged requests. Absent/empty means the target opts out of tag filtering (eligible only via the default fallback once any sibling target is tagged). The configured strategy then orders whatever set survives.",
           "type": [
@@ -152,7 +223,7 @@
           }
         },
         "weight": {
-          "description": "Target weight for `weighted` routing. Other strategies ignore this field.",
+          "description": "Target weight, default `1`. Used by `round_robin` (rotation share), `consistent_hash` (share of the hash ring), and `least_busy` (in-flight divided by weight). `failover`, `least_cost`, and `least_latency` accept the field but do not use it.",
           "type": [
             "integer",
             "null"
