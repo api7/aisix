@@ -52,16 +52,22 @@ const SENSITIVE = "这个 EDA 软件的版本是 12.1";
 const MASKED = "这个 EDA 软件的版本是 ***";
 
 // The layer-② acceptance matrix in one message: both hard positives, the
-// hard negatives, and a bare number with no lexical evidence at all (the
-// model band — this candidate pays a real in-process inference).
+// hard negatives (including the Chinese-unit and timestamp classes the
+// defect-fix round added), and a bare number with no lexical evidence at
+// all (the model band — this candidate pays a real in-process inference).
+// `Virtuoso IC6.1.8` masks as the WHOLE fused token now: layer ① sees
+// fused version tokens since the defect-fix round, so the `IC` identity
+// prefix no longer survives (the MVP-era output was `Virtuoso IC***`).
 const MIXED =
   "我们把仿真工具升级到 2022.4 之后,Virtuoso IC6.1.8 反而开始频繁崩溃," +
   "完整的运行日志我贴在下面了,麻烦帮忙看看到底是哪一步出了问题: " +
+  "[10:23:45.123] build started, 整个 build 花了 45.5 秒, " +
   "Elapsed: 12.345s, Memory: 4.2 GB, 服务器 IP 是 10.2.255.1, " +
   "另外圆周率约等于 3.14159";
 const MIXED_MASKED =
-  "我们把仿真工具升级到 *** 之后,Virtuoso IC*** 反而开始频繁崩溃," +
+  "我们把仿真工具升级到 *** 之后,Virtuoso *** 反而开始频繁崩溃," +
   "完整的运行日志我贴在下面了,麻烦帮忙看看到底是哪一步出了问题: " +
+  "[10:23:45.123] build started, 整个 build 花了 45.5 秒, " +
   "Elapsed: 12.345s, Memory: 4.2 GB, 服务器 IP 是 10.2.255.1, " +
   "另外圆周率约等于 3.14159";
 
