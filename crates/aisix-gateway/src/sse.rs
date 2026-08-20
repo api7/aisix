@@ -189,9 +189,10 @@ impl SseDecoder {
 
     fn decode_message(&mut self, message: &str, out: &mut Vec<SseEvent>) {
         // Split on either terminator character rather than `lines()`,
-        // which only knows `\n`: a CR-terminated stream would otherwise
-        // arrive as one long line. Empty segments are the blank line and
-        // the second half of a `\r\n` pair.
+        // which splits on `\n` and `\r\n` but not on a bare `\r`: a
+        // CR-terminated stream would otherwise arrive as one long line.
+        // Empty segments are the blank line and the second half of a
+        // `\r\n` pair.
         for line in message.split(['\n', '\r']) {
             if line.is_empty() {
                 continue;
