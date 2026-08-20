@@ -130,10 +130,11 @@ const ALWAYS_STRIP: &[&str] = &[
 /// COMPAT-SINCE: 0.10.0 #1010 — 0.10.0 removed the implicit
 /// `/passthrough/:provider/*rest` tunnel, and a migration pointer beats a
 /// bare 404 while un-migrated callers are still out there; the public docs
-/// promise the 410 for one release. Retiring it drops this constant, the
-/// `entry` branch that serves it, its WARN and the `UNRESOLVED_LABEL`
-/// metric series, and leaves the namespace entirely the operator's to claim
-/// with explicit routes.
+/// promise the 410 for one release, then plain 404s.
+///
+/// Retiring it drops this constant, the `entry` branch that serves it, its
+/// WARN and the `UNRESOLVED_LABEL` metric series, and leaves the namespace
+/// entirely the operator's to claim with explicit routes.
 const LEGACY_TUNNEL_GONE: &str = "the implicit /passthrough/:provider tunnel has been removed; \
      configure an explicit passthrough_route resource for this path \
      (see the provider passthrough documentation for the migration)";

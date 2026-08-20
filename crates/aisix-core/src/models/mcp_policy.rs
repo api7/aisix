@@ -116,11 +116,12 @@ pub struct McpAccess {
     /// and never re-serialized.
     ///
     /// COMPAT-SINCE: 0.10.0 #1009 — the control plane stopped emitting this
-    /// tombstone when the compat floor moved to 0.10.0, but documents written
-    /// before the run-once reprojection still carry `mode`, so this generation
-    /// reads and drops it instead of reporting partial compat on every row.
-    /// Remove the field and its tolerance together with the loader test that
-    /// pins them.
+    /// tombstone at the 0.10.0 compat floor, but documents written before the
+    /// run-once reprojection still carry `mode`, so this generation reads and
+    /// drops it rather than reporting partial compat on every row.
+    ///
+    /// Retiring it removes the field, the `#[schemars(skip)]` exclusion, and
+    /// the loader test that pins the tolerance.
     #[serde(default, rename = "mode", skip_serializing)]
     #[schemars(skip)]
     pub legacy_mode: Option<serde_json::Value>,

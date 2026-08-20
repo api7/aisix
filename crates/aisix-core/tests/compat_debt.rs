@@ -24,7 +24,9 @@
 //!   tag list instead of from anyone's roadmap.
 //! - `#1009` — the tracking issue (`#N`, or `owner/repo#N` when it lives in
 //!   the other plane's repo), so whoever trips the gate has somewhere to go.
-//! - the rest — one sentence a stranger can act on.
+//! - the rest — one sentence a stranger can act on. It continues to the end
+//!   of the marker's comment paragraph, so a wrapped reason reaches the
+//!   failure report whole; a blank comment line ends it.
 //!
 //! # When it comes due
 //!
@@ -174,6 +176,42 @@ struct Marker {
 /// Shortest reason that can plausibly tell a stranger what the shim
 /// tolerates. Guards against `COMPAT-SINCE: 0.10.0 #1 — tbd`.
 const MIN_REASON_CHARS: usize = 12;
+
+/// Cap on a reason gathered across a comment paragraph, so a marker placed
+/// mid-doc-comment cannot drag a page of prose into the failure report.
+const MAX_REASON_CHARS: usize = 400;
+
+/// The continuation of a marker's reason: the rest of its comment PARAGRAPH.
+///
+/// A reason that stopped at the marker's own line would quote half a
+/// sentence in the report, which is the one thing the report cannot afford —
+/// so the lines that follow, sharing the marker's comment lead-in (`    ///`,
+/// `\t//`, `#`), are joined onto it. The paragraph ends at a blank comment
+/// line, the next marker, the end of the comment, or the length cap. A marker
+/// with no comment lead-in at all (column zero) has no continuation.
+fn reason_continuation(rest: &[&str], lead_in: &str) -> Option<String> {
+    let lead_in = lead_in.trim_end();
+    if lead_in.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    let mut len = 0;
+    for line in rest {
+        let Some(tail) = line.trim_end().strip_prefix(lead_in) else {
+            break;
+        };
+        let tail = tail.trim();
+        if tail.is_empty() || tail.contains(MARKER) {
+            break;
+        }
+        len += tail.chars().count() + 1;
+        parts.push(tail);
+        if len >= MAX_REASON_CHARS {
+            break;
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
 
 /// Does this line at least *intend* to be a marker? Used so a typo becomes a
 /// hard failure instead of silently unmarked debt.
@@ -330,14 +368,24 @@ fn scan_file(root: &Path, path: &Path, out: &mut Vec<Found>) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
     };
-    for (i, line) in text.lines().enumerate() {
-        if let Some(parsed) = parse_marker_line(line) {
-            out.push(Found {
-                path: rel.clone(),
-                line_no: i + 1,
-                parsed,
-            });
-        }
+    let lines: Vec<&str> = text.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(parsed) = parse_marker_line(line) else {
+            continue;
+        };
+        let parsed = parsed.map(|mut marker| {
+            let lead_in = &line[..line.find(MARKER).expect("matched above")];
+            if let Some(tail) = reason_continuation(&lines[i + 1..], lead_in) {
+                marker.reason.push(' ');
+                marker.reason.push_str(&tail);
+            }
+            marker
+        });
+        out.push(Found {
+            path: rel.clone(),
+            line_no: i + 1,
+            parsed,
+        });
     }
 }
 
@@ -614,6 +662,67 @@ mod logic {
             let err = parse_marker_line(line).unwrap().expect_err("rejected");
             assert!(err.contains(needle), "error {err:?} lacks {needle:?}");
         }
+    }
+
+    fn write(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn a_reason_runs_to_the_end_of_its_comment_paragraph() {
+        // A reason cut off at the marker's own line would quote half a
+        // sentence in the failure report.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "src/x.rs",
+            "/// Unrelated doc above.\n\
+             ///\n\
+             /// COMPAT-SINCE: 0.9.0 #1 — tolerates the old shape written by a\n\
+             /// control plane that has since stopped emitting it.\n\
+             ///\n\
+             /// A separate paragraph, not part of the reason.\n\
+             pub const X: u8 = 0;\n",
+        );
+        let found = scan(dir.path());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].line_no, 3);
+        assert_eq!(
+            found[0].parsed.as_ref().unwrap().reason,
+            "tolerates the old shape written by a control plane that has since \
+             stopped emitting it."
+        );
+    }
+
+    #[test]
+    fn the_scan_skips_what_cannot_hold_a_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "crates/x/src/lib.rs",
+            "// COMPAT-SINCE: 0.9.0 #1 — the only real one here\n",
+        );
+        write(
+            root,
+            "node_modules/pkg/index.js",
+            "// COMPAT-SINCE: 0.1.0 #2 — vendored, must be ignored\n",
+        );
+        write(
+            root,
+            "target/debug/build.rs",
+            "// COMPAT-SINCE: 0.1.0 #3 — build output\n",
+        );
+        std::fs::write(
+            root.join("blob.bin"),
+            b"\xff\xfe\x00COMPAT-SINCE: 0.1.0 #4 -- binary",
+        )
+        .unwrap();
+        let found = scan(root);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].path, "crates/x/src/lib.rs");
     }
 
     #[test]
