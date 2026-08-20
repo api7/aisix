@@ -70,6 +70,14 @@ async function waitForSpans(
 
 const nanos = (value: string): bigint => BigInt(value);
 
+/**
+ * Cover the exporter pipelines' independent ~1s flush phases before
+ * trusting a negative or exact-count assertion: a late batch (or a
+ * duplicate one, if emission regressed) can land up to a flush interval
+ * plus a retry after the first spans arrive.
+ */
+const settle = () => new Promise((r) => setTimeout(r, 2_500));
+
 describe("trace hierarchy e2e (AISIX-Cloud#1279)", () => {
   let etcdReachable = false;
   let app: SpawnedApp | undefined;
@@ -211,7 +219,11 @@ describe("trace hierarchy e2e (AISIX-Cloud#1279)", () => {
     const requestId = await driveChat("trace-hier-virtual");
 
     // 2 attempts + logical + server.
-    const spans = await waitForSpans(otlp, requestId, 4);
+    await waitForSpans(otlp, requestId, 4);
+    await settle();
+    const spans = otlp.spans.filter(
+      (s) => s.attributes["aisix.request_id"] === requestId,
+    );
     expect(spans).toHaveLength(4);
 
     // One trace: every span shares one non-zero trace id, all ids distinct.
@@ -381,8 +393,10 @@ describe("trace hierarchy e2e (AISIX-Cloud#1279)", () => {
     const control = await waitForSpans(controlRecv, requestId, 3);
     const controlServer = control.find((s) => s.kind === KIND_SERVER)!;
     expect(controlServer.parentSpanId).toBe(REMOTE_PARENT_ID);
-    // ...so the zero-rate exporter's silence is a sampling decision, not
-    // slowness: the caller's sampled=1 did not force its way in.
+    // ...and only after covering the zero exporter's own flush phase is
+    // its silence a sampling decision rather than slowness: the caller's
+    // sampled=1 did not force its way in.
+    await settle();
     expect(
       zeroRecv.spans.filter(
         (s) => s.attributes["aisix.request_id"] === requestId,
@@ -592,7 +606,11 @@ describe("trace hierarchy e2e (AISIX-Cloud#1279)", () => {
     // Exactly SERVER + logical + two failed attempts: no terminal event
     // exists on this shape, so the LAST failed attempt's emission must
     // carry the structural spans — and only once.
-    const spans = await waitForSpans(otlp, requestId!, 4);
+    await waitForSpans(otlp, requestId!, 4);
+    await settle();
+    const spans = otlp.spans.filter(
+      (s) => s.attributes["aisix.request_id"] === requestId,
+    );
     expect(spans).toHaveLength(4);
     expect(spans.filter((s) => s.kind === KIND_SERVER)).toHaveLength(1);
     const server = spans.find((s) => s.kind === KIND_SERVER)!;
@@ -705,9 +723,15 @@ describe("trace hierarchy e2e (AISIX-Cloud#1279)", () => {
 
     // Two panel sub-calls + the judge's terminal emission (SERVER +
     // logical carrier) = four spans.
-    const spans = await waitForSpans(otlp, requestId, 4);
+    await waitForSpans(otlp, requestId, 4);
+    await settle();
+    const spans = otlp.spans.filter(
+      (s) => s.attributes["aisix.request_id"] === requestId,
+    );
     expect(spans).toHaveLength(4);
     expect(spans.filter((s) => s.kind === KIND_SERVER)).toHaveLength(1);
+    // One trace: parent resolution below is meaningful only within it.
+    expect(new Set(spans.map((s) => s.traceId)).size).toBe(1);
 
     // Every parent resolves within the exported trace — the orphan-span
     // regression this test exists to prevent.
@@ -785,7 +809,11 @@ describe("trace hierarchy e2e (AISIX-Cloud#1279)", () => {
     }
     expect(hit, "no cache hit within 10s").toBeTruthy();
 
-    const spans = await waitForSpans(otlp, hit!.requestId, 1);
+    await waitForSpans(otlp, hit!.requestId, 1);
+    await settle();
+    const spans = otlp.spans.filter(
+      (s) => s.attributes["aisix.request_id"] === hit!.requestId,
+    );
     expect(spans).toHaveLength(1);
     expect(spans[0].kind).toBe(KIND_SERVER);
     expect(spans[0].parentSpanId).toBe("");

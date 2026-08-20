@@ -355,6 +355,7 @@ async fn dispatch(
                     false,
                     Vec::new(),
                     trace,
+                    /* dispatched */ false,
                 );
                 return response;
             }
@@ -427,6 +428,7 @@ async fn dispatch(
                 true,
                 monitor_hits,
                 trace,
+                /* dispatched */ false,
             );
             return jsonrpc_guardrail_block(rpc_id, "tool call", guardrail_name.as_deref());
         }
@@ -507,6 +509,7 @@ async fn dispatch(
                 true,
                 monitor_hits,
                 trace,
+                /* dispatched */ true,
             );
             return jsonrpc_guardrail_block(rpc_id, "tool result", guardrail_name.as_deref());
         }
@@ -528,6 +531,7 @@ async fn dispatch(
             false,
             monitor_hits,
             trace,
+            /* dispatched */ true,
         );
     }
     response
@@ -650,6 +654,10 @@ fn emit_tool_call_usage(
     guardrail_blocked: bool,
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+    // Whether the tool call reached its upstream MCP server — false for a
+    // quota rejection or an input-guardrail block, which refuse before any
+    // upstream contact and must not export an upstream CLIENT span.
+    dispatched: bool,
 ) {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -685,7 +693,7 @@ fn emit_tool_call_usage(
         None,
         trace,
         /* terminal */ true,
-        /* dispatched */ true,
+        dispatched,
     );
 }
 

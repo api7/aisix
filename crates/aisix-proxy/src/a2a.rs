@@ -294,6 +294,7 @@ async fn dispatch(
                 response.status().as_u16(),
                 Duration::ZERO,
                 trace.as_ref(),
+                /* dispatched */ false,
             );
             return response;
         }
@@ -340,6 +341,7 @@ async fn dispatch(
                 StatusCode::OK.as_u16(),
                 latency,
                 trace.as_ref(),
+                /* dispatched */ true,
             );
             axum::Json(response_value).into_response()
         }
@@ -356,6 +358,7 @@ async fn dispatch(
                 status.as_u16(),
                 latency,
                 trace.as_ref(),
+                /* dispatched */ true,
             );
             a2a_error_response(rpc_id, status, &err.to_string())
         }
@@ -425,6 +428,7 @@ impl Drop for StreamUsageOnDrop {
             status,
             self.started.elapsed(),
             self.trace.as_ref(),
+            /* dispatched */ true,
         );
     }
 }
@@ -468,6 +472,7 @@ async fn dispatch_stream(
                 status.as_u16(),
                 started.elapsed(),
                 trace.as_ref(),
+                /* dispatched */ true,
             );
             return a2a_error_response(rpc_id, status, &err.to_string());
         }
@@ -719,6 +724,9 @@ fn emit_a2a_usage(
     status_code: u16,
     latency: Duration,
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+    // Whether the call reached the upstream agent — false for a quota
+    // rejection, which refuses before any upstream contact.
+    dispatched: bool,
 ) {
     // No model resolves on this endpoint, so the estimator falls back to its
     // default encoding — the same thing it does for any non-OpenAI model.
@@ -812,7 +820,7 @@ fn emit_a2a_usage(
         captured.as_ref(),
         trace,
         /* terminal */ true,
-        /* dispatched */ true,
+        dispatched,
     );
 }
 

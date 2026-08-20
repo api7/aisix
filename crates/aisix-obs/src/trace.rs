@@ -238,6 +238,13 @@ pub struct RequestTraceBundle {
     /// double-emit bug upstream of here) degrades to an attempt-only
     /// emission instead of shipping a duplicate SERVER span.
     terminal_emitted: AtomicBool,
+    /// Set when a non-terminal emission synthesized a sub-call span (the
+    /// ensemble trunk bypass) — those spans are parented under the logical
+    /// span id, so the terminal emission MUST export that parent even when
+    /// the terminal event itself never dispatched (an ensemble whose judge
+    /// failed or whose output was blocked): otherwise every already-shipped
+    /// sub-call span dangles.
+    synthesized_children: AtomicBool,
 }
 
 impl RequestTraceBundle {
@@ -259,6 +266,7 @@ impl RequestTraceBundle {
             clock,
             attempts: Mutex::new(Vec::new()),
             terminal_emitted: AtomicBool::new(false),
+            synthesized_children: AtomicBool::new(false),
         }
     }
 
@@ -281,7 +289,13 @@ impl RequestTraceBundle {
     /// same instant so the vec stays index-addressable.
     pub fn start_attempt(&self, index: u32) {
         let now = self.clock.now_unix_nanos();
-        let mut attempts = self.attempts.lock().expect("trace bundle lock");
+        // Poisoning is survivable here: the guarded vec cannot be left
+        // logically inconsistent (worst case one backfilled entry), and
+        // this path runs from Drop guards where a panic could abort.
+        let mut attempts = self
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         while attempts.len() <= index as usize {
             attempts.push(AttemptSpan {
                 span_id: SpanId::random(),
@@ -298,7 +312,10 @@ impl RequestTraceBundle {
     /// the event's own measured duration (see [`Self::emission`]).
     pub fn end_attempt(&self, index: u32) {
         let now = self.clock.now_unix_nanos();
-        let mut attempts = self.attempts.lock().expect("trace bundle lock");
+        let mut attempts = self
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(a) = attempts.get_mut(index as usize) {
             a.end_unix_nano.get_or_insert(now);
         }
@@ -327,11 +344,14 @@ impl RequestTraceBundle {
     /// - otherwise — a cache hit, a guardrail block, a pre-dispatch error:
     ///   the SERVER span alone. No fictitious upstream CLIENT span.
     ///
-    /// `dispatched_upstream` is the CALLER's statement of fact, never
-    /// inferred from the event's latency: a cache hit and a pre-dispatch
-    /// error legitimately carry the handler's elapsed time in
-    /// `upstream_latency_ms`, which an inference would misread as an
-    /// upstream call.
+    /// `dispatched_upstream` is the CALLER's statement of fact and the
+    /// ONLY signal consulted — never inferred from the event's latency: a
+    /// cache hit and a pre-dispatch error legitimately carry the handler's
+    /// elapsed time in `upstream_latency_ms` (which an inference would
+    /// misread as an upstream call), while a real sub-millisecond upstream
+    /// call legitimately measures 0ms (which an inference would drop,
+    /// orphaning any spans parented under the never-exported logical
+    /// span). A 0ms dispatched call yields a truthful zero-length span.
     pub fn emission(
         &self,
         terminal: bool,
@@ -341,7 +361,10 @@ impl RequestTraceBundle {
     ) -> TraceEmission {
         let now = self.clock.now_unix_nanos();
         let latency_nanos = u64::from(upstream_latency_ms).saturating_mul(1_000_000);
-        let attempts = self.attempts.lock().expect("trace bundle lock");
+        let attempts = self
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut spans = Vec::new();
 
         // First terminal call wins; a duplicate degrades to attempt-only.
@@ -376,14 +399,20 @@ impl RequestTraceBundle {
         // trace. The id is minted once per emission snapshot, so delivery
         // retries and every exporter still agree on it.
         let attempt_span = attempt_span.or_else(|| {
-            (!terminal && dispatched_upstream && upstream_latency_ms > 0).then(|| SpanEmit {
-                role: SpanRole::Attempt,
-                span_id: SpanId::random(),
-                parent_span_id: Some(self.logical_span_id),
-                start_unix_nano: now
-                    .saturating_sub(latency_nanos)
-                    .max(self.server_start_unix_nano),
-                end_unix_nano: now,
+            (!terminal && dispatched_upstream).then(|| {
+                // Remember that a span parented under the logical id has
+                // shipped — the terminal emission must export that parent
+                // even if the terminal event itself never dispatched.
+                self.synthesized_children.store(true, Ordering::Release);
+                SpanEmit {
+                    role: SpanRole::Attempt,
+                    span_id: SpanId::random(),
+                    parent_span_id: Some(self.logical_span_id),
+                    start_unix_nano: now
+                        .saturating_sub(latency_nanos)
+                        .max(self.server_start_unix_nano),
+                    end_unix_nano: now,
+                }
             })
         });
 
@@ -412,7 +441,7 @@ impl RequestTraceBundle {
                     start_unix_nano: first.start_unix_nano,
                     end_unix_nano: last_end,
                 });
-            } else if dispatched_upstream && upstream_latency_ms > 0 {
+            } else if dispatched_upstream {
                 // Dispatched upstream without per-attempt tracking: one
                 // CLIENT span placed by the handler's measured duration,
                 // clamped inside the SERVER span.
@@ -423,6 +452,20 @@ impl RequestTraceBundle {
                     start_unix_nano: now
                         .saturating_sub(latency_nanos)
                         .max(self.server_start_unix_nano),
+                    end_unix_nano: now,
+                });
+            } else if self.synthesized_children.load(Ordering::Acquire) {
+                // The terminal event itself never dispatched — an ensemble
+                // whose judge failed or whose synthesized answer was
+                // blocked — but sub-call spans parented under the logical
+                // id already shipped: export their parent (spanning the
+                // request, which brackets every child) so they don't
+                // dangle.
+                spans.push(SpanEmit {
+                    role: SpanRole::Logical,
+                    span_id: self.logical_span_id,
+                    parent_span_id: Some(self.server_span_id),
+                    start_unix_nano: self.server_start_unix_nano,
                     end_unix_nano: now,
                 });
             }
@@ -744,6 +787,47 @@ mod tests {
         let em = bundle.emission(true, 0, 40, false);
         assert_eq!(em.spans.len(), 1);
         assert_eq!(em.spans[0].role, SpanRole::Server);
+    }
+
+    /// A real sub-millisecond upstream call must still get its span — the
+    /// caller's `dispatched_upstream` is the only signal, never latency.
+    #[test]
+    fn dispatched_zero_latency_still_emits_the_client_child() {
+        let bundle = RequestTraceBundle::new(None);
+        let em = bundle.emission(true, 0, 0, true);
+        assert_eq!(em.spans.len(), 2);
+        assert!(em.spans.iter().any(|s| s.role == SpanRole::Logical));
+    }
+
+    /// A failed ensemble: panel sub-call spans shipped (non-terminal,
+    /// parented under the logical id), then the judge failed and the outer
+    /// error arm emits the terminal WITHOUT having dispatched. The
+    /// already-shipped children's parent must still be exported.
+    #[test]
+    fn undispatched_terminal_still_exports_the_parent_of_shipped_subcall_spans() {
+        let bundle = RequestTraceBundle::new(None);
+        // Two panel members shipped their synthesized spans.
+        let member = bundle.emission(false, 0, 12, true);
+        assert_eq!(member.spans.len(), 1);
+        let member_parent = member.spans[0].parent_span_id.expect("parented");
+        let _ = bundle.emission(false, 1, 15, true);
+
+        // The pre-dispatch-shaped terminal (judge failed → outer error arm).
+        let terminal = bundle.emission(true, 0, 40, false);
+        let server = terminal
+            .spans
+            .iter()
+            .find(|s| s.role == SpanRole::Server)
+            .expect("server span");
+        let logical = terminal
+            .spans
+            .iter()
+            .find(|s| s.role == SpanRole::Logical)
+            .expect("the shipped children's parent must be exported");
+        assert_eq!(logical.span_id, member_parent);
+        assert_eq!(logical.parent_span_id, Some(server.span_id));
+        assert!(logical.start_unix_nano <= member.spans[0].start_unix_nano);
+        assert!(member.spans[0].end_unix_nano <= logical.end_unix_nano);
     }
 
     /// Families that dispatch without per-attempt tracking (MCP / A2A /

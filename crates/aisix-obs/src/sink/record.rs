@@ -172,6 +172,23 @@ mod tests {
         assert_eq!(json["request_id"], "req-1");
     }
 
+    /// The public correlation key (AISIX-Cloud#1279): `trace_id` rides the
+    /// flattened usage fields on every sink wire when set — the exact key
+    /// the CP column and `{trace_id}` link template consume — and is
+    /// absent (→ SQL NULL) when the emitting path predates the bundle.
+    #[test]
+    fn trace_id_rides_the_flattened_wire_when_set_and_is_absent_when_empty() {
+        let rec = SinkRecord::metadata_only(UsageEvent {
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".into(),
+            ..UsageEvent::default()
+        });
+        let json = serde_json::to_value(&rec).unwrap();
+        assert_eq!(json["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736");
+
+        let bare = serde_json::to_value(SinkRecord::metadata_only(UsageEvent::default())).unwrap();
+        assert!(bare.get("trace_id").is_none());
+    }
+
     #[test]
     fn full_content_record_carries_prompt_and_response() {
         let rec = SinkRecord::metadata_only(UsageEvent::default()).with_content(SinkContent {

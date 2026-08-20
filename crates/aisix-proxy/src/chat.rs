@@ -4557,9 +4557,10 @@ fn emit_failed_attempts(
             client,
             content,
             /* terminal */ terminal_last && Some(i) == last_failed,
-            // A recorded attempt is real dispatch work by definition.
+            // The record's own network-boundary fact: a rate-limit-refused
+            // attempt never reached an upstream.
             /* dispatched */
-            true,
+            rec.dispatched,
         );
     }
 }

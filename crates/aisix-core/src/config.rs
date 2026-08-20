@@ -760,6 +760,15 @@ impl RequestIdConfig {
                 if RESERVED_UPSTREAM_HEADERS.contains(&name.as_str()) {
                     return Err(s.clone());
                 }
+                // W3C trace-context headers can't be request-id sources
+                // either (AISIX-Cloud#1279): the resolved id is echoed to
+                // the caller, logged, and sent upstream — adopting the
+                // inbound `traceparent`/`tracestate` value would disclose
+                // the caller's trace context through all three, walking
+                // around the never-forward guard.
+                if matches!(name.as_str(), "traceparent" | "tracestate") {
+                    return Err(s.clone());
+                }
                 Ok(name)
             })
             .collect()
