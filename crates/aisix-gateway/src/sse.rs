@@ -35,6 +35,41 @@ pub enum SseEvent {
     Done,
 }
 
+/// Byte offset and length of the earliest event terminator — a blank
+/// line — in `buf`.
+///
+/// The SSE spec lets a line end in `\n`, `\r\n` or `\r`, so an event ends
+/// at any two line terminators in a row, in any mix. Searching for
+/// `"\n\n"` alone misses `\r\n\r\n` entirely, and OpenAI's transcription
+/// stream (`/v1/audio/transcriptions` with `stream=true`) is CRLF-framed:
+/// against it the decoder unlocked no event at all until end-of-stream,
+/// which is how a streamed transcription came to bill zero tokens
+/// (#998 follow-up). `messages::find_frame_end` and the passthrough
+/// route's frame splitter already scan both shapes; this is the decoder
+/// that did not.
+fn find_event_terminator(buf: &str) -> Option<(usize, usize)> {
+    let bytes = buf.as_bytes();
+    let terminator_at = |i: usize| -> Option<usize> {
+        match bytes.get(i)? {
+            b'\r' if bytes.get(i + 1) == Some(&b'\n') => Some(2),
+            b'\r' | b'\n' => Some(1),
+            _ => None,
+        }
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        let Some(first) = terminator_at(i) else {
+            i += 1;
+            continue;
+        };
+        if let Some(second) = terminator_at(i + first) {
+            return Some((i, first + second));
+        }
+        i += first;
+    }
+    None
+}
+
 #[derive(Debug, Default)]
 pub struct SseDecoder {
     /// Raw bytes that have not yet decoded into a complete UTF-8
@@ -67,9 +102,9 @@ impl SseDecoder {
         self.decode_buffered_bytes();
 
         let mut events = Vec::new();
-        // Event terminator is \n\n; process one message at a time.
-        while let Some(idx) = self.buffer.find("\n\n") {
-            let message: String = self.buffer.drain(..idx + 2).collect();
+        // A blank line terminates an event; process one message at a time.
+        while let Some((idx, len)) = find_event_terminator(&self.buffer) {
+            let message: String = self.buffer.drain(..idx + len).collect();
             self.decode_message(&message, &mut events);
         }
         events
@@ -153,8 +188,12 @@ impl SseDecoder {
     }
 
     fn decode_message(&mut self, message: &str, out: &mut Vec<SseEvent>) {
-        for line in message.lines() {
-            let line = line.trim_end_matches('\r');
+        // Split on either terminator character rather than `lines()`,
+        // which splits on `\n` and `\r\n` but not on a bare `\r`: a
+        // CR-terminated stream would otherwise arrive as one long line.
+        // Empty segments are the blank line and the second half of a
+        // `\r\n` pair.
+        for line in message.split(['\n', '\r']) {
             if line.is_empty() {
                 continue;
             }
@@ -191,6 +230,70 @@ mod tests {
         let mut d = SseDecoder::new();
         let ev = d.feed(b"data: {\"x\":1}\n\n".as_slice());
         assert_eq!(ev, vec![SseEvent::Data(r#"{"x":1}"#.into())]);
+    }
+
+    /// OpenAI's streamed transcription is CRLF-framed. A decoder that
+    /// only knows `\n\n` unlocks nothing on it until end-of-stream, which
+    /// is how a streamed transcription came to bill zero tokens (#998
+    /// follow-up): the terminal event carrying `usage` was never decoded.
+    #[test]
+    fn crlf_framed_events_are_decoded_as_they_arrive() {
+        let raw = [
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\"hello\"}\r\n\r\n",
+            "data: {\"type\":\"transcript.text.done\",\"usage\":{\"input_tokens\":26}}\r\n\r\n",
+            "data: [DONE]\r\n\r\n",
+        ]
+        .concat();
+        let mut d = SseDecoder::new();
+        assert_eq!(
+            d.feed(raw.as_bytes()),
+            vec![
+                SseEvent::Data(r#"{"type":"transcript.text.delta","delta":"hello"}"#.into()),
+                SseEvent::Data(
+                    r#"{"type":"transcript.text.done","usage":{"input_tokens":26}}"#.into()
+                ),
+                SseEvent::Done,
+            ],
+        );
+    }
+
+    /// The spec allows a bare `\r` as a line terminator too, and nothing
+    /// stops a stream from mixing the three.
+    #[test]
+    fn cr_only_and_mixed_terminators_are_decoded() {
+        let mut d = SseDecoder::new();
+        assert_eq!(
+            d.feed("data: {\"a\":1}\r\r".as_bytes()),
+            vec![SseEvent::Data(r#"{"a":1}"#.into())],
+        );
+        assert_eq!(
+            d.feed("data: {\"b\":2}\n\r\n".as_bytes()),
+            vec![SseEvent::Data(r#"{"b":2}"#.into())],
+        );
+        assert_eq!(
+            d.feed("data: {\"c\":3}\r\n\n".as_bytes()),
+            vec![SseEvent::Data(r#"{"c":3}"#.into())],
+        );
+    }
+
+    /// A chunk boundary can fall inside a `\r\n` pair. However the halves
+    /// are framed, the caller must see each event exactly once and never
+    /// a spurious empty one.
+    #[test]
+    fn a_terminator_split_across_feeds_yields_each_event_once() {
+        let mut d = SseDecoder::new();
+        let mut seen = Vec::new();
+        for chunk in ["data: {\"x\":1}\r", "\n\r", "\ndata: {\"y\":2}\r\n", "\r\n"] {
+            seen.extend(d.feed(chunk.as_bytes()));
+        }
+        seen.extend(d.finish());
+        assert_eq!(
+            seen,
+            vec![
+                SseEvent::Data(r#"{"x":1}"#.into()),
+                SseEvent::Data(r#"{"y":2}"#.into()),
+            ],
+        );
     }
 
     #[test]
