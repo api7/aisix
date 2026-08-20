@@ -146,6 +146,12 @@ jobs:
       ETCD_TEST_URL: http://127.0.0.1:2379
     steps:
       - uses: actions/checkout@v6
+        with:
+          # crates/aisix-core/tests/compat_debt.rs resolves "has a release
+          # shipped since this compat marker's anchor?" from `git tag`. The
+          # default shallow checkout carries no tags, and that gate FAILS
+          # rather than skips when it finds none — do not drop this.
+          fetch-tags: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
