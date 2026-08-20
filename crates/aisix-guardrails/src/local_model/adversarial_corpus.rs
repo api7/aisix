@@ -1,4 +1,4 @@
-//! Report instrument for the guardrail-defect fixes: a 79-line labeled
+//! Report instrument for the guardrail-defect fixes: an 87-line labeled
 //! adversarial corpus covering the three measured defect classes
 //! (Chinese-unit negatives, prototype-scoring form, fused-token layer-①
 //! recall) plus the shipped acceptance shapes as regressions.
@@ -30,7 +30,9 @@ struct Case {
     sensitive: &'static [&'static str],
 }
 
-/// The 79-line corpus. Tool names and numbers are deliberately disjoint
+/// The corpus (79 lines from the defect brief + 8 from the independent
+/// audit: everyday identifiers, measure-word durations, electrical
+/// units). Tool names and numbers are deliberately disjoint
 /// from [`PROTOTYPE_SAMPLES`] (and the negative sample set once it
 /// exists) so model-band scores measure shape generalization, not string
 /// overlap — the same discipline as the probe matrix.
@@ -56,6 +58,10 @@ const CORPUS: &[Case] = &[
     Case { cat: "zh-unit", text: "线宽是 0.15 微米", sensitive: &[] },
     Case { cat: "zh-unit", text: "芯片边长 8.5 毫米", sensitive: &[] },
     Case { cat: "zh-unit", text: "功耗降了 12.5%,别的没变", sensitive: &[] },
+    // Audit round: measure-word duration and electrical units, each with
+    // an ADJACENT trigger — the shapes the first fix round still masked.
+    Case { cat: "zh-unit", text: "版本升级花了 3.5 个小时", sensitive: &[] },
+    Case { cat: "zh-unit", text: "升级到新驱动后功耗 5.5 瓦", sensitive: &[] },
     // ── log timestamps (defect 1): must all release ──────────────────────
     Case { cat: "timestamp", text: "[10:23:45.123] build started", sensitive: &[] },
     Case { cat: "timestamp", text: "[09:01:07.500] version check passed", sensitive: &[] },
@@ -116,6 +122,18 @@ const CORPUS: &[Case] = &[
     Case { cat: "model-neg", text: "第 3.2 节有详细说明", sensitive: &[] },
     Case { cat: "model-neg", text: "see section 4.1.2 for details", sensitive: &[] },
     Case { cat: "model-neg", text: "今天集群负载均值是 3.5", sensitive: &[] },
+    // ── everyday identifiers (audit round): the fused-token relaxation
+    //    makes these candidates for the FIRST time; they carry no unit
+    //    and no anchor, so only the model can release them — the
+    //    negative families files/hashes/tickets/standards and
+    //    product/model names exist because these mis-masked without
+    //    them ────────────────────────────────────────────────────────────
+    Case { cat: "ident-neg", text: "把 report3.txt 发我一下", sensitive: &[] },
+    Case { cat: "ident-neg", text: "模型是 gpt-4o 那个", sensitive: &[] },
+    Case { cat: "ident-neg", text: "commit deadbeef123 部署上去了", sensitive: &[] },
+    Case { cat: "ident-neg", text: "构建号 a1b2c3d4e5f6", sensitive: &[] },
+    Case { cat: "ident-neg", text: "对应 issue 编号 GH-2048", sensitive: &[] },
+    Case { cat: "ident-neg", text: "这块板子过了 802.11ac 认证", sensitive: &[] },
     // ── model-band positives: version mentions with NO lexical anchor —
     //    only the model can mask these ─────────────────────────────────────
     Case { cat: "model-pos", text: "工具从 21.10 换到 21.12 就不崩了", sensitive: &["21.10", "21.12"] },
@@ -272,6 +290,7 @@ async fn adversarial_corpus_report() {
         println!("  WRONG [{cat}] {text:?} -> {actual:?}");
     }
 
+
     let n_pos = model_items_rel.iter().filter(|(_, p)| *p).count();
     println!(
         "── model band: {} items ({} pos / {} neg)  shipped threshold {:.4}",
@@ -305,4 +324,26 @@ async fn adversarial_corpus_report() {
             if *p { "POS" } else { "NEG" }
         );
     }
+
+    // Quality floor, asserted LAST so a regression still prints the full
+    // report above (audit finding: a report that only prints lets sample
+    // or model drift collapse the numbers silently while CI stays
+    // green). The rule layer must be EXACT on this corpus — a rule
+    // decision never consults the model, so a wrong one is an
+    // unconditional mis-rewrite (mask side) or a silent leak (pass
+    // side). The end-to-end floor allows exactly the two disclosed
+    // model-band misses.
+    assert_eq!(
+        rule_masked_correct, rule_masked,
+        "rule-mask precision must stay 100% on the corpus"
+    );
+    assert_eq!(
+        rule_passed_correct, rule_passed,
+        "rule-pass must not release a labeled positive"
+    );
+    assert!(
+        lines_correct >= CORPUS.len() - 2,
+        "line accuracy fell below the pinned floor: {lines_correct}/{}",
+        CORPUS.len()
+    );
 }

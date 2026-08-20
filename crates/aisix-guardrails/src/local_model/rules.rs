@@ -128,11 +128,17 @@ const TOOL_PATTERN: &str = r"(?i)\b(?:virtuoso|calibre|vcs|innovus|icc2|primetim
 /// hit), checked with an explicit ASCII-alnum guard rather than `\b`
 /// because the regex crate's Unicode `\b` treats a following CJK char as
 /// a word char. Chinese units are substring-matched (no word boundaries
-/// in CJK); single-char units with heavy compound ambiguity (`分` —
-/// points vs minutes) are deliberately excluded, and the residual
-/// compound risk of the kept ones (`12.1 天线`) is accepted: a wrong
-/// release is fail-open, a wrong rewrite corrupts content.
-const UNIT_SUFFIX_PATTERN: &str = r"^\s*(?:%|％|(?i:ms|us|ns|ps|fs|s|secs?|seconds?|mins?|minutes?|hours?|[kmgt]i?b|um|nm|[kmg]?hz)(?:[^0-9A-Za-z]|$)|纳秒|微秒|毫秒|秒|分钟|小时|天|纳米|微米|毫米|[兆吉太]字节|[千兆吉]?赫兹|[千兆吉]赫|个?百分点)";
+/// in CJK); durations also carry the measure-word form (`3.5 个小时`,
+/// `2.5 个星期` — the audit found the bare forms alone still rule-masked
+/// next to a trigger), and thermal/electrical units (`度`, `伏特`,
+/// `瓦特`, `安培`) cover the power/temperature lines EDA logs are full
+/// of. Single-char units with heavy compound ambiguity are deliberately
+/// excluded — `分` (points vs minutes) and bare `安` (`12.1 安装之后`
+/// would systematically RELEASE real versions next to the extremely
+/// common 安装) — and the residual compound risk of the kept ones
+/// (`12.1 天线`) is accepted: a wrong release is fail-open, a wrong
+/// rewrite corrupts content.
+const UNIT_SUFFIX_PATTERN: &str = r"^\s*(?:%|％|(?i:ms|us|ns|ps|fs|s|secs?|seconds?|mins?|minutes?|hours?|[kmgt]i?b|um|nm|[kmg]?hz)(?:[^0-9A-Za-z]|$)|纳秒|微秒|毫秒|秒|分钟|个?(?:小时|钟头|星期|月)|天|纳米|微米|毫米|[兆吉太]字节|[千兆吉]?赫兹|[千兆吉]赫|个?百分点|摄氏度|度|伏特?|瓦特?|安培|毫安)";
 
 /// Negative: the span itself ENDS in an ASCII measurement unit. Fused
 /// candidate tokens (`12.345s`, `3.2GHz`, `7nm`, `0.13um` as ONE span)
@@ -171,6 +177,25 @@ const COLON_DIGIT_SUFFIX_PATTERN: &str = r"^:\d";
 /// adversarial-corpus finding. ASCII and fullwidth colons both count.
 const TIME_OF_DAY_PREFIX_PATTERN: &str = r"[0-9]{1,2}[:：][0-9]{1,2}[:：]$";
 
+/// Negative: the span is FILENAME-shaped — a fused token ending in a
+/// dot plus a 2–4 letter extension (`report3.txt`, `setup2.cfg`).
+/// Audit finding: everyday filenames are fused-token candidates now,
+/// and `GH-2048`-class identifiers sit too close to the weakest
+/// anchor-free version positives for the embedding to separate — but a
+/// trailing alphabetic extension is decisive LEXICAL evidence, which is
+/// this layer's job, not the model's. Version tokens never end in a
+/// dot-plus-letters segment (`802.11ac`'s last segment starts with
+/// digits; `…-SP2` has no dot before the letters), so the shape is
+/// precise. Same class as the source-location patterns.
+const FILE_EXTENSION_SUFFIX_PATTERN: &str = r"(?i)\.[a-z]{2,4}$";
+
+/// Negative: an identifier tag right before the span — `编号 GH-2048`,
+/// `编号: JIRA-1024`, optionally through `是/为`. `版本编号` is carved
+/// out (the char before `编号` must not be `本`): that compound means
+/// "version number" and must keep masking. Same class as the source
+/// location — a tagged identifier is a locator, not a version.
+const ID_TAG_PREFIX_PATTERN: &str = r"(?:^|[^本])编号[::]?(?:是|为)?\s*$";
+
 /// What layer ② decided for one candidate span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RuleDecision {
@@ -196,6 +221,8 @@ pub(super) struct RuleScorer {
     file_colon_prefix: Regex,
     colon_digit_suffix: Regex,
     time_of_day_prefix: Regex,
+    file_extension_suffix: Regex,
+    id_tag_prefix: Regex,
 }
 
 impl RuleScorer {
@@ -216,6 +243,8 @@ impl RuleScorer {
             file_colon_prefix: compile(FILE_COLON_PREFIX_PATTERN),
             colon_digit_suffix: compile(COLON_DIGIT_SUFFIX_PATTERN),
             time_of_day_prefix: compile(TIME_OF_DAY_PREFIX_PATTERN),
+            file_extension_suffix: compile(FILE_EXTENSION_SUFFIX_PATTERN),
+            id_tag_prefix: compile(ID_TAG_PREFIX_PATTERN),
         }
     }
 
@@ -289,6 +318,8 @@ impl RuleScorer {
         if self.file_colon_prefix.is_match(&text[..span.start])
             || self.colon_digit_suffix.is_match(&text[span.end..])
             || self.time_of_day_prefix.is_match(&text[..span.start])
+            || self.file_extension_suffix.is_match(&text[span.clone()])
+            || self.id_tag_prefix.is_match(&text[..span.start])
         {
             score += NEGATIVE_CLASS_SCORE;
         }
@@ -483,6 +514,29 @@ mod tests {
     }
 
     #[test]
+    fn measure_word_durations_are_negative_evidence() {
+        // The measure-word (`个`) forms, each next to a trigger — the
+        // audit's finding: the bare-unit list alone still rule-masked
+        // these.
+        assert_eq!(only("版本升级花了 3.5 个小时"), RuleDecision::Pass);
+        assert_eq!(only("升级到新机器后等了 1.5 个钟头"), RuleDecision::Pass);
+        assert_eq!(only("等了 2.5 个星期才排上机时"), RuleDecision::Pass);
+        assert_eq!(only("整个项目走了 4.5 个月"), RuleDecision::Pass);
+    }
+
+    #[test]
+    fn thermal_and_electrical_units_are_negative_evidence() {
+        assert_eq!(only("升级到新驱动后功耗 5.5 瓦"), RuleDecision::Pass);
+        assert_eq!(only("结温到了 85.5 度就降频"), RuleDecision::Pass);
+        assert_eq!(only("外壳温度 42.5 摄氏度"), RuleDecision::Pass);
+        assert_eq!(only("核心电压是 0.75 伏"), RuleDecision::Pass);
+        assert_eq!(only("满载电流 1.8 安培"), RuleDecision::Pass);
+        // Bare 安 is deliberately NOT a unit: 安装 right after a version
+        // must not release it (安装 is everywhere in the driving corpus).
+        assert_eq!(only("版本是 12.1 安装之后报错"), RuleDecision::Mask);
+    }
+
+    #[test]
     fn chinese_size_and_frequency_units_are_negative_evidence() {
         assert_eq!(only("日志文件有 128.5 兆字节"), RuleDecision::Pass);
         assert_eq!(only("内存峰值到了 4.2 吉字节"), RuleDecision::Pass);
@@ -545,6 +599,24 @@ mod tests {
         assert_eq!(only("回退到 E-2010.12-ICC-SP2 就不崩了"), RuleDecision::Mask);
         assert_eq!(only("装的是 v16.12-s051_1 这个版本"), RuleDecision::Mask);
         assert_eq!(only("Virtuoso IC618 又崩了"), RuleDecision::Mask);
+    }
+
+    #[test]
+    fn filename_shaped_tokens_release() {
+        // Trailing dot-plus-letters extension is decisive lexical
+        // evidence (audit finding: `report3.txt` mis-masked in the
+        // model band — but it never needed the model).
+        assert_eq!(only("把 report3.txt 发我一下"), RuleDecision::Pass);
+        assert_eq!(only("参数都写在 sim7.cfg 里面"), RuleDecision::Pass);
+    }
+
+    #[test]
+    fn id_tag_prefix_releases_tagged_identifiers() {
+        assert_eq!(only("对应 issue 编号 GH-2048"), RuleDecision::Pass);
+        assert_eq!(only("工单编号: AB-3072 已建好"), RuleDecision::Pass);
+        // 版本编号 is carved out — it means "version number" and must
+        // keep masking (the char before 编号 is 本).
+        assert_eq!(only("版本编号 12.1 别外发"), RuleDecision::Mask);
     }
 
     #[test]

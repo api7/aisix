@@ -169,7 +169,7 @@ const PROTOTYPE_DESCRIPTION_ZH: &str = "EDA 软件的版本号";
 /// which is also why the MVP's `Xcelium 23.09` sample left this list
 /// when `XCELIUM2309` entered the adversarial corpus.
 ///
-/// Scale note: 24 positives + 78 negatives (~1:3). The ecosystem's
+/// Scale note: 24 positives + 90 negatives (~1:3.75). The ecosystem's
 /// published floor for trainable classifiers is 50–500 positives and
 /// ≥150 negatives at ~1:3 (Microsoft Purview,
 /// <https://learn.microsoft.com/en-us/purview/trainable-classifiers-get-started-with>);
@@ -208,14 +208,18 @@ const PROTOTYPE_SAMPLES: &[&str] = &[
 /// relative scoring form — under the absolute form the model had to
 /// clear a fixed bar with no notion of what "not a version" looks like,
 /// and the measured margin on anchor-free windows was NEGATIVE (the MVP
-/// finding, reproduced on the adversarial corpus). Thirteen semantic
+/// finding, reproduced on the adversarial corpus). Fifteen semantic
 /// families × 6, zh+en: math constants, exchange rates / finance, body
 /// measurements, dates, quantities/statistics, spelled durations,
 /// physical quantities, dimensions, process nodes, scores/ratios,
 /// section numbers, clock times, and bare number sequences (data rows /
 /// log dumps — the driving corpus is dense compile logs, and without
 /// this family a context-free run of numbers sits EXACTLY on the
-/// relative-score decision boundary, where int8 noise picks the sign).
+/// relative-score decision boundary, where int8 noise picks the sign),
+/// plus files/hashes/tickets/standard numbers and product/model
+/// identifiers (the fused-token relaxation makes everyday identifiers —
+/// filenames, commit hashes, GPU and LLM model names — candidates, and
+/// the audit measured them mis-masking without these two families).
 /// Numbers are disjoint from the corpora and the positive set.
 const NEGATIVE_PROTOTYPE_SAMPLES: &[&str] = &[
     "圆周率约是 3.1416",
@@ -296,6 +300,18 @@ const NEGATIVE_PROTOTYPE_SAMPLES: &[&str] = &[
     "the raw dump reads 0.5 1.5 2.5 3.5 4.5",
     "column two is 9.1 8.2 7.3 6.4",
     "坐标序列 10.5 20.5 30.5 40.5",
+    "配置都在 setup2.cfg 里",
+    "commit 是 f00dbabe42 那个",
+    "工单编号是 JIRA-1024",
+    "the log lives in run5.txt",
+    "the checksum is 9f8e7d6c5b",
+    "先过 802.3af 认证再说",
+    "换成 gpt-5.2 再试一次",
+    "这个 bug 用 llama-3.1 也能复现",
+    "显卡是 RTX4090",
+    "主控芯片是 BCM2712",
+    "the endpoint serves claude-haiku-4.5",
+    "the box ships with an RTX4080 inside",
 ];
 
 /// How the category's prototype vector sets are built at load time.
@@ -367,8 +383,8 @@ impl PrototypeStrategy {
 
 impl Default for PrototypeStrategy {
     /// `SampleMax`: the probe matrix (module tests) measures the widest
-    /// positive hard margin here (+0.0449 vs +0.0246 for the centroid —
-    /// averaging ten shape-diverse samples into one vector costs
+    /// relative hard margin here (+0.0355 vs +0.0341 for the centroid —
+    /// averaging shape-diverse samples into one vector costs
     /// nearest-shape resolution).
     fn default() -> Self {
         Self::SampleMax
@@ -481,6 +497,19 @@ impl LocalModelConfig {
             .and_then(|s| s.parse::<f32>().ok())
             .filter(|t| t.is_finite() && (-2.0..=2.0).contains(t))
             .unwrap_or_else(|| prototypes.default_threshold());
+        // The sample strategies moved from absolute cosine to the
+        // relative margin scale: a pre-migration override (e.g. the old
+        // 0.82) is far above any reachable margin and would silently
+        // turn every model-band judgement into a release.
+        if prototypes != PrototypeStrategy::Description && threshold > 0.5 {
+            tracing::warn!(
+                threshold,
+                strategy = ?prototypes,
+                "{THRESHOLD_ENV} looks like an absolute-cosine value, but this \
+                 strategy gates the relative margin (max_pos − max_neg, ~±0.2): \
+                 the model band will likely never mask"
+            );
+        }
         let lanes = parse_lanes(std::env::var(LANES_ENV).ok().as_deref());
         let rule_window = std::env::var(RULE_WINDOW_ENV)
             .ok()
@@ -755,11 +784,26 @@ impl CandidateFinder {
         // masks more) or stands alone. The overlap (not containment)
         // check also covers mixed-width pathologies (`12．3-s1`), where
         // trimming could otherwise leave two intersecting spans.
+        //
+        // Both lists arrive ascending and internally disjoint
+        // (`find_iter` order), so the overlap check is a linear
+        // two-pointer walk over the FUSED prefix only — a growing-vector
+        // `iter().any()` here is O(n²) and turns a `"1.1 "`-flood
+        // megabyte into ~17 s of synchronous work on the async worker
+        // BEFORE the per-segment cap can meter anything (audit finding
+        // on this PR; measured quadratic: 1.37 s at 256 KiB, 17.6 s at
+        // 1 MiB — linear after the fix).
+        let fused_len = spans.len();
+        let mut fi = 0;
         for m in self.dotted.find_iter(text) {
             let r = m.range();
-            if r.len() <= MAX_CANDIDATE_SPAN_BYTES
-                && !spans.iter().any(|s| s.start < r.end && r.start < s.end)
-            {
+            if r.len() > MAX_CANDIDATE_SPAN_BYTES {
+                continue;
+            }
+            while fi < fused_len && spans[fi].end <= r.start {
+                fi += 1;
+            }
+            if fi >= fused_len || spans[fi].start >= r.end {
                 spans.push(r);
             }
         }
@@ -1097,6 +1141,38 @@ mod tests {
         );
         // A pure word and a pure dash-number never become fused tokens.
         assert_eq!(values_of("high-performance run -3.5 offset"), vec!["3.5"]);
+    }
+
+    #[test]
+    fn candidate_dedupe_keeps_standalone_dotted_runs_between_fused_tokens() {
+        // Interleaved fused and dotted candidates: the two-pointer
+        // dedupe must drop exactly the dotted runs inside fused tokens
+        // and keep the standalone ones (regression for the O(n²)
+        // rewrite — audit finding).
+        let text = "v1.2-a 3.4 IC5.6 7.8 soc9.9x 10.11";
+        assert_eq!(
+            values_of(text),
+            vec!["v1.2-a", "3.4", "IC5.6", "7.8", "soc9.9x", "10.11"]
+        );
+    }
+
+    #[test]
+    fn candidate_generation_stays_linear_on_floods() {
+        // The audit measured the pre-fix quadratic dedupe at 17.6 s of
+        // synchronous CPU for a 1 MiB `"1.1 "` flood (1.37 s at
+        // 256 KiB) — BEFORE the per-segment cap could meter anything.
+        // Linear generation does this in tens of milliseconds; the
+        // bound leaves two orders of magnitude of CI headroom while
+        // sitting far below the quadratic's floor.
+        let flood = "1.1 ".repeat(256 * 1024); // 1 MiB
+        let started = Instant::now();
+        let spans = CandidateFinder::new().spans(&flood);
+        assert_eq!(spans.len(), 256 * 1024);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "candidate generation took {:?} on a 1 MiB flood",
+            started.elapsed()
+        );
     }
 
     #[test]
