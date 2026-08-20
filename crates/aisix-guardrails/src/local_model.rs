@@ -127,6 +127,10 @@ pub const LANES_ENV: &str = "GUARDRAIL_LOCAL_MODEL_LANES";
 /// Optional layer-② hotword proximity window override, in chars each
 /// side of a candidate (default [`rules::DEFAULT_PROXIMITY_CHARS`],
 /// clamped to [`rules::MAX_PROXIMITY_CHARS`]; malformed → default).
+/// `0` collapses the window to the candidate itself — hotword evidence
+/// is disabled and only the negative shape classes still act, i.e. a
+/// "negatives-only" rules mode where every unresolved candidate falls
+/// to the model band.
 pub const RULE_WINDOW_ENV: &str = "GUARDRAIL_LOCAL_MODEL_RULE_WINDOW";
 /// Optional layer-③ prototype strategy: `description`, `max`, or
 /// `centroid` (default [`PrototypeStrategy::default`]; malformed →
@@ -182,12 +186,14 @@ pub enum PrototypeStrategy {
 
 impl PrototypeStrategy {
     fn parse(raw: Option<&str>) -> Self {
-        match raw {
-            None => Self::default(),
-            Some("description") => Self::Description,
-            Some("max") => Self::SampleMax,
-            Some("centroid") => Self::SampleCentroid,
-            Some(other) => {
+        let Some(raw) = raw else {
+            return Self::default();
+        };
+        match raw.to_ascii_lowercase().as_str() {
+            "description" => Self::Description,
+            "max" => Self::SampleMax,
+            "centroid" => Self::SampleCentroid,
+            other => {
                 tracing::warn!(
                     value = other,
                     default = ?Self::default(),
@@ -247,6 +253,19 @@ const WINDOW_CONTEXT_CHARS: usize = 50;
 /// the cap are left untouched and a warning is logged — degrade to
 /// doing less, never to blocking or stalling.
 const MAX_MODEL_CALLS_PER_PASS: usize = 8;
+
+/// Hard cap on rule-scored candidates per SEGMENT. Rule scoring is
+/// µs-cheap per candidate but re-scans a proximity window each time, so
+/// a crafted body that is nothing but candidates (`1.1 1.1 …`) turns
+/// the per-segment scoring loop into a linear CPU amplifier on the
+/// async worker — measured ~91 ms of synchronous work per MiB at the
+/// default window and ~6× that at the window clamp (audit finding on
+/// this PR; the request-body limit defaults to unlimited). Candidates
+/// past the cap are RELEASED unscored with a warning — the same
+/// fail-open arm as every other cap here — and a segment with thousands
+/// of dotted-number runs is a log dump, not prose a version leaks
+/// through.
+const MAX_RULE_SCORED_SPANS_PER_SEGMENT: usize = 4096;
 
 /// Hardcoded rewrite for an above-threshold candidate span.
 const MASK_REPLACEMENT: &str = "***";
@@ -651,7 +670,15 @@ impl LocalModelGuardrail {
         let mut hits: Vec<Range<usize>> = Vec::new();
         let (mut rule_masked, mut rule_passed, mut model_judged) = (0u32, 0u32, 0u32);
         let mut over_budget = false;
-        for span in candidate_spans(&self.candidate_re, text) {
+        let spans = candidate_spans(&self.candidate_re, text);
+        if spans.len() > MAX_RULE_SCORED_SPANS_PER_SEGMENT {
+            tracing::warn!(
+                candidates = spans.len(),
+                cap = MAX_RULE_SCORED_SPANS_PER_SEGMENT,
+                "local-model guardrail: candidate cap reached; the tail is released unscored"
+            );
+        }
+        for span in spans.into_iter().take(MAX_RULE_SCORED_SPANS_PER_SEGMENT) {
             match self.rules.decide(text, &span) {
                 RuleDecision::Mask => {
                     rule_masked += 1;
@@ -851,6 +878,15 @@ mod tests {
             PrototypeStrategy::parse(Some("centroid")),
             PrototypeStrategy::SampleCentroid
         );
+        // Case-insensitive: an operator typing `Description` means it.
+        assert_eq!(
+            PrototypeStrategy::parse(Some("Description")),
+            PrototypeStrategy::Description
+        );
+        assert_eq!(
+            PrototypeStrategy::parse(Some("MAX")),
+            PrototypeStrategy::SampleMax
+        );
         assert_eq!(
             PrototypeStrategy::parse(Some("bogus")),
             PrototypeStrategy::default()
@@ -973,6 +1009,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A candidate flood past [`MAX_RULE_SCORED_SPANS_PER_SEGMENT`]
+    /// releases the tail unscored: a rule-maskable sentence hidden
+    /// beyond the cap stays untouched (fail-open — rewrite less, never
+    /// stall), and the flood burns at most the model-call budget.
+    #[tokio::test]
+    #[ignore = "needs GUARDRAIL_LOCAL_MODEL_DIR with model.onnx + tokenizer.json"]
+    async fn candidate_flood_releases_the_tail() {
+        let Some(g) = load_from_env() else { return };
+        let flood = "1.1 ".repeat(MAX_RULE_SCORED_SPANS_PER_SEGMENT);
+        let text = format!("{flood}这个 EDA 软件的版本是 12.1");
+        let outcome = g.moderate_input_segments(&[text]).await;
+        assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
+        assert!(
+            outcome.masked.is_none(),
+            "the over-cap tail must be released unscored"
+        );
     }
 
     /// The acceptance matrix end to end through the segment hook, on the

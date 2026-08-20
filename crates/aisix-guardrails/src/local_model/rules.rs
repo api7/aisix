@@ -43,6 +43,13 @@
 //! [`RULE_WINDOW_ENV`][super::RULE_WINDOW_ENV] (clamped to
 //! [`MAX_PROXIMITY_CHARS`], the Google DLP hard cap).
 //!
+//! Threat-model boundary, inherited from the design issue's "只能防无意
+//! 泄漏" line and inherent to score-subtraction DLP: a sender (or a
+//! hostile upstream, on the output side) can defeat the rule layer by
+//! FORMATTING — appending a unit-looking suffix (`升级到 2022.4s`), a
+//! `:digit` tail, or fullwidth digits that never become candidates. The
+//! layer scores accidental phrasing, not adversarial encoding.
+//!
 //! Everything here is pure text work — no model, no I/O — so the layer is
 //! unit-testable standalone, which is also how the "rules alone" halves
 //! of the acceptance matrix are measured.
@@ -95,17 +102,27 @@ const EN_TRIGGER_PATTERN: &str = r"(?i)\b(?:version|release|build|upgraded?\s+to
 const TOOL_PATTERN: &str = r"(?i)\b(?:virtuoso|calibre|vcs|innovus|icc2|primetime)\b";
 
 /// Negative: a measurement unit right after the span (`12.345s`,
-/// `4.2 GB`, `0.13um`, `99.9%`). Anchored to the span end with optional
-/// whitespace; letter units must not continue into a longer word
-/// (`12.1 seconds` is NOT a bare-unit hit), checked with an explicit
-/// ASCII-alnum guard rather than `\b` because the regex crate's Unicode
-/// `\b` treats a following CJK char as a word char.
-const UNIT_SUFFIX_PATTERN: &str = r"^\s*(?:%|(?i:ms|s|gb|mb|um|nm)(?:[^0-9A-Za-z]|$))";
+/// `4.2 GB`, `0.13um`, `99.9%`, `0.5ns`). Beyond the design brief's
+/// minimum list, this covers the full timing-unit family (`us/ns/ps/fs`,
+/// the `Hz` family, spelled-out durations) because the driving corpus —
+/// STA/timing logs — is ns/ps-dense, and a unit the list misses next to
+/// a tool name would RULE-MASK a slack value (audit finding on this PR).
+/// Anchored to the span end with optional whitespace; letter units must
+/// not continue into a longer word (`12.1 subsystem` is NOT an `s` hit),
+/// checked with an explicit ASCII-alnum guard rather than `\b` because
+/// the regex crate's Unicode `\b` treats a following CJK char as a word
+/// char.
+const UNIT_SUFFIX_PATTERN: &str = r"^\s*(?:%|(?i:ms|us|ns|ps|fs|s|secs?|seconds?|mins?|minutes?|hours?|[kmgt]i?b|um|nm|[kmg]?hz)(?:[^0-9A-Za-z]|$))";
 
 /// Negative: the span itself is IPv4-shaped (`10.2.255.1`). Shape only —
-/// no octet range check, matching how DLP engines treat dotted quads;
-/// a 4-group version string whose groups all fit in 3 digits is rare
-/// enough that the model band is not worth the ambiguity.
+/// no octet range check, matching how DLP engines treat dotted quads.
+/// Known recall tradeoff (recorded on the design issue): real EDA
+/// sub-versions can run to 4 dotted groups (`IC6.1.8.500`), and this
+/// class releases them even next to an adjacent tool name. Kept anyway:
+/// weakening the class when positive evidence is adjacent would mask
+/// ACTUAL addresses (`Virtuoso 主机 10.2.255.1`), and a mask
+/// false-positive corrupts content while a release only defers recall to
+/// the sample corpus.
 const IPV4_PATTERN: &str = r"^\d{1,3}(?:\.\d{1,3}){3}$";
 
 /// Negative: source-location context — the span directly follows a
@@ -182,18 +199,24 @@ impl RuleScorer {
             win.match_indices(t)
                 .map(|(i, m)| window.start + i..window.start + i + m.len())
         }));
-        tally(
-            &mut self
-                .en_trigger
-                .find_iter(win)
-                .map(|m| window.start + m.start()..window.start + m.end()),
-        );
-        tally(
-            &mut self
-                .tool
-                .find_iter(win)
-                .map(|m| window.start + m.start()..window.start + m.end()),
-        );
+        // A clipped window edge can bisect a word and hand `\b` a false
+        // boundary at the slice rim (`…conversion` clipped to a slice
+        // ending in `version`), so word-bounded matches flush with a
+        // CLIPPED edge are discarded. Substring (zh) matching has no
+        // boundary semantics, so it needs no such guard.
+        let clipped_start = window.start > 0;
+        let clipped_end = window.end < text.len();
+        let mut bounded = |re: &Regex| {
+            tally(
+                &mut re
+                    .find_iter(win)
+                    .filter(|m| !(clipped_start && m.start() == 0))
+                    .filter(|m| !(clipped_end && m.end() == win.len()))
+                    .map(|m| window.start + m.start()..window.start + m.end()),
+            );
+        };
+        bounded(&self.en_trigger);
+        bounded(&self.tool);
 
         let mut score = adjacent_classes * ADJACENT_CLASS_SCORE;
         if adjacent_classes == 0 && window_only {
@@ -336,6 +359,19 @@ mod tests {
     }
 
     #[test]
+    fn clipped_window_edge_cannot_fabricate_a_word_boundary() {
+        // With a window sized to clip `conversion` exactly at its inner
+        // `version`, the slice-start `\b` would fire and rule-mask; the
+        // clipped-edge guard drops the match and the candidate stays in
+        // the model band.
+        let text = "big conversion 3.5 result";
+        let re = Regex::new(CANDIDATE_PATTERN).unwrap();
+        let span = &candidate_spans(&re, text)[0];
+        let tight = RuleScorer::new(8);
+        assert_eq!(tight.decide(text, span), RuleDecision::Model);
+    }
+
+    #[test]
     fn source_location_context_passes() {
         assert_eq!(
             only("see top.v:12.1 for the assignment"),
@@ -345,12 +381,29 @@ mod tests {
 
     #[test]
     fn unit_must_not_continue_into_a_word() {
-        // `s` starts `seconds`: not a bare unit, and 版本 is adjacent →
+        // `s` starts `subsystem`: not a unit hit, and 版本 is adjacent →
         // decisive positive stands.
         assert_eq!(
-            only("版本是 12.1 seconds 之外的另一个话题"),
+            only("版本是 12.1 subsystem 之外的另一个话题"),
             RuleDecision::Mask
         );
+    }
+
+    #[test]
+    fn timing_units_outweigh_adjacent_tool_names() {
+        // The driving corpus is ns/ps-dense STA logs: a slack value next
+        // to a tool name must NOT rule-mask (audit finding on this PR).
+        assert_eq!(only("PrimeTime slack 0.5ns 违例"), RuleDecision::Pass);
+        assert_eq!(only("版本升级后耗时 12.5ns,可以接受"), RuleDecision::Pass);
+        assert_eq!(only("clock period 1.25ps setup ok"), RuleDecision::Pass);
+        assert_eq!(only("跑到 3.2GHz 依然稳定"), RuleDecision::Pass);
+        assert_eq!(only("内存占用 1.5 GiB 左右"), RuleDecision::Pass);
+    }
+
+    #[test]
+    fn spelled_duration_units_are_negative_evidence() {
+        assert_eq!(only("the build took 12.5 minutes"), RuleDecision::Pass);
+        assert_eq!(only("版本是 12.1 seconds 之外的话题"), RuleDecision::Pass);
     }
 
     #[test]
