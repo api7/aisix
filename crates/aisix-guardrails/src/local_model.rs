@@ -116,8 +116,8 @@ use rules::{RuleDecision, RuleScorer};
 /// `tokenizer.json`). Set → the server bootstrap loads and injects the
 /// guardrail; unset → the feature is completely inert.
 pub const MODEL_DIR_ENV: &str = "GUARDRAIL_LOCAL_MODEL_DIR";
-/// Optional cosine-similarity gate override (default
-/// [`DEFAULT_THRESHOLD`]).
+/// Optional cosine-similarity gate override (default: the configured
+/// strategy's calibrated `default_threshold`).
 pub const THRESHOLD_ENV: &str = "GUARDRAIL_LOCAL_MODEL_THRESHOLD";
 /// Optional inference-lane count (default 1, clamped to
 /// [`MAX_LANES`]). Each lane is one ONNX session — one more core the
@@ -578,7 +578,7 @@ pub struct LocalModelGuardrail {
 impl LocalModelGuardrail {
     /// Load tokenizer + the session pool and encode the category's
     /// prototype set. Blocking (N model loads + up to
-    /// [`PROTOTYPE_SAMPLES`]-many inferences) — the server bootstrap
+    /// `PROTOTYPE_SAMPLES`-many inferences) — the server bootstrap
     /// wraps it in `spawn_blocking`.
     pub fn load(config: &LocalModelConfig) -> Result<Self, LocalModelError> {
         let started = Instant::now();
@@ -951,7 +951,10 @@ mod tests {
                     _ => {}
                 }
             }
-            println!("  hard margin (min POS − max NEG): {:+.4}", hard_pos_min - neg_max);
+            println!(
+                "  hard margin (min POS − max NEG): {:+.4}",
+                hard_pos_min - neg_max
+            );
 
             // Pin the calibration contract for the sample strategies:
             // the margin the experiment claims stays open, and the
@@ -981,10 +984,7 @@ mod tests {
     async fn acceptance_matrix_end_to_end() {
         let Some(g) = load_from_env() else { return };
         let masked_cases = [
-            (
-                "这个 EDA 软件的版本是 12.1",
-                "这个 EDA 软件的版本是 ***",
-            ),
+            ("这个 EDA 软件的版本是 12.1", "这个 EDA 软件的版本是 ***"),
             (
                 "我们把仿真工具升级到 2022.4 之后速度快了很多",
                 "我们把仿真工具升级到 *** 之后速度快了很多",
@@ -994,7 +994,9 @@ mod tests {
         for (input, want) in masked_cases {
             let outcome = g.moderate_input_segments(&[input.to_owned()]).await;
             assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
-            let masked = outcome.masked.unwrap_or_else(|| panic!("must mask: {input}"));
+            let masked = outcome
+                .masked
+                .unwrap_or_else(|| panic!("must mask: {input}"));
             assert_eq!(masked[0], want);
         }
         let passthrough_cases = [

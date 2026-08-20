@@ -182,14 +182,18 @@ impl RuleScorer {
             win.match_indices(t)
                 .map(|(i, m)| window.start + i..window.start + i + m.len())
         }));
-        tally(&mut self
-            .en_trigger
-            .find_iter(win)
-            .map(|m| window.start + m.start()..window.start + m.end()));
-        tally(&mut self
-            .tool
-            .find_iter(win)
-            .map(|m| window.start + m.start()..window.start + m.end()));
+        tally(
+            &mut self
+                .en_trigger
+                .find_iter(win)
+                .map(|m| window.start + m.start()..window.start + m.end()),
+        );
+        tally(
+            &mut self
+                .tool
+                .find_iter(win)
+                .map(|m| window.start + m.start()..window.start + m.end()),
+        );
 
         let mut score = adjacent_classes * ADJACENT_CLASS_SCORE;
         if adjacent_classes == 0 && window_only {
@@ -261,7 +265,10 @@ mod tests {
 
     #[test]
     fn acceptance_positive_masks_by_rules_alone() {
-        assert_eq!(only("这个 EDA 软件的版本是 12.1,请确认兼容性"), RuleDecision::Mask);
+        assert_eq!(
+            only("这个 EDA 软件的版本是 12.1,请确认兼容性"),
+            RuleDecision::Mask
+        );
     }
 
     #[test]
@@ -322,19 +329,28 @@ mod tests {
         assert_eq!(only("PrimeTime 2022.03 跑不过时序"), RuleDecision::Mask);
         // Tool at window distance next to a non-version number: weak
         // evidence — the model decides, not the rules.
-        assert_eq!(only("PrimeTime reported a slack of 12.5"), RuleDecision::Model);
+        assert_eq!(
+            only("PrimeTime reported a slack of 12.5"),
+            RuleDecision::Model
+        );
     }
 
     #[test]
     fn source_location_context_passes() {
-        assert_eq!(only("see top.v:12.1 for the assignment"), RuleDecision::Pass);
+        assert_eq!(
+            only("see top.v:12.1 for the assignment"),
+            RuleDecision::Pass
+        );
     }
 
     #[test]
     fn unit_must_not_continue_into_a_word() {
         // `s` starts `seconds`: not a bare unit, and 版本 is adjacent →
         // decisive positive stands.
-        assert_eq!(only("版本是 12.1 seconds 之外的另一个话题"), RuleDecision::Mask);
+        assert_eq!(
+            only("版本是 12.1 seconds 之外的另一个话题"),
+            RuleDecision::Mask
+        );
     }
 
     #[test]
@@ -375,10 +391,7 @@ mod tests {
             .flat_map(|t| decisions(t).into_iter().map(|(_, d)| d))
             .collect();
         assert_eq!(all.len(), 8);
-        let to_model = all
-            .iter()
-            .filter(|d| **d == RuleDecision::Model)
-            .count();
+        let to_model = all.iter().filter(|d| **d == RuleDecision::Model).count();
         assert_eq!(to_model, 1, "decisions: {all:?}");
     }
 }
