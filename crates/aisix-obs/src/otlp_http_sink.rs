@@ -132,10 +132,19 @@ impl OtlpHttpFanOut {
     /// `content_mode = full`; every other exporter — and the CP telemetry
     /// path, which is not in this loop — receives the shared metadata-only
     /// record, so prompt/response can never leak there.
+    ///
+    /// `trace` is the event's span snapshot (AISIX-Cloud#1279) — ids and
+    /// boundaries frozen at emission time by the request's trace bundle.
+    /// It rides every record unchanged (`SinkRecord::trace` is
+    /// serde-skipped, so only the OTLP encoder reads it), which is what
+    /// makes span ids byte-identical across delivery retries and across
+    /// exporters. `None` (a caller predating the bundle, or a synthetic
+    /// event) falls back to the legacy single-span encoding.
     pub fn fan_out<'a, I>(
         &self,
         event: &UsageEvent,
         content: Option<&CapturedContent>,
+        trace: Option<&crate::trace::TraceEmission>,
         exporters: I,
     ) where
         I: IntoIterator<Item = &'a ObservabilityExporter>,
@@ -246,11 +255,10 @@ impl OtlpHttpFanOut {
             // A content-bearing record for an SLS exporter that opted into
             // full capture (and only when the handler captured content); the
             // shared metadata-only record for everyone else.
-            let record = content_record(&exp.kind, event, content).unwrap_or_else(|| {
-                Arc::clone(
-                    metadata_record
-                        .get_or_insert_with(|| Arc::new(SinkRecord::metadata_only(event.clone()))),
-                )
+            let record = content_record(&exp.kind, event, content, trace).unwrap_or_else(|| {
+                Arc::clone(metadata_record.get_or_insert_with(|| {
+                    Arc::new(SinkRecord::metadata_only(event.clone()).with_trace(trace.cloned()))
+                }))
             });
             handle.try_enqueue(record);
         }
@@ -393,6 +401,7 @@ fn content_record(
     kind: &ExporterKind,
     event: &UsageEvent,
     content: Option<&CapturedContent>,
+    trace: Option<&crate::trace::TraceEmission>,
 ) -> Option<Arc<SinkRecord>> {
     // The exporters that opt into full content capture share the
     // `SlsContentMode` model; pull each one's (mode, cap). Any other kind
@@ -410,7 +419,9 @@ fn content_record(
     let mut sc = SinkContent::capture(&captured.prompt, &captured.response, max_bytes as usize);
     sc.truncated = sc.truncated || captured.truncated;
     Some(Arc::new(
-        SinkRecord::metadata_only(event.clone()).with_content(sc),
+        SinkRecord::metadata_only(event.clone())
+            .with_content(sc)
+            .with_trace(trace.cloned()),
     ))
 }
 
@@ -532,12 +543,12 @@ impl ObservabilitySink for OtlpSink {
         if batch.is_empty() {
             return Ok(SinkAck::default());
         }
-        // One export request carrying every record's span — one POST, one
+        // One export request carrying every record's spans — one POST, one
         // atomic retry unit (vs. the per-event fan-out's N spawns).
         let spans: Vec<Value> = batch
             .records
             .iter()
-            .map(|record| build_otlp_span(record, &self.name))
+            .flat_map(|record| build_otlp_spans(record, &self.name))
             .collect();
         let body = otlp_export_request(spans);
         let bytes = serde_json::to_vec(&body)
@@ -631,13 +642,141 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
     let latency_nanos = (event.upstream_latency_ms as u128).saturating_mul(1_000_000);
     let start_unix_nano = end_unix_nano.saturating_sub(latency_nanos);
 
-    // Status: OK (1) for 2xx, ERROR (2) otherwise.
-    let status_code = if (200..300).contains(&event.status_code) {
+    json!({
+        "traceId": trace_id,
+        "spanId":  span_id,
+        "name":    span_name(event),
+        // SPAN_KIND_CLIENT for all three: the gateway is the client of a
+        // remote LLM, agent or MCP server. The conventions name INTERNAL for
+        // a tool executed in-process, which is not what this span describes.
+        "kind":    3,
+        "startTimeUnixNano": start_unix_nano.to_string(),
+        "endTimeUnixNano":   end_unix_nano.to_string(),
+        "attributes": event_attributes(record, exporter_name),
+        "status": { "code": span_status(event.status_code) },
+    })
+}
+
+/// Encode one sink record into its OTLP span set.
+///
+/// A record carrying a [`crate::trace::TraceEmission`] (AISIX-Cloud#1279)
+/// yields the request's span hierarchy — SERVER → logical GenAI CLIENT →
+/// attempt CLIENT — with ids and nanosecond boundaries frozen at emission
+/// time, so a delivery retry re-encodes byte-identical spans and every
+/// exporter agrees on the trace. A record without one (a caller predating
+/// the bundle, or a synthetic event) falls back to the legacy single-span
+/// shape of [`build_otlp_span`].
+fn build_otlp_spans(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
+    use crate::trace::SpanRole;
+
+    let Some(trace) = &record.trace else {
+        return vec![build_otlp_span(record, exporter_name)];
+    };
+    let event = &record.usage;
+    let trace_id = trace.trace_id.to_hex();
+    let status = span_status(event.status_code);
+    let carrier = trace.carrier_role();
+    trace
+        .spans
+        .iter()
+        .map(|span| {
+            // The carrier span — the attempt when present, else the
+            // logical CLIENT, else SERVER — gets the event's full
+            // attribute set (and captured content); the structural spans
+            // above it carry only what a consumer needs to join them.
+            let attributes = if Some(span.role) == carrier {
+                event_attributes(record, exporter_name)
+            } else {
+                structural_attributes(event, exporter_name)
+            };
+            // OTLP SpanKind: SERVER (2) for the inbound request; CLIENT
+            // (3) for the logical GenAI operation and each upstream
+            // attempt.
+            let kind = match span.role {
+                SpanRole::Server => 2,
+                SpanRole::Logical | SpanRole::Attempt => 3,
+            };
+            let mut json = json!({
+                "traceId": trace_id,
+                "spanId": span.span_id.to_hex(),
+                "name": span_name(event),
+                "kind": kind,
+                "startTimeUnixNano": span.start_unix_nano.to_string(),
+                "endTimeUnixNano": span.end_unix_nano.to_string(),
+                "attributes": attributes,
+                "status": { "code": status },
+                "flags": span_flags(span, trace),
+            });
+            if let Some(parent) = span.parent_span_id {
+                json["parentSpanId"] = Value::String(parent.to_hex());
+            }
+            // The caller's tracestate belongs to the propagated context;
+            // it rides the SERVER span, the one that continues it.
+            if span.role == SpanRole::Server {
+                if let Some(state) = &trace.tracestate {
+                    json["traceState"] = Value::String(state.clone());
+                }
+            }
+            json
+        })
+        .collect()
+}
+
+/// OTLP span `flags` (uint32): the low byte is the span's W3C trace-flags
+/// — always `sampled`, since encoding IS the export decision, plus the
+/// inbound octet's `random` bit (0x02) on a SERVER span continuing a
+/// remote trace — and `HAS_IS_REMOTE` (bit 8) on every span, with
+/// `IS_REMOTE` (bit 9) on a SERVER span whose parent arrived over the
+/// wire in `traceparent`.
+fn span_flags(span: &crate::trace::SpanEmit, trace: &crate::trace::TraceEmission) -> u32 {
+    const SAMPLED: u32 = 0x01;
+    const W3C_RANDOM: u32 = 0x02;
+    const HAS_IS_REMOTE: u32 = 0x100;
+    const IS_REMOTE: u32 = 0x200;
+    let remote = span.role == crate::trace::SpanRole::Server
+        && span.parent_span_id.is_some()
+        && trace.remote_flags.is_some();
+    let mut flags = SAMPLED | HAS_IS_REMOTE;
+    if remote {
+        flags |= IS_REMOTE;
+        // The random bit describes the trace id, which the remote parent
+        // minted — preserve its claim; never invent it for local roots.
+        flags |= u32::from(trace.remote_flags.unwrap_or(0)) & W3C_RANDOM;
+    }
+    flags
+}
+
+/// The joining attributes a structural (non-carrier) span carries: enough
+/// to group a trace's spans by request and operation without duplicating
+/// the event's full attribute set onto every level of the hierarchy.
+fn structural_attributes(event: &UsageEvent, exporter_name: &str) -> Vec<Value> {
+    let mut attributes = vec![
+        attr_string("gen_ai.system", "aisix"),
+        attr_string("gen_ai.operation.name", operation_name(event)),
+        attr_string("aisix.exporter_name", exporter_name),
+        attr_string("aisix.request_id", &event.request_id),
+        attr_int("http.response.status_code", event.status_code as i64),
+    ];
+    if !event.requested_model.is_empty() {
+        attributes.push(attr_string("gen_ai.request.model", &event.requested_model));
+    }
+    attributes
+}
+
+/// Status: OK (1) for 2xx, ERROR (2) otherwise.
+fn span_status(status: u16) -> i64 {
+    if (200..300).contains(&status) {
         1
     } else {
         2
-    };
+    }
+}
 
+/// The event's full attribute set — every wire field the OTLP allowlist
+/// exports, plus captured content when the record carries it. Attached to
+/// the legacy single span and to the hierarchy's carrier span.
+fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
+    let event = &record.usage;
     let mut attributes = vec![
         attr_string("gen_ai.system", "aisix"),
         attr_string("gen_ai.operation.name", operation_name(event)),
@@ -834,19 +973,7 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
         }
     }
 
-    json!({
-        "traceId": trace_id,
-        "spanId":  span_id,
-        "name":    span_name(event),
-        // SPAN_KIND_CLIENT for all three: the gateway is the client of a
-        // remote LLM, agent or MCP server. The conventions name INTERNAL for
-        // a tool executed in-process, which is not what this span describes.
-        "kind":    3,
-        "startTimeUnixNano": start_unix_nano.to_string(),
-        "endTimeUnixNano":   end_unix_nano.to_string(),
-        "attributes": attributes,
-        "status": { "code": status_code },
-    })
+    attributes
 }
 
 /// The OpenTelemetry GenAI operation this event describes.
@@ -1140,6 +1267,105 @@ mod tests {
         })
     }
 
+    /// A three-attempt failover bundle with a remote parent, for the
+    /// hierarchy-encoding assertions (AISIX-Cloud#1279).
+    fn hierarchy_record() -> SinkRecord {
+        let (trace_id, parent_span_id, flags) = crate::trace::parse_traceparent(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        )
+        .unwrap();
+        let bundle =
+            crate::trace::RequestTraceBundle::new(Some(crate::trace::RemoteTraceContext {
+                trace_id,
+                parent_span_id,
+                flags,
+                tracestate: Some("vendor=x".into()),
+            }));
+        bundle.start_attempt(0);
+        bundle.end_attempt(0);
+        bundle.start_attempt(1);
+        bundle.end_attempt(1);
+        let mut event = sample_event();
+        event.attempt_index = 1;
+        SinkRecord::metadata_only(event).with_trace(Some(bundle.emission(true, 1, 250, true)))
+    }
+
+    /// The hierarchy contract (AISIX-Cloud#1279): a terminal record with a
+    /// remote parent encodes SERVER (kind 2, parented to the inbound
+    /// traceparent, carrying traceState) → logical CLIENT → attempt
+    /// CLIENT, all under the caller's trace id, with the event's full
+    /// attribute set on the attempt span only.
+    #[test]
+    fn hierarchy_record_encodes_server_logical_attempt_spans() {
+        let record = hierarchy_record();
+        let spans = build_otlp_spans(&record, "exp-1");
+        assert_eq!(spans.len(), 3);
+
+        for span in &spans {
+            assert_eq!(span["traceId"], "4bf92f3577b34da6a3ce929d0e0e4736");
+        }
+        let server = &spans[0];
+        let logical = &spans[1];
+        let attempt = &spans[2];
+        assert_eq!(server["kind"], 2);
+        assert_eq!(server["parentSpanId"], "00f067aa0ba902b7");
+        assert_eq!(server["traceState"], "vendor=x");
+        // SAMPLED | HAS_IS_REMOTE | IS_REMOTE.
+        assert_eq!(server["flags"], 0x301);
+
+        assert_eq!(logical["kind"], 3);
+        assert_eq!(logical["parentSpanId"], server["spanId"]);
+        assert_eq!(logical["flags"], 0x101);
+        assert!(logical.get("traceState").is_none());
+
+        assert_eq!(attempt["kind"], 3);
+        assert_eq!(attempt["parentSpanId"], logical["spanId"]);
+
+        // The event's full attribute set rides the attempt span; the
+        // structural spans carry only the joining keys.
+        let keys = |span: &Value| -> Vec<String> {
+            span["attributes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["key"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(keys(attempt).contains(&"gen_ai.response.id".to_string()));
+        assert!(!keys(server).contains(&"gen_ai.response.id".to_string()));
+        assert!(keys(server).contains(&"aisix.request_id".to_string()));
+
+        // Timestamps bracket: server ⊇ logical ⊇ attempt.
+        let nanos =
+            |span: &Value, key: &str| -> u128 { span[key].as_str().unwrap().parse().unwrap() };
+        assert!(nanos(server, "startTimeUnixNano") <= nanos(logical, "startTimeUnixNano"));
+        assert!(nanos(logical, "endTimeUnixNano") <= nanos(server, "endTimeUnixNano"));
+        assert!(nanos(logical, "startTimeUnixNano") <= nanos(attempt, "startTimeUnixNano"));
+        assert!(nanos(attempt, "endTimeUnixNano") <= nanos(logical, "endTimeUnixNano"));
+    }
+
+    /// The regenerate-per-retry defect this PR removes: encoding the same
+    /// record twice — what the delivery retry loop does — must produce
+    /// byte-identical ids and timestamps.
+    #[test]
+    fn re_encoding_a_trace_record_is_byte_identical() {
+        let record = hierarchy_record();
+        let a = build_otlp_spans(&record, "exp-1");
+        let b = build_otlp_spans(&record, "exp-1");
+        assert_eq!(a, b);
+    }
+
+    /// A record without a trace snapshot (a synthetic event, or a caller
+    /// predating the bundle) keeps the legacy single-span shape.
+    #[test]
+    fn traceless_record_falls_back_to_the_legacy_single_span() {
+        let record = SinkRecord::metadata_only(sample_event());
+        let spans = build_otlp_spans(&record, "exp-1");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["kind"], 3);
+        assert!(spans[0].get("parentSpanId").is_none());
+    }
+
     fn otlp_kind(content_mode: SlsContentMode, max_bytes: u32) -> ExporterKind {
         ExporterKind::OtlpHttp(OtlpHttpConfig {
             endpoint: "https://x/v1/traces".into(),
@@ -1174,7 +1400,7 @@ mod tests {
         // otlp on its default (metadata_only) never carries content, even
         // when content was captured.
         let otlp = otlp_kind(SlsContentMode::MetadataOnly, 1024);
-        assert!(content_record(&otlp, &event, Some(&captured)).is_none());
+        assert!(content_record(&otlp, &event, Some(&captured), None).is_none());
 
         // object_store never carries content either — content_record gates on
         // the AliyunSls variant, so any other kind gets metadata-only even when
@@ -1190,19 +1416,19 @@ mod tests {
         }))
         .unwrap()
         .kind;
-        assert!(content_record(&objstore, &event, Some(&captured)).is_none());
+        assert!(content_record(&objstore, &event, Some(&captured), None).is_none());
 
         // sls metadata_only → no content.
         let meta = sls_kind(SlsContentMode::MetadataOnly, 1024);
-        assert!(content_record(&meta, &event, Some(&captured)).is_none());
+        assert!(content_record(&meta, &event, Some(&captured), None).is_none());
 
         // sls full but nothing captured → falls back to metadata.
         let full = sls_kind(SlsContentMode::Full, 1024);
-        assert!(content_record(&full, &event, None).is_none());
+        assert!(content_record(&full, &event, None, None).is_none());
 
         // sls full + captured content → a content-bearing record that still
         // carries the metadata.
-        let rec = content_record(&full, &event, Some(&captured))
+        let rec = content_record(&full, &event, Some(&captured), None)
             .expect("full-capture sls with content yields a content record");
         let c = rec.content.as_ref().expect("content attached");
         assert_eq!(c.prompt, "the prompt");
@@ -1216,7 +1442,13 @@ mod tests {
             response: "ok".into(),
             truncated: false,
         };
-        let rec = content_record(&sls_kind(SlsContentMode::Full, 16), &event, Some(&big)).unwrap();
+        let rec = content_record(
+            &sls_kind(SlsContentMode::Full, 16),
+            &event,
+            Some(&big),
+            None,
+        )
+        .unwrap();
         let c = rec.content.as_ref().unwrap();
         assert_eq!(c.prompt.len(), 16);
         assert!(c.truncated, "oversize content must flag truncated");
@@ -1228,7 +1460,7 @@ mod tests {
             response: "short".into(),
             truncated: true,
         };
-        let rec = content_record(&full, &event, Some(&pre)).unwrap();
+        let rec = content_record(&full, &event, Some(&pre), None).unwrap();
         assert!(
             rec.content.as_ref().unwrap().truncated,
             "source truncation must propagate"
@@ -1238,31 +1470,42 @@ mod tests {
         // full + captured content → a content-bearing record (same shared
         // `SlsContentMode` plumbing).
         let dd_meta = datadog_kind(SlsContentMode::MetadataOnly, 1024);
-        assert!(content_record(&dd_meta, &event, Some(&captured)).is_none());
+        assert!(content_record(&dd_meta, &event, Some(&captured), None).is_none());
         let dd_full = datadog_kind(SlsContentMode::Full, 1024);
-        assert!(content_record(&dd_full, &event, None).is_none());
-        let rec = content_record(&dd_full, &event, Some(&captured))
+        assert!(content_record(&dd_full, &event, None, None).is_none());
+        let rec = content_record(&dd_full, &event, Some(&captured), None)
             .expect("full-capture datadog with content yields a content record");
         let c = rec.content.as_ref().expect("content attached");
         assert_eq!(c.prompt, "the prompt");
         assert_eq!(c.response, "the response");
         // Per-exporter cap truncates a datadog record too.
-        let rec =
-            content_record(&datadog_kind(SlsContentMode::Full, 16), &event, Some(&big)).unwrap();
+        let rec = content_record(
+            &datadog_kind(SlsContentMode::Full, 16),
+            &event,
+            Some(&big),
+            None,
+        )
+        .unwrap();
         assert_eq!(rec.content.as_ref().unwrap().prompt.len(), 16);
         assert!(rec.content.as_ref().unwrap().truncated);
 
         // otlp_http behaves identically (#519 B.2): full + captured content →
         // a content-bearing record; full with nothing captured → metadata.
         let otlp_full = otlp_kind(SlsContentMode::Full, 1024);
-        assert!(content_record(&otlp_full, &event, None).is_none());
-        let rec = content_record(&otlp_full, &event, Some(&captured))
+        assert!(content_record(&otlp_full, &event, None, None).is_none());
+        let rec = content_record(&otlp_full, &event, Some(&captured), None)
             .expect("full-capture otlp with content yields a content record");
         let c = rec.content.as_ref().expect("content attached");
         assert_eq!(c.prompt, "the prompt");
         assert_eq!(c.response, "the response");
         // Per-exporter cap truncates an otlp record too.
-        let rec = content_record(&otlp_kind(SlsContentMode::Full, 16), &event, Some(&big)).unwrap();
+        let rec = content_record(
+            &otlp_kind(SlsContentMode::Full, 16),
+            &event,
+            Some(&big),
+            None,
+        )
+        .unwrap();
         assert_eq!(rec.content.as_ref().unwrap().prompt.len(), 16);
         assert!(rec.content.as_ref().unwrap().truncated);
     }
@@ -1295,6 +1538,7 @@ mod tests {
             &otlp_kind(SlsContentMode::Full, 1024),
             &event,
             Some(&captured),
+            None,
         )
         .unwrap();
         let span = build_otlp_span(&rec, "x");
@@ -1317,7 +1561,13 @@ mod tests {
             response: "ok".into(),
             truncated: false,
         };
-        let rec = content_record(&otlp_kind(SlsContentMode::Full, 16), &event, Some(&big)).unwrap();
+        let rec = content_record(
+            &otlp_kind(SlsContentMode::Full, 16),
+            &event,
+            Some(&big),
+            None,
+        )
+        .unwrap();
         let span = build_otlp_span(&rec, "x");
         let attrs = span["attributes"].as_array().unwrap();
         let flag = attrs
@@ -1959,7 +2209,7 @@ mod tests {
         // can't easily count spawned tasks, but if the call returned
         // and the test process didn't hang, we're good.
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, std::iter::empty());
+        f.fan_out(&sample_event(), None, None, std::iter::empty());
     }
 
     #[test]
@@ -1973,7 +2223,7 @@ mod tests {
         let mut exp = sample_exporter();
         exp.enabled = false;
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, std::iter::once(&exp));
+        f.fan_out(&sample_event(), None, None, std::iter::once(&exp));
     }
 
     #[tokio::test]
@@ -2006,7 +2256,7 @@ mod tests {
         let control = mk("control", &ctrl_srv.uri(), None);
 
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, [&zero, &control]);
+        f.fan_out(&sample_event(), None, None, [&zero, &control]);
 
         // The control's span lands after the 1s flush…
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2051,7 +2301,7 @@ mod tests {
         .unwrap();
 
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, std::iter::once(&exp));
+        f.fan_out(&sample_event(), None, None, std::iter::once(&exp));
 
         // Poll for the batched POST (flush_interval is 1s).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

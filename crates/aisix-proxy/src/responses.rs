@@ -284,6 +284,9 @@ pub async fn responses(
                 // The winner's success event carries the content.
                 /* content_for_last */
                 None,
+                // The winner's event carries the terminal spans.
+                /* terminal_last */
+                false,
             );
             // Issue #404: emit UsageEvent so cp-api's budget ledger
             // and customer-facing /logs analytics see /v1/responses
@@ -350,6 +353,8 @@ pub async fn responses(
                         redaction_counts.clone(),
                         monitor_hits.clone(),
                         success.captured_content.as_ref(),
+                        /* terminal */ true,
+                        /* dispatched */ true,
                     );
                 }
             }
@@ -443,6 +448,10 @@ pub async fn responses(
                 &client,
                 &routing,
                 content_for_last,
+                // All-failed: the last failed attempt is the terminal
+                // emission; the pre-dispatch branch below covers empty.
+                /* terminal_last */
+                !routing.attempts.is_empty(),
             );
             // Pre-dispatch failure (model-not-found, auth, budget) records no
             // attempts — emit a single terminal event carrying the failure
@@ -470,6 +479,10 @@ pub async fn responses(
                     redaction_counts.clone(),
                     monitor_hits.clone(),
                     failure_content.take(),
+                    /* terminal */ true,
+                    // Pre-dispatch failure: no upstream contacted.
+                    /* dispatched */
+                    false,
                 );
             }
             err.into_response()
@@ -645,7 +658,8 @@ async fn dispatch(
     // pre-dispatch 4xx); if this endpoint ever grows semantic support,
     // widen this flag or the deferred policies are silently skipped.
     let is_routing_request = model_entry.value.routing.is_some();
-    let mut routing = RoutingTelemetry::for_request(&model_entry.value.display_name);
+    let mut routing = RoutingTelemetry::for_request(&model_entry.value.display_name)
+        .with_trace(client.trace.clone());
     // Walk the targets, failing over on a retryable failure. Streaming and
     // non-streaming share this loop: the per-target dispatch branches
     // internally and, for streaming, only returns Ok once the first chunk
@@ -1605,6 +1619,8 @@ async fn responses_to_target(
                     input_redactions.clone(),
                     monitor_hits,
                     captured_content.as_ref(),
+                    /* terminal */ true,
+                    /* dispatched */ true,
                 );
             },
         );
@@ -2100,6 +2116,8 @@ async fn responses_cross_provider_to_target(
                         merged
                     },
                     captured_content.as_ref(),
+                    /* terminal */ true,
+                    /* dispatched */ true,
                 );
             },
         );
@@ -2920,6 +2938,11 @@ fn emit_usage_event(
     // Captured request/response content for content-capturing exporters
     // (AISIX-Cloud#947). Forwarded only to `fan_out`, never to the CP sink.
     content: Option<&CapturedContent>,
+    // Whether this event ends the request (AISIX-Cloud#1279).
+    terminal: bool,
+    // Whether the work this event describes actually reached an upstream —
+    // false for a pre-dispatch failure, whose `elapsed` is handler time.
+    dispatched: bool,
 ) {
     let tags = pk.telemetry_tags();
     let mut event = UsageEvent {
@@ -2962,15 +2985,17 @@ fn emit_usage_event(
     };
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
-    state.usage_sink.try_emit(
+    crate::usage_attr::emit_usage(
+        state,
+        snap,
         "responses",
         event.clone(),
         crate::usage_attr::usage_event_labels(&usage_model, pk),
+        content,
+        client.trace.as_ref(),
+        terminal,
+        dispatched,
     );
-    let exporters = crate::usage_attr::live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, content, exporters.iter().map(|e| &e.value));
     // AISIX-Cloud#1044: token volume by inbound client type × model. Codex
     // traffic arrives on /v1/responses, so leaving this endpoint out of the
     // by-client series made an allowlisted client invisible in it. All three
@@ -3033,6 +3058,12 @@ fn emit_zero_token_event(
     // AISIX-Cloud#1013: captured (post-mask) request body for failed
     // requests. Forwarded only to `fan_out`, never to the CP sink.
     content: Option<CapturedContent>,
+    // Whether this event ends the request (AISIX-Cloud#1279): true for a
+    // pre-dispatch / all-failed terminal, false for a superseded attempt.
+    terminal: bool,
+    // Whether this attempt actually reached an upstream — false on the
+    // pre-dispatch path, true for a recorded failed attempt.
+    dispatched: bool,
 ) {
     let pk = ResolvedPk::resolve(snap, provider_key_id);
     let tags = pk.telemetry_tags();
@@ -3063,15 +3094,17 @@ fn emit_zero_token_event(
     };
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
-    state.usage_sink.try_emit(
+    crate::usage_attr::emit_usage(
+        state,
+        snap,
         "responses",
         event.clone(),
         crate::usage_attr::usage_event_labels(&usage_model, &pk),
+        content.as_ref(),
+        client.trace.as_ref(),
+        terminal,
+        dispatched,
     );
-    let exporters = crate::usage_attr::live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, content.as_ref(), exporters.iter().map(|e| &e.value));
 }
 
 /// Emit one zero-token `UsageEvent` per FAILED attempt of a `/v1/responses`
@@ -3090,6 +3123,10 @@ fn emit_failed_attempts(
     // the one whose status the caller saw. Other attempts (and the
     // success-path caller) stay content-less.
     mut content_for_last: Option<CapturedContent>,
+    // AISIX-Cloud#1279: on the all-failed path the LAST failed attempt's
+    // event is the request's terminal emission, so it carries the trace's
+    // SERVER + logical spans. False on the success path.
+    terminal_last: bool,
 ) {
     let last_failed = routing.attempts.iter().rposition(|a| !a.success);
     for (i, rec) in routing
@@ -3122,6 +3159,11 @@ fn emit_failed_attempts(
             crate::redact::RedactionCounts::new(),
             Vec::new(),
             content,
+            /* terminal */ terminal_last && Some(i) == last_failed,
+            // The record's own network-boundary fact: a rate-limit-refused
+            // attempt never reached an upstream.
+            /* dispatched */
+            rec.dispatched,
         );
     }
 }

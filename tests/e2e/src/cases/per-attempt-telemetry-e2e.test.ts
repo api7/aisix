@@ -103,16 +103,23 @@ async function waitForAttempts(
   timeoutMs = 10_000,
 ): Promise<Array<Record<string, string>>> {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const hits = recv.spanAttrs.filter(
-      (a) => a["aisix.request_id"] === requestId,
+  // Attempt carriers only: since AISIX-Cloud#1279 the export also ships
+  // the structural SERVER / logical spans of the trace hierarchy, which
+  // share `aisix.request_id` but carry no per-attempt attributes.
+  const matching = () =>
+    recv.spanAttrs.filter(
+      (a) =>
+        a["aisix.request_id"] === requestId &&
+        a["aisix.attempt_index"] !== undefined,
     );
+  while (Date.now() < deadline) {
+    const hits = matching();
     if (hits.length >= count) return hits;
     await new Promise((r) => setTimeout(r, 50));
   }
   throw new Error(
     `expected ${count} attempt spans for request_id=${requestId}, ` +
-      `saw ${recv.spanAttrs.filter((a) => a["aisix.request_id"] === requestId).length}`,
+      `saw ${matching().length}`,
   );
 }
 
@@ -124,8 +131,13 @@ async function waitForAttemptSpans(
   timeoutMs = 10_000,
 ): Promise<Array<{ attrs: Record<string, string>; latencyMs: number }>> {
   const deadline = Date.now() + timeoutMs;
+  // Attempt carriers only — see `waitForAttempts`.
   const matching = () =>
-    recv.spans.filter((s) => s.attrs["aisix.request_id"] === requestId);
+    recv.spans.filter(
+      (s) =>
+        s.attrs["aisix.request_id"] === requestId &&
+        s.attrs["aisix.attempt_index"] !== undefined,
+    );
   while (Date.now() < deadline) {
     const hits = matching();
     if (hits.length >= count) {

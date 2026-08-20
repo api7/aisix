@@ -20,6 +20,7 @@ pub mod metrics;
 pub mod otlp;
 pub mod otlp_http_sink;
 pub mod sink;
+pub mod trace;
 pub mod usage;
 
 use std::io::IsTerminal as _;
@@ -40,6 +41,10 @@ pub use sink::{
     ExporterPipelines, IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope,
     PipelineConfig, SinkAck, SinkCapabilities, SinkContent, SinkError, SinkHandle, SinkHealth,
     SinkPipeline, SinkRecord, SinkResult, SinkStatsSnapshot, SCHEMA_VERSION,
+};
+pub use trace::{
+    parse_traceparent, screen_tracestate, RemoteTraceContext, RequestTraceBundle, SpanEmit,
+    SpanRole, TraceEmission, TRACEPARENT_HEADER, TRACESTATE_HEADER,
 };
 pub use usage::{UsageEvent, UsageSink};
 

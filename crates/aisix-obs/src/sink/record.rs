@@ -97,6 +97,15 @@ pub struct SinkRecord {
     /// Opt-in captured content; omitted entirely under `metadata_only`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<SinkContent>,
+    /// The event's span snapshot (AISIX-Cloud#1279): ids + boundaries
+    /// frozen at emission time, so the encoder — which runs inside the
+    /// delivery retry loop — reproduces byte-identical ids on every retry.
+    /// `serde(skip)`: this is OTLP structure, not record data; the
+    /// Datadog/SLS/object-store wire shapes are unchanged. (The public
+    /// `UsageEvent::trace_id` correlation key rides the flattened usage
+    /// fields instead.)
+    #[serde(skip)]
+    pub trace: Option<crate::trace::TraceEmission>,
 }
 
 impl SinkRecord {
@@ -106,12 +115,19 @@ impl SinkRecord {
             schema_version: SCHEMA_VERSION,
             usage,
             content: None,
+            trace: None,
         }
     }
 
     /// Attach captured content (`content_mode = full`).
     pub fn with_content(mut self, content: SinkContent) -> Self {
         self.content = Some(content);
+        self
+    }
+
+    /// Attach the request's span snapshot (AISIX-Cloud#1279).
+    pub fn with_trace(mut self, trace: Option<crate::trace::TraceEmission>) -> Self {
+        self.trace = trace;
         self
     }
 }
@@ -154,6 +170,23 @@ mod tests {
         // content key is absent, and metadata is flattened (no `usage` nesting)
         assert!(json.get("content").is_none());
         assert_eq!(json["request_id"], "req-1");
+    }
+
+    /// The public correlation key (AISIX-Cloud#1279): `trace_id` rides the
+    /// flattened usage fields on every sink wire when set — the exact key
+    /// the CP column and `{trace_id}` link template consume — and is
+    /// absent (→ SQL NULL) when the emitting path predates the bundle.
+    #[test]
+    fn trace_id_rides_the_flattened_wire_when_set_and_is_absent_when_empty() {
+        let rec = SinkRecord::metadata_only(UsageEvent {
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".into(),
+            ..UsageEvent::default()
+        });
+        let json = serde_json::to_value(&rec).unwrap();
+        assert_eq!(json["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736");
+
+        let bare = serde_json::to_value(SinkRecord::metadata_only(UsageEvent::default())).unwrap();
+        assert!(bare.get("trace_id").is_none());
     }
 
     #[test]

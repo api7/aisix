@@ -98,7 +98,14 @@ async function waitForSpan(
 ): Promise<Record<string, string>> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const hit = recv.spans.find((a) => a["aisix.request_id"] === requestId);
+    // Attempt carriers only: since AISIX-Cloud#1279 the export also ships
+    // the trace's structural SERVER / logical spans, which share
+    // `aisix.request_id` but carry no per-attempt usage attributes.
+    const hit = recv.spans.find(
+      (a) =>
+        a["aisix.request_id"] === requestId &&
+        a["aisix.attempt_index"] !== undefined,
+    );
     if (hit) return hit;
     await new Promise((r) => setTimeout(r, 50));
   }

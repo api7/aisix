@@ -2023,16 +2023,19 @@ fn emit_usage_event(
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);
     // Handler label "audio" — bucketed prometheus counter (#408).
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
-    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
-    state.usage_sink.try_emit(
+    let usage_model =
+        crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
+    crate::usage_attr::emit_usage(
+        state,
+        snap,
         "audio",
-        event.clone(),
+        event,
         crate::usage_attr::usage_event_labels(&usage_model, pk),
+        content,
+        client.trace.as_ref(),
+        /* terminal */ true,
+        /* dispatched */ true,
     );
-    let exporters = crate::usage_attr::live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, content, exporters.iter().map(|e| &e.value));
     // Speech (TTS) reports no tokens at all, so this is a no-op there; the
     // transcription routes report them when the model supplies a usage block.
     let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);

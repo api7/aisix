@@ -776,16 +776,19 @@ async fn run_session(
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
     crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
-    let usage_model = crate::usage_attr::usage_event_model_label(&snap, &event.requested_model);
-    state.usage_sink.try_emit(
+    let usage_model =
+        crate::usage_attr::usage_event_model_label(&snap, &event.requested_model).into_owned();
+    crate::usage_attr::emit_usage(
+        &state,
+        &snap,
         "realtime",
         event.clone(),
         crate::usage_attr::usage_event_labels(&usage_model, &pk),
+        None,
+        client.trace.as_ref(),
+        /* terminal */ true,
+        /* dispatched */ true,
     );
-    let exporters = crate::usage_attr::live_exporters(&state, &snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
     // A realtime session bills real tokens against a real model, and this is
     // the only place that knows the session's totals. Its cost is resolved
     // here too, unlike the other endpoints, so it is the one non-chat surface

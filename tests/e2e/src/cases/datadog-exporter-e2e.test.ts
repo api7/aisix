@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { gunzipSync } from "node:zlib";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
@@ -247,6 +248,15 @@ describe("datadog exporter e2e (#688): DP delivers a gzip JSON intake to Datadog
         // Default privacy posture: operational metadata only, never content.
         content_mode: "metadata_only",
       });
+      // A second exporter on the OTLP wire, to pin that the public
+      // trace_id both sinks carry names the SAME trace (AISIX-Cloud#1279).
+      const otlp: MockOtlp = await startMockOtlp();
+      await seed.createObservabilityExporter({
+        name: "mock-datadog-otlp-side",
+        enabled: true,
+        kind: "otlp_http",
+        endpoint: otlp.url,
+      });
       await seedRouting(seed, upstream, "datadog-exporter-model");
 
       await waitConfigPropagation(async () => {
@@ -298,6 +308,29 @@ describe("datadog exporter e2e (#688): DP delivers a gzip JSON intake to Datadog
 
       // The API key must appear ONLY in the header — never anywhere in the body.
       expect(intake.bodyText.includes(DD_API_KEY)).toBe(false);
+
+      // The public trace_id (AISIX-Cloud#1279): present on the log wire as
+      // 32 lowercase hex, and EQUAL to the trace the OTLP exporter shipped
+      // for the same request — the correlation contract the control
+      // plane's {trace_id} link template depends on.
+      const logTraceId = log["aisix.trace_id"];
+      expect(logTraceId).toMatch(/^[0-9a-f]{32}$/);
+      const requestId = log["aisix.request_id"];
+      const deadline = Date.now() + 10_000;
+      while (
+        Date.now() < deadline &&
+        !otlp.spans.some((s) => s.attributes["aisix.request_id"] === requestId)
+      ) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      const spans = otlp.spans.filter(
+        (s) => s.attributes["aisix.request_id"] === requestId,
+      );
+      expect(spans.length).toBeGreaterThan(0);
+      for (const span of spans) {
+        expect(span.traceId).toBe(logTraceId);
+      }
+      await otlp.close();
       // Metadata-only posture: no captured prompt / response fields at all.
       expect(log["gen_ai.prompt"]).toBeUndefined();
       expect(log["gen_ai.completion"]).toBeUndefined();

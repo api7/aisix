@@ -63,6 +63,18 @@ const NEVER_FORWARD_HEADERS: &[&str] = &[
     "te",
     "trailer",
     "transfer-encoding",
+    // W3C trace context (AISIX-Cloud#1279): the caller's `traceparent`
+    // names a span in the CALLER's trace — relayed to a provider it links
+    // the provider's internal telemetry into the caller's tracing backend
+    // and leaks the caller's trace ids to a third party. The gateway is a
+    // fresh hop; provider-side propagation, if ever wanted, is a separate
+    // opt-in that injects the gateway's own context, never the inbound
+    // value. Listed here rather than in RESERVED_UPSTREAM_HEADERS so an
+    // operator's deliberate `default_headers` entry for a trusted
+    // first-party upstream still works — only the client's copy is
+    // blocked.
+    "traceparent",
+    "tracestate",
     "upgrade",
 ];
 
@@ -368,6 +380,32 @@ mod tests {
         apply_request_headers(&mut headers, &ctx);
         assert_eq!(headers.len(), 1, "leaked: {headers:?}");
         assert_eq!(headers["x-keep"], "yes");
+    }
+
+    // AISIX-Cloud#1279: the caller's W3C trace context must never reach a
+    // provider — not under a `*` glob, and not even when an allowlist names
+    // the headers outright. The gateway is a fresh tracing hop; a future
+    // provider-side propagation opt-in injects the gateway's OWN context.
+    #[test]
+    fn trace_context_headers_are_never_forwarded() {
+        for allowlist in [&["*"][..], &["traceparent", "tracestate"][..]] {
+            let patterns: Vec<&str> = allowlist.to_vec();
+            let r = overrides(&[], &patterns);
+            let mut headers = HeaderMap::new();
+            let inbound = client(&[
+                (
+                    "traceparent",
+                    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                ),
+                ("tracestate", "vendor=x"),
+            ]);
+            let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
+            apply_request_headers(&mut headers, &ctx);
+            assert!(
+                headers.is_empty(),
+                "trace context leaked under {allowlist:?}: {headers:?}"
+            );
+        }
     }
 
     #[test]

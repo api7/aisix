@@ -129,6 +129,19 @@ pub(crate) async fn ensure_request_id(
         .unwrap_or_else(new_request_id);
     request.extensions_mut().insert(RequestId(id.clone()));
 
+    // The request's trace identity (AISIX-Cloud#1279), minted at the same
+    // single point as the request id so every usage event and exported
+    // span of this request shares one trace. A valid inbound W3C
+    // `traceparent` continues the caller's trace; anything malformed —
+    // or a duplicated header — degrades to a locally-rooted one, and the
+    // caller's `tracestate` is only kept alongside a valid parent.
+    let remote = remote_trace_context(request.headers());
+    request
+        .extensions_mut()
+        .insert(std::sync::Arc::new(aisix_obs::RequestTraceBundle::new(
+            remote,
+        )));
+
     let span = tracing::info_span!("request", request_id = %id);
     let mut response = next.run(request).instrument(span).await;
 
@@ -140,6 +153,51 @@ pub(crate) async fn ensure_request_id(
         }
     }
     response
+}
+
+/// The caller's W3C trace context, when it arrived intact.
+///
+/// Strict on purpose — this value decides what the gateway's own
+/// telemetry is filed under. Exactly one `traceparent` header (the spec
+/// invalidates a duplicated one), parsed by the strict v00 grammar in
+/// `aisix_obs::parse_traceparent`; `tracestate` (spec: multiple headers
+/// combine as a comma-joined list) is screened and kept only when the
+/// parent it travelled with was valid. Invalid → `None` → a
+/// locally-rooted trace, never a rejected request.
+fn remote_trace_context(headers: &axum::http::HeaderMap) -> Option<aisix_obs::RemoteTraceContext> {
+    let mut parents = headers.get_all(aisix_obs::TRACEPARENT_HEADER).iter();
+    let parent = parents.next()?;
+    if parents.next().is_some() {
+        tracing::debug!("multiple traceparent headers; starting a local trace");
+        return None;
+    }
+    let Some((trace_id, parent_span_id, flags)) =
+        parent.to_str().ok().and_then(aisix_obs::parse_traceparent)
+    else {
+        tracing::debug!("unusable traceparent header; starting a local trace");
+        return None;
+    };
+    let tracestate = {
+        // All-or-nothing: joining only the readable values would forward a
+        // list the caller never sent. One unreadable value discards the
+        // whole tracestate (the traceparent stays valid — the spec treats
+        // state as optional refinement).
+        let values: Result<Vec<&str>, _> = headers
+            .get_all(aisix_obs::TRACESTATE_HEADER)
+            .iter()
+            .map(|v| v.to_str())
+            .collect();
+        match values {
+            Ok(values) if !values.is_empty() => aisix_obs::screen_tracestate(&values.join(",")),
+            _ => None,
+        }
+    };
+    Some(aisix_obs::RemoteTraceContext {
+        trace_id,
+        parent_span_id,
+        flags,
+        tracestate,
+    })
 }
 
 /// Stream adapter that enters `span` for the duration of every

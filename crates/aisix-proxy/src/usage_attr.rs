@@ -384,7 +384,14 @@ pub(crate) fn emit_error_usage_event(
     let attributed = crate::attribution::current().unwrap_or_default();
     let pk = ResolvedPk::resolve(snap, &attributed.provider_key_id);
     let model = usage_event_model_label(snap, requested_model);
-    emit_prepared_usage_event(state, snap, label, event, usage_event_labels(&model, &pk));
+    emit_prepared_usage_event(
+        state,
+        snap,
+        label,
+        event,
+        usage_event_labels(&model, &pk),
+        client.trace.as_ref(),
+    );
 }
 
 /// The [`emit_error_usage_event`] event without the emission, for a caller
@@ -464,12 +471,58 @@ pub(crate) fn emit_prepared_usage_event(
     label: &'static str,
     event: UsageEvent,
     labels: UsageEventLabels<'_>,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
 ) {
+    // An error event is the request's terminal (and only) emission. Its
+    // builder leaves `upstream_latency_ms` at 0, so no upstream span is
+    // derivable either way — `dispatched: false` states the common case
+    // (most error events never reached a provider).
+    emit_usage(state, snap, label, event, labels, None, trace, true, false);
+}
+
+/// THE emission chokepoint (AISIX-Cloud#1279): every usage event leaves
+/// through here, so the CP telemetry leg and the exporter fan-out cannot
+/// drift, and the trace snapshot is taken in exactly one place.
+///
+/// `trace` is the request's bundle (`ClientContext::trace`); `terminal`
+/// says whether this event ends the request — the terminal event carries
+/// the SERVER + logical spans (ending the SERVER span at NOW, the real
+/// body EOF/drop), a non-terminal one carries its own attempt span alone.
+/// `dispatched` is the caller's statement that this event describes work
+/// that actually reached an upstream — a cache hit and a pre-dispatch
+/// error pass `false` so no fictitious upstream CLIENT span is fabricated
+/// from the handler-elapsed time their events carry. The event's public
+/// `trace_id` is stamped here so the CP row and the exported spans always
+/// agree.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_usage(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    label: &'static str,
+    mut event: UsageEvent,
+    labels: UsageEventLabels<'_>,
+    content: Option<&aisix_obs::CapturedContent>,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+    terminal: bool,
+    dispatched: bool,
+) {
+    let emission = trace.map(|bundle| {
+        event.trace_id = bundle.trace_id_hex();
+        bundle.emission(
+            terminal,
+            event.attempt_index,
+            event.upstream_latency_ms,
+            dispatched,
+        )
+    });
     state.usage_sink.try_emit(label, event.clone(), labels);
     let exporters = live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
+    state.otlp_fan_out.fan_out(
+        &event,
+        content,
+        emission.as_ref(),
+        exporters.iter().map(|e| &e.value),
+    );
 }
 
 #[cfg(test)]

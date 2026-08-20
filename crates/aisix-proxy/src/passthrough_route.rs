@@ -110,6 +110,13 @@ const ALWAYS_STRIP: &[&str] = &[
     "proxy-authorization",
     "te",
     "trailer",
+    "traceparent",
+    // W3C trace context (AISIX-Cloud#1279): stripped unconditionally, same
+    // as the standard pipeline's never-forward set — the caller's trace
+    // ids are not the provider's to see, and passthrough forwarded them
+    // verbatim before this entry existed. A future provider-side
+    // propagation opt-in would inject the gateway's own context instead.
+    "tracestate",
     "transfer-encoding",
     "upgrade",
     // Gateway-owned correlation id: the dispatch sets its own value, and
@@ -402,6 +409,7 @@ pub async fn entry(
                     &usage_model,
                     &crate::usage_attr::ResolvedPk::unresolved(),
                 ),
+                client.trace.as_ref(),
             );
             error.into_response()
         }
@@ -806,6 +814,7 @@ async fn dispatch(
     let mut telemetry = RouteTelemetry {
         state: state.clone(),
         route_name: route.name.clone(),
+        trace: client.trace.clone(),
         provider_label: pk_entry
             .as_ref()
             .map(|pk| pk.value.provider.to_ascii_lowercase())
@@ -1972,6 +1981,9 @@ struct RouteTelemetry {
     state: ProxyState,
     route_name: String,
     provider_label: String,
+    /// The request's trace bundle (AISIX-Cloud#1279) — the Drop emit is
+    /// the request's terminal emission, so it carries the terminal spans.
+    trace: Option<Arc<aisix_obs::RequestTraceBundle>>,
     pk_id: String,
     method: Method,
     path: String,
@@ -2142,17 +2154,15 @@ impl RouteTelemetry {
             event.auth_type = "anonymous".to_string();
         }
         let usage_model = crate::usage_attr::usage_event_model_label(
-            &self.state.snapshot.load(),
+            // The snapshot loaded above: a config swap between two loads
+            // would make this label disagree with the emit's attribution.
+            &snapshot,
             &event.requested_model,
-        );
-        self.state.usage_sink.try_emit(
-            "passthrough_route",
-            event.clone(),
-            crate::usage_attr::usage_event_labels(&usage_model, &pk),
-        );
+        )
+        .into_owned();
 
         // Captured content rides ONLY on the exporter fan-out, per the
-        // content_mode invariant (never the CP telemetry path above).
+        // content_mode invariant (never the CP telemetry path).
         let content = match (&self.captured_prompt, self.content_cap) {
             (Some(prompt), Some(cap)) => Some(aisix_obs::CapturedContent::new(
                 prompt,
@@ -2161,11 +2171,18 @@ impl RouteTelemetry {
             )),
             _ => None,
         };
-        let exporters = crate::usage_attr::live_exporters(&self.state, &snapshot);
-        self.state.otlp_fan_out.fan_out(
-            &event,
+        crate::usage_attr::emit_usage(
+            &self.state,
+            &snapshot,
+            "passthrough_route",
+            event,
+            crate::usage_attr::usage_event_labels(&usage_model, &pk),
             content.as_ref(),
-            exporters.iter().map(|e| &e.value),
+            self.trace.as_ref(),
+            // The Drop emit is the request's end — body EOF or client drop.
+            /* terminal */
+            true,
+            /* dispatched */ true,
         );
     }
 }

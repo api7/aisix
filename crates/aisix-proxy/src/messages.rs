@@ -241,6 +241,9 @@ pub async fn messages(
                 // The winner's success event carries the content.
                 /* content_for_last */
                 None,
+                // ...and the terminal trace spans.
+                /* terminal_last */
+                false,
             );
             if !usage_handled_by_stream {
                 // Winning-attempt classification (#655). Direct models have
@@ -288,6 +291,8 @@ pub async fn messages(
                     redaction_counts.clone(),
                     monitor_hits.clone(),
                     captured_content,
+                    /* terminal */ true,
+                    /* dispatched */ true,
                 );
             }
             response
@@ -385,6 +390,10 @@ pub async fn messages(
                 &applied_guardrails,
                 &routing,
                 content_for_last,
+                // All-failed: the last failed attempt is the terminal
+                // emission; the pre-dispatch branch below covers empty.
+                /* terminal_last */
+                !routing.attempts.is_empty(),
             );
             // Pre-dispatch failure (model-not-found, auth, budget, guardrail
             // block before any upstream attempt) records no attempts — emit a
@@ -418,6 +427,10 @@ pub async fn messages(
                     redaction_counts.clone(),
                     monitor_hits.clone(),
                     failure_content.take(),
+                    /* terminal */ true,
+                    // Pre-dispatch failure: no upstream was contacted.
+                    /* dispatched */
+                    false,
                 );
             }
             // /v1/messages must return Anthropic-shape error envelope
@@ -453,6 +466,10 @@ fn emit_failed_attempts_anthropic(
     // the one whose status the caller saw. Other attempts (and the
     // success-path caller) stay content-less.
     mut content_for_last: Option<CapturedContent>,
+    // AISIX-Cloud#1279: on the all-failed path the LAST failed attempt's
+    // event is the request's terminal emission, so it carries the trace's
+    // SERVER + logical spans. False on the success path.
+    terminal_last: bool,
 ) {
     let last_failed = routing.attempts.iter().rposition(|a| !a.success);
     for (i, rec) in routing
@@ -493,6 +510,11 @@ fn emit_failed_attempts_anthropic(
             crate::redact::RedactionCounts::new(),
             Vec::new(),
             content,
+            /* terminal */ terminal_last && Some(i) == last_failed,
+            // The record's own network-boundary fact: a rate-limit-refused
+            // attempt never reached an upstream.
+            /* dispatched */
+            rec.dispatched,
         );
     }
 }
@@ -679,7 +701,8 @@ async fn dispatch(
     // pre-dispatch 4xx); if this endpoint ever grows semantic support,
     // widen this flag or the deferred policies are silently skipped.
     let is_routing_request = model_entry.value.routing.is_some();
-    let mut routing = RoutingTelemetry::for_request(&model_entry.value.display_name);
+    let mut routing = RoutingTelemetry::for_request(&model_entry.value.display_name)
+        .with_trace(client.trace.clone());
 
     // Walk targets, failing over to the next only on a retryable upstream
     // failure. A 4xx / config error is returned as-is — retrying other
@@ -1445,6 +1468,10 @@ async fn anthropic_passthrough_dispatch(
                         )),
                         _ => None,
                     },
+                    // Drop-guard emit at stream end = the request's end.
+                    /* terminal */
+                    true,
+                    /* dispatched */ true,
                 );
             },
         );
@@ -2089,6 +2116,10 @@ async fn cross_provider_dispatch(
                         )),
                         _ => None,
                     },
+                    // Drop-guard emit at stream end = the request's end.
+                    /* terminal */
+                    true,
+                    /* dispatched */ true,
                 );
             },
         );
@@ -2781,6 +2812,13 @@ fn emit_anthropic_usage_event(
     // output merged.
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     content: Option<CapturedContent>,
+    // Whether this event ends the request (AISIX-Cloud#1279): the terminal
+    // event carries the trace's SERVER + logical spans; a failed attempt's
+    // event carries its own attempt span alone.
+    terminal: bool,
+    // Whether the work this event describes actually reached an upstream —
+    // false for a pre-dispatch failure, whose `elapsed` is handler time.
+    dispatched: bool,
 ) {
     // Per-PK telemetry attribution (#302 M17 / AISIX-Cloud#436).
     // Same shape as chat.rs's emit_usage_event — look up the
@@ -2830,15 +2868,19 @@ fn emit_anthropic_usage_event(
     // path. Bucketed prometheus counter (#408).
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
-    state.usage_sink.try_emit(
+    // The metric code below still reads `event`, so the chokepoint gets
+    // its own copy (it stamps `trace_id` on the emitted one).
+    crate::usage_attr::emit_usage(
+        state,
+        snap,
         "messages",
         event.clone(),
         crate::usage_attr::usage_event_labels(&usage_model, pk),
+        content.as_ref(),
+        client.trace.as_ref(),
+        terminal,
+        dispatched,
     );
-    let exporters = crate::usage_attr::live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, content.as_ref(), exporters.iter().map(|e| &e.value));
     // Cache-inclusive canonical total: Anthropic reports cache tokens as
     // counters separate from prompt_tokens, so prompt+completion undercounts
     // cached traffic (#995/#906). Shared by the LLM-usage total metric and the

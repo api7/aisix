@@ -601,16 +601,19 @@ fn emit_job_usage_event(
     let pk = crate::usage_attr::ResolvedPk::resolve(snap, &target.pk_entry.id);
     crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
     crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
-    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
-    state.usage_sink.try_emit(
+    let usage_model =
+        crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
+    crate::usage_attr::emit_usage(
+        state,
+        snap,
         label,
-        event.clone(),
+        event,
         crate::usage_attr::usage_event_labels(&usage_model, &pk),
+        None,
+        client.trace.as_ref(),
+        /* terminal */ true,
+        /* dispatched */ true,
     );
-    let exporters = crate::usage_attr::live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1851,15 +1854,19 @@ async fn attribute_batch_usage(
         // Attribution names the identity that observed completion — the
         // same caller the event's api_key_id already reflects.
         crate::usage_attr::apply_jwt_identity(&mut event, jwt);
-        let usage_model = crate::usage_attr::usage_event_model_label(&snap, &event.requested_model);
+        let usage_model =
+            crate::usage_attr::usage_event_model_label(&snap, &event.requested_model).into_owned();
         state.usage_sink.try_emit(
             "batch",
             event.clone(),
             crate::usage_attr::usage_event_labels(&usage_model, &pk),
         );
+        // A background poll attributes usage after the fact — there is no
+        // live request and therefore no trace bundle; the exporter falls
+        // back to the legacy flat span (AISIX-Cloud#1279).
         state
             .otlp_fan_out
-            .fan_out(&event, None, exporters.iter().map(|e| &e.value));
+            .fan_out(&event, None, None, exporters.iter().map(|e| &e.value));
         tracing::info!(
             batch_id = %raw_batch_id,
             provider_model = %provider_model,

@@ -2011,16 +2011,19 @@ fn emit_submit_usage_event(
     let pk = crate::usage_attr::ResolvedPk::resolve(snap, provider_key_id);
     crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
-    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
-    state.usage_sink.try_emit(
+    let usage_model =
+        crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
+    crate::usage_attr::emit_usage(
+        state,
+        snap,
         "videos",
-        event.clone(),
+        event,
         crate::usage_attr::usage_event_labels(&usage_model, &pk),
+        None,
+        client.trace.as_ref(),
+        /* terminal */ true,
+        /* dispatched */ true,
     );
-    let exporters = crate::usage_attr::live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
 }
 
 #[cfg(test)]
