@@ -148,8 +148,7 @@ const UNIT_SUFFIX_PATTERN: &str = r"^\s*(?:%|％|(?i:ms|us|ns|ps|fs|s|secs?|seco
 /// carry the unit evidence INSIDE the span rather than after it, so the
 /// suffix check above never sees it. Same class as
 /// [`UNIT_SUFFIX_PATTERN`] — either placement counts once.
-const FUSED_UNIT_SUFFIX_PATTERN: &str =
-    r"(?i)[0-9](?:%|ms|us|ns|ps|fs|s|secs?|seconds?|mins?|minutes?|hours?|[kmgt]i?b|um|nm|[kmg]?hz)$";
+const FUSED_UNIT_SUFFIX_PATTERN: &str = r"(?i)[0-9](?:%|ms|us|ns|ps|fs|s|secs?|seconds?|mins?|minutes?|hours?|[kmgt]i?b|um|nm|[kmg]?hz)$";
 
 /// Negative: the Chinese percentage PREFIX form (`百分之 3.5`) — the
 /// percent evidence precedes the number. Same class as the unit suffix.
@@ -576,7 +575,10 @@ mod tests {
             only("10:15:30.250 upgraded to the new license server"),
             RuleDecision::Pass
         );
-        assert_eq!(only("构建时间戳 [23:07:01.250] 已经记录"), RuleDecision::Pass);
+        assert_eq!(
+            only("构建时间戳 [23:07:01.250] 已经记录"),
+            RuleDecision::Pass
+        );
     }
 
     // ── fused-token candidates (layer-① relaxation) through the rules ──
@@ -602,7 +604,10 @@ mod tests {
             only("仿真器升级到 XCELIUM2309 之后就好了"),
             RuleDecision::Mask
         );
-        assert_eq!(only("回退到 E-2010.12-ICC-SP2 就不崩了"), RuleDecision::Mask);
+        assert_eq!(
+            only("回退到 E-2010.12-ICC-SP2 就不崩了"),
+            RuleDecision::Mask
+        );
         assert_eq!(only("装的是 v16.12-s051_1 这个版本"), RuleDecision::Mask);
         assert_eq!(only("Virtuoso IC618 又崩了"), RuleDecision::Mask);
     }
@@ -635,7 +640,10 @@ mod tests {
     #[test]
     fn fullwidth_version_with_adjacent_trigger_masks() {
         assert_eq!(only("版本是 １２．１,不要外传"), RuleDecision::Mask);
-        assert_eq!(only("工具版本号 ２０２２．４ 见内部 wiki"), RuleDecision::Mask);
+        assert_eq!(
+            only("工具版本号 ２０２２．４ 见内部 wiki"),
+            RuleDecision::Mask
+        );
     }
 
     #[test]

@@ -36,6 +36,10 @@ struct Case {
 /// from [`PROTOTYPE_SAMPLES`] (and the negative sample set once it
 /// exists) so model-band scores measure shape generalization, not string
 /// overlap — the same discipline as the probe matrix.
+///
+/// One line per case, kept single-line on purpose (grep-friendly data
+/// table — the `ebml.rs` tag-table precedent).
+#[rustfmt::skip]
 const CORPUS: &[Case] = &[
     // ── Chinese measurement units (defect 1): must all release ──────────
     Case { cat: "zh-unit", text: "时钟周期是 0.8 纳秒", sensitive: &[] },
@@ -176,10 +180,7 @@ fn best_threshold_accuracy(items: &[(f32, bool)]) -> (f64, f32) {
     cuts.push(f32::NEG_INFINITY);
     let mut best = (0.0f64, f32::NEG_INFINITY);
     for cut in cuts {
-        let correct = items
-            .iter()
-            .filter(|(s, pos)| (*s >= cut) == *pos)
-            .count();
+        let correct = items.iter().filter(|(s, pos)| (*s >= cut) == *pos).count();
         let acc = correct as f64 / items.len() as f64;
         if acc > best.0 {
             best = (acc, cut);
@@ -274,7 +275,11 @@ async fn adversarial_corpus_report() {
         }
     }
 
-    println!("── corpus: {} lines, {} candidates", CORPUS.len(), n_candidates);
+    println!(
+        "── corpus: {} lines, {} candidates",
+        CORPUS.len(),
+        n_candidates
+    );
     println!(
         "rule-masked {rule_masked} (precision {:.1}%), rule-passed {rule_passed} ({} misreleased), model band {model_band} ({:.1}% of candidates)",
         pct(rule_masked_correct, rule_masked),
@@ -291,7 +296,6 @@ async fn adversarial_corpus_report() {
     for (cat, text, actual) in &wrong_lines {
         println!("  WRONG [{cat}] {text:?} -> {actual:?}");
     }
-
 
     let n_pos = model_items_rel.iter().filter(|(_, p)| *p).count();
     println!(

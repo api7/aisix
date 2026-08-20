@@ -1135,10 +1135,7 @@ mod tests {
     #[test]
     fn fused_tokens_trim_rim_punctuation() {
         // Sentence punctuation from the token char class must not stick.
-        assert_eq!(
-            values_of("pinned to v16.12-s051_1."),
-            vec!["v16.12-s051_1"]
-        );
+        assert_eq!(values_of("pinned to v16.12-s051_1."), vec!["v16.12-s051_1"]);
         // A pure word and a pure dash-number never become fused tokens.
         assert_eq!(values_of("high-performance run -3.5 offset"), vec!["3.5"]);
     }
