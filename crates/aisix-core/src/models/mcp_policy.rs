@@ -103,9 +103,9 @@ pub struct McpAccess {
     pub deny: Vec<String>,
 
     /// Compatibility tombstone for the pre-0.10.0 `mode` selector. The
-    /// control plane projects `"mode": "deny"` alongside the layered
+    /// control plane projected `"mode": "deny"` alongside the layered
     /// shape so a 0.9.x data plane — where `mode` is required and `deny`
-    /// means "no MCP tool access" — still loads the whole api_key row,
+    /// means "no MCP tool access" — still loaded the whole api_key row,
     /// fail-closed, instead of skipping it (a skipped row stops the key
     /// authenticating for EVERY kind of traffic). This generation
     /// consumes and ignores the value; the field exists only so the
@@ -113,8 +113,14 @@ pub struct McpAccess {
     /// row. Any JSON shape is accepted so a malformed tombstone can
     /// never kill the row. Hidden from the schemas — the strict write
     /// path closes unknown fields, so resource authors cannot set it —
-    /// and never re-serialized. Retire together with the CP emission
-    /// once 0.9.x is out of the supported upgrade window.
+    /// and never re-serialized.
+    ///
+    /// COMPAT-SINCE: 0.10.0 #1009 — the control plane stopped emitting this
+    /// tombstone when the compat floor moved to 0.10.0, but documents written
+    /// before the run-once reprojection still carry `mode`, so this generation
+    /// reads and drops it instead of reporting partial compat on every row.
+    /// Remove the field and its tolerance together with the loader test that
+    /// pins them.
     #[serde(default, rename = "mode", skip_serializing)]
     #[schemars(skip)]
     pub legacy_mode: Option<serde_json::Value>,

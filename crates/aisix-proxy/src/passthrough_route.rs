@@ -125,9 +125,15 @@ const ALWAYS_STRIP: &[&str] = &[
     "x-aisix-request-id",
 ];
 
-/// Fixed 410 message for the removed implicit tunnel. One release of
-/// tombstone, then the namespace is entirely the operator's to claim with
-/// explicit routes.
+/// Fixed 410 message for the removed implicit tunnel.
+///
+/// COMPAT-SINCE: 0.10.0 #1010 — 0.10.0 removed the implicit
+/// `/passthrough/:provider/*rest` tunnel, and a migration pointer beats a
+/// bare 404 while un-migrated callers are still out there; the public docs
+/// promise the 410 for one release. Retiring it drops this constant, the
+/// `entry` branch that serves it, its WARN and the `UNRESOLVED_LABEL`
+/// metric series, and leaves the namespace entirely the operator's to claim
+/// with explicit routes.
 const LEGACY_TUNNEL_GONE: &str = "the implicit /passthrough/:provider tunnel has been removed; \
      configure an explicit passthrough_route resource for this path \
      (see the provider passthrough documentation for the migration)";
@@ -314,7 +320,8 @@ pub async fn entry(
     let Some(matched) = match_route(&snapshot, host.as_deref(), &path) else {
         if path.starts_with("/passthrough/") {
             // The removed implicit tunnel's namespace: a fixed 410 with
-            // the migration pointer beats a bare 404 for one release.
+            // the migration pointer beats a bare 404 while callers migrate
+            // (release-debt marker on LEGACY_TUNNEL_GONE).
             // Logged AND counted (unresolved-provider labels, like the
             // old tunnel's failure path) so operators can locate and
             // size un-migrated callers.
