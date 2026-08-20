@@ -178,15 +178,18 @@ fn remote_trace_context(headers: &axum::http::HeaderMap) -> Option<aisix_obs::Re
         return None;
     };
     let tracestate = {
-        let values: Vec<&str> = headers
+        // All-or-nothing: joining only the readable values would forward a
+        // list the caller never sent. One unreadable value discards the
+        // whole tracestate (the traceparent stays valid — the spec treats
+        // state as optional refinement).
+        let values: Result<Vec<&str>, _> = headers
             .get_all(aisix_obs::TRACESTATE_HEADER)
             .iter()
-            .filter_map(|v| v.to_str().ok())
+            .map(|v| v.to_str())
             .collect();
-        if values.is_empty() {
-            None
-        } else {
-            aisix_obs::screen_tracestate(&values.join(","))
+        match values {
+            Ok(values) if !values.is_empty() => aisix_obs::screen_tracestate(&values.join(",")),
+            _ => None,
         }
     };
     Some(aisix_obs::RemoteTraceContext {

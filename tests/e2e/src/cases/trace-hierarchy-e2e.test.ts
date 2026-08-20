@@ -115,6 +115,7 @@ describe("trace hierarchy e2e (AISIX-Cloud#1279)", () => {
       const res = await fetch(`${app!.proxyUrl}/v1/models`, {
         headers: { authorization: `Bearer ${canary}` },
       });
+      await res.text();
       return res.status === 200;
     });
   }
@@ -172,7 +173,7 @@ describe("trace hierarchy e2e (AISIX-Cloud#1279)", () => {
       }),
     });
     expect(res.status).toBe(200);
-    const requestId = res.headers.get("x-aisix-call-id");
+    const requestId = res.headers.get("x-aisix-request-id");
     expect(requestId).toBeTruthy();
     await res.text();
     return requestId!;

@@ -2154,7 +2154,9 @@ impl RouteTelemetry {
             event.auth_type = "anonymous".to_string();
         }
         let usage_model = crate::usage_attr::usage_event_model_label(
-            &self.state.snapshot.load(),
+            // The snapshot loaded above: a config swap between two loads
+            // would make this label disagree with the emit's attribution.
+            &snapshot,
             &event.requested_model,
         )
         .into_owned();
