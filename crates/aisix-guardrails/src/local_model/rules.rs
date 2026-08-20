@@ -196,7 +196,7 @@ const FILE_EXTENSION_SUFFIX_PATTERN: &str = r"(?i)\.[a-z]{2,4}$";
 /// out (the char before `编号` must not be `本`): that compound means
 /// "version number" and must keep masking. Same class as the source
 /// location — a tagged identifier is a locator, not a version.
-const ID_TAG_PREFIX_PATTERN: &str = r"(?:^|[^本])编号[::]?(?:是|为)?\s*$";
+const ID_TAG_PREFIX_PATTERN: &str = r"(?:^|[^本])编号[:：]?(?:是|为)?\s*$";
 
 /// What layer ② decided for one candidate span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -619,12 +619,18 @@ mod tests {
         // model band — but it never needed the model).
         assert_eq!(only("把 report3.txt 发我一下"), RuleDecision::Pass);
         assert_eq!(only("参数都写在 sim7.cfg 里面"), RuleDecision::Pass);
+        // Decisive even against an ADJACENT trigger: the extension must
+        // outweigh 版本 (bot-review example).
+        assert_eq!(only("版本是 build_2023.log 里说的那个"), RuleDecision::Pass);
     }
 
     #[test]
     fn id_tag_prefix_releases_tagged_identifiers() {
         assert_eq!(only("对应 issue 编号 GH-2048"), RuleDecision::Pass);
         assert_eq!(only("工单编号: AB-3072 已建好"), RuleDecision::Pass);
+        // Fullwidth colon after the tag (bot-review finding: the class
+        // had two ASCII colons and no fullwidth one).
+        assert_eq!(only("工单编号：AB-3072 已建好"), RuleDecision::Pass);
         // 版本编号 is carved out — it means "version number" and must
         // keep masking (the char before 编号 is 本).
         assert_eq!(only("版本编号 12.1 别外发"), RuleDecision::Mask);

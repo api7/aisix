@@ -177,7 +177,11 @@ fn expected_output(case: &Case) -> String {
 /// threshold achieving it).
 fn best_threshold_accuracy(items: &[(f32, bool)]) -> (f64, f32) {
     let mut cuts: Vec<f32> = items.iter().map(|(s, _)| *s).collect();
+    // The two degenerate classifiers bound the sweep: -inf = mask
+    // everything, +inf = release everything (bot-review finding: without
+    // the latter, an all-negative item set understates best accuracy).
     cuts.push(f32::NEG_INFINITY);
+    cuts.push(f32::INFINITY);
     let mut best = (0.0f64, f32::NEG_INFINITY);
     for cut in cuts {
         let correct = items.iter().filter(|(s, pos)| (*s >= cut) == *pos).count();
