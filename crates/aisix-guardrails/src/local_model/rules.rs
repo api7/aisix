@@ -135,10 +135,13 @@ const TOOL_PATTERN: &str = r"(?i)\b(?:virtuoso|calibre|vcs|innovus|icc2|primetim
 /// of. Single-char units with heavy compound ambiguity are deliberately
 /// excluded — `分` (points vs minutes) and bare `安` (`12.1 安装之后`
 /// would systematically RELEASE real versions next to the extremely
-/// common 安装) — and the residual compound risk of the kept ones
+/// common 安装), and `度` must not continue into `度过` (verification
+/// audit: `版本 12.1 度过了回归测试` released a real version; the
+/// negated-char form costs one lookahead-free char, harmless for
+/// `is_match`) — and the residual compound risk of the kept ones
 /// (`12.1 天线`) is accepted: a wrong release is fail-open, a wrong
 /// rewrite corrupts content.
-const UNIT_SUFFIX_PATTERN: &str = r"^\s*(?:%|％|(?i:ms|us|ns|ps|fs|s|secs?|seconds?|mins?|minutes?|hours?|[kmgt]i?b|um|nm|[kmg]?hz)(?:[^0-9A-Za-z]|$)|纳秒|微秒|毫秒|秒|分钟|个?(?:小时|钟头|星期|月)|天|纳米|微米|毫米|[兆吉太]字节|[千兆吉]?赫兹|[千兆吉]赫|个?百分点|摄氏度|度|伏特?|瓦特?|安培|毫安)";
+const UNIT_SUFFIX_PATTERN: &str = r"^\s*(?:%|％|(?i:ms|us|ns|ps|fs|s|secs?|seconds?|mins?|minutes?|hours?|[kmgt]i?b|um|nm|[kmg]?hz)(?:[^0-9A-Za-z]|$)|纳秒|微秒|毫秒|秒|分钟|个?(?:小时|钟头|星期|月)|天|纳米|微米|毫米|[兆吉太]字节|[千兆吉]?赫兹|[千兆吉]赫|个?百分点|摄氏度|度(?:[^过]|$)|伏特?|瓦特?|安培|毫安)";
 
 /// Negative: the span itself ENDS in an ASCII measurement unit. Fused
 /// candidate tokens (`12.345s`, `3.2GHz`, `7nm`, `0.13um` as ONE span)
@@ -534,6 +537,9 @@ mod tests {
         // Bare 安 is deliberately NOT a unit: 安装 right after a version
         // must not release it (安装 is everywhere in the driving corpus).
         assert_eq!(only("版本是 12.1 安装之后报错"), RuleDecision::Mask);
+        // 度 must not fire inside 度过 (verification-audit regression:
+        // this real version released as a "degrees" reading).
+        assert_eq!(only("版本 12.1 度过了回归测试"), RuleDecision::Mask);
     }
 
     #[test]

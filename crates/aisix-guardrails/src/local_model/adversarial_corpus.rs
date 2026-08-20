@@ -1,4 +1,4 @@
-//! Report instrument for the guardrail-defect fixes: an 87-line labeled
+//! Report instrument for the guardrail-defect fixes: an 88-line labeled
 //! adversarial corpus covering the three measured defect classes
 //! (Chinese-unit negatives, prototype-scoring form, fused-token layer-①
 //! recall) plus the shipped acceptance shapes as regressions.
@@ -30,9 +30,9 @@ struct Case {
     sensitive: &'static [&'static str],
 }
 
-/// The corpus (79 lines from the defect brief + 8 from the independent
-/// audit: everyday identifiers, measure-word durations, electrical
-/// units). Tool names and numbers are deliberately disjoint
+/// The corpus (79 lines from the defect brief + 9 from the independent
+/// audit and verification rounds: everyday identifiers, measure-word
+/// durations, electrical units, the 度过 compound). Tool names and numbers are deliberately disjoint
 /// from [`PROTOTYPE_SAMPLES`] (and the negative sample set once it
 /// exists) so model-band scores measure shape generalization, not string
 /// overlap — the same discipline as the probe matrix.
@@ -107,6 +107,8 @@ const CORPUS: &[Case] = &[
     Case { cat: "anchor-pos", text: "PrimeTime 2022.03 跑不过时序", sensitive: &["2022.03"] },
     Case { cat: "anchor-pos", text: "Innovus 21.13 的这个 bug 已经确认了", sensitive: &["21.13"] },
     Case { cat: "anchor-pos", text: "版本回退到 20.11 才恢复正常", sensitive: &["20.11"] },
+    // Verification-audit regression: 度 inside 度过 released this.
+    Case { cat: "anchor-pos", text: "版本 12.1 度过了回归测试", sensitive: &["12.1"] },
     Case { cat: "anchor-pos", text: "build 33.1 is broken on centos", sensitive: &["33.1"] },
     // ── model-band negatives (defect 2): decimals with non-software
     //    semantics — must release, and only the model can say so ──────────
