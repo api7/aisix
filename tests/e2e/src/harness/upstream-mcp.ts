@@ -15,6 +15,12 @@ import {
 export interface McpUpstream {
   /** Streamable HTTP endpoint of this upstream (`http://127.0.0.1:<port>/mcp`). */
   url: string;
+  /**
+   * Raw request bodies this upstream received, in arrival order — exactly
+   * the bytes the gateway's MCP client sent, so a masking suite can
+   * byte-diff what reached the upstream.
+   */
+  received: string[];
   close(): Promise<void>;
 }
 
@@ -26,6 +32,14 @@ export interface McpUpstreamOptions {
    * every other suite asserts on stays `echo` + `reverse`.
    */
   structuredTool?: boolean;
+  /**
+   * Also expose a `report` tool returning fixed rich content regardless of
+   * its arguments: a text summary block, an embedded resource carrying
+   * `log` as `resource.text` (the natural shape for a compile/sim log),
+   * and a `structuredContent` object with a `log` string leaf plus a
+   * numeric field. The mask write-back suite owns the strings.
+   */
+  reportContent?: { summary: string; log: string; structuredLog: string };
 }
 
 /**
@@ -45,8 +59,9 @@ export async function startMcpUpstream(
   label: string,
   options: McpUpstreamOptions = {},
 ): Promise<McpUpstream> {
+  const received: string[] = [];
   const httpServer: HttpServer = createServer((req, res) => {
-    void handle(label, req, res, options);
+    void handle(label, req, res, options, received);
   });
   await new Promise<void>((resolve) =>
     httpServer.listen(0, "127.0.0.1", resolve),
@@ -57,6 +72,7 @@ export async function startMcpUpstream(
   }
   return {
     url: `http://127.0.0.1:${address.port}/mcp`,
+    received,
     close: () =>
       new Promise((resolve) => httpServer.close(() => resolve())),
   };
@@ -67,6 +83,7 @@ async function handle(
   req: IncomingMessage,
   res: ServerResponse,
   options: McpUpstreamOptions,
+  received: string[],
 ): Promise<void> {
   try {
     if (req.method !== "POST") {
@@ -75,7 +92,9 @@ async function handle(
     }
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
-    const body: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const raw = Buffer.concat(chunks).toString("utf8");
+    received.push(raw);
+    const body: unknown = JSON.parse(raw);
 
     const server = new Server(
       { name: `${label}-upstream`, version: "0.1.0" },
@@ -111,10 +130,39 @@ async function handle(
               },
             ]
           : []),
+        ...(options.reportContent
+          ? [
+              {
+                name: "report",
+                description: "return a fixed rich report (text + resource + structured)",
+                inputSchema: {
+                  type: "object" as const,
+                  properties: { text: { type: "string" } },
+                },
+              },
+            ]
+          : []),
       ],
     }));
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const text = String(request.params.arguments?.text ?? "");
+      if (request.params.name === "report" && options.reportContent) {
+        const { summary, log, structuredLog } = options.reportContent;
+        return {
+          content: [
+            { type: "text", text: summary },
+            {
+              type: "resource",
+              resource: {
+                uri: "file:///run.log",
+                mimeType: "text/plain",
+                text: log,
+              },
+            },
+          ],
+          structuredContent: { log: structuredLog, cells: 42 },
+        };
+      }
       if (request.params.name === "lookup") {
         // The text block is deliberately constant and clean: only
         // `structuredContent` carries the caller's value, which is exactly

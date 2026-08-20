@@ -47,6 +47,7 @@ pub mod health;
 mod http_client;
 mod images;
 mod jobs;
+mod json_splice;
 mod jwt;
 mod mcp;
 mod mcp_auth;
