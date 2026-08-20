@@ -369,7 +369,10 @@ impl RequestTraceBundle {
 
         // First terminal call wins; a duplicate degrades to attempt-only.
         // (`&&` short-circuits, so a non-terminal call never touches the
-        // flag.)
+        // flag.) The original request is kept separately: a degraded
+        // duplicate must not fall into the synthesize-a-sub-call branch
+        // below and invent a second upstream span.
+        let terminal_requested = terminal;
         let terminal = terminal && !self.terminal_emitted.swap(true, Ordering::AcqRel);
 
         let attempt_span = attempts.get(attempt_index as usize).map(|a| {
@@ -399,7 +402,7 @@ impl RequestTraceBundle {
         // trace. The id is minted once per emission snapshot, so delivery
         // retries and every exporter still agree on it.
         let attempt_span = attempt_span.or_else(|| {
-            (!terminal && dispatched_upstream).then(|| {
+            (!terminal_requested && dispatched_upstream).then(|| {
                 // Remember that a span parented under the logical id has
                 // shipped — the terminal emission must export that parent
                 // even if the terminal event itself never dispatched.
@@ -787,6 +790,19 @@ mod tests {
         let em = bundle.emission(true, 0, 40, false);
         assert_eq!(em.spans.len(), 1);
         assert_eq!(em.spans[0].role, SpanRole::Server);
+    }
+
+    /// A duplicate terminal from a family without per-attempt tracking
+    /// degrades to NOTHING — it must not fall into the synthesize branch
+    /// and invent a second upstream span for a request that dispatched
+    /// once.
+    #[test]
+    fn duplicate_untracked_terminal_does_not_emit_a_synthetic_attempt() {
+        let bundle = RequestTraceBundle::new(None);
+        let first = bundle.emission(true, 0, 25, true);
+        assert_eq!(first.spans.len(), 2);
+        let duplicate = bundle.emission(true, 0, 25, true);
+        assert!(duplicate.spans.is_empty());
     }
 
     /// A real sub-millisecond upstream call must still get its span — the
