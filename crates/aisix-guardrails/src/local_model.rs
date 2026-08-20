@@ -1,23 +1,25 @@
-//! Local CPU embedding-model guardrail — MVP vertical slice of the
-//! second-tier guardrail (AISIX-Cloud#1331).
+//! Local CPU embedding-model guardrail — the second-tier guardrail
+//! (AISIX-Cloud#1331), grown from the MVP vertical slice.
 //!
-//! Proves ONE thing: an in-process ONNX embedding model can sit inside
-//! the guardrail chain, produce a span-level judgement, and drive a real
-//! in-place rewrite. It is NOT the full three-layer pipeline from the
-//! design issue (no rule scoring layer, no prototype library, no
-//! standard risk categories, single hardcoded category).
-//!
-//! Pipeline per text segment:
+//! Implements the design issue's three-layer pipeline for one hardcoded
+//! category (no prototype library resource, no standard risk categories
+//! yet). Pipeline per text segment:
 //!   1. regex finds candidate spans with exact byte offsets
 //!      (dotted number runs, the EDA-version candidate shape);
-//!   2. a context window around each candidate (±[`WINDOW_CONTEXT_CHARS`]
-//!      chars — the keyword-proximity window magnitude mainstream DLP
-//!      engines use, typically 50–300 chars) is embedded by the local
-//!      model and compared, by cosine similarity, against ONE category
-//!      prototype vector encoded at load time from a hardcoded Chinese
-//!      description sentence;
-//!   3. above-threshold candidates are rewritten in place to
-//!      [`MASK_REPLACEMENT`]; everything else is returned byte-identical.
+//!   2. rule scoring ([`rules`]): hotword proximity co-occurrence raises
+//!      a candidate's score, negative patterns lower it, and a double
+//!      threshold resolves decisive candidates right here — high scores
+//!      rewrite and low scores release WITHOUT a model call; only the
+//!      uncertain band continues;
+//!   3. a context window around each remaining candidate
+//!      (±[`WINDOW_CONTEXT_CHARS`] chars — the keyword-proximity window
+//!      magnitude mainstream DLP engines use, typically 50–300 chars) is
+//!      embedded by the local model and compared, by cosine similarity,
+//!      against the category's prototype vector set (encoded at load
+//!      time; see [`PrototypeStrategy`]); above-threshold candidates are
+//!      rewritten in place to [`MASK_REPLACEMENT`].
+//!
+//! Everything not rewritten is returned byte-identical.
 //!
 //! The verdict is always `Allow` — this guardrail rewrites, never blocks
 //! (the design issue's "只改写不阻断" hard constraint).
@@ -90,6 +92,8 @@
 //! ONNX Runtime download) with `ORT_LIB_PATH` pointing at a pre-fetched
 //! library (see `ort-sys` `build/vars.rs`).
 
+mod rules;
+
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -106,42 +110,134 @@ use crate::{
     DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
 };
 
+use rules::{RuleDecision, RuleScorer};
+
 /// Environment variable holding the model directory (`model.onnx` +
 /// `tokenizer.json`). Set → the server bootstrap loads and injects the
 /// guardrail; unset → the feature is completely inert.
 pub const MODEL_DIR_ENV: &str = "GUARDRAIL_LOCAL_MODEL_DIR";
-/// Optional cosine-similarity gate override (default
-/// [`DEFAULT_THRESHOLD`]).
+/// Optional cosine-similarity gate override (default: the configured
+/// strategy's calibrated `default_threshold`).
 pub const THRESHOLD_ENV: &str = "GUARDRAIL_LOCAL_MODEL_THRESHOLD";
 /// Optional inference-lane count (default 1, clamped to
 /// [`MAX_LANES`]). Each lane is one ONNX session — one more core the
 /// guardrail may use and roughly one more ~100 MiB weight copy resident (measured); see
 /// the module scaling notes and api7/aisix#1001.
 pub const LANES_ENV: &str = "GUARDRAIL_LOCAL_MODEL_LANES";
+/// Optional layer-② hotword proximity window override, in chars each
+/// side of a candidate (default [`rules::DEFAULT_PROXIMITY_CHARS`],
+/// clamped to [`rules::MAX_PROXIMITY_CHARS`]; malformed or zero →
+/// default). Zero is a misconfiguration, not a mode — the same rule as
+/// [`LANES_ENV`]: a zero window finds no hotword, so layer ② silently
+/// stops masking while looking configured.
+pub const RULE_WINDOW_ENV: &str = "GUARDRAIL_LOCAL_MODEL_RULE_WINDOW";
+/// Optional layer-③ prototype strategy: `description`, `max`, or
+/// `centroid` (default [`PrototypeStrategy::default`]; malformed →
+/// default with a warning — silently landing on the wrong vector space
+/// would invalidate the operator's calibrated threshold).
+pub const PROTOTYPES_ENV: &str = "GUARDRAIL_LOCAL_MODEL_PROTOTYPES";
 
 /// Upper clamp for [`LANES_ENV`]: lanes are cores, and no sane host
 /// grants the guardrail more than this.
 const MAX_LANES: usize = 32;
 
-/// Cosine-similarity gate for "this window is about the category".
-/// Calibrated with this module's `#[ignore]` probe against the
-/// prototype below: the acceptance-style positive scores ~0.90, every
-/// probed negative (compile-log timings, memory sizes, IPs, plain
-/// numbers) ≤0.76. Deliberately precision-leaning — a mask
-/// false-positive corrupts user content — at a measured recall cost:
-/// harder positives ("升级到 2022.4"、"Virtuoso IC6.1.8") score
-/// 0.75–0.79 and are NOT masked at this default. Single-prototype
-/// zero-shot cosine cannot separate those from the hard negatives at
-/// all (every phrasing swept had negative margin); closing that gap is
-/// the design issue's rule-scoring layer + real-sample prototypes, not
-/// a threshold tweak.
-const DEFAULT_THRESHOLD: f32 = 0.80;
-
-/// The ONE category this MVP ships: EDA-software version numbers. The
-/// prototype vector is the load-time embedding of this sentence — the
-/// v1 "customer types one Chinese description" path from the design
-/// issue, collapsed to a compile-time constant.
+/// The ONE category this module ships: EDA-software version numbers.
+/// Under [`PrototypeStrategy::Description`] the prototype vector is the
+/// load-time embedding of this sentence — the v1 "customer types one
+/// Chinese description" path from the design issue, collapsed to a
+/// compile-time constant.
 const PROTOTYPE_DESCRIPTION_ZH: &str = "EDA 软件的版本号";
+
+/// Sample sentences for the sample-based prototype strategies — the v2
+/// "customer supplies example sentences" path from the design issue,
+/// collapsed to a compile-time constant set (synthesized; real customer
+/// corpus not yet available). Coverage is by SHAPE, not by string: the
+/// upgrade/rollback phrasing and the tool-name+version phrasing that the
+/// single description prototype measurably missed, in Chinese and
+/// English. Tool names and numbers are deliberately DIFFERENT from the
+/// probe corpus (Spectre/Xcelium here, Virtuoso in the probes) so the
+/// calibration probes measure shape generalization, not string overlap.
+const PROTOTYPE_SAMPLES: &[&str] = &[
+    "布局布线工具升级到 21.15 之后跑得快多了",
+    "仿真器回退到 19.03 才恢复正常",
+    "这个后端工具的版本是 33.0",
+    "综合工具的版本号是 2020.09,不要外传",
+    "Spectre 23.1.0 在这个工艺角下会崩溃",
+    "签核工具装的是 22.4 这个版本",
+    "We upgraded the place-and-route tool to 21.15",
+    "The simulator crashed on release 6.2.1",
+    "Xcelium 23.09 fails on this testbench",
+    "The sign-off tool version is 2020.09",
+];
+
+/// How the category's prototype vector set is built at load time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrototypeStrategy {
+    /// One vector: the embedded category description (the MVP form).
+    Description,
+    /// One vector per [`PROTOTYPE_SAMPLES`] entry; a window scores by its
+    /// MAX cosine over the set (nearest sample decides).
+    SampleMax,
+    /// One vector: the L2-renormalized mean of the sample embeddings; a
+    /// window scores against the class centroid.
+    SampleCentroid,
+}
+
+impl PrototypeStrategy {
+    fn parse(raw: Option<&str>) -> Self {
+        let Some(raw) = raw else {
+            return Self::default();
+        };
+        match raw.to_ascii_lowercase().as_str() {
+            "description" => Self::Description,
+            "max" => Self::SampleMax,
+            "centroid" => Self::SampleCentroid,
+            other => {
+                tracing::warn!(
+                    value = other,
+                    default = ?Self::default(),
+                    "unrecognized {PROTOTYPES_ENV}; using the default strategy"
+                );
+                Self::default()
+            }
+        }
+    }
+
+    /// Cosine gate calibrated per strategy with this module's
+    /// `#[ignore]` probe matrix (cosine absolute scale shifts with the
+    /// prototype construction, so one shared default would be wrong for
+    /// two of the three). Measured bands (granite-97m int8):
+    /// - `Description` keeps the MVP calibration: acceptance positive
+    ///   ~0.90, every probed negative ≤0.76, hard positives 0.75–0.79
+    ///   below the gate — the measured single-prototype recall gap
+    ///   (negative hard margin in all five phrasings swept) that
+    ///   layer ② now covers.
+    /// - `SampleMax`: hard positives ≥0.8316, negatives ≤0.7867
+    ///   (hard margin +0.0449); 0.82 sits precision-leaning in that
+    ///   band — 0.033 above the negative ceiling.
+    /// - `SampleCentroid`: hard positives ≥0.8616, negatives ≤0.8370
+    ///   (hard margin +0.0246); 0.85 likewise.
+    ///
+    /// All three lean precision — a mask false-positive corrupts user
+    /// content; layer ② carries recall for anchored shapes.
+    fn default_threshold(self) -> f32 {
+        match self {
+            Self::Description => 0.80,
+            Self::SampleMax => 0.82,
+            Self::SampleCentroid => 0.85,
+        }
+    }
+}
+
+impl Default for PrototypeStrategy {
+    /// `SampleMax`: the probe matrix (module tests) measures the widest
+    /// positive hard margin here (+0.0449 vs +0.0246 for the centroid —
+    /// averaging ten shape-diverse samples into one vector costs
+    /// nearest-shape resolution).
+    fn default() -> Self {
+        Self::SampleMax
+    }
+}
 
 /// Candidate shape: a dotted number run (`12.1`, `2022.4`, `6.1.8`).
 /// Plain integers are out of MVP scope.
@@ -156,6 +252,19 @@ const WINDOW_CONTEXT_CHARS: usize = 50;
 /// the cap are left untouched and a warning is logged — degrade to
 /// doing less, never to blocking or stalling.
 const MAX_MODEL_CALLS_PER_PASS: usize = 8;
+
+/// Hard cap on rule-scored candidates per SEGMENT. Rule scoring is
+/// µs-cheap per candidate but re-scans a proximity window each time, so
+/// a crafted body that is nothing but candidates (`1.1 1.1 …`) turns
+/// the per-segment scoring loop into a linear CPU amplifier on the
+/// async worker — measured ~91 ms of synchronous work per MiB at the
+/// default window and ~6× that at the window clamp (audit finding on
+/// this PR; the request-body limit defaults to unlimited). Candidates
+/// past the cap are RELEASED unscored with a warning — the same
+/// fail-open arm as every other cap here — and a segment with thousands
+/// of dotted-number runs is a log dump, not prose a version leaks
+/// through.
+const MAX_RULE_SCORED_SPANS_PER_SEGMENT: usize = 4096;
 
 /// Hardcoded rewrite for an above-threshold candidate span.
 const MASK_REPLACEMENT: &str = "***";
@@ -194,28 +303,42 @@ pub struct LocalModelConfig {
     pub threshold: f32,
     /// Inference lanes = ONNX sessions = max concurrent inferences.
     pub lanes: usize,
+    /// Layer-② hotword proximity window (chars each side of a span).
+    pub rule_window: usize,
+    /// Layer-③ prototype-set construction.
+    pub prototypes: PrototypeStrategy,
 }
 
 impl LocalModelConfig {
     /// `None` when [`MODEL_DIR_ENV`] is unset (guardrail disabled). A
-    /// malformed or out-of-range threshold falls back to the default
-    /// rather than failing boot — the gate is a tuning knob, not a
-    /// correctness one. The range check matters: `"NaN"` parses as a
+    /// malformed or out-of-range threshold falls back to the strategy's
+    /// default rather than failing boot — the gate is a tuning knob, not
+    /// a correctness one. The range check matters: `"NaN"` parses as a
     /// valid f32 and would make `score >= threshold` always false — a
-    /// configured-looking guardrail that silently never masks. Lanes
-    /// follow the same lenient rule (malformed → 1).
+    /// configured-looking guardrail that silently never masks. Lanes and
+    /// the rule window follow the same lenient rule (malformed →
+    /// default).
     pub fn from_env() -> Option<Self> {
         let model_dir = PathBuf::from(std::env::var_os(MODEL_DIR_ENV)?);
+        let prototypes = PrototypeStrategy::parse(std::env::var(PROTOTYPES_ENV).ok().as_deref());
         let threshold = std::env::var(THRESHOLD_ENV)
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
             .filter(|t| t.is_finite() && (0.0..=1.0).contains(t))
-            .unwrap_or(DEFAULT_THRESHOLD);
+            .unwrap_or_else(|| prototypes.default_threshold());
         let lanes = parse_lanes(std::env::var(LANES_ENV).ok().as_deref());
+        let rule_window = std::env::var(RULE_WINDOW_ENV)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&w| w >= 1)
+            .unwrap_or(rules::DEFAULT_PROXIMITY_CHARS)
+            .min(rules::MAX_PROXIMITY_CHARS);
         Some(Self {
             model_dir,
             threshold,
             lanes,
+            rule_window,
+            prototypes,
         })
     }
 }
@@ -377,6 +500,35 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
+/// A window's score against the prototype set: max cosine over the set
+/// (with one vector this IS plain cosine, so all three strategies score
+/// through here).
+fn prototype_score(prototypes: &[Vec<f32>], v: &[f32]) -> f32 {
+    prototypes
+        .iter()
+        .map(|p| cosine(p, v))
+        .fold(f32::NEG_INFINITY, f32::max)
+}
+
+/// L2-renormalized mean of a set of L2-normalized vectors — the
+/// [`PrototypeStrategy::SampleCentroid`] construction.
+fn centroid(vectors: &[Vec<f32>]) -> Vec<f32> {
+    let dim = vectors.first().map_or(0, Vec::len);
+    let mut mean = vec![0.0f32; dim];
+    for v in vectors {
+        for (m, x) in mean.iter_mut().zip(v) {
+            *m += x;
+        }
+    }
+    let norm = mean.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for m in &mut mean {
+            *m /= norm;
+        }
+    }
+    mean
+}
+
 /// Hard byte cap on a single candidate span. A real version number is
 /// short by definition; without this cap `\d+(?:\.\d+)+` matches an
 /// arbitrarily long `1.1.1...` run as ONE span, and since the window is
@@ -430,10 +582,12 @@ fn apply_masks(text: &str, spans: &[Range<usize>]) -> String {
 /// The runtime guardrail. Always-`Allow`; masks via the segment hooks.
 pub struct LocalModelGuardrail {
     embedder: Arc<Embedder>,
-    /// L2-normalized embedding of [`PROTOTYPE_DESCRIPTION_ZH`].
-    prototype: Vec<f32>,
+    /// L2-normalized prototype vector set (see [`PrototypeStrategy`]).
+    prototypes: Vec<Vec<f32>>,
     threshold: f32,
     candidate_re: Regex,
+    /// Layer-② scorer (hotword proximity + negative patterns).
+    rules: RuleScorer,
     /// Bounds in-flight `spawn_blocking` inference tasks. Sized to the
     /// session-pool size (the configured lanes): more permits would
     /// only queue on the session mutexes from inside blocking threads.
@@ -441,25 +595,40 @@ pub struct LocalModelGuardrail {
 }
 
 impl LocalModelGuardrail {
-    /// Load tokenizer + the session pool and encode the category
-    /// prototype. Blocking (N model loads + one inference) — the server
-    /// bootstrap wraps it in `spawn_blocking`.
+    /// Load tokenizer + the session pool and encode the category's
+    /// prototype set. Blocking (N model loads + up to
+    /// `PROTOTYPE_SAMPLES`-many inferences) — the server bootstrap
+    /// wraps it in `spawn_blocking`.
     pub fn load(config: &LocalModelConfig) -> Result<Self, LocalModelError> {
         let started = Instant::now();
         let embedder = Embedder::load(&config.model_dir, config.lanes)?;
-        let prototype = embedder.embed(PROTOTYPE_DESCRIPTION_ZH)?;
+        let embed_samples = || {
+            PROTOTYPE_SAMPLES
+                .iter()
+                .map(|s| embedder.embed(s))
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let prototypes = match config.prototypes {
+            PrototypeStrategy::Description => vec![embedder.embed(PROTOTYPE_DESCRIPTION_ZH)?],
+            PrototypeStrategy::SampleMax => embed_samples()?,
+            PrototypeStrategy::SampleCentroid => vec![centroid(&embed_samples()?)],
+        };
         tracing::info!(
             model_dir = %config.model_dir.display(),
             threshold = config.threshold,
             lanes = config.lanes,
+            rule_window = config.rule_window,
+            strategy = ?config.prototypes,
+            prototypes = prototypes.len(),
             load_ms = started.elapsed().as_millis() as u64,
             "local-model guardrail loaded (category: EDA software version)"
         );
         Ok(Self {
             embedder: Arc::new(embedder),
-            prototype,
+            prototypes,
             threshold: config.threshold,
             candidate_re: Regex::new(CANDIDATE_PATTERN).expect("candidate pattern must compile"),
+            rules: RuleScorer::new(config.rule_window),
             permits: Arc::new(tokio::sync::Semaphore::new(config.lanes)),
         })
     }
@@ -489,37 +658,73 @@ impl LocalModelGuardrail {
     }
 
     /// Mask one segment. Returns the rewritten text and how many spans
-    /// were masked; `budget` is the shared per-pass model-call cap.
-    /// Model failure on a candidate leaves that span untouched (rewrite
-    /// less, never block — the fail-open arm of "只改写不阻断").
+    /// were masked; `budget` is the shared per-pass model-call cap —
+    /// layer-② decisions are budget-free (µs of regex work), so the cap
+    /// only meters candidates that reach layer ③, and an exhausted
+    /// budget skips THOSE while later rule-decided candidates still
+    /// resolve. Model failure on a candidate leaves that span untouched
+    /// (rewrite less, never block — the fail-open arm of "只改写不阻断"
+    /// that also answers "model unavailable": the pipeline degrades to
+    /// ①+②).
     async fn mask_segment(&self, text: &str, budget: &mut usize) -> (String, u32) {
         let mut hits: Vec<Range<usize>> = Vec::new();
-        for span in candidate_spans(&self.candidate_re, text) {
-            if *budget == 0 {
-                tracing::warn!(
-                    cap = MAX_MODEL_CALLS_PER_PASS,
-                    "local-model guardrail: candidate cap reached; remaining candidates left unmasked"
-                );
-                break;
-            }
-            *budget -= 1;
-            let window = text[window_bounds(text, &span, WINDOW_CONTEXT_CHARS)].to_owned();
-            match self.embed_window(window).await {
-                Ok(vector) => {
-                    let score = cosine(&vector, &self.prototype);
-                    tracing::debug!(
-                        score,
-                        threshold = self.threshold,
-                        "local-model window judged"
-                    );
-                    if score >= self.threshold {
-                        hits.push(span);
+        let (mut rule_masked, mut rule_passed, mut model_judged) = (0u32, 0u32, 0u32);
+        let mut over_budget = false;
+        let spans = candidate_spans(&self.candidate_re, text);
+        if spans.len() > MAX_RULE_SCORED_SPANS_PER_SEGMENT {
+            tracing::warn!(
+                candidates = spans.len(),
+                cap = MAX_RULE_SCORED_SPANS_PER_SEGMENT,
+                "local-model guardrail: candidate cap reached; the tail is released unscored"
+            );
+        }
+        for span in spans.into_iter().take(MAX_RULE_SCORED_SPANS_PER_SEGMENT) {
+            match self.rules.decide(text, &span) {
+                RuleDecision::Mask => {
+                    rule_masked += 1;
+                    hits.push(span);
+                }
+                RuleDecision::Pass => rule_passed += 1,
+                RuleDecision::Model => {
+                    if *budget == 0 {
+                        if !over_budget {
+                            over_budget = true;
+                            tracing::warn!(
+                                cap = MAX_MODEL_CALLS_PER_PASS,
+                                "local-model guardrail: model-call cap reached; uncertain candidates left unmasked"
+                            );
+                        }
+                        continue;
+                    }
+                    *budget -= 1;
+                    model_judged += 1;
+                    let window = text[window_bounds(text, &span, WINDOW_CONTEXT_CHARS)].to_owned();
+                    match self.embed_window(window).await {
+                        Ok(vector) => {
+                            let score = prototype_score(&self.prototypes, &vector);
+                            tracing::debug!(
+                                score,
+                                threshold = self.threshold,
+                                "local-model window judged"
+                            );
+                            if score >= self.threshold {
+                                hits.push(span);
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "local-model guardrail inference failed; span left unmasked");
+                        }
                     }
                 }
-                Err(err) => {
-                    tracing::warn!(error = %err, "local-model guardrail inference failed; span left unmasked");
-                }
             }
+        }
+        if rule_masked + rule_passed + model_judged > 0 {
+            tracing::debug!(
+                rule_masked,
+                rule_passed,
+                model_judged,
+                "local-model segment candidates resolved"
+            );
         }
         if hits.is_empty() {
             (text.to_owned(), 0)
@@ -650,10 +855,52 @@ mod tests {
         // parse fallback path via the public constructor contract.
         let cfg = LocalModelConfig {
             model_dir: PathBuf::from("/nonexistent"),
-            threshold: DEFAULT_THRESHOLD,
+            threshold: PrototypeStrategy::default().default_threshold(),
             lanes: 1,
+            rule_window: rules::DEFAULT_PROXIMITY_CHARS,
+            prototypes: PrototypeStrategy::default(),
         };
         assert!(LocalModelGuardrail::load(&cfg).is_err());
+    }
+
+    #[test]
+    fn prototype_strategy_parses_and_defaults() {
+        assert_eq!(PrototypeStrategy::parse(None), PrototypeStrategy::default());
+        assert_eq!(
+            PrototypeStrategy::parse(Some("description")),
+            PrototypeStrategy::Description
+        );
+        assert_eq!(
+            PrototypeStrategy::parse(Some("max")),
+            PrototypeStrategy::SampleMax
+        );
+        assert_eq!(
+            PrototypeStrategy::parse(Some("centroid")),
+            PrototypeStrategy::SampleCentroid
+        );
+        // Case-insensitive: an operator typing `Description` means it.
+        assert_eq!(
+            PrototypeStrategy::parse(Some("Description")),
+            PrototypeStrategy::Description
+        );
+        assert_eq!(
+            PrototypeStrategy::parse(Some("MAX")),
+            PrototypeStrategy::SampleMax
+        );
+        assert_eq!(
+            PrototypeStrategy::parse(Some("bogus")),
+            PrototypeStrategy::default()
+        );
+    }
+
+    #[test]
+    fn centroid_is_the_renormalized_mean() {
+        let c = centroid(&[vec![1.0, 0.0], vec![0.0, 1.0]]);
+        let inv_sqrt2 = 1.0 / 2.0_f32.sqrt();
+        assert!((c[0] - inv_sqrt2).abs() < 1e-6 && (c[1] - inv_sqrt2).abs() < 1e-6);
+        // Max-over-set picks the nearest prototype.
+        let set = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        assert!((prototype_score(&set, &[0.0, 1.0]) - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -680,55 +927,145 @@ mod tests {
         Some(LocalModelGuardrail::load(&cfg).expect("model files present but load failed"))
     }
 
-    /// Calibration probe: prints the cosine matrix behind
-    /// [`DEFAULT_THRESHOLD`] and pins the MVP contract — the
-    /// acceptance-style positive clears the gate, every probed negative
-    /// stays under it. The harder positives are printed but NOT
-    /// asserted: single-prototype zero-shot cosine has no margin over
-    /// the hard negatives (measured; see the threshold doc), so at the
-    /// precision-leaning default they are a known recall gap.
+    /// The MVP probe matrix, re-run for the prototype-set experiment:
+    /// the same 7 probe windows (1 acceptance-style positive, 2 hard
+    /// positives, 4 hard negatives) scored against 5 single-description
+    /// prototype phrasings (the MVP sweep that measured NEGATIVE margin
+    /// in every column) plus the two sample-based strategies. Prints the
+    /// full matrix and each column's hard margin
+    /// (min over hard positives − max over negatives).
+    ///
+    /// The MVP's original 5-phrasing sweep was scratch work; these
+    /// phrasings reconstruct it (the shipped description first) and are
+    /// committed so the experiment stays repeatable.
     #[tokio::test]
     #[ignore = "needs GUARDRAIL_LOCAL_MODEL_DIR with model.onnx + tokenizer.json"]
     async fn probe_similarity_matrix() {
         let Some(g) = load_from_env() else { return };
-        let acceptance = "这个 EDA 软件的版本是 12.1,请确认兼容性";
-        let recall_gap_positives = [
-            "我们把仿真工具升级到 2022.4 之后速度快了很多",
-            "Virtuoso IC6.1.8 出现了崩溃",
+        let phrasings = [
+            PROTOTYPE_DESCRIPTION_ZH,
+            "软件版本号",
+            "芯片设计软件的版本号",
+            "提到了 EDA 工具的具体版本号",
+            "EDA 软件的版本信息,比如某个工具的版本是 12.1",
         ];
-        let negatives = [
+        let windows = [
+            ("ACC", "这个 EDA 软件的版本是 12.1,请确认兼容性"),
+            ("POS", "我们把仿真工具升级到 2022.4 之后速度快了很多"),
+            ("POS", "Virtuoso IC6.1.8 出现了崩溃"),
+            ("NEG", "Elapsed: 12.345s, Memory: 4.2 GB"),
+            ("NEG", "服务器的 IP 地址是 10.2.255.1"),
+            ("NEG", "圆周率约等于 3.14159"),
+            ("NEG", "工艺节点是 0.13um,良率还行"),
+        ];
+
+        // Columns: each phrasing as a single-vector prototype set, then
+        // the sample set (max) and its centroid.
+        let mut columns: Vec<(String, Vec<Vec<f32>>)> = Vec::new();
+        for p in phrasings {
+            let v = g.embed_window(p.to_owned()).await.unwrap();
+            columns.push((format!("desc:{p}"), vec![v]));
+        }
+        let mut samples = Vec::new();
+        for s in PROTOTYPE_SAMPLES {
+            samples.push(g.embed_window((*s).to_owned()).await.unwrap());
+        }
+        columns.push(("samples-max".to_owned(), samples.clone()));
+        columns.push(("samples-centroid".to_owned(), vec![centroid(&samples)]));
+
+        for (name, prototypes) in &columns {
+            let mut hard_pos_min = f32::INFINITY;
+            let mut neg_max = f32::NEG_INFINITY;
+            println!("── column: {name}");
+            for (kind, text) in windows {
+                let v = g.embed_window(text.to_owned()).await.unwrap();
+                let s = prototype_score(prototypes, &v);
+                println!("  {kind} {s:.4}  {text}");
+                match kind {
+                    "POS" => hard_pos_min = hard_pos_min.min(s),
+                    "NEG" => neg_max = neg_max.max(s),
+                    _ => {}
+                }
+            }
+            println!(
+                "  hard margin (min POS − max NEG): {:+.4}",
+                hard_pos_min - neg_max
+            );
+
+            // Pin the calibration contract for the sample strategies:
+            // the margin the experiment claims stays open, and the
+            // shipped default gate sits strictly inside it. The
+            // description columns stay unasserted — their negative
+            // margin is the documented MVP finding, not a contract.
+            let gate = match name.as_str() {
+                "samples-max" => Some(PrototypeStrategy::SampleMax.default_threshold()),
+                "samples-centroid" => Some(PrototypeStrategy::SampleCentroid.default_threshold()),
+                _ => None,
+            };
+            if let Some(gate) = gate {
+                assert!(
+                    neg_max < gate && gate <= hard_pos_min,
+                    "{name}: default gate {gate} outside the measured band ({neg_max:.4}, {hard_pos_min:.4}]"
+                );
+            }
+        }
+    }
+
+    /// A candidate flood past [`MAX_RULE_SCORED_SPANS_PER_SEGMENT`]
+    /// releases the tail unscored: a rule-maskable sentence hidden
+    /// beyond the cap stays untouched (fail-open — rewrite less, never
+    /// stall), and the flood burns at most the model-call budget.
+    #[tokio::test]
+    #[ignore = "needs GUARDRAIL_LOCAL_MODEL_DIR with model.onnx + tokenizer.json"]
+    async fn candidate_flood_releases_the_tail() {
+        let Some(g) = load_from_env() else { return };
+        let flood = "1.1 ".repeat(MAX_RULE_SCORED_SPANS_PER_SEGMENT);
+        let text = format!("{flood}这个 EDA 软件的版本是 12.1");
+        let outcome = g.moderate_input_segments(&[text]).await;
+        assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
+        assert!(
+            outcome.masked.is_none(),
+            "the over-cap tail must be released unscored"
+        );
+    }
+
+    /// The acceptance matrix end to end through the segment hook, on the
+    /// default configuration: both hard positives and the MVP acceptance
+    /// positive are rewritten; every hard negative comes back untouched
+    /// (`masked == None` ⇒ byte-identical passthrough upstream).
+    #[tokio::test]
+    #[ignore = "needs GUARDRAIL_LOCAL_MODEL_DIR with model.onnx + tokenizer.json"]
+    async fn acceptance_matrix_end_to_end() {
+        let Some(g) = load_from_env() else { return };
+        let masked_cases = [
+            ("这个 EDA 软件的版本是 12.1", "这个 EDA 软件的版本是 ***"),
+            (
+                "我们把仿真工具升级到 2022.4 之后速度快了很多",
+                "我们把仿真工具升级到 *** 之后速度快了很多",
+            ),
+            ("Virtuoso IC6.1.8 出现了崩溃", "Virtuoso IC*** 出现了崩溃"),
+        ];
+        for (input, want) in masked_cases {
+            let outcome = g.moderate_input_segments(&[input.to_owned()]).await;
+            assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
+            let masked = outcome
+                .masked
+                .unwrap_or_else(|| panic!("must mask: {input}"));
+            assert_eq!(masked[0], want);
+        }
+        let passthrough_cases = [
             "Elapsed: 12.345s, Memory: 4.2 GB",
             "服务器的 IP 地址是 10.2.255.1",
             "圆周率约等于 3.14159",
             "工艺节点是 0.13um,良率还行",
         ];
-        let acc = cosine(
-            &g.embed_window(acceptance.to_owned()).await.unwrap(),
-            &g.prototype,
-        );
-        println!("ACC {acc:.4}  {acceptance}");
-        for text in recall_gap_positives {
-            let s = cosine(
-                &g.embed_window(text.to_owned()).await.unwrap(),
-                &g.prototype,
-            );
-            println!("POS(gap) {s:.4}  {text}");
-        }
-        assert!(
-            acc >= g.threshold,
-            "acceptance positive {acc:.4} under threshold {}",
-            g.threshold
-        );
-        for text in negatives {
-            let s = cosine(
-                &g.embed_window(text.to_owned()).await.unwrap(),
-                &g.prototype,
-            );
-            println!("NEG {s:.4}  {text}");
+        for input in passthrough_cases {
+            let outcome = g.moderate_input_segments(&[input.to_owned()]).await;
+            assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
             assert!(
-                s < g.threshold,
-                "negative {s:.4} would mask at threshold {}: {text}",
-                g.threshold
+                outcome.masked.is_none(),
+                "negative must pass untouched: {input} → {:?}",
+                outcome.masked
             );
         }
     }
