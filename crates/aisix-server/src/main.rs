@@ -923,6 +923,28 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             bedrock_endpoint_url,
             Some(guardrail_metrics_sink),
         ));
+    // Local CPU embedding-model guardrail MVP (AISIX-Cloud#1331):
+    // env-activated, no control-plane surface yet. Load failure with the
+    // env var set is boot-fatal — a masking guardrail the operator asked
+    // for that silently isn't there would leak the very content it exists
+    // to rewrite. Model load + prototype inference block, so they run off
+    // the async bootstrap thread.
+    #[cfg(feature = "local-model-guardrail")]
+    if let Some(local_cfg) = aisix_guardrails::LocalModelConfig::from_env() {
+        let guardrail = tokio::task::spawn_blocking(move || {
+            aisix_guardrails::LocalModelGuardrail::load(&local_cfg)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("local-model guardrail load task: {e}"))??;
+        proxy_state = proxy_state.with_local_model_guardrail(Arc::new(guardrail));
+    }
+    #[cfg(not(feature = "local-model-guardrail"))]
+    if std::env::var_os("GUARDRAIL_LOCAL_MODEL_DIR").is_some() {
+        tracing::warn!(
+            "GUARDRAIL_LOCAL_MODEL_DIR is set, but this binary was built without the \
+             `local-model-guardrail` feature; ignoring"
+        );
+    }
     // Heartbeat worker — spawned after proxy_state exists so it can read
     // the exporter fan-out's delivery counters. Each tick reports:
     //   - rejected_resources: the supervisor's loader rejections (#115)

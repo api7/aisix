@@ -30,6 +30,8 @@ mod index;
 mod keyword;
 #[cfg(feature = "lakera")]
 mod lakera;
+#[cfg(feature = "local-model")]
+mod local_model;
 #[cfg(feature = "openai-moderation")]
 mod openai_moderation;
 mod pii;
@@ -196,6 +198,8 @@ pub use index::{GuardrailIndex, RequestContext};
 pub use keyword::{KeywordBlocklist, KeywordRule};
 #[cfg(feature = "lakera")]
 pub use lakera::LakeraGuardrail;
+#[cfg(feature = "local-model")]
+pub use local_model::{LocalModelConfig, LocalModelError, LocalModelGuardrail, MODEL_DIR_ENV};
 #[cfg(feature = "openai-moderation")]
 pub use openai_moderation::OpenaiModerationGuardrail;
 pub use pii::{builtin_rule, PiiAction, PiiGuardrail, PiiRule, BUILTIN_DETECTORS};
