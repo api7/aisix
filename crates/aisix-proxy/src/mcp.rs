@@ -734,13 +734,18 @@ async fn apply_output_guardrails(
     let mut scanned: Vec<String> = Vec::new();
     if let Some(blocks) = result.get("content").and_then(|c| c.as_array()) {
         for block in blocks {
-            // The `text` string of any block. (Previously filtered to
-            // `type == "text"`; any block-level `text` is still a string
-            // VALUE, never an envelope key, so scanning it is safe and
-            // strictly wider.)
-            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                if !text.is_empty() {
-                    scanned.push(text.to_owned());
+            // The `text` string of any block, plus the block-level
+            // `description`/`title` a `resource_link` carries — all string
+            // VALUES, never envelope keys, so scanning them is safe and
+            // strictly wider than the old `type == "text"` filter. A
+            // link's `name`/`uri` are deliberately NOT scanned or masked:
+            // they address the resource, and rewriting an identifier
+            // breaks the client's follow-up fetch.
+            for key in ["text", "description", "title"] {
+                if let Some(text) = block.get(key).and_then(|t| t.as_str()) {
+                    if !text.is_empty() {
+                        scanned.push(text.to_owned());
+                    }
                 }
             }
             // Embedded resource (`type: "resource"`): the payload rides
@@ -798,8 +803,10 @@ async fn apply_output_guardrails(
         return ToolResultOutcome::Block(guardrail_name);
     }
     // Mask write-back over the same surface the scan covers:
-    // `result.content[i].text`, `result.content[i].resource.text`, and
-    // every string leaf under `result.structuredContent`.
+    // `result.content[i].{text,description,title}`,
+    // `result.content[i].resource.text`, and every string leaf under
+    // `result.structuredContent`. (`name`/`uri` stay untouched — they
+    // address a resource; see the scan-loop comment.)
     if !aisix_guardrails::Guardrail::redacts_output(chain) {
         return ToolResultOutcome::Allow(None);
     }
@@ -814,7 +821,10 @@ async fn apply_output_guardrails(
                 Some(seg) if seg.is_key("structuredContent") => true,
                 Some(seg) if seg.is_key("content") => {
                     matches!(path.get(2), Some(crate::json_splice::PathSeg::Index(_)))
-                        && ((path.len() == 4 && path[3].is_key("text"))
+                        && ((path.len() == 4
+                            && (path[3].is_key("text")
+                                || path[3].is_key("description")
+                                || path[3].is_key("title")))
                             || (path.len() == 5
                                 && path[3].is_key("resource")
                                 && path[4].is_key("text")))
@@ -2114,6 +2124,48 @@ mod tests {
                 .is_some(),
             "resource.text must be scanned even when a text block exists"
         );
+    }
+
+    /// Same silent class one sibling over (#1008 audit): a
+    /// `resource_link` block carries its data in block-level
+    /// `description`/`title`. Both must scan (block) and mask (rewrite);
+    /// `name`/`uri` address the resource and stay untouched.
+    #[tokio::test]
+    async fn output_guardrail_covers_resource_link_description_and_title() {
+        // Block rule anchored only in the link description, with a clean
+        // sibling text block suppressing the fallback.
+        let chain = env_chain_with(OUTPUT_GUARD);
+        let body = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"summary ok"},{"type":"resource_link","uri":"file:///a.log","name":"a.log","description":"holds forbidden-token data"}]}}"#;
+        assert!(
+            output_guardrail_block(&chain, body, "list", &mut Vec::new())
+                .await
+                .is_some(),
+            "resource_link description must be scanned"
+        );
+
+        // Mask rule: description and title rewrite in place; name/uri and
+        // every other byte survive verbatim.
+        let chain = env_chain_with(&pii_mask_guard("output"));
+        let body = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":["#,
+            r#"{"type":"resource_link","uri":"file:///v.log","name":"run version: 9.9.log","title":"run version: 3.4","description":"log for version: 12.1"}"#,
+            r#"]}}"#,
+        );
+        match apply_output_guardrails(&chain, body.as_bytes(), "list", &mut Vec::new()).await {
+            ToolResultOutcome::Allow(Some((bytes, counts))) => {
+                assert_eq!(counts.get("eda_version"), Some(&2));
+                assert_eq!(
+                    String::from_utf8(bytes).unwrap(),
+                    concat!(
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"content":["#,
+                        r#"{"type":"resource_link","uri":"file:///v.log","name":"run version: 9.9.log","title":"run version: ***","description":"log for version: ***"}"#,
+                        r#"]}}"#,
+                    ),
+                    "description/title masked; uri/name untouched",
+                );
+            }
+            _ => panic!("expected a rewritten Allow"),
+        }
     }
 
     fn tools_call_with_args(arguments: serde_json::Value) -> HttpRequest<Body> {

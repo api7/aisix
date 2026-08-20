@@ -285,8 +285,12 @@ describe("mcp mask write-back e2e: /mcp", () => {
     if (!etcdReachable || !appG || !sls) return ctx.skip();
 
     // The guarded echo call from the request test carried the MARKER; its
-    // usage event (with captured content) lands on the full logstore.
+    // usage event (with captured content) lands on the full logstore. The
+    // report event must have flushed too before the raw-value negatives
+    // below can prove anything about the RESPONSE direction — its summary
+    // prefix is the wait token (#1008 audit MEDIUM-2).
     await waitForToken(sls, FULL_LOGSTORE, MARKER);
+    await waitForToken(sls, FULL_LOGSTORE, "阶段汇总");
     const decoded = decodedTextFor(sls, FULL_LOGSTORE);
     // Post-mask capture on both directions...
     expect(decoded).toContain("version: ***");
