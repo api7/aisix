@@ -249,12 +249,22 @@ fn build_one_inner(
                         value: s.to_owned(),
                     })?,
                 };
-                let rule = PiiRule::new(p.name.clone(), &p.regex, action, None).map_err(|e| {
-                    BuildError::InvalidRegex {
+                // `replacement` only means something to a mask rewrite; on a
+                // block-action pattern it would be accepted-but-unread config
+                // (the #962 class), so the row is rejected instead. cp-api
+                // validates the same combination at write time; this covers
+                // the declarative-file source and defends the invariant.
+                if p.replacement.is_some() && action == PiiAction::Block {
+                    return Err(BuildError::ReplacementOnBlock {
+                        name: p.name.clone(),
+                    });
+                }
+                let rule = PiiRule::new(p.name.clone(), &p.regex, action, None)
+                    .map_err(|e| BuildError::InvalidRegex {
                         pattern: p.regex.clone(),
                         source: e,
-                    }
-                })?;
+                    })?
+                    .with_replacement(p.replacement.clone());
                 rules.push(rule);
             }
             let on_exceeded_fail_open = cfg.on_buffer_exceeded == "fail_open";
@@ -459,6 +469,14 @@ enum BuildError {
     /// skipped + warned rather than silently running a weaker policy.
     #[error("invalid {field} value {value:?}")]
     InvalidValue { field: &'static str, value: String },
+    /// A `custom_patterns[].replacement` on a pattern whose effective
+    /// action is `block` — the replacement would never be read (never
+    /// half-honor a knob, #963). Carries the pattern NAME only, never
+    /// the replacement text or a matched value.
+    #[error(
+        "custom_patterns[].replacement requires action=mask (pattern {name:?} resolves to block)"
+    )]
+    ReplacementOnBlock { name: String },
     /// A guardrail kind whose runtime dispatch was compiled out via
     /// feature flags (e.g. a pruned build that excluded `--features bedrock`
     /// or `--features azure-content-safety`). The chain treats the row as
@@ -1457,6 +1475,67 @@ mod tests {
                 .is_block(),
             "unknown mode must default to block, not silently pass through",
         );
+    }
+
+    /// AISIX-Cloud#1334: a capture-group custom pattern with a
+    /// `replacement` builds and rewrites only group 1 through the chain.
+    #[test]
+    fn pii_custom_pattern_replacement_and_group_build_from_row() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "eda",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "eda",
+                    "kind": "pii",
+                    "custom_patterns": [{
+                        "name": "eda_version",
+                        "regex": "version\\s*:\\s*(\\d+(?:\\.\\d+)+)",
+                        "action": "mask",
+                        "replacement": "***"
+                    }]
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table, None);
+        assert_eq!(chain.len(), 1);
+        let r = chain.redact_input_text("tool version: 12.1 done").unwrap();
+        assert_eq!(r.text, "tool version: *** done");
+    }
+
+    /// A `replacement` on a pattern whose effective action is `block`
+    /// (explicit or via `default_action`) rejects the row — the knob
+    /// would otherwise be accepted but never read (#963).
+    #[test]
+    fn pii_replacement_on_block_action_rejects_row() {
+        for row in [
+            // Explicit per-pattern block.
+            r#"{
+                "name": "bad-explicit",
+                "kind": "pii",
+                "custom_patterns": [{
+                    "name": "p", "regex": "x(y)", "action": "block", "replacement": "*"
+                }]
+            }"#,
+            // Inherited block via default_action.
+            r#"{
+                "name": "bad-inherited",
+                "kind": "pii",
+                "default_action": "block",
+                "custom_patterns": [{
+                    "name": "p", "regex": "x(y)", "replacement": "*"
+                }]
+            }"#,
+        ] {
+            let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+            table.insert(entry("bad", "g-1", parse(row)));
+            let chain = build_chain_from_snapshot(&table, None);
+            assert!(
+                chain.is_empty(),
+                "replacement+block row must be skipped, not half-honored",
+            );
+        }
     }
 
     /// A stub remote guardrail that always fails open (returns `Bypass`),

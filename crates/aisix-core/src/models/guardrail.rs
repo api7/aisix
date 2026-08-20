@@ -445,12 +445,26 @@ pub struct PiiCustomPattern {
     pub name: String,
     /// Regular expression AISIX compiles when building the guardrail chain.
     /// An invalid pattern makes AISIX log and skip the guardrail.
+    ///
+    /// When the expression declares at least one capture group, a `mask`
+    /// action rewrites only the first capture group of each match and keeps
+    /// the rest of the match unchanged. Use this to replace a value while
+    /// preserving its surrounding key or label, for example
+    /// `"version"\s*:\s*"([^"]*)"`. Without capture groups, the whole match
+    /// is rewritten.
     #[schemars(length(min = 1))]
     pub regex: String,
     /// Per-pattern action override. Falls back to the guardrail's
     /// `default_action` when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+    /// Literal text that replaces the masked span, such as `***`. When
+    /// omitted, the span is rewritten to `[<NAME>_REDACTED]`. An empty
+    /// string removes the span. Only valid when the pattern's effective
+    /// action is `mask`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 256))]
+    pub replacement: Option<String>,
 }
 
 /// Config block for `kind: "pii"`. Built-in sensitive-data detection and
@@ -1464,7 +1478,8 @@ mod tests {
             "kind": "pii",
             "default_action": "block",
             "custom_patterns": [
-                { "name": "employee_id", "regex": "\\bEMP-\\d{6}\\b", "action": "mask" }
+                { "name": "employee_id", "regex": "\\bEMP-\\d{6}\\b", "action": "mask" },
+                { "name": "eda_version", "regex": "version: (\\S+)", "action": "mask", "replacement": "***" }
             ],
             "max_buffer_bytes": 1024,
             "on_buffer_exceeded": "fail_open"
@@ -1473,15 +1488,23 @@ mod tests {
         match g.config {
             GuardrailKind::Pii(ref c) => {
                 assert!(c.detectors.is_empty());
-                assert_eq!(c.custom_patterns.len(), 1);
+                assert_eq!(c.custom_patterns.len(), 2);
                 assert_eq!(c.custom_patterns[0].name, "employee_id");
                 assert_eq!(c.custom_patterns[0].action.as_deref(), Some("mask"));
+                assert_eq!(c.custom_patterns[0].replacement, None);
+                assert_eq!(c.custom_patterns[1].replacement.as_deref(), Some("***"));
                 assert_eq!(c.default_action, "block");
                 assert_eq!(c.max_buffer_bytes, 1024);
                 assert_eq!(c.on_buffer_exceeded, "fail_open");
             }
             _ => panic!("expected Pii variant"),
         }
+        // A row without `replacement` serialises without the key
+        // (skip_serializing_if), so older documents round-trip untouched.
+        let ser = serde_json::to_value(&g).unwrap();
+        let pats = ser["custom_patterns"].as_array().unwrap();
+        assert!(pats[0].get("replacement").is_none());
+        assert_eq!(pats[1]["replacement"], "***");
     }
 
     #[test]
