@@ -10,15 +10,27 @@
 //! Each rule carries an action:
 //! - `Block`: the request/response is rejected (422 content-filter) —
 //!   same enforcement path as the keyword blocklist.
-//! - `Mask`: each matched span is rewritten to `[<DETECTOR>_REDACTED]`
-//!   and processing continues. Callers apply the rewrite through
-//!   [`crate::Guardrail::redact_input_text`] /
+//! - `Mask`: each matched span is rewritten to the rule's replacement
+//!   text (`[<DETECTOR>_REDACTED]` by default, or an operator-configured
+//!   `replacement`) and processing continues. Callers apply the rewrite
+//!   through [`crate::Guardrail::redact_input_text`] /
 //!   [`crate::Guardrail::redact_output_text`].
+//!
+//! Capture-group scoping (AISIX-Cloud#1334): a rule whose regex declares
+//! at least one capture group replaces (and checksum-validates) ONLY
+//! group 1 of each match; the rest of the match is kept verbatim. This is
+//! how a rule expresses "replace the value, keep the key" for shapes like
+//! `"version": "12.1"` — the `regex` crate has no lookaround, so context
+//! can only be consumed by the match and preserved via the group split.
+//! A regex without capture groups keeps the original whole-match
+//! semantics.
 //!
 //! The detector NAME is the only thing that ever leaves this module —
 //! block reasons, telemetry counts, and mask tokens all carry the name,
 //! never the matched value (#153 anti-leak rule, and the #932 acceptance
-//! criterion that redacted values must not appear in gateway logs).
+//! criterion that redacted values must not appear in gateway logs). An
+//! operator-configured `replacement` is config, not matched content, so
+//! it may appear in rewritten payloads by design.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -32,7 +44,8 @@ use crate::{Guardrail, GuardrailVerdict, Redaction, StreamOutputPolicy};
 /// What to do when a detector matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PiiAction {
-    /// Rewrite the matched span to `[<DETECTOR>_REDACTED]` and continue.
+    /// Rewrite the matched span to the rule's replacement text
+    /// (`[<DETECTOR>_REDACTED]` by default) and continue.
     Mask,
     /// Reject the request/response (422 content-filter).
     Block,
@@ -63,8 +76,14 @@ pub struct PiiRule {
     regex: Regex,
     action: PiiAction,
     validate: Option<MatchValidator>,
-    /// Pre-computed `[<NAME>_REDACTED]` token.
+    /// The literal text a masked span is rewritten to: the pre-computed
+    /// `[<NAME>_REDACTED]` token, or the operator-configured
+    /// `replacement` override (see [`PiiRule::with_replacement`]).
     mask_token: String,
+    /// `true` when the regex declares at least one capture group — the
+    /// rule then replaces and validates ONLY group 1 of each match,
+    /// keeping the rest of the match verbatim (module docs).
+    group_scoped: bool,
 }
 
 impl PiiRule {
@@ -76,13 +95,29 @@ impl PiiRule {
     ) -> Result<Self, regex::Error> {
         let name = name.into();
         let mask_token = mask_token(&name);
+        let regex = Regex::new(pattern)?;
+        // captures_len() counts group 0 (the whole match), so > 1 means
+        // the pattern declares explicit groups. `(?:…)` doesn't count.
+        let group_scoped = regex.captures_len() > 1;
         Ok(Self {
-            regex: Regex::new(pattern)?,
+            regex,
             name,
             action,
             validate,
             mask_token,
+            group_scoped,
         })
+    }
+
+    /// Override the default `[<NAME>_REDACTED]` mask token with an
+    /// operator-configured literal replacement (AISIX-Cloud#1334).
+    /// `None` keeps the default; an empty string deletes the span.
+    /// The text is used verbatim — no `$n` group expansion.
+    pub fn with_replacement(mut self, replacement: Option<String>) -> Self {
+        if let Some(r) = replacement {
+            self.mask_token = r;
+        }
+        self
     }
 
     /// `true` when `candidate` is a real detection (regex already matched;
@@ -91,22 +126,53 @@ impl PiiRule {
         self.validate.is_none_or(|v| v(candidate))
     }
 
-    /// First validated match in `text`, or `None`.
-    fn detects(&self, text: &str) -> bool {
-        self.regex.find_iter(text).any(|m| self.accepts(m.as_str()))
+    /// The span of `caps` this rule replaces and validates: group 1 for a
+    /// group-scoped rule, the whole match otherwise. `None` when group 1
+    /// did not participate in this match (an alternation branch without
+    /// it) — the match is then not a detection and stays untouched.
+    fn target_span<'t>(&self, caps: &regex::Captures<'t>) -> Option<regex::Match<'t>> {
+        caps.get(if self.group_scoped { 1 } else { 0 })
     }
 
-    /// Rewrite every validated match in `text` to the rule's mask token.
-    /// Returns the match count (0 = `text` returned unchanged).
+    /// First validated match in `text`, or `None`.
+    fn detects(&self, text: &str) -> bool {
+        if self.group_scoped {
+            // Group-scoped rules validate group 1, so the (slower)
+            // captures iterator is required; the built-in detectors have
+            // no groups and stay on the find_iter fast path below.
+            self.regex.captures_iter(text).any(|caps| {
+                self.target_span(&caps)
+                    .is_some_and(|g| self.accepts(g.as_str()))
+            })
+        } else {
+            self.regex.find_iter(text).any(|m| self.accepts(m.as_str()))
+        }
+    }
+
+    /// Rewrite every validated match in `text` to the rule's mask token —
+    /// only group 1 of the match for a group-scoped rule. Returns the
+    /// match count (0 = `text` returned unchanged).
     fn mask_all<'t>(&self, text: &'t str) -> (Cow<'t, str>, u32) {
         let mut count = 0u32;
         let out = self.regex.replace_all(text, |caps: &regex::Captures<'_>| {
-            let m = &caps[0];
-            if self.accepts(m) {
-                count += 1;
-                self.mask_token.clone()
-            } else {
-                m.to_string()
+            let whole = caps.get(0).expect("group 0 always participates");
+            match self.target_span(caps) {
+                Some(target) if self.accepts(target.as_str()) => {
+                    count += 1;
+                    if self.group_scoped {
+                        // Keep the match's bytes outside group 1 verbatim.
+                        let m = whole.as_str();
+                        let mut out =
+                            String::with_capacity(m.len() - target.len() + self.mask_token.len());
+                        out.push_str(&m[..target.start() - whole.start()]);
+                        out.push_str(&self.mask_token);
+                        out.push_str(&m[target.end() - whole.start()..]);
+                        out
+                    } else {
+                        self.mask_token.clone()
+                    }
+                }
+                _ => whole.as_str().to_string(),
             }
         });
         (out, count)
@@ -587,6 +653,154 @@ mod tests {
             .redact_input_text("ssn 123-45-6789 from 192.168.1.100")
             .unwrap();
         assert_eq!(r.text, "ssn [US_SSN_REDACTED] from [IP_ADDRESS_REDACTED]");
+    }
+
+    // ---- capture-group scoping + replacement (AISIX-Cloud#1334) ----
+
+    #[test]
+    fn group_scoped_rule_replaces_group_1_only() {
+        let rule = PiiRule::new(
+            "eda_version",
+            r"version\s*:\s*(\d+(?:\.\d+)+)",
+            PiiAction::Mask,
+            None,
+        )
+        .unwrap()
+        .with_replacement(Some("***".into()));
+        let g = guardrail(vec![rule]);
+        let r = g.redact_input_text("tool version: 12.1 loaded").unwrap();
+        assert_eq!(r.text, "tool version: *** loaded");
+        assert_eq!(r.counts.get("eda_version"), Some(&1));
+    }
+
+    #[test]
+    fn group_scoped_rule_keeps_json_parseable() {
+        let rule = PiiRule::new(
+            "eda_version",
+            r#""version"\s*:\s*"([^"]*)""#,
+            PiiAction::Mask,
+            None,
+        )
+        .unwrap()
+        .with_replacement(Some("***".into()));
+        let g = guardrail(vec![rule]);
+        let doc = r#"{"tool":"eda","version": "12.1","cells":42}"#;
+        let r = g.redact_input_text(doc).unwrap();
+        assert_eq!(r.text, r#"{"tool":"eda","version": "***","cells":42}"#);
+        // The acceptance criterion is structural, not textual: the
+        // rewritten document must still parse.
+        let v: serde_json::Value = serde_json::from_str(&r.text).unwrap();
+        assert_eq!(v["version"], "***");
+        assert_eq!(v["cells"], 42);
+    }
+
+    #[test]
+    fn group_scoped_rule_skips_hard_negatives_byte_for_byte() {
+        let rule = PiiRule::new(
+            "eda_version",
+            r"(?:version|版本)\s*[:：]\s*(\d+(?:\.\d+)+)",
+            PiiAction::Mask,
+            None,
+        )
+        .unwrap()
+        .with_replacement(Some("***".into()));
+        let g = guardrail(vec![rule]);
+        // Dot-separated numbers everywhere, none anchored by the keyword:
+        // zero hits, and None means the caller keeps the original bytes.
+        let log = "Elapsed: 12.345s Memory: 4.2 GB node 0.13um top.v:12:1 at 10.2.255.1";
+        assert!(g.redact_input_text(log).is_none());
+        // Mixed hit + negatives: only the anchored value is rewritten,
+        // every other byte survives verbatim (exact-string assertion).
+        let mixed = "Elapsed: 12.345s 版本：12.1 at 10.2.255.1";
+        let r = g.redact_input_text(mixed).unwrap();
+        assert_eq!(r.text, "Elapsed: 12.345s 版本：*** at 10.2.255.1");
+    }
+
+    #[test]
+    fn group_scoped_validator_checks_group_not_whole_match() {
+        // A prefixed card-number rule: the whole match includes "card "
+        // which can never pass Luhn. The validator must run on group 1 —
+        // otherwise a prefixed pattern silently disables its checksum.
+        let rule = PiiRule::new(
+            "prefixed_card",
+            r"card (\d{13,19})",
+            PiiAction::Mask,
+            Some(luhn_checksum),
+        )
+        .unwrap()
+        .with_replacement(Some("####".into()));
+        let g = guardrail(vec![rule]);
+        // 4111111111111111 passes Luhn → masked, prefix kept.
+        let r = g.redact_input_text("card 4111111111111111 ok").unwrap();
+        assert_eq!(r.text, "card #### ok");
+        // Same shape, broken check digit → untouched.
+        assert!(g.redact_input_text("card 4111111111111112 ok").is_none());
+    }
+
+    #[test]
+    fn group_scoped_block_rule_validates_group_too() {
+        let rule = PiiRule::new(
+            "prefixed_card",
+            r"card (\d{13,19})",
+            PiiAction::Block,
+            Some(luhn_checksum),
+        )
+        .unwrap();
+        let g = guardrail(vec![rule]);
+        assert!(g.first_block_match("card 4111111111111111").is_some());
+        assert!(g.first_block_match("card 4111111111111112").is_none());
+    }
+
+    #[test]
+    fn group_not_participating_leaves_match_untouched() {
+        // Alternation where only one branch carries group 1: the other
+        // branch has no sensitive segment to replace, so it stays as-is.
+        let rule = PiiRule::new("opt_group", r"ver=(\d+)|verless", PiiAction::Mask, None)
+            .unwrap()
+            .with_replacement(Some("***".into()));
+        let g = guardrail(vec![rule]);
+        let r = g.redact_input_text("ver=42 and verless mode").unwrap();
+        assert_eq!(r.text, "ver=*** and verless mode");
+        assert_eq!(r.counts.get("opt_group"), Some(&1));
+        assert!(g.redact_input_text("verless only").is_none());
+    }
+
+    #[test]
+    fn replacement_defaults_to_name_token_and_supports_empty() {
+        // No replacement → the [<NAME>_REDACTED] default, group-scoped.
+        let rule = PiiRule::new("ver", r"version: (\S+)", PiiAction::Mask, None).unwrap();
+        let g = guardrail(vec![rule]);
+        let r = g.redact_input_text("version: 12.1").unwrap();
+        assert_eq!(r.text, "version: [VER_REDACTED]");
+        // Empty replacement deletes the span.
+        let rule = PiiRule::new("ver", r"version: (\S+)", PiiAction::Mask, None)
+            .unwrap()
+            .with_replacement(Some(String::new()));
+        let g = guardrail(vec![rule]);
+        let r = g.redact_input_text("version: 12.1 end").unwrap();
+        assert_eq!(r.text, "version:  end");
+    }
+
+    #[test]
+    fn replacement_without_groups_replaces_whole_match() {
+        // Back-compat: no capture group + custom replacement still swaps
+        // the entire match.
+        let rule = PiiRule::new("ver", r"\bv\d+\.\d+\b", PiiAction::Mask, None)
+            .unwrap()
+            .with_replacement(Some("vX.Y".into()));
+        let g = guardrail(vec![rule]);
+        let r = g.redact_input_text("running v12.1 now").unwrap();
+        assert_eq!(r.text, "running vX.Y now");
+    }
+
+    #[test]
+    fn replacement_dollar_is_literal_not_group_expansion() {
+        let rule = PiiRule::new("ver", r"version: (\S+)", PiiAction::Mask, None)
+            .unwrap()
+            .with_replacement(Some("$1".into()));
+        let g = guardrail(vec![rule]);
+        let r = g.redact_input_text("version: 12.1").unwrap();
+        assert_eq!(r.text, "version: $1");
     }
 
     #[test]
