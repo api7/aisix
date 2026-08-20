@@ -4,8 +4,10 @@
 //! Implements the design issue's three-layer pipeline for one hardcoded
 //! category (no prototype library resource, no standard risk categories
 //! yet). Pipeline per text segment:
-//!   1. regex finds candidate spans with exact byte offsets
-//!      (dotted number runs, the EDA-version candidate shape);
+//!   1. regex finds candidate spans with exact byte offsets — two
+//!      shapes: dotted number runs (ASCII or fullwidth) and fused
+//!      version tokens (letters+digits in one token, `IC618`); the
+//!      layer is deliberately broad, precision lives in ② and ③;
 //!   2. rule scoring ([`rules`]): hotword proximity co-occurrence raises
 //!      a candidate's score, negative patterns lower it, and a double
 //!      threshold resolves decisive candidates right here — high scores
@@ -14,10 +16,11 @@
 //!   3. a context window around each remaining candidate
 //!      (±[`WINDOW_CONTEXT_CHARS`] chars — the keyword-proximity window
 //!      magnitude mainstream DLP engines use, typically 50–300 chars) is
-//!      embedded by the local model and compared, by cosine similarity,
-//!      against the category's prototype vector set (encoded at load
-//!      time; see [`PrototypeStrategy`]); above-threshold candidates are
-//!      rewritten in place to [`MASK_REPLACEMENT`].
+//!      embedded by the local model and scored RELATIVELY against the
+//!      category's positive and negative prototype sets
+//!      (`max_pos − max_neg`; encoded at load time, see
+//!      [`PrototypeStrategy`] / [`PrototypeSet`]); above-threshold
+//!      candidates are rewritten in place to [`MASK_REPLACEMENT`].
 //!
 //! Everything not rewritten is returned byte-identical.
 //!
@@ -92,6 +95,8 @@
 //! ONNX Runtime download) with `ORT_LIB_PATH` pointing at a pre-fetched
 //! library (see `ort-sys` `build/vars.rs`).
 
+#[cfg(test)]
+mod adversarial_corpus;
 mod rules;
 
 use std::collections::BTreeMap;
@@ -116,8 +121,11 @@ use rules::{RuleDecision, RuleScorer};
 /// `tokenizer.json`). Set → the server bootstrap loads and injects the
 /// guardrail; unset → the feature is completely inert.
 pub const MODEL_DIR_ENV: &str = "GUARDRAIL_LOCAL_MODEL_DIR";
-/// Optional cosine-similarity gate override (default: the configured
-/// strategy's calibrated `default_threshold`).
+/// Optional score-gate override (default: the configured strategy's
+/// calibrated `default_threshold`). NOTE the scale depends on the
+/// strategy: `description` scores absolute cosine in [-1, 1]; the
+/// sample strategies score the relative margin `max_pos − max_neg`
+/// in [-2, 2].
 pub const THRESHOLD_ENV: &str = "GUARDRAIL_LOCAL_MODEL_THRESHOLD";
 /// Optional inference-lane count (default 1, clamped to
 /// [`MAX_LANES`]). Each lane is one ONNX session — one more core the
@@ -148,15 +156,26 @@ const MAX_LANES: usize = 32;
 /// compile-time constant.
 const PROTOTYPE_DESCRIPTION_ZH: &str = "EDA 软件的版本号";
 
-/// Sample sentences for the sample-based prototype strategies — the v2
-/// "customer supplies example sentences" path from the design issue,
-/// collapsed to a compile-time constant set (synthesized; real customer
-/// corpus not yet available). Coverage is by SHAPE, not by string: the
-/// upgrade/rollback phrasing and the tool-name+version phrasing that the
-/// single description prototype measurably missed, in Chinese and
-/// English. Tool names and numbers are deliberately DIFFERENT from the
-/// probe corpus (Spectre/Xcelium here, Virtuoso in the probes) so the
-/// calibration probes measure shape generalization, not string overlap.
+/// Positive sample sentences for the sample-based prototype strategies —
+/// the v2 "customer supplies example sentences" path from the design
+/// issue, collapsed to a compile-time constant set (synthesized; real
+/// customer corpus not yet available). Coverage is by SHAPE, not by
+/// string: upgrade/rollback phrasing, tool-name+version phrasing,
+/// anchor-free "we run X" phrasing, and FUSED version tokens, in Chinese
+/// and English. Tool names and numbers are deliberately DIFFERENT from
+/// the probe/adversarial corpora (Spectre/Genus and invented fused
+/// tokens here; Virtuoso/Xcelium-family tokens in the corpora) so the
+/// calibration probes measure shape generalization, not string overlap —
+/// which is also why the MVP's `Xcelium 23.09` sample left this list
+/// when `XCELIUM2309` entered the adversarial corpus.
+///
+/// Scale note: 24 positives + 78 negatives (~1:3). The ecosystem's
+/// published floor for trainable classifiers is 50–500 positives and
+/// ≥150 negatives at ~1:3 (Microsoft Purview,
+/// <https://learn.microsoft.com/en-us/purview/trainable-classifiers-get-started-with>);
+/// this set moves from 10:0 to a meaningful fraction of that floor and
+/// the ratio it prescribes, and the rest is the evaluation-set work
+/// (AISIX-Cloud#1332), not more synthesis.
 const PROTOTYPE_SAMPLES: &[&str] = &[
     "布局布线工具升级到 21.15 之后跑得快多了",
     "仿真器回退到 19.03 才恢复正常",
@@ -164,22 +183,142 @@ const PROTOTYPE_SAMPLES: &[&str] = &[
     "综合工具的版本号是 2020.09,不要外传",
     "Spectre 23.1.0 在这个工艺角下会崩溃",
     "签核工具装的是 22.4 这个版本",
+    "时序工具从 18.1 换到 20.2 就没再出过问题",
+    "现在生产环境跑的是 16.3 那个版本的布线器",
+    "形式验证工具还停在 10.6,太老了",
+    "装了 31.2 之后 license 就报错",
+    "版图工具的补丁版本是 QSV302",
+    "提取工具升级到 QRC1921 以后内存翻倍",
+    "DRC 用的签核包是 K-2019.06-SP1",
+    "那台机器装的仿真器是 v14.2-p004",
     "We upgraded the place-and-route tool to 21.15",
     "The simulator crashed on release 6.2.1",
-    "Xcelium 23.09 fails on this testbench",
     "The sign-off tool version is 2020.09",
+    "Genus 19.13 fails on this floorplan",
+    "the flow needs tool build 30.4 or newer",
+    "we rolled back to 17.0 after the crash",
+    "they still run SPECTRE181 in production",
+    "the timing box has PT-2021.06-SP3 installed",
+    "our extraction flow is pinned to v19.1-s022_2",
+    "the older 14.7 install still passes DRC",
 ];
 
-/// How the category's prototype vector set is built at load time.
+/// Negative sample sentences: numbers that LOOK like the candidate shape
+/// but carry non-software semantics. This is the other half of the
+/// relative scoring form — under the absolute form the model had to
+/// clear a fixed bar with no notion of what "not a version" looks like,
+/// and the measured margin on anchor-free windows was NEGATIVE (the MVP
+/// finding, reproduced on the adversarial corpus). Thirteen semantic
+/// families × 6, zh+en: math constants, exchange rates / finance, body
+/// measurements, dates, quantities/statistics, spelled durations,
+/// physical quantities, dimensions, process nodes, scores/ratios,
+/// section numbers, clock times, and bare number sequences (data rows /
+/// log dumps — the driving corpus is dense compile logs, and without
+/// this family a context-free run of numbers sits EXACTLY on the
+/// relative-score decision boundary, where int8 noise picks the sign).
+/// Numbers are disjoint from the corpora and the positive set.
+const NEGATIVE_PROTOTYPE_SAMPLES: &[&str] = &[
+    "圆周率约是 3.1416",
+    "自然常数 e 约等于 2.71828",
+    "黄金分割比大约是 1.618",
+    "根号二约等于 1.41421",
+    "pi is roughly 3.1416",
+    "the golden ratio is about 1.618",
+    "今天美元兑人民币汇率是 7.18",
+    "欧元汇率涨到 7.92",
+    "股价收在 24.35",
+    "年化利率是 3.65",
+    "the exchange rate moved to 7.15",
+    "the stock closed at 132.5 today",
+    "早上量体温 36.6,正常",
+    "孩子昨晚烧到 39.2",
+    "空腹血糖 5.2,没问题",
+    "体重降到 62.5 公斤了",
+    "her temperature was 37.8 last night",
+    "resting heart rate dropped to 58.5",
+    "会议改到 9.28 上午十点",
+    "项目截止日期是 2026.10.31",
+    "10.1 假期值班表出来了",
+    "发票日期写的 2025.12.05",
+    "the review is scheduled for 11.20",
+    "the contract was signed on 2026.4.30",
+    "这批晶圆一共 8.5 万片",
+    "平均每天触发 4.5 次告警",
+    "样本均值 6.35,标准差 1.2",
+    "库存还剩 3.5 箱",
+    "we shipped 2.4 million units last year",
+    "the average queue depth is 5.5",
+    "排队等了 3.5 个星期",
+    "面试聊了 1.5 个钟头",
+    "整个流程走了 4.5 个月",
+    "assembly 那步要等 2.5 个工作日",
+    "it took 2.5 weeks end to end",
+    "the outage lasted 3.5 days",
+    "结温升到 88.5 度就限频",
+    "内核电压是 0.72 伏",
+    "整机功耗 5.5 瓦左右",
+    "环境温度 23.5 度恒温",
+    "the die temperature hit 95.5 degrees",
+    "supply voltage sagged to 0.66 volts",
+    "die 面积是 15.21 平方毫米",
+    "键合线直径 25.4 微米",
+    "这条走线长 3.6 毫米",
+    "硅片厚度 0.775 毫米",
+    "the package is 10.5 by 10.5 millimeters",
+    "the wafer is 0.725 millimeters thick",
+    "主力工艺切到 N2 了",
+    "这个块还在 N16 上",
+    "新项目评估 4nm 的 PDK",
+    "老产品线停留在 14nm",
+    "the pilot line runs N6",
+    "we are qualifying the 3nm flow",
+    "客户满意度打了 9.2 分",
+    "评审平均分 8.65",
+    "基准测试跑分 456.5",
+    "良率这周爬到 91.5",
+    "the benchmark scores 78.5 overall",
+    "approval rating sits at 62.5",
+    "详见第 2.4 节",
+    "规范的 5.3.1 条款有说明",
+    "图 4.2 画的是数据通路",
+    "表 6.1 列出了引脚定义",
+    "see section 3.4.2 of the spec",
+    "chapter 12.3 covers the protocol",
+    "日志停在 11:42:07.333",
+    "[07:03:59.001] job finished",
+    "晚上 20.45 的班车",
+    "闹钟定在 6.30",
+    "the cron fires at 23.55 every night",
+    "the shuttle leaves at 8.15",
+    "0.2 0.4 0.6 0.8 1.0 1.2",
+    "数据列是 2.2 4.4 6.6 8.8",
+    "表里那列全是 1.3 2.6 3.9 5.2 这种数",
+    "the raw dump reads 0.5 1.5 2.5 3.5 4.5",
+    "column two is 9.1 8.2 7.3 6.4",
+    "坐标序列 10.5 20.5 30.5 40.5",
+];
+
+/// How the category's prototype vector sets are built at load time.
+///
+/// All three strategies score through the same relative form
+/// ([`PrototypeSet::score`]): `max_pos − max_neg`, with an empty
+/// negative set contributing 0 — so `Description` (no negative
+/// material) keeps its MVP absolute-cosine semantics unchanged, and the
+/// sample strategies gain the contrastive term the adversarial corpus
+/// showed the absolute form cannot do without (its measured margin on
+/// anchor-free windows was negative under EVERY positive-only
+/// construction).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrototypeStrategy {
-    /// One vector: the embedded category description (the MVP form).
+    /// One positive vector: the embedded category description (the MVP
+    /// form). No negative set.
     Description,
-    /// One vector per [`PROTOTYPE_SAMPLES`] entry; a window scores by its
-    /// MAX cosine over the set (nearest sample decides).
+    /// One vector per [`PROTOTYPE_SAMPLES`] / [`NEGATIVE_PROTOTYPE_SAMPLES`]
+    /// entry; a window scores by max-cosine per set, nearest sample on
+    /// each side decides.
     SampleMax,
-    /// One vector: the L2-renormalized mean of the sample embeddings; a
-    /// window scores against the class centroid.
+    /// One vector per side: the L2-renormalized mean of each sample set;
+    /// a window scores against the two class centroids.
     SampleCentroid,
 }
 
@@ -203,28 +342,25 @@ impl PrototypeStrategy {
         }
     }
 
-    /// Cosine gate calibrated per strategy with this module's
-    /// `#[ignore]` probe matrix (cosine absolute scale shifts with the
-    /// prototype construction, so one shared default would be wrong for
-    /// two of the three). Measured bands (granite-97m int8):
-    /// - `Description` keeps the MVP calibration: acceptance positive
-    ///   ~0.90, every probed negative ≤0.76, hard positives 0.75–0.79
-    ///   below the gate — the measured single-prototype recall gap
-    ///   (negative hard margin in all five phrasings swept) that
-    ///   layer ② now covers.
-    /// - `SampleMax`: hard positives ≥0.8316, negatives ≤0.7867
-    ///   (hard margin +0.0449); 0.82 sits precision-leaning in that
-    ///   band — 0.033 above the negative ceiling.
-    /// - `SampleCentroid`: hard positives ≥0.8616, negatives ≤0.8370
-    ///   (hard margin +0.0246); 0.85 likewise.
+    /// Score gate calibrated per strategy with this module's
+    /// `#[ignore]` probe matrix and the adversarial-corpus report (the
+    /// score SCALE shifts with the prototype construction, so one
+    /// shared default would be wrong for two of the three).
+    /// - `Description` keeps the MVP absolute-cosine calibration
+    ///   (no negative set ⇒ score IS the positive cosine): acceptance
+    ///   positive ~0.90, every probed negative ≤0.76.
+    /// - `SampleMax` / `SampleCentroid` gate the RELATIVE margin
+    ///   `max_pos − max_neg`; the calibrated values are pinned by the
+    ///   probe matrix so model/sample drift fails the calibration test
+    ///   instead of silently shifting behavior.
     ///
     /// All three lean precision — a mask false-positive corrupts user
     /// content; layer ② carries recall for anchored shapes.
     fn default_threshold(self) -> f32 {
         match self {
             Self::Description => 0.80,
-            Self::SampleMax => 0.82,
-            Self::SampleCentroid => 0.85,
+            Self::SampleMax => 0.0,
+            Self::SampleCentroid => 0.0,
         }
     }
 }
@@ -239,9 +375,26 @@ impl Default for PrototypeStrategy {
     }
 }
 
-/// Candidate shape: a dotted number run (`12.1`, `2022.4`, `6.1.8`).
-/// Plain integers are out of MVP scope.
-const CANDIDATE_PATTERN: &str = r"\d+(?:\.\d+)+";
+/// Candidate shape A: a dotted number run (`12.1`, `2022.4`, `6.1.8`),
+/// ASCII or fullwidth (`１２．１` — Chinese-IME phrasing is accidental,
+/// not adversarial, so it is in scope). Plain integers stay out of
+/// scope.
+const CANDIDATE_PATTERN: &str = r"[0-9０-９]+(?:[.．][0-9０-９]+)+";
+
+/// Candidate shape B: a fused version token — a maximal
+/// `[A-Za-z0-9._-]` run mixing ASCII letters and digits. Real EDA
+/// corpora fuse the version into one token the dotted shape cannot see
+/// (`IC618`, `ICADV12.3`, `XCELIUM2309`, `MMSIM151`, `E-2010.12-ICC-SP2`,
+/// `v16.12-s051_1`, `T-2022.03`, `20.09-s003`) — the adversarial-corpus
+/// finding this widens layer ① for. The shape is deliberately BROAD
+/// (`7nm`, `N5`, `sha256`-ish identifiers all qualify): a garbage
+/// candidate costs a rule score in microseconds and at worst one model
+/// call, while an invisible candidate is an unconditional leak — layers
+/// ②③ exist precisely so ① does not have to be precise. Leading and
+/// trailing `[._-]` are trimmed (sentence punctuation), and a token
+/// must mix letters AND digits — pure words and pure numbers fall back
+/// to shape A or drop out.
+const FUSED_TOKEN_PATTERN: &str = r"[A-Za-z0-9._-]+";
 
 /// Context chars kept on each side of a candidate when cutting the
 /// window the model judges.
@@ -315,16 +468,18 @@ impl LocalModelConfig {
     /// default rather than failing boot — the gate is a tuning knob, not
     /// a correctness one. The range check matters: `"NaN"` parses as a
     /// valid f32 and would make `score >= threshold` always false — a
-    /// configured-looking guardrail that silently never masks. Lanes and
-    /// the rule window follow the same lenient rule (malformed →
-    /// default).
+    /// configured-looking guardrail that silently never masks. The
+    /// accepted range is the RELATIVE-score span [-2, 2] (see
+    /// [`THRESHOLD_ENV`]); `description`'s meaningful values are its
+    /// [0, 1] subset. Lanes and the rule window follow the same lenient
+    /// rule (malformed → default).
     pub fn from_env() -> Option<Self> {
         let model_dir = PathBuf::from(std::env::var_os(MODEL_DIR_ENV)?);
         let prototypes = PrototypeStrategy::parse(std::env::var(PROTOTYPES_ENV).ok().as_deref());
         let threshold = std::env::var(THRESHOLD_ENV)
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
-            .filter(|t| t.is_finite() && (0.0..=1.0).contains(t))
+            .filter(|t| t.is_finite() && (-2.0..=2.0).contains(t))
             .unwrap_or_else(|| prototypes.default_threshold());
         let lanes = parse_lanes(std::env::var(LANES_ENV).ok().as_deref());
         let rule_window = std::env::var(RULE_WINDOW_ENV)
@@ -500,14 +655,37 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-/// A window's score against the prototype set: max cosine over the set
-/// (with one vector this IS plain cosine, so all three strategies score
-/// through here).
-fn prototype_score(prototypes: &[Vec<f32>], v: &[f32]) -> f32 {
+/// Max cosine over a prototype set (nearest prototype decides).
+fn max_cosine(prototypes: &[Vec<f32>], v: &[f32]) -> f32 {
     prototypes
         .iter()
         .map(|p| cosine(p, v))
         .fold(f32::NEG_INFINITY, f32::max)
+}
+
+/// The category's prototype material: a positive set and a negative set
+/// (either may be a single centroid; see [`PrototypeStrategy`]).
+struct PrototypeSet {
+    positive: Vec<Vec<f32>>,
+    negative: Vec<Vec<f32>>,
+}
+
+impl PrototypeSet {
+    /// The relative scoring form: `max_pos − max_neg`. Nearest-prototype
+    /// max-over-set on each side; an empty negative set contributes 0,
+    /// which collapses to the MVP's absolute form for `Description`.
+    /// This is the standard contrastive nearest-prototype shape (the
+    /// commercial precedent for sample-set semantic matching, Azure AI
+    /// Content Safety custom categories, likewise scores candidate
+    /// classes against each other rather than against a fixed bar).
+    fn score(&self, v: &[f32]) -> f32 {
+        let pos = max_cosine(&self.positive, v);
+        if self.negative.is_empty() {
+            pos
+        } else {
+            pos - max_cosine(&self.negative, v)
+        }
+    }
 }
 
 /// L2-renormalized mean of a set of L2-normalized vectors — the
@@ -538,13 +716,71 @@ fn centroid(vectors: &[Vec<f32>]) -> Vec<f32> {
 /// per-pass budget so they cannot starve legitimate candidates either.
 const MAX_CANDIDATE_SPAN_BYTES: usize = 64;
 
-/// Candidate spans (byte ranges) in `text`, in order. Spans longer than
-/// [`MAX_CANDIDATE_SPAN_BYTES`] are not candidates (see the constant).
-fn candidate_spans(re: &Regex, text: &str) -> Vec<Range<usize>> {
-    re.find_iter(text)
-        .map(|m| m.range())
-        .filter(|s| s.len() <= MAX_CANDIDATE_SPAN_BYTES)
-        .collect()
+/// Layer ①: the compiled candidate generator — the two shapes above,
+/// merged and de-overlapped.
+struct CandidateFinder {
+    dotted: Regex,
+    fused: Regex,
+}
+
+impl CandidateFinder {
+    fn new() -> Self {
+        let compile = |p: &str| Regex::new(p).expect("candidate pattern must compile");
+        Self {
+            dotted: compile(CANDIDATE_PATTERN),
+            fused: compile(FUSED_TOKEN_PATTERN),
+        }
+    }
+
+    /// Candidate spans (byte ranges) in `text`, ascending and
+    /// non-overlapping. Fused tokens win overlaps with dotted runs (the
+    /// dotted digits of `ICADV12.3` are PART of the version — masking
+    /// only them leaks the `ICADV` identity, the pre-fix behavior).
+    /// Spans longer than [`MAX_CANDIDATE_SPAN_BYTES`] are not candidates
+    /// (see the constant).
+    fn spans(&self, text: &str) -> Vec<Range<usize>> {
+        let mut spans: Vec<Range<usize>> = self
+            .fused
+            .find_iter(text)
+            .map(|m| trim_token(text, m.range()))
+            .filter(|s| {
+                let token = text[s.clone()].as_bytes();
+                s.len() <= MAX_CANDIDATE_SPAN_BYTES
+                    && token.iter().any(u8::is_ascii_digit)
+                    && token.iter().any(u8::is_ascii_alphabetic)
+            })
+            .collect();
+        // Maximal same-class runs never overlap each other; a dotted run
+        // either sits inside a fused token (drop it — the fused span
+        // masks more) or stands alone. The overlap (not containment)
+        // check also covers mixed-width pathologies (`12．3-s1`), where
+        // trimming could otherwise leave two intersecting spans.
+        for m in self.dotted.find_iter(text) {
+            let r = m.range();
+            if r.len() <= MAX_CANDIDATE_SPAN_BYTES
+                && !spans.iter().any(|s| s.start < r.end && r.start < s.end)
+            {
+                spans.push(r);
+            }
+        }
+        spans.sort_by_key(|s| s.start);
+        spans
+    }
+}
+
+/// Strip leading/trailing `[._-]` from a fused-token match: the char
+/// class must include them mid-token (`E-2010.12-ICC-SP2`), which makes
+/// sentence punctuation stick to a token at the rim (`v16.12-s051_1.`).
+/// ASCII-only, so byte trimming is char-safe.
+fn trim_token(text: &str, mut span: Range<usize>) -> Range<usize> {
+    let bytes = text.as_bytes();
+    while span.start < span.end && matches!(bytes[span.start], b'.' | b'_' | b'-') {
+        span.start += 1;
+    }
+    while span.start < span.end && matches!(bytes[span.end - 1], b'.' | b'_' | b'-') {
+        span.end -= 1;
+    }
+    span
 }
 
 /// The context window around `span`: `ctx` chars on each side, snapped
@@ -582,10 +818,10 @@ fn apply_masks(text: &str, spans: &[Range<usize>]) -> String {
 /// The runtime guardrail. Always-`Allow`; masks via the segment hooks.
 pub struct LocalModelGuardrail {
     embedder: Arc<Embedder>,
-    /// L2-normalized prototype vector set (see [`PrototypeStrategy`]).
-    prototypes: Vec<Vec<f32>>,
+    /// L2-normalized prototype vector sets (see [`PrototypeStrategy`]).
+    prototypes: PrototypeSet,
     threshold: f32,
-    candidate_re: Regex,
+    finder: CandidateFinder,
     /// Layer-② scorer (hotword proximity + negative patterns).
     rules: RuleScorer,
     /// Bounds in-flight `spawn_blocking` inference tasks. Sized to the
@@ -602,16 +838,25 @@ impl LocalModelGuardrail {
     pub fn load(config: &LocalModelConfig) -> Result<Self, LocalModelError> {
         let started = Instant::now();
         let embedder = Embedder::load(&config.model_dir, config.lanes)?;
-        let embed_samples = || {
-            PROTOTYPE_SAMPLES
+        let embed_all = |samples: &[&str]| {
+            samples
                 .iter()
                 .map(|s| embedder.embed(s))
-                .collect::<Result<Vec<_>, _>>()
+                .collect::<Result<Vec<_>, LocalModelError>>()
         };
         let prototypes = match config.prototypes {
-            PrototypeStrategy::Description => vec![embedder.embed(PROTOTYPE_DESCRIPTION_ZH)?],
-            PrototypeStrategy::SampleMax => embed_samples()?,
-            PrototypeStrategy::SampleCentroid => vec![centroid(&embed_samples()?)],
+            PrototypeStrategy::Description => PrototypeSet {
+                positive: vec![embedder.embed(PROTOTYPE_DESCRIPTION_ZH)?],
+                negative: Vec::new(),
+            },
+            PrototypeStrategy::SampleMax => PrototypeSet {
+                positive: embed_all(PROTOTYPE_SAMPLES)?,
+                negative: embed_all(NEGATIVE_PROTOTYPE_SAMPLES)?,
+            },
+            PrototypeStrategy::SampleCentroid => PrototypeSet {
+                positive: vec![centroid(&embed_all(PROTOTYPE_SAMPLES)?)],
+                negative: vec![centroid(&embed_all(NEGATIVE_PROTOTYPE_SAMPLES)?)],
+            },
         };
         tracing::info!(
             model_dir = %config.model_dir.display(),
@@ -619,7 +864,8 @@ impl LocalModelGuardrail {
             lanes = config.lanes,
             rule_window = config.rule_window,
             strategy = ?config.prototypes,
-            prototypes = prototypes.len(),
+            positive_prototypes = prototypes.positive.len(),
+            negative_prototypes = prototypes.negative.len(),
             load_ms = started.elapsed().as_millis() as u64,
             "local-model guardrail loaded (category: EDA software version)"
         );
@@ -627,7 +873,7 @@ impl LocalModelGuardrail {
             embedder: Arc::new(embedder),
             prototypes,
             threshold: config.threshold,
-            candidate_re: Regex::new(CANDIDATE_PATTERN).expect("candidate pattern must compile"),
+            finder: CandidateFinder::new(),
             rules: RuleScorer::new(config.rule_window),
             permits: Arc::new(tokio::sync::Semaphore::new(config.lanes)),
         })
@@ -670,7 +916,7 @@ impl LocalModelGuardrail {
         let mut hits: Vec<Range<usize>> = Vec::new();
         let (mut rule_masked, mut rule_passed, mut model_judged) = (0u32, 0u32, 0u32);
         let mut over_budget = false;
-        let spans = candidate_spans(&self.candidate_re, text);
+        let spans = self.finder.spans(text);
         if spans.len() > MAX_RULE_SCORED_SPANS_PER_SEGMENT {
             tracing::warn!(
                 candidates = spans.len(),
@@ -701,7 +947,7 @@ impl LocalModelGuardrail {
                     let window = text[window_bounds(text, &span, WINDOW_CONTEXT_CHARS)].to_owned();
                     match self.embed_window(window).await {
                         Ok(vector) => {
-                            let score = prototype_score(&self.prototypes, &vector);
+                            let score = self.prototypes.score(&vector);
                             tracing::debug!(
                                 score,
                                 threshold = self.threshold,
@@ -799,16 +1045,58 @@ impl Guardrail for LocalModelGuardrail {
 mod tests {
     use super::*;
 
-    fn re() -> Regex {
-        Regex::new(CANDIDATE_PATTERN).unwrap()
+    fn spans_of(text: &str) -> Vec<Range<usize>> {
+        CandidateFinder::new().spans(text)
+    }
+
+    fn values_of(text: &str) -> Vec<&str> {
+        spans_of(text).into_iter().map(|s| &text[s]).collect()
     }
 
     #[test]
     fn candidate_spans_find_dotted_runs_only() {
         let text = "版本是 12.1,构建号 2022.4.1,端口 8080";
-        let spans = candidate_spans(&re(), text);
-        let values: Vec<&str> = spans.iter().map(|s| &text[s.clone()]).collect();
-        assert_eq!(values, vec!["12.1", "2022.4.1"]);
+        // Plain integers are still not candidates.
+        assert_eq!(values_of(text), vec!["12.1", "2022.4.1"]);
+    }
+
+    #[test]
+    fn candidate_spans_find_fused_tokens_whole() {
+        // The adversarial-corpus shapes: version fused with the tool
+        // name / letter affixes into ONE token — the candidate is the
+        // whole token, not its dotted substring.
+        for (text, want) in [
+            ("Virtuoso IC618 又崩了", "IC618"),
+            ("版图工具用的是 ICADV12.3", "ICADV12.3"),
+            ("XCELIUM2309 的仿真结果对不上", "XCELIUM2309"),
+            ("MMSIM151 装在新机器上了", "MMSIM151"),
+            ("综合用的 T-2022.03 有已知问题", "T-2022.03"),
+            ("回退到 E-2010.12-ICC-SP2 就不崩了", "E-2010.12-ICC-SP2"),
+            ("装的是 v16.12-s051_1 这个版本", "v16.12-s051_1"),
+            ("hotfix 20.09-s003 已经推送了", "20.09-s003"),
+            ("7nm 工艺下功耗有点高", "7nm"),
+            ("这个块是 N5 工艺的", "N5"),
+        ] {
+            assert_eq!(values_of(text), vec![want], "text: {text}");
+        }
+    }
+
+    #[test]
+    fn candidate_spans_find_fullwidth_dotted_runs() {
+        assert_eq!(values_of("版本是 １２．１,不要外传"), vec!["１２．１"]);
+        // Mixed-width digits with a fullwidth dot still form one run.
+        assert_eq!(values_of("旧版是 ２０２２．4"), vec!["２０２２．4"]);
+    }
+
+    #[test]
+    fn fused_tokens_trim_rim_punctuation() {
+        // Sentence punctuation from the token char class must not stick.
+        assert_eq!(
+            values_of("pinned to v16.12-s051_1."),
+            vec!["v16.12-s051_1"]
+        );
+        // A pure word and a pure dash-number never become fused tokens.
+        assert_eq!(values_of("high-performance run -3.5 offset"), vec!["3.5"]);
     }
 
     #[test]
@@ -818,15 +1106,13 @@ mod tests {
         // so it can neither stall the lane nor starve real candidates.
         let bomb = "1.1".repeat(60); // 180 bytes, single match
         let text = format!("前缀 {bomb} 中缀 12.1 后缀");
-        let spans = candidate_spans(&re(), &text);
-        let values: Vec<&str> = spans.iter().map(|s| &text[s.clone()]).collect();
-        assert_eq!(values, vec!["12.1"]);
+        assert_eq!(values_of(&text), vec!["12.1"]);
     }
 
     #[test]
     fn window_bounds_snap_to_char_boundaries() {
         let text = "这个 EDA 软件的版本是 12.1,请勿外传";
-        let span = candidate_spans(&re(), text).remove(0);
+        let span = spans_of(text).remove(0);
         // A tiny context still lands on char boundaries around CJK.
         let w = window_bounds(text, &span, 3);
         let window = &text[w];
@@ -837,7 +1123,7 @@ mod tests {
     #[test]
     fn window_bounds_clamp_to_text_edges() {
         let text = "12.1 只有后文";
-        let span = candidate_spans(&re(), text).remove(0);
+        let span = spans_of(text).remove(0);
         let w = window_bounds(text, &span, 50);
         assert_eq!(&text[w], text);
     }
@@ -845,7 +1131,7 @@ mod tests {
     #[test]
     fn apply_masks_rewrites_right_to_left() {
         let text = "从 12.1 升到 13.0 了";
-        let spans = candidate_spans(&re(), text);
+        let spans = spans_of(text);
         assert_eq!(apply_masks(text, &spans), "从 *** 升到 *** 了");
     }
 
@@ -900,7 +1186,25 @@ mod tests {
         assert!((c[0] - inv_sqrt2).abs() < 1e-6 && (c[1] - inv_sqrt2).abs() < 1e-6);
         // Max-over-set picks the nearest prototype.
         let set = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
-        assert!((prototype_score(&set, &[0.0, 1.0]) - 1.0).abs() < 1e-6);
+        assert!((max_cosine(&set, &[0.0, 1.0]) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn prototype_set_scores_relatively() {
+        let set = PrototypeSet {
+            positive: vec![vec![1.0, 0.0]],
+            negative: vec![vec![0.0, 1.0]],
+        };
+        // Aligned with the positive prototype: margin +1 − 0.
+        assert!((set.score(&[1.0, 0.0]) - 1.0).abs() < 1e-6);
+        // Aligned with the negative prototype: margin 0 − 1.
+        assert!((set.score(&[0.0, 1.0]) + 1.0).abs() < 1e-6);
+        // No negative material collapses to the absolute form.
+        let desc = PrototypeSet {
+            positive: vec![vec![1.0, 0.0]],
+            negative: Vec::new(),
+        };
+        assert!((desc.score(&[1.0, 0.0]) - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -927,17 +1231,16 @@ mod tests {
         Some(LocalModelGuardrail::load(&cfg).expect("model files present but load failed"))
     }
 
-    /// The MVP probe matrix, re-run for the prototype-set experiment:
-    /// the same 7 probe windows (1 acceptance-style positive, 2 hard
-    /// positives, 4 hard negatives) scored against 5 single-description
-    /// prototype phrasings (the MVP sweep that measured NEGATIVE margin
-    /// in every column) plus the two sample-based strategies. Prints the
-    /// full matrix and each column's hard margin
-    /// (min over hard positives − max over negatives).
-    ///
-    /// The MVP's original 5-phrasing sweep was scratch work; these
-    /// phrasings reconstruct it (the shipped description first) and are
-    /// committed so the experiment stays repeatable.
+    /// The probe matrix, re-run for the relative-scoring form: the same
+    /// 7 probe windows as the MVP sweep (1 acceptance-style positive,
+    /// 2 hard positives, 4 hard negatives) scored against 5
+    /// single-description prototype phrasings (the MVP sweep that
+    /// measured NEGATIVE margin in every column) plus the two
+    /// sample-based strategies, each in BOTH scoring forms — `abs` is
+    /// the old positive-only max cosine, `rel` the shipped
+    /// `max_pos − max_neg`. Prints the full matrix and each column's
+    /// hard margin (min over hard positives − max over negatives) per
+    /// form; the calibration assertion pins the shipped (relative) form.
     #[tokio::test]
     #[ignore = "needs GUARDRAIL_LOCAL_MODEL_DIR with model.onnx + tokenizer.json"]
     async fn probe_similarity_matrix() {
@@ -959,41 +1262,61 @@ mod tests {
             ("NEG", "工艺节点是 0.13um,良率还行"),
         ];
 
-        // Columns: each phrasing as a single-vector prototype set, then
-        // the sample set (max) and its centroid.
-        let mut columns: Vec<(String, Vec<Vec<f32>>)> = Vec::new();
+        let mut columns: Vec<(String, PrototypeSet)> = Vec::new();
         for p in phrasings {
             let v = g.embed_window(p.to_owned()).await.unwrap();
-            columns.push((format!("desc:{p}"), vec![v]));
+            columns.push((
+                format!("desc:{p}"),
+                PrototypeSet {
+                    positive: vec![v],
+                    negative: Vec::new(),
+                },
+            ));
         }
-        let mut samples = Vec::new();
+        let mut pos = Vec::new();
         for s in PROTOTYPE_SAMPLES {
-            samples.push(g.embed_window((*s).to_owned()).await.unwrap());
+            pos.push(g.embed_window((*s).to_owned()).await.unwrap());
         }
-        columns.push(("samples-max".to_owned(), samples.clone()));
-        columns.push(("samples-centroid".to_owned(), vec![centroid(&samples)]));
+        let mut neg = Vec::new();
+        for s in NEGATIVE_PROTOTYPE_SAMPLES {
+            neg.push(g.embed_window((*s).to_owned()).await.unwrap());
+        }
+        columns.push((
+            "samples-max".to_owned(),
+            PrototypeSet {
+                positive: pos.clone(),
+                negative: neg.clone(),
+            },
+        ));
+        columns.push((
+            "samples-centroid".to_owned(),
+            PrototypeSet {
+                positive: vec![centroid(&pos)],
+                negative: vec![centroid(&neg)],
+            },
+        ));
 
-        for (name, prototypes) in &columns {
-            let mut hard_pos_min = f32::INFINITY;
-            let mut neg_max = f32::NEG_INFINITY;
+        for (name, set) in &columns {
+            let mut margins = [(f32::INFINITY, f32::NEG_INFINITY); 2]; // abs, rel
             println!("── column: {name}");
             for (kind, text) in windows {
                 let v = g.embed_window(text.to_owned()).await.unwrap();
-                let s = prototype_score(prototypes, &v);
-                println!("  {kind} {s:.4}  {text}");
-                match kind {
-                    "POS" => hard_pos_min = hard_pos_min.min(s),
-                    "NEG" => neg_max = neg_max.max(s),
-                    _ => {}
+                let abs = max_cosine(&set.positive, &v);
+                let rel = set.score(&v);
+                println!("  {kind} abs {abs:.4} rel {rel:+.4}  {text}");
+                for (m, s) in margins.iter_mut().zip([abs, rel]) {
+                    match kind {
+                        "POS" => m.0 = m.0.min(s),
+                        "NEG" => m.1 = m.1.max(s),
+                        _ => {}
+                    }
                 }
             }
-            println!(
-                "  hard margin (min POS − max NEG): {:+.4}",
-                hard_pos_min - neg_max
-            );
+            let [abs_m, rel_m] = margins.map(|(p, n)| p - n);
+            println!("  hard margin (min POS − max NEG): abs {abs_m:+.4} rel {rel_m:+.4}");
 
             // Pin the calibration contract for the sample strategies:
-            // the margin the experiment claims stays open, and the
+            // the relative margin the fix claims stays open, and the
             // shipped default gate sits strictly inside it. The
             // description columns stay unasserted — their negative
             // margin is the documented MVP finding, not a contract.
@@ -1003,9 +1326,10 @@ mod tests {
                 _ => None,
             };
             if let Some(gate) = gate {
+                let (rel_pos_min, rel_neg_max) = margins[1];
                 assert!(
-                    neg_max < gate && gate <= hard_pos_min,
-                    "{name}: default gate {gate} outside the measured band ({neg_max:.4}, {hard_pos_min:.4}]"
+                    rel_neg_max < gate && gate <= rel_pos_min,
+                    "{name}: default gate {gate} outside the measured relative band ({rel_neg_max:.4}, {rel_pos_min:.4}]"
                 );
             }
         }
@@ -1020,7 +1344,13 @@ mod tests {
     async fn candidate_flood_releases_the_tail() {
         let Some(g) = load_from_env() else { return };
         let flood = "1.1 ".repeat(MAX_RULE_SCORED_SPANS_PER_SEGMENT);
-        let text = format!("{flood}这个 EDA 软件的版本是 12.1");
+        // Padding wider than the ±50-char context window between the
+        // flood and the bait sentence: the model judges WINDOWS, so a
+        // pre-cap flood span whose window overlaps the bait would be
+        // (semantically correctly!) masked, and the test would measure
+        // window contamination instead of the cap. The padding word is
+        // letters-only — not a candidate.
+        let text = format!("{flood}{} 这个 EDA 软件的版本是 12.1", "x".repeat(60));
         let outcome = g.moderate_input_segments(&[text]).await;
         assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
         assert!(
@@ -1043,7 +1373,12 @@ mod tests {
                 "我们把仿真工具升级到 2022.4 之后速度快了很多",
                 "我们把仿真工具升级到 *** 之后速度快了很多",
             ),
-            ("Virtuoso IC6.1.8 出现了崩溃", "Virtuoso IC*** 出现了崩溃"),
+            // Whole-token rewrite: the fused `IC6.1.8` is ONE candidate
+            // now, so the tool-fused prefix no longer survives (the MVP
+            // masked only the dotted digits: `Virtuoso IC***`).
+            ("Virtuoso IC6.1.8 出现了崩溃", "Virtuoso *** 出现了崩溃"),
+            ("Virtuoso IC618 又崩了", "Virtuoso *** 又崩了"),
+            ("版本是 １２．１,不要外传", "版本是 ***,不要外传"),
         ];
         for (input, want) in masked_cases {
             let outcome = g.moderate_input_segments(&[input.to_owned()]).await;
@@ -1058,6 +1393,9 @@ mod tests {
             "服务器的 IP 地址是 10.2.255.1",
             "圆周率约等于 3.14159",
             "工艺节点是 0.13um,良率还行",
+            // The Chinese-unit / timestamp defect classes this PR fixes.
+            "整个 build 花了 45.5 秒",
+            "[10:23:45.123] build started",
         ];
         for input in passthrough_cases {
             let outcome = g.moderate_input_segments(&[input.to_owned()]).await;
