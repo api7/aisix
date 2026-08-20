@@ -267,7 +267,9 @@ async fn dispatch(
 
     // Buffer the body so the JSON-RPC method can be inspected, then rebuilt for
     // the gateway. The global body-limit layer has already capped the size.
-    let (parts, body) = request.into_parts();
+    // `parts` is mutable so the input mask write-back below can refresh
+    // Content-Length when it changes the body.
+    let (mut parts, body) = request.into_parts();
     let bytes = match to_bytes(
         body,
         crate::error::body_read_cap(state.request_body_limit_bytes),
@@ -354,6 +356,8 @@ async fn dispatch(
                     Duration::ZERO,
                     false,
                     Vec::new(),
+                    crate::redact::RedactionCounts::new(),
+                    None,
                     trace,
                     /* dispatched */ false,
                 );
@@ -427,12 +431,86 @@ async fn dispatch(
                 Duration::ZERO,
                 true,
                 monitor_hits,
+                crate::redact::RedactionCounts::new(),
+                None,
                 trace,
                 /* dispatched */ false,
             );
             return jsonrpc_guardrail_block(rpc_id, "tool call", guardrail_name.as_deref());
         }
     }
+
+    // Content capture opt-in (AISIX-Cloud#1330): the largest cap any
+    // full-content exporter requests, same gate as the LLM handlers.
+    // Resolved before the write-backs so the response is buffered when
+    // capture needs it even without a guardrail chain.
+    let capture_cap = if is_tool_call {
+        aisix_obs::content_capture_cap(
+            snapshot
+                .observability_exporters
+                .entries()
+                .iter()
+                .map(|e| &e.value),
+        )
+    } else {
+        None
+    };
+
+    // Input mask write-back (AISIX-Cloud#1330): rewrite the string leaves
+    // under `params.arguments`, splicing on the raw bytes so every byte
+    // outside a masked span reaches the gateway verbatim (`json_splice`).
+    // Runs AFTER the block check — block rules judge the original text —
+    // and only when the chain has a sync redactor (kind=pii mask rules).
+    let mut redaction_counts = crate::redact::RedactionCounts::new();
+    let bytes = match &guardrail_chain {
+        Some(chain) if aisix_guardrails::Guardrail::redacts_input(chain) => {
+            match rewrite_tool_arguments(chain, &bytes) {
+                Ok(None) => bytes,
+                Ok(Some((rewritten, counts))) => {
+                    crate::redact::merge_counts(&mut redaction_counts, counts);
+                    // The body length changed; the inner service must not
+                    // trust a stale Content-Length.
+                    parts.headers.insert(
+                        axum::http::header::CONTENT_LENGTH,
+                        axum::http::HeaderValue::from(rewritten.len()),
+                    );
+                    axum::body::Bytes::from(rewritten)
+                }
+                Err(err) => {
+                    // Structurally impossible (the body already parsed as
+                    // JSON for the peek) — fail closed rather than forward
+                    // content the operator's mask policy should have hidden.
+                    tracing::warn!(
+                        tool = %mcp_tool,
+                        error = %err,
+                        "mcp input mask splice failed; blocking tool call",
+                    );
+                    emit_tool_call_usage(
+                        state,
+                        &snapshot,
+                        &auth,
+                        request_id,
+                        &mcp_server,
+                        &mcp_tool,
+                        StatusCode::OK.as_u16(),
+                        Duration::ZERO,
+                        true,
+                        monitor_hits,
+                        crate::redact::RedactionCounts::new(),
+                        None,
+                        trace,
+                        /* dispatched */ false,
+                    );
+                    return jsonrpc_guardrail_block(rpc_id, "tool call", None);
+                }
+            }
+        }
+        _ => bytes,
+    };
+    // Post-mask by construction: cloned AFTER the write-back above, so a
+    // capturing exporter can never archive a value the mask removed
+    // (same ordering rule as the LLM path — mask first, capture after).
+    let captured_args = capture_cap.map(|_| bytes.clone());
 
     // Scope the gateway to the tools this caller's key permits — resolved
     // from the key together with the environment/team MCP access policies —
@@ -479,11 +557,14 @@ async fn dispatch(
     };
     let latency = started.elapsed();
 
-    // Output guardrails: scan the tool result before returning it. The response
-    // body is only buffered when a guardrail chain is attached.
-    let response = if let Some(chain) = &guardrail_chain {
-        let (resp_parts, resp_body) = response.into_parts();
-        let resp_bytes = match to_bytes(
+    // Output guardrails + mask write-back: scan the tool result before
+    // returning it, rewriting masked spans in place. The response body is
+    // buffered when a guardrail chain is attached OR a full-content
+    // exporter wants the result captured.
+    let mut captured_result: Option<axum::body::Bytes> = None;
+    let response = if guardrail_chain.is_some() || capture_cap.is_some() {
+        let (mut resp_parts, resp_body) = response.into_parts();
+        let mut resp_bytes = match to_bytes(
             resp_body,
             crate::error::body_read_cap(state.request_body_limit_bytes),
         )
@@ -494,31 +575,53 @@ async fn dispatch(
                 return (StatusCode::BAD_GATEWAY, "invalid upstream response").into_response()
             }
         };
-        if let Some(guardrail_name) =
-            output_guardrail_block(chain, &resp_bytes, &mcp_tool, &mut monitor_hits).await
-        {
-            emit_tool_call_usage(
-                state,
-                &snapshot,
-                &auth,
-                request_id,
-                &mcp_server,
-                &mcp_tool,
-                StatusCode::OK.as_u16(),
-                latency,
-                true,
-                monitor_hits,
-                trace,
-                /* dispatched */ true,
-            );
-            return jsonrpc_guardrail_block(rpc_id, "tool result", guardrail_name.as_deref());
+        if let Some(chain) = &guardrail_chain {
+            match apply_output_guardrails(chain, &resp_bytes, &mcp_tool, &mut monitor_hits).await {
+                ToolResultOutcome::Block(guardrail_name) => {
+                    emit_tool_call_usage(
+                        state,
+                        &snapshot,
+                        &auth,
+                        request_id,
+                        &mcp_server,
+                        &mcp_tool,
+                        StatusCode::OK.as_u16(),
+                        latency,
+                        true,
+                        monitor_hits,
+                        redaction_counts,
+                        None,
+                        trace,
+                        /* dispatched */ true,
+                    );
+                    return jsonrpc_guardrail_block(
+                        rpc_id,
+                        "tool result",
+                        guardrail_name.as_deref(),
+                    );
+                }
+                ToolResultOutcome::Allow(Some((rewritten, counts))) => {
+                    crate::redact::merge_counts(&mut redaction_counts, counts);
+                    resp_parts.headers.insert(
+                        axum::http::header::CONTENT_LENGTH,
+                        axum::http::HeaderValue::from(rewritten.len()),
+                    );
+                    resp_bytes = axum::body::Bytes::from(rewritten);
+                }
+                ToolResultOutcome::Allow(None) => {}
+            }
         }
+        // Post-mask by construction — cloned after the write-back above.
+        captured_result = capture_cap.map(|_| resp_bytes.clone());
         Response::from_parts(resp_parts, Body::from(resp_bytes))
     } else {
         response
     };
 
     if is_tool_call {
+        let capture = capture_cap.map(|cap| {
+            tool_call_capture(cap, captured_args.as_deref(), captured_result.as_deref())
+        });
         emit_tool_call_usage(
             state,
             &snapshot,
@@ -530,6 +633,8 @@ async fn dispatch(
             latency,
             false,
             monitor_hits,
+            redaction_counts,
+            capture.as_ref(),
             trace,
             /* dispatched */ true,
         );
@@ -537,18 +642,77 @@ async fn dispatch(
     response
 }
 
-/// Run the output guardrail chain over an MCP tool result. Returns `Some(_)` to
-/// block — the inner value is the firing guardrail's name, or `None` for a
-/// fail-closed block on a body that cannot be parsed — and `None` to allow. The
-/// tool result's text is fed to `check_output` as assistant text, the same hook
-/// the LLM response path uses; a protocol-level error envelope (no `result`) has
-/// nothing to scan and is allowed.
-async fn output_guardrail_block(
+/// Splice-rewrite the string leaves under `params.arguments` of a
+/// `tools/call` body through the chain's input redactor (AISIX-Cloud#1330).
+/// `Ok(None)` = nothing masked, keep the original bytes.
+fn rewrite_tool_arguments(
+    chain: &aisix_guardrails::GuardrailChain,
+    body: &[u8],
+) -> Result<Option<(Vec<u8>, crate::redact::RedactionCounts)>, crate::json_splice::SpliceError> {
+    let mut counts = crate::redact::RedactionCounts::new();
+    let out = crate::json_splice::rewrite_string_values(
+        body,
+        |path| {
+            path.first().is_some_and(|s| s.is_key("params"))
+                && path.get(1).is_some_and(|s| s.is_key("arguments"))
+        },
+        |text| {
+            aisix_guardrails::Guardrail::redact_input_text(chain, text).map(|r| {
+                crate::redact::merge_counts(&mut counts, r.counts);
+                r.text
+            })
+        },
+    )?;
+    Ok(out.map(|bytes| (bytes, counts)))
+}
+
+/// The post-mask content-capture pair for a tool call: `prompt` is the
+/// (rewritten) `params.arguments`, `response` the (rewritten) `result`.
+/// Both re-serialise through `Value` — capture is telemetry, not wire
+/// bytes, so canonical key order is fine here.
+fn tool_call_capture(
+    cap: u32,
+    request_bytes: Option<&[u8]>,
+    result_bytes: Option<&[u8]>,
+) -> aisix_obs::CapturedContent {
+    let prompt = request_bytes
+        .and_then(|b| serde_json::from_slice::<JsonRpcPeek>(b).ok())
+        .and_then(|p| p.params)
+        .and_then(|p| p.arguments)
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    let response = result_bytes
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+        .and_then(|mut v| v.get_mut("result").map(serde_json::Value::take))
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    aisix_obs::CapturedContent::new(&prompt, &response, cap as usize)
+}
+
+/// Outcome of the output-hook guardrail pass over an MCP tool result.
+enum ToolResultOutcome {
+    /// Reject the tool result. The inner value is the firing guardrail's
+    /// name, or `None` for a fail-closed block (unparseable body / splice
+    /// failure).
+    Block(Option<String>),
+    /// Release the tool result; `Some` carries the mask-rewritten body
+    /// bytes and the per-detector counts.
+    Allow(Option<(Vec<u8>, crate::redact::RedactionCounts)>),
+}
+
+/// Run the output guardrail chain over an MCP tool result: verdict AND
+/// mask write-back (AISIX-Cloud#1330). The tool result's text is fed to
+/// `check_output` as assistant text, the same hook the LLM response path
+/// uses; a protocol-level error envelope (no `result`) has nothing to
+/// scan and is allowed. When the chain carries a sync redactor, masked
+/// spans are spliced back into the raw body bytes — every byte outside a
+/// masked span reaches the client verbatim.
+async fn apply_output_guardrails(
     chain: &aisix_guardrails::GuardrailChain,
     response_bytes: &[u8],
     tool: &str,
     monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
-) -> Option<Option<String>> {
+) -> ToolResultOutcome {
     // Fail closed on an unparseable body. The `/mcp` gateway is configured
     // `json_response = true`, so a `tools/call` returns a single
     // `application/json` object; a body that does not parse (e.g. if that ever
@@ -556,28 +720,46 @@ async fn output_guardrail_block(
     // guardrail — block rather than allow.
     let value: serde_json::Value = match serde_json::from_slice(response_bytes) {
         Ok(value) => value,
-        Err(_) => return Some(None),
+        Err(_) => return ToolResultOutcome::Block(None),
     };
     // A protocol-level error envelope (no `result`) has no tool output to scan.
-    let result = value.get("result")?;
-    // Scan the client-visible tool text — the `text`-type content blocks the
-    // result carries — not the serialized JSON envelope. This keeps MCP output
-    // and LLM output on the same representation: a keyword guardrail sees the
-    // decoded prose, so envelope field names (`content`, `type`, `text`) can't
-    // trip a false positive, and escaped characters can't hide blocked content.
-    let mut scanned: Vec<String> = result
-        .get("content")
-        .and_then(|c| c.as_array())
-        .map(|blocks| {
-            blocks
-                .iter()
-                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                .filter(|text| !text.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
+    let Some(result) = value.get("result") else {
+        return ToolResultOutcome::Allow(None);
+    };
+    // Scan the client-visible tool text — the decoded content-block strings,
+    // not the serialized JSON envelope. This keeps MCP output and LLM output
+    // on the same representation: a keyword guardrail sees the decoded prose,
+    // so envelope field names (`content`, `type`, `text`) can't trip a false
+    // positive, and escaped characters can't hide blocked content.
+    let mut scanned: Vec<String> = Vec::new();
+    if let Some(blocks) = result.get("content").and_then(|c| c.as_array()) {
+        for block in blocks {
+            // The `text` string of any block. (Previously filtered to
+            // `type == "text"`; any block-level `text` is still a string
+            // VALUE, never an envelope key, so scanning it is safe and
+            // strictly wider.)
+            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                if !text.is_empty() {
+                    scanned.push(text.to_owned());
+                }
+            }
+            // Embedded resource (`type: "resource"`): the payload rides
+            // `resource.text` — the natural shape for a log file — and
+            // previously escaped the scan entirely whenever a sibling
+            // text block kept `scanned` non-empty (AISIX-Cloud#1330).
+            // base64 `blob` resources are NOT decoded here (deliberate:
+            // mimeType allowlist + size caps are an open design point).
+            if let Some(text) = block
+                .get("resource")
+                .and_then(|r| r.get("text"))
+                .and_then(|t| t.as_str())
+            {
+                if !text.is_empty() {
+                    scanned.push(text.to_owned());
+                }
+            }
+        }
+    }
     // `structuredContent` is serialized to the client ALONGSIDE `content`, and
     // the spec only RECOMMENDS mirroring it into a text block — so a tool can
     // return clean prose and carry the sensitive value here. Scan its string
@@ -602,20 +784,64 @@ async fn output_guardrail_block(
     };
     let (verdict, hits) = aisix_guardrails::Guardrail::check_output_observed(chain, &resp).await;
     monitor_hits.extend(hits);
-    match verdict {
-        aisix_guardrails::GuardrailVerdict::Block {
-            reason,
-            guardrail_name,
-        } => {
+    if let aisix_guardrails::GuardrailVerdict::Block {
+        reason,
+        guardrail_name,
+    } = verdict
+    {
+        tracing::warn!(
+            guardrail_hook = "output",
+            tool = %tool,
+            reason = %reason,
+            "guardrail blocked MCP tool result"
+        );
+        return ToolResultOutcome::Block(guardrail_name);
+    }
+    // Mask write-back over the same surface the scan covers:
+    // `result.content[i].text`, `result.content[i].resource.text`, and
+    // every string leaf under `result.structuredContent`.
+    if !aisix_guardrails::Guardrail::redacts_output(chain) {
+        return ToolResultOutcome::Allow(None);
+    }
+    let mut counts = crate::redact::RedactionCounts::new();
+    let rewritten = crate::json_splice::rewrite_string_values(
+        response_bytes,
+        |path| {
+            if !path.first().is_some_and(|s| s.is_key("result")) {
+                return false;
+            }
+            match path.get(1) {
+                Some(seg) if seg.is_key("structuredContent") => true,
+                Some(seg) if seg.is_key("content") => {
+                    matches!(path.get(2), Some(crate::json_splice::PathSeg::Index(_)))
+                        && ((path.len() == 4 && path[3].is_key("text"))
+                            || (path.len() == 5
+                                && path[3].is_key("resource")
+                                && path[4].is_key("text")))
+                }
+                _ => false,
+            }
+        },
+        |text| {
+            aisix_guardrails::Guardrail::redact_output_text(chain, text).map(|r| {
+                crate::redact::merge_counts(&mut counts, r.counts);
+                r.text
+            })
+        },
+    );
+    match rewritten {
+        Ok(None) => ToolResultOutcome::Allow(None),
+        Ok(Some(bytes)) => ToolResultOutcome::Allow(Some((bytes, counts))),
+        Err(err) => {
+            // Structurally impossible (the body parsed above); fail closed
+            // rather than release a result the mask policy should rewrite.
             tracing::warn!(
-                guardrail_hook = "output",
                 tool = %tool,
-                reason = %reason,
-                "guardrail blocked MCP tool result"
+                error = %err,
+                "mcp output mask splice failed; blocking tool result",
             );
-            Some(guardrail_name)
+            ToolResultOutcome::Block(None)
         }
-        _ => None,
     }
 }
 
@@ -653,6 +879,12 @@ fn emit_tool_call_usage(
     latency: Duration,
     guardrail_blocked: bool,
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    // Per-detector mask counts from the write-back passes (names only,
+    // never values — #932 no-leak).
+    redacted_entity_counts: crate::redact::RedactionCounts,
+    // Post-mask captured args/result for full-content exporters
+    // (AISIX-Cloud#1330); `None` when no exporter captures content.
+    content: Option<&aisix_obs::CapturedContent>,
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
     // Whether the tool call reached its upstream MCP server — false for a
     // quota rejection or an input-guardrail block, which refuse before any
@@ -664,6 +896,7 @@ fn emit_tool_call_usage(
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         api_key_id: auth.entry.id.clone(),
         status_code,
+        redacted_entity_counts,
         // Single-attempt endpoint: the attempt spans the whole request, so
         // the upstream figure and what the caller waited for coincide.
         upstream_latency_ms: latency.as_millis().min(u32::MAX as u128) as u32,
@@ -682,15 +915,15 @@ fn emit_tool_call_usage(
     // ONE label set across every handler (AISIX-Cloud#1317).
     // #698: both emit legs (CP sink + per-env exporter fan-out) go through
     // the shared chokepoint — pre-fix MCP usage reached only the CP sink, so
-    // exporters never saw /mcp traffic. No content capture (tool args/results
-    // are a separate surface from prompt/response).
+    // exporters never saw /mcp traffic. `content` carries the POST-MASK
+    // tool args/result for full-content exporters (AISIX-Cloud#1330).
     crate::usage_attr::emit_usage(
         state,
         snap,
         "mcp",
         event,
         aisix_obs::UsageEventLabels::default(),
-        None,
+        content,
         trace,
         /* terminal */ true,
         dispatched,
@@ -1757,6 +1990,131 @@ mod tests {
 
     const INPUT_GUARD: &str = r#"{"name":"mcp-input-guard","kind":"keyword","patterns":[{"kind":"literal","value":"forbidden-token"}]}"#;
     const OUTPUT_GUARD: &str = r#"{"name":"mcp-output-guard","kind":"keyword","hook_point":"output","patterns":[{"kind":"literal","value":"forbidden-token"}]}"#;
+
+    /// Verdict-only view over [`apply_output_guardrails`] for the block
+    /// tests: `Some(name)` = blocked, `None` = allowed (rewritten or not).
+    async fn output_guardrail_block(
+        chain: &aisix_guardrails::GuardrailChain,
+        response_bytes: &[u8],
+        tool: &str,
+        monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
+    ) -> Option<Option<String>> {
+        match apply_output_guardrails(chain, response_bytes, tool, monitor_hits).await {
+            ToolResultOutcome::Block(name) => Some(name),
+            ToolResultOutcome::Allow(_) => None,
+        }
+    }
+
+    /// Mask-action pii guardrail with a capture-group custom pattern +
+    /// literal replacement (AISIX-Cloud#1334), for the write-back tests.
+    fn pii_mask_guard(hook: &str) -> String {
+        format!(
+            r#"{{"name":"pii-mask","kind":"pii","hook_point":"{hook}","custom_patterns":[{{"name":"eda_version","regex":"version\\s*:\\s*(\\d+(?:\\.\\d+)+)","action":"mask","replacement":"***"}}]}}"#,
+        )
+    }
+
+    fn env_chain_with(guardrail_json: &str) -> aisix_guardrails::GuardrailChain {
+        use aisix_guardrails::{LiveGuardrailIndex, RequestContext};
+        let handle = SnapshotHandle::new(snapshot_with_key());
+        seed_guardrail(&handle, guardrail_json);
+        LiveGuardrailIndex::new(handle, None).resolve(&RequestContext {
+            passthrough_route_id: "",
+            model_id: "",
+            mcp_server_id: "",
+            api_key_id: "ak-1",
+            team_id: None,
+        })
+    }
+
+    /// AISIX-Cloud#1330: the output hook rewrites masked spans IN PLACE —
+    /// content text, embedded resource text, structuredContent leaves —
+    /// and every byte outside the hits (key order, whitespace, number
+    /// spellings, the envelope) survives verbatim.
+    #[tokio::test]
+    async fn output_mask_rewrites_in_place_byte_identical_elsewhere() {
+        let chain = env_chain_with(&pii_mask_guard("output"));
+        let body = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":["#,
+            r#"{"type":"text","text":"tool version: 12.1 ok"},"#,
+            r#"{"type":"resource","resource":{"uri":"file:///run.log","mimeType":"text/plain","text":"Compile version: 2022.4 Elapsed: 12.345s"}}"#,
+            r#"], "structuredContent":{"log":"cfg version: 9.0 end","cells": 1e3}}}"#,
+        );
+        let out = match apply_output_guardrails(&chain, body.as_bytes(), "report", &mut Vec::new())
+            .await
+        {
+            ToolResultOutcome::Allow(Some((bytes, counts))) => {
+                assert_eq!(counts.get("eda_version"), Some(&3));
+                String::from_utf8(bytes).unwrap()
+            }
+            other => panic!(
+                "expected a rewritten Allow, got {}",
+                match other {
+                    ToolResultOutcome::Block(_) => "Block",
+                    ToolResultOutcome::Allow(None) => "Allow(None)",
+                    ToolResultOutcome::Allow(_) => unreachable!(),
+                }
+            ),
+        };
+        assert_eq!(
+            out,
+            concat!(
+                r#"{"jsonrpc":"2.0","id":1,"result":{"content":["#,
+                r#"{"type":"text","text":"tool version: *** ok"},"#,
+                r#"{"type":"resource","resource":{"uri":"file:///run.log","mimeType":"text/plain","text":"Compile version: *** Elapsed: 12.345s"}}"#,
+                r#"], "structuredContent":{"log":"cfg version: *** end","cells": 1e3}}}"#,
+            ),
+        );
+        // Structural acceptance: the rewritten body still parses.
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["result"]["content"][1]["resource"]["mimeType"],
+            "text/plain"
+        );
+
+        // A no-hit result is returned with NO rewrite at all.
+        let clean = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"Elapsed: 12.345s"}]}}"#;
+        assert!(matches!(
+            apply_output_guardrails(&chain, clean, "report", &mut Vec::new()).await,
+            ToolResultOutcome::Allow(None),
+        ));
+    }
+
+    /// The input hook rewrites only the string leaves under
+    /// `params.arguments`; the method, tool name, id, and every other
+    /// byte are untouched.
+    #[test]
+    fn input_mask_rewrites_only_arguments() {
+        let chain = env_chain_with(&pii_mask_guard("input"));
+        let body = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"eda__echo","arguments":{"text":"build version: 12.1 done","note":"version untouched"}}}"#;
+        let (bytes, counts) = rewrite_tool_arguments(&chain, body.as_bytes())
+            .unwrap()
+            .expect("a hit rewrites");
+        assert_eq!(counts.get("eda_version"), Some(&1));
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"eda__echo","arguments":{"text":"build version: *** done","note":"version untouched"}}}"#,
+        );
+        // No hit → no allocation, original bytes forwarded.
+        let clean = br#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"eda__echo","arguments":{"text":"Elapsed: 12.345s"}}}"#;
+        assert!(rewrite_tool_arguments(&chain, clean).unwrap().is_none());
+    }
+
+    /// AISIX-Cloud#1330 scan-surface fix: a forbidden token that appears
+    /// ONLY in an embedded resource's text — next to a clean text block —
+    /// must block. Pre-fix the `type == "text"` filter dropped the
+    /// resource and the non-empty scan set suppressed the fallback, so
+    /// exactly this shape (text summary + resource log) went unread.
+    #[tokio::test]
+    async fn output_guardrail_scans_embedded_resource_text() {
+        let chain = env_chain_with(OUTPUT_GUARD);
+        let body = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"summary ok"},{"type":"resource","resource":{"uri":"file:///run.log","text":"log carries forbidden-token here"}}]}}"#;
+        assert!(
+            output_guardrail_block(&chain, body, "report", &mut Vec::new())
+                .await
+                .is_some(),
+            "resource.text must be scanned even when a text block exists"
+        );
+    }
 
     fn tools_call_with_args(arguments: serde_json::Value) -> HttpRequest<Body> {
         mcp_request(
