@@ -1107,7 +1107,8 @@ async fn anthropic_passthrough_dispatch(
     let url = aisix_gateway::url_cache::cached_endpoint_url(
         pk_id,
         "proxy/messages",
-        &[pk_value.api_base.as_deref().unwrap_or("")],
+        // Every resolve_base_url input (#1017) via the shared constructor.
+        &crate::dispatch::pk_url_fingerprint(pk_value),
         || {
             let base = crate::dispatch::resolve_base_url(pk_value)?;
             Ok::<_, crate::error::ProxyError>(crate::dispatch::build_anthropic_url(
