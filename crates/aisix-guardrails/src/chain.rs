@@ -128,14 +128,6 @@ impl GuardrailChain {
         self
     }
 
-    /// The request's enforced-hit log, for a caller that must keep hold of
-    /// it after the concrete chain is erased to `Arc<dyn Guardrail>` (the
-    /// trait has no accessor) — the same reason [`Self::applied`] is
-    /// snapshotted early on the chat path.
-    pub fn audit_log(&self) -> Option<&Arc<GuardrailAuditLog>> {
-        self.audit.as_ref()
-    }
-
     /// The ENFORCE-mode hits recorded on this request so far: which
     /// configured guardrail masked or blocked, on which hook, with what
     /// per-detector counts. Empty when no guardrail enforced anything (the
@@ -227,13 +219,27 @@ struct Recorders<'a> {
 }
 
 /// Report one member execution. `hits` are the MEMBER's own hits from
-/// this call, not the fold's accumulator.
+/// this call, not the fold's accumulator. `counts` are the member's
+/// per-entity mask counts, and only the segment pass has any — the check
+/// folds pass `None`.
 ///
 /// The audit log takes only the two ENFORCED outcomes it exists to
 /// record: `masked` and `blocked`. `allowed` is not an event, `bypassed`
 /// is already carried by `guardrail_bypassed_reason`, and the two
 /// `would_*` results belong to `guardrail_monitor_hits` — routing them
 /// here would make an enforcing hit indistinguishable from a staged one.
+///
+/// One caveat a reader of the audit trail needs: `blocked` is the
+/// ENFORCED outcome, which covers a fail-CLOSED availability failure as
+/// well as a content decision. A member with `fail_open: false` (or a
+/// `mandatory` one) whose upstream is unreachable returns `Block`, not
+/// `Bypass` — see [`classify_execution`] — so it lands here indis-
+/// tinguishable from a policy hit. AISIX-Cloud#1365 tracks separating
+/// the two.
+// Five of the eight describe one member execution (verdict, masked, hits,
+// counts) plus where to report it; splitting them into a struct would put a
+// name on a grouping that exists only here.
+#[allow(clippy::too_many_arguments)]
 fn record_execution(
     to: Recorders<'_>,
     member: &ChainMember,
@@ -242,6 +248,7 @@ fn record_execution(
     verdict: &GuardrailVerdict,
     masked: bool,
     hits: &[GuardrailMonitorHit],
+    counts: Option<&std::collections::BTreeMap<String, u32>>,
 ) {
     if to.sink.is_none() && to.audit.is_none() {
         return;
@@ -261,14 +268,15 @@ fn record_execution(
     if let (Some(audit), "blocked" | "masked") = (to.audit, result) {
         // A `blocked` member reports no counts: the block short-circuits
         // before any span is rewritten, and the reason stays off the event
-        // (#153 no-leak).
-        audit.record(
-            &member.name,
-            phase,
-            result,
-            elapsed,
-            &std::collections::BTreeMap::new(),
-        );
+        // (#153 no-leak). Counts ride an APPLIED mask only — the same
+        // invariant `redacted_entity_counts` upholds in `fold_segments`,
+        // so the two attributions on one event cannot disagree.
+        let empty = std::collections::BTreeMap::new();
+        let counts = match (result, counts) {
+            ("masked", Some(counts)) => counts,
+            _ => &empty,
+        };
+        audit.record(&member.name, phase, result, elapsed, counts);
     }
 }
 
@@ -330,7 +338,16 @@ impl Guardrail for GuardrailChain {
         for m in &self.members {
             let started = Instant::now();
             let verdict = m.guardrail.check_input(req).await;
-            record_execution(self.recorders(), m, "input", started, &verdict, false, &[]);
+            record_execution(
+                self.recorders(),
+                m,
+                "input",
+                started,
+                &verdict,
+                false,
+                &[],
+                None,
+            );
             match verdict {
                 GuardrailVerdict::Allow => continue,
                 GuardrailVerdict::Block {
@@ -357,7 +374,16 @@ impl Guardrail for GuardrailChain {
         for m in &self.members {
             let started = Instant::now();
             let verdict = m.guardrail.check_output(resp).await;
-            record_execution(self.recorders(), m, "output", started, &verdict, false, &[]);
+            record_execution(
+                self.recorders(),
+                m,
+                "output",
+                started,
+                &verdict,
+                false,
+                &[],
+                None,
+            );
             match verdict {
                 GuardrailVerdict::Allow => continue,
                 GuardrailVerdict::Block {
@@ -398,6 +424,7 @@ impl Guardrail for GuardrailChain {
                 &verdict,
                 false,
                 &member_hits,
+                None,
             );
             hits.extend(member_hits);
             match verdict {
@@ -437,6 +464,7 @@ impl Guardrail for GuardrailChain {
                 &verdict,
                 false,
                 &member_hits,
+                None,
             );
             hits.extend(member_hits);
             match verdict {
@@ -481,6 +509,7 @@ impl Guardrail for GuardrailChain {
                     &verdict,
                     false,
                     &member_hits,
+                    None,
                 );
             }
             hits.extend(member_hits);
@@ -522,6 +551,7 @@ impl Guardrail for GuardrailChain {
                     &verdict,
                     false,
                     &member_hits,
+                    None,
                 );
             }
             hits.extend(member_hits);
@@ -574,7 +604,16 @@ impl Guardrail for GuardrailChain {
             let started = Instant::now();
             let verdict = m.guardrail.check_input_non_segment(req).await;
             if !m.guardrail.moderates_segments() {
-                record_execution(self.recorders(), m, "input", started, &verdict, false, &[]);
+                record_execution(
+                    self.recorders(),
+                    m,
+                    "input",
+                    started,
+                    &verdict,
+                    false,
+                    &[],
+                    None,
+                );
             }
             match verdict {
                 GuardrailVerdict::Allow => continue,
@@ -601,7 +640,16 @@ impl Guardrail for GuardrailChain {
             let started = Instant::now();
             let verdict = m.guardrail.check_output_non_segment(resp).await;
             if !m.guardrail.moderates_segments() {
-                record_execution(self.recorders(), m, "output", started, &verdict, false, &[]);
+                record_execution(
+                    self.recorders(),
+                    m,
+                    "output",
+                    started,
+                    &verdict,
+                    false,
+                    &[],
+                    None,
+                );
             }
             match verdict {
                 GuardrailVerdict::Allow => continue,
@@ -678,14 +726,23 @@ async fn fold_segments(
         } else {
             m.guardrail.moderate_output_segments(src).await
         };
+        // Report the mask the fold will ACCEPT, not the one the member
+        // returned: a drifted-length mask is refused below and the
+        // originals are kept, so recording it as applied would put
+        // `action: "masked"` on a request where nothing was rewritten.
+        let accepted_mask = outcome
+            .masked
+            .as_ref()
+            .is_some_and(|new| new.len() == src.len());
         record_execution(
             to,
             m,
             phase,
             started,
             &outcome.verdict,
-            outcome.masked.is_some(),
+            accepted_mask,
             &outcome.monitor_hits,
+            Some(&outcome.counts),
         );
         monitor_hits.append(&mut outcome.monitor_hits);
         match outcome.verdict {

@@ -22,8 +22,8 @@
 mod aliyun;
 #[cfg(feature = "aliyun-text-moderation")]
 mod aliyun_ai_guardrail;
-#[cfg(feature = "bedrock")]
 mod audit;
+#[cfg(feature = "bedrock")]
 mod bedrock;
 mod build;
 mod chain;
@@ -189,8 +189,8 @@ pub fn supported_kinds() -> &'static [&'static str] {
 pub use aliyun::AliyunTextModerationGuardrail;
 #[cfg(feature = "aliyun-text-moderation")]
 pub use aliyun_ai_guardrail::AliyunAiGuardrail;
-#[cfg(feature = "bedrock")]
 pub use audit::GuardrailAuditLog;
+#[cfg(feature = "bedrock")]
 pub use bedrock::BedrockGuardrail;
 pub use build::{
     build_chain_from_snapshot, build_index_from_snapshot, LiveGuardrailChain, LiveGuardrailIndex,

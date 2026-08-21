@@ -1206,14 +1206,19 @@ impl LiveGuardrailIndex {
         if index.is_empty() {
             return GuardrailChain::empty();
         }
+        let chain = index
+            .resolve(ctx)
+            .with_metrics_sink(self.metrics_sink.clone());
         // A fresh audit log per resolve — and a chain is resolved exactly
         // once per request — is what makes the log request-scoped
-        // (AISIX-Cloud#1330). The empty-index fast path above skips it, so
-        // the guardrail-free deployment pays nothing.
-        index
-            .resolve(ctx)
-            .with_metrics_sink(self.metrics_sink.clone())
-            .with_audit_log(Some(Arc::new(crate::GuardrailAuditLog::new())))
+        // (AISIX-Cloud#1330). Skipped when nothing matched: a non-empty
+        // index still resolves to an empty chain for every request outside
+        // the scope of its one team-scoped row, and those must not pay an
+        // allocation for a log no member can ever write to.
+        if chain.is_empty() {
+            return chain;
+        }
+        chain.with_audit_log(Some(Arc::new(crate::GuardrailAuditLog::new())))
     }
 
     /// `true` when the resolved index has no guardrail entries — neither

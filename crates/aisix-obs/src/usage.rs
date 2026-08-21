@@ -1395,8 +1395,9 @@ mod tests {
         assert!(json.contains(r#""eda_version":3"#));
         assert!(json.contains(r#""duration_us":87"#));
         assert!(json.contains(r#""action":"blocked""#));
-        // A block reports no counts and no duration; both stay off the wire
-        // rather than serialising as noise.
+        // A block reports no counts. The fixture leaves its duration at
+        // zero so both stay off the wire here; a production block does
+        // carry `duration_us` — the member's own evaluation time.
         assert_eq!(json.matches(r#""counts""#).count(), 1);
         assert_eq!(json.matches(r#""duration_us""#).count(), 1);
 
