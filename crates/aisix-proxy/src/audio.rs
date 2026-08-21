@@ -2553,6 +2553,38 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// #1016 audit LOW-2: the gate sits AFTER model resolution on the
+    /// audio dispatch too — an unknown model with an invalid prompt
+    /// still answers 404, pinning the placement like the edits test.
+    #[tokio::test]
+    async fn non_utf8_prompt_unknown_model_still_404() {
+        let snap = new_snap("http://unused");
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(
+            b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nnope\r\n",
+        );
+        body.extend_from_slice(b"--b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n");
+        body.extend_from_slice(&[0xFF]);
+        body.extend_from_slice(
+            b"x\r\n--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\
+             Content-Type: audio/mpeg\r\n\r\nID3fakeaudio\r\n--b--\r\n",
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "multipart/form-data; boundary=b")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
     fn build_app_with_sink(
         snap: AisixSnapshot,
         tx: tokio::sync::mpsc::Sender<aisix_obs::UsageEvent>,
