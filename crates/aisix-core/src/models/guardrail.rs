@@ -78,7 +78,6 @@ pub enum KeywordPattern {
 
 /// Config block for `kind: "keyword"`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct KeywordConfig {
     /// Blocklist patterns. An empty list is valid and allows every
     /// request, equivalent to `enabled: false`.
@@ -122,7 +121,6 @@ pub enum BedrockLatencyMode {
 /// projection time so the DP always holds plaintext in memory. The
 /// key is never logged.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct AzureContentSafetyConfig {
     /// Azure Cognitive Services resource endpoint, e.g.
     /// `https://my-resource.cognitiveservices.azure.com`.
@@ -158,7 +156,6 @@ fn default_acs_timeout_ms() -> u32 {
 /// default. Only `api_key` is a secret (decrypted by cp-api before kine
 /// projection). Every other field travels in the clear.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct AzureContentSafetyTextModerationConfig {
     /// Azure Cognitive Services resource endpoint. The gateway appends
     /// `/contentsafety/text:analyze?api-version=2024-09-01`.
@@ -282,7 +279,6 @@ fn default_acs_on_buffer_exceeded() -> String {
 /// projection. It is plaintext in DP memory only and never logged). Every other
 /// field travels in the clear.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct AliyunTextModerationConfig {
     /// Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The gateway
     /// builds the endpoint `https://green-cip.<region>.aliyuncs.com`.
@@ -361,7 +357,6 @@ fn default_aliyun_risk_level_threshold() -> String {
 /// projection. It is plaintext in DP memory only and never logged). Every
 /// other field travels in the clear.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct AliyunAiGuardrailConfig {
     /// Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The gateway
     /// builds the endpoint `https://green-cip.<region>.aliyuncs.com`.
@@ -423,7 +418,6 @@ fn default_aliyun_aig_service_level() -> String {
 /// detector to enable; `action` optionally overrides the guardrail-level
 /// `default_action` for this detector only.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct PiiDetectorConfig {
     /// Built-in detector to enable for this PII guardrail entry.
     #[serde(rename = "type")]
@@ -437,7 +431,6 @@ pub struct PiiDetectorConfig {
 
 /// One operator-supplied regex detector for `kind: "pii"`.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct PiiCustomPattern {
     /// Detector name surfaced in the mask token (`[<NAME>_REDACTED]`),
     /// telemetry counts, and block reasons. Never the matched value.
@@ -478,7 +471,6 @@ pub struct PiiCustomPattern {
 /// content-filter envelope. Matched values never appear in logs, telemetry,
 /// or error envelopes — only detector names and match counts do.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct PiiConfig {
     /// Built-in detectors to enable. The resource schema rejects unknown
     /// detector ids, so a typo cannot silently disable the policy.
@@ -521,7 +513,6 @@ fn default_aliyun_window_overlap_size() -> u32 {
 /// `aisix-guardrails::BedrockGuardrail` from this and dispatches
 /// `ApplyGuardrail` on every governed request.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct BedrockConfig {
     /// Guardrail identifier issued by the AWS console.
     #[schemars(length(min = 1, max = 64))]
@@ -553,7 +544,6 @@ pub struct BedrockConfig {
 /// configuration is applied; the plaintext is held in memory only and is
 /// never logged.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct LakeraConfig {
     /// Lakera API key sent as a `Authorization: Bearer` header. Decrypted
     /// before projection. Plaintext is held in memory only and is not logged.
@@ -604,7 +594,6 @@ pub struct LakeraConfig {
 /// configuration is applied; the plaintext is held in memory only and is
 /// never logged.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct OpenaiModerationConfig {
     /// OpenAI API key sent as a `Authorization: Bearer` header. Decrypted
     /// before projection. Plaintext is held in memory only and is not logged.
@@ -649,7 +638,6 @@ fn default_openai_moderation_model() -> String {
 /// `action` optionally overrides the guardrail-level `default_action` for
 /// this entity only — the same per-detector shape as `kind: "pii"`.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct PresidioEntityConfig {
     /// Presidio entity type, e.g. `EMAIL_ADDRESS`, `PERSON`, `US_SSN`.
     #[serde(rename = "type")]
@@ -671,7 +659,6 @@ pub struct PresidioEntityConfig {
 /// compliance posture, and selectable anonymize operators. No vendor secret:
 /// both URLs point at customer-run containers.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct PresidioConfig {
     /// Presidio analyzer base URL, e.g. `http://presidio-analyzer:3000`.
     /// The gateway appends `/analyze`.
@@ -737,6 +724,14 @@ fn default_presidio_language() -> String {
 
 /// Provider discriminator. The kind drives which `*_config` block is
 /// expected. Serde's `tag = "kind"` keeps us honest at parse time.
+///
+/// The per-kind configs deliberately carry no `#[serde(deny_unknown_fields)]`:
+/// `Guardrail` flattens this enum, so a type-level guard here also applies to
+/// the etcd loader, which deserialises the same types — and a guardrail row
+/// dropped for one unknown field is a content policy that silently stops
+/// enforcing. Unknown-field strictness belongs to the write path and lives in
+/// the branch and definition closures in
+/// [`guardrail_root_schema`](crate::models::schema::guardrail_root_schema).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GuardrailKind {
@@ -1120,30 +1115,34 @@ mod tests {
     }
 
     #[test]
-    fn unknown_field_rejected_by_inner_kind_struct() {
-        // The outer Guardrail can't use deny_unknown_fields (see its
-        // doc comment), but the inner KeywordConfig does — and serde
-        // surfaces unknown fields from the flattened inner type at
-        // the top level. Net effect: typos are still caught.
+    fn unknown_field_is_rejected_on_write_and_kept_on_read() {
+        // The typo guard used to be `deny_unknown_fields` on the config
+        // structs, which sat in the TYPE — so it also applied to the etcd
+        // loader, which deserialises the same types, and killed the whole
+        // row. It now lives in the strict schema: `aisix validate` and the
+        // file source still refuse the typo, while a stored document keeps
+        // loading with the field ignored.
         let v = json!({
             "name": "g",
             "kind": "keyword",
             "patterns": [],
             "extra": "nope"
         });
-        let r: Result<Guardrail, _> = serde_json::from_value(v);
-        assert!(r.is_err());
+        assert!(crate::models::validate_guardrail(&v).is_err());
+        assert!(crate::models::validate_guardrail_lenient(&v).is_ok());
+        let g: Guardrail = serde_json::from_value(v).expect("the read path keeps the row");
+        assert_eq!(g.name, "g");
     }
 
     #[test]
-    fn p0c_fields_dont_trip_keyword_config_deny_unknown_fields() {
-        // `KeywordConfig` has `deny_unknown_fields`. The P0c fields
-        // (`enforcement_mode`, `mandatory`, `direction`) are declared on
-        // the outer `Guardrail` struct with `#[serde(default)]`, so serde
-        // absorbs them at the outer level before the flattened inner sees
-        // the remaining fields. This test pins that routing: if any of
-        // these fields accidentally reached `KeywordConfig`, the parse
-        // would return an unknown-field error.
+    fn p0c_fields_travel_past_the_flattened_kind() {
+        // The P0c fields (`enforcement_mode`, `mandatory`, `direction`) are
+        // declared on the outer `Guardrail` struct with `#[serde(default)]`,
+        // so serde absorbs them at the outer level before the flattened
+        // inner kind sees the remaining fields. The strict schema owes them
+        // the same passage from the other direction: a closed kind branch
+        // lists only its own kind's fields, so the root properties are
+        // copied in (`guardrail_root_schema`) or every real document fails.
         let v = json!({
             "name": "g",
             "kind": "keyword",
@@ -1152,8 +1151,9 @@ mod tests {
             "mandatory": true,
             "direction": "input"
         });
-        let g: Guardrail = serde_json::from_value(v)
-            .expect("P0c fields must not trip KeywordConfig deny_unknown_fields");
+        assert!(crate::models::validate_guardrail(&v).is_ok());
+        let g: Guardrail =
+            serde_json::from_value(v).expect("outer fields must not reach the inner kind");
         assert_eq!(g.enforcement_mode, "monitor");
         assert!(g.mandatory);
         assert_eq!(g.direction, "input");

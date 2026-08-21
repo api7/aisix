@@ -49,23 +49,7 @@ fn main() {
     // `ensemble`/`rate_limit`/`routing` have no standalone validator (they
     // are nested struct types) so they dump straight from the struct via
     // `schema_for!`, closed the same way.
-    for resource in [
-        "api_key",
-        "cache_policy",
-        "model",
-        "rate_limit_policy",
-        "provider_key",
-        "observability_exporter",
-        "guardrail",
-        "guardrail_attachment",
-        "mcp_server",
-        "mcp_policy",
-        "a2a_agent",
-        "oidc_provider",
-        "claim_mapping",
-        "passthrough_route",
-        "mcp_auth_settings",
-    ] {
+    for resource in schema::RESOURCES {
         dump_value(
             &out_dir,
             resource,
