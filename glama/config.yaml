@@ -1,0 +1,8 @@
+resources_file: /app/glama/resources.yaml
+
+proxy:
+  addr: "127.0.0.1:3000"
+
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["glama-image-local-admin"]
