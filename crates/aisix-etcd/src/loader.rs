@@ -127,8 +127,8 @@ pub struct PartialCompatEntry {
     pub kind: String,
     /// Dotted path of the ignored field inside the document
     /// (e.g. `quota_profile` or `rate_limit.burst`). Array indices are
-    /// normalized to `[]` (`routing.targets[].priority`) so the entry
-    /// count is bounded by the document shape, not the data volume.
+    /// normalized to a `[]` segment (`routing.targets.[].priority`) so the
+    /// entry count is bounded by the document shape, not the data volume.
     pub field: String,
     /// Number of rows of this kind carrying this unknown field in the
     /// build.
