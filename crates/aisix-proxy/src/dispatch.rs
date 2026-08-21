@@ -219,16 +219,32 @@ fn strip_endpoint_suffix(base: &str) -> &str {
 }
 
 /// The upstream base URL: `provider_key.api_base` override if set,
-/// otherwise the `Provider`'s built-in default. Tolerates an operator
+/// otherwise the one built-in vendor default. Tolerates an operator
 /// pasting the full upstream URL into `api_base` by stripping any
 /// trailing endpoint suffix — see [`API_BASE_ENDPOINT_SUFFIXES`].
+///
+/// The `openai` vendor is the single default-base exception (#1017):
+/// before it, an OpenAI key with no `api_base` worked on the
+/// bridge-dispatched routes (chat, generations) and `/v1/videos` —
+/// both fall back to [`aisix_provider_openai::OPENAI_DEFAULT_BASE`] —
+/// but 400'd on every direct-HTTP route through this resolver (audio,
+/// image edits, jobs, realtime). The fallback here converges all of
+/// them. Strictly the exact vendor string: an empty or
+/// OpenAI-compatible vendor still errors, because this resolver also
+/// serves non-OpenAI-family paths and must never send another vendor's
+/// credential to api.openai.com (the same refusal the family bridge
+/// makes). Every other catalog vendor keeps requiring `api_base` —
+/// the DP does not enumerate per-vendor default URLs.
 pub(crate) fn resolve_base_url(provider_key: &ProviderKey) -> Result<String, ProxyError> {
     match provider_key.api_base.as_deref() {
         Some(b) if !b.trim().is_empty() => Ok(strip_endpoint_suffix(b.trim()).to_string()),
+        _ if provider_key.provider.trim().eq_ignore_ascii_case("openai") => {
+            Ok(aisix_provider_openai::OPENAI_DEFAULT_BASE.to_string())
+        }
         _ => Err(ProxyError::InvalidRequest(format!(
             "provider_key {:?} has no api_base — cp-api must populate api_base \
              for every catalog vendor (the DP does not enumerate per-vendor \
-             default URLs)",
+             default URLs; the openai vendor is the one built-in default)",
             provider_key.display_name
         ))),
     }
@@ -547,6 +563,9 @@ mod tests {
     /// admission gap into a loud 400 instead of a silent mis-route.
     #[test]
     fn resolve_base_url_errors_when_api_base_missing() {
+        // No provider (legacy row) — must NOT get the openai default:
+        // sending an unknown vendor's credential to api.openai.com is
+        // worse than the 400.
         let pk: ProviderKey = serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
         let err = resolve_base_url(&pk).unwrap_err();
         match err {
@@ -558,6 +577,51 @@ mod tests {
             }
             other => panic!("expected InvalidRequest, got {other:?}"),
         }
+    }
+
+    /// #1017: the `openai` vendor is the one built-in default base — a
+    /// key with no `api_base` resolves to the same base the specialized
+    /// bridge and the videos route fall back to, so an OpenAI key
+    /// behaves identically on every route family.
+    #[test]
+    fn resolve_base_url_openai_vendor_falls_back_to_default_base() {
+        let pk: ProviderKey =
+            serde_json::from_str(r#"{"display_name":"x","secret":"k","provider":"openai"}"#)
+                .unwrap();
+        assert_eq!(
+            resolve_base_url(&pk).unwrap(),
+            aisix_provider_openai::OPENAI_DEFAULT_BASE
+        );
+    }
+
+    /// The vendor match is trim + case-insensitive (operator-typed
+    /// declarative rows), and a whitespace-only `api_base` counts as
+    /// unset — same emptiness rule as the error arm.
+    #[test]
+    fn resolve_base_url_openai_fallback_tolerates_case_and_blank_base() {
+        let pk: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"x","secret":"k","provider":" OpenAI ","api_base":"   "}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_base_url(&pk).unwrap(),
+            aisix_provider_openai::OPENAI_DEFAULT_BASE
+        );
+    }
+
+    /// An OpenAI-COMPATIBLE vendor is not OpenAI: it still requires
+    /// `api_base`, mirroring the family bridge's refusal to fall back —
+    /// a DeepSeek credential must never be sent to api.openai.com.
+    #[test]
+    fn resolve_base_url_openai_compatible_vendor_still_errors() {
+        let pk: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"x","secret":"k","provider":"deepseek","adapter":"openai"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve_base_url(&pk).unwrap_err(),
+            ProxyError::InvalidRequest(_)
+        ));
     }
 
     fn pk_with_base(api_base: &str) -> ProviderKey {
