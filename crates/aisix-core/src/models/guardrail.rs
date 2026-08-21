@@ -848,6 +848,47 @@ pub struct GuardrailMonitorHit {
     pub counts: std::collections::BTreeMap<String, u32>,
 }
 
+/// One ENFORCE-mode guardrail hit on this request: which configured
+/// guardrail fired, on which side, and what it actually did
+/// (AISIX-Cloud#1330 audit chain). The monitor-mode counterpart is
+/// [`GuardrailMonitorHit`]; the two never describe the same execution,
+/// so a consumer can read `action` without also checking the mode.
+///
+/// Carried on the telemetry UsageEvent so a compliance audit can answer
+/// "which policy rewrote this request, and how much did it rewrite" from
+/// the event alone. Names and counts ONLY — the matched value, the block
+/// reason, and any upstream detail are never captured (#153 / #932
+/// no-leak criterion).
+///
+/// One entry per `(guardrail_name, hook, action)`: a guardrail that masks
+/// forty string leaves of one tool result reports a single entry whose
+/// `counts` and `duration_us` are summed across those leaves.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardrailEnforcedHit {
+    /// The configured (row) name of the guardrail that fired.
+    pub guardrail_name: String,
+    /// Which side it fired on: `input` or `output`.
+    pub hook: String,
+    /// What it did: `masked` (content was rewritten and the request
+    /// continued) or `blocked` (the request was refused).
+    pub action: String,
+    /// detector/rule name → number of spans masked (`masked` only; empty
+    /// for `blocked`). Same key space as `redacted_entity_counts`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub counts: std::collections::BTreeMap<String, u32>,
+    /// Wall-clock time this guardrail spent on this hook, in
+    /// MICROseconds, summed over every evaluation that contributed to the
+    /// entry. Microseconds rather than milliseconds because in-process
+    /// rule evaluation is routinely sub-millisecond and would otherwise
+    /// always report zero. Saturates at `u32::MAX` (about 71 minutes).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub duration_us: u32,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 /// One guardrail member execution as observed by the chain fold
 /// (AISIX-Cloud#1076): identity, phase, enforced outcome, and wall-clock
 /// duration. All fields are bounded values safe for metric labels — never

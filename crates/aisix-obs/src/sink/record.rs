@@ -189,6 +189,36 @@ mod tests {
         assert!(bare.get("trace_id").is_none());
     }
 
+    /// AISIX-Cloud#1330: the enforced-hit audit array must reach the
+    /// SOC/SIEM exporters too, not just the control plane. `SinkRecord`
+    /// flattens `UsageEvent`, so this is a guard against a future
+    /// `#[serde(skip)]` — the attribute that already keeps `trace`
+    /// off the wire — being applied to it by mistake.
+    #[test]
+    fn enforced_hits_ride_the_flattened_exporter_wire() {
+        let rec = SinkRecord::metadata_only(UsageEvent {
+            guardrail_enforced_hits: vec![aisix_core::GuardrailEnforcedHit {
+                guardrail_name: "eda-mask".into(),
+                hook: "output".into(),
+                action: "masked".into(),
+                counts: [("eda_version".to_owned(), 2u32)].into_iter().collect(),
+                duration_us: 41,
+            }],
+            ..UsageEvent::default()
+        });
+        let json = serde_json::to_value(&rec).unwrap();
+        let hits = json["guardrail_enforced_hits"]
+            .as_array()
+            .expect("flattened onto the record, not nested under `usage`");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["guardrail_name"], "eda-mask");
+        assert_eq!(hits[0]["action"], "masked");
+        assert_eq!(hits[0]["counts"]["eda_version"], 2);
+
+        let bare = serde_json::to_value(SinkRecord::metadata_only(UsageEvent::default())).unwrap();
+        assert!(bare.get("guardrail_enforced_hits").is_none());
+    }
+
     #[test]
     fn full_content_record_carries_prompt_and_response() {
         let rec = SinkRecord::metadata_only(UsageEvent::default()).with_content(SinkContent {

@@ -14,8 +14,11 @@ use aisix_core::AppliedGuardrail;
 use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 
-use aisix_core::models::{GuardrailExecution, GuardrailMetricsSink, GuardrailMonitorHit};
+use aisix_core::models::{
+    GuardrailEnforcedHit, GuardrailExecution, GuardrailMetricsSink, GuardrailMonitorHit,
+};
 
+use crate::audit::GuardrailAuditLog;
 use crate::{Guardrail, GuardrailVerdict, Redaction, SegmentsOutcome, StreamOutputPolicy};
 
 /// One chain member: the runtime guardrail plus the operator-facing name
@@ -45,6 +48,13 @@ pub struct GuardrailChain {
     /// the metrics layer's sink so every fold below reports each member's
     /// phase/result/duration.
     sink: Option<Arc<dyn GuardrailMetricsSink>>,
+    /// Per-REQUEST accumulator of enforcing hits (AISIX-Cloud#1330).
+    /// `None` (the default) records nothing; `LiveGuardrailIndex::resolve`
+    /// mints a fresh log on every resolve, and a chain is resolved once
+    /// per request, so the log never spans two requests. Unlike `sink` —
+    /// a process-global metrics receiver — this one is read back by the
+    /// handler that emits the request's usage event.
+    audit: Option<Arc<GuardrailAuditLog>>,
 }
 
 impl std::fmt::Debug for GuardrailChain {
@@ -68,6 +78,7 @@ impl GuardrailChain {
                 .collect(),
             applied: Vec::new(),
             sink: None,
+            audit: None,
         }
     }
 
@@ -97,6 +108,7 @@ impl GuardrailChain {
                 .collect(),
             applied,
             sink: None,
+            audit: None,
         }
     }
 
@@ -106,6 +118,43 @@ impl GuardrailChain {
     pub fn with_metrics_sink(mut self, sink: Option<Arc<dyn GuardrailMetricsSink>>) -> Self {
         self.sink = sink;
         self
+    }
+
+    /// Attach the request's enforced-hit log (AISIX-Cloud#1330). Called by
+    /// `LiveGuardrailIndex::resolve` with a freshly minted log; `None`
+    /// (the default for test-built chains) records nothing.
+    pub fn with_audit_log(mut self, audit: Option<Arc<GuardrailAuditLog>>) -> Self {
+        self.audit = audit;
+        self
+    }
+
+    /// The request's enforced-hit log, for a caller that must keep hold of
+    /// it after the concrete chain is erased to `Arc<dyn Guardrail>` (the
+    /// trait has no accessor) — the same reason [`Self::applied`] is
+    /// snapshotted early on the chat path.
+    pub fn audit_log(&self) -> Option<&Arc<GuardrailAuditLog>> {
+        self.audit.as_ref()
+    }
+
+    /// The ENFORCE-mode hits recorded on this request so far: which
+    /// configured guardrail masked or blocked, on which hook, with what
+    /// per-detector counts. Empty when no guardrail enforced anything (the
+    /// dominant case) or when the chain carries no audit log.
+    ///
+    /// Non-destructive — see [`GuardrailAuditLog::snapshot`].
+    pub fn enforced_hits(&self) -> Vec<GuardrailEnforcedHit> {
+        self.audit
+            .as_ref()
+            .map(|a| a.snapshot())
+            .unwrap_or_default()
+    }
+
+    /// Borrow both execution receivers for one fold.
+    fn recorders(&self) -> Recorders<'_> {
+        Recorders {
+            sink: self.sink.as_deref(),
+            audit: self.audit.as_deref(),
+        }
     }
 
     /// The `{kind, hook}` set of guardrails that governed this request,
@@ -166,10 +215,27 @@ fn classify_execution<'v>(
     }
 }
 
-/// Report one member execution to `sink` (no-op when `None`). `hits` are
-/// the MEMBER's own hits from this call, not the fold's accumulator.
+/// The two receivers a fold reports each member execution to: the
+/// process-global metrics sink (AISIX-Cloud#1076) and the request's
+/// enforced-hit log (AISIX-Cloud#1330). Either may be absent — a
+/// test-built chain has neither — and they are gated independently, so a
+/// deployment without the metrics layer still produces audit entries.
+#[derive(Clone, Copy, Default)]
+struct Recorders<'a> {
+    sink: Option<&'a dyn GuardrailMetricsSink>,
+    audit: Option<&'a GuardrailAuditLog>,
+}
+
+/// Report one member execution. `hits` are the MEMBER's own hits from
+/// this call, not the fold's accumulator.
+///
+/// The audit log takes only the two ENFORCED outcomes it exists to
+/// record: `masked` and `blocked`. `allowed` is not an event, `bypassed`
+/// is already carried by `guardrail_bypassed_reason`, and the two
+/// `would_*` results belong to `guardrail_monitor_hits` — routing them
+/// here would make an enforcing hit indistinguishable from a staged one.
 fn record_execution(
-    sink: Option<&dyn GuardrailMetricsSink>,
+    to: Recorders<'_>,
     member: &ChainMember,
     phase: &'static str,
     started: Instant,
@@ -177,16 +243,33 @@ fn record_execution(
     masked: bool,
     hits: &[GuardrailMonitorHit],
 ) {
-    let Some(sink) = sink else { return };
+    if to.sink.is_none() && to.audit.is_none() {
+        return;
+    }
     let (result, error_type) = classify_execution(verdict, masked, hits);
-    sink.record_guardrail_execution(&GuardrailExecution {
-        guardrail_name: &member.name,
-        kind: &member.kind,
-        phase,
-        result,
-        error_type,
-        elapsed: started.elapsed(),
-    });
+    let elapsed = started.elapsed();
+    if let Some(sink) = to.sink {
+        sink.record_guardrail_execution(&GuardrailExecution {
+            guardrail_name: &member.name,
+            kind: &member.kind,
+            phase,
+            result,
+            error_type,
+            elapsed,
+        });
+    }
+    if let (Some(audit), "blocked" | "masked") = (to.audit, result) {
+        // A `blocked` member reports no counts: the block short-circuits
+        // before any span is rewritten, and the reason stays off the event
+        // (#153 no-leak).
+        audit.record(
+            &member.name,
+            phase,
+            result,
+            elapsed,
+            &std::collections::BTreeMap::new(),
+        );
+    }
 }
 
 /// Attribute a member's `Block` verdict to its configured name: fill
@@ -247,15 +330,7 @@ impl Guardrail for GuardrailChain {
         for m in &self.members {
             let started = Instant::now();
             let verdict = m.guardrail.check_input(req).await;
-            record_execution(
-                self.sink.as_deref(),
-                m,
-                "input",
-                started,
-                &verdict,
-                false,
-                &[],
-            );
+            record_execution(self.recorders(), m, "input", started, &verdict, false, &[]);
             match verdict {
                 GuardrailVerdict::Allow => continue,
                 GuardrailVerdict::Block {
@@ -282,15 +357,7 @@ impl Guardrail for GuardrailChain {
         for m in &self.members {
             let started = Instant::now();
             let verdict = m.guardrail.check_output(resp).await;
-            record_execution(
-                self.sink.as_deref(),
-                m,
-                "output",
-                started,
-                &verdict,
-                false,
-                &[],
-            );
+            record_execution(self.recorders(), m, "output", started, &verdict, false, &[]);
             match verdict {
                 GuardrailVerdict::Allow => continue,
                 GuardrailVerdict::Block {
@@ -324,7 +391,7 @@ impl Guardrail for GuardrailChain {
             let started = Instant::now();
             let (verdict, member_hits) = m.guardrail.check_input_observed(req).await;
             record_execution(
-                self.sink.as_deref(),
+                self.recorders(),
                 m,
                 "input",
                 started,
@@ -363,7 +430,7 @@ impl Guardrail for GuardrailChain {
             let started = Instant::now();
             let (verdict, member_hits) = m.guardrail.check_output_observed(resp).await;
             record_execution(
-                self.sink.as_deref(),
+                self.recorders(),
                 m,
                 "output",
                 started,
@@ -407,7 +474,7 @@ impl Guardrail for GuardrailChain {
             // "allowed" samples.
             if !m.guardrail.moderates_segments() {
                 record_execution(
-                    self.sink.as_deref(),
+                    self.recorders(),
                     m,
                     "input",
                     started,
@@ -448,7 +515,7 @@ impl Guardrail for GuardrailChain {
             let (verdict, member_hits) = m.guardrail.check_output_non_segment_observed(resp).await;
             if !m.guardrail.moderates_segments() {
                 record_execution(
-                    self.sink.as_deref(),
+                    self.recorders(),
                     m,
                     "output",
                     started,
@@ -489,11 +556,11 @@ impl Guardrail for GuardrailChain {
     /// member moderates the previous member's masked output, mirroring
     /// `fold_redactions`; the first Bypass reason sticks. Counts merge.
     async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
-        fold_segments(&self.members, self.sink.as_deref(), texts, true).await
+        fold_segments(&self.members, self.recorders(), texts, true).await
     }
 
     async fn moderate_output_segments(&self, texts: &[String]) -> SegmentsOutcome {
-        fold_segments(&self.members, self.sink.as_deref(), texts, false).await
+        fold_segments(&self.members, self.recorders(), texts, false).await
     }
 
     /// The check fold minus segment-moderating members — the pass those
@@ -507,15 +574,7 @@ impl Guardrail for GuardrailChain {
             let started = Instant::now();
             let verdict = m.guardrail.check_input_non_segment(req).await;
             if !m.guardrail.moderates_segments() {
-                record_execution(
-                    self.sink.as_deref(),
-                    m,
-                    "input",
-                    started,
-                    &verdict,
-                    false,
-                    &[],
-                );
+                record_execution(self.recorders(), m, "input", started, &verdict, false, &[]);
             }
             match verdict {
                 GuardrailVerdict::Allow => continue,
@@ -542,15 +601,7 @@ impl Guardrail for GuardrailChain {
             let started = Instant::now();
             let verdict = m.guardrail.check_output_non_segment(resp).await;
             if !m.guardrail.moderates_segments() {
-                record_execution(
-                    self.sink.as_deref(),
-                    m,
-                    "output",
-                    started,
-                    &verdict,
-                    false,
-                    &[],
-                );
+                record_execution(self.recorders(), m, "output", started, &verdict, false, &[]);
             }
             match verdict {
                 GuardrailVerdict::Allow => continue,
@@ -585,20 +636,18 @@ impl Guardrail for GuardrailChain {
     fn redact_input_text(&self, text: &str) -> Option<Redaction> {
         fold_redactions(
             text,
-            self.members
-                .iter()
-                .filter_map(|m| m.guardrail.redacts_input().then_some(&m.guardrail)),
+            self.members.iter().filter(|m| m.guardrail.redacts_input()),
             true,
+            self.audit.as_deref(),
         )
     }
 
     fn redact_output_text(&self, text: &str) -> Option<Redaction> {
         fold_redactions(
             text,
-            self.members
-                .iter()
-                .filter_map(|m| m.guardrail.redacts_output().then_some(&m.guardrail)),
+            self.members.iter().filter(|m| m.guardrail.redacts_output()),
             false,
+            self.audit.as_deref(),
         )
     }
 }
@@ -609,7 +658,7 @@ impl Guardrail for GuardrailChain {
 /// previous member's masked output. Counts merge across members.
 async fn fold_segments(
     members: &[ChainMember],
-    sink: Option<&dyn GuardrailMetricsSink>,
+    to: Recorders<'_>,
     texts: &[String],
     input: bool,
 ) -> SegmentsOutcome {
@@ -630,7 +679,7 @@ async fn fold_segments(
             m.guardrail.moderate_output_segments(src).await
         };
         record_execution(
-            sink,
+            to,
             m,
             phase,
             started,
@@ -692,17 +741,29 @@ async fn fold_segments(
 /// when no member changed anything.
 fn fold_redactions<'a>(
     text: &str,
-    members: impl Iterator<Item = &'a Arc<dyn Guardrail>>,
+    members: impl Iterator<Item = &'a ChainMember>,
     input: bool,
+    audit: Option<&GuardrailAuditLog>,
 ) -> Option<Redaction> {
+    let phase = if input { "input" } else { "output" };
     let mut current: Option<Redaction> = None;
-    for g in members {
+    for m in members {
+        let g = &m.guardrail;
         let src = current.as_ref().map_or(text, |r| r.text.as_str());
+        let started = Instant::now();
         let next = if input {
             g.redact_input_text(src)
         } else {
             g.redact_output_text(src)
         };
+        // The sync per-field redactors bypass `record_execution` entirely
+        // (they are not verdicts), so this is the ONLY place an in-process
+        // mask can be attributed to the row that applied it — the
+        // `kind: "pii"` MCP path the audit chain exists for. Recorded only
+        // when this member actually rewrote something.
+        if let (Some(audit), Some(r)) = (audit, next.as_ref()) {
+            audit.record(&m.name, phase, "masked", started.elapsed(), &r.counts);
+        }
         if let Some(r) = next {
             current = Some(match current.take() {
                 None => r,
@@ -722,6 +783,58 @@ mod tests {
     use super::*;
     use crate::{KeywordBlocklist, KeywordRule};
     use aisix_gateway::{ChatMessage, FinishReason, UsageStats};
+
+    /// AISIX-Cloud#1330: the audit log and the metrics sink are gated
+    /// independently. `record_execution` used to bail the moment the sink
+    /// was absent — a chain built without the metrics layer (every
+    /// test-built chain, and any deployment that has not wired it) would
+    /// then silently record no audit entry at all.
+    #[tokio::test]
+    async fn a_block_is_audited_even_with_no_metrics_sink_attached() {
+        let audit = Arc::new(GuardrailAuditLog::new());
+        let chain = GuardrailChain::new_with_applied(
+            vec![(
+                "deny-secrets".to_owned(),
+                Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("nope")]))
+                    as Arc<dyn Guardrail>,
+            )],
+            vec![AppliedGuardrail {
+                kind: "keyword".to_owned(),
+                hook: "both".to_owned(),
+            }],
+        )
+        .with_audit_log(Some(Arc::clone(&audit)));
+        assert!(chain.sink.is_none(), "no metrics sink for this chain");
+
+        assert!(matches!(
+            chain.check_input(&req("nope")).await,
+            GuardrailVerdict::Block { .. }
+        ));
+
+        let hits = chain.enforced_hits();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].guardrail_name, "deny-secrets");
+        assert_eq!(hits[0].hook, "input");
+        assert_eq!(hits[0].action, "blocked");
+    }
+
+    /// An allowed request records nothing: `allowed` and `bypassed` are
+    /// not enforcement events, and the two monitor-mode results belong to
+    /// `guardrail_monitor_hits` instead.
+    #[tokio::test]
+    async fn an_allowed_request_records_no_enforced_hit() {
+        let audit = Arc::new(GuardrailAuditLog::new());
+        let chain = GuardrailChain::new(vec![Arc::new(KeywordBlocklist::new(vec![
+            KeywordRule::literal("nope"),
+        ])) as Arc<dyn Guardrail>])
+        .with_audit_log(Some(Arc::clone(&audit)));
+
+        assert!(matches!(
+            chain.check_input(&req("fine")).await,
+            GuardrailVerdict::Allow
+        ));
+        assert!(chain.enforced_hits().is_empty());
+    }
 
     fn req(msg: &str) -> ChatFormat {
         ChatFormat::new("m", vec![ChatMessage::user(msg)])
