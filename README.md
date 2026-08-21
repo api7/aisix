@@ -175,12 +175,14 @@ Covered by 183 end-to-end scenario files (496 cases) that run against real gatew
   moderation), and two Alibaba Cloud services. A block returns `422 content_filter`;
   monitor mode records what would have happened without blocking.
 - **Caching** — exact-match and **semantic** response caching with per-policy TTL and
-  model/key scope matchers; memory and Redis backends; cost-saved telemetry on every hit.
+  model/key match rules; memory and Redis backends; cost-saved telemetry on every hit.
   A cache policy carrying a `semantic` block serves a cached answer to a differently-worded
   question at or above its cosine similarity threshold — in-process, or shared across
-  gateway replicas on Redis vector search. Separately, **automatic prompt caching** can be
-  enabled per direct Anthropic model to inject cache breakpoints, so callers get
-  provider-side prompt discounts without changing their requests.
+  gateway replicas on Redis vector search. Only fully textual requests match semantically,
+  and entries stay private to the caller's API key unless the policy sets `scope: env`.
+  Separately, **automatic prompt caching** can be enabled per direct Anthropic model to
+  inject cache breakpoints, so callers get provider-side prompt discounts without changing
+  their requests.
 - **MCP gateway** — front registered upstream MCP servers at `/mcp` with gateway-held
   credentials, per-server tool namespaces, and per-caller access. It serves every
   Streamable HTTP revision from `2025-03-26` through stateless `2026-07-28` without
@@ -196,9 +198,10 @@ Covered by 183 end-to-end scenario files (496 cases) that run against real gatew
   events, OTLP/GenAI span export (Langfuse, Honeycomb, Grafana Cloud, or any OTLP receiver),
   plus dedicated Datadog and Aliyun SLS log exporters and object-storage (S3/GCS/Azure Blob)
   telemetry.
-- **Declarative configuration** — one `resources.yaml` carries all ten resource collections
-  (provider keys, models, caller keys, guardrails, MCP servers, A2A agents, cache policies,
-  observability exporters, rate-limit policies, OIDC providers), validated against the same
+- **Declarative configuration** — one `resources.yaml` carries all thirteen resource
+  collections (provider keys, models, caller keys, guardrails, MCP servers, MCP auth
+  settings, A2A agents, cache policies, observability exporters, rate-limit policies,
+  OIDC providers, JWT claim mappings, passthrough routes), validated against the same
   JSON Schemas the gateway uses at runtime. `aisix validate` checks a file offline; `SIGHUP`
   reloads it atomically.
 - **Operational endpoints** — `/livez` and `/readyz` on the proxy listener; `/status/config`,
