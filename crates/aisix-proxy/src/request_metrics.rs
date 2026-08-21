@@ -323,6 +323,7 @@ const LLM_ENDPOINTS: &[&str] = &[
     "/v1/completions",
     "/v1/embeddings",
     "/v1/images/generations",
+    "/v1/images/edits",
     "/v1/messages",
     "/v1/messages/count_tokens",
     "/v1/rerank",
@@ -589,6 +590,7 @@ mod tests {
         "/v1/completions",
         "/v1/embeddings",
         "/v1/images/generations",
+        "/v1/images/edits",
         "/v1/messages",
         "/v1/messages/count_tokens",
         "/v1/rerank",
@@ -657,6 +659,7 @@ mod tests {
             "/v1/responses",
             "/v1/messages/count_tokens",
             "/v1/embeddings",
+            "/v1/images/edits",
             "/v1/audio/speech",
             "/v1/videos/vid_abc123/content",
             // Moved in once realtime started reporting its tokens + cost.

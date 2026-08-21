@@ -147,7 +147,7 @@ For a multi-replica cluster, point the gateway at etcd instead — `resources_fi
 Covered by 183 end-to-end scenario files (496 cases) that run against real gateway processes.
 
 - **OpenAI-compatible proxy** (`:3000`) — `chat/completions`, `completions`, `responses`,
-  `embeddings`, `rerank`, `images/generations`, `audio/{speech,transcriptions,translations}`,
+  `embeddings`, `rerank`, `images/{generations,edits}`, `audio/{speech,transcriptions,translations}`,
   `videos` (submit → poll → fetch), `files`, `batches`, `fine_tuning/jobs`, `realtime`,
   `GET /v1/models`, plus a root-level `/passthrough/:provider/*` escape hatch. Native SSE streaming,
   tool/function calling, JSON mode, vision/multimodal input, and reasoning-content support.

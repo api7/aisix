@@ -37,10 +37,12 @@ const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
 
-// ASCII marker standing in for PNG bytes — the mock upstream captures
-// bodies as utf8 strings, so an ASCII marker survives capture while
-// still traveling through the gateway as an opaque file part.
+// ASCII markers standing in for PNG bytes — the mock upstream captures
+// bodies as utf8 strings, so ASCII markers survive capture while still
+// traveling through the gateway as opaque file parts.
 const FAKE_IMAGE_BYTES = "PNG-FAKE-IMAGE-BYTES-e2e";
+const FAKE_IMAGE_BYTES_2 = "PNG-FAKE-SECOND-IMAGE-e2e";
+const FAKE_MASK_BYTES = "PNG-FAKE-MASK-BYTES-e2e";
 
 describe("images edits e2e: /v1/images/edits multipart forward + model translation", () => {
   let app: SpawnedApp | undefined;
@@ -94,10 +96,22 @@ describe("images edits e2e: /v1/images/edits multipart forward + model translati
     form.set("prompt", "add a red hat to the cat");
     form.set("size", "1024x1024");
     form.set("n", "1");
-    form.set(
+    // append, not set: repeated `image` parts are part of the rebuild
+    // contract (multi-image edits) and must all reach the upstream.
+    form.append(
       "image",
       new Blob([FAKE_IMAGE_BYTES], { type: "image/png" }),
       "cat.png",
+    );
+    form.append(
+      "image",
+      new Blob([FAKE_IMAGE_BYTES_2], { type: "image/png" }),
+      "dog.png",
+    );
+    form.set(
+      "mask",
+      new Blob([FAKE_MASK_BYTES], { type: "image/png" }),
+      "mask.png",
     );
     return fetch(`${app!.proxyUrl}/v1/images/edits`, {
       method: "POST",
@@ -158,12 +172,16 @@ describe("images edits e2e: /v1/images/edits multipart forward + model translati
 
     // Form contract: `model` rewritten to the upstream model id (the
     // caller alias never reaches the provider); every other field —
-    // the image file bytes, its filename, prompt, size, n — forwards
-    // intact.
+    // both repeated image parts, the mask, filenames, prompt, size,
+    // n — forwards intact.
     expect(sent.body).toContain("gpt-image-2");
     expect(sent.body).not.toContain("img-edits-e2e");
     expect(sent.body).toContain(FAKE_IMAGE_BYTES);
+    expect(sent.body).toContain(FAKE_IMAGE_BYTES_2);
+    expect(sent.body).toContain(FAKE_MASK_BYTES);
     expect(sent.body).toContain("cat.png");
+    expect(sent.body).toContain("dog.png");
+    expect(sent.body).toContain("mask.png");
     expect(sent.body).toContain("add a red hat to the cat");
     expect(sent.body).toContain("1024x1024");
 

@@ -201,16 +201,18 @@ pub async fn image_edits(
                 status,
                 elapsed,
             );
-            // Per #655 parity: surface the failed request in Logs. The model
-            // isn't extracted on this error path, so requested_model is
-            // empty; status + error class still identify it.
+            // Per #655 parity: surface the failed request in Logs. The
+            // attribution cell carries the requested model for every
+            // failure past model resolution (a guardrail 422, a provider
+            // 400); earlier failures leave it empty — status + error
+            // class still identify those.
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 &snapshot,
                 "images",
                 "openai",
                 &request_id,
-                "",
+                &attributed.requested_model,
                 &api_key_id,
                 status,
                 err.kind(),
@@ -266,18 +268,6 @@ async fn dispatch(
         .map(|s| s.trim().to_string())
         .ok_or_else(|| ProxyError::InvalidRequest("`model` field missing from form".into()))?;
 
-    // Partial-image SSE (`stream=true`) is not relayed yet — reject
-    // rather than buffer a stream the caller asked to watch grow (see
-    // the module doc). Rejected AFTER the model extraction so the error
-    // still carries request attribution, BEFORE any quota reservation.
-    if fields.iter().any(|(name, _, _, data)| {
-        name == "stream" && std::str::from_utf8(data).map(str::trim) == Ok("true")
-    }) {
-        return Err(ProxyError::InvalidRequest(
-            "`stream` is not supported on /v1/images/edits".into(),
-        ));
-    }
-
     let snapshot = &**snapshot_out.insert(state.snapshot.load());
     let model_entry = crate::model_resolve::resolve_model(snapshot, &model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
@@ -288,6 +278,20 @@ async fn dispatch(
 
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
+
+    // Partial-image SSE (`stream=true`) is not relayed yet — reject
+    // rather than buffer a stream the caller asked to watch grow (see
+    // the module doc). Rejected AFTER model resolution so an unknown
+    // model still answers 404 (matching the JSON endpoints' precedence)
+    // and the error carries the attribution `resolve_model` recorded,
+    // BEFORE any quota reservation.
+    if fields.iter().any(|(name, _, _, data)| {
+        name == "stream" && std::str::from_utf8(data).map(str::trim) == Ok("true")
+    }) {
+        return Err(ProxyError::InvalidRequest(
+            "`stream` is not supported on /v1/images/edits".into(),
+        ));
+    }
 
     // #545 parity with generations: the `prompt` form field is caller text
     // forwarded verbatim to the provider — scan it (input hook, before the
@@ -787,6 +791,52 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(v["data"][0]["b64_json"].is_string());
+    }
+
+    /// The headline rebuild contract: repeated `image` parts and the
+    /// `mask` part all survive the drain → rebuild round-trip with their
+    /// bytes and filenames intact. A rebuild that dedups by field name
+    /// (the shape a map-keyed rebuild would take) or drops the mask
+    /// fails here.
+    #[tokio::test]
+    async fn repeated_image_and_mask_parts_forward_intact() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .and(wiremock::matchers::body_string_contains("IMAGE-ONE-BYTES"))
+            .and(wiremock::matchers::body_string_contains("IMAGE-TWO-BYTES"))
+            .and(wiremock::matchers::body_string_contains("MASK-BYTES"))
+            .and(wiremock::matchers::body_string_contains("first.png"))
+            .and(wiremock::matchers::body_string_contains("second.png"))
+            .and(wiremock::matchers::body_string_contains("mask.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("img-edit-prod"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let body = "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nimg-edit-prod\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\ncombine them\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"image\"; filename=\"first.png\"\r\n\
+             Content-Type: image/png\r\n\r\nIMAGE-ONE-BYTES\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"image\"; filename=\"second.png\"\r\n\
+             Content-Type: image/png\r\n\r\nIMAGE-TWO-BYTES\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"mask\"; filename=\"mask.png\"\r\n\
+             Content-Type: image/png\r\n\r\nMASK-BYTES\r\n--b--\r\n";
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/images/edits")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "multipart/form-data; boundary=b")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// The alias must NOT reach the upstream — the form's `model` field
