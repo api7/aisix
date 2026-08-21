@@ -127,8 +127,8 @@ pub struct PartialCompatEntry {
     pub kind: String,
     /// Dotted path of the ignored field inside the document
     /// (e.g. `quota_profile` or `rate_limit.burst`). Array indices are
-    /// normalized to `[]` (`routing.targets[].priority`) so the entry
-    /// count is bounded by the document shape, not the data volume.
+    /// normalized to a `[]` segment (`routing.targets.[].priority`) so the
+    /// entry count is bounded by the document shape, not the data volume.
     pub field: String,
     /// Number of rows of this kind carrying this unknown field in the
     /// build.
@@ -527,6 +527,16 @@ where
                 return None;
             }
             stats.accepted += 1;
+            // `serde_ignored` is blind inside serde-buffered content, which
+            // for some kinds is the whole config subtree; those take their
+            // unknown-field paths off the schema instead.
+            if let Some(resource) = schema_reported_resource(parsed.kind) {
+                ignored.extend(
+                    aisix_core::models::unknown_field_paths(resource, value)
+                        .iter()
+                        .map(|path| normalize_ignored_path(path)),
+                );
+            }
             if !ignored.is_empty() {
                 // YELLOW: loaded, but fields this build does not know were
                 // ignored — typically written by a newer control plane.
@@ -563,6 +573,25 @@ where
             ));
             None
         }
+    }
+}
+
+/// The schema resource name behind an etcd row kind, for the kinds whose
+/// unknown fields `serde_ignored` cannot see: `guardrails` and
+/// `observability_exporters` deserialise their entire config through a
+/// `#[serde(flatten)]`ed tagged enum, `models` and `rate_limit_policies`
+/// through untagged variants (`OnEmbeddingFailure`, `ConditionNode`). Serde
+/// buffers all of it, so the ignored-field callback never fires there and
+/// the row would load silently. Every other kind is fully covered by
+/// `serde_ignored`; the two sources overlap harmlessly, since the paths are
+/// normalized the same way and deduped.
+fn schema_reported_resource(row_kind: &str) -> Option<&'static str> {
+    match row_kind {
+        "guardrails" => Some("guardrail"),
+        "observability_exporters" => Some("observability_exporter"),
+        "models" => Some("model"),
+        "rate_limit_policies" => Some("rate_limit_policy"),
+        _ => None,
     }
 }
 
@@ -952,6 +981,77 @@ mod tests {
             vec![PartialCompatEntry {
                 kind: "api_keys".into(),
                 field: "quota_profile".into(),
+                count: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn guardrail_unknown_field_inside_a_nested_config_object_loads_and_is_reported() {
+        // The shape that used to take the whole row down: a control plane
+        // one release ahead adds an optional field inside a nested guardrail
+        // config object (this is what `custom_patterns[].replacement` did to
+        // a 0.10.0 data plane). The row must load with the field ignored —
+        // a skipped guardrail row is a content policy that silently stops
+        // enforcing — and the field must still be named in the report,
+        // which `serde_ignored` cannot do inside the flattened tagged kind.
+        let entries = vec![raw(
+            "/aisix/guardrails/g-forward",
+            br#"{
+                "name": "redact-versions",
+                "kind": "pii",
+                "custom_patterns": [{
+                    "name": "eda_version",
+                    "regex": "version\\s*:\\s*(\\d+)",
+                    "action": "mask",
+                    "future_knob": "from-a-newer-cp"
+                }]
+            }"#,
+            1,
+        )];
+        let (snap, stats) = build_snapshot("/aisix", &entries);
+
+        assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
+        assert!(stats.rejections.is_empty());
+        assert_eq!(snap.guardrails.len(), 1);
+        let entry = snap.guardrails.get_by_id("g-forward").unwrap();
+        assert_eq!(entry.value.name, "redact-versions");
+
+        assert_eq!(
+            stats.partially_compatible,
+            vec![PartialCompatEntry {
+                kind: "guardrails".into(),
+                field: "custom_patterns.[].future_knob".into(),
+                count: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn observability_exporter_unknown_field_loads_and_is_reported() {
+        // Same shape one resource over: the exporter kind block is
+        // flattened and tagged too, so its closure lived on the read path
+        // and its report was impossible. An exporter that stops exporting
+        // is a fleet going dark on telemetry for the length of the window.
+        let entries = vec![raw(
+            "/aisix/observability_exporters/o-forward",
+            br#"{
+                "name": "otlp",
+                "kind": "otlp_http",
+                "endpoint": "https://otel.example/v1/traces",
+                "future_knob": true
+            }"#,
+            1,
+        )];
+        let (snap, stats) = build_snapshot("/aisix", &entries);
+
+        assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
+        assert_eq!(snap.observability_exporters.len(), 1);
+        assert_eq!(
+            stats.partially_compatible,
+            vec![PartialCompatEntry {
+                kind: "observability_exporters".into(),
+                field: "future_knob".into(),
                 count: 1,
             }]
         );

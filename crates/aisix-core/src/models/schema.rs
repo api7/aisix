@@ -26,12 +26,21 @@
 //!   ignored — and reported — instead of whole-row rejected.
 //!
 //! Both sets build from the same per-resource producers; strictness is a
-//! mechanical [`close_unknown_fields`] pass over the produced value, so the
-//! two can never drift field-wise. Deliberately closed subschemas (the
-//! `observability_exporter` branches and the guardrail tagged sub-enums,
-//! injected inside the producers) stay closed in BOTH sets: serde silently
-//! ignores unknown fields inside those tagged shapes, so an open schema
-//! there would be an unreportable — silent — tolerance.
+//! mechanical pair of passes over the produced value — [`close_unknown_fields`]
+//! for the write set, [`open_unknown_fields`] for the read set — so the two
+//! can never drift field-wise. Every closure, whether the write pass placed it
+//! or a producer injected it by hand (the `observability_exporter` and
+//! guardrail kind branches, the guardrail tagged sub-enums, the untagged
+//! `ConditionNode`/`OnEmbeddingFailure` variants), belongs to the write set
+//! alone: the read pass strips `additionalProperties: false` at EVERY depth,
+//! so an optional field a newer control plane added inside a nested config
+//! object is ignored instead of taking the whole row down with it.
+//!
+//! Tolerated is not the same as silent. Unknown fields inside serde-buffered
+//! content — everything under the guardrail/exporter `#[serde(flatten)]`ed
+//! tagged config, or inside an untagged variant — never reach
+//! `serde_ignored`, so the loader takes their paths from
+//! [`unknown_field_paths`], which reads them off the strict schema.
 //!
 //! The watch path reuses step 2 on incoming events — malformed payloads are
 //! skipped with a warning and do not take down the gateway.
@@ -71,6 +80,28 @@ pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile(
 /// against this set (issue #871); every write path stays on [`SCHEMAS`].
 pub static LENIENT_SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile(false)));
 
+/// Every resource with a runtime validator, by the name
+/// [`resource_root_schema`] takes. The published schema files and the
+/// validator sets are built from this list, so a new resource cannot reach
+/// one without reaching the other.
+pub const RESOURCES: [&str; 15] = [
+    "model",
+    "api_key",
+    "provider_key",
+    "guardrail",
+    "guardrail_attachment",
+    "cache_policy",
+    "observability_exporter",
+    "rate_limit_policy",
+    "mcp_server",
+    "mcp_policy",
+    "a2a_agent",
+    "oidc_provider",
+    "claim_mapping",
+    "passthrough_route",
+    "mcp_auth_settings",
+];
+
 /// Whether a resource's write contract closes unknown top-level fields.
 /// `cache_policy`, `guardrail`, `guardrail_attachment` and
 /// `observability_exporter` historically ship open root schemas (documented
@@ -108,8 +139,12 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "mcp_auth_settings" => mcp_auth_settings_root_schema(),
         other => panic!("unknown resource {other:?}"),
     };
-    if strict && closes_on_write(resource) {
-        close_unknown_fields(&mut schema);
+    if strict {
+        if closes_on_write(resource) {
+            close_unknown_fields(&mut schema);
+        }
+    } else {
+        open_unknown_fields(&mut schema);
     }
     schema
 }
@@ -156,20 +191,223 @@ impl Schemas {
 ///   map-typed field;
 /// - enum-shaped definitions (no `properties`) are skipped.
 pub fn close_unknown_fields(schema: &mut Value) {
-    fn close_object(node: &mut Value) {
-        let Some(obj) = node.as_object_mut() else {
-            return;
-        };
-        if obj.contains_key("properties") && !obj.contains_key("additionalProperties") {
-            obj.insert("additionalProperties".to_string(), json!(false));
-        }
-    }
-
     close_object(schema);
+    close_definitions(schema);
+}
+
+/// Insert `additionalProperties: false` on one schema node, if it is a plain
+/// object schema that has not already stated its own answer.
+fn close_object(node: &mut Value) {
+    let Some(obj) = node.as_object_mut() else {
+        return;
+    };
+    if obj.contains_key("properties") && !obj.contains_key("additionalProperties") {
+        obj.insert("additionalProperties".to_string(), json!(false));
+    }
+}
+
+/// Close every struct-shaped `definitions` entry, leaving the root alone.
+/// Used on its own by the producers of resources whose ROOT stays open on the
+/// write path but whose nested structs do not (`guardrail`).
+fn close_definitions(schema: &mut Value) {
     if let Some(Value::Object(defs)) = schema.get_mut("definitions") {
         for def in defs.values_mut() {
             close_object(def);
         }
+    }
+}
+
+/// Open a produced resource schema against unknown fields at EVERY depth:
+/// drop `additionalProperties: false` wherever it sits — the root, a
+/// `definitions` entry, a `oneOf`/`anyOf` branch, a nested property.
+///
+/// Not a mirror of [`close_unknown_fields`], deliberately. Closing is a
+/// shallow, hand-placed decision (closing an `if`/`then` overlay would reject
+/// every field the overlay does not list), so it touches only the root and
+/// the definitions. Opening has to reach everywhere a closure can be written
+/// — including the ones `schemars` renders from a nested
+/// `#[serde(deny_unknown_fields)]` struct and the ones a producer injects by
+/// hand — because a closure the read path leaves standing is a whole stored
+/// row lost the first time a newer control plane adds a field under it.
+///
+/// The read set is therefore free of `additionalProperties: false` by
+/// construction, which is what makes "an additive optional field is ignored
+/// by older data planes" true at every nesting depth instead of only at the
+/// document root.
+pub fn open_unknown_fields(schema: &mut Value) {
+    match schema {
+        Value::Object(obj) => {
+            if obj.get("additionalProperties") == Some(&Value::Bool(false)) {
+                obj.remove("additionalProperties");
+            }
+            for child in obj.values_mut() {
+                open_unknown_fields(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                open_unknown_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The resources whose unknown-field report cannot come from
+/// `serde_ignored`, mapped to their strict schema.
+///
+/// `serde_ignored` reports a field only when the ignored-field callback
+/// fires, and it never fires inside serde-buffered content: a
+/// `#[serde(flatten)]`ed internally-tagged enum (the entire `guardrail` and
+/// `observability_exporter` config subtree) and untagged variants
+/// (`ConditionNode`, `OnEmbeddingFailure`) are deserialised from a buffered
+/// `Content`, out of the wrapper's sight. Those are exactly the places the
+/// read schema now leaves open, so without a second source the tolerance
+/// would be silent.
+///
+/// A resource listed here must not carry a schema-hidden but
+/// serde-consumed field — a `#[schemars(skip)]` tombstone like
+/// `McpAccess::legacy_mode`. This walk reads known field names off the
+/// schema, so a field the schema does not mention would be reported as
+/// unknown on every row that carries it.
+static REPORT_SCHEMAS: Lazy<Vec<(&'static str, Value)>> = Lazy::new(|| {
+    [
+        "guardrail",
+        "observability_exporter",
+        "model",
+        "rate_limit_policy",
+    ]
+    .into_iter()
+    .map(|resource| (resource, resource_root_schema(resource, true)))
+    .collect()
+});
+
+/// Paths of the fields `value` carries that this build's write contract for
+/// `resource` does not know, at every depth — the loader's unknown-field
+/// report for the resources `serde_ignored` cannot see into
+/// ([`REPORT_SCHEMAS`]). Returns an empty vector for every other resource.
+///
+/// `jsonschema` cannot stand in for this: a `oneOf` failure collapses to one
+/// root-level "not valid under any of the schemas" error that names no field,
+/// and every guardrail and exporter document is a `oneOf`.
+///
+/// Conservative by construction. A key is reported only when NO branch
+/// applicable at that position declares it, so cross-kind leakage (a
+/// `datadog` exporter carrying an `otlp_http` field) does not show up here —
+/// that is a malformed document, not a field from a newer build, and the
+/// write path rejects it. Map-valued fields (`headers`,
+/// `severity_threshold_by_category`) declare a value schema rather than
+/// properties, so their keys are never unknown.
+pub fn unknown_field_paths(resource: &str, value: &Value) -> Vec<String> {
+    let Some((_, schema)) = REPORT_SCHEMAS.iter().find(|(name, _)| *name == resource) else {
+        return Vec::new();
+    };
+    let empty = serde_json::Map::new();
+    let definitions = schema
+        .get("definitions")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+    let mut out = Vec::new();
+    collect_unknown_fields(&[schema], definitions, value, "", &mut out);
+    out
+}
+
+/// Flatten the schema nodes that apply to one value position: the node
+/// itself, whatever its `$ref` names, and every `allOf`/`oneOf`/`anyOf`
+/// member. Branch selection is deliberately skipped — the union of what all
+/// branches declare is what keeps [`unknown_field_paths`] conservative.
+fn expand_applicable<'a>(
+    nodes: &[&'a Value],
+    definitions: &'a serde_json::Map<String, Value>,
+) -> Vec<&'a Value> {
+    let mut pending: Vec<&Value> = nodes.to_vec();
+    let mut applicable = Vec::new();
+    while let Some(node) = pending.pop() {
+        let Some(obj) = node.as_object() else {
+            continue;
+        };
+        if let Some(name) = obj
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|r| r.strip_prefix("#/definitions/"))
+        {
+            if let Some(target) = definitions.get(name) {
+                pending.push(target);
+            }
+        }
+        for combinator in ["allOf", "oneOf", "anyOf"] {
+            if let Some(Value::Array(members)) = obj.get(combinator) {
+                pending.extend(members.iter());
+            }
+        }
+        if obj.contains_key("properties")
+            || obj.contains_key("additionalProperties")
+            || obj.contains_key("items")
+        {
+            applicable.push(node);
+        }
+    }
+    applicable
+}
+
+fn collect_unknown_fields(
+    nodes: &[&Value],
+    definitions: &serde_json::Map<String, Value>,
+    value: &Value,
+    path: &str,
+    out: &mut Vec<String>,
+) {
+    let applicable = expand_applicable(nodes, definitions);
+    match value {
+        Value::Object(fields) => {
+            // Nothing here describes an object shape (a `true` schema, an
+            // enum) — no field name can be called unknown against it.
+            if !applicable.iter().any(|n| n.get("properties").is_some()) {
+                return;
+            }
+            for (key, child) in fields {
+                let mut child_nodes: Vec<&Value> = Vec::new();
+                for node in &applicable {
+                    if let Some(declared) = node.get("properties").and_then(|p| p.get(key)) {
+                        child_nodes.push(declared);
+                    } else if let Some(values) = node
+                        .get("additionalProperties")
+                        .filter(|v| v.is_object() || **v == Value::Bool(true))
+                    {
+                        child_nodes.push(values);
+                    }
+                }
+                let child_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                if child_nodes.is_empty() {
+                    out.push(child_path);
+                } else {
+                    collect_unknown_fields(&child_nodes, definitions, child, &child_path, out);
+                }
+            }
+        }
+        Value::Array(items) => {
+            let item_nodes: Vec<&Value> = applicable
+                .iter()
+                .filter_map(|node| node.get("items"))
+                .collect();
+            if item_nodes.is_empty() {
+                return;
+            }
+            for (index, item) in items.iter().enumerate() {
+                collect_unknown_fields(
+                    &item_nodes,
+                    definitions,
+                    item,
+                    &format!("{path}.{index}"),
+                    out,
+                );
+            }
+        }
+        _ => {}
     }
 }
 
@@ -282,7 +520,15 @@ pub fn validate_provider_key(value: &Value) -> Result<(), SchemaError> {
 }
 
 pub fn validate_guardrail(value: &Value) -> Result<(), SchemaError> {
-    validate(&SCHEMAS.guardrail, value)
+    match validate(&SCHEMAS.guardrail, value) {
+        Ok(()) => Ok(()),
+        Err(err) => Err(name_unknown_fields(
+            "guardrail",
+            &SCHEMAS.guardrail,
+            value,
+            err,
+        )),
+    }
 }
 
 pub fn validate_cache_policy(value: &Value) -> Result<(), SchemaError> {
@@ -290,7 +536,85 @@ pub fn validate_cache_policy(value: &Value) -> Result<(), SchemaError> {
 }
 
 pub fn validate_observability_exporter(value: &Value) -> Result<(), SchemaError> {
-    validate(&SCHEMAS.observability_exporter, value)
+    match validate(&SCHEMAS.observability_exporter, value) {
+        Ok(()) => Ok(()),
+        Err(err) => Err(name_unknown_fields(
+            "observability_exporter",
+            &SCHEMAS.observability_exporter,
+            value,
+            err,
+        )),
+    }
+}
+
+/// Replace a `oneOf` rejection with the unknown field names behind it.
+///
+/// `jsonschema` collapses every branch failure of a `oneOf` into one
+/// root-level "not valid under any of the schemas" — true, but naming no
+/// field, and a guardrail or exporter document IS a `oneOf`, so its most
+/// ordinary write-path error (a typo) arrives unreadable. The strict schema
+/// knows every field name, which is what [`unknown_field_paths`] reads.
+///
+/// Same discipline as [`validate_model`]: the names replace the message only
+/// when they are the WHOLE story. The document is re-validated with exactly
+/// those fields removed, and one that also violates something else keeps the
+/// original error, which points at the other problem. Only field NAMES are
+/// added, never instance values, so the masking contract in [`validate`]
+/// holds.
+fn name_unknown_fields(
+    resource: &str,
+    validator: &Validator,
+    value: &Value,
+    err: SchemaError,
+) -> SchemaError {
+    let unknown = unknown_field_paths(resource, value);
+    if unknown.is_empty() {
+        return err;
+    }
+    let mut probe = value.clone();
+    for path in &unknown {
+        remove_path(&mut probe, path);
+    }
+    if validate(validator, &probe).is_err() {
+        return err;
+    }
+    SchemaError {
+        path: err.path,
+        message: format!(
+            "unknown field(s): {}",
+            unknown
+                .iter()
+                .map(|path| format!("`{path}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// Remove one dotted path produced by [`unknown_field_paths`] from a
+/// document; a numeric segment indexes into an array.
+fn remove_path(value: &mut Value, path: &str) {
+    let mut segments = path.split('.').peekable();
+    let mut node = value;
+    while let Some(segment) = segments.next() {
+        if segments.peek().is_none() {
+            if let Some(fields) = node.as_object_mut() {
+                fields.remove(segment);
+            }
+            return;
+        }
+        node = match (node, segment.parse::<usize>()) {
+            (Value::Array(items), Ok(index)) => match items.get_mut(index) {
+                Some(item) => item,
+                None => return,
+            },
+            (Value::Object(fields), _) => match fields.get_mut(segment) {
+                Some(field) => field,
+                None => return,
+            },
+            _ => return,
+        };
+    }
 }
 
 pub fn validate_rate_limit_policy(value: &Value) -> Result<(), SchemaError> {
@@ -441,11 +765,11 @@ pub fn model_root_schema(strict: bool) -> Value {
         .insert("oneOf".to_string(), one_of);
     // `OnEmbeddingFailure` is `#[serde(untagged)]` with an object variant
     // (`{ "target": … }`): serde buffers untagged content and silently
-    // swallows unknown fields inside it, invisible to both the write
-    // path's serde step and the loader's `serde_ignored` reporting. The
-    // schema closure is therefore the only non-silent guard — same
-    // reasoning as the tagged-enum branch closures below, applied to
-    // both validator sets.
+    // swallows unknown fields inside it, invisible to the write path's
+    // serde step and to `serde_ignored` alike. The schema closure is
+    // therefore the write path's only guard — and, once the read pass
+    // opens it, what `unknown_field_paths` reads to keep the loader's
+    // tolerance from being silent.
     if let Some(any_of) = schema
         .get_mut("definitions")
         .and_then(|d| d.get_mut("OnEmbeddingFailure"))
@@ -845,22 +1169,33 @@ pub fn mcp_policy_root_schema(strict: bool) -> Value {
 
 /// Canonical JSON Schema for the `guardrail` resource, derived from the
 /// [`Guardrail`](crate::models::Guardrail) struct. `schemars` renders the
-/// internally-tagged `GuardrailKind` as a native top-level `oneOf`; the
-/// top-level object and its branches are intentionally open (matching the
-/// hand-written schema — unknown inner fields are caught by serde at
-/// deserialize). Three things need fixing up:
+/// internally-tagged `GuardrailKind` as a native top-level `oneOf`. Five
+/// things need fixing up:
 ///
-/// 1. The tagged sub-enums (`KeywordPattern`/`BedrockAWSCredentials`/
+/// 1. Unknown-field strictness, which used to live in the config structs as
+///    `#[serde(deny_unknown_fields)]` and now lives here. `Guardrail`
+///    flattens a tagged enum, so serde hands the whole config subtree to a
+///    buffered `Content`: a type-level `deny` there applied to the etcd READ
+///    path as well, where it killed every row whose control plane had added
+///    a field, and it was invisible in the published schema besides. The
+///    write contract is expressed instead by closing every struct-shaped
+///    definition and every kind branch — the shared root properties are
+///    copied into each branch first, since a closed branch lists only its own
+///    kind's fields while the document also carries `name`, `enabled`,
+///    `hook_point`, … from the flattened parent. Allowed = root fields ∪
+///    `kind` ∪ that kind's fields: exactly what serde enforced, now on the
+///    write path only ([`open_unknown_fields`] strips it for the loader).
+/// 2. The tagged sub-enums (`KeywordPattern`/`BedrockAWSCredentials`/
 ///    `BedrockLatencyMode`) lose `deny_unknown_fields` in their `oneOf`
 ///    branches, so each is re-closed with `additionalProperties: false`.
-/// 2. The stringly-typed moderation fields carry closed sets the hand-written
+/// 3. The stringly-typed moderation fields carry closed sets the hand-written
 ///    schema enforced via `enum`. They stay `String` on the struct (their
 ///    values flow through `aisix-guardrails` as strings; converting them to
 ///    Rust enums would churn that crate's processing), so the closed set is
 ///    injected here into the relevant property.
-/// 3. `schemars` leaves discriminator tag fields and collection item schemas
+/// 4. `schemars` leaves discriminator tag fields and collection item schemas
 ///    without descriptions, so the public schema fills those gaps.
-/// 4. `created_at` republishes its `date-time` format (annotation-only).
+/// 5. `created_at` republishes its `date-time` format (annotation-only).
 pub fn guardrail_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::Guardrail>(false);
     let obj = schema
@@ -1048,6 +1383,32 @@ pub fn guardrail_root_schema() -> Value {
         created_at.insert("format".to_string(), json!("date-time"));
     }
 
+    // Point 1 of the doc comment: the write-path closure the config structs
+    // used to carry in their types. Copy the flattened parent's properties
+    // into each branch before closing it, or the closure would reject
+    // `name`/`enabled`/`hook_point`/… on every document.
+    let top_props = obj
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(Value::Array(branches)) = obj.get_mut("oneOf") {
+        for branch in branches.iter_mut() {
+            let Some(b) = branch.as_object_mut() else {
+                continue;
+            };
+            let props = b
+                .entry("properties".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(props) = props.as_object_mut() {
+                for (key, value) in &top_props {
+                    props.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+            }
+            b.insert("additionalProperties".to_string(), json!(false));
+        }
+    }
+    close_definitions(&mut schema);
     schema
 }
 
@@ -1203,7 +1564,10 @@ pub fn cache_policy_root_schema() -> Value {
 ///    serde does not enforce it there either, so each branch is re-closed with
 ///    `additionalProperties: false` (rejecting a smuggled plaintext secret).
 ///    Because a closed branch only lists its own kind's fields, the shared
-///    top-level `name`/`enabled` are copied into every branch.
+///    top-level `name`/`enabled` are copied into every branch. This is the
+///    WRITE contract: [`open_unknown_fields`] strips it for the loader, which
+///    would otherwise lose the whole exporter row — telemetry off for the
+///    length of the upgrade window — over one optional field.
 /// 2. The `object_store` cloud-identity cross-field rule (cloud_identity ⇒
 ///    provider ∈ {s3,gcs} and no credential_ref; otherwise credential_ref
 ///    required) is injected as an `allOf`/`if`/`then`/`else` — `schemars` can't
@@ -1283,11 +1647,12 @@ fn branch_kind(branch: &serde_json::Map<String, Value>) -> Option<&str> {
 ///   ([`super::rate_limit_policy::rate_limit_policy_form_one_of`]), which also
 ///   carries the classic form's "at least one of `max_requests`/`max_tokens`";
 /// - the `PolicySchedule` day-selector XOR;
-/// - closing the `ConditionNode` object variants in **both** validator sets:
-///   the node is `#[serde(untagged)]`, so serde buffers its content and
-///   silently swallows unknown fields inside it, invisible to the write
-///   path's serde step and the loader's `serde_ignored` reporting alike — the
-///   schema closure is the only non-silent guard (same reasoning as
+/// - closing the `ConditionNode` object variants on the write path: the node
+///   is `#[serde(untagged)]`, so serde buffers its content and silently
+///   swallows unknown fields inside it, invisible to the write path's serde
+///   step and to `serde_ignored` alike — the schema closure is the only
+///   guard there, and the only thing [`unknown_field_paths`] can read to
+///   report what the opened read schema now lets through (same reasoning as
 ///   `OnEmbeddingFailure` in [`model_root_schema`]).
 ///
 /// The tree caps (depth/leaf counts), the operator×dimension admission
@@ -3167,10 +3532,11 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_policy_rejects_unknown_field_inside_condition_node() {
+    fn rate_limit_policy_condition_node_unknown_field_writes_red_reads_reported() {
         // ConditionNode is #[serde(untagged)]: serde silently swallows
-        // unknown fields inside untagged content, so the schema closure
-        // on the node definitions is the only guard — in both sets.
+        // unknown fields inside untagged content, so the schema closure is
+        // the only guard on write — and `unknown_field_paths` is the only
+        // report on read, since serde_ignored cannot see in there either.
         let v = json!({
             "name": "sneaky",
             "conditions": [
@@ -3179,7 +3545,11 @@ mod tests {
             "limits": { "rpm": 5 }
         });
         assert!(validate_rate_limit_policy(&v).is_err());
-        assert!(validate_rate_limit_policy_lenient(&v).is_err());
+        validate_rate_limit_policy_lenient(&v).expect("a stored policy keeps limiting");
+        assert_eq!(
+            unknown_field_paths("rate_limit_policy", &v),
+            vec!["conditions.0.extra".to_string()]
+        );
     }
 
     #[test]
@@ -3595,6 +3965,383 @@ mod tests {
     // ---- strict-write / lenient-read split (issue #871) ----
 
     #[test]
+    fn write_rejection_names_the_unknown_field_behind_the_one_of() {
+        // A typo in a resources file must say which field it was. The
+        // guardrail and exporter documents are `oneOf`s, so `jsonschema`
+        // reports only "not valid under any of the schemas" and the author
+        // is left guessing.
+        let err = validate_guardrail(&json!({
+            "name": "p", "kind": "pii",
+            "custom_patterns": [{"name": "n", "regex": "x", "replacment": "***"}]
+        }))
+        .expect_err("the write contract rejects the typo");
+        assert!(
+            err.message.contains("custom_patterns.0.replacment"),
+            "unhelpful message: {}",
+            err.message
+        );
+
+        let err = validate_observability_exporter(&json!({
+            "name": "o", "kind": "otlp_http",
+            "endpoint": "https://otel.example/v1/traces", "timout_ms": 5
+        }))
+        .expect_err("the write contract rejects the typo");
+        assert!(
+            err.message.contains("timout_ms"),
+            "unhelpful message: {}",
+            err.message
+        );
+
+        // A document that ALSO violates something else keeps the original
+        // error: replacing it would leave `path` and `message` describing
+        // different fields.
+        let err = validate_guardrail(&json!({
+            "name": "", "kind": "pii",
+            "custom_patterns": [{"name": "n", "regex": "x", "replacment": "***"}]
+        }))
+        .expect_err("an empty name is still a violation");
+        assert!(
+            !err.message.contains("replacment"),
+            "the other problem must win: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn lenient_set_carries_no_closure_at_any_depth() {
+        // The mechanical guarantee behind "an additive optional field is
+        // ignored, not fatal": there is nowhere left in the read set for a
+        // closure to hide. A single `additionalProperties: false` surviving
+        // in here — placed by a producer, or emitted by `schemars` from a
+        // nested `#[serde(deny_unknown_fields)]` struct — is one whole
+        // stored row lost the first time a newer control plane writes a
+        // field under it.
+        for resource in RESOURCES {
+            let mut found = Vec::new();
+            closure_paths(&resource_root_schema(resource, false), "", &mut found);
+            assert!(
+                found.is_empty(),
+                "{resource} read schema still closes {found:?}"
+            );
+        }
+    }
+
+    fn closure_paths(node: &Value, path: &str, out: &mut Vec<String>) {
+        match node {
+            Value::Object(obj) => {
+                if obj.get("additionalProperties") == Some(&Value::Bool(false)) {
+                    out.push(path.to_string());
+                }
+                for (key, child) in obj {
+                    closure_paths(child, &format!("{path}/{key}"), out);
+                }
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    closure_paths(item, &format!("{path}/{index}"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every nested object the read path used to close, one document each,
+    /// carrying a field this build does not know. Before this pair of passes
+    /// existed, every one of these was a skipped row on a data plane one
+    /// release behind its control plane — a guardrail that stopped
+    /// enforcing, an exporter that stopped exporting.
+    #[test]
+    fn formerly_closed_nested_objects_load_on_read_and_are_reported() {
+        let bedrock = |credentials: Value, latency: Value| {
+            json!({
+                "name": "b", "kind": "bedrock",
+                "guardrail_id": "gr-1", "guardrail_version": "1", "region": "us-east-1",
+                "aws_credentials": credentials,
+                "latency_mode": latency,
+            })
+        };
+        let serial = json!({"kind": "serial"});
+        let credentials = json!({"kind": "static", "access_key_id": "a", "secret_access_key": "b"});
+        let cases: Vec<(&str, Value, &str)> = vec![
+            (
+                "guardrail",
+                json!({
+                    "name": "p", "kind": "pii",
+                    "custom_patterns": [{"name": "n", "regex": "x", "future_knob": 1}]
+                }),
+                "custom_patterns.0.future_knob",
+            ),
+            (
+                "guardrail",
+                json!({
+                    "name": "p", "kind": "pii",
+                    "detectors": [{"type": "email", "future_knob": 1}]
+                }),
+                "detectors.0.future_knob",
+            ),
+            (
+                "guardrail",
+                json!({
+                    "name": "p", "kind": "presidio",
+                    "analyzer_url": "http://a", "anonymizer_url": "http://b",
+                    "entities": [{"type": "EMAIL_ADDRESS", "future_knob": 1}]
+                }),
+                "entities.0.future_knob",
+            ),
+            (
+                "guardrail",
+                json!({
+                    "name": "k", "kind": "keyword",
+                    "patterns": [{"kind": "literal", "value": "x", "future_knob": 1}]
+                }),
+                "patterns.0.future_knob",
+            ),
+            (
+                "guardrail",
+                bedrock(
+                    json!({
+                        "kind": "static", "access_key_id": "a", "secret_access_key": "b",
+                        "future_knob": 1
+                    }),
+                    serial.clone(),
+                ),
+                "aws_credentials.future_knob",
+            ),
+            (
+                "guardrail",
+                bedrock(
+                    credentials.clone(),
+                    json!({"kind": "serial", "future_knob": 1}),
+                ),
+                "latency_mode.future_knob",
+            ),
+            (
+                "guardrail",
+                bedrock(
+                    credentials,
+                    json!({"kind": "timed", "timeout_ms": 200, "future_knob": 1}),
+                ),
+                "latency_mode.future_knob",
+            ),
+            (
+                // Not a nested object at all: the guardrail ROOT, where the
+                // guard was `deny_unknown_fields` on the flattened kind
+                // config rather than a schema closure. Same blast radius.
+                "guardrail",
+                json!({"name": "k", "kind": "keyword", "patterns": [], "future_knob": 1}),
+                "future_knob",
+            ),
+            (
+                "observability_exporter",
+                json!({
+                    "name": "o", "kind": "otlp_http",
+                    "endpoint": "https://otel.example/v1/traces", "future_knob": 1
+                }),
+                "future_knob",
+            ),
+            (
+                "observability_exporter",
+                json!({
+                    "name": "o", "kind": "aliyun_sls",
+                    "endpoint": "ap-southeast-3.log.aliyuncs.com",
+                    "project": "p", "logstore": "l", "credential_ref": "r",
+                    "future_knob": 1
+                }),
+                "future_knob",
+            ),
+            (
+                "observability_exporter",
+                json!({
+                    "name": "o", "kind": "object_store", "provider": "s3",
+                    "bucket": "b", "prefix": "p", "credential_ref": "r",
+                    "future_knob": 1
+                }),
+                "future_knob",
+            ),
+            (
+                "observability_exporter",
+                json!({
+                    "name": "o", "kind": "datadog", "site": "datadoghq.com",
+                    "credential_ref": "r", "service": "s", "future_knob": 1
+                }),
+                "future_knob",
+            ),
+            (
+                "rate_limit_policy",
+                json!({
+                    "name": "r",
+                    "conditions": [
+                        {"logic": "and", "future_knob": 1, "children": [
+                            {"dimension": "team", "operator": "==", "value": "t"}
+                        ]}
+                    ],
+                    "limits": {"rpm": 5}
+                }),
+                "conditions.0.future_knob",
+            ),
+            (
+                "model",
+                json!({
+                    "display_name": "s",
+                    "semantic": {
+                        "embedding_model": "e",
+                        "routes": [{"name": "a", "target": "m", "examples": ["x"]}],
+                        "default": "d",
+                        "match": {"threshold": 0.5},
+                        "on_embedding_failure": {"target": "t", "future_knob": 1}
+                    }
+                }),
+                "semantic.on_embedding_failure.future_knob",
+            ),
+        ];
+
+        for (resource, document, field) in cases {
+            let strict = strict_validator(resource);
+            let lenient = lenient_validator(resource);
+            assert!(
+                validate(strict, &document).is_err(),
+                "{resource}/{field}: the write contract must keep rejecting the typo"
+            );
+            validate(lenient, &document).unwrap_or_else(|err| {
+                panic!("{resource}/{field}: stored row must keep loading, got {err}")
+            });
+            assert_eq!(
+                unknown_field_paths(resource, &document),
+                vec![field.to_string()],
+                "{resource}/{field}: tolerated is not the same as silent"
+            );
+        }
+    }
+
+    #[test]
+    fn opening_the_read_set_does_not_disturb_one_of_selection() {
+        // The reason opening was safe to begin with: every union among the
+        // formerly-closed objects discriminates on a `kind` const, not on
+        // the closure. The sharpest case is a document whose extra field is
+        // exactly a SIBLING branch's field — under `oneOf`, a second
+        // matching branch would fail the document just as hard as the
+        // closure used to.
+        let sibling_field = json!({
+            "name": "b", "kind": "bedrock",
+            "guardrail_id": "gr-1", "guardrail_version": "1", "region": "us-east-1",
+            "aws_credentials": {"kind": "static", "access_key_id": "a", "secret_access_key": "b"},
+            // `timeout_ms` belongs to the `timed` branch; `serial` no longer
+            // rejects it, and must still be the only branch that matches.
+            "latency_mode": {"kind": "serial", "timeout_ms": 200}
+        });
+        validate_guardrail_lenient(&sibling_field).expect("exactly one branch still matches");
+        assert!(validate_guardrail(&sibling_field).is_err());
+        let parsed: crate::models::Guardrail =
+            serde_json::from_value(sibling_field.clone()).expect("row deserializes");
+        match &parsed.config {
+            crate::models::GuardrailKind::Bedrock(cfg) => assert!(
+                matches!(cfg.latency_mode, crate::models::BedrockLatencyMode::Serial),
+                "the `kind` const, not the closure, picks the branch"
+            ),
+            other => panic!("wrong kind: {}", other.kind_str()),
+        }
+        // A sibling branch declares `timeout_ms`, so the report stays quiet:
+        // it is a malformed document, not a field from a newer build, and
+        // the strict path above is what says so.
+        assert!(unknown_field_paths("guardrail", &sibling_field).is_empty());
+
+        // Same at the top level: a `keyword` guardrail carrying a `pii`
+        // field still resolves to `keyword`, because every other branch
+        // pins its own `kind`. Cross-kind leakage is a malformed document,
+        // not a newer build's field, so the write path rejects it and the
+        // report stays quiet about it (see `unknown_field_paths`).
+        let cross_kind = json!({
+            "name": "k", "kind": "keyword", "patterns": [],
+            "detectors": [{"type": "email"}]
+        });
+        validate_guardrail_lenient(&cross_kind).expect("exactly one branch still matches");
+        assert!(validate_guardrail(&cross_kind).is_err());
+        let parsed: crate::models::Guardrail =
+            serde_json::from_value(cross_kind.clone()).expect("row deserializes");
+        assert_eq!(parsed.config.kind_str(), "keyword");
+        assert!(unknown_field_paths("guardrail", &cross_kind).is_empty());
+    }
+
+    #[test]
+    fn valid_documents_report_no_unknown_fields() {
+        // The other half of the report's contract: a document this build
+        // fully understands must stay GREEN. A field the schema cannot see
+        // but serde consumes — a `#[schemars(skip)]` tombstone — would show
+        // up here as a permanent YELLOW on every row, which is why the
+        // resources `unknown_field_paths` covers must not carry one.
+        let documents: Vec<(&str, Value)> = vec![
+            (
+                "guardrail",
+                json!({
+                    "name": "p", "kind": "pii", "enabled": true, "hook_point": "both",
+                    "fail_open": false, "enforcement_mode": "monitor", "mandatory": true,
+                    "direction": "input", "created_at": "2026-01-01T00:00:00Z",
+                    "detectors": [{"type": "email", "action": "mask"}],
+                    "custom_patterns": [
+                        {"name": "n", "regex": "x(y)", "action": "mask", "replacement": "***"}
+                    ],
+                    "default_action": "mask"
+                }),
+            ),
+            (
+                "observability_exporter",
+                json!({
+                    "name": "o", "enabled": true, "kind": "otlp_http",
+                    "endpoint": "https://otel.example/v1/traces",
+                    "headers": {"x-team": "abc"}
+                }),
+            ),
+            (
+                "rate_limit_policy",
+                json!({
+                    "name": "r",
+                    "conditions": [
+                        {"logic": "and", "children": [
+                            {"dimension": "team", "operator": "==", "value": "t"}
+                        ]}
+                    ],
+                    "limits": {"rpm": 5}
+                }),
+            ),
+            (
+                "model",
+                json!({
+                    "display_name": "d", "provider": "openai", "model_name": "gpt-4o",
+                    "provider_key_id": "11111111-1111-1111-1111-111111111111"
+                }),
+            ),
+        ];
+        for (resource, document) in documents {
+            validate(strict_validator(resource), &document)
+                .unwrap_or_else(|err| panic!("{resource} fixture must be valid: {err}"));
+            assert!(
+                unknown_field_paths(resource, &document).is_empty(),
+                "{resource}: a fully known document must not report unknown fields"
+            );
+        }
+    }
+
+    fn strict_validator(resource: &str) -> &'static Validator {
+        match resource {
+            "guardrail" => &SCHEMAS.guardrail,
+            "observability_exporter" => &SCHEMAS.observability_exporter,
+            "rate_limit_policy" => &SCHEMAS.rate_limit_policy,
+            "model" => &SCHEMAS.model,
+            other => panic!("no strict validator wired for {other}"),
+        }
+    }
+
+    fn lenient_validator(resource: &str) -> &'static Validator {
+        match resource {
+            "guardrail" => &LENIENT_SCHEMAS.guardrail,
+            "observability_exporter" => &LENIENT_SCHEMAS.observability_exporter,
+            "rate_limit_policy" => &LENIENT_SCHEMAS.rate_limit_policy,
+            "model" => &LENIENT_SCHEMAS.model,
+            other => panic!("no lenient validator wired for {other}"),
+        }
+    }
+
+    #[test]
     fn lenient_set_tolerates_unknown_fields_strict_set_rejects() {
         let v = json!({
             "key_hash": "9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
@@ -3624,35 +4371,47 @@ mod tests {
     }
 
     #[test]
-    fn lenient_set_keeps_deliberate_closures_closed() {
-        // The observability-exporter branches guard the credential_ref
-        // indirection against a smuggled plaintext secret, and serde
-        // cannot report ignored fields inside tagged-enum content — so
-        // these closures must hold on the READ path too, or the
-        // tolerance would be silent.
+    fn lenient_set_opens_the_producers_closures_and_reports_them_instead() {
+        // These closures used to hold on the read path too, on the argument
+        // that serde cannot report ignored fields inside tagged-enum
+        // content and a silent tolerance is worse than a rejection. But a
+        // rejection here is the whole row: an exporter that stops
+        // exporting, a guardrail that stops enforcing, because a newer
+        // control plane added one optional field. The read path opens them
+        // and `unknown_field_paths` supplies the report serde cannot.
         let exporter = json!({
             "name": "o", "kind": "otlp_http",
             "endpoint": "https://otel.example/v1/traces",
             "smuggled_secret": "sk-x"
         });
-        assert!(validate_observability_exporter_lenient(&exporter).is_err());
+        assert!(validate_observability_exporter(&exporter).is_err());
+        validate_observability_exporter_lenient(&exporter)
+            .expect("a stored exporter keeps exporting");
+        assert_eq!(
+            unknown_field_paths("observability_exporter", &exporter),
+            vec!["smuggled_secret".to_string()]
+        );
 
-        // Same for the guardrail tagged sub-enums: serde silently
-        // swallows unknown fields inside inline-tagged variants.
+        // Same for the guardrail tagged sub-enums.
         let guardrail = json!({
             "name": "kw", "kind": "keyword",
             "patterns": [{"kind": "literal", "value": "x", "extra": 1}]
         });
-        assert!(validate_guardrail_lenient(&guardrail).is_err());
+        assert!(validate_guardrail(&guardrail).is_err());
+        validate_guardrail_lenient(&guardrail).expect("a stored guardrail keeps enforcing");
+        assert_eq!(
+            unknown_field_paths("guardrail", &guardrail),
+            vec!["patterns.0.extra".to_string()]
+        );
     }
 
     #[test]
-    fn on_embedding_failure_object_variant_is_closed_on_both_paths() {
+    fn on_embedding_failure_object_variant_writes_red_reads_reported() {
         // `OnEmbeddingFailure` is untagged with an object variant: serde
         // buffers untagged content and silently swallows unknown fields
         // inside it — invisible to serde_ignored too. The producer closes
-        // the object branch so the typo is caught on write AND stays a
-        // loud (RED) rejection on read instead of a silent tolerance.
+        // the object branch so the typo is caught on write; on read the
+        // row loads and `unknown_field_paths` names the field.
         let v = json!({
             "display_name": "prod-chat",
             "semantic": {
@@ -3664,7 +4423,11 @@ mod tests {
             }
         });
         assert!(validate_model(&v).is_err());
-        assert!(validate_model_lenient(&v).is_err());
+        validate_model_lenient(&v).expect("a stored router keeps routing");
+        assert_eq!(
+            unknown_field_paths("model", &v),
+            vec!["semantic.on_embedding_failure.sneaky".to_string()]
+        );
 
         // The legitimate shapes keep validating on both paths.
         let ok = json!({

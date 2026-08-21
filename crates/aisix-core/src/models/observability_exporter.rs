@@ -35,6 +35,13 @@ use serde::{Deserialize, Serialize};
 use crate::resource::Resource;
 
 /// Exporter backend selected by the `kind` discriminator.
+///
+/// The per-kind configs deliberately carry no `#[serde(deny_unknown_fields)]`:
+/// a type-level guard here would also apply to the etcd loader, which
+/// deserialises the same types and would drop the whole exporter row the
+/// first time a newer control plane added a field. Unknown-field strictness
+/// is the write path's, and lives in the branch closures in
+/// [`observability_exporter_root_schema`](crate::models::schema::observability_exporter_root_schema).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExporterKind {
@@ -46,7 +53,6 @@ pub enum ExporterKind {
 
 /// OTLP/HTTP trace exporter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct OtlpHttpConfig {
     /// Full URL of the OTLP/HTTP traces endpoint. Include the receiver's
     /// expected path, such as `/v1/traces`.
@@ -76,7 +82,6 @@ pub struct OtlpHttpConfig {
 
 /// Aliyun SLS PutLogs exporter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct AliyunSlsConfig {
     /// SLS regional endpoint host without a scheme, such as `ap-southeast-3.log.aliyuncs.com`.
     /// Signed requests are sent to this endpoint with the SLS project as the host prefix.
@@ -127,7 +132,6 @@ const fn default_content_max_bytes() -> u32 {
 
 /// Datadog native Logs HTTP intake exporter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct DatadogConfig {
     /// Datadog site, such as `datadoghq.com`, `us3.datadoghq.com`, or `datadoghq.eu`.
     #[schemars(regex(
@@ -177,7 +181,6 @@ const fn default_dd_content_max_bytes() -> u32 {
 
 /// Object-storage exporter configuration for S3, GCS, Azure Blob, and compatible S3 backends.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct ObjectStoreConfig {
     /// Which object-storage backend the bucket lives in.
     pub provider: ObjectStoreProvider,
@@ -403,13 +406,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_inner_field() {
-        // OtlpHttpConfig has deny_unknown_fields so a typo at the
-        // flattened level is rejected.
-        let r: Result<ObservabilityExporter, _> = serde_json::from_str(
+    fn rejects_unknown_inner_field_on_write_and_ignores_it_on_read() {
+        // The closed kind branch in the strict schema is what refuses a typo
+        // at the flattened level. The loader's lenient twin drops that
+        // closure, so a stored exporter written by a newer control plane
+        // keeps exporting with the field ignored instead of going dark.
+        let v: serde_json::Value = serde_json::from_str(
             r#"{"name":"x","kind":"otlp_http","endpoint":"https://x","timeout":5}"#,
-        );
-        assert!(r.is_err());
+        )
+        .unwrap();
+        assert!(crate::models::validate_observability_exporter(&v).is_err());
+        assert!(crate::models::validate_observability_exporter_lenient(&v).is_ok());
+        let e: ObservabilityExporter = serde_json::from_value(v).unwrap();
+        assert!(matches!(e.kind, ExporterKind::OtlpHttp(_)));
     }
 
     #[test]
@@ -497,16 +506,22 @@ mod tests {
     #[test]
     fn rejects_plaintext_credentials_in_config() {
         // The AccessKey must NEVER be a config field — only a
-        // `credential_ref`. `deny_unknown_fields` on the inner config
-        // rejects any attempt to smuggle a plaintext key onto the kine path.
+        // `credential_ref`. The closed kind branch in the strict schema
+        // rejects any attempt to smuggle a plaintext key in; on the read
+        // path the field is ignored, never consumed as a credential.
         for key in ["access_key_secret", "access_key_id", "ak", "sk"] {
-            let json = format!(
+            let v: serde_json::Value = serde_json::from_str(&format!(
                 r#"{{"name":"x","kind":"aliyun_sls","endpoint":"ap-southeast-3.log.aliyuncs.com","project":"p","logstore":"l","credential_ref":"r","{key}":"AKIASECRET"}}"#
-            );
-            let r: Result<ObservabilityExporter, _> = serde_json::from_str(&json);
+            ))
+            .unwrap();
             assert!(
-                r.is_err(),
+                crate::models::validate_observability_exporter(&v).is_err(),
                 "plaintext credential field `{key}` must be rejected"
+            );
+            let e: ObservabilityExporter = serde_json::from_value(v).unwrap();
+            assert!(
+                !serde_json::to_string(&e).unwrap().contains("AKIASECRET"),
+                "plaintext credential field `{key}` must not be retained"
             );
         }
     }
@@ -606,20 +621,26 @@ mod tests {
     #[test]
     fn rejects_plaintext_credentials_in_object_store_config() {
         // Cloud keys must NEVER be config fields — only `credential_ref`.
-        // `deny_unknown_fields` rejects any smuggled plaintext secret.
+        // The closed kind branch in the strict schema rejects any smuggled
+        // plaintext secret; on the read path it is ignored, never consumed.
         for key in [
             "access_key_id",
             "secret_access_key",
             "sas_token",
             "service_account_json",
         ] {
-            let json = format!(
+            let v: serde_json::Value = serde_json::from_str(&format!(
                 r#"{{"name":"x","kind":"object_store","provider":"s3","bucket":"b","prefix":"p","credential_ref":"r","{key}":"PLAINTEXT"}}"#
-            );
-            let r: Result<ObservabilityExporter, _> = serde_json::from_str(&json);
+            ))
+            .unwrap();
             assert!(
-                r.is_err(),
+                crate::models::validate_observability_exporter(&v).is_err(),
                 "plaintext credential field `{key}` must be rejected"
+            );
+            let e: ObservabilityExporter = serde_json::from_value(v).unwrap();
+            assert!(
+                !serde_json::to_string(&e).unwrap().contains("PLAINTEXT"),
+                "plaintext credential field `{key}` must not be retained"
             );
         }
     }
@@ -695,16 +716,22 @@ mod tests {
     #[test]
     fn rejects_plaintext_api_key_in_datadog_config() {
         // The Datadog API key must NEVER be a config field — only a
-        // `credential_ref`. `deny_unknown_fields` on the inner config rejects
-        // any attempt to smuggle a plaintext key onto the kine path.
+        // `credential_ref`. The closed kind branch in the strict schema
+        // rejects any attempt to smuggle a plaintext key in; on the read
+        // path it is ignored, never consumed as a credential.
         for key in ["api_key", "apikey", "dd_api_key", "key"] {
-            let json = format!(
+            let v: serde_json::Value = serde_json::from_str(&format!(
                 r#"{{"name":"x","kind":"datadog","site":"datadoghq.com","credential_ref":"r","service":"s","{key}":"DDSECRET"}}"#
-            );
-            let r: Result<ObservabilityExporter, _> = serde_json::from_str(&json);
+            ))
+            .unwrap();
             assert!(
-                r.is_err(),
+                crate::models::validate_observability_exporter(&v).is_err(),
                 "plaintext credential field `{key}` must be rejected"
+            );
+            let e: ObservabilityExporter = serde_json::from_value(v).unwrap();
+            assert!(
+                !serde_json::to_string(&e).unwrap().contains("DDSECRET"),
+                "plaintext credential field `{key}` must not be retained"
             );
         }
     }

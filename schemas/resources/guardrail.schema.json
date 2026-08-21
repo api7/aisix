@@ -252,13 +252,58 @@
   "description": "Content policy evaluated before or after upstream calls.",
   "oneOf": [
     {
+      "additionalProperties": false,
       "description": "In-process literal/regex blocklist. Always available.",
       "properties": {
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": true,
+          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
+        },
         "kind": {
           "description": "Guardrail provider type for literal and regular expression matching.",
           "enum": [
             "keyword"
           ],
+          "type": "string"
+        },
+        "mandatory": {
+          "default": false,
+          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
+          "type": "boolean"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
           "type": "string"
         },
         "patterns": {
@@ -276,6 +321,7 @@
       "type": "object"
     },
     {
+      "additionalProperties": false,
       "description": "AWS Bedrock managed guardrail using `ApplyGuardrail` on input, output, or both.",
       "properties": {
         "aws_credentials": {
@@ -285,6 +331,31 @@
             }
           ],
           "description": "IAM credentials for Bedrock requests."
+        },
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": true,
+          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "type": "boolean"
         },
         "guardrail_id": {
           "description": "Guardrail identifier issued by the AWS console.",
@@ -297,6 +368,15 @@
           "maxLength": 16,
           "minLength": 1,
           "type": "string"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
         },
         "kind": {
           "description": "Guardrail provider type for Amazon Bedrock Guardrails.",
@@ -312,6 +392,16 @@
             }
           ],
           "description": "Bedrock guardrail latency policy. Timed mode caps wait time with `timeout_ms`."
+        },
+        "mandatory": {
+          "default": false,
+          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
+          "type": "boolean"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
         },
         "output_fail_open": {
           "default": false,
@@ -335,6 +425,7 @@
       "type": "object"
     },
     {
+      "additionalProperties": false,
       "description": "Azure AI Content Safety Prompt Shield. Detects jailbreak and indirect injection attacks via the `/contentsafety/text:shieldPrompt` API.",
       "properties": {
         "api_key": {
@@ -342,16 +433,60 @@
           "minLength": 1,
           "type": "string"
         },
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
         "endpoint": {
           "description": "Azure Cognitive Services resource endpoint, e.g. `https://my-resource.cognitiveservices.azure.com`. The gateway appends `/contentsafety/text:shieldPrompt?api-version=2024-09-01`.",
           "minLength": 1,
           "type": "string"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": true,
+          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
         },
         "kind": {
           "description": "Guardrail provider type for Azure Prompt Shield.",
           "enum": [
             "azure_content_safety"
           ],
+          "type": "string"
+        },
+        "mandatory": {
+          "default": false,
+          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
+          "type": "boolean"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
           "type": "string"
         },
         "output_fail_open": {
@@ -376,6 +511,7 @@
       "type": "object"
     },
     {
+      "additionalProperties": false,
       "description": "Azure AI Content Safety Text Moderation. Category-severity and blocklist moderation via the `/contentsafety/text:analyze` API, on input and/or output, including streaming output.",
       "properties": {
         "api_key": {
@@ -412,15 +548,49 @@
           },
           "type": "array"
         },
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
         "endpoint": {
           "description": "Azure Cognitive Services resource endpoint. The gateway appends `/contentsafety/text:analyze?api-version=2024-09-01`.",
           "minLength": 1,
           "type": "string"
         },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": true,
+          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "type": "boolean"
+        },
         "halt_on_blocklist_hit": {
           "default": false,
           "description": "Forwarded to Azure's `haltOnBlocklistHit`.",
           "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
         },
         "kind": {
           "description": "Guardrail provider type for Azure text moderation.",
@@ -429,12 +599,22 @@
           ],
           "type": "string"
         },
+        "mandatory": {
+          "default": false,
+          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
+          "type": "boolean"
+        },
         "max_buffer_bytes": {
           "default": 262144,
           "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.",
           "format": "uint64",
           "minimum": 1.0,
           "type": "integer"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
         },
         "on_buffer_exceeded": {
           "default": "fail_closed",
@@ -524,6 +704,7 @@
       "type": "object"
     },
     {
+      "additionalProperties": false,
       "description": "Aliyun content-safety guardrail. Risk-level moderation via the `TextModerationPlus` action on `green-cip.<region>.aliyuncs.com`, on input and/or output, including streaming output.",
       "properties": {
         "access_key_id": {
@@ -536,11 +717,45 @@
           "minLength": 1,
           "type": "string"
         },
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
         "endpoint": {
           "default": null,
           "description": "Explicit endpoint override as a full URL with no trailing slash. When set, it takes precedence over `region`.",
           "minLength": 1,
           "type": "string"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": true,
+          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
         },
         "kind": {
           "description": "Guardrail provider type for Aliyun text moderation.",
@@ -549,12 +764,22 @@
           ],
           "type": "string"
         },
+        "mandatory": {
+          "default": false,
+          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
+          "type": "boolean"
+        },
         "max_buffer_bytes": {
           "default": 262144,
           "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.",
           "format": "uint64",
           "minimum": 1.0,
           "type": "integer"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
         },
         "on_buffer_exceeded": {
           "default": "fail_closed",
@@ -623,6 +848,7 @@
       "type": "object"
     },
     {
+      "additionalProperties": false,
       "description": "Aliyun AI Guardrails (AI 安全护栏). Policy-driven moderation via the `MultiModalGuard` action on `green-cip.<region>.aliyuncs.com`; the verdict follows the console-configured policy's `Suggestion`. On input and/or output, including streaming output.",
       "properties": {
         "access_key_id": {
@@ -635,11 +861,45 @@
           "minLength": 1,
           "type": "string"
         },
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
         "endpoint": {
           "default": null,
           "description": "Explicit endpoint override as a full URL with no trailing slash. When set, it takes precedence over `region`.",
           "minLength": 1,
           "type": "string"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": true,
+          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
         },
         "kind": {
           "enum": [
@@ -647,12 +907,22 @@
           ],
           "type": "string"
         },
+        "mandatory": {
+          "default": false,
+          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
+          "type": "boolean"
+        },
         "max_buffer_bytes": {
           "default": 262144,
           "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.",
           "format": "uint64",
           "minimum": 1.0,
           "type": "integer"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
         },
         "on_buffer_exceeded": {
           "default": "fail_closed",
@@ -712,8 +982,14 @@
       "type": "object"
     },
     {
+      "additionalProperties": false,
       "description": "Built-in sensitive-data detection and redaction inside AISIX. Built-in detectors and custom regex patterns can mask matched spans or block traffic on input, output, or both, including buffered streaming output. Always available and does not call an external service.",
       "properties": {
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
         "custom_patterns": {
           "default": [],
           "description": "Operator-supplied regex detectors, evaluated after the built-ins.",
@@ -739,6 +1015,35 @@
           },
           "type": "array"
         },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": true,
+          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
+        },
         "kind": {
           "description": "Guardrail provider type for in-process sensitive-data detection and redaction.",
           "enum": [
@@ -746,12 +1051,22 @@
           ],
           "type": "string"
         },
+        "mandatory": {
+          "default": false,
+          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
+          "type": "boolean"
+        },
         "max_buffer_bytes": {
           "default": 262144,
           "description": "Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.",
           "format": "uint64",
           "minimum": 1.0,
           "type": "integer"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
         },
         "on_buffer_exceeded": {
           "default": "fail_closed",
@@ -765,6 +1080,7 @@
       "type": "object"
     },
     {
+      "additionalProperties": false,
       "description": "Lakera Guard screening via `POST /v2/guard`. Prompt-injection, jailbreak, and content-policy detections block traffic. Detections that involve only PII mask spans using the returned offsets. Applies on input, output, or both, including buffered streaming output.",
       "properties": {
         "api_key": {
@@ -772,11 +1088,45 @@
           "minLength": 1,
           "type": "string"
         },
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
         "endpoint": {
           "default": null,
           "description": "Endpoint override, e.g. a regional or self-hosted Lakera deployment. The gateway appends `/v2/guard`. Defaults to `https://api.lakera.ai`.",
           "minLength": 1,
           "type": "string"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": true,
+          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
         },
         "kind": {
           "description": "Guardrail provider type for Lakera Guard screening.",
@@ -785,12 +1135,22 @@
           ],
           "type": "string"
         },
+        "mandatory": {
+          "default": false,
+          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
+          "type": "boolean"
+        },
         "max_buffer_bytes": {
           "default": 262144,
           "description": "Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.",
           "format": "uint64",
           "minimum": 1.0,
           "type": "integer"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
         },
         "on_buffer_exceeded": {
           "default": "fail_closed",
@@ -823,6 +1183,7 @@
       "type": "object"
     },
     {
+      "additionalProperties": false,
       "description": "OpenAI Moderation API category screening via `POST /moderations`. Flagged content or configured category thresholds block traffic. This guardrail is detection-only and never rewrites content. Applies on input, output, or both, including buffered streaming output.",
       "properties": {
         "api_key": {
@@ -840,11 +1201,45 @@
           "description": "Per-category score thresholds, e.g. `{\"violence\": 0.5}`. When set, only the listed categories are enforced and a category blocks when its score reaches the threshold. When empty (the default), the provider's `flagged` decision determines whether to block.",
           "type": "object"
         },
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
         "endpoint": {
           "default": null,
           "description": "Endpoint override, such as an Azure OpenAI deployment. AISIX appends `/moderations`. Defaults to `https://api.openai.com/v1`.",
           "minLength": 1,
           "type": "string"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": true,
+          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
         },
         "kind": {
           "description": "Guardrail provider type for the OpenAI Moderation API.",
@@ -853,9 +1248,19 @@
           ],
           "type": "string"
         },
+        "mandatory": {
+          "default": false,
+          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
+          "type": "boolean"
+        },
         "model": {
           "default": "omni-moderation-latest",
           "description": "Moderation model sent to the provider. The default is `omni-moderation-latest`; provider model names are not restricted by AISIX.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
           "minLength": 1,
           "type": "string"
         },
@@ -880,6 +1285,7 @@
       "type": "object"
     },
     {
+      "additionalProperties": false,
       "description": "Self-hosted Microsoft Presidio PII detection and anonymization. Analyzer entities can mask or block per entity, and masked entities use the selected anonymize operator. Applies on input, output, or both, including buffered streaming output.",
       "properties": {
         "analyzer_url": {
@@ -892,6 +1298,11 @@
           "minLength": 1,
           "type": "string"
         },
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
         "default_action": {
           "default": "mask",
           "description": "Action for entities that do not set their own override.",
@@ -901,6 +1312,21 @@
           ],
           "type": "string"
         },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
         "entities": {
           "default": [],
           "description": "Entities to detect. Empty (the default) analyzes with Presidio's full recognizer set and applies `default_action` to every hit.",
@@ -908,6 +1334,20 @@
             "$ref": "#/definitions/PresidioEntityConfig"
           },
           "type": "array"
+        },
+        "fail_open": {
+          "default": true,
+          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
         },
         "kind": {
           "description": "Guardrail provider type for self-hosted Microsoft Presidio PII detection and anonymization.",
@@ -922,12 +1362,22 @@
           "minLength": 1,
           "type": "string"
         },
+        "mandatory": {
+          "default": false,
+          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
+          "type": "boolean"
+        },
         "max_buffer_bytes": {
           "default": 262144,
           "description": "Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.",
           "format": "uint64",
           "minimum": 1.0,
           "type": "integer"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
         },
         "on_buffer_exceeded": {
           "default": "fail_closed",
