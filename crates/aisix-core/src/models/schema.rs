@@ -520,7 +520,15 @@ pub fn validate_provider_key(value: &Value) -> Result<(), SchemaError> {
 }
 
 pub fn validate_guardrail(value: &Value) -> Result<(), SchemaError> {
-    validate(&SCHEMAS.guardrail, value)
+    match validate(&SCHEMAS.guardrail, value) {
+        Ok(()) => Ok(()),
+        Err(err) => Err(name_unknown_fields(
+            "guardrail",
+            &SCHEMAS.guardrail,
+            value,
+            err,
+        )),
+    }
 }
 
 pub fn validate_cache_policy(value: &Value) -> Result<(), SchemaError> {
@@ -528,7 +536,85 @@ pub fn validate_cache_policy(value: &Value) -> Result<(), SchemaError> {
 }
 
 pub fn validate_observability_exporter(value: &Value) -> Result<(), SchemaError> {
-    validate(&SCHEMAS.observability_exporter, value)
+    match validate(&SCHEMAS.observability_exporter, value) {
+        Ok(()) => Ok(()),
+        Err(err) => Err(name_unknown_fields(
+            "observability_exporter",
+            &SCHEMAS.observability_exporter,
+            value,
+            err,
+        )),
+    }
+}
+
+/// Replace a `oneOf` rejection with the unknown field names behind it.
+///
+/// `jsonschema` collapses every branch failure of a `oneOf` into one
+/// root-level "not valid under any of the schemas" — true, but naming no
+/// field, and a guardrail or exporter document IS a `oneOf`, so its most
+/// ordinary write-path error (a typo) arrives unreadable. The strict schema
+/// knows every field name, which is what [`unknown_field_paths`] reads.
+///
+/// Same discipline as [`validate_model`]: the names replace the message only
+/// when they are the WHOLE story. The document is re-validated with exactly
+/// those fields removed, and one that also violates something else keeps the
+/// original error, which points at the other problem. Only field NAMES are
+/// added, never instance values, so the masking contract in [`validate`]
+/// holds.
+fn name_unknown_fields(
+    resource: &str,
+    validator: &Validator,
+    value: &Value,
+    err: SchemaError,
+) -> SchemaError {
+    let unknown = unknown_field_paths(resource, value);
+    if unknown.is_empty() {
+        return err;
+    }
+    let mut probe = value.clone();
+    for path in &unknown {
+        remove_path(&mut probe, path);
+    }
+    if validate(validator, &probe).is_err() {
+        return err;
+    }
+    SchemaError {
+        path: err.path,
+        message: format!(
+            "unknown field(s): {}",
+            unknown
+                .iter()
+                .map(|path| format!("`{path}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// Remove one dotted path produced by [`unknown_field_paths`] from a
+/// document; a numeric segment indexes into an array.
+fn remove_path(value: &mut Value, path: &str) {
+    let mut segments = path.split('.').peekable();
+    let mut node = value;
+    while let Some(segment) = segments.next() {
+        if segments.peek().is_none() {
+            if let Some(fields) = node.as_object_mut() {
+                fields.remove(segment);
+            }
+            return;
+        }
+        node = match (node, segment.parse::<usize>()) {
+            (Value::Array(items), Ok(index)) => match items.get_mut(index) {
+                Some(item) => item,
+                None => return,
+            },
+            (Value::Object(fields), _) => match fields.get_mut(segment) {
+                Some(field) => field,
+                None => return,
+            },
+            _ => return,
+        };
+    }
 }
 
 pub fn validate_rate_limit_policy(value: &Value) -> Result<(), SchemaError> {
@@ -3877,6 +3963,49 @@ mod tests {
     }
 
     // ---- strict-write / lenient-read split (issue #871) ----
+
+    #[test]
+    fn write_rejection_names_the_unknown_field_behind_the_one_of() {
+        // A typo in a resources file must say which field it was. The
+        // guardrail and exporter documents are `oneOf`s, so `jsonschema`
+        // reports only "not valid under any of the schemas" and the author
+        // is left guessing.
+        let err = validate_guardrail(&json!({
+            "name": "p", "kind": "pii",
+            "custom_patterns": [{"name": "n", "regex": "x", "replacment": "***"}]
+        }))
+        .expect_err("the write contract rejects the typo");
+        assert!(
+            err.message.contains("custom_patterns.0.replacment"),
+            "unhelpful message: {}",
+            err.message
+        );
+
+        let err = validate_observability_exporter(&json!({
+            "name": "o", "kind": "otlp_http",
+            "endpoint": "https://otel.example/v1/traces", "timout_ms": 5
+        }))
+        .expect_err("the write contract rejects the typo");
+        assert!(
+            err.message.contains("timout_ms"),
+            "unhelpful message: {}",
+            err.message
+        );
+
+        // A document that ALSO violates something else keeps the original
+        // error: replacing it would leave `path` and `message` describing
+        // different fields.
+        let err = validate_guardrail(&json!({
+            "name": "", "kind": "pii",
+            "custom_patterns": [{"name": "n", "regex": "x", "replacment": "***"}]
+        }))
+        .expect_err("an empty name is still a violation");
+        assert!(
+            !err.message.contains("replacment"),
+            "the other problem must win: {}",
+            err.message
+        );
+    }
 
     #[test]
     fn lenient_set_carries_no_closure_at_any_depth() {
