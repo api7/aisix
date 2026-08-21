@@ -293,6 +293,11 @@ async fn dispatch(
         ));
     }
 
+    // #1016: a `prompt` part that is not valid UTF-8 would be skipped by
+    // the guardrail scan below yet forwarded verbatim — reject it before
+    // the guardrail pass instead of leaving that asymmetry.
+    crate::dispatch::require_utf8_prompt_fields(&fields)?;
+
     // #545 parity with generations: the `prompt` form field is caller text
     // forwarded verbatim to the provider — scan it (input hook, before the
     // reservation per #542) and mask it (#932). The response is an image,
@@ -936,6 +941,84 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("BLOCKME"));
+    }
+
+    /// #1016: a `prompt` part that is not valid UTF-8 is rejected 400
+    /// before the guardrail pass — pre-fix the scan silently skipped it
+    /// while the rebuilt form forwarded the bytes verbatim, and on this
+    /// route the input scan is the ONLY control (the response is an
+    /// image, no output hook). Upstream must never be contacted.
+    #[tokio::test]
+    async fn non_utf8_prompt_rejected_400_before_guardrail_and_upstream() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("img-edit-prod"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(
+            b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nimg-edit-prod\r\n",
+        );
+        body.extend_from_slice(b"--b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n");
+        body.extend_from_slice(&[0xFF]);
+        body.extend_from_slice(b"BLOCKME\r\n");
+        body.extend_from_slice(
+            b"--b\r\nContent-Disposition: form-data; name=\"image\"; filename=\"a.png\"\r\n\
+             Content-Type: image/png\r\n\r\nPNGFAKEBYTES\r\n--b--\r\n",
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/images/edits")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "multipart/form-data; boundary=b")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert!(v["error"]["message"].as_str().unwrap().contains("UTF-8"));
+    }
+
+    /// #1016: the reject sits AFTER model resolution — an unknown model
+    /// with an invalid prompt still answers 404, keeping the JSON
+    /// endpoints' status precedence.
+    #[tokio::test]
+    async fn non_utf8_prompt_unknown_model_still_404() {
+        let snap = new_snap("http://unused");
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(
+            b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nnope\r\n",
+        );
+        body.extend_from_slice(b"--b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n");
+        body.extend_from_slice(&[0xFF]);
+        body.extend_from_slice(b"x\r\n--b--\r\n");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/images/edits")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "multipart/form-data; boundary=b")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     /// #168 parallel: a non-OpenAI Model is rejected 400 at the gateway
