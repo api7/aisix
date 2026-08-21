@@ -8,14 +8,23 @@
 //! case is obvious. New resources append their own table as they migrate.
 
 use aisix_core::models::schema::{
-    validate_apikey, validate_cache_policy, validate_guardrail, validate_guardrail_attachment,
-    validate_observability_exporter, validate_provider_key, validate_rate_limit_policy,
+    unknown_field_paths, validate_apikey, validate_cache_policy, validate_guardrail,
+    validate_guardrail_attachment, validate_observability_exporter, validate_provider_key,
+    validate_rate_limit_policy,
 };
 use serde_json::{json, Value};
 
 /// Run a corpus of `(label, expect_accept, payload)` against `validate`.
+///
+/// Every accepted case doubles as a guard on the loader's unknown-field
+/// report: a document the write contract accepts is a document this build
+/// fully understands, so it must report nothing. The report is derived from
+/// the strict schema (`unknown_field_paths`), and it runs on every row of
+/// these kinds — a producer that stops declaring a field would turn the whole
+/// corpus into permanent partial-compat warnings.
 #[track_caller]
 fn check(
+    resource: &str,
     validate: fn(&Value) -> Result<(), aisix_core::models::schema::SchemaError>,
     cases: &[(&str, bool, Value)],
 ) {
@@ -26,6 +35,11 @@ fn check(
                 result.is_ok(),
                 "expected ACCEPT for `{label}`, got: {:?}",
                 result.err()
+            );
+            let unknown = unknown_field_paths(resource, payload);
+            assert!(
+                unknown.is_empty(),
+                "`{label}` is fully valid but reports unknown fields: {unknown:?}"
             );
         } else {
             assert!(
@@ -39,6 +53,7 @@ fn check(
 #[test]
 fn cache_policy_corpus() {
     check(
+        "cache_policy",
         validate_cache_policy,
         &[
             (
@@ -111,6 +126,7 @@ fn cache_policy_corpus() {
 #[test]
 fn apikey_corpus() {
     check(
+        "api_key",
         validate_apikey,
         &[
             (
@@ -195,6 +211,7 @@ fn apikey_corpus() {
 #[test]
 fn rate_limit_policy_corpus() {
     check(
+        "rate_limit_policy",
         validate_rate_limit_policy,
         &[
             (
@@ -283,6 +300,7 @@ fn provider_key_corpus() {
     // written before the field's rename to `api_key`. The canonical
     // spelling is pinned by the dedicated cases below.
     check(
+        "provider_key",
         validate_provider_key,
         &[
             (
@@ -430,6 +448,7 @@ fn provider_key_corpus() {
 #[test]
 fn observability_exporter_corpus() {
     check(
+        "observability_exporter",
         validate_observability_exporter,
         &[
             // otlp_http
@@ -575,6 +594,7 @@ fn observability_exporter_corpus() {
 #[test]
 fn guardrail_corpus() {
     check(
+        "guardrail",
         validate_guardrail,
         &[
             // keyword
@@ -748,6 +768,7 @@ fn guardrail_corpus() {
 #[test]
 fn guardrail_attachment_corpus() {
     check(
+        "guardrail_attachment",
         validate_guardrail_attachment,
         &[
             (

@@ -11,15 +11,25 @@
 //! validator wrongly rejected them even though the `RateLimit` struct and the
 //! rate limiter support them, so they now ACCEPT — the deliberate bug fix.
 
-use aisix_core::models::schema::validate_model;
+use aisix_core::models::schema::{unknown_field_paths, validate_model};
 use serde_json::{json, Value};
 
 /// Assert that the current `validate_model` ACCEPTS `value`.
+///
+/// An accepted document is one this build fully understands, so it must also
+/// report no unknown fields — the loader derives that report from the strict
+/// schema and runs it on every model row, where a false positive would be a
+/// permanent partial-compat warning on a healthy fleet.
 #[track_caller]
 fn accept(label: &str, value: Value) {
     if let Err(e) = validate_model(&value) {
         panic!("expected ACCEPT for `{label}`, got reject: {e}");
     }
+    let unknown = unknown_field_paths("model", &value);
+    assert!(
+        unknown.is_empty(),
+        "`{label}` is fully valid but reports unknown fields: {unknown:?}"
+    );
 }
 
 /// Assert that the current `validate_model` REJECTS `value`.
