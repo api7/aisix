@@ -46,6 +46,7 @@ mod guardrail_stream;
 pub mod health;
 mod http_client;
 mod images;
+mod images_edits;
 mod jobs;
 mod json_splice;
 mod jwt;
@@ -114,6 +115,7 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/v1/completions", post(completions::completions))
         .route("/v1/embeddings", post(embeddings::embeddings))
         .route("/v1/images/generations", post(images::image_generations))
+        .route("/v1/images/edits", post(images_edits::image_edits))
         .route("/v1/messages", post(messages::messages))
         .route(
             "/v1/messages/count_tokens",
@@ -340,6 +342,7 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         "/v1/completions" => "/v1/completions",
         "/v1/embeddings" => "/v1/embeddings",
         "/v1/images/generations" => "/v1/images/generations",
+        "/v1/images/edits" => "/v1/images/edits",
         "/v1/messages" => "/v1/messages",
         "/v1/messages/count_tokens" => "/v1/messages/count_tokens",
         "/v1/rerank" => "/v1/rerank",

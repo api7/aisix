@@ -111,6 +111,7 @@ pub async fn image_generations(
             // for completions / responses / rerank.
             let status = success.response.status().as_u16();
             emit_access_log(
+                "/v1/images/generations",
                 &model_name,
                 &success.provider,
                 &api_key_id,
@@ -151,6 +152,7 @@ pub async fn image_generations(
                     &state,
                     &snapshot,
                     &pk,
+                    "/v1/images/generations",
                     &request_id,
                     &success.model_id,
                     &model_name,
@@ -174,6 +176,7 @@ pub async fn image_generations(
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
             emit_access_log(
+                "/v1/images/generations",
                 &model_name,
                 "unknown",
                 &api_key_id,
@@ -444,7 +447,7 @@ async fn dispatch(
 /// `usage: {input_tokens, output_tokens, total_tokens, ...}`; dall-e-2/3
 /// return no `usage` block → `None`. Wire shape:
 /// <https://platform.openai.com/docs/api-reference/images/object>
-fn extract_token_usage(body: &Value) -> Option<(u32, u32)> {
+pub(crate) fn extract_token_usage(body: &Value) -> Option<(u32, u32)> {
     let usage = body.get("usage")?;
     let input = usage.get("input_tokens").and_then(Value::as_u64)? as u32;
     let output = usage
@@ -467,12 +470,15 @@ fn extract_token_usage(body: &Value) -> Option<(u32, u32)> {
 /// resolved ProviderKey — same lookup as chat / messages / responses /
 /// embeddings (AISIX-Cloud#867 parity) via `usage_attr::apply_pk_telemetry`.
 #[allow(clippy::too_many_arguments)]
-fn emit_usage_event(
+pub(crate) fn emit_usage_event(
     state: &ProxyState,
     // The request's snapshot + its one ProviderKey observation, resolved
     // by the handler (#941).
     snap: &aisix_core::AisixSnapshot,
     pk: &crate::usage_attr::ResolvedPk<'_>,
+    // `/v1/images/generations` or `/v1/images/edits` — the two image
+    // surfaces share this emit (AISIX-Cloud#1360).
+    endpoint: &'static str,
     request_id: &str,
     model_id: &str,
     requested_model: &str,
@@ -536,7 +542,7 @@ fn emit_usage_event(
     let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
     crate::request_metrics::record_usage(
         state,
-        "/v1/images/generations",
+        endpoint,
         owned_caller.as_caller(),
         crate::request_metrics::Upstream {
             provider,
@@ -554,7 +560,9 @@ fn emit_usage_event(
         },
     );
 }
-fn emit_access_log(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_access_log(
+    endpoint: &'static str,
     model: &str,
     provider: &str,
     api_key_id: &str,
@@ -572,7 +580,7 @@ fn emit_access_log(
     };
     AccessLog {
         method: "POST",
-        path: "/v1/images/generations",
+        path: endpoint,
         status,
         latency,
         provider: Some(provider),
