@@ -1107,13 +1107,8 @@ async fn anthropic_passthrough_dispatch(
     let url = aisix_gateway::url_cache::cached_endpoint_url(
         pk_id,
         "proxy/messages",
-        &[
-            pk_value.api_base.as_deref().unwrap_or(""),
-            // The resolver's output depends on the vendor since #1017
-            // (openai default-base fallback); without it in the
-            // fingerprint a repurposed row would keep its stale URL.
-            pk_value.provider.as_str(),
-        ],
+        // Every resolve_base_url input (#1017) via the shared constructor.
+        &crate::dispatch::pk_url_fingerprint(pk_value),
         || {
             let base = crate::dispatch::resolve_base_url(pk_value)?;
             Ok::<_, crate::error::ProxyError>(crate::dispatch::build_anthropic_url(

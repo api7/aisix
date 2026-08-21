@@ -436,14 +436,12 @@ async fn dispatch(
     let url = aisix_gateway::url_cache::cached_endpoint_url(
         &pk_entry.id,
         "proxy/images/edits",
-        &[
-            pk_entry.value.api_base.as_deref().unwrap_or(""),
-            // The resolver's output depends on the vendor since #1017
-            // (openai default-base fallback); without it in the
-            // fingerprint a repurposed row would keep its stale URL.
-            pk_entry.value.provider.as_str(),
-            "/images/edits",
-        ],
+        // Every resolve_base_url input, via the shared constructor
+        // (#1017), plus the endpoint path.
+        &{
+            let [base, vendor] = crate::dispatch::pk_url_fingerprint(&pk_entry.value);
+            [base, vendor, "/images/edits"]
+        },
         || {
             let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
             Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(

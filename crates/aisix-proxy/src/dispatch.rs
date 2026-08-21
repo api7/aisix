@@ -245,9 +245,9 @@ fn strip_endpoint_suffix(base: &str) -> &str {
 /// keeps requiring `api_base` — the DP does not enumerate per-vendor
 /// default URLs.
 ///
-/// Callers that cache the built URL MUST include the vendor in the
-/// cache fingerprint alongside `api_base` — since this fallback, the
-/// resolved URL depends on both.
+/// Callers that cache the built URL take their fingerprint from
+/// [`pk_url_fingerprint`], which carries every input this resolver
+/// reads — never hand-build a partial fingerprint.
 pub(crate) fn resolve_base_url(provider_key: &ProviderKey) -> Result<String, ProxyError> {
     match provider_key.api_base.as_deref() {
         Some(b) if !b.trim().is_empty() => Ok(strip_endpoint_suffix(b.trim()).to_string()),
@@ -322,6 +322,19 @@ pub(crate) fn build_openai_url(base: &str, path: &str) -> String {
     } else {
         format!("{trimmed}/v1{path}")
     }
+}
+
+/// The cache-fingerprint elements for a URL derived from
+/// [`resolve_base_url`]: every raw input the resolved URL depends on —
+/// `api_base` AND the vendor (the #1017 default-base fallback made the
+/// output vendor-dependent). One constructor for all call sites, so a
+/// future input added here reaches every cached URL at once instead of
+/// relying on each site's comment discipline.
+pub(crate) fn pk_url_fingerprint(provider_key: &ProviderKey) -> [&str; 2] {
+    [
+        provider_key.api_base.as_deref().unwrap_or(""),
+        provider_key.provider.as_str(),
+    ]
 }
 
 /// Join an Anthropic upstream base with a version-independent endpoint
@@ -658,10 +671,7 @@ mod tests {
         let first = aisix_gateway::url_cache::cached_endpoint_url(
             resource_id,
             "test/1017-fingerprint",
-            &[
-                openai_pk.api_base.as_deref().unwrap_or(""),
-                openai_pk.provider.as_str(),
-            ],
+            &pk_url_fingerprint(&openai_pk),
             || {
                 let base = resolve_base_url(&openai_pk)?;
                 Ok::<_, ProxyError>(build_openai_url(&base, "/responses"))
@@ -676,10 +686,7 @@ mod tests {
         let second = aisix_gateway::url_cache::cached_endpoint_url(
             resource_id,
             "test/1017-fingerprint",
-            &[
-                deepseek_pk.api_base.as_deref().unwrap_or(""),
-                deepseek_pk.provider.as_str(),
-            ],
+            &pk_url_fingerprint(&deepseek_pk),
             || {
                 let base = resolve_base_url(&deepseek_pk)?;
                 Ok::<_, ProxyError>(build_openai_url(&base, "/responses"))
