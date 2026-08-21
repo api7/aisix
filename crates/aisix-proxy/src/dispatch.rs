@@ -231,22 +231,48 @@ fn strip_endpoint_suffix(base: &str) -> &str {
 /// image edits, jobs, realtime). The fallback here converges all of
 /// them. Strictly the exact vendor string: an empty or
 /// OpenAI-compatible vendor still errors, because this resolver also
-/// serves non-OpenAI-family paths and must never send another vendor's
-/// credential to api.openai.com (the same refusal the family bridge
-/// makes). Every other catalog vendor keeps requiring `api_base` —
-/// the DP does not enumerate per-vendor default URLs.
+/// serves non-OpenAI-family paths (messages / count_tokens) and must
+/// never send another vendor's credential to api.openai.com. Note the
+/// family bridge is LOOSER: it refuses only a non-empty non-openai
+/// vendor and still falls back for the legacy empty-provider shape —
+/// so a legacy `{provider: "", adapter: "openai"}` row with no
+/// `api_base` remains route-dependent (chat falls back, direct routes
+/// 400); that residue is tracked in #1019 rather than widened here. A
+/// key misdeclared as `provider: "openai"` on an anthropic-adapter
+/// path now dispatches to api.openai.com and gets the upstream's 401
+/// instead of a gateway 400 — by declaration that secret is an OpenAI
+/// credential, so nothing crosses vendors. Every other catalog vendor
+/// keeps requiring `api_base` — the DP does not enumerate per-vendor
+/// default URLs.
+///
+/// Callers that cache the built URL MUST include the vendor in the
+/// cache fingerprint alongside `api_base` — since this fallback, the
+/// resolved URL depends on both.
 pub(crate) fn resolve_base_url(provider_key: &ProviderKey) -> Result<String, ProxyError> {
     match provider_key.api_base.as_deref() {
         Some(b) if !b.trim().is_empty() => Ok(strip_endpoint_suffix(b.trim()).to_string()),
         _ if provider_key.provider.trim().eq_ignore_ascii_case("openai") => {
             Ok(aisix_provider_openai::OPENAI_DEFAULT_BASE.to_string())
         }
-        _ => Err(ProxyError::InvalidRequest(format!(
-            "provider_key {:?} has no api_base — cp-api must populate api_base \
-             for every catalog vendor (the DP does not enumerate per-vendor \
-             default URLs; the openai vendor is the one built-in default)",
-            provider_key.display_name
-        ))),
+        _ => {
+            // Remediation detail (control-plane field names, provider
+            // topology) goes to logs only — the customer-visible body
+            // stays free of internal taxonomy, matching the family
+            // bridge's posture.
+            tracing::error!(
+                pk_display_name = %provider_key.display_name,
+                pk_vendor = %provider_key.provider,
+                "provider_key has no api_base. Operator action: populate \
+                 `api_base` on the ProviderKey resource (managed \
+                 deployments: via the control plane's provider settings; \
+                 standalone: directly on the resource). Only the openai \
+                 vendor has a built-in default base."
+            );
+            Err(ProxyError::InvalidRequest(format!(
+                "provider_key {:?} has no api_base configured",
+                provider_key.display_name
+            )))
+        }
     }
 }
 
@@ -606,6 +632,62 @@ mod tests {
         assert_eq!(
             resolve_base_url(&pk).unwrap(),
             aisix_provider_openai::OPENAI_DEFAULT_BASE
+        );
+    }
+
+    /// #1017 HIGH-1 regression: the cached-URL fingerprint at every
+    /// resolver-fed call site must include the vendor. Simulated here at
+    /// the cache level with the exact fingerprint shape those sites use:
+    /// a row cached under `provider: "openai"` (no api_base → default
+    /// base) must NOT keep serving that URL after the row is repurposed
+    /// to another vendor — the rebuild must run and surface the 400,
+    /// or the repurposed vendor's credential would flow to
+    /// api.openai.com until restart.
+    #[test]
+    fn cached_url_rebuilds_when_provider_changes_without_api_base() {
+        let openai_pk: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"repurpose","secret":"k","provider":"openai"}"#,
+        )
+        .unwrap();
+        let deepseek_pk: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"repurpose","secret":"k2","provider":"deepseek","adapter":"openai"}"#,
+        )
+        .unwrap();
+        let resource_id = "test-1017-fingerprint-repurpose";
+
+        let first = aisix_gateway::url_cache::cached_endpoint_url(
+            resource_id,
+            "test/1017-fingerprint",
+            &[
+                openai_pk.api_base.as_deref().unwrap_or(""),
+                openai_pk.provider.as_str(),
+            ],
+            || {
+                let base = resolve_base_url(&openai_pk)?;
+                Ok::<_, ProxyError>(build_openai_url(&base, "/responses"))
+            },
+        )
+        .unwrap();
+        assert!(format!("{first:?}").contains("api.openai.com"));
+
+        // Same resource id + endpoint, vendor edited: the fingerprint
+        // mismatch must force a rebuild, which errors — the stale
+        // api.openai.com URL must not be served.
+        let second = aisix_gateway::url_cache::cached_endpoint_url(
+            resource_id,
+            "test/1017-fingerprint",
+            &[
+                deepseek_pk.api_base.as_deref().unwrap_or(""),
+                deepseek_pk.provider.as_str(),
+            ],
+            || {
+                let base = resolve_base_url(&deepseek_pk)?;
+                Ok::<_, ProxyError>(build_openai_url(&base, "/responses"))
+            },
+        );
+        assert!(
+            second.is_err(),
+            "repurposed vendor must rebuild and surface the 400, not the cached URL"
         );
     }
 

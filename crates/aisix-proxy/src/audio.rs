@@ -990,6 +990,11 @@ async fn multipart_dispatch(
         url_cache_key,
         &[
             pk_entry.value.api_base.as_deref().unwrap_or(""),
+            // The resolver's output depends on the vendor since #1017
+            // (openai default-base fallback) — a fingerprint without it
+            // would keep serving a stale api.openai.com URL after the
+            // row is repurposed to another vendor.
+            pk_entry.value.provider.as_str(),
             upstream_path,
         ],
         || {
@@ -1664,7 +1669,11 @@ async fn speech_dispatch(
     let speech_url = aisix_gateway::url_cache::cached_endpoint_url(
         &pk_entry.id,
         "proxy/audio/speech",
-        &[pk_entry.value.api_base.as_deref().unwrap_or("")],
+        &[
+            pk_entry.value.api_base.as_deref().unwrap_or(""),
+            // Vendor in the fingerprint — see multipart_dispatch (#1017).
+            pk_entry.value.provider.as_str(),
+        ],
         || {
             let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
             Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
