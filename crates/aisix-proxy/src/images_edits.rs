@@ -385,12 +385,15 @@ async fn dispatch(
                 obj.insert(key, Value::String(value));
             }
         };
-        for (name, _, content_type, data) in &fields {
-            // `image` / `mask` carry file bytes; represent them by
+        for (name, _, _, data) in &fields {
+            // `image` / `mask` are the file slots; represent them by
             // checksum even when the bytes happen to be valid UTF-8 (an
             // SVG source, say) — the capture is an audit trail, not an
-            // asset store.
-            let is_binary_slot = name == "image" || name == "mask" || content_type.is_some();
+            // asset store. Name-based, not content-type-based: browsers
+            // and SDKs stamp `text/plain` on ordinary text fields, and
+            // hashing a `prompt` for that would erase the very text the
+            // capture exists to audit (same rule as audio's `file`).
+            let is_binary_slot = name == "image" || name == "mask";
             match std::str::from_utf8(data) {
                 Ok(text) if !is_binary_slot => {
                     push(name.clone(), text.to_string());
@@ -574,17 +577,19 @@ async fn dispatch(
         }
     };
 
-    state.health.record_success(&model.display_name);
-    state.runtime_status.mark_healthy(&model_entry.id);
-
     // The edits response is a JSON object (`{created, data, usage?}`) on
     // every documented success; a body that doesn't parse is an upstream
     // defect surfaced as 502 rather than relayed as ambiguous bytes.
+    // Parsed BEFORE the health marks below, so a 2xx-with-garbage answer
+    // doesn't record the model healthy on a request the caller sees fail.
     let resp_json: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
         ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(format!(
             "image edits response is not JSON: {e}"
         )))
     })?;
+
+    state.health.record_success(&model.display_name);
+    state.runtime_status.mark_healthy(&model_entry.id);
 
     // #911 [21]: commit the actual token cost so TPM/TPD is enforced.
     let usage = crate::images::extract_token_usage(&resp_json);

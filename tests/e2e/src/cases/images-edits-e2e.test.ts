@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -126,19 +127,14 @@ describe("images edits e2e: /v1/images/edits multipart forward + model translati
       return;
     }
 
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await editCall("img-edits-e2e");
-        if (r.status !== 200) {
-          await r.text();
-          return false;
-        }
-        const j = (await r.json()) as { data?: unknown };
-        return Array.isArray(j.data) && (j.data as unknown[]).length > 0;
-      } catch {
-        return false;
-      }
-    });
+    // Readiness gate on an independent condition (AGENTS.md): the caller
+    // key was seeded after every other resource, so it authenticating
+    // implies the whole seed set is in the snapshot. `listModels` cannot
+    // throw, so nothing masks a real failure as a timeout.
+    const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(
+      async () => (await probe.listModels()).status === 200,
+    );
 
     const baseline = upstream.receivedRequests.length;
     const res = await editCall("img-edits-e2e");
@@ -218,19 +214,12 @@ describe("images edits e2e: /v1/images/edits multipart forward + model translati
       allowed_models: ["img-edits-anthropic"],
     });
 
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await editCall("img-edits-anthropic", nonOaCaller);
-        if (r.status !== 400) {
-          await r.text();
-          return false;
-        }
-        const j = (await r.json()) as { error?: { type?: unknown } };
-        return j.error?.type === "invalid_request_error";
-      } catch {
-        return false;
-      }
-    });
+    // Same independent gate: this key was seeded after the anthropic
+    // model, so it authenticating implies that model is in the snapshot.
+    const nonOaProbe = new ProxyClient(app.proxyUrl, nonOaCaller);
+    await waitConfigPropagation(
+      async () => (await nonOaProbe.listModels()).status === 200,
+    );
 
     const baseline = upstream.receivedRequests.length;
     const res = await editCall("img-edits-anthropic", nonOaCaller);
