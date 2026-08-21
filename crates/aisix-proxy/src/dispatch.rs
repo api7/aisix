@@ -324,6 +324,37 @@ pub(crate) fn build_openai_url(base: &str, path: &str) -> String {
     }
 }
 
+/// Reject a multipart `prompt` field that is not valid UTF-8 (#1016).
+///
+/// The guardrail scan and mask passes read `prompt` through
+/// `std::str::from_utf8` and SKIP a field that fails to decode, while
+/// the rebuilt form forwards the original bytes verbatim — so a caller
+/// could smuggle text past a keyword/DLP input guardrail by prefixing
+/// one invalid byte or using a non-UTF-8 encoding. Fail closed instead:
+/// the upstream contracts type `prompt` as text, so a compliant caller
+/// loses nothing, and the JSON endpoints already behave this way (serde
+/// rejects invalid UTF-8 bodies with 400). Deliberately UNCONDITIONAL —
+/// not gated on a guardrail chain being configured — so a request's
+/// validity does not flip when a guardrail is attached later, matching
+/// the boundary-validation posture content-inspection systems use
+/// (validate encoding first, match second).
+///
+/// Called by every multipart surface that scans `prompt` (audio
+/// transcriptions/translations, image edits) after model resolution —
+/// unknown models keep answering 404 — and before the guardrail pass.
+pub(crate) fn require_utf8_prompt_fields(
+    fields: &[(String, Option<String>, Option<String>, bytes::Bytes)],
+) -> Result<(), ProxyError> {
+    for (name, _, _, data) in fields {
+        if name == "prompt" && std::str::from_utf8(data).is_err() {
+            return Err(ProxyError::InvalidRequest(
+                "`prompt` field is not valid UTF-8".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The cache-fingerprint elements for a URL derived from
 /// [`resolve_base_url`]: every raw input the resolved URL depends on —
 /// `api_base` AND the vendor (the #1017 default-base fallback made the
@@ -646,6 +677,36 @@ mod tests {
             resolve_base_url(&pk).unwrap(),
             aisix_provider_openai::OPENAI_DEFAULT_BASE
         );
+    }
+
+    /// #1016: the multipart prompt UTF-8 gate — invalid bytes in a
+    /// `prompt` part reject; binary bytes in other parts (the image
+    /// itself) pass through untouched.
+    #[test]
+    fn require_utf8_prompt_fields_rejects_only_invalid_prompt() {
+        use bytes::Bytes;
+        let valid = vec![
+            ("model".to_string(), None, None, Bytes::from_static(b"m")),
+            ("prompt".to_string(), None, None, Bytes::from_static(b"ok")),
+            (
+                "image".to_string(),
+                Some("a.png".to_string()),
+                Some("image/png".to_string()),
+                Bytes::from_static(&[0xFF, 0xD8, 0xFF]),
+            ),
+        ];
+        assert!(require_utf8_prompt_fields(&valid).is_ok());
+
+        let invalid = vec![(
+            "prompt".to_string(),
+            None,
+            None,
+            Bytes::from_static(&[0xFF, b'h', b'i']),
+        )];
+        assert!(matches!(
+            require_utf8_prompt_fields(&invalid).unwrap_err(),
+            ProxyError::InvalidRequest(_)
+        ));
     }
 
     /// #1017 HIGH-1 regression: the cached-URL fingerprint at every

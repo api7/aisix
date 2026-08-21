@@ -845,6 +845,11 @@ async fn multipart_dispatch(
     // Client-IP allowlist gate (#557): reject before quota / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
 
+    // #1016: a `prompt` part that is not valid UTF-8 would be skipped by
+    // the guardrail scan below yet forwarded verbatim — reject it before
+    // the guardrail pass instead of leaving that asymmetry.
+    crate::dispatch::require_utf8_prompt_fields(&fields)?;
+
     // #696: transcriptions/translations run the guardrail chain too. The
     // audio bytes aren't scannable text, but the optional `prompt` form
     // field IS caller text forwarded verbatim to the provider — scan it
@@ -2460,6 +2465,92 @@ mod tests {
             .unwrap();
         let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// #1016: a `prompt` part that is not valid UTF-8 is rejected 400
+    /// BEFORE the guardrail pass — pre-fix the scan silently skipped it
+    /// while the rebuilt form forwarded the bytes verbatim, so an
+    /// invalid-byte prefix smuggled blocked text past a keyword
+    /// guardrail. The upstream must never be contacted.
+    #[tokio::test]
+    async fn non_utf8_prompt_rejected_400_before_guardrail_and_upstream() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"text":"x"})))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-whisper"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(
+            b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nmy-whisper\r\n",
+        );
+        body.extend_from_slice(b"--b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n");
+        // 0xFF makes the field invalid UTF-8; the blocked keyword rides
+        // behind it, unseen by the scan pre-fix.
+        body.extend_from_slice(&[0xFF]);
+        body.extend_from_slice(b"BLOCKME\r\n");
+        body.extend_from_slice(
+            b"--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\
+             Content-Type: audio/mpeg\r\n\r\nID3fakeaudio\r\n--b--\r\n",
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "multipart/form-data; boundary=b")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert!(v["error"]["message"].as_str().unwrap().contains("UTF-8"));
+    }
+
+    /// #1016 companion on the second wired route: translations shares
+    /// the dispatch, and the reject is UNCONDITIONAL — no guardrail
+    /// configured here, the invalid prompt still 400s (validity must
+    /// not flip when a guardrail is attached later).
+    #[tokio::test]
+    async fn translations_non_utf8_prompt_rejected_without_guardrail() {
+        let snap = new_snap("http://unused");
+        snap.models.insert(whisper_model("my-whisper"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(
+            b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nmy-whisper\r\n",
+        );
+        body.extend_from_slice(b"--b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n");
+        body.extend_from_slice(&[0xC3, 0x28]);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(
+            b"--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\
+             Content-Type: audio/mpeg\r\n\r\nID3fakeaudio\r\n--b--\r\n",
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/translations")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "multipart/form-data; boundary=b")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     fn build_app_with_sink(
