@@ -518,16 +518,6 @@ where
         ignored.push(normalize_ignored_path(&path.to_string()));
     }) {
         Ok(t) => {
-            // `serde_ignored` is blind inside serde-buffered content, which
-            // is the whole config subtree of some kinds; those resources get
-            // their unknown-field paths off the schema instead.
-            if let Some(resource) = schema_reported_resource(parsed.kind) {
-                ignored.extend(
-                    aisix_core::models::unknown_field_paths(resource, value)
-                        .iter()
-                        .map(|path| normalize_ignored_path(path)),
-                );
-            }
             if let Err(err) = semantic(&t) {
                 tracing::error!(key = %key, error = %err, "semantic validation failed; skipping (incompatible row)");
                 stats.schema_rejected += 1;
@@ -537,6 +527,16 @@ where
                 return None;
             }
             stats.accepted += 1;
+            // `serde_ignored` is blind inside serde-buffered content, which
+            // for some kinds is the whole config subtree; those take their
+            // unknown-field paths off the schema instead.
+            if let Some(resource) = schema_reported_resource(parsed.kind) {
+                ignored.extend(
+                    aisix_core::models::unknown_field_paths(resource, value)
+                        .iter()
+                        .map(|path| normalize_ignored_path(path)),
+                );
+            }
             if !ignored.is_empty() {
                 // YELLOW: loaded, but fields this build does not know were
                 // ignored — typically written by a newer control plane.
