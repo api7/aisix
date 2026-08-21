@@ -1,0 +1,20 @@
+_format_version: "1"
+
+mcp_servers:
+  - display_name: echo
+    url: http://127.0.0.1:13100/mcp
+    enabled: true
+
+api_keys:
+  - display_name: anon-principal
+    key_env: ANON_PRINCIPAL_KEY
+    allowed_models: []
+    mcp_access:
+      allow: ["*"]
+
+mcp_auth_settings:
+  - anonymous:
+      api_key_id: 9aeb246c-ed38-5bef-a854-c8565ca95fb4  # uuid5(FILE_RESOURCE_NAMESPACE, "api_keys/anon-principal")
+      source_cidrs: ["0.0.0.0/0", "::/0"]
+      servers: ["echo"]
+      aggregate_entry: true
