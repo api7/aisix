@@ -3775,6 +3775,7 @@ mod tests {
             .expect("UsageEvent must be emitted for the refusal")
             .expect("usage_sink sender dropped");
         assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].guardrail_name, "t");
         assert_eq!(ev.guardrail_enforced_hits[0].hook, "input");
         assert_eq!(ev.guardrail_enforced_hits[0].action, "blocked");
         let wire = serde_json::to_string(&ev).unwrap();

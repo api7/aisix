@@ -926,7 +926,16 @@ pub struct GuardrailExecution<'a> {
     /// (monitor mode).
     pub result: &'static str,
     /// Bounded failure tag (e.g. `lakera_timeout`) when the guardrail could
-    /// not evaluate and failed open (`result = bypassed`); `None` otherwise.
+    /// not evaluate: on `result = bypassed` (it failed OPEN and the request
+    /// continued) and, since AISIX-Cloud#1365, on `result = blocked` when
+    /// it failed CLOSED and the request was refused instead. `None` for
+    /// every outcome the guardrail actually decided.
+    ///
+    /// `result` deliberately does not distinguish those two blocks — it is
+    /// a shipped metric label with alerting attached, and splitting its
+    /// value domain would silently stop an existing `result="blocked"`
+    /// alert from counting outages. `error_type != None` is the
+    /// discriminator on this side; the audit event uses a separate action.
     pub error_type: Option<&'a str>,
     /// Wall-clock time the member call took.
     pub elapsed: std::time::Duration,

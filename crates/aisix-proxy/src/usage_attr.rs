@@ -39,13 +39,17 @@ use crate::state::ProxyState;
 /// snapshot, so no call site needs to branch on it.
 pub(crate) type GuardrailAudit = Option<Arc<aisix_guardrails::GuardrailAuditLog>>;
 
-/// Drain `audit` into a terminal `UsageEvent`'s `guardrail_enforced_hits`.
+/// Snapshot `audit` into a terminal `UsageEvent`'s
+/// `guardrail_enforced_hits`.
 ///
 /// Terminal events only: guardrails run once per request, not once per
 /// attempt, so stamping a per-attempt event would report the same hit
-/// once per retry. The read is non-destructive, so a handler that emits
-/// both kinds is free to call this on the terminal one after the
-/// per-attempt ones have already gone out.
+/// once per retry.
+///
+/// Reading does not consume the log, and that is load-bearing rather than
+/// incidental: the retrying families call this from emitters that also
+/// serve superseded attempts, and a destructive read would leave whichever
+/// event happened to go out first holding the only copy.
 pub(crate) fn enforced_hits(audit: &GuardrailAudit) -> Vec<aisix_core::GuardrailEnforcedHit> {
     audit.as_ref().map(|a| a.snapshot()).unwrap_or_default()
 }

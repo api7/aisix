@@ -257,9 +257,20 @@ describe("guardrail enforced hits on the LLM handler family", () => {
    * Assert the row that masked is named on the exported event, with the
    * endpoint's own detector count — and that the value it masked is not
    * anywhere in the SOC feed.
+   *
+   * Gated on the requested MODEL, which rides every event this endpoint
+   * emits and is therefore independent of the array under test. Waiting on
+   * the detector name would look equivalent — it also rides
+   * `redacted_entity_counts` — but that couples the gate to a second field
+   * that could itself regress, and then a lost drain fails by burning the
+   * 10s poll instead of by the assertion below (tests/e2e/AGENTS.md).
    */
-  const expectAuditedMask = async (detector: string, marker: string): Promise<void> => {
-    await waitForToken(sls!, LOGSTORE, detector);
+  const expectAuditedMask = async (
+    model: string,
+    detector: string,
+    marker: string,
+  ): Promise<void> => {
+    await waitForToken(sls!, LOGSTORE, model);
     const decoded = decodedTextFor(sls!, LOGSTORE);
 
     const hits = hitsIn(decoded).filter(
@@ -300,7 +311,7 @@ describe("guardrail enforced hits on the LLM handler family", () => {
     expect(body).toContain("***");
     expect(body).not.toContain(CASES.chat.marker);
 
-    await expectAuditedMask(CASES.chat.detector, CASES.chat.marker);
+    await expectAuditedMask("enforced-chat", CASES.chat.detector, CASES.chat.marker);
   });
 
   test("/v1/chat/completions (streaming) names the row that masked", async (ctx) => {
@@ -319,7 +330,7 @@ describe("guardrail enforced hits on the LLM handler family", () => {
     expect(body).toContain("***");
     expect(body).not.toContain(CASES.chatStream.marker);
 
-    await expectAuditedMask(CASES.chatStream.detector, CASES.chatStream.marker);
+    await expectAuditedMask("enforced-chat-stream", CASES.chatStream.detector, CASES.chatStream.marker);
   });
 
   test("/v1/messages names the row that masked (Claude-Code path)", async (ctx) => {
@@ -335,7 +346,7 @@ describe("guardrail enforced hits on the LLM handler family", () => {
     expect(body).toContain("***");
     expect(body).not.toContain(CASES.messages.marker);
 
-    await expectAuditedMask(CASES.messages.detector, CASES.messages.marker);
+    await expectAuditedMask("enforced-messages", CASES.messages.detector, CASES.messages.marker);
   });
 
   test("/v1/responses names the row that masked (Codex path)", async (ctx) => {
@@ -350,7 +361,7 @@ describe("guardrail enforced hits on the LLM handler family", () => {
     expect(body).toContain("***");
     expect(body).not.toContain(CASES.responses.marker);
 
-    await expectAuditedMask(CASES.responses.detector, CASES.responses.marker);
+    await expectAuditedMask("enforced-responses", CASES.responses.detector, CASES.responses.marker);
   });
 });
 
