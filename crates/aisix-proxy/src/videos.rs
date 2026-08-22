@@ -3953,5 +3953,4 @@ mod tests {
         let wire = serde_json::to_string(&ev).unwrap();
         assert!(!wire.contains("BLOCKME"), "{wire}");
     }
-
 }

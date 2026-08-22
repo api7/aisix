@@ -197,25 +197,27 @@ mod tests {
     #[test]
     fn enforced_hits_ride_the_flattened_exporter_wire() {
         let rec = SinkRecord::metadata_only(UsageEvent {
-            guardrail_enforced_hits: vec![aisix_core::GuardrailEnforcedHit {
-                guardrail_name: "eda-mask".into(),
-                hook: "output".into(),
-                action: "masked".into(),
-                counts: [("eda_version".to_owned(), 2u32)].into_iter().collect(),
-                duration_us: 41,
-                ..Default::default()
-            },
-            // AISIX-Cloud#1365: the fail-closed refusal is a distinct
-            // action carrying a bounded cause, and the SOC exporters must
-            // see the distinction the /logs badge sees — an auditor
-            // reading the NDJSON drop has no control plane to ask.
-            aisix_core::GuardrailEnforcedHit {
-                guardrail_name: "lakera-prod".into(),
-                hook: "input".into(),
-                action: "blocked_unavailable".into(),
-                error_type: "lakera_timeout".into(),
-                ..Default::default()
-            }],
+            guardrail_enforced_hits: vec![
+                aisix_core::GuardrailEnforcedHit {
+                    guardrail_name: "eda-mask".into(),
+                    hook: "output".into(),
+                    action: "masked".into(),
+                    counts: [("eda_version".to_owned(), 2u32)].into_iter().collect(),
+                    duration_us: 41,
+                    ..Default::default()
+                },
+                // AISIX-Cloud#1365: the fail-closed refusal is a distinct
+                // action carrying a bounded cause, and the SOC exporters must
+                // see the distinction the /logs badge sees — an auditor
+                // reading the NDJSON drop has no control plane to ask.
+                aisix_core::GuardrailEnforcedHit {
+                    guardrail_name: "lakera-prod".into(),
+                    hook: "input".into(),
+                    action: "blocked_unavailable".into(),
+                    error_type: "lakera_timeout".into(),
+                    ..Default::default()
+                },
+            ],
             ..UsageEvent::default()
         });
         let json = serde_json::to_value(&rec).unwrap();

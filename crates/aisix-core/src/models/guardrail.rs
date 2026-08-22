@@ -860,9 +860,15 @@ pub struct GuardrailMonitorHit {
 /// reason, and any upstream detail are never captured (#153 / #932
 /// no-leak criterion).
 ///
-/// One entry per `(guardrail_name, hook, action)`: a guardrail that masks
-/// forty string leaves of one tool result reports a single entry whose
-/// `counts` and `duration_us` are summed across those leaves.
+/// One entry per `(guardrail_name, hook, action, error_type)`: a guardrail
+/// that masks forty string leaves of one tool result reports a single entry
+/// whose `counts` and `duration_us` are summed across those leaves.
+///
+/// An empty array alongside `guardrail_blocked: true` is a legitimate
+/// state, not a contradiction: a streamed response aborted by the
+/// guardrail buffer cap is refused without any member returning a verdict,
+/// so there is no policy to name. Read the array as "which policies acted,
+/// when one did", never as an inverse of the boolean.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuardrailEnforcedHit {
     /// The configured (row) name of the guardrail that fired.

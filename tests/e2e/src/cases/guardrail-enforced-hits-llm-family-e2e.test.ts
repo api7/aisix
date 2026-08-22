@@ -73,6 +73,11 @@ interface EnforcedHit {
  * objects are BTreeMap-ordered, so an entry's first key is `action` rather
  * than the struct's declaration order. Both spellings are accepted so a
  * later encoder change does not silently turn this into a no-op match.
+ *
+ * `guardrail_monitor_hits` renders with the same leading keys, so its
+ * entries are dropped by their `would_*` actions — otherwise adding a
+ * monitor-mode member to one of these rows would make the per-endpoint
+ * assertions below compare a staged hit against an enforced contract.
  */
 const hitsIn = (decoded: string): EnforcedHit[] =>
   [...decoded.matchAll(/\[\{"(?:action|guardrail_name)":.*?\}\]/g)]
@@ -84,7 +89,8 @@ const hitsIn = (decoded: string): EnforcedHit[] =>
       }
     })
     .filter((a): a is EnforcedHit[] => Array.isArray(a))
-    .flat();
+    .flat()
+    .filter((h) => !h.action?.startsWith("would_"));
 
 describe("guardrail enforced hits on the LLM handler family", () => {
   let app: SpawnedApp | undefined;
@@ -444,7 +450,11 @@ describe("a fail-closed guardrail outage is audited apart from a policy block", 
     // must not weaken the guarantee itself.
     expect(res.status).toBe(422);
 
-    await waitForToken(sls, DEAD_LOGSTORE, "presidio-prod");
+    // Waited on the requested MODEL, not the guardrail row: the row name
+    // rides only the array under test, so waiting on it would turn a lost
+    // drain into a 10s timeout instead of the assertion below — the
+    // failure mode tests/e2e/AGENTS.md calls out.
+    await waitForToken(sls, DEAD_LOGSTORE, "enforced-unavailable");
     const decoded = decodedTextFor(sls, DEAD_LOGSTORE);
     const hits = hitsIn(decoded).filter((h) => h.guardrail_name === "presidio-prod");
     expect(hits.length).toBeGreaterThan(0);

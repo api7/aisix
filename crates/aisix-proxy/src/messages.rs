@@ -5419,8 +5419,7 @@ data: [DONE]\n\n";
             }"#,
         )
         .unwrap();
-        snap.guardrails
-            .insert(ResourceEntry::new("g-mask", row, 1));
+        snap.guardrails.insert(ResourceEntry::new("g-mask", row, 1));
     }
 
     #[track_caller]
@@ -5438,7 +5437,10 @@ data: [DONE]\n\n";
         assert_eq!(hit.action, "masked");
         assert_eq!(hit.counts.get("eda_version").copied(), Some(1));
         let wire = serde_json::to_string(event).expect("event serialises");
-        assert!(!wire.contains("9.9.9"), "masked value reached the event: {wire}");
+        assert!(
+            !wire.contains("9.9.9"),
+            "masked value reached the event: {wire}"
+        );
     }
 
     /// Non-streaming `/v1/messages`.
@@ -5547,8 +5549,14 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(resp.status(), StatusCode::OK);
         let streamed =
             String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
-        assert!(streamed.contains("***"), "the stream was not masked: {streamed}");
-        assert!(!streamed.contains("9.9.9"), "the stream leaked the value: {streamed}");
+        assert!(
+            streamed.contains("***"),
+            "the stream was not masked: {streamed}"
+        );
+        assert!(
+            !streamed.contains("9.9.9"),
+            "the stream leaked the value: {streamed}"
+        );
 
         let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
             .await
@@ -5556,5 +5564,4 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             .expect("usage event sender dropped");
         assert_masked_by_eda(&event);
     }
-
 }

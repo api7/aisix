@@ -148,7 +148,14 @@ mod tests {
     fn hook_and_action_split_entries_apart() {
         let log = GuardrailAuditLog::new();
         let none = BTreeMap::new();
-        log.record("g", "input", "masked", None, Duration::ZERO, &counts(&[("ip", 1)]));
+        log.record(
+            "g",
+            "input",
+            "masked",
+            None,
+            Duration::ZERO,
+            &counts(&[("ip", 1)]),
+        );
         log.record(
             "g",
             "output",
@@ -191,7 +198,14 @@ mod tests {
     #[test]
     fn snapshot_does_not_drain() {
         let log = GuardrailAuditLog::new();
-        log.record("g", "input", "blocked", None, Duration::ZERO, &BTreeMap::new());
+        log.record(
+            "g",
+            "input",
+            "blocked",
+            None,
+            Duration::ZERO,
+            &BTreeMap::new(),
+        );
         assert_eq!(log.snapshot().len(), 1);
         assert_eq!(log.snapshot().len(), 1);
     }

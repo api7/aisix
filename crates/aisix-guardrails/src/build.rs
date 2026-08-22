@@ -771,7 +771,7 @@ impl MandatoryGuardrail {
                 GuardrailVerdict::Block {
                     reason: format!("mandatory guardrail unavailable: {reason}"),
                     guardrail_name: Some(self.row_name.clone()),
-                    unavailable: Some(reason),
+                    unavailable: Some(crate::bounded_failure_tag(&reason)),
                 }
             }
             other => other,

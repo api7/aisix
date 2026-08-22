@@ -475,7 +475,12 @@ impl Guardrail for GuardrailChain {
                     reason,
                     guardrail_name,
                     unavailable,
-                } => return (attribute_block(&m.name, reason, guardrail_name, unavailable), hits),
+                } => {
+                    return (
+                        attribute_block(&m.name, reason, guardrail_name, unavailable),
+                        hits,
+                    )
+                }
                 GuardrailVerdict::Bypass { reason } => {
                     if bypass.is_none() {
                         bypass = Some(reason);
@@ -516,7 +521,12 @@ impl Guardrail for GuardrailChain {
                     reason,
                     guardrail_name,
                     unavailable,
-                } => return (attribute_block(&m.name, reason, guardrail_name, unavailable), hits),
+                } => {
+                    return (
+                        attribute_block(&m.name, reason, guardrail_name, unavailable),
+                        hits,
+                    )
+                }
                 GuardrailVerdict::Bypass { reason } => {
                     if bypass.is_none() {
                         bypass = Some(reason);
@@ -563,7 +573,12 @@ impl Guardrail for GuardrailChain {
                     reason,
                     guardrail_name,
                     unavailable,
-                } => return (attribute_block(&m.name, reason, guardrail_name, unavailable), hits),
+                } => {
+                    return (
+                        attribute_block(&m.name, reason, guardrail_name, unavailable),
+                        hits,
+                    )
+                }
                 GuardrailVerdict::Bypass { reason } => {
                     if bypass.is_none() {
                         bypass = Some(reason);
@@ -606,7 +621,12 @@ impl Guardrail for GuardrailChain {
                     reason,
                     guardrail_name,
                     unavailable,
-                } => return (attribute_block(&m.name, reason, guardrail_name, unavailable), hits),
+                } => {
+                    return (
+                        attribute_block(&m.name, reason, guardrail_name, unavailable),
+                        hits,
+                    )
+                }
                 GuardrailVerdict::Bypass { reason } => {
                     if bypass.is_none() {
                         bypass = Some(reason);
@@ -957,7 +977,10 @@ mod tests {
 
         let audit = Arc::new(GuardrailAuditLog::new());
         let chain = GuardrailChain::new_with_applied(
-            vec![("lakera-prod".to_owned(), Arc::new(Unavailable) as Arc<dyn Guardrail>)],
+            vec![(
+                "lakera-prod".to_owned(),
+                Arc::new(Unavailable) as Arc<dyn Guardrail>,
+            )],
             vec![AppliedGuardrail {
                 kind: "lakera".to_owned(),
                 hook: "input".to_owned(),

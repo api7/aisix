@@ -369,13 +369,7 @@ pub async fn entry(
     // too (AISIX-Cloud#1330 / #1024).
     let mut audit = crate::usage_attr::GuardrailAudit::default();
     match dispatch(
-        &state,
-        &snapshot,
-        &matched,
-        req,
-        &client,
-        started,
-        &mut audit,
+        &state, &snapshot, &matched, req, &client, started, &mut audit,
     )
     .await
     {
@@ -1816,10 +1810,10 @@ fn stream_response(
                             let text = format!("{overlap_tail}{scan_buf}");
                             match scan_output(&chain, &route_name, &text, &mut telemetry).await {
                                 GuardrailVerdict::Block {
-                reason,
-                guardrail_name,
-                ..
-            } => {
+                                    reason,
+                                    guardrail_name,
+                                    ..
+                                } => {
                                     tracing::warn!(
                                         guardrail_hook = "output",
                                         route = %route_name,
@@ -3295,5 +3289,4 @@ mod tests {
         let wire = serde_json::to_string(&ev).unwrap();
         assert!(!wire.contains("BLOCKME"), "{wire}");
     }
-
 }

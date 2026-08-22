@@ -206,7 +206,10 @@ impl PromptShieldGuardrail {
         if fail_open {
             GuardrailVerdict::Bypass { reason: tag.into() }
         } else {
-            GuardrailVerdict::block_unavailable(format!("azure content safety unavailable ({tag})"), tag)
+            GuardrailVerdict::block_unavailable(
+                format!("azure content safety unavailable ({tag})"),
+                tag,
+            )
         }
     }
 }

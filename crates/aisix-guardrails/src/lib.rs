@@ -254,6 +254,30 @@ pub enum GuardrailVerdict {
     },
 }
 
+/// Clamp a failure tag to the shape a metric label and an audit field can
+/// safely carry: lowercase alphanumerics and underscores, at most 64 bytes.
+///
+/// Every producer already passes a `bypass_tag()` constant, so this is a
+/// no-op today. It is here because the TYPE cannot say so: the tag is a
+/// `String` (`MandatoryGuardrail` forwards whatever reason the inner
+/// guardrail's `Bypass` carried), it lands on an unsanitized Prometheus
+/// label, and it reaches the usage event that #153 forbids putting content
+/// on. A future guardrail that returns a free-text bypass reason would
+/// otherwise mint one metric series per distinct string.
+pub(crate) fn bounded_failure_tag(tag: &str) -> String {
+    let cleaned: String = tag
+        .chars()
+        .map(|c| c.to_ascii_lowercase())
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "unknown".to_owned()
+    } else {
+        cleaned
+    }
+}
+
 impl GuardrailVerdict {
     /// `Block` verdict with no guardrail-name attribution (the chain fills
     /// the name in). Implementations use this so they don't repeat
@@ -277,7 +301,7 @@ impl GuardrailVerdict {
         GuardrailVerdict::Block {
             reason: reason.into(),
             guardrail_name: None,
-            unavailable: Some(tag.into()),
+            unavailable: Some(bounded_failure_tag(&tag.into())),
         }
     }
 
@@ -982,6 +1006,30 @@ mod tests {
             Some("lakera_timeout"),
         );
         assert_eq!(GuardrailVerdict::Allow.unavailable_tag(), None);
+        // The tag reaches an unsanitized Prometheus label and the usage
+        // event, so it is clamped at construction rather than trusted:
+        // every producer passes a `bypass_tag()` constant today, but the
+        // field's TYPE is `String` and cannot say so.
+        assert_eq!(
+            GuardrailVerdict::block_unavailable("x", "presidio_5xx").unavailable_tag(),
+            Some("presidio_5xx"),
+            "a real tag must survive the clamp unchanged",
+        );
+        assert_eq!(
+            GuardrailVerdict::block_unavailable("x", "Lakera Timeout: 500ms!").unavailable_tag(),
+            Some("lakeratimeout500ms"),
+        );
+        assert_eq!(
+            GuardrailVerdict::block_unavailable("x", "!!!").unavailable_tag(),
+            Some("unknown"),
+        );
+        assert_eq!(
+            GuardrailVerdict::block_unavailable("x", "a".repeat(200))
+                .unavailable_tag()
+                .map(str::len),
+            Some(64),
+            "an unbounded tag must not mint an unbounded metric series",
+        );
         assert_eq!(
             GuardrailVerdict::Bypass { reason: "y".into() }.unavailable_tag(),
             None,

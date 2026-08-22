@@ -5297,10 +5297,10 @@ where
                                 guard.comp().monitor_hits.extend(hits);
                                 match verdict {
                                     aisix_guardrails::GuardrailVerdict::Block {
-                reason,
-                guardrail_name,
-                ..
-            } => {
+                                        reason,
+                                        guardrail_name,
+                                        ..
+                                    } => {
                                         tracing::warn!(
                                             guardrail_hook = "output",
                                             model = %ctx.model_name,
@@ -5505,10 +5505,10 @@ where
                         }
                         match verdict {
                             aisix_guardrails::GuardrailVerdict::Block {
-                reason,
-                guardrail_name,
-                ..
-            } => {
+                                reason,
+                                guardrail_name,
+                                ..
+                            } => {
                                 tracing::warn!(
                                     guardrail_hook = "output",
                                     model = %ctx.model_name,
@@ -5593,10 +5593,10 @@ where
                 guard.comp().monitor_hits.extend(hits);
                 match verdict {
                     aisix_guardrails::GuardrailVerdict::Block {
-                reason,
-                guardrail_name,
-                ..
-            } => {
+                        reason,
+                        guardrail_name,
+                        ..
+                    } => {
                         // Mirror the non-streaming path's #153
                         // redaction contract: the wire-level message
                         // names only the guardrail that fired (#519

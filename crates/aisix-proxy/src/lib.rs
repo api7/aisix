@@ -10028,7 +10028,10 @@ data: [DONE]\n\n";
         assert_eq!(hit.counts.get("eda_version").copied(), Some(1));
         // #153: names and counts only — never the value that was masked.
         let wire = serde_json::to_string(event).expect("event serialises");
-        assert!(!wire.contains("9.9.9"), "masked value reached the event: {wire}");
+        assert!(
+            !wire.contains("9.9.9"),
+            "masked value reached the event: {wire}"
+        );
     }
 
     fn chat_request(model: &str, streaming: bool) -> Request<Body> {
@@ -10129,7 +10132,10 @@ data: [DONE]\n\n";
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("***"), "the stream was not masked: {body}");
-        assert!(!body.contains("9.9.9"), "the stream leaked the value: {body}");
+        assert!(
+            !body.contains("9.9.9"),
+            "the stream leaked the value: {body}"
+        );
 
         let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
             .await
@@ -10188,8 +10194,9 @@ data: [DONE]\n\n";
         let hub = Arc::new(Hub::new());
         hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
-        let state = build_state(snap, hub)
-            .with_local_model_guardrail(Arc::new(InertLocalModel) as Arc<dyn aisix_guardrails::Guardrail>);
+        let state = build_state(snap, hub).with_local_model_guardrail(
+            Arc::new(InertLocalModel) as Arc<dyn aisix_guardrails::Guardrail>
+        );
         seed_guardrail(&state.snapshot, "g-mask", MASKING_GUARDRAIL);
         let app = build_router(state.with_usage_sink(UsageSink::new(tx)));
 
@@ -10242,5 +10249,4 @@ data: [DONE]\n\n";
         assert_eq!(hit.action, "blocked");
         assert!(hit.error_type.is_empty());
     }
-
 }

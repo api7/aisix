@@ -1275,9 +1275,12 @@ async fn multipart_dispatch(
             let applied_c = applied_guardrails.clone();
             // The chain itself does not survive into the relay closure, so
             // clone the audit handle here — the same line `applied` is
-            // snapshotted — and read it at end-of-stream. Without this the
-            // held-back relay's output-hook mask is recorded and then
-            // dropped (AISIX-Cloud#1330 / #1024).
+            // snapshotted — and read it at end-of-stream. It carries the
+            // INPUT-side hits: this is the live-relay branch, which a
+            // block- or mask-capable chain never reaches (`live_relay`
+            // sends those down the buffered path above), so its end-of-
+            // stream scan is monitor-only by construction and writes no
+            // enforced hit of its own (AISIX-Cloud#1330 / #1024).
             let audit_c = audit_out.clone();
             let redactions_c = redactions.clone();
             let input_monitor_hits = monitor_hits.clone();
@@ -3778,4 +3781,145 @@ mod tests {
         assert!(!wire.contains("BLOCKME"), "{wire}");
     }
 
+    /// [`transcription_multipart_with_prompt`] plus `stream=true`, i.e.
+    /// what a caller that wants the transcript incrementally AND supplies
+    /// prompt text sends — the shape that reaches the relay closure.
+    fn streaming_transcription_multipart_with_prompt(
+        model: &str,
+        prompt: &str,
+    ) -> (String, axum::body::Body) {
+        let body = format!(
+            "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"stream\"\r\n\r\ntrue\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n{prompt}\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\
+             Content-Type: audio/mpeg\r\n\r\nID3fakeaudio\r\n--b--\r\n"
+        );
+        (
+            "multipart/form-data; boundary=b".to_string(),
+            axum::body::Body::from(body),
+        )
+    }
+
+    /// A `kind: "pii"` row masking a version string on the INPUT hook —
+    /// what an audio `prompt` actually gets, as opposed to the keyword
+    /// BLOCK the sibling tests drive.
+    fn masking_input_guardrail() -> ResourceEntry<aisix_core::Guardrail> {
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"eda-mask","enabled":true,"hook_point":"input","kind":"pii","detectors":[],"custom_patterns":[{"name":"eda_version","regex":"version\\s*:\\s*(\\d+(?:\\.\\d+)+)","action":"mask","replacement":"***"}]}"#,
+        )
+        .unwrap();
+        ResourceEntry::new("g-mask", g, 1)
+    }
+
+    /// AISIX-Cloud#1330 / #1024: the NON-streaming transcription's own
+    /// emitter (`emit_audio_usage`) drains too. The sibling refusal test
+    /// drives `/v1/audio/speech`, which is a different dispatch entirely,
+    /// so without this the whole multipart surface's success path is
+    /// unasserted.
+    #[tokio::test]
+    async fn transcription_mask_names_the_policy_on_the_usage_event() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "hello world",
+                "usage": {"type": "tokens", "input_tokens": 4, "output_tokens": 2, "total_tokens": 6}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(masking_input_guardrail());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) =
+            transcription_multipart_with_prompt("my-transcribe", "build version: 9.9.9 ok");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The masked prompt is what actually reached the provider.
+        let seen = upstream.received_requests().await.unwrap();
+        let forwarded = String::from_utf8_lossy(&seen[0].body).into_owned();
+        assert!(forwarded.contains("***"), "{forwarded}");
+        assert!(!forwarded.contains("9.9.9"), "{forwarded}");
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].guardrail_name, "eda-mask");
+        assert_eq!(ev.guardrail_enforced_hits[0].hook, "input");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "masked");
+        let wire = serde_json::to_string(&ev).unwrap();
+        assert!(!wire.contains("9.9.9"), "{wire}");
+    }
+
+    /// The STREAMED transcription relay's end-of-stream emit — the one
+    /// emitter on this surface that runs from a `move` closure after the
+    /// handler frame is gone, and the reason the audit handle is cloned
+    /// beside `applied_guardrails` rather than read from the chain.
+    /// Nothing else in the suite reaches it.
+    #[tokio::test]
+    async fn streamed_transcription_mask_names_the_policy_on_the_usage_event() {
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"type\":\"transcript.text.delta\",\"delta\":\"hello\"}\n\n\
+data: {\"type\":\"transcript.text.done\",\"text\":\"hello world\"}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(masking_input_guardrail());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = streaming_transcription_multipart_with_prompt(
+            "my-transcribe",
+            "build version: 9.9.9 ok",
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Drain the body so the relay's end-of-stream emit runs.
+        let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(1000), rx.recv())
+            .await
+            .expect("the streamed relay must emit a UsageEvent")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].guardrail_name, "eda-mask");
+        assert_eq!(ev.guardrail_enforced_hits[0].hook, "input");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "masked");
+        let wire = serde_json::to_string(&ev).unwrap();
+        assert!(!wire.contains("9.9.9"), "{wire}");
+    }
 }

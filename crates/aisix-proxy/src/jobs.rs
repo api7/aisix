@@ -929,7 +929,15 @@ pub(crate) async fn create_file(
 
         // Batch/fine-tune input files carry end-user content — scan them
         // like any other inbound payload.
-        scan_input_blob(&state, &auth, &target, &file_bytes, &mut monitor_hits, &mut enforced_hits).await?;
+        scan_input_blob(
+            &state,
+            &auth,
+            &target,
+            &file_bytes,
+            &mut monitor_hits,
+            &mut enforced_hits,
+        )
+        .await?;
         let _reservation = crate::quota::enforce(
             &state,
             snapshot,
@@ -952,7 +960,15 @@ pub(crate) async fn create_file(
             &request_id,
         )
         .await?;
-        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits, &mut enforced_hits).await?;
+        scan_output_blob(
+            &state,
+            &auth,
+            &target,
+            &bytes,
+            &mut monitor_hits,
+            &mut enforced_hits,
+        )
+        .await?;
         let model = target.display_name().to_string();
         Ok((
             json_response(status, &resp_headers, bytes, Some(&model)),
@@ -1174,7 +1190,15 @@ pub(crate) async fn create_batch(
         }
         let out_body = Bytes::from(serde_json::to_vec(&req_json).unwrap_or_default());
 
-        scan_input_blob(&state, &auth, &target, &out_body, &mut monitor_hits, &mut enforced_hits).await?;
+        scan_input_blob(
+            &state,
+            &auth,
+            &target,
+            &out_body,
+            &mut monitor_hits,
+            &mut enforced_hits,
+        )
+        .await?;
         let _reservation = crate::quota::enforce(
             &state,
             &snapshot,
@@ -1197,7 +1221,15 @@ pub(crate) async fn create_batch(
             &request_id,
         )
         .await?;
-        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits, &mut enforced_hits).await?;
+        scan_output_blob(
+            &state,
+            &auth,
+            &target,
+            &bytes,
+            &mut monitor_hits,
+            &mut enforced_hits,
+        )
+        .await?;
         let model = target.display_name().to_string();
         Ok((
             json_response(status, &resp_headers, bytes, Some(&model)),
@@ -1265,7 +1297,15 @@ pub(crate) async fn get_batch(
             &request_id,
         )
         .await?;
-        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits, &mut enforced_hits).await?;
+        scan_output_blob(
+            &state,
+            &auth,
+            &target,
+            &bytes,
+            &mut monitor_hits,
+            &mut enforced_hits,
+        )
+        .await?;
 
         // Batch cost attribution (#720): first observation of a completed
         // batch downloads the output JSONL and emits real token usage.
@@ -1431,7 +1471,15 @@ pub(crate) async fn create_ft_job(
         }
         let out_body = Bytes::from(serde_json::to_vec(&req_json).unwrap_or_default());
 
-        scan_input_blob(&state, &auth, &target, &out_body, &mut monitor_hits, &mut enforced_hits).await?;
+        scan_input_blob(
+            &state,
+            &auth,
+            &target,
+            &out_body,
+            &mut monitor_hits,
+            &mut enforced_hits,
+        )
+        .await?;
         let _reservation = crate::quota::enforce(
             &state,
             &snapshot,
@@ -1454,7 +1502,15 @@ pub(crate) async fn create_ft_job(
             &request_id,
         )
         .await?;
-        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits, &mut enforced_hits).await?;
+        scan_output_blob(
+            &state,
+            &auth,
+            &target,
+            &bytes,
+            &mut monitor_hits,
+            &mut enforced_hits,
+        )
+        .await?;
         let model = target.display_name().to_string();
         Ok((
             json_response(status, &resp_headers, bytes, Some(&model)),
@@ -1617,7 +1673,15 @@ async fn forward_simple(
         let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
 
         if let Some(body) = &spec.body {
-            scan_input_blob(&state, &auth, &target, body, &mut monitor_hits, &mut enforced_hits).await?;
+            scan_input_blob(
+                &state,
+                &auth,
+                &target,
+                body,
+                &mut monitor_hits,
+                &mut enforced_hits,
+            )
+            .await?;
         }
         let _reservation = crate::quota::enforce(
             &state,
@@ -1639,7 +1703,15 @@ async fn forward_simple(
         };
         let (status, resp_headers, bytes) =
             send_upstream(&state, &target, spec.method, &url, body, &request_id).await?;
-        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits, &mut enforced_hits).await?;
+        scan_output_blob(
+            &state,
+            &auth,
+            &target,
+            &bytes,
+            &mut monitor_hits,
+            &mut enforced_hits,
+        )
+        .await?;
 
         let resp = if spec.relay_raw_body {
             let mut resp = Response::builder()
@@ -2625,5 +2697,4 @@ mod tests {
         let wire = serde_json::to_string(&ev).unwrap();
         assert!(!wire.contains("custom_id"), "{wire}");
     }
-
 }
