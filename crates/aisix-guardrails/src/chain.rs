@@ -141,6 +141,20 @@ impl GuardrailChain {
             .unwrap_or_default()
     }
 
+    /// The request's audit log handle, for a caller that outlives the
+    /// chain value: a streaming emitter running inside a `move` closure
+    /// after the handler frame is gone, or a handler whose chain is
+    /// erased to `Arc<dyn Guardrail>` (the trait carries no `enforced_hits`).
+    /// Clone it at the same point `applied()` is snapshotted and read it
+    /// with [`GuardrailAuditLog::snapshot`] when the usage event is built.
+    ///
+    /// `None` for a chain resolved with nothing attached — that request
+    /// can never produce an enforced hit, so the absent log and an empty
+    /// snapshot mean the same thing.
+    pub fn audit_log(&self) -> Option<Arc<GuardrailAuditLog>> {
+        self.audit.clone()
+    }
+
     /// Borrow both execution receivers for one fold.
     fn recorders(&self) -> Recorders<'_> {
         Recorders {
@@ -183,15 +197,24 @@ impl GuardrailChain {
 /// Block surfaces as `would_block` (via its hits), not `blocked`. `masked`
 /// only arises on the segment pass — the sync per-field redactors are not
 /// timed here. The `error_type` is the bounded per-kind failure tag a
-/// `Bypass` carries (e.g. `lakera_timeout`); fail-closed failures surface
-/// as `blocked` with no tag (the tag only exists structured on `Bypass`).
+/// `Bypass` carries (e.g. `lakera_timeout`) — and, since AISIX-Cloud#1365,
+/// the same tag on a fail-CLOSED block, which is an availability failure
+/// wearing a block's clothes.
+///
+/// `result` deliberately stays `blocked` for that case. It is a shipped
+/// Prometheus label (AISIX-Cloud#1076) with operator alerting attached, and
+/// splitting its value domain would silently stop an existing
+/// `result="blocked"` alert from counting outages. Populating `error_type`
+/// only widens an existing label instead, so `sum by (result)` is unchanged
+/// while `error_type != "none"` separates the two. The audit event, which
+/// is unreleased, does split them — see [`record_execution`].
 fn classify_execution<'v>(
     verdict: &'v GuardrailVerdict,
     masked: bool,
     hits: &[GuardrailMonitorHit],
 ) -> (&'static str, Option<&'v str>) {
     match verdict {
-        GuardrailVerdict::Block { .. } => ("blocked", None),
+        GuardrailVerdict::Block { unavailable, .. } => ("blocked", unavailable.as_deref()),
         GuardrailVerdict::Bypass { reason } => ("bypassed", Some(reason.as_str())),
         GuardrailVerdict::Allow => {
             if masked {
@@ -229,13 +252,14 @@ struct Recorders<'a> {
 /// `would_*` results belong to `guardrail_monitor_hits` — routing them
 /// here would make an enforcing hit indistinguishable from a staged one.
 ///
-/// One caveat a reader of the audit trail needs: `blocked` is the
-/// ENFORCED outcome, which covers a fail-CLOSED availability failure as
-/// well as a content decision. A member with `fail_open: false` (or a
-/// `mandatory` one) whose upstream is unreachable returns `Block`, not
-/// `Bypass` — see [`classify_execution`] — so it lands here indis-
-/// tinguishable from a policy hit. AISIX-Cloud#1365 tracks separating
-/// the two.
+/// The two are told apart on the audit event (AISIX-Cloud#1365): a member
+/// with `fail_open: false` (or a `mandatory` one) whose upstream is
+/// unreachable returns `Block`, not `Bypass`, and records
+/// `blocked_unavailable` plus the bounded failure tag rather than
+/// `blocked`. That matters because the naive read of `action = "blocked"`
+/// is "this content violated policy X" — which, for a provider outage on a
+/// fail-closed row, is a wrong answer rather than a missing one, and one a
+/// compliance review would act on.
 // Five of the eight describe one member execution (verdict, masked, hits,
 // counts) plus where to report it; splitting them into a struct would put a
 // name on a grouping that exists only here.
@@ -276,7 +300,16 @@ fn record_execution(
             ("masked", Some(counts)) => counts,
             _ => &empty,
         };
-        audit.record(&member.name, phase, result, elapsed, counts);
+        // A tagged block is an outage, not a policy decision. Splitting it
+        // into its own action — rather than leaving it to a reader who
+        // remembers to also check `error_type` — is what makes the naive
+        // query `action = 'blocked'` correct by construction
+        // (AISIX-Cloud#1365).
+        let action = match (result, error_type) {
+            ("blocked", Some(_)) => "blocked_unavailable",
+            _ => result,
+        };
+        audit.record(&member.name, phase, action, error_type, elapsed, counts);
     }
 }
 
@@ -289,15 +322,22 @@ fn attribute_block(
     member_name: &str,
     reason: String,
     guardrail_name: Option<String>,
+    // Carried through untouched: whether the block was a content decision
+    // or a fail-closed availability failure is the member's fact, not the
+    // chain's, and re-attributing the name must not lose it
+    // (AISIX-Cloud#1365).
+    unavailable: Option<String>,
 ) -> GuardrailVerdict {
     match guardrail_name {
         Some(_) => GuardrailVerdict::Block {
             reason,
             guardrail_name,
+            unavailable,
         },
         None => GuardrailVerdict::Block {
             reason: format!("guardrail '{member_name}': {reason}"),
             guardrail_name: Some(member_name.to_owned()),
+            unavailable,
         },
     }
 }
@@ -353,7 +393,8 @@ impl Guardrail for GuardrailChain {
                 GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                } => return attribute_block(&m.name, reason, guardrail_name),
+                    unavailable,
+                } => return attribute_block(&m.name, reason, guardrail_name, unavailable),
                 GuardrailVerdict::Bypass { reason } => {
                     // First bypass sticks; downstream guardrails still
                     // get to inspect the request (they may Block).
@@ -389,7 +430,8 @@ impl Guardrail for GuardrailChain {
                 GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                } => return attribute_block(&m.name, reason, guardrail_name),
+                    unavailable,
+                } => return attribute_block(&m.name, reason, guardrail_name, unavailable),
                 GuardrailVerdict::Bypass { reason } => {
                     if bypass.is_none() {
                         bypass = Some(reason);
@@ -432,7 +474,13 @@ impl Guardrail for GuardrailChain {
                 GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                } => return (attribute_block(&m.name, reason, guardrail_name), hits),
+                    unavailable,
+                } => {
+                    return (
+                        attribute_block(&m.name, reason, guardrail_name, unavailable),
+                        hits,
+                    )
+                }
                 GuardrailVerdict::Bypass { reason } => {
                     if bypass.is_none() {
                         bypass = Some(reason);
@@ -472,7 +520,13 @@ impl Guardrail for GuardrailChain {
                 GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                } => return (attribute_block(&m.name, reason, guardrail_name), hits),
+                    unavailable,
+                } => {
+                    return (
+                        attribute_block(&m.name, reason, guardrail_name, unavailable),
+                        hits,
+                    )
+                }
                 GuardrailVerdict::Bypass { reason } => {
                     if bypass.is_none() {
                         bypass = Some(reason);
@@ -518,7 +572,13 @@ impl Guardrail for GuardrailChain {
                 GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                } => return (attribute_block(&m.name, reason, guardrail_name), hits),
+                    unavailable,
+                } => {
+                    return (
+                        attribute_block(&m.name, reason, guardrail_name, unavailable),
+                        hits,
+                    )
+                }
                 GuardrailVerdict::Bypass { reason } => {
                     if bypass.is_none() {
                         bypass = Some(reason);
@@ -560,7 +620,13 @@ impl Guardrail for GuardrailChain {
                 GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                } => return (attribute_block(&m.name, reason, guardrail_name), hits),
+                    unavailable,
+                } => {
+                    return (
+                        attribute_block(&m.name, reason, guardrail_name, unavailable),
+                        hits,
+                    )
+                }
                 GuardrailVerdict::Bypass { reason } => {
                     if bypass.is_none() {
                         bypass = Some(reason);
@@ -620,7 +686,8 @@ impl Guardrail for GuardrailChain {
                 GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                } => return attribute_block(&m.name, reason, guardrail_name),
+                    unavailable,
+                } => return attribute_block(&m.name, reason, guardrail_name, unavailable),
                 GuardrailVerdict::Bypass { reason } => {
                     if bypass.is_none() {
                         bypass = Some(reason);
@@ -656,7 +723,8 @@ impl Guardrail for GuardrailChain {
                 GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                } => return attribute_block(&m.name, reason, guardrail_name),
+                    unavailable,
+                } => return attribute_block(&m.name, reason, guardrail_name, unavailable),
                 GuardrailVerdict::Bypass { reason } => {
                     if bypass.is_none() {
                         bypass = Some(reason);
@@ -750,9 +818,10 @@ async fn fold_segments(
             GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
+                unavailable,
             } => {
                 return SegmentsOutcome {
-                    verdict: attribute_block(&m.name, reason, guardrail_name),
+                    verdict: attribute_block(&m.name, reason, guardrail_name, unavailable),
                     masked: None,
                     counts: std::collections::BTreeMap::new(),
                     monitor_hits,
@@ -819,7 +888,14 @@ fn fold_redactions<'a>(
         // `kind: "pii"` MCP path the audit chain exists for. Recorded only
         // when this member actually rewrote something.
         if let (Some(audit), Some(r)) = (audit, next.as_ref()) {
-            audit.record(&m.name, phase, "masked", started.elapsed(), &r.counts);
+            audit.record(
+                &m.name,
+                phase,
+                "masked",
+                /* error_type */ None,
+                started.elapsed(),
+                &r.counts,
+            );
         }
         if let Some(r) = next {
             current = Some(match current.take() {
@@ -873,6 +949,107 @@ mod tests {
         assert_eq!(hits[0].guardrail_name, "deny-secrets");
         assert_eq!(hits[0].hook, "input");
         assert_eq!(hits[0].action, "blocked");
+    }
+
+    /// AISIX-Cloud#1365: a fail-CLOSED refusal is an outage, not a policy
+    /// decision, and the audit trail has to say which. Before this the two
+    /// were the same `action: "blocked"` entry, so a provider outage on a
+    /// `fail_open: false` row stamped every request in the window as a
+    /// content violation — a wrong answer for a compliance review, not a
+    /// missing one.
+    #[tokio::test]
+    async fn a_fail_closed_block_is_audited_apart_from_a_policy_block() {
+        struct Unavailable;
+        #[async_trait]
+        impl Guardrail for Unavailable {
+            fn name(&self) -> &'static str {
+                "unavailable"
+            }
+            async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
+                // What every remote guardrail's `handle_failure` returns
+                // when it cannot reach its upstream and `fail_open` is off.
+                GuardrailVerdict::block_unavailable(
+                    "lakera guard unavailable (lakera_timeout)",
+                    "lakera_timeout",
+                )
+            }
+        }
+
+        let audit = Arc::new(GuardrailAuditLog::new());
+        let chain = GuardrailChain::new_with_applied(
+            vec![(
+                "lakera-prod".to_owned(),
+                Arc::new(Unavailable) as Arc<dyn Guardrail>,
+            )],
+            vec![AppliedGuardrail {
+                kind: "lakera".to_owned(),
+                hook: "input".to_owned(),
+            }],
+        )
+        .with_audit_log(Some(Arc::clone(&audit)));
+
+        // The REQUEST still gets refused — separating the two must not
+        // weaken the fail-closed guarantee itself.
+        assert!(chain.check_input(&req("anything")).await.is_block());
+
+        let hits = chain.enforced_hits();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].guardrail_name, "lakera-prod");
+        assert_eq!(hits[0].action, "blocked_unavailable");
+        assert_eq!(hits[0].error_type, "lakera_timeout");
+
+        // ...and the ordinary content block is untouched: it keeps the
+        // bare `blocked` action and gains no cause, so `action =
+        // "blocked"` still means exactly "this content violated policy".
+        let audit = Arc::new(GuardrailAuditLog::new());
+        let policy = GuardrailChain::new(vec![Arc::new(KeywordBlocklist::new(vec![
+            KeywordRule::literal("nope"),
+        ])) as Arc<dyn Guardrail>])
+        .with_audit_log(Some(Arc::clone(&audit)));
+        assert!(policy.check_input(&req("nope")).await.is_block());
+        let hits = policy.enforced_hits();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].action, "blocked");
+        assert!(hits[0].error_type.is_empty());
+    }
+
+    /// The Prometheus `result` label deliberately does NOT split
+    /// (AISIX-Cloud#1365): it is a shipped label with operator alerting
+    /// attached, so an existing `result="blocked"` alert must keep
+    /// counting outages. The cause rides `error_type`, which was already
+    /// a label and merely gains values.
+    #[tokio::test]
+    async fn the_metrics_result_label_keeps_counting_fail_closed_as_blocked() {
+        #[derive(Default)]
+        struct Recorder(std::sync::Mutex<Vec<(String, String)>>);
+        impl GuardrailMetricsSink for Recorder {
+            fn record_guardrail_execution(&self, exec: &GuardrailExecution<'_>) {
+                self.0.lock().unwrap().push((
+                    exec.result.to_owned(),
+                    exec.error_type.unwrap_or("none").to_owned(),
+                ));
+            }
+        }
+        struct Unavailable;
+        #[async_trait]
+        impl Guardrail for Unavailable {
+            fn name(&self) -> &'static str {
+                "unavailable"
+            }
+            async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
+                GuardrailVerdict::block_unavailable("presidio unavailable", "presidio_5xx")
+            }
+        }
+
+        let sink = Arc::new(Recorder::default());
+        let chain = GuardrailChain::new(vec![Arc::new(Unavailable) as Arc<dyn Guardrail>])
+            .with_metrics_sink(Some(Arc::clone(&sink) as Arc<dyn GuardrailMetricsSink>));
+        assert!(chain.check_input(&req("hi")).await.is_block());
+
+        assert_eq!(
+            sink.0.lock().unwrap().as_slice(),
+            [("blocked".to_owned(), "presidio_5xx".to_owned())],
+        );
     }
 
     /// An allowed request records nothing: `allowed` and `bypassed` are
@@ -972,6 +1149,7 @@ mod tests {
             GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
+                ..
             } => {
                 assert_eq!(guardrail_name.as_deref(), Some("block-secrets"));
                 assert!(
@@ -1015,6 +1193,7 @@ mod tests {
             GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
+                ..
             } => {
                 assert_eq!(guardrail_name.as_deref(), Some("inner-rule"));
                 assert!(

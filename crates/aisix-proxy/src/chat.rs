@@ -135,6 +135,10 @@ pub async fn chat_completions(
     // Filled by `dispatch` with monitor-mode guardrail observations
     // (AISIX-Cloud#562), same dual-path lifecycle as `applied_guardrails`.
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    // Filled by `dispatch` with the request's ENFORCE-mode audit handle
+    // (AISIX-Cloud#1330 / #1024), same dual-path lifecycle again — the
+    // guardrail-block path is exactly where a `blocked` hit is recorded.
+    let mut audit = crate::usage_attr::GuardrailAudit::default();
     // One snapshot for the whole request (#941). Dispatch, the quota gate,
     // the terminal metric emits and the usage events all read this handle
     // instead of loading their own, so a request sees ONE config generation
@@ -151,6 +155,7 @@ pub async fn chat_completions(
         &mut applied_guardrails,
         &mut redaction_counts,
         &mut monitor_hits,
+        &mut audit,
     )
     .await;
 
@@ -215,6 +220,7 @@ pub async fn chat_completions(
                 // ...and the terminal trace spans.
                 /* terminal_last */
                 false,
+                &audit,
             );
             // The streaming path wires the WINNER's telemetry into the SSE
             // stream's on_complete callback (it has to wait for the
@@ -291,6 +297,7 @@ pub async fn chat_completions(
                     // upstream; any other no-attempt success did.
                     /* dispatched */
                     winner.is_some() || success.cache_hit_layer.is_none(),
+                    &audit,
                 );
             }
             // Inject x-ratelimit-* headers so OpenAI SDK clients see the
@@ -507,6 +514,7 @@ pub async fn chat_completions(
                 // billed-then-blocked event below is terminal instead.
                 /* terminal_last */
                 charge.is_none(),
+                &audit,
             );
             // Terminal event:
             //  - output-blocked (charge present): the WINNING attempt was
@@ -585,6 +593,7 @@ pub async fn chat_completions(
                         // Billed-then-blocked: the upstream answered.
                         /* dispatched */
                         true,
+                        &audit,
                     );
                 }
                 None if routing.attempts.is_empty() => {
@@ -623,6 +632,7 @@ pub async fn chat_completions(
                         // `elapsed` is handler time, not an upstream call.
                         /* dispatched */
                         false,
+                        &audit,
                     );
                 }
                 None => {
@@ -1208,6 +1218,11 @@ async fn dispatch(
     // Out-param: monitor-mode guardrail observations (AISIX-Cloud#562),
     // same lifecycle as `redactions_out`.
     monitor_hits_out: &mut Vec<aisix_core::GuardrailMonitorHit>,
+    // Out-param: the request's ENFORCE-mode audit handle (AISIX-Cloud#1330),
+    // same lifecycle as `applied_out` — and filled at the same line, for the
+    // same reason: the concrete chain is about to be erased to
+    // `Arc<dyn Guardrail>`, which carries neither `applied()` nor the log.
+    audit_out: &mut crate::usage_attr::GuardrailAudit,
 ) -> Result<Success, DispatchFailure> {
     if req.messages.is_empty() {
         return Err(DispatchFailure::new(
@@ -1269,6 +1284,15 @@ async fn dispatch(
     // local copy for the streaming on_complete closure below.
     let applied_guardrails = resolved.applied().to_vec();
     *applied_out = applied_guardrails.clone();
+    // Taken HERE for the same reason `applied()` is: below, the concrete
+    // chain is erased to `Arc<dyn Guardrail>` and — when a local-model
+    // guardrail is configured — re-wrapped with `GuardrailChain::new`,
+    // which leaves the new outer chain's audit log unset. Reading the
+    // handle after that point would return `None` and every enforced hit
+    // on the chat path would go unattributed while every other endpoint
+    // reported normally. The inner chain keeps its own recorders, so its
+    // members still write here (AISIX-Cloud#1330 / #1024).
+    *audit_out = resolved.audit_log();
     let resolved_chain: std::sync::Arc<dyn aisix_guardrails::Guardrail> =
         std::sync::Arc::new(resolved);
     // AISIX-Cloud#1331 MVP: the env-injected local-model guardrail joins
@@ -1311,6 +1335,7 @@ async fn dispatch(
         GuardrailVerdict::Block {
             reason,
             guardrail_name,
+            ..
         } => {
             // The verdict's `reason` carries matched-pattern detail
             // (e.g. `"input blocked by literal \"forbidden-token\""`).
@@ -1466,6 +1491,7 @@ async fn dispatch(
             reservation,
             &resolved_chain,
             &applied_guardrails,
+            audit_out,
             bypass_reason,
             &model_id,
             &auth.entry.id,
@@ -1903,6 +1929,11 @@ async fn dispatch(
         // Applied guardrail set (#379), owned for the move into on_complete so
         // the streamed-response telemetry event records which guardrails ran.
         let applied_guardrails_for_telem = applied_guardrails.clone();
+        // Same line, same reason: the chain does not survive into the
+        // on_complete closure, so the audit handle is cloned here and read
+        // at stream end — where the held-back output hook has just recorded
+        // whatever it masked (AISIX-Cloud#1330 / #1024).
+        let audit_for_telem = audit_out.clone();
         // Input-side PII mask counts (#932), captured before the stream so
         // the end-of-stream event merges them with the output-side counts
         // accumulated in `comp.redacted_entity_counts`.
@@ -2086,6 +2117,7 @@ async fn dispatch(
                     /* terminal */
                     true,
                     /* dispatched */ true,
+                    &audit_for_telem,
                 );
                 // #1002: comp.total_tokens is the cache-inclusive total (an
                 // Anthropic upstream bridged to an OpenAI-shape client folds
@@ -2413,6 +2445,7 @@ async fn dispatch(
                     GuardrailVerdict::Block {
                         reason,
                         guardrail_name,
+                        ..
                     } => {
                         tracing::warn!(
                             guardrail_hook = "output",
@@ -2999,6 +3032,7 @@ async fn dispatch(
         GuardrailVerdict::Block {
             reason,
             guardrail_name,
+            ..
         } => {
             // Output filter fires AFTER the upstream call, so the
             // provider has already billed for these tokens. Surface
@@ -3231,6 +3265,12 @@ async fn dispatch_ensemble(
     reservation: aisix_ratelimit::MultiReservation,
     resolved_chain: &Arc<dyn aisix_guardrails::Guardrail>,
     applied_guardrails: &[AppliedGuardrail],
+    // The request's ENFORCE-mode audit handle, threaded beside
+    // `applied_guardrails` because the erased chain above carries neither
+    // (AISIX-Cloud#1330). The ensemble's judge event is the request's
+    // terminal one, so it is the event that must report the parent chain's
+    // enforced hits.
+    audit: &crate::usage_attr::GuardrailAudit,
     mut bypass_reason: Option<String>,
     model_id: &str,
     api_key_id: &str,
@@ -3352,6 +3392,7 @@ async fn dispatch_ensemble(
                 /* content */ None,
                 /* terminal */ false,
                 /* dispatched */ true,
+                audit,
             );
         };
 
@@ -3619,6 +3660,8 @@ async fn dispatch_ensemble(
             crate::usage_attr::metric_model_label(snapshot, &req.model).into_owned();
         let api_key_id_for_telem = api_key_id.to_string();
         let applied_guardrails_for_telem = applied_guardrails.to_vec();
+        // See the single-upstream streaming path.
+        let audit_for_telem = audit.clone();
         let client_for_telem = client.clone();
         let bypass_for_telem = bypass_reason.clone().unwrap_or_default();
         // Input-side PII mask counts (#932); merged with the streamed judge's
@@ -3725,6 +3768,7 @@ async fn dispatch_ensemble(
                         /* content */ None,
                         /* terminal */ false,
                         /* dispatched */ true,
+                        &audit_for_telem,
                     );
                 }
                 let judge_pk =
@@ -3787,6 +3831,7 @@ async fn dispatch_ensemble(
                     /* terminal */
                     true,
                     /* dispatched */ true,
+                    &audit_for_telem,
                 );
                 // SLO histograms (AISIX-Cloud#1011): the handler's
                 // record_success is stream-gated, so the ensemble stream
@@ -4003,6 +4048,7 @@ async fn dispatch_ensemble(
             /* terminal */
             terminal_judge,
             /* dispatched */ true,
+            audit,
         );
     };
 
@@ -4032,6 +4078,7 @@ async fn dispatch_ensemble(
         GuardrailVerdict::Block {
             reason,
             guardrail_name,
+            ..
         } => {
             tracing::warn!(
                 guardrail_hook = "output",
@@ -4290,6 +4337,8 @@ fn emit_usage_event(
     // the HANDLER's elapsed time, which must not fabricate an upstream
     // CLIENT span.
     dispatched: bool,
+    // The request's enforced-guardrail audit handle (AISIX-Cloud#1330).
+    audit: &crate::usage_attr::GuardrailAudit,
 ) {
     // Per-PK telemetry attribution tags. An unresolved key (the
     // pre-dispatch error paths) yields default (all empty / false) tags →
@@ -4323,6 +4372,10 @@ fn emit_usage_event(
         applied_guardrails: extras.applied_guardrails,
         redacted_entity_counts: extras.redacted_entity_counts,
         guardrail_monitor_hits: extras.guardrail_monitor_hits,
+        // Guardrails run once per REQUEST, not once per attempt, so only the
+        // terminal event carries them — a superseded attempt (or an ensemble
+        // panel member) would otherwise repeat the same hit.
+        guardrail_enforced_hits: crate::usage_attr::terminal_enforced_hits(terminal, audit),
         cache_status: extras.cache_status,
         cache_hit_layer: extras.cache_hit_layer,
         cache_similarity: extras.cache_similarity,
@@ -4524,6 +4577,9 @@ fn emit_failed_attempts(
     // carries the trace's SERVER + logical spans. False on the success
     // path, where the winner's event is the terminal one.
     terminal_last: bool,
+    // The request's enforced-guardrail audit handle (AISIX-Cloud#1330);
+    // stamped only on the event this call marks terminal.
+    audit: &crate::usage_attr::GuardrailAudit,
 ) {
     let last_failed = routing.attempts.iter().rposition(|a| !a.success);
     for (i, rec) in routing
@@ -4571,6 +4627,7 @@ fn emit_failed_attempts(
             // attempt never reached an upstream.
             /* dispatched */
             rec.dispatched,
+            audit,
         );
     }
 }
@@ -5239,7 +5296,11 @@ where
                                     ctx.chain.check_output_observed(&synthesized).await;
                                 guard.comp().monitor_hits.extend(hits);
                                 match verdict {
-                                    aisix_guardrails::GuardrailVerdict::Block { reason, guardrail_name } => {
+                                    aisix_guardrails::GuardrailVerdict::Block {
+                                        reason,
+                                        guardrail_name,
+                                        ..
+                                    } => {
                                         tracing::warn!(
                                             guardrail_hook = "output",
                                             model = %ctx.model_name,
@@ -5443,7 +5504,11 @@ where
                             );
                         }
                         match verdict {
-                            aisix_guardrails::GuardrailVerdict::Block { reason, guardrail_name } => {
+                            aisix_guardrails::GuardrailVerdict::Block {
+                                reason,
+                                guardrail_name,
+                                ..
+                            } => {
                                 tracing::warn!(
                                     guardrail_hook = "output",
                                     model = %ctx.model_name,
@@ -5527,7 +5592,11 @@ where
                 let (verdict, hits) = ctx.chain.check_output_observed(&synthesized).await;
                 guard.comp().monitor_hits.extend(hits);
                 match verdict {
-                    aisix_guardrails::GuardrailVerdict::Block { reason, guardrail_name } => {
+                    aisix_guardrails::GuardrailVerdict::Block {
+                        reason,
+                        guardrail_name,
+                        ..
+                    } => {
                         // Mirror the non-streaming path's #153
                         // redaction contract: the wire-level message
                         // names only the guardrail that fired (#519

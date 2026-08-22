@@ -213,6 +213,10 @@ pub async fn responses(
     // Filled by `dispatch` with monitor-mode guardrail observations
     // (AISIX-Cloud#562), same lifecycle as `redaction_counts`.
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    // Filled by `dispatch` at chain resolution with the request's
+    // ENFORCE-mode audit handle (AISIX-Cloud#1330 / #1024), same lifecycle
+    // again — read back by whichever emit below is the terminal one.
+    let mut audit = crate::usage_attr::GuardrailAudit::default();
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
     match dispatch(
@@ -225,6 +229,7 @@ pub async fn responses(
         &client,
         &mut redaction_counts,
         &mut monitor_hits,
+        &mut audit,
     )
     .await
     {
@@ -287,6 +292,7 @@ pub async fn responses(
                 // The winner's event carries the terminal spans.
                 /* terminal_last */
                 false,
+                &audit,
             );
             // Issue #404: emit UsageEvent so cp-api's budget ledger
             // and customer-facing /logs analytics see /v1/responses
@@ -355,6 +361,7 @@ pub async fn responses(
                         success.captured_content.as_ref(),
                         /* terminal */ true,
                         /* dispatched */ true,
+                        &audit,
                     );
                 }
             }
@@ -452,6 +459,7 @@ pub async fn responses(
                 // emission; the pre-dispatch branch below covers empty.
                 /* terminal_last */
                 !routing.attempts.is_empty(),
+                &audit,
             );
             // Pre-dispatch failure (model-not-found, auth, budget) records no
             // attempts — emit a single terminal event carrying the failure
@@ -483,6 +491,7 @@ pub async fn responses(
                     // Pre-dispatch failure: no upstream contacted.
                     /* dispatched */
                     false,
+                    &audit,
                 );
             }
             err.into_response()
@@ -512,6 +521,11 @@ async fn dispatch(
     // Out-param: monitor-mode guardrail observations (AISIX-Cloud#562),
     // same lifecycle as `redactions_out`.
     monitor_hits_out: &mut Vec<aisix_core::GuardrailMonitorHit>,
+    // Out-param: the request's ENFORCE-mode audit handle, cloned off the
+    // resolved chain (AISIX-Cloud#1330). Handed back rather than read here
+    // because the terminal event is built by the caller — and, on the
+    // streaming paths, from a closure that runs after both frames are gone.
+    audit_out: &mut crate::usage_attr::GuardrailAudit,
 ) -> Result<ResponseDispatchSuccess, ResponsesDispatchError> {
     let model_name = body
         .get("model")
@@ -552,6 +566,7 @@ async fn dispatch(
     // response body (which outlives this handler) for end-of-stream output
     // guardrails (#825), mirroring /v1/messages.
     let resolved_chain = Arc::new(state.guardrail_index.resolve(&guardrail_ctx));
+    *audit_out = resolved_chain.audit_log();
     if !resolved_chain.is_empty() {
         let chat = responses_input_to_chat(&model_name, body);
         let (verdict, hits) = aisix_guardrails::Guardrail::check_input_non_segment_observed(
@@ -575,6 +590,7 @@ async fn dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
+            ..
         } = verdict
         {
             // Per #153 the matched-pattern detail stays in ops logs only; the
@@ -1333,6 +1349,7 @@ async fn responses_to_target(
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
+                ..
             } = verdict
             {
                 // Per #153 the matched-pattern detail stays in ops logs only.
@@ -1474,6 +1491,11 @@ async fn responses_to_target(
         // call (e.g. all Codex traffic, which always streams) was invisible
         // to the dashboard Logs and the budget ledger.
         let state_c = state.clone();
+        // The chain does not survive into the end-of-stream closure, so
+        // clone the audit handle here and read it there — the streaming
+        // paths are where an output-hook mask actually lands
+        // (AISIX-Cloud#1330 / #1024).
+        let audit_c = chain.audit_log();
         let request_id_c = request_id.to_string();
         let model_id_c = model_id.to_string();
         let requested_model_c = requested_model.to_string();
@@ -1622,6 +1644,7 @@ async fn responses_to_target(
                     captured_content.as_ref(),
                     /* terminal */ true,
                     /* dispatched */ true,
+                    &audit_c,
                 );
             },
         );
@@ -1725,6 +1748,7 @@ async fn responses_to_target(
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
+                ..
             } = verdict
             {
                 // Per #153 the matched-pattern detail stays in ops logs only.
@@ -1977,6 +2001,11 @@ async fn responses_cross_provider_to_target(
         };
 
         let state_c = state.clone();
+        // The chain does not survive into the end-of-stream closure, so
+        // clone the audit handle here and read it there — the streaming
+        // paths are where an output-hook mask actually lands
+        // (AISIX-Cloud#1330 / #1024).
+        let audit_c = chain.audit_log();
         let request_id_c = request_id.to_string();
         let model_id_c = model_id.to_string();
         let requested_model_c = requested_model.to_string();
@@ -2119,6 +2148,7 @@ async fn responses_cross_provider_to_target(
                     captured_content.as_ref(),
                     /* terminal */ true,
                     /* dispatched */ true,
+                    &audit_c,
                 );
             },
         );
@@ -2229,6 +2259,7 @@ async fn responses_cross_provider_to_target(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
+            ..
         } = verdict
         {
             tracing::warn!(
@@ -2944,6 +2975,8 @@ fn emit_usage_event(
     // Whether the work this event describes actually reached an upstream —
     // false for a pre-dispatch failure, whose `elapsed` is handler time.
     dispatched: bool,
+    // The request's enforced-guardrail audit handle (AISIX-Cloud#1330).
+    audit: &crate::usage_attr::GuardrailAudit,
 ) {
     let tags = pk.telemetry_tags();
     let mut event = UsageEvent {
@@ -2982,6 +3015,8 @@ fn emit_usage_event(
         guardrail_blocked,
         redacted_entity_counts,
         guardrail_monitor_hits,
+        // See `emit_zero_token_event`: request-scoped, so terminal only.
+        guardrail_enforced_hits: crate::usage_attr::terminal_enforced_hits(terminal, audit),
         ..Default::default()
     };
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
@@ -3065,6 +3100,8 @@ fn emit_zero_token_event(
     // Whether this attempt actually reached an upstream — false on the
     // pre-dispatch path, true for a recorded failed attempt.
     dispatched: bool,
+    // The request's enforced-guardrail audit handle (AISIX-Cloud#1330).
+    audit: &crate::usage_attr::GuardrailAudit,
 ) {
     let pk = ResolvedPk::resolve(snap, provider_key_id);
     let tags = pk.telemetry_tags();
@@ -3091,6 +3128,10 @@ fn emit_zero_token_event(
         byo_label: sanitize_tag(tags.byo_label.unwrap_or_default()),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        // Guardrails run once per REQUEST, not once per attempt, so a
+        // superseded attempt's event would repeat the same hit per retry.
+        // Only the terminal event carries them.
+        guardrail_enforced_hits: crate::usage_attr::terminal_enforced_hits(terminal, audit),
         ..Default::default()
     };
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
@@ -3128,6 +3169,9 @@ fn emit_failed_attempts(
     // event is the request's terminal emission, so it carries the trace's
     // SERVER + logical spans. False on the success path.
     terminal_last: bool,
+    // The request's enforced-guardrail audit handle (AISIX-Cloud#1330);
+    // stamped only on the event this call marks terminal.
+    audit: &crate::usage_attr::GuardrailAudit,
 ) {
     let last_failed = routing.attempts.iter().rposition(|a| !a.success);
     for (i, rec) in routing
@@ -3165,6 +3209,7 @@ fn emit_failed_attempts(
             // attempt never reached an upstream.
             /* dispatched */
             rec.dispatched,
+            audit,
         );
     }
 }
@@ -5665,5 +5710,171 @@ data: [DONE]\n\n";
         // One push may land after the buffer crosses the cap; the point is
         // the accumulation stops near the cap instead of growing 100x.
         assert!(text.len() <= 20, "delta buffer must stay near the cap");
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // AISIX-Cloud#1330 / #1024 — `/v1/responses` is the other family the
+    // handler-family rule names by hand: it carries Codex traffic, and a
+    // chat-only test would stay green forever while this one silently
+    // reported nothing.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// The same in-process masking row the chat / messages tests use.
+    fn masking_guardrail() -> ResourceEntry<aisix_core::models::Guardrail> {
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{
+                "name": "eda-mask",
+                "kind": "pii",
+                "hook_point": "both",
+                "detectors": [],
+                "custom_patterns": [
+                    {"name": "eda_version", "regex": "version\\s*:\\s*(\\d+(?:\\.\\d+)+)", "action": "mask", "replacement": "***"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        ResourceEntry::new("g-mask", row, 1)
+    }
+
+    /// `spans` is how many times the pattern occurs in what the upstream
+    /// actually sent: the Responses streaming wire shape repeats the full
+    /// text on the terminal `response.completed` event, so a value that
+    /// appears once to a reader is two masked spans on the wire.
+    #[track_caller]
+    fn assert_masked_by_eda(event: &aisix_obs::UsageEvent, spans: u32) {
+        let hits = &event.guardrail_enforced_hits;
+        assert!(
+            !hits.is_empty(),
+            "the enforcing mask left no audit trail on the usage event: {event:?}",
+        );
+        let hit = hits
+            .iter()
+            .find(|h| h.hook == "output")
+            .unwrap_or_else(|| panic!("no output-hook enforced hit in {hits:?}"));
+        assert_eq!(hit.guardrail_name, "eda-mask");
+        assert_eq!(hit.action, "masked");
+        assert_eq!(hit.counts.get("eda_version").copied(), Some(spans));
+        let wire = serde_json::to_string(event).expect("event serialises");
+        assert!(
+            !wire.contains("9.9.9"),
+            "masked value reached the event: {wire}"
+        );
+    }
+
+    /// Non-streaming `/v1/responses`.
+    #[tokio::test]
+    async fn responses_usage_event_carries_the_enforced_mask() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp-mask-1",
+                "object": "response",
+                "model": "gpt-4o-2024-08-06",
+                "output": [{
+                    "type": "message",
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "the version: 9.9.9 build"}]
+                }],
+                "usage": {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(masking_guardrail());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model": "gpt-4o-resp", "input": "hi"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body =
+            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("***"), "the response was not masked: {body}");
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("usage_sink sender dropped");
+        assert_masked_by_eda(&event, 1);
+    }
+
+    /// Streaming `/v1/responses` — pitfall (1) of #1024 on the Codex path.
+    #[tokio::test]
+    async fn streaming_responses_usage_event_carries_the_enforced_mask() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let sse = "event: response.output_text.delta\n\
+                   data: {\"type\":\"response.output_text.delta\",\"delta\":\"the version: 9.9.9 build\"}\n\n\
+                   event: response.completed\n\
+                   data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"the version: 9.9.9 build\"}]}],\"usage\":{\"input_tokens\":5,\"output_tokens\":7,\"total_tokens\":12}}}\n\n\
+                   data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(masking_guardrail());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model": "gpt-4o-resp", "input": "hi", "stream": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Drain the body so the stream's Drop guard fires the usage event.
+        let streamed =
+            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        assert!(
+            streamed.contains("***"),
+            "the stream was not masked: {streamed}"
+        );
+        assert!(
+            !streamed.contains("9.9.9"),
+            "the stream leaked the value: {streamed}"
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(1000), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("usage_sink sender dropped");
+        // Two spans: the delta frame and the terminal event's repeat.
+        assert_masked_by_eda(&event, 2);
     }
 }

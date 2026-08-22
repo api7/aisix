@@ -860,20 +860,39 @@ pub struct GuardrailMonitorHit {
 /// reason, and any upstream detail are never captured (#153 / #932
 /// no-leak criterion).
 ///
-/// One entry per `(guardrail_name, hook, action)`: a guardrail that masks
-/// forty string leaves of one tool result reports a single entry whose
-/// `counts` and `duration_us` are summed across those leaves.
+/// One entry per `(guardrail_name, hook, action, error_type)`: a guardrail
+/// that masks forty string leaves of one tool result reports a single entry
+/// whose `counts` and `duration_us` are summed across those leaves.
+///
+/// An empty array alongside `guardrail_blocked: true` is a legitimate
+/// state, not a contradiction: a streamed response aborted by the
+/// guardrail buffer cap is refused without any member returning a verdict,
+/// so there is no policy to name. Read the array as "which policies acted,
+/// when one did", never as an inverse of the boolean.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuardrailEnforcedHit {
     /// The configured (row) name of the guardrail that fired.
     pub guardrail_name: String,
     /// Which side it fired on: `input` or `output`.
     pub hook: String,
-    /// What it did: `masked` (content was rewritten and the request
-    /// continued) or `blocked` (the request was refused).
+    /// What it did:
+    ///
+    /// - `masked` — content was rewritten and the request continued.
+    /// - `blocked` — the guardrail's content policy refused the request.
+    /// - `blocked_unavailable` — the guardrail could not evaluate the
+    ///   request and its configuration refuses what it cannot check
+    ///   (`fail_open: false`, or a mandatory rule). The request was
+    ///   refused because the check was unavailable, not because the
+    ///   content matched a policy.
     pub action: String,
+    /// Why the check was unavailable, on `blocked_unavailable` only: a
+    /// short, bounded cause such as `lakera_timeout` or
+    /// `presidio_5xx`. Empty for every other action.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error_type: String,
     /// detector/rule name → number of spans masked (`masked` only; empty
-    /// for `blocked`). Same key space as `redacted_entity_counts`.
+    /// for the two refusal actions). Same key space as
+    /// `redacted_entity_counts`.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub counts: std::collections::BTreeMap<String, u32>,
     /// Wall-clock time this guardrail spent on this hook, in
@@ -907,7 +926,16 @@ pub struct GuardrailExecution<'a> {
     /// (monitor mode).
     pub result: &'static str,
     /// Bounded failure tag (e.g. `lakera_timeout`) when the guardrail could
-    /// not evaluate and failed open (`result = bypassed`); `None` otherwise.
+    /// not evaluate: on `result = bypassed` (it failed OPEN and the request
+    /// continued) and, since AISIX-Cloud#1365, on `result = blocked` when
+    /// it failed CLOSED and the request was refused instead. `None` for
+    /// every outcome the guardrail actually decided.
+    ///
+    /// `result` deliberately does not distinguish those two blocks — it is
+    /// a shipped metric label with alerting attached, and splitting its
+    /// value domain would silently stop an existing `result="blocked"`
+    /// alert from counting outages. `error_type != None` is the
+    /// discriminator on this side; the audit event uses a separate action.
     pub error_type: Option<&'a str>,
     /// Wall-clock time the member call took.
     pub elapsed: std::time::Duration,

@@ -370,7 +370,10 @@ impl AliyunTextModerationGuardrail {
         if fail_open {
             GuardrailVerdict::Bypass { reason: tag.into() }
         } else {
-            GuardrailVerdict::block(format!("aliyun text moderation unavailable ({tag})"))
+            GuardrailVerdict::block_unavailable(
+                format!("aliyun text moderation unavailable ({tag})"),
+                tag,
+            )
         }
     }
 }

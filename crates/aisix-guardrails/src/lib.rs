@@ -236,10 +236,46 @@ pub enum GuardrailVerdict {
         /// `None` when the verdict came from a bare guardrail outside a
         /// chain.
         guardrail_name: Option<String>,
+        /// Set when this block is an AVAILABILITY failure rather than a
+        /// content decision: a remote guardrail with `fail_open: false`
+        /// (or a `mandatory` row) that could not reach its upstream blocks
+        /// instead of bypassing, and the two are otherwise
+        /// indistinguishable to every consumer downstream
+        /// (AISIX-Cloud#1365).
+        ///
+        /// Carries the same bounded per-kind failure tag a `Bypass` puts
+        /// in its reason (e.g. `lakera_timeout`) — a closed vocabulary,
+        /// never free text and never matched content, so it is safe on a
+        /// metric label and on the wire (#153).
+        unavailable: Option<String>,
     },
     Bypass {
         reason: String,
     },
+}
+
+/// Clamp a failure tag to the shape a metric label and an audit field can
+/// safely carry: lowercase alphanumerics and underscores, at most 64 bytes.
+///
+/// Every producer already passes a `bypass_tag()` constant, so this is a
+/// no-op today. It is here because the TYPE cannot say so: the tag is a
+/// `String` (`MandatoryGuardrail` forwards whatever reason the inner
+/// guardrail's `Bypass` carried), it lands on an unsanitized Prometheus
+/// label, and it reaches the usage event that #153 forbids putting content
+/// on. A future guardrail that returns a free-text bypass reason would
+/// otherwise mint one metric series per distinct string.
+pub(crate) fn bounded_failure_tag(tag: &str) -> String {
+    let cleaned: String = tag
+        .chars()
+        .map(|c| c.to_ascii_lowercase())
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "unknown".to_owned()
+    } else {
+        cleaned
+    }
 }
 
 impl GuardrailVerdict {
@@ -250,6 +286,35 @@ impl GuardrailVerdict {
         GuardrailVerdict::Block {
             reason: reason.into(),
             guardrail_name: None,
+            unavailable: None,
+        }
+    }
+
+    /// `Block` for a fail-CLOSED AVAILABILITY failure (AISIX-Cloud#1365):
+    /// the guardrail could not evaluate, and its configuration says an
+    /// un-evaluated request is refused rather than let through.
+    ///
+    /// `tag` is the guardrail kind's bounded failure tag — the same value
+    /// the fail-OPEN branch puts in `Bypass::reason`, so one outage reads
+    /// the same whichever way the row is configured.
+    pub fn block_unavailable(reason: impl Into<String>, tag: impl Into<String>) -> Self {
+        GuardrailVerdict::Block {
+            reason: reason.into(),
+            guardrail_name: None,
+            unavailable: Some(bounded_failure_tag(&tag.into())),
+        }
+    }
+
+    /// The bounded failure tag when this verdict is a fail-closed
+    /// availability block; `None` for a content decision and for every
+    /// non-block verdict.
+    pub fn unavailable_tag(&self) -> Option<&str> {
+        match self {
+            GuardrailVerdict::Block {
+                unavailable: Some(tag),
+                ..
+            } => Some(tag.as_str()),
+            _ => None,
         }
     }
 
@@ -928,7 +993,46 @@ mod tests {
             GuardrailVerdict::Block {
                 reason: "x".into(),
                 guardrail_name: None,
+                unavailable: None,
             },
+        );
+        // A plain content block carries no cause; a fail-closed one does,
+        // and that is the only difference a consumer can see
+        // (AISIX-Cloud#1365).
+        assert_eq!(GuardrailVerdict::block("x").unavailable_tag(), None);
+        assert!(GuardrailVerdict::block_unavailable("x", "lakera_timeout").is_block());
+        assert_eq!(
+            GuardrailVerdict::block_unavailable("x", "lakera_timeout").unavailable_tag(),
+            Some("lakera_timeout"),
+        );
+        assert_eq!(GuardrailVerdict::Allow.unavailable_tag(), None);
+        // The tag reaches an unsanitized Prometheus label and the usage
+        // event, so it is clamped at construction rather than trusted:
+        // every producer passes a `bypass_tag()` constant today, but the
+        // field's TYPE is `String` and cannot say so.
+        assert_eq!(
+            GuardrailVerdict::block_unavailable("x", "presidio_5xx").unavailable_tag(),
+            Some("presidio_5xx"),
+            "a real tag must survive the clamp unchanged",
+        );
+        assert_eq!(
+            GuardrailVerdict::block_unavailable("x", "Lakera Timeout: 500ms!").unavailable_tag(),
+            Some("lakeratimeout500ms"),
+        );
+        assert_eq!(
+            GuardrailVerdict::block_unavailable("x", "!!!").unavailable_tag(),
+            Some("unknown"),
+        );
+        assert_eq!(
+            GuardrailVerdict::block_unavailable("x", "a".repeat(200))
+                .unavailable_tag()
+                .map(str::len),
+            Some(64),
+            "an unbounded tag must not mint an unbounded metric series",
+        );
+        assert_eq!(
+            GuardrailVerdict::Bypass { reason: "y".into() }.unavailable_tag(),
+            None,
         );
         assert!(!GuardrailVerdict::Allow.is_bypass());
         assert!(GuardrailVerdict::Bypass { reason: "y".into() }.is_bypass());

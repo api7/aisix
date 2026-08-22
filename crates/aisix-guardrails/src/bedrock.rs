@@ -300,7 +300,7 @@ impl BedrockGuardrail {
                 reason: reason.into(),
             }
         } else {
-            GuardrailVerdict::block(format!("bedrock unavailable ({reason})"))
+            GuardrailVerdict::block_unavailable(format!("bedrock unavailable ({reason})"), reason)
         }
     }
 }

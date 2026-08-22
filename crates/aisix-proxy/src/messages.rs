@@ -134,6 +134,10 @@ pub async fn messages(
     // Filled by `dispatch` with monitor-mode guardrail observations
     // (AISIX-Cloud#562), same lifecycle as `redaction_counts`.
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    // Filled by `dispatch` with the request's ENFORCE-mode audit handle
+    // (AISIX-Cloud#1330 / #1024), same dual-path lifecycle again — the
+    // input-block path is exactly where a `blocked` hit is recorded.
+    let mut audit = crate::usage_attr::GuardrailAudit::default();
     // #890 req-1: capture the client's streaming intent before dispatch
     // (which mutates the body).
     let stream_requested = body
@@ -151,6 +155,7 @@ pub async fn messages(
         &mut applied_guardrails,
         &mut redaction_counts,
         &mut monitor_hits,
+        &mut audit,
     )
     .await
     {
@@ -244,6 +249,7 @@ pub async fn messages(
                 // ...and the terminal trace spans.
                 /* terminal_last */
                 false,
+                &audit,
             );
             if !usage_handled_by_stream {
                 // Winning-attempt classification (#655). Direct models have
@@ -293,6 +299,7 @@ pub async fn messages(
                     captured_content,
                     /* terminal */ true,
                     /* dispatched */ true,
+                    &audit,
                 );
             }
             response
@@ -394,6 +401,7 @@ pub async fn messages(
                 // emission; the pre-dispatch branch below covers empty.
                 /* terminal_last */
                 !routing.attempts.is_empty(),
+                &audit,
             );
             // Pre-dispatch failure (model-not-found, auth, budget, guardrail
             // block before any upstream attempt) records no attempts — emit a
@@ -431,6 +439,7 @@ pub async fn messages(
                     // Pre-dispatch failure: no upstream was contacted.
                     /* dispatched */
                     false,
+                    &audit,
                 );
             }
             // /v1/messages must return Anthropic-shape error envelope
@@ -470,6 +479,9 @@ fn emit_failed_attempts_anthropic(
     // event is the request's terminal emission, so it carries the trace's
     // SERVER + logical spans. False on the success path.
     terminal_last: bool,
+    // The request's enforced-guardrail audit handle (AISIX-Cloud#1330);
+    // stamped only on the event this call marks terminal.
+    audit: &crate::usage_attr::GuardrailAudit,
 ) {
     let last_failed = routing.attempts.iter().rposition(|a| !a.success);
     for (i, rec) in routing
@@ -515,6 +527,7 @@ fn emit_failed_attempts_anthropic(
             // attempt never reached an upstream.
             /* dispatched */
             rec.dispatched,
+            audit,
         );
     }
 }
@@ -541,6 +554,10 @@ async fn dispatch(
     // Out-param: monitor-mode guardrail observations (AISIX-Cloud#562),
     // same lifecycle as `redactions_out`.
     monitor_hits_out: &mut Vec<aisix_core::GuardrailMonitorHit>,
+    // Out-param: the request's ENFORCE-mode audit handle, cloned off the
+    // resolved chain at the same point `applied_out` is filled
+    // (AISIX-Cloud#1330).
+    audit_out: &mut crate::usage_attr::GuardrailAudit,
 ) -> Result<DispatchOutcome, MessagesDispatchError> {
     // Extract and resolve model.
     let model_name = body
@@ -583,6 +600,7 @@ async fn dispatch(
     // event records which guardrails governed the request even when the input
     // check below blocks it (#379 / closes the anthropic gap in #519).
     *applied_out = resolved_chain.applied().to_vec();
+    *audit_out = resolved_chain.audit_log();
     if !resolved_chain.is_empty() {
         if let Ok(chat) = aisix_provider_anthropic::parse_inbound_request(body) {
             let (verdict, hits) = aisix_guardrails::Guardrail::check_input_non_segment_observed(
@@ -606,6 +624,7 @@ async fn dispatch(
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
+                ..
             } = verdict
             {
                 // AISIX-Cloud#1013: mask before returning so the failure
@@ -1316,6 +1335,11 @@ async fn anthropic_passthrough_dispatch(
         // Applied guardrail set (#379), owned for the move into the
         // end-of-stream telemetry closure.
         let applied_guardrails_c = resolved_chain.applied().to_vec();
+        // Same line, same reason: the chain itself does not survive into the
+        // Drop-guard emit, so the audit handle is cloned here and read at
+        // stream end — where the output-hook mask has just been recorded
+        // (AISIX-Cloud#1330 / #1024).
+        let audit_c = resolved_chain.audit_log();
         let stream_guardrail = if resolved_chain.is_empty() {
             None
         } else {
@@ -1473,6 +1497,7 @@ async fn anthropic_passthrough_dispatch(
                     /* terminal */
                     true,
                     /* dispatched */ true,
+                    &audit_c,
                 );
             },
         );
@@ -1595,6 +1620,7 @@ async fn anthropic_passthrough_dispatch(
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
+                    ..
                 } = verdict
                 {
                     tracing::warn!(
@@ -1975,6 +2001,8 @@ async fn cross_provider_dispatch(
         // Applied guardrail set (#379), owned for the move into the
         // end-of-stream telemetry closure.
         let applied_guardrails_for_telem = resolved_chain.applied().to_vec();
+        // See the sibling passthrough path.
+        let audit_for_telem = resolved_chain.audit_log();
         let stream_guardrail = if resolved_chain.is_empty() {
             None
         } else {
@@ -2121,6 +2149,7 @@ async fn cross_provider_dispatch(
                     /* terminal */
                     true,
                     /* dispatched */ true,
+                    &audit_for_telem,
                 );
             },
         );
@@ -2190,6 +2219,7 @@ async fn cross_provider_dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
+            ..
         } = verdict
         {
             tracing::warn!(
@@ -2519,6 +2549,7 @@ fn build_anthropic_sse_stream(
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
+                    ..
                 } = verdict
                 {
                     tracing::warn!(
@@ -2820,6 +2851,8 @@ fn emit_anthropic_usage_event(
     // Whether the work this event describes actually reached an upstream —
     // false for a pre-dispatch failure, whose `elapsed` is handler time.
     dispatched: bool,
+    // The request's enforced-guardrail audit handle (AISIX-Cloud#1330).
+    audit: &crate::usage_attr::GuardrailAudit,
 ) {
     // Per-PK telemetry attribution (#302 M17 / AISIX-Cloud#436).
     // Same shape as chat.rs's emit_usage_event — look up the
@@ -2863,6 +2896,10 @@ fn emit_anthropic_usage_event(
         applied_guardrails,
         redacted_entity_counts,
         guardrail_monitor_hits,
+        // Guardrails run once per REQUEST, not once per attempt, so only
+        // the terminal event carries them — a superseded attempt would
+        // otherwise repeat the same hit once per retry.
+        guardrail_enforced_hits: crate::usage_attr::terminal_enforced_hits(terminal, audit),
         ..Default::default()
     };
     // Handler label "messages" — Anthropic /v1/messages inbound
@@ -3528,6 +3565,7 @@ where
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
+                    ..
                 } = verdict
                 {
                     tracing::warn!(
@@ -5357,5 +5395,173 @@ data: [DONE]\n\n";
             "my-claude-via-ds",
         )
         .await;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // AISIX-Cloud#1330 / #1024 — `/v1/messages` is one of the two
+    // families the handler-family rule names by hand: it carries
+    // Claude-Code traffic, and before the drain an enforcing mask here
+    // showed up in Prometheus while the /logs row for the same request
+    // looked exactly like "no guardrail acted".
+    // ─────────────────────────────────────────────────────────────────
+
+    /// The same in-process masking row the chat tests use.
+    fn seed_masking_guardrail(snap: &AisixSnapshot) {
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{
+                "name": "eda-mask",
+                "kind": "pii",
+                "hook_point": "both",
+                "detectors": [],
+                "custom_patterns": [
+                    {"name": "eda_version", "regex": "version\\s*:\\s*(\\d+(?:\\.\\d+)+)", "action": "mask", "replacement": "***"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        snap.guardrails.insert(ResourceEntry::new("g-mask", row, 1));
+    }
+
+    #[track_caller]
+    fn assert_masked_by_eda(event: &aisix_obs::UsageEvent) {
+        let hits = &event.guardrail_enforced_hits;
+        assert!(
+            !hits.is_empty(),
+            "the enforcing mask left no audit trail on the usage event: {event:?}",
+        );
+        let hit = hits
+            .iter()
+            .find(|h| h.hook == "output")
+            .unwrap_or_else(|| panic!("no output-hook enforced hit in {hits:?}"));
+        assert_eq!(hit.guardrail_name, "eda-mask");
+        assert_eq!(hit.action, "masked");
+        assert_eq!(hit.counts.get("eda_version").copied(), Some(1));
+        let wire = serde_json::to_string(event).expect("event serialises");
+        assert!(
+            !wire.contains("9.9.9"),
+            "masked value reached the event: {wire}"
+        );
+    }
+
+    /// Non-streaming `/v1/messages`.
+    #[tokio::test]
+    async fn messages_usage_event_carries_the_enforced_mask() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_mask_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "the version: 9.9.9 build"}],
+                "model": "claude-3-5-haiku-20241022",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 3}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("my-claude"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        seed_masking_guardrail(&snap);
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "my-claude",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body =
+            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("***"), "the response was not masked: {body}");
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("usage event sender dropped");
+        assert_masked_by_eda(&event);
+    }
+
+    /// Streaming `/v1/messages` — pitfall (1) of #1024. The terminal event
+    /// is emitted from the stream's Drop guard, where the chain is long
+    /// gone; only a cloned audit handle can carry the mask that the
+    /// hold-back release just applied.
+    #[tokio::test]
+    async fn streaming_messages_usage_event_carries_the_enforced_mask() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let sse = "\
+event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_mask_2\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null,\"usage\":{\"input_tokens\":37,\"output_tokens\":1}}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"the version: 9.9.9 build\"}}\n\n\
+event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":52}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("my-claude"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        seed_masking_guardrail(&snap);
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "my-claude",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100,
+                "stream": true,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let streamed =
+            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        assert!(
+            streamed.contains("***"),
+            "the stream was not masked: {streamed}"
+        );
+        assert!(
+            !streamed.contains("9.9.9"),
+            "the stream leaked the value: {streamed}"
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("usage event sender dropped");
+        assert_masked_by_eda(&event);
     }
 }
