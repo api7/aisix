@@ -467,7 +467,8 @@ describe("a fail-closed guardrail outage is audited apart from a policy block", 
     // failure mode tests/e2e/AGENTS.md calls out.
     await waitForToken(sls, DEAD_LOGSTORE, "enforced-unavailable");
     const decoded = decodedTextFor(sls, DEAD_LOGSTORE);
-    const hits = hitsIn(decoded).filter((h) => h.guardrail_name === "presidio-prod");
+    const all = hitsIn(decoded);
+    const hits = all.filter((h) => h.guardrail_name === "presidio-prod");
     expect(hits.length).toBeGreaterThan(0);
     for (const hit of hits) {
       expect(
@@ -479,9 +480,12 @@ describe("a fail-closed guardrail outage is audited apart from a policy block", 
       expect(hit.error_type ?? "").toMatch(/^presidio_/);
       expect(hit.counts ?? {}).toEqual({});
     }
-    // ...and no entry on this request claims a policy decision, which is
-    // the whole failure mode: one row saying `blocked` here is one row an
-    // auditor counts as a customer violation.
-    expect(hits.filter((h) => h.action === "blocked")).toHaveLength(0);
+    // ...and no entry ANYWHERE in this logstore claims a policy decision,
+    // which is the whole failure mode: one row saying `blocked` here is one
+    // row an auditor counts as a customer violation. Checked against the
+    // unfiltered set — re-checking `hits` would be a tautology, since the
+    // loop above has already established what every entry in it says, and
+    // this app's exporter serves only this test.
+    expect(all.filter((h) => h.action === "blocked")).toHaveLength(0);
   });
 });
