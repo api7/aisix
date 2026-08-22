@@ -55,63 +55,110 @@ fn redact_str(
     }
 }
 
-/// Offer an object member to `redact` as its JSON spelling — `"key": "value"`
-/// — so an operator rule anchored on the field NAME can fire on a value that
-/// is a real JSON field (AISIX-Cloud#1330 case B).
+/// The speculative twin of [`redact_str`]: same rewrite, nothing recorded
+/// to the per-request enforcement audit (see the trait method's docs).
+fn redact_str_unaudited(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    text: &str,
+) -> Option<aisix_guardrails::Redaction> {
+    match dir {
+        Direction::Input => chain.redact_input_text_unaudited(text),
+        Direction::Output => chain.redact_output_text_unaudited(text),
+    }
+}
+
+/// The VALUE span of a rewritten `"key":"value"` synthetic, or `None` when
+/// the rule rewrote the synthesized context instead of the tool's data.
 ///
-/// A leaf-by-leaf rewrite hands the rule the bare value (`12.1`), which is
+/// `prefix` is valid UTF-8 and must match byte-for-byte, which puts its
+/// length on a char boundary; the trailing `"` is one ASCII byte.
+fn keyed_value_span<'a>(prefix: &str, rewritten: &'a str) -> Option<&'a str> {
+    (rewritten.len() > prefix.len()
+        && rewritten.as_bytes().starts_with(prefix.as_bytes())
+        && rewritten.ends_with('"'))
+    .then(|| &rewritten[prefix.len()..rewritten.len() - 1])
+}
+
+/// Redact one string member of a JSON object, offering the rules its field
+/// NAME as well as its value (AISIX-Cloud#1330 case B).
+///
+/// A leaf-by-leaf rewrite hands the rules the bare value (`12.1`), which is
 /// indistinguishable from any other dotted number. A rule keyed on the field
 /// (`"version"\s*:\s*"([^"]*)"`) then never matches and the value ships
-/// unmasked, while the same rule DOES fire when the tool happens to embed the
-/// document in a prose leaf — a difference the operator has no way to predict.
-/// Wrapping the leaf in its key restores the discriminator the rule was
-/// written around; because the value's bytes appear verbatim inside the
-/// synthetic text, a value-anchored rule still sees exactly what it saw
-/// before, in one pass.
+/// unmasked — while the same rule DOES fire when a tool happens to embed the
+/// document in a prose leaf, a difference the operator has no way to predict.
 ///
-/// Only the VALUE span survives. The synthetic prefix (`"key": "`) and the
-/// closing quote must come back byte-for-byte; a rule that swallowed either
-/// rewrote the synthesized context rather than the tool's data, so its result
-/// is discarded and the bare leaf is redacted instead — the pre-key-context
-/// behaviour. The same fallback catches a rule the wrapper hides (an `^…$`
-/// anchored pattern matches the bare value but not the wrapped one), at the
-/// cost of a second pass over leaves nothing matched.
+/// Two passes, composed the way a chain composes its members
+/// (`fold_redactions`), never raced against each other:
 ///
-/// Note on the audit log: a chain records an enforced mask hit as soon as a
-/// member rewrites, so a discarded out-of-bounds pass is still audited. That
-/// can over-count `guardrail_enforced_hits` on that rare path — the direction
-/// is fail-safe (a mask attempt is reported, never hidden).
+///  1. the BARE leaf, exactly the pre-key-context rewrite. Its result is
+///     always kept, so a rule anchored to the whole leaf (`^…$` — which can
+///     only ever match the bare form) keeps firing no matter what pass 2
+///     does. Racing the two instead would let any unanchored sibling rule
+///     steal the anchored rule's only chance: a `^\d{4}$` PIN mask silently
+///     became a one-character mask.
+///  2. the member's JSON spelling around pass 1's output, in the SAME
+///     compact form the MCP input scan hands `check_input`
+///     (`Value::to_string()`), so one operator rule covers block and mask.
 ///
-/// `key: None` (array element, document root) skips the synthesis entirely.
+/// Pass 2 is kept only when the synthesized prefix (`"key":"`) and the
+/// closing quote come back byte-for-byte AND the value actually changed —
+/// otherwise the rule rewrote the wrapper rather than the data, or matched
+/// its own mask token a second time, and the pass-1 result stands. Because
+/// that pass can be thrown away it runs UNAUDITED, and the kept rewrite is
+/// replayed through the audited path: an enforcement hit must describe a
+/// mask the client really saw.
+///
+/// The wrapped pass is skipped for an empty value, and for a key or value
+/// carrying `"` or `\`: their decoded bytes are not JSON string content, so
+/// the synthetic would not be the document's own spelling and a `"([^"]*)"`
+/// rule would frame on the embedded quote and mask only the head.
+///
+/// `key: None` (array element, document root) is pass 1 alone.
 pub fn redact_with_key_context(
+    chain: &dyn Guardrail,
+    dir: Direction,
     key: Option<&str>,
     text: &str,
-    mut redact: impl FnMut(&str) -> Option<aisix_guardrails::Redaction>,
 ) -> Option<aisix_guardrails::Redaction> {
+    let bare = redact_str(chain, dir, text);
     let Some(key) = key else {
-        return redact(text);
+        return bare;
     };
-    // JSON spelling with the key's DECODED bytes: the rule is written against
-    // what a reader sees, not against the document's escape choices.
-    let prefix = format!("\"{key}\": \"");
-    let mut synthetic = String::with_capacity(prefix.len() + text.len() + 1);
-    synthetic.push_str(&prefix);
-    synthetic.push_str(text);
-    synthetic.push('"');
-    if let Some(r) = redact(&synthetic) {
-        // `prefix` is valid UTF-8 and matched byte-for-byte, so its length is
-        // a char boundary in `r.text`; the trailing `"` is one ASCII byte.
-        if r.text.len() > prefix.len()
-            && r.text.as_bytes().starts_with(prefix.as_bytes())
-            && r.text.ends_with('"')
-        {
-            return Some(aisix_guardrails::Redaction {
-                text: r.text[prefix.len()..r.text.len() - 1].to_owned(),
-                counts: r.counts,
-            });
-        }
+    let base = bare.as_ref().map_or(text, |r| r.text.as_str());
+    if base.is_empty() || base.contains(['"', '\\']) || key.contains(['"', '\\']) {
+        return bare;
     }
-    redact(text)
+    let prefix = format!("\"{key}\":\"");
+    let mut synthetic = String::with_capacity(prefix.len() + base.len() + 1);
+    synthetic.push_str(&prefix);
+    synthetic.push_str(base);
+    synthetic.push('"');
+
+    let probed = match redact_str_unaudited(chain, dir, &synthetic) {
+        Some(probed) => probed,
+        None => return bare,
+    };
+    match keyed_value_span(&prefix, &probed.text) {
+        Some(masked) if masked != base => {}
+        _ => return bare,
+    }
+    // Replay through the audited path. The redactors are pure regex
+    // rewrites, so this repeats the accepted result exactly; anything else
+    // means the chain changed under us and pass 1 stands.
+    let Some(kept) = redact_str(chain, dir, &synthetic) else {
+        return bare;
+    };
+    let Some(masked) = keyed_value_span(&prefix, &kept.text).map(str::to_owned) else {
+        return bare;
+    };
+    let mut counts = bare.map(|b| b.counts).unwrap_or_default();
+    merge_counts(&mut counts, kept.counts);
+    Some(aisix_guardrails::Redaction {
+        text: masked,
+        counts,
+    })
 }
 
 // ─── Remote segment moderation (kind=bedrock mask write-back) ────────────────
@@ -369,7 +416,7 @@ fn redact_value_strings_under(
             // text once, verbatim (`redacts_positionally`) — the bedrock
             // segment bridge walks these same tool-argument documents.
             let key = key.filter(|_| !chain.redacts_positionally());
-            if let Some(r) = redact_with_key_context(key, s, |t| redact_str(chain, dir, t)) {
+            if let Some(r) = redact_with_key_context(chain, dir, key, s) {
                 *s = r.text;
                 merge_counts(counts, r.counts);
             }
@@ -1551,6 +1598,75 @@ mod tests {
         redact_value_strings(chain.as_ref(), Direction::Input, &mut v, &mut counts);
         assert_eq!(v, json!({"pin": "####", "note": "pin 1234 here"}));
         assert_eq!(counts.get("pin"), Some(&1));
+    }
+
+    /// A chain where one rule fires on the WRAPPED text and another is
+    /// anchored to the whole leaf. The wrapped hit must not consume the
+    /// leaf-anchored rule's only chance to see the bare value: before this
+    /// was composed, `"1234"` came back `Z234` — three of the four secret
+    /// digits shipped where the leaf rule had masked all four.
+    #[test]
+    fn a_wrapped_hit_does_not_steal_the_leaf_anchored_rule() {
+        let ctx = aisix_guardrails::PiiRule::new("ctx", r#""\s*:\s*"(\d)"#, PiiAction::Mask, None)
+            .unwrap()
+            .with_replacement(Some("Z".into()));
+        let pin = aisix_guardrails::PiiRule::new("pin", r"^\d{4}$", PiiAction::Mask, None)
+            .unwrap()
+            .with_replacement(Some("ZZZZ".into()));
+        let chain: Arc<dyn Guardrail> =
+            Arc::new(GuardrailChain::new(vec![Arc::new(PiiGuardrail::new(
+                vec![ctx, pin],
+                aisix_core::models::GuardrailHookPoint::Both,
+                262_144,
+                false,
+            ))]));
+        let mut v = json!({"pin": "1234"});
+        let mut counts = RedactionCounts::new();
+        redact_value_strings(chain.as_ref(), Direction::Input, &mut v, &mut counts);
+        assert_eq!(v, json!({"pin": "ZZZZ"}));
+        assert_eq!(counts.get("pin"), Some(&1));
+    }
+
+    /// A mask token its own rule matches again must not tally twice: the
+    /// wrapped pass is kept only when it actually changed the value, so a
+    /// second idempotent match neither inflates `redacted_entity_counts` nor
+    /// files a second enforced hit.
+    #[test]
+    fn a_wrapped_pass_that_changes_nothing_is_not_counted_twice() {
+        let chain = rule_chain("digits", r"(\d+)", "9");
+        let mut v = json!({"n": "12"});
+        let mut counts = RedactionCounts::new();
+        redact_value_strings(chain.as_ref(), Direction::Input, &mut v, &mut counts);
+        assert_eq!(v, json!({"n": "9"}));
+        assert_eq!(counts.get("digits"), Some(&1));
+    }
+
+    /// A value carrying a `"` has no faithful single-line JSON spelling, so
+    /// the canonical `"key":"([^"]*)"` rule would frame on the value's own
+    /// quote and mask the head while reporting a full hit. The wrapped pass
+    /// is skipped instead and the member keeps its bare-leaf outcome.
+    #[test]
+    fn a_value_carrying_a_quote_skips_the_wrapped_pass() {
+        let chain = rule_chain("eda_version", r#""version"\s*:\s*"([^"]*)""#, "***");
+        let mut v = json!({"version": "12.1\" and-the-tail"});
+        let mut counts = RedactionCounts::new();
+        redact_value_strings(chain.as_ref(), Direction::Input, &mut v, &mut counts);
+        assert_eq!(v, json!({"version": "12.1\" and-the-tail"}));
+        assert!(counts.is_empty(), "a partial mask must not be reported");
+    }
+
+    /// The synthesized spelling is the COMPACT one the MCP input scan
+    /// already hands `check_input` (`Value::to_string()`), so one operator
+    /// rule covers both the block decision and the mask. A rule written
+    /// without `\s*` would otherwise block but never mask.
+    #[test]
+    fn the_synthetic_uses_the_scan_paths_compact_spelling() {
+        let chain = rule_chain("compact", r#""version":"([^"]*)""#, "***");
+        let mut v = json!({"version": "12.1"});
+        let mut counts = RedactionCounts::new();
+        redact_value_strings(chain.as_ref(), Direction::Input, &mut v, &mut counts);
+        assert_eq!(v, json!({"version": "***"}));
+        assert_eq!(counts.get("compact"), Some(&1));
     }
 
     /// The segment-moderation bridge pairs walk slots BY INDEX, so its probes

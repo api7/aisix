@@ -444,9 +444,23 @@ describe("mcp mask write-back e2e: /mcp", () => {
       for (const detector of detectors) {
         expect(["eda_version", "eda_version_json"]).toContain(detector);
       }
+      // The audit must not claim more masks than the bodies carry. Each
+      // request masks at most four spans, so a speculative pass that was
+      // discarded — or counted twice — shows up here.
+      for (const n of Object.values(hit.counts ?? {})) {
+        expect(n).toBeGreaterThan(0);
+        expect(n).toBeLessThanOrEqual(4);
+      }
       expect(JSON.stringify(hit)).not.toContain("12.1");
       expect(JSON.stringify(hit)).not.toContain("2022.4");
     }
+    // Across the request's events both detectors are represented: the prose
+    // shapes still fire `eda_version`, the real JSON fields fire
+    // `eda_version_json`. A regression that collapsed one into the other
+    // would keep every per-hit check above green.
+    expect(new Set(hits.flatMap((h) => Object.keys(h.counts ?? {})))).toEqual(
+      new Set(["eda_version", "eda_version_json"]),
+    );
     // Both hooks are represented across the request's events.
     expect(new Set(hits.map((h) => h.hook))).toEqual(new Set(["input", "output"]));
   });

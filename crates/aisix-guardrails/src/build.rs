@@ -728,6 +728,21 @@ impl Guardrail for MonitorGuardrail {
         self.observe_redaction("output", self.inner.redact_output_text(text));
         None
     }
+
+    // A speculative pass records nothing — not the enforcement audit, and
+    // not the monitor observation either: the caller may throw the rewrite
+    // away, and a would_mask hit for it would be as false as an enforced one.
+    fn redact_input_text_unaudited(&self, _text: &str) -> Option<Redaction> {
+        None
+    }
+
+    fn redact_output_text_unaudited(&self, _text: &str) -> Option<Redaction> {
+        None
+    }
+
+    fn redacts_positionally(&self) -> bool {
+        self.inner.redacts_positionally()
+    }
 }
 
 /// `mandatory: true` decorator. A remote guardrail that can't reach its
@@ -813,6 +828,18 @@ impl Guardrail for MandatoryGuardrail {
 
     fn redact_output_text(&self, text: &str) -> Option<Redaction> {
         self.inner.redact_output_text(text)
+    }
+
+    fn redact_input_text_unaudited(&self, text: &str) -> Option<Redaction> {
+        self.inner.redact_input_text_unaudited(text)
+    }
+
+    fn redact_output_text_unaudited(&self, text: &str) -> Option<Redaction> {
+        self.inner.redact_output_text_unaudited(text)
+    }
+
+    fn redacts_positionally(&self) -> bool {
+        self.inner.redacts_positionally()
     }
 }
 
@@ -927,6 +954,18 @@ impl Guardrail for LiveGuardrailChain {
 
     fn redact_output_text(&self, text: &str) -> Option<Redaction> {
         self.current().redact_output_text(text)
+    }
+
+    fn redact_input_text_unaudited(&self, text: &str) -> Option<Redaction> {
+        self.current().redact_input_text_unaudited(text)
+    }
+
+    fn redact_output_text_unaudited(&self, text: &str) -> Option<Redaction> {
+        self.current().redact_output_text_unaudited(text)
+    }
+
+    fn redacts_positionally(&self) -> bool {
+        self.current().redacts_positionally()
     }
 }
 

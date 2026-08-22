@@ -698,6 +698,33 @@ impl Guardrail for GuardrailChain {
             self.audit.as_deref(),
         )
     }
+
+    // The speculative pair: same fold, no audit sink. A caller that may
+    // throw the rewrite away uses these, then replays the audited call on
+    // the rewrite it actually keeps.
+    fn redact_input_text_unaudited(&self, text: &str) -> Option<Redaction> {
+        fold_redactions(
+            text,
+            self.members.iter().filter(|m| m.guardrail.redacts_input()),
+            true,
+            None,
+        )
+    }
+
+    fn redact_output_text_unaudited(&self, text: &str) -> Option<Redaction> {
+        fold_redactions(
+            text,
+            self.members.iter().filter(|m| m.guardrail.redacts_output()),
+            false,
+            None,
+        )
+    }
+
+    fn redacts_positionally(&self) -> bool {
+        self.members
+            .iter()
+            .any(|m| m.guardrail.redacts_positionally())
+    }
 }
 
 /// Fold the texts through each segment-moderating member. Mirrors the

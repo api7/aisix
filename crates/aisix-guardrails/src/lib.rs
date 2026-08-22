@@ -532,6 +532,23 @@ pub trait Guardrail: Send + Sync + 'static {
         None
     }
 
+    /// The same rewrite as [`Self::redact_input_text`], but SPECULATIVE: the
+    /// caller may discard the result, so nothing may reach the per-request
+    /// enforcement audit. A discarded rewrite that had already been recorded
+    /// would put a `masked` hit on the usage event for a mask no client ever
+    /// saw — worse than no audit, because the operator reads that array as
+    /// evidence. Only a guardrail that records (a chain) needs to override
+    /// this; a plain redactor's audited and speculative rewrites are the same
+    /// pure function.
+    fn redact_input_text_unaudited(&self, text: &str) -> Option<Redaction> {
+        self.redact_input_text(text)
+    }
+
+    /// Response-side [`Self::redact_input_text_unaudited`].
+    fn redact_output_text_unaudited(&self, text: &str) -> Option<Redaction> {
+        self.redact_output_text(text)
+    }
+
     /// `true` when this redactor consumes the offered texts POSITIONALLY —
     /// it pairs slot *i* of one walk over a body with slot *i* of the next,
     /// rather than deciding each text on its own content. A wire walker must

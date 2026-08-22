@@ -672,9 +672,12 @@ fn rewrite_tool_arguments(
             let key = (path.len() > 2)
                 .then(|| crate::json_splice::member_key(path))
                 .flatten();
-            crate::redact::redact_with_key_context(key, text, |t| {
-                aisix_guardrails::Guardrail::redact_input_text(chain, t)
-            })
+            crate::redact::redact_with_key_context(
+                chain,
+                crate::redact::Direction::Input,
+                key,
+                text,
+            )
             .map(|r| {
                 crate::redact::merge_counts(&mut counts, r.counts);
                 r.text
@@ -855,16 +858,19 @@ async fn apply_output_guardrails(
             // Under `structuredContent` the field name is the tool's own
             // (`{"version": "12.1"}`), so it is handed to the rule; a content
             // block's `text`/`description`/`title`/`resource.text` are MCP
-            // envelope names, and synthesizing `"text": "…"` around a prose
+            // envelope names, and synthesizing `"text":"…"` around a prose
             // block would reintroduce exactly the envelope-name false
             // positives the scan path decodes the blocks to avoid.
             let key = (path.len() > 2
                 && path.get(1).is_some_and(|s| s.is_key("structuredContent")))
             .then(|| crate::json_splice::member_key(path))
             .flatten();
-            crate::redact::redact_with_key_context(key, text, |t| {
-                aisix_guardrails::Guardrail::redact_output_text(chain, t)
-            })
+            crate::redact::redact_with_key_context(
+                chain,
+                crate::redact::Direction::Output,
+                key,
+                text,
+            )
             .map(|r| {
                 crate::redact::merge_counts(&mut counts, r.counts);
                 r.text
@@ -2166,7 +2172,7 @@ mod tests {
     /// AISIX-Cloud#1330 case B: when the sensitive value IS a JSON field, a
     /// leaf-by-leaf rewrite hands the rule a bare `12.1` and the key-anchored
     /// rule can never fire — the value ships unmasked with no signal. Offering
-    /// each `structuredContent` member as `"key": "value"` makes it fire, and
+    /// each `structuredContent` member as `"key":"value"` makes it fire, and
     /// the discrimination is the point: same-shaped values under a field the
     /// rule does not name survive byte-for-byte.
     #[tokio::test]
@@ -2205,7 +2211,7 @@ mod tests {
     /// The MCP envelope's own field names are NOT synthesized as context. The
     /// scan path decodes the content blocks precisely so `content`/`type`/
     /// `text` can't trip a rule; wrapping a prose block back up as
-    /// `"text": "…"` would reintroduce exactly that false positive. Only the
+    /// `"text":"…"` would reintroduce exactly that false positive. Only the
     /// tool's own `structuredContent` keys are its data.
     #[tokio::test]
     async fn envelope_field_names_are_not_offered_as_key_context() {
@@ -2260,6 +2266,38 @@ mod tests {
             r#""arguments":{"elapsed":"12.345","port":"10.2.255.1"}}}"#,
         );
         assert!(rewrite_tool_arguments(&chain, clean.as_bytes())
+            .unwrap()
+            .is_none());
+    }
+
+    /// A discarded speculative pass must leave NO trace in the enforcement
+    /// audit. A key-anchored rule WITHOUT a capture group replaces the whole
+    /// match, which swallows the synthesized wrapper: the rewrite is dropped
+    /// and the value ships as it stood, so a `masked` hit on the usage event
+    /// would describe a mask no client ever saw — worse than no audit, since
+    /// operators read that array as evidence (#1023).
+    #[test]
+    fn a_discarded_wrapped_pass_files_no_enforced_hit() {
+        let chain = env_chain_with(
+            r#"{"name":"pii-key","kind":"pii","hook_point":"input","custom_patterns":[{"name":"whole_match","regex":"\"version\"\\s*:\\s*\"[^\"]*\"","action":"mask","replacement":"***"}]}"#,
+        );
+        let body = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"t","arguments":{"version":"12.1"}}}"#;
+        assert!(rewrite_tool_arguments(&chain, body.as_bytes())
+            .unwrap()
+            .is_none());
+        let hits = chain.enforced_hits();
+        assert!(hits.is_empty(), "nothing was masked: {hits:?}");
+    }
+
+    /// An empty argument has nothing to mask. Without the guard the wrapped
+    /// pass lets a `"key":"([^"]*)"` rule match the empty value and plant a
+    /// mask token in a field that carried none — which a downstream agent
+    /// reads as a real value.
+    #[test]
+    fn an_empty_argument_is_never_given_a_mask_token() {
+        let chain = env_chain_with(&pii_json_key_guard("input"));
+        let body = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"t","arguments":{"version":""}}}"#;
+        assert!(rewrite_tool_arguments(&chain, body.as_bytes())
             .unwrap()
             .is_none());
     }
