@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   decodedTextFor,
   EtcdClient,
+  pickFreePort,
   ProxyClient,
   SeedClient,
   spawnApp,
@@ -344,5 +345,122 @@ describe("guardrail enforced hits on the LLM handler family", () => {
     expect(body).not.toContain(CASES.responses.marker);
 
     await expectAuditedMask(CASES.responses.detector, CASES.responses.marker);
+  });
+});
+
+// AISIX-Cloud#1365: the third enforcement state.
+//
+// A guardrail with `fail_open: false` returns a REFUSAL when its upstream
+// is unreachable — the same verdict a content violation produces. Reported
+// as plain `blocked`, a 30-second provider outage stamps every request in
+// that window as a policy violation, and an operator reading /logs (or the
+// CSV an auditor pulls) concludes a burst of customer prompts broke policy
+// when the provider was simply down. That is a wrong answer, not a missing
+// one, which is why it gets its own action and carries the cause.
+//
+// Its own app + env: the guardrail is env-scoped and refuses every request,
+// so it cannot share a snapshot with the masking cases above.
+describe("a fail-closed guardrail outage is audited apart from a policy block", () => {
+  let app: SpawnedApp | undefined;
+  let sls: MockSls | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let etcdReachable = false;
+
+  const DEAD_LOGSTORE = "enforced-hits-unavailable";
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+
+    upstream = await startOpenAiUpstream({});
+    sls = await startMockSls();
+    app = await spawnApp({
+      extraEnv: {
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-secret",
+      },
+    });
+
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createObservabilityExporter({
+      name: "sls-enforced-unavailable",
+      enabled: true,
+      kind: "aliyun_sls",
+      endpoint: sls.url,
+      project: SLS_PROJECT,
+      logstore: DEAD_LOGSTORE,
+      credential_ref: CREDENTIAL_REF,
+    });
+    // A real remote guardrail pointed at a port nothing listens on. Not a
+    // stub of a failure — the actual connect error the DP classifies.
+    const deadPort = await pickFreePort();
+    await seed.createGuardrail({
+      name: "presidio-prod",
+      enabled: true,
+      hook_point: "input",
+      fail_open: false,
+      kind: "presidio",
+      analyzer_url: `http://127.0.0.1:${deadPort}`,
+      anonymizer_url: `http://127.0.0.1:${deadPort}`,
+      timeout_ms: 500,
+    });
+    const pk = await seed.createProviderKey({
+      display_name: "unavailable-pk",
+      secret: "sk-mock-upstream",
+      api_base: upstream.baseUrl,
+      provider: "openai",
+      adapter: "openai",
+    });
+    await seed.createModel({
+      display_name: "enforced-unavailable",
+      provider: "openai",
+      model_name: "gpt-4o",
+      provider_key_id: pk.id,
+    });
+    await seed.createApiKey({ key_hash: sha256(KEY), allowed_models: ["*"] });
+    const proxy = new ProxyClient(app.proxyUrl, KEY);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
+  }, 90_000);
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+    await sls?.close();
+  });
+
+  test("the refusal records blocked_unavailable with its cause, not blocked", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${KEY}` },
+      body: JSON.stringify({
+        model: "enforced-unavailable",
+        messages: [{ role: "user", content: "anything at all" }],
+      }),
+    });
+    // Fail-closed still means closed — separating the two attributions
+    // must not weaken the guarantee itself.
+    expect(res.status).toBe(422);
+
+    await waitForToken(sls, DEAD_LOGSTORE, "presidio-prod");
+    const decoded = decodedTextFor(sls, DEAD_LOGSTORE);
+    const hits = hitsIn(decoded).filter((h) => h.guardrail_name === "presidio-prod");
+    expect(hits.length).toBeGreaterThan(0);
+    for (const hit of hits) {
+      expect(
+        hit.action,
+        "an unreachable guardrail upstream must not be reported as a policy decision",
+      ).toBe("blocked_unavailable");
+      expect(hit.hook).toBe("input");
+      // A bounded per-kind cause, never free text and never the request.
+      expect(hit.error_type ?? "").toMatch(/^presidio_/);
+      expect(hit.counts ?? {}).toEqual({});
+    }
+    // ...and no entry on this request claims a policy decision, which is
+    // the whole failure mode: one row saying `blocked` here is one row an
+    // auditor counts as a customer violation.
+    expect(hits.filter((h) => h.action === "blocked")).toHaveLength(0);
   });
 });
