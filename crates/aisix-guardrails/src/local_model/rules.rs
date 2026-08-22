@@ -623,10 +623,7 @@ mod tests {
         assert_eq!(scorer.score(text, &span), 0);
 
         // A pattern that fits the window still fires.
-        let negatives = vec![(
-            Regex::new("aaa$").expect("compiles"),
-            "aaa$".to_owned(),
-        )];
+        let negatives = vec![(Regex::new("aaa$").expect("compiles"), "aaa$".to_owned())];
         let scorer = RuleScorer::compile(5, &[], negatives).expect("compiles");
         assert_eq!(scorer.score(text, &span), NEGATIVE_CLASS_SCORE);
     }
