@@ -722,6 +722,99 @@ fn default_presidio_language() -> String {
     "en".to_owned()
 }
 
+/// One hotword group for a semantic category. Terms in a group are
+/// lexical evidence for the category: a term found next to a candidate
+/// span raises the span's rule score, and each group contributes at most
+/// once per span. Group terms by the role they play (for example trigger
+/// words, tool names) rather than listing every term in one group.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
+pub struct SemanticHotwordGroup {
+    /// Literal terms. Terms containing CJK characters match as
+    /// substrings; ASCII terms match on word boundaries, and may run
+    /// directly into a digit (so a tool name fused to a version number
+    /// still counts).
+    #[schemars(length(min = 1, max = 50))]
+    pub terms: Vec<String>,
+}
+
+/// One user-defined category for `kind: "semantic"`: what to look for
+/// (regex candidate patterns), the lexical evidence that confirms or
+/// rejects a candidate (hotword groups and negative patterns), the
+/// natural-language description the embedding model judges uncertain
+/// candidates against, and how a confirmed span is rewritten.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
+pub struct SemanticCategory {
+    /// Category name surfaced in the mask token (`[<NAME>_REDACTED]`),
+    /// telemetry counts, and audit records. Never the matched value.
+    /// Must be unique within the guardrail.
+    #[schemars(length(min = 1, max = 64))]
+    pub name: String,
+    /// Natural-language description of the category, such as
+    /// `EDA 软件的版本号`. Candidates that regex and hotword evidence
+    /// cannot decide are judged by embedding similarity between their
+    /// surrounding text and this description.
+    #[schemars(length(min = 1, max = 1000))]
+    pub description: String,
+    /// Regular expressions that generate candidate spans. Only text
+    /// matched by a candidate pattern can ever be masked, so patterns
+    /// should be broad — precision comes from the hotword and negative
+    /// evidence and from the embedding judgement.
+    #[serde(default)]
+    #[schemars(length(min = 1, max = 10))]
+    pub candidate_patterns: Vec<String>,
+    /// Regular expressions that are evidence AGAINST a candidate. Each
+    /// pattern is tried against the candidate span itself, the text
+    /// immediately before it, and the text immediately after it (anchor
+    /// with `^` or `$` to pin the position); any match counts once and
+    /// strongly lowers the span's score.
+    #[serde(default)]
+    #[schemars(length(max = 20))]
+    pub negative_patterns: Vec<String>,
+    /// Hotword groups — lexical evidence FOR a candidate. A group term
+    /// adjacent to the span is decisive; terms merely nearby are weak
+    /// evidence that routes the span to the embedding judgement.
+    #[serde(default)]
+    #[schemars(length(max = 10))]
+    pub hotword_groups: Vec<SemanticHotwordGroup>,
+    /// Action for spans confirmed as this category. Only `mask` is
+    /// supported: this guardrail rewrites content and never blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Literal text that replaces a masked span, such as `***`. When
+    /// omitted, the span is rewritten to `[<NAME>_REDACTED]`. An empty
+    /// string removes the span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 256))]
+    pub replacement: Option<String>,
+    /// Similarity threshold for the embedding judgement, in `[-1, 1]`
+    /// (cosine similarity against the category description). Omitted →
+    /// the calibrated default that ships with the bundled model. Raise
+    /// it to mask less, lower it to mask more; pair tuning with
+    /// `enforcement_mode: monitor` to preview the effect first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = -1.0, max = 1.0))]
+    pub threshold: Option<f32>,
+}
+
+/// Config block for `kind: "semantic"`. Category-based semantic
+/// detection and redaction computed inside the gateway by a bundled CPU
+/// embedding model — no external service is called and no content leaves
+/// the gateway. Each category pipelines regex candidate generation,
+/// hotword/negative-evidence scoring, and an embedding similarity
+/// judgement for the remaining uncertain spans. Confirmed spans are
+/// masked in place; everything else is returned byte-identical. This
+/// guardrail rewrites content and never blocks traffic, so `fail_open`
+/// must stay `true`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
+pub struct SemanticConfig {
+    /// The categories this guardrail detects. Categories are evaluated
+    /// in order; each category rewrites the text the previous one
+    /// produced.
+    #[serde(default)]
+    #[schemars(length(min = 1, max = 30))]
+    pub categories: Vec<SemanticCategory>,
+}
+
 /// Provider discriminator. The kind drives which `*_config` block is
 /// expected. Serde's `tag = "kind"` keeps us honest at parse time.
 ///
@@ -776,6 +869,15 @@ pub enum GuardrailKind {
     /// use the selected anonymize operator. Applies on input, output, or both,
     /// including buffered streaming output.
     Presidio(PresidioConfig),
+    /// Category-based semantic detection and redaction using a CPU
+    /// embedding model bundled with the gateway. User-defined categories
+    /// combine regex candidates, hotword evidence, and embedding
+    /// similarity against a natural-language description; confirmed
+    /// spans are masked in place. Rewrites only — never blocks. Applies
+    /// on input, output, or both, including buffered streaming output.
+    /// Requires the gateway's bundled model files; nodes without them
+    /// do not serve this kind.
+    Semantic(SemanticConfig),
 }
 
 impl GuardrailKind {
@@ -795,6 +897,7 @@ impl GuardrailKind {
             GuardrailKind::Lakera(_) => "lakera",
             GuardrailKind::OpenaiModeration(_) => "openai_moderation",
             GuardrailKind::Presidio(_) => "presidio",
+            GuardrailKind::Semantic(_) => "semantic",
         }
     }
 }
@@ -946,6 +1049,19 @@ pub struct GuardrailExecution<'a> {
 /// build time, so aisix-guardrails stays free of a metrics dependency.
 pub trait GuardrailMetricsSink: Send + Sync + 'static {
     fn record_guardrail_execution(&self, exec: &GuardrailExecution<'_>);
+
+    /// One embedding-model inference performed by the semantic
+    /// guardrail runtime. Default no-op so non-metrics sinks and tests
+    /// need not care.
+    fn record_semantic_model_call(&self) {}
+
+    /// One semantic-guardrail degrade: a span (or category) fell back
+    /// to the rule layers instead of getting its embedding judgement.
+    /// `reason` is a bounded vocabulary (see the semantic runtime's
+    /// degrade enum), never free text.
+    fn record_semantic_degrade(&self, reason: &'static str) {
+        let _ = reason;
+    }
 }
 
 /// Content policy evaluated before or after upstream calls.

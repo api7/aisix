@@ -247,6 +247,95 @@
         "type"
       ],
       "type": "object"
+    },
+    "SemanticCategory": {
+      "additionalProperties": false,
+      "description": "One user-defined category for `kind: \"semantic\"`: what to look for (regex candidate patterns), the lexical evidence that confirms or rejects a candidate (hotword groups and negative patterns), the natural-language description the embedding model judges uncertain candidates against, and how a confirmed span is rewritten.",
+      "properties": {
+        "action": {
+          "description": "Action for spans confirmed as this category. Only `mask` is supported: this guardrail rewrites content and never blocks.",
+          "enum": [
+            "mask"
+          ],
+          "type": "string"
+        },
+        "candidate_patterns": {
+          "default": [],
+          "description": "Regular expressions that generate candidate spans. Only text matched by a candidate pattern can ever be masked, so patterns should be broad — precision comes from the hotword and negative evidence and from the embedding judgement.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 10,
+          "minItems": 1,
+          "type": "array"
+        },
+        "description": {
+          "description": "Natural-language description of the category, such as `EDA 软件的版本号`. Candidates that regex and hotword evidence cannot decide are judged by embedding similarity between their surrounding text and this description.",
+          "maxLength": 1000,
+          "minLength": 1,
+          "type": "string"
+        },
+        "hotword_groups": {
+          "default": [],
+          "description": "Hotword groups — lexical evidence FOR a candidate. A group term adjacent to the span is decisive; terms merely nearby are weak evidence that routes the span to the embedding judgement.",
+          "items": {
+            "$ref": "#/definitions/SemanticHotwordGroup"
+          },
+          "maxItems": 10,
+          "type": "array"
+        },
+        "name": {
+          "description": "Category name surfaced in the mask token (`[<NAME>_REDACTED]`), telemetry counts, and audit records. Never the matched value. Must be unique within the guardrail.",
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        "negative_patterns": {
+          "default": [],
+          "description": "Regular expressions that are evidence AGAINST a candidate. Each pattern is tried against the candidate span itself, the text immediately before it, and the text immediately after it (anchor with `^` or `$` to pin the position); any match counts once and strongly lowers the span's score.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 20,
+          "type": "array"
+        },
+        "replacement": {
+          "description": "Literal text that replaces a masked span, such as `***`. When omitted, the span is rewritten to `[<NAME>_REDACTED]`. An empty string removes the span.",
+          "maxLength": 256,
+          "type": "string"
+        },
+        "threshold": {
+          "description": "Similarity threshold for the embedding judgement, in `[-1, 1]` (cosine similarity against the category description). Omitted → the calibrated default that ships with the bundled model. Raise it to mask less, lower it to mask more; pair tuning with `enforcement_mode: monitor` to preview the effect first.",
+          "format": "float",
+          "maximum": 1.0,
+          "minimum": -1.0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "description",
+        "name"
+      ],
+      "type": "object"
+    },
+    "SemanticHotwordGroup": {
+      "additionalProperties": false,
+      "description": "One hotword group for a semantic category. Terms in a group are lexical evidence for the category: a term found next to a candidate span raises the span's rule score, and each group contributes at most once per span. Group terms by the role they play (for example trigger words, tool names) rather than listing every term in one group.",
+      "properties": {
+        "terms": {
+          "description": "Literal terms. Terms containing CJK characters match as substrings; ASCII terms match on word boundaries, and may run directly into a digit (so a tool name fused to a version number still counts).",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 50,
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "terms"
+      ],
+      "type": "object"
     }
   },
   "description": "Content policy evaluated before or after upstream calls.",
@@ -1419,6 +1508,77 @@
       "required": [
         "analyzer_url",
         "anonymizer_url",
+        "kind"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "description": "Category-based semantic detection and redaction using a CPU embedding model bundled with the gateway. User-defined categories combine regex candidates, hotword evidence, and embedding similarity against a natural-language description; confirmed spans are masked in place. Rewrites only — never blocks. Applies on input, output, or both, including buffered streaming output. Requires the gateway's bundled model files; nodes without them do not serve this kind.",
+      "properties": {
+        "categories": {
+          "default": [],
+          "description": "The categories this guardrail detects. Categories are evaluated in order; each category rewrites the text the previous one produced.",
+          "items": {
+            "$ref": "#/definitions/SemanticCategory"
+          },
+          "maxItems": 30,
+          "minItems": 1,
+          "type": "array"
+        },
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": true,
+          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
+        },
+        "kind": {
+          "description": "Guardrail provider type for in-process semantic category detection and redaction using the bundled embedding model.",
+          "enum": [
+            "semantic"
+          ],
+          "type": "string"
+        },
+        "mandatory": {
+          "default": false,
+          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
+          "type": "boolean"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
         "kind"
       ],
       "type": "object"

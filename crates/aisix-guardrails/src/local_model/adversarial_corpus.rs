@@ -169,7 +169,7 @@ fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
 fn expected_output(case: &Case) -> String {
     let mut ranges = sensitive_ranges(case);
     ranges.sort_by_key(|r| r.start);
-    apply_masks(case.text, &ranges)
+    apply_masks(case.text, &ranges, "***")
 }
 
 /// Best 0/1 accuracy over all thresholds for `(score, is_positive)`
@@ -205,32 +205,36 @@ fn pct(part: usize, whole: usize) -> f64 {
 /// reproduce the real pipeline output) so the SAME test measures the
 /// before and after states without encoding either as a contract.
 #[tokio::test]
-#[ignore = "needs GUARDRAIL_LOCAL_MODEL_DIR with model.onnx + tokenizer.json"]
+#[ignore = "needs GUARDRAIL_LOCAL_MODEL_DIR with the model bundle"]
 async fn adversarial_corpus_report() {
-    let Some(cfg) = LocalModelConfig::from_env() else {
+    let Some(g) = super::tests::fixtures::model_guardrail() else {
         return;
     };
-    let g = LocalModelGuardrail::load(&cfg).expect("model files present but load failed");
+    let cat = &g.categories[0];
+    let prototype = g
+        .runtime
+        .prototype_for(&cat.description)
+        .await
+        .expect("description embeds");
 
     let mut n_candidates = 0usize;
     let (mut rule_masked, mut rule_passed, mut model_band) = (0usize, 0usize, 0usize);
     let (mut rule_masked_correct, mut rule_passed_correct) = (0usize, 0usize);
-    // Model-band scores in BOTH forms: `abs` — the old positive-only max
-    // cosine; `rel` — the shipped `max_pos − max_neg`. Same embeddings,
-    // so the comparison isolates the scoring FORM.
-    let mut model_items_abs: Vec<(f32, bool)> = Vec::new();
-    let mut model_items_rel: Vec<(f32, bool)> = Vec::new();
+    // Model-band scores under the v1 judgement form: absolute cosine
+    // against the description prototype. (The sample-set relative form
+    // is v2 material — its probe lives in `probe_similarity_matrix`.)
+    let mut model_items: Vec<(f32, bool)> = Vec::new();
     let (mut lines_correct, mut cand_correct) = (0usize, 0usize);
     let mut wrong_lines: Vec<(&str, String, String)> = Vec::new();
 
     for case in CORPUS {
         let labels = sensitive_ranges(case);
-        let spans = g.finder.spans(case.text);
+        let spans = cat.finder.spans(case.text);
         let mut hits: Vec<Range<usize>> = Vec::new();
         for span in spans {
             n_candidates += 1;
             let positive = labels.iter().any(|l| overlaps(l, &span));
-            let masked = match g.rules.decide(case.text, &span) {
+            let masked = match cat.rules.decide(case.text, &span) {
                 RuleDecision::Mask => {
                     rule_masked += 1;
                     rule_masked_correct += usize::from(positive);
@@ -245,11 +249,10 @@ async fn adversarial_corpus_report() {
                     model_band += 1;
                     let window =
                         case.text[window_bounds(case.text, &span, WINDOW_CONTEXT_CHARS)].to_owned();
-                    let v = g.embed_window(window).await.expect("embed failed");
-                    model_items_abs.push((max_cosine(&g.prototypes.positive, &v), positive));
-                    let score = g.prototypes.score(&v);
-                    model_items_rel.push((score, positive));
-                    score >= g.threshold
+                    let v = g.runtime.embed_text(window).await.expect("embed failed");
+                    let score = cosine(&prototype, &v);
+                    model_items.push((score, positive));
+                    score >= cat.threshold
                 }
             };
             cand_correct += usize::from(masked == positive);
@@ -260,7 +263,7 @@ async fn adversarial_corpus_report() {
         // Instrument consistency: the replication above must reproduce
         // the real pipeline byte for byte.
         hits.sort_by_key(|r| r.start);
-        let replicated = apply_masks(case.text, &hits);
+        let replicated = apply_masks(case.text, &hits, "***");
         let outcome = g.moderate_input_segments(&[case.text.to_owned()]).await;
         let actual = outcome
             .masked
@@ -301,38 +304,35 @@ async fn adversarial_corpus_report() {
         println!("  WRONG [{cat}] {text:?} -> {actual:?}");
     }
 
-    let n_pos = model_items_rel.iter().filter(|(_, p)| *p).count();
+    let n_pos = model_items.iter().filter(|(_, p)| *p).count();
     println!(
         "── model band: {} items ({} pos / {} neg)  shipped threshold {:.4}",
-        model_items_rel.len(),
+        model_items.len(),
         n_pos,
-        model_items_rel.len() - n_pos,
-        g.threshold,
+        model_items.len() - n_pos,
+        cat.threshold,
     );
-    for (name, items) in [("abs", &model_items_abs), ("rel", &model_items_rel)] {
-        let (acc, cut) = best_threshold_accuracy(items);
-        let min_pos = items
+    {
+        let (acc, cut) = best_threshold_accuracy(&model_items);
+        let min_pos = model_items
             .iter()
             .filter(|(_, p)| *p)
             .map(|(s, _)| *s)
             .fold(f32::INFINITY, f32::min);
-        let max_neg = items
+        let max_neg = model_items
             .iter()
             .filter(|(_, p)| !*p)
             .map(|(s, _)| *s)
             .fold(f32::NEG_INFINITY, f32::max);
         println!(
-            "  form {name}: margin (min pos − max neg) {:+.4}  best-threshold accuracy {:.1}% at {:.4}",
+            "  margin (min pos − max neg) {:+.4}  best-threshold accuracy {:.1}% at {:.4}",
             min_pos - max_neg,
             100.0 * acc,
             cut,
         );
     }
-    for ((abs, p), (rel, _)) in model_items_abs.iter().zip(&model_items_rel) {
-        println!(
-            "  {} abs {abs:.4} rel {rel:+.4}",
-            if *p { "POS" } else { "NEG" }
-        );
+    for (score, p) in &model_items {
+        println!("  {} score {score:.4}", if *p { "POS" } else { "NEG" });
     }
 
     // Quality floor, asserted LAST so a regression still prints the full
@@ -341,8 +341,7 @@ async fn adversarial_corpus_report() {
     // green). The rule layer must be EXACT on this corpus — a rule
     // decision never consults the model, so a wrong one is an
     // unconditional mis-rewrite (mask side) or a silent leak (pass
-    // side). The end-to-end floor allows exactly the two disclosed
-    // model-band misses.
+    // side).
     assert_eq!(
         rule_masked_correct, rule_masked,
         "rule-mask precision must stay 100% on the corpus"
@@ -351,9 +350,22 @@ async fn adversarial_corpus_report() {
         rule_passed_correct, rule_passed,
         "rule-pass must not release a labeled positive"
     );
-    assert!(
-        lines_correct >= CORPUS.len() - 2,
-        "line accuracy fell below the pinned floor: {lines_correct}/{}",
-        CORPUS.len()
+    // v1's model band judges absolute cosine against the description
+    // prototype (no sample set yet), which leans precision: it must
+    // never CORRUPT a negative line (a wrong mask rewrites user
+    // content), while anchor-free positives may release — that recall
+    // is exactly what the v2 sample sets buy back (the sweep measured
+    // the description form's margin negative on anchor-free windows).
+    let wrongly_masked = wrong_lines
+        .iter()
+        .filter(|(_, text, actual)| actual != text)
+        .count();
+    assert_eq!(
+        wrongly_masked, 0,
+        "the description-form model band must not mis-mask a negative: {wrong_lines:?}"
+    );
+    println!(
+        "missed (released) positive lines: {}",
+        wrong_lines.len() - wrongly_masked
     );
 }

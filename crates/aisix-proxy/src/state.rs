@@ -190,13 +190,6 @@ pub struct ProxyStateInner {
     pub health: Arc<HealthTracker>,
     /// Public liveness state served on `GET /livez`.
     pub livez: Arc<LivezState>,
-    /// Env-injected local CPU embedding-model guardrail (AISIX-Cloud#1331
-    /// MVP vertical slice). `None` (the default) = inactive. When present,
-    /// the chat handler composes it AFTER the per-request resolved chain:
-    /// it is deployment-wide experimental surface, not an
-    /// attachment-scoped guardrail row, and it only masks (never blocks).
-    /// MVP wiring covers `/v1/chat/completions` only.
-    pub local_model_guardrail: Option<Arc<dyn aisix_guardrails::Guardrail>>,
     /// Runtime model-status tracker keyed by resolved direct-model id.
     /// Used for request-path cooldown/background health exclusion and
     /// surfaced by `GET /admin/v1/models/status`.
@@ -272,8 +265,12 @@ const TEST_RATE_LIMIT_CLOCK_SECS: u64 = 1_763_000_000;
 impl ProxyState {
     pub fn new(snapshot: SnapshotHandle<AisixSnapshot>, hub: Arc<Hub>, cfg: &ProxyConfig) -> Self {
         let metrics = Arc::new(Metrics::new(false));
-        let guardrail_index =
-            LiveGuardrailIndex::new_with_sink(snapshot.clone(), None, Some(metrics.clone()));
+        let guardrail_index = LiveGuardrailIndex::new_with_sink(
+            snapshot.clone(),
+            None,
+            Some(metrics.clone()),
+            aisix_guardrails::SemanticRuntimeSlot::none(),
+        );
         // Unit tests get a frozen rate-limit clock: on the wall clock, any
         // "the next request 429s" assertion silently races the fixed-window
         // minute boundary — a test that straddles :00 lands its two requests
@@ -301,7 +298,6 @@ impl ProxyState {
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
-            local_model_guardrail: None,
             config_apply_age: None,
             runtime_status: Arc::new(ModelRuntimeStatusTracker::new()),
             usage_sink: UsageSink::disabled(),
@@ -330,8 +326,12 @@ impl ProxyState {
         cfg: &ProxyConfig,
     ) -> Self {
         let metrics = Arc::new(Metrics::new(false));
-        let guardrail_index =
-            LiveGuardrailIndex::new_with_sink(snapshot.clone(), None, Some(metrics.clone()));
+        let guardrail_index = LiveGuardrailIndex::new_with_sink(
+            snapshot.clone(),
+            None,
+            Some(metrics.clone()),
+            aisix_guardrails::SemanticRuntimeSlot::none(),
+        );
         Self::from_inner(ProxyStateInner {
             snapshot,
             hub,
@@ -344,7 +344,6 @@ impl ProxyState {
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
-            local_model_guardrail: None,
             config_apply_age: None,
             runtime_status: Arc::new(ModelRuntimeStatusTracker::new()),
             usage_sink: UsageSink::disabled(),
@@ -375,8 +374,12 @@ impl ProxyState {
         cache: Option<CacheBackends>,
         cfg: &ProxyConfig,
     ) -> Self {
-        let guardrail_index =
-            LiveGuardrailIndex::new_with_sink(snapshot.clone(), None, Some(metrics.clone()));
+        let guardrail_index = LiveGuardrailIndex::new_with_sink(
+            snapshot.clone(),
+            None,
+            Some(metrics.clone()),
+            aisix_guardrails::SemanticRuntimeSlot::none(),
+        );
         // The bootstrap constructor is the one place the tracker gets a
         // metrics sink + snapshot handle, so cooldown transitions emit
         // `aisix_deployment_*`. Clone both before they are moved into the
@@ -401,7 +404,6 @@ impl ProxyState {
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::with_flags(bookkeeping_flags)),
             livez: Arc::new(LivezState::new()),
-            local_model_guardrail: None,
             config_apply_age: None,
             runtime_status,
             usage_sink: UsageSink::disabled(),
@@ -439,20 +441,6 @@ impl ProxyState {
     /// deterministic one via `LiveGuardrailIndex::new(stub_handle, None)`.
     pub fn with_guardrail_index(mut self, index: Arc<LiveGuardrailIndex>) -> Self {
         Arc::make_mut(&mut self.inner).guardrail_index = index;
-        self
-    }
-
-    /// Inject the env-configured local-model guardrail (AISIX-Cloud#1331
-    /// MVP). Wired by the server bootstrap when
-    /// `GUARDRAIL_LOCAL_MODEL_DIR` is set on a binary built with the
-    /// `local-model-guardrail` feature (non-`AISIX_` prefix on purpose:
-    /// the config loader maps every `AISIX_*` env var onto a config
-    /// field and strictly rejects unknown ones).
-    pub fn with_local_model_guardrail(
-        mut self,
-        guardrail: Arc<dyn aisix_guardrails::Guardrail>,
-    ) -> Self {
-        Arc::make_mut(&mut self.inner).local_model_guardrail = Some(guardrail);
         self
     }
 

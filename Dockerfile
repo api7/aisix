@@ -130,6 +130,35 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         exit 2; \
     fi
 
+# --- Stage 1b: semantic guardrail model bundle -------------------------------
+# The semantic guardrail's embedding model (`kind: "semantic"`,
+# AISIX-Cloud#1363), fetched from the PINNED upstream revision and
+# verified file-by-file against the repo's manifest before it ships.
+# The manifest baked next to the files is the SAME document the gateway
+# re-verifies at boot, so a drifted download fails the image build here
+# — never the data plane. Runs in parallel with the Rust builder stage.
+#
+# Model: ibm-granite/granite-embedding-97m-multilingual-r2 (Apache-2.0),
+# official int8 ONNX export (`onnx/model_quint8_avx2.onnx`) + tokenizer.
+FROM debian:bookworm-slim AS guardrail-model
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /bundle
+COPY docker/guardrail-model.manifest.json manifest.json
+
+ARG GUARDRAIL_MODEL_BASE=https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2/resolve/835ad14087e140460703cf0fae09f97d469d65c2
+RUN set -eu; \
+    curl -fsSL --retry 3 -o model.onnx "$GUARDRAIL_MODEL_BASE/onnx/model_quint8_avx2.onnx"; \
+    curl -fsSL --retry 3 -o tokenizer.json "$GUARDRAIL_MODEL_BASE/tokenizer.json"; \
+    for f in model.onnx tokenizer.json; do \
+        want="$(sed -n 's/.*"'"$f"'": "sha256:\([0-9a-f]*\)".*/\1/p' manifest.json)"; \
+        [ -n "$want" ] || { echo "manifest carries no sha256 for $f" >&2; exit 2; }; \
+        echo "$want  $f" | sha256sum -c -; \
+    done
+
 # --- Stage 2: runtime --------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 
@@ -169,6 +198,14 @@ RUN --mount=type=bind,from=builder,source=/usr/local/bin/aisix,target=/mnt/aisix
        fi \
     && apt-get purge -y --auto-remove libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
+
+# Bake the verified semantic-guardrail model bundle at the path the
+# binary defaults to (`DEFAULT_MODEL_DIR`), so `kind: "semantic"` rows
+# work out of the box — no download, no import step. Boot re-verifies
+# the manifest; the model stays cold (no sessions, no memory) until a
+# semantic guardrail row exists. GUARDRAIL_LOCAL_MODEL_DIR overrides
+# the path for model upgrades without an image rebuild.
+COPY --from=guardrail-model /bundle /usr/local/aisix/guardrail-model
 
 # Bake the managed-mode bootstrap config so AISIX gateways managed by
 # AISIX Cloud can `docker run` without mounting a configuration file.

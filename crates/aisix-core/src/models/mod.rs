@@ -52,7 +52,7 @@ pub use guardrail::{
     GuardrailExecution, GuardrailHookPoint, GuardrailKind, GuardrailMetricsSink,
     GuardrailMonitorHit, GuardrailScopeType, KeywordConfig, KeywordPattern, LakeraConfig,
     OpenaiModerationConfig, PiiConfig, PiiCustomPattern, PiiDetectorConfig, PresidioConfig,
-    PresidioEntityConfig,
+    PresidioEntityConfig, SemanticCategory, SemanticConfig, SemanticHotwordGroup,
 };
 pub use mcp_auth_settings::McpAuthSettings;
 pub use mcp_policy::{McpAccess, McpPolicy, McpPolicyScope};

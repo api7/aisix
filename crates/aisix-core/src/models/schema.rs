@@ -1242,6 +1242,10 @@ pub fn guardrail_root_schema() -> Value {
             json!(["mask", "block"]),
         );
         set_definition_property_enum(defs, "PiiCustomPattern", "action", json!(["mask", "block"]));
+        // Semantic categories rewrite only — the `block` action does not
+        // exist for this kind, and the schema says so rather than letting
+        // a `block` value be accepted and half-honored (#963).
+        set_definition_property_enum(defs, "SemanticCategory", "action", json!(["mask"]));
         set_definition_property_enum(
             defs,
             "PresidioEntityConfig",
@@ -1472,6 +1476,9 @@ fn guardrail_kind_description(kind: &str) -> Option<&'static str> {
         "presidio" => {
             Some("Guardrail provider type for self-hosted Microsoft Presidio PII detection and anonymization.")
         }
+        "semantic" => Some(
+            "Guardrail provider type for in-process semantic category detection and redaction using the bundled embedding model.",
+        ),
         _ => None,
     }
 }

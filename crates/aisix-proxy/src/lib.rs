@@ -10144,35 +10144,17 @@ data: [DONE]\n\n";
         assert_masked_by_eda(&event, "output");
     }
 
-    /// Pitfall (2) of #1024, chat-only. When a local-model guardrail is
-    /// configured, `dispatch` re-wraps the resolved chain with
-    /// `GuardrailChain::new(vec![resolved, local])` — and `new` leaves the
-    /// OUTER chain's audit log unset. Reading the handle after that point
-    /// yields `None`, so every attachment-row hit on the chat path would
-    /// go unattributed while every sibling endpoint reported normally.
-    /// The handle is therefore taken from the attachment-resolved chain,
-    /// at the same line `applied()` is snapshotted.
+    /// Successor of the #1024 pitfall-(2) regression: the semantic
+    /// guardrail is an ordinary `kind: "semantic"` row on the standard
+    /// chain now (#1363) — no re-wrap exists to lose the audit handle —
+    /// and its enforced mask must be attributed to the ROW name with
+    /// per-category counts on the usage event, exactly like every other
+    /// kind. Runs the rule layer only (adjacent hotword → mask), so no
+    /// model files are needed; the test runtime's engine never loads.
+    #[cfg(feature = "local-model-guardrail")]
     #[tokio::test]
-    async fn chat_enforced_hits_survive_the_local_model_rewrap() {
+    async fn chat_enforced_hits_attribute_the_semantic_row() {
         use aisix_obs::UsageSink;
-
-        /// Stands in for the env-injected local-model guardrail: a member
-        /// that never blocks and never masks, present only to force the
-        /// re-wrap branch. Its own verdicts are irrelevant here — what is
-        /// under test is that wrapping does not lose the INNER chain's log.
-        struct InertLocalModel;
-        #[axum::async_trait]
-        impl aisix_guardrails::Guardrail for InertLocalModel {
-            fn name(&self) -> &'static str {
-                "local-model"
-            }
-            async fn check_input(
-                &self,
-                _req: &aisix_gateway::ChatFormat,
-            ) -> aisix_guardrails::GuardrailVerdict {
-                aisix_guardrails::GuardrailVerdict::Allow
-            }
-        }
 
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
@@ -10194,20 +10176,65 @@ data: [DONE]\n\n";
         let hub = Arc::new(Hub::new());
         hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
-        let state = build_state(snap, hub).with_local_model_guardrail(
-            Arc::new(InertLocalModel) as Arc<dyn aisix_guardrails::Guardrail>
+        let state = build_state(snap, hub);
+        seed_guardrail(
+            &state.snapshot,
+            "g-semantic",
+            r#"{
+                "name": "eda-semantic",
+                "kind": "semantic",
+                "hook_point": "both",
+                "categories": [{
+                    "name": "eda_version",
+                    "description": "EDA 软件的版本号",
+                    "candidate_patterns": ["\\d+(?:\\.\\d+)+"],
+                    "hotword_groups": [{"terms": ["version"]}],
+                    "replacement": "***"
+                }]
+            }"#,
         );
-        seed_guardrail(&state.snapshot, "g-mask", MASKING_GUARDRAIL);
-        let app = build_router(state.with_usage_sink(UsageSink::new(tx)));
+        // The state constructors carry no semantic runtime; rebuild the
+        // index with the modelless test runtime so the row compiles.
+        let index = aisix_guardrails::LiveGuardrailIndex::new_with_sink(
+            state.snapshot.clone(),
+            None,
+            None,
+            aisix_guardrails::SemanticRuntimeSlot::new(Arc::new(
+                aisix_guardrails::SemanticRuntime::for_tests_without_model(),
+            )),
+        );
+        let app = build_router(
+            state
+                .with_guardrail_index(index)
+                .with_usage_sink(UsageSink::new(tx)),
+        );
 
         let resp = run(app, chat_request("my-gpt4", false)).await;
         assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("***"), "the response was not masked: {body}");
+        assert!(!body.contains("9.9.9"), "the value leaked: {body}");
 
         let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
             .await
             .expect("usage event was never emitted")
             .expect("sender dropped without sending");
-        assert_masked_by_eda(&event, "output");
+        let hits = &event.guardrail_enforced_hits;
+        let hit = hits
+            .iter()
+            .find(|h| h.hook == "output")
+            .unwrap_or_else(|| panic!("no output-hook enforced hit in {hits:?}"));
+        assert_eq!(hit.guardrail_name, "eda-semantic");
+        assert_eq!(hit.action, "masked");
+        assert_eq!(hit.counts.get("eda_version").copied(), Some(1));
+        assert_eq!(
+            event.redacted_entity_counts.get("eda_version").copied(),
+            Some(1),
+            "{event:?}"
+        );
+        let wire = serde_json::to_string(&event).expect("event serialises");
+        assert!(!wire.contains("9.9.9"), "masked value reached the event");
     }
 
     /// The refusal path: a guardrail BLOCK leaves through `Err`, so the

@@ -408,7 +408,12 @@ async fn dispatch(
             .unwrap_or_default();
         let chat =
             aisix_gateway::ChatFormat::new("", vec![aisix_gateway::ChatMessage::user(args_text)]);
-        let (verdict, hits) = aisix_guardrails::Guardrail::check_input_observed(chain, &chat).await;
+        // Segment-moderating members (semantic, Bedrock ANONYMIZE) are
+        // consulted through the segment pass below instead — the same
+        // check/moderate split every LLM family uses, so a member is
+        // never consulted (or billed) twice per hook.
+        let (verdict, hits) =
+            aisix_guardrails::Guardrail::check_input_non_segment_observed(chain, &chat).await;
         monitor_hits.extend(hits);
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
@@ -511,7 +516,50 @@ async fn dispatch(
         }
         _ => bytes,
     };
-    // Post-mask by construction: cloned AFTER the write-back above, so a
+    // Async segment-moderation pass over the same `params.arguments`
+    // string leaves the sync write-back covers (#1363): semantic rows —
+    // and any other segment-moderating member — mask through here. The
+    // pass reuses the byte-splice walker, so the scan slots and the
+    // write-back slots are the same set by construction (no fourth text
+    // shape; the aisix#1027 scan/rewrite divergence is not widened).
+    let bytes = match &guardrail_chain {
+        Some(chain) if aisix_guardrails::Guardrail::moderates_segments(chain) => {
+            match moderate_tool_arguments(chain, &bytes, &mut monitor_hits, &mut redaction_counts)
+                .await
+            {
+                SegmentPassOutcome::Keep => bytes,
+                SegmentPassOutcome::Rewritten(rewritten) => {
+                    parts.headers.insert(
+                        axum::http::header::CONTENT_LENGTH,
+                        axum::http::HeaderValue::from(rewritten.len()),
+                    );
+                    axum::body::Bytes::from(rewritten)
+                }
+                SegmentPassOutcome::Block(guardrail_name) => {
+                    emit_tool_call_usage(
+                        state,
+                        &snapshot,
+                        &auth,
+                        request_id,
+                        &mcp_server,
+                        &mcp_tool,
+                        StatusCode::OK.as_u16(),
+                        Duration::ZERO,
+                        true,
+                        monitor_hits,
+                        redaction_counts,
+                        guardrail_chain.as_ref(),
+                        None,
+                        trace,
+                        /* dispatched */ false,
+                    );
+                    return jsonrpc_guardrail_block(rpc_id, "tool call", guardrail_name.as_deref());
+                }
+            }
+        }
+        _ => bytes,
+    };
+    // Post-mask by construction: cloned AFTER the write-backs above, so a
     // capturing exporter can never archive a value the mask removed
     // (same ordering rule as the LLM path — mask first, capture after).
     let captured_args = capture_cap.map(|_| bytes.clone());
@@ -656,20 +704,152 @@ fn rewrite_tool_arguments(
     body: &[u8],
 ) -> Result<Option<(Vec<u8>, crate::redact::RedactionCounts)>, crate::json_splice::SpliceError> {
     let mut counts = crate::redact::RedactionCounts::new();
-    let out = crate::json_splice::rewrite_string_values(
-        body,
-        |path| {
-            path.first().is_some_and(|s| s.is_key("params"))
-                && path.get(1).is_some_and(|s| s.is_key("arguments"))
-        },
-        |text| {
-            aisix_guardrails::Guardrail::redact_input_text(chain, text).map(|r| {
-                crate::redact::merge_counts(&mut counts, r.counts);
-                r.text
-            })
-        },
-    )?;
+    let out = crate::json_splice::rewrite_string_values(body, tool_argument_path, |text| {
+        aisix_guardrails::Guardrail::redact_input_text(chain, text).map(|r| {
+            crate::redact::merge_counts(&mut counts, r.counts);
+            r.text
+        })
+    })?;
     Ok(out.map(|bytes| (bytes, counts)))
+}
+
+/// Path predicate for the `params.arguments` string leaves — shared by
+/// the sync write-back and both walks of the segment pass, so the scan
+/// slots and the write-back slots can never drift.
+fn tool_argument_path(path: &[crate::json_splice::PathSeg]) -> bool {
+    path.first().is_some_and(|s| s.is_key("params"))
+        && path.get(1).is_some_and(|s| s.is_key("arguments"))
+}
+
+/// Path predicate for the tool-result surfaces:
+/// `result.content[i].{text,description,title}`,
+/// `result.content[i].resource.text`, and every string leaf under
+/// `result.structuredContent`. (`name`/`uri` stay untouched — they
+/// address a resource.)
+fn tool_result_path(path: &[crate::json_splice::PathSeg]) -> bool {
+    if !path.first().is_some_and(|s| s.is_key("result")) {
+        return false;
+    }
+    match path.get(1) {
+        Some(seg) if seg.is_key("structuredContent") => true,
+        Some(seg) if seg.is_key("content") => {
+            matches!(path.get(2), Some(crate::json_splice::PathSeg::Index(_)))
+                && ((path.len() == 4
+                    && (path[3].is_key("text")
+                        || path[3].is_key("description")
+                        || path[3].is_key("title")))
+                    || (path.len() == 5 && path[3].is_key("resource") && path[4].is_key("text")))
+        }
+        _ => false,
+    }
+}
+
+/// Outcome of one async segment-moderation pass over a JSON-RPC body.
+enum SegmentPassOutcome {
+    /// Nothing changed; keep the current bytes.
+    Keep,
+    /// Masked replacements were spliced in.
+    Rewritten(Vec<u8>),
+    /// A segment-moderating member blocked; the value is the firing
+    /// guardrail's name (`None` for a fail-closed walk failure).
+    Block(Option<String>),
+}
+
+/// Segment pass over the request's `params.arguments` string leaves.
+async fn moderate_tool_arguments(
+    chain: &aisix_guardrails::GuardrailChain,
+    body: &[u8],
+    monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
+    counts_out: &mut crate::redact::RedactionCounts,
+) -> SegmentPassOutcome {
+    moderate_selected_segments(
+        chain,
+        body,
+        tool_argument_path,
+        true,
+        monitor_hits,
+        counts_out,
+    )
+    .await
+}
+
+/// Run the chain's segment-moderating members (semantic rows, Bedrock
+/// ANONYMIZE) over the string leaves `pred` selects (#1363): collect
+/// the decoded slots with the same byte-splice walker the write-back
+/// uses, moderate them in ONE chain pass, and splice the positionally
+/// aligned masked texts back. Every byte outside a masked span reaches
+/// the peer verbatim.
+async fn moderate_selected_segments(
+    chain: &aisix_guardrails::GuardrailChain,
+    body: &[u8],
+    pred: fn(&[crate::json_splice::PathSeg]) -> bool,
+    input: bool,
+    monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
+    counts_out: &mut crate::redact::RedactionCounts,
+) -> SegmentPassOutcome {
+    // Collect: a rewrite walk that rewrites nothing.
+    let mut texts: Vec<String> = Vec::new();
+    if let Err(err) = crate::json_splice::rewrite_string_values(body, pred, |t| {
+        texts.push(t.to_owned());
+        None
+    }) {
+        // Structurally impossible (every caller's body already parsed as
+        // JSON) — fail closed rather than let content bypass the pass.
+        tracing::warn!(error = %err, "mcp segment collect walk failed; blocking");
+        return SegmentPassOutcome::Block(None);
+    }
+    if texts.is_empty() {
+        return SegmentPassOutcome::Keep;
+    }
+    let mut outcome = if input {
+        aisix_guardrails::Guardrail::moderate_input_segments(chain, &texts).await
+    } else {
+        aisix_guardrails::Guardrail::moderate_output_segments(chain, &texts).await
+    };
+    monitor_hits.append(&mut outcome.monitor_hits);
+    if let aisix_guardrails::GuardrailVerdict::Block {
+        reason,
+        guardrail_name,
+        ..
+    } = outcome.verdict
+    {
+        tracing::warn!(
+            guardrail_hook = if input { "input" } else { "output" },
+            reason = %reason,
+            "guardrail blocked MCP content in the segment pass"
+        );
+        return SegmentPassOutcome::Block(guardrail_name);
+    }
+    let Some(masked) = outcome.masked else {
+        return SegmentPassOutcome::Keep;
+    };
+    if masked.len() != texts.len() {
+        tracing::warn!(
+            offered = texts.len(),
+            masked = masked.len(),
+            "mcp segment mask drifted from the collect walk; keeping originals"
+        );
+        return SegmentPassOutcome::Keep;
+    }
+    let mut cursor = 0usize;
+    match crate::json_splice::rewrite_string_values(body, pred, |t| {
+        let i = cursor;
+        cursor += 1;
+        match masked.get(i) {
+            Some(m) if m != t => Some(m.clone()),
+            _ => None,
+        }
+    }) {
+        Ok(None) => SegmentPassOutcome::Keep,
+        Ok(Some(bytes)) => {
+            crate::redact::merge_counts(counts_out, outcome.counts);
+            SegmentPassOutcome::Rewritten(bytes)
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "mcp segment mask splice failed; blocking");
+            SegmentPassOutcome::Block(None)
+        }
+    }
 }
 
 /// The post-mask content-capture pair for a tool call: `prompt` is the
@@ -793,7 +973,9 @@ async fn apply_output_guardrails(
         finish_reason: aisix_gateway::FinishReason::Stop,
         usage: aisix_gateway::UsageStats::new(0, 0),
     };
-    let (verdict, hits) = aisix_guardrails::Guardrail::check_output_observed(chain, &resp).await;
+    // Segment-moderating members answer through the segment pass below.
+    let (verdict, hits) =
+        aisix_guardrails::Guardrail::check_output_non_segment_observed(chain, &resp).await;
     monitor_hits.extend(hits);
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
@@ -809,57 +991,58 @@ async fn apply_output_guardrails(
         );
         return ToolResultOutcome::Block(guardrail_name);
     }
-    // Mask write-back over the same surface the scan covers:
-    // `result.content[i].{text,description,title}`,
-    // `result.content[i].resource.text`, and every string leaf under
-    // `result.structuredContent`. (`name`/`uri` stay untouched — they
-    // address a resource; see the scan-loop comment.)
-    if !aisix_guardrails::Guardrail::redacts_output(chain) {
-        return ToolResultOutcome::Allow(None);
-    }
+    // Mask write-back over the same surface the scan covers
+    // (`tool_result_path`; `name`/`uri` stay untouched — they address a
+    // resource; see the scan-loop comment). Two write-back channels
+    // compose: the sync per-field redactors (kind=pii mask rules), then
+    // the async segment pass (semantic rows, Bedrock ANONYMIZE) over
+    // whatever the sync pass produced.
     let mut counts = crate::redact::RedactionCounts::new();
-    let rewritten = crate::json_splice::rewrite_string_values(
-        response_bytes,
-        |path| {
-            if !path.first().is_some_and(|s| s.is_key("result")) {
-                return false;
+    let mut current: Option<Vec<u8>> = None;
+    if aisix_guardrails::Guardrail::redacts_output(chain) {
+        let rewritten =
+            crate::json_splice::rewrite_string_values(response_bytes, tool_result_path, |text| {
+                aisix_guardrails::Guardrail::redact_output_text(chain, text).map(|r| {
+                    crate::redact::merge_counts(&mut counts, r.counts);
+                    r.text
+                })
+            });
+        match rewritten {
+            Ok(None) => {}
+            Ok(Some(bytes)) => current = Some(bytes),
+            Err(err) => {
+                // Structurally impossible (the body parsed above); fail
+                // closed rather than release a result the mask policy
+                // should rewrite.
+                tracing::warn!(
+                    tool = %tool,
+                    error = %err,
+                    "mcp output mask splice failed; blocking tool result",
+                );
+                return ToolResultOutcome::Block(None);
             }
-            match path.get(1) {
-                Some(seg) if seg.is_key("structuredContent") => true,
-                Some(seg) if seg.is_key("content") => {
-                    matches!(path.get(2), Some(crate::json_splice::PathSeg::Index(_)))
-                        && ((path.len() == 4
-                            && (path[3].is_key("text")
-                                || path[3].is_key("description")
-                                || path[3].is_key("title")))
-                            || (path.len() == 5
-                                && path[3].is_key("resource")
-                                && path[4].is_key("text")))
-                }
-                _ => false,
-            }
-        },
-        |text| {
-            aisix_guardrails::Guardrail::redact_output_text(chain, text).map(|r| {
-                crate::redact::merge_counts(&mut counts, r.counts);
-                r.text
-            })
-        },
-    );
-    match rewritten {
-        Ok(None) => ToolResultOutcome::Allow(None),
-        Ok(Some(bytes)) => ToolResultOutcome::Allow(Some((bytes, counts))),
-        Err(err) => {
-            // Structurally impossible (the body parsed above); fail closed
-            // rather than release a result the mask policy should rewrite.
-            tracing::warn!(
-                tool = %tool,
-                error = %err,
-                "mcp output mask splice failed; blocking tool result",
-            );
-            ToolResultOutcome::Block(None)
         }
     }
+    if aisix_guardrails::Guardrail::moderates_segments(chain) {
+        let body_now: &[u8] = current.as_deref().unwrap_or(response_bytes);
+        match moderate_selected_segments(
+            chain,
+            body_now,
+            tool_result_path,
+            false,
+            monitor_hits,
+            &mut counts,
+        )
+        .await
+        {
+            SegmentPassOutcome::Keep => {}
+            SegmentPassOutcome::Rewritten(bytes) => current = Some(bytes),
+            SegmentPassOutcome::Block(guardrail_name) => {
+                return ToolResultOutcome::Block(guardrail_name)
+            }
+        }
+    }
+    ToolResultOutcome::Allow(current.map(|bytes| (bytes, counts)))
 }
 
 /// Push every non-empty string leaf of `value` — walking objects and arrays —
