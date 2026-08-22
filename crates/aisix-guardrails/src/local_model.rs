@@ -631,6 +631,14 @@ impl SemanticRuntime {
         }
     }
 
+    /// Drive the engine load to completion. Spawned detached at chain
+    /// build time (see `build.rs`): the load happens when a semantic
+    /// row appears, and this task is the persistent awaiter that keeps
+    /// the `OnceCell` init alive when request-side awaiters give up.
+    pub async fn warm_engine(&self) {
+        let _ = self.engine().await;
+    }
+
     /// The lazily loaded engine; `None` after a failed initialization
     /// (capability flips to failed, heartbeat stops advertising).
     async fn engine(&self) -> Option<Arc<Engine>> {
@@ -696,8 +704,14 @@ impl SemanticRuntime {
     /// cancellations would pile threads up toward the pool cap (audit
     /// finding on PR #999).
     async fn embed_text(&self, text: String) -> Result<Vec<f32>, SemanticDegradeReason> {
-        let Some(engine) = self.engine().await else {
-            return Err(SemanticDegradeReason::EngineFailed);
+        // The engine wait is bounded like the lane wait: while the
+        // detached warm task is still loading the session, a request
+        // releases its span after 500ms instead of stalling on the
+        // multi-second disk-bound load.
+        let engine = match tokio::time::timeout(LANE_WAIT_TIMEOUT, self.engine()).await {
+            Ok(Some(engine)) => engine,
+            Ok(None) => return Err(SemanticDegradeReason::EngineFailed),
+            Err(_) => return Err(SemanticDegradeReason::QueueTimeout),
         };
         let permit = match tokio::time::timeout(
             LANE_WAIT_TIMEOUT,
@@ -735,7 +749,7 @@ impl SemanticRuntime {
         if let Some(hit) = self
             .prototype_cache
             .lock()
-            .expect("prototype cache poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(text)
             .cloned()
         {
@@ -744,7 +758,7 @@ impl SemanticRuntime {
         let vector = Arc::new(self.embed_text(text.to_owned()).await?);
         self.prototype_cache
             .lock()
-            .expect("prototype cache poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(text.to_owned(), Arc::clone(&vector));
         Ok(vector)
     }
@@ -764,11 +778,13 @@ impl CandidateFinder {
     }
 
     /// Candidate spans (byte ranges) in `text`, ascending and
-    /// non-overlapping. When spans from different patterns overlap the
-    /// LONGER one wins (a broader token pattern must beat the dotted run
-    /// inside it — masking only the digits of `ICADV12.3` leaks the
-    /// `ICADV` identity); ties break toward the earlier pattern. Spans
-    /// longer than [`MAX_CANDIDATE_SPAN_BYTES`] are not candidates.
+    /// non-overlapping. When spans overlap, the EARLIEST start wins and
+    /// the LONGER one wins at equal starts (a broader token pattern
+    /// starts at-or-before the dotted run inside it, so it beats the
+    /// inner span — masking only the digits of `ICADV12.3` would leak
+    /// the `ICADV` identity); ties break toward the earlier pattern.
+    /// Spans longer than [`MAX_CANDIDATE_SPAN_BYTES`] are not
+    /// candidates.
     fn spans(&self, text: &str) -> Vec<Range<usize>> {
         let mut all: Vec<Range<usize>> = Vec::new();
         for re in &self.patterns {
@@ -1016,14 +1032,19 @@ impl SemanticGuardrail {
                         }
                         continue;
                     }
+                    // Only a PERMANENT failure (engine unavailable) may
+                    // cache `None`; a transient one (queue timeout under
+                    // burst, a one-off inference error) leaves the cell
+                    // empty so the next model-band span retries the
+                    // ~ms-scale prototype embed instead of degrading the
+                    // category until restart.
                     let prototype = cat
                         .prototype
-                        .get_or_init(|| async {
+                        .get_or_try_init(|| async {
                             match self.runtime.prototype_for(&cat.description).await {
-                                Ok(v) => Some(v),
-                                Err(reason) => {
-                                    // Record the UNDERLYING cause (engine
-                                    // failed, queue timeout, …) — that is
+                                Ok(v) => Ok(Some(v)),
+                                Err(reason @ SemanticDegradeReason::EngineFailed) => {
+                                    // Record the UNDERLYING cause — that is
                                     // what the operator has to fix.
                                     self.runtime.record_degrade(reason);
                                     tracing::warn!(
@@ -1032,20 +1053,27 @@ impl SemanticGuardrail {
                                         "semantic guardrail: description prototype \
                                          unavailable; category degrades to rule layers"
                                     );
-                                    None
+                                    Ok(None)
                                 }
+                                Err(reason) => Err(reason),
                             }
                         })
-                        .await
-                        .clone();
-                    let Some(prototype) = prototype else {
-                        // Already-failed category: keep the ongoing signal
-                        // alive — every span that would have been judged is
-                        // one more degrade sample, not a one-off at failure
-                        // time.
-                        self.runtime
-                            .record_degrade(SemanticDegradeReason::PrototypeUnavailable);
-                        continue;
+                        .await;
+                    let prototype = match prototype {
+                        Ok(Some(prototype)) => Arc::clone(prototype),
+                        Ok(None) => {
+                            // Permanently-failed category: keep the ongoing
+                            // signal alive — every span that would have been
+                            // judged is one more degrade sample, not a
+                            // one-off at failure time.
+                            self.runtime
+                                .record_degrade(SemanticDegradeReason::PrototypeUnavailable);
+                            continue;
+                        }
+                        Err(reason) => {
+                            self.runtime.record_degrade(reason);
+                            continue;
+                        }
                     };
                     *budget -= 1;
                     let window = text[window_bounds(text, &span, WINDOW_CONTEXT_CHARS)].to_owned();

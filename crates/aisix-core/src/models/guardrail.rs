@@ -1345,6 +1345,42 @@ mod tests {
     }
 
     #[test]
+    fn semantic_kind_strict_schema_edges() {
+        let valid = json!({
+            "name": "sem",
+            "kind": "semantic",
+            "categories": [{
+                "name": "eda-version",
+                "description": "EDA tool version numbers",
+                "candidate_patterns": ["\\d+\\.\\d+"]
+            }]
+        });
+        assert!(crate::models::validate_guardrail(&valid).is_ok());
+
+        // `block` does not exist for this kind — pinned in the schema, not
+        // accepted-and-half-honored (#963).
+        let mut blocked = valid.clone();
+        blocked["categories"][0]["action"] = json!("block");
+        assert!(crate::models::validate_guardrail(&blocked).is_err());
+
+        // A category with no candidate patterns compiles to nothing and
+        // would skip the whole row DP-side; the schema must refuse it even
+        // when the property is ABSENT (serde default `[]` — `minItems`
+        // alone does not fire on a missing property). The requirement
+        // rides the shared producer, so the READ path rejects too — safe,
+        // because no strict writer can ever have stored such a row (the
+        // kind is new), and a hand-crafted one is better rejected
+        // RED-visible than silently skipped at category compile.
+        let mut missing = valid.clone();
+        missing["categories"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("candidate_patterns");
+        assert!(crate::models::validate_guardrail(&missing).is_err());
+        assert!(crate::models::validate_guardrail_lenient(&missing).is_err());
+    }
+
+    #[test]
     fn bedrock_kind_parses_with_serial_latency() {
         let v = json!({
             "name": "block-pii",

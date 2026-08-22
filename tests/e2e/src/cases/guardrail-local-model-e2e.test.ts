@@ -253,35 +253,50 @@ describe("local-model guardrail e2e: EDA version number masked on request and re
       await scrapeMetrics(app.metricsUrl),
       "aisix_guardrail_semantic_model_calls_total",
     );
-    const res = await new OpenAI({
+    const client = new OpenAI({
       apiKey: CALLER,
       baseURL: `${app.proxyUrl}/v1`,
       maxRetries: 0,
-    }).chat.completions.create({
-      model: "local-model-e2e-mixed",
-      messages: [{ role: "user", content: MIXED }],
     });
 
-    // Response side: versions masked, everything else — the compile-log
-    // numbers, the IP, the bare number the model judged — byte-identical.
-    expect(res.choices[0]?.message?.content).toBe(MIXED_MASKED);
+    // The engine loads detached when the semantic row first compiles, and
+    // a request only waits 500ms for it before releasing the span
+    // (fail-open). Drive the same request until a model call is counted:
+    // every iteration must already produce the full rewrite (the masked
+    // spans are rule-band; the model band only RELEASES here), and within
+    // the deadline one iteration rides the warmed engine.
+    const deadline = Date.now() + 30_000;
+    let after = before;
+    for (;;) {
+      const res = await client.chat.completions.create({
+        model: "local-model-e2e-mixed",
+        messages: [{ role: "user", content: MIXED }],
+      });
 
-    // Request side: the upstream saw the same rewrite and neither
-    // version value.
-    const lastReq = mixedUpstream.receivedRequests.at(-1);
-    expect(lastReq).toBeDefined();
-    expect(lastReq!.body).toContain(MIXED_MASKED);
-    expect(lastReq!.body).not.toContain("2022.4");
-    expect(lastReq!.body).not.toContain("6.1.8");
+      // Response side: versions masked, everything else — the compile-log
+      // numbers, the IP, the bare number the model judged — byte-identical.
+      expect(res.choices[0]?.message?.content).toBe(MIXED_MASKED);
+
+      // Request side: the upstream saw the same rewrite and neither
+      // version value.
+      const lastReq = mixedUpstream.receivedRequests.at(-1);
+      expect(lastReq).toBeDefined();
+      expect(lastReq!.body).toContain(MIXED_MASKED);
+      expect(lastReq!.body).not.toContain("2022.4");
+      expect(lastReq!.body).not.toContain("6.1.8");
+
+      after = sumMetric(
+        await scrapeMetrics(app.metricsUrl),
+        "aisix_guardrail_semantic_model_calls_total",
+      );
+      if (after > before || Date.now() > deadline) break;
+      await new Promise((r) => setTimeout(r, 500));
+    }
 
     // The bare number traversed a LIVE layer-③ inference, and the
     // model-call metric family counted it (the /metrics shipping rule —
     // this is the real-model half; the degrade half is asserted in the
     // kind suite).
-    const after = sumMetric(
-      await scrapeMetrics(app.metricsUrl),
-      "aisix_guardrail_semantic_model_calls_total",
-    );
     expect(after).toBeGreaterThan(before);
   });
 });

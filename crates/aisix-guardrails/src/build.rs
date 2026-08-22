@@ -480,6 +480,17 @@ fn build_one_inner(
                 row.hook_point,
             )
             .map_err(BuildError::SemanticCategory)?;
+            // Kick the engine load NOW, detached: creating a semantic row
+            // is the activation switch, so the multi-second session load
+            // happens at compile time — not on the first model-band
+            // request. Detached also means the load is uncancellable: a
+            // request-side awaiter that gives up (timeout, disconnect)
+            // abandons the OnceCell init, and without a persistent
+            // awaiter the next caller would start a SECOND load.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let rt = Arc::clone(runtime);
+                handle.spawn(async move { rt.warm_engine().await });
+            }
             Ok(Some(Arc::new(g)))
         }
         #[cfg(not(feature = "local-model"))]

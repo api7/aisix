@@ -17,7 +17,10 @@
 //!     evidence: +2 per group. Terms merely within the proximity window
 //!     are weak evidence: +1 total, regardless of group count — distant
 //!     co-occurrence alone must never mask, only route to the model.
-//!   - negative patterns LOWER the score: -4 per pattern. Each pattern
+//!   - negative patterns LOWER the score: -4 per pattern. (The MVP
+//!     scored -4 once per matched negative CLASS; counting per pattern
+//!     is a deliberate generalization — user categories have no class
+//!     grouping — pinned unchanged on the ported corpus.) Each pattern
 //!     is tried against the span itself (always), against the text
 //!     BEFORE the span when the pattern is `$`-anchored, and against the
 //!     text AFTER the span when it is `^`-anchored — the anchors pin the

@@ -314,7 +314,8 @@
       },
       "required": [
         "description",
-        "name"
+        "name",
+        "candidate_patterns"
       ],
       "type": "object"
     },

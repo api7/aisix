@@ -1246,6 +1246,14 @@ pub fn guardrail_root_schema() -> Value {
         // exist for this kind, and the schema says so rather than letting
         // a `block` value be accepted and half-honored (#963).
         set_definition_property_enum(defs, "SemanticCategory", "action", json!(["mask"]));
+        // The write path must see candidate patterns spelled out: the
+        // serde default is `[]`, and JSON Schema's `minItems` does not
+        // apply to an ABSENT property — without `required`, a category
+        // with no patterns validates strictly and then fails category
+        // compilation, silently skipping the whole row (#963 class).
+        if let Some(cat) = defs.get_mut("SemanticCategory") {
+            require_property(cat, "candidate_patterns");
+        }
         set_definition_property_enum(
             defs,
             "PresidioEntityConfig",
