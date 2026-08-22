@@ -37,6 +37,10 @@ import {
 //   - rewrite never blocks: HTTP 200, no JSON-RPC error, no `isError`;
 //   - the SOC export carries the POST-MASK content and the detector counts,
 //     never the raw values;
+//   - a value that is a REAL JSON field (`{"version": "12.1"}`) is offered to
+//     the rule with its field name attached, so a key-anchored rule fires —
+//     while same-shaped values under a field the rule does not name stay
+//     byte-identical (AISIX-Cloud#1330 case B);
 //   - Chinese and English label forms both rewrite.
 
 const KEY = "sk-mcp-writeback-e2e";
@@ -60,6 +64,16 @@ const ARG_MASKED = `${MARKER} build version: *** ${NEG} 工具版本：*** 完�
 const SUMMARY = `阶段汇总 版本：2022.4 用时 12.345s`;
 const LOG = `Compile OK version: 12.1\n${NEG}`;
 const STRUCT_LOG = `config {"version": "12.1"} ok`;
+
+// Real JSON fields (case B): the value alone is just a dotted number — only
+// the FIELD NAME says which one is a tool version. `elapsed`/`port` carry the
+// same shapes under names the rule does not cover and must survive verbatim.
+const STRUCT_FIELDS = {
+  version: "12.1",
+  版本: "2022.4",
+  elapsed: "12.345",
+  port: "10.2.255.1",
+};
 
 interface RpcReply {
   status: number;
@@ -167,8 +181,10 @@ describe("mcp mask write-back e2e: /mcp", () => {
             replacement: "***",
           },
           {
+            // Anchored on the FIELD NAME, en + zh: the shape an operator
+            // writes when the sensitive value is a real JSON field.
             name: "eda_version_json",
-            regex: '"version"\\s*:\\s*"([^"]*)"',
+            regex: '"(?:version|版本)"\\s*:\\s*"([^"]*)"',
             action: "mask",
             replacement: "***",
           },
@@ -192,7 +208,12 @@ describe("mcp mask write-back e2e: /mcp", () => {
     if (!etcdReachable) return;
 
     upstream = await startMcpUpstream("eda", {
-      reportContent: { summary: SUMMARY, log: LOG, structuredLog: STRUCT_LOG },
+      reportContent: {
+        summary: SUMMARY,
+        log: LOG,
+        structuredLog: STRUCT_LOG,
+        structuredFields: STRUCT_FIELDS,
+      },
     });
     sls = await startMockSls();
     appG = await spawnApp({
@@ -264,7 +285,9 @@ describe("mcp mask write-back e2e: /mcp", () => {
       baseline.body
         .replace("version: 12.1", "version: ***") // resource.text log line
         .replace("版本：2022.4", "版本：***") // summary text block
-        .replace('{\\"version\\": \\"12.1\\"}', '{\\"version\\": \\"***\\"}'), // structured leaf
+        .replace('{\\"version\\": \\"12.1\\"}', '{\\"version\\": \\"***\\"}') // structured leaf
+        .replace('"version":"12.1"', '"version":"***"') // structured FIELD, en
+        .replace('"版本":"2022.4"', '"版本":"***"'), // structured FIELD, zh
     );
     expect(guarded.body).not.toContain("12.1");
     expect(guarded.body).not.toContain("2022.4");
@@ -278,7 +301,67 @@ describe("mcp mask write-back e2e: /mcp", () => {
     expect(result?.structuredContent).toEqual({
       log: 'config {"version": "***"} ok',
       cells: 42,
+      // Case B: the field name is what made these two masked...
+      version: "***",
+      版本: "***",
+      // ...and what left these two alone.
+      elapsed: "12.345",
+      port: "10.2.255.1",
     });
+  });
+
+  test("structured field: the field NAME decides — same-shaped values under other names are untouched", async (ctx) => {
+    if (!etcdReachable || !appG) return ctx.skip();
+
+    // AISIX-Cloud#1330 case B. A leaf-by-leaf rewrite hands the rule the bare
+    // value `12.1`, which is indistinguishable from `12.345` or `10.2.255.1`:
+    // a key-anchored rule can never match and the value ships unmasked with no
+    // signal at all. Offering `"version": "12.1"` restores the discriminator —
+    // and the negatives below are the proof it discriminates rather than just
+    // masking more.
+    const guarded = await callTool(appG, "eda__report", { text: "go" });
+    expect(guarded.status).toBe(200);
+    expect(guarded.json?.error).toBeUndefined();
+    expect(guarded.json?.result?.isError).toBeFalsy();
+
+    const structured = guarded.json?.result?.structuredContent ?? {};
+    expect(structured.version).toBe("***");
+    expect(structured["版本"]).toBe("***");
+    // Zero hits: same dotted-number shapes, field names the rule never named.
+    expect(structured.elapsed).toBe("12.345");
+    expect(structured.port).toBe("10.2.255.1");
+    // A non-string leaf is out of scope by design and stays a number.
+    expect(structured.cells).toBe(42);
+  });
+
+  test("request: a structured tool argument reaches the upstream masked by field name", async (ctx) => {
+    if (!etcdReachable || !appG || !appP || !upstream) return ctx.skip();
+
+    const before = upstream.received.length;
+    // The same fields, this time as `tools/call` arguments.
+    const guarded = await callTool(appG, "eda__echo", STRUCT_FIELDS);
+    const baseline = await callTool(appP, "eda__echo", STRUCT_FIELDS);
+    expect(guarded.status).toBe(200);
+    expect(baseline.status).toBe(200);
+
+    const calls = upstream.received
+      .slice(before)
+      .filter((b) => b.includes('"tools/call"'));
+    expect(calls).toHaveLength(2);
+    const [guardedRaw, baselineRaw] = calls;
+    // The upstream saw the version fields masked and nothing else changed.
+    expect(stripIds(guardedRaw)).toBe(
+      stripIds(baselineRaw)
+        .replace('"version":"12.1"', '"version":"***"')
+        .replace('"版本":"2022.4"', '"版本":"***"'),
+    );
+    expect(guardedRaw).toContain('"version":"***"');
+    expect(guardedRaw).toContain('"版本":"***"');
+    expect(guardedRaw).not.toContain("12.1");
+    expect(guardedRaw).not.toContain("2022.4");
+    // The negatives reached the upstream verbatim.
+    expect(guardedRaw).toContain('"elapsed":"12.345"');
+    expect(guardedRaw).toContain('"port":"10.2.255.1"');
   });
 
   test("SOC export: captured content is the post-mask text with detector counts, never the raw values", async (ctx) => {
@@ -351,8 +434,16 @@ describe("mcp mask write-back e2e: /mcp", () => {
     for (const hit of hits) {
       expect(hit.action).toBe("masked");
       expect(["input", "output"]).toContain(hit.hook);
-      // Names and counts only — the matched value is never carried.
-      expect(Object.keys(hit.counts ?? {})).toContain("eda_version");
+      // Names and counts only — the matched value is never carried. Which
+      // detector fired depends on the shape that request carried (prose vs
+      // a real JSON field), so pin the SET the names may come from rather
+      // than one name: an unexpected key here is a leak, an empty map means
+      // the counts never rode the event.
+      const detectors = Object.keys(hit.counts ?? {});
+      expect(detectors.length).toBeGreaterThan(0);
+      for (const detector of detectors) {
+        expect(["eda_version", "eda_version_json"]).toContain(detector);
+      }
       expect(JSON.stringify(hit)).not.toContain("12.1");
       expect(JSON.stringify(hit)).not.toContain("2022.4");
     }

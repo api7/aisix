@@ -532,6 +532,18 @@ pub trait Guardrail: Send + Sync + 'static {
         None
     }
 
+    /// `true` when this redactor consumes the offered texts POSITIONALLY —
+    /// it pairs slot *i* of one walk over a body with slot *i* of the next,
+    /// rather than deciding each text on its own content. A wire walker must
+    /// then offer every text exactly once and exactly as it stands: no repeat
+    /// call, no context synthesized around a value, or the two walks stop
+    /// lining up and masks land on the wrong fields. Only the collect/apply
+    /// probes of the segment-moderation bridge set this; a real guardrail
+    /// redacts each text independently and leaves it `false`.
+    fn redacts_positionally(&self) -> bool {
+        false
+    }
+
     // --- remote segment moderation (#932 bedrock follow-up) ---------------
     //
     // A remote-API guardrail that can MASK (Bedrock PII anonymize) can't

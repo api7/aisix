@@ -650,6 +650,11 @@ async fn dispatch(
 /// Splice-rewrite the string leaves under `params.arguments` of a
 /// `tools/call` body through the chain's input redactor (AISIX-Cloud#1330).
 /// `Ok(None)` = nothing masked, keep the original bytes.
+///
+/// The keys under `arguments` are the TOOL's own input schema, so each
+/// member is offered to the redactor with its key as context — a rule
+/// anchored on the field name fires on `{"version": "12.1"}` exactly as it
+/// does on a document embedded in prose (`redact_with_key_context`).
 fn rewrite_tool_arguments(
     chain: &aisix_guardrails::GuardrailChain,
     body: &[u8],
@@ -661,8 +666,16 @@ fn rewrite_tool_arguments(
             path.first().is_some_and(|s| s.is_key("params"))
                 && path.get(1).is_some_and(|s| s.is_key("arguments"))
         },
-        |text| {
-            aisix_guardrails::Guardrail::redact_input_text(chain, text).map(|r| {
+        |path, text| {
+            // Only members INSIDE `arguments` carry a tool-defined key;
+            // `arguments` itself is the envelope's name.
+            let key = (path.len() > 2)
+                .then(|| crate::json_splice::member_key(path))
+                .flatten();
+            crate::redact::redact_with_key_context(key, text, |t| {
+                aisix_guardrails::Guardrail::redact_input_text(chain, t)
+            })
+            .map(|r| {
                 crate::redact::merge_counts(&mut counts, r.counts);
                 r.text
             })
@@ -837,8 +850,22 @@ async fn apply_output_guardrails(
                 _ => false,
             }
         },
-        |text| {
-            aisix_guardrails::Guardrail::redact_output_text(chain, text).map(|r| {
+        |path, text| {
+            // Key context only where the keys are the TOOL's output schema.
+            // Under `structuredContent` the field name is the tool's own
+            // (`{"version": "12.1"}`), so it is handed to the rule; a content
+            // block's `text`/`description`/`title`/`resource.text` are MCP
+            // envelope names, and synthesizing `"text": "…"` around a prose
+            // block would reintroduce exactly the envelope-name false
+            // positives the scan path decodes the blocks to avoid.
+            let key = (path.len() > 2
+                && path.get(1).is_some_and(|s| s.is_key("structuredContent")))
+            .then(|| crate::json_splice::member_key(path))
+            .flatten();
+            crate::redact::redact_with_key_context(key, text, |t| {
+                aisix_guardrails::Guardrail::redact_output_text(chain, t)
+            })
+            .map(|r| {
                 crate::redact::merge_counts(&mut counts, r.counts);
                 r.text
             })
@@ -2125,6 +2152,116 @@ mod tests {
         // No hit → no allocation, original bytes forwarded.
         let clean = br#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"eda__echo","arguments":{"text":"Elapsed: 12.345s"}}}"#;
         assert!(rewrite_tool_arguments(&chain, clean).unwrap().is_none());
+    }
+
+    /// A mask guard whose rule is anchored on the FIELD NAME — the shape an
+    /// operator writes when the sensitive value is a real JSON field rather
+    /// than a number embedded in prose (AISIX-Cloud#1330 case B).
+    fn pii_json_key_guard(hook: &str) -> String {
+        format!(
+            r#"{{"name":"pii-key","kind":"pii","hook_point":"{hook}","custom_patterns":[{{"name":"eda_version_json","regex":"\"(?:version|版本)\"\\s*:\\s*\"([^\"]*)\"","action":"mask","replacement":"***"}}]}}"#,
+        )
+    }
+
+    /// AISIX-Cloud#1330 case B: when the sensitive value IS a JSON field, a
+    /// leaf-by-leaf rewrite hands the rule a bare `12.1` and the key-anchored
+    /// rule can never fire — the value ships unmasked with no signal. Offering
+    /// each `structuredContent` member as `"key": "value"` makes it fire, and
+    /// the discrimination is the point: same-shaped values under a field the
+    /// rule does not name survive byte-for-byte.
+    #[tokio::test]
+    async fn output_mask_reads_the_field_name_of_a_structured_value() {
+        let chain = env_chain_with(&pii_json_key_guard("output"));
+        let body = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"report ready"}],"#,
+            r#""structuredContent":{"version": "12.1","版本":"2022.4","elapsed":"12.345","#,
+            r#""port":"10.2.255.1","run":{"version":"9.0"},"tags":["12.1"],"cells": 1e3}}}"#,
+        );
+        let out = match apply_output_guardrails(&chain, body.as_bytes(), "report", &mut Vec::new())
+            .await
+        {
+            ToolResultOutcome::Allow(Some((bytes, counts))) => {
+                assert_eq!(counts.get("eda_version_json"), Some(&3));
+                String::from_utf8(bytes).unwrap()
+            }
+            _ => panic!("expected a rewritten Allow"),
+        };
+        assert_eq!(
+            out,
+            concat!(
+                r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"report ready"}],"#,
+                // en + zh field names hit; `elapsed`/`port` carry the same
+                // shapes under a different name and are untouched; a nested
+                // member takes its own key; an array element has no key and
+                // keeps plain-leaf behaviour; the number spelling survives.
+                r#""structuredContent":{"version": "***","版本":"***","elapsed":"12.345","#,
+                r#""port":"10.2.255.1","run":{"version":"***"},"tags":["12.1"],"cells": 1e3}}}"#,
+            ),
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["result"]["structuredContent"]["cells"], 1000.0);
+    }
+
+    /// The MCP envelope's own field names are NOT synthesized as context. The
+    /// scan path decodes the content blocks precisely so `content`/`type`/
+    /// `text` can't trip a rule; wrapping a prose block back up as
+    /// `"text": "…"` would reintroduce exactly that false positive. Only the
+    /// tool's own `structuredContent` keys are its data.
+    #[tokio::test]
+    async fn envelope_field_names_are_not_offered_as_key_context() {
+        let chain = env_chain_with(
+            r#"{"name":"pii-key","kind":"pii","hook_point":"output","custom_patterns":[{"name":"any_text","regex":"\"text\"\\s*:\\s*\"([^\"]*)\"","action":"mask","replacement":"***"}]}"#,
+        );
+        let body = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"harmless prose"},"#,
+            r#"{"type":"resource","resource":{"uri":"file:///a.log","text":"log line"}}],"#,
+            r#""structuredContent":{"text":"tool field"}}}"#,
+        );
+        match apply_output_guardrails(&chain, body.as_bytes(), "report", &mut Vec::new()).await {
+            ToolResultOutcome::Allow(Some((bytes, _))) => assert_eq!(
+                String::from_utf8(bytes).unwrap(),
+                concat!(
+                    // The two envelope-named blocks are untouched...
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"harmless prose"},"#,
+                    r#"{"type":"resource","resource":{"uri":"file:///a.log","text":"log line"}}],"#,
+                    // ...only the tool's own field is offered with its key.
+                    r#""structuredContent":{"text":"***"}}}"#,
+                ),
+            ),
+            _ => panic!("expected a rewritten Allow"),
+        }
+    }
+
+    /// Request direction, same contract: a tool argument that IS a JSON field
+    /// reaches the rule with its name attached, so the upstream receives the
+    /// masked value; a same-shaped argument under another name does not.
+    #[test]
+    fn input_mask_reads_the_field_name_of_a_tool_argument() {
+        let chain = env_chain_with(&pii_json_key_guard("input"));
+        let body = concat!(
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"eda__run","#,
+            r#""arguments":{"version":"12.1","版本":"2022.4","elapsed":"12.345"}}}"#,
+        );
+        let (bytes, counts) = rewrite_tool_arguments(&chain, body.as_bytes())
+            .unwrap()
+            .expect("a hit rewrites");
+        assert_eq!(counts.get("eda_version_json"), Some(&2));
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            concat!(
+                // `params.name` is outside `arguments` and never offered.
+                r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"eda__run","#,
+                r#""arguments":{"version":"***","版本":"***","elapsed":"12.345"}}}"#,
+            ),
+        );
+        // Nothing but same-shaped negatives → no rewrite, original bytes.
+        let clean = concat!(
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"eda__run","#,
+            r#""arguments":{"elapsed":"12.345","port":"10.2.255.1"}}}"#,
+        );
+        assert!(rewrite_tool_arguments(&chain, clean.as_bytes())
+            .unwrap()
+            .is_none());
     }
 
     /// AISIX-Cloud#1330 audit chain: a mask that actually fired names the

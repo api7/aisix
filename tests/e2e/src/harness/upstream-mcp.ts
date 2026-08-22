@@ -38,8 +38,18 @@ export interface McpUpstreamOptions {
    * `log` as `resource.text` (the natural shape for a compile/sim log),
    * and a `structuredContent` object with a `log` string leaf plus a
    * numeric field. The mask write-back suite owns the strings.
+   *
+   * `structuredFields` are merged into `structuredContent` as further
+   * members — the shape where the sensitive value is a real JSON field
+   * (`{"version": "12.1"}`) rather than a number inside prose, so the
+   * field NAME is the only thing telling a rule what the value is.
    */
-  reportContent?: { summary: string; log: string; structuredLog: string };
+  reportContent?: {
+    summary: string;
+    log: string;
+    structuredLog: string;
+    structuredFields?: Record<string, string | number>;
+  };
 }
 
 /**
@@ -147,7 +157,8 @@ async function handle(
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const text = String(request.params.arguments?.text ?? "");
       if (request.params.name === "report" && options.reportContent) {
-        const { summary, log, structuredLog } = options.reportContent;
+        const { summary, log, structuredLog, structuredFields } =
+          options.reportContent;
         return {
           content: [
             { type: "text", text: summary },
@@ -160,7 +171,11 @@ async function handle(
               },
             },
           ],
-          structuredContent: { log: structuredLog, cells: 42 },
+          structuredContent: {
+            log: structuredLog,
+            cells: 42,
+            ...(structuredFields ?? {}),
+          },
         };
       }
       if (request.params.name === "lookup") {

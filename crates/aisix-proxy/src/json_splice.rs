@@ -38,6 +38,15 @@ impl PathSeg {
     }
 }
 
+/// The object key the value at `path` is a member of; `None` for an array
+/// element or the document root, where there is no key to speak of.
+pub fn member_key(path: &[PathSeg]) -> Option<&str> {
+    match path.last() {
+        Some(PathSeg::Key(k)) => Some(k.as_str()),
+        _ => None,
+    }
+}
+
 /// Scanner failure. Carries no document content (the byte offset only),
 /// so an error can be logged without leaking the payload.
 #[derive(Debug, thiserror::Error)]
@@ -55,8 +64,10 @@ const MAX_DEPTH: usize = 256;
 /// leaving every other byte untouched.
 ///
 /// For each string VALUE (never a key) whose path satisfies the
-/// predicate, the decoded text is offered to `rewrite`; `Some(new)`
-/// replaces that value's bytes with the JSON encoding of `new`.
+/// predicate, the decoded text is offered to `rewrite` along with that
+/// path — so a caller can hand the leaf's object key to the rule that
+/// decides ([`member_key`]); `Some(new)` replaces that value's bytes with
+/// the JSON encoding of `new`.
 ///
 /// Returns `Ok(None)` when nothing changed (callers keep the original
 /// buffer — the no-hit case allocates nothing), `Ok(Some(bytes))` with
@@ -64,7 +75,7 @@ const MAX_DEPTH: usize = 256;
 pub fn rewrite_string_values(
     input: &[u8],
     mut should_rewrite: impl FnMut(&[PathSeg]) -> bool,
-    mut rewrite: impl FnMut(&str) -> Option<String>,
+    mut rewrite: impl FnMut(&[PathSeg], &str) -> Option<String>,
 ) -> Result<Option<Vec<u8>>, SpliceError> {
     enum Frame {
         Object,
@@ -153,7 +164,7 @@ pub fn rewrite_string_values(
                 let end = scan_string(pos)?;
                 if should_rewrite(&path) {
                     let decoded = decode_str(pos..end)?;
-                    if let Some(new) = rewrite(&decoded) {
+                    if let Some(new) = rewrite(&path, &decoded) {
                         // to_string of a String is infallible.
                         let encoded = serde_json::to_string(&new).map_err(|_| err(pos))?;
                         splices.push((pos..end, encoded));
@@ -246,8 +257,8 @@ pub fn rewrite_string_values(
 mod tests {
     use super::*;
 
-    fn rewrite_all(input: &str, f: impl FnMut(&str) -> Option<String>) -> Option<String> {
-        rewrite_string_values(input.as_bytes(), |_| true, f)
+    fn rewrite_all(input: &str, mut f: impl FnMut(&str) -> Option<String>) -> Option<String> {
+        rewrite_string_values(input.as_bytes(), |_| true, |_, s| f(s))
             .unwrap()
             .map(|b| String::from_utf8(b).unwrap())
     }
@@ -267,7 +278,7 @@ mod tests {
     #[test]
     fn no_change_returns_none() {
         let doc = r#"{"a": "x", "b": 2}"#;
-        assert!(rewrite_string_values(doc.as_bytes(), |_| true, |_| None)
+        assert!(rewrite_string_values(doc.as_bytes(), |_| true, |_, _| None)
             .unwrap()
             .is_none());
     }
@@ -283,7 +294,7 @@ mod tests {
                 paths.push(p.to_vec());
                 true
             },
-            |s| {
+            |_, s| {
                 offered.push(s.to_owned());
                 None
             },
@@ -301,6 +312,32 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_sees_the_member_key_of_each_leaf() {
+        // The key a leaf hangs off is what a key-anchored redaction rule
+        // needs; array elements and the root have none.
+        let doc = r#"{"version":"12.1","tags":["a"],"run":{"版本":"2022.4"}}"#;
+        let mut seen = Vec::new();
+        rewrite_string_values(
+            doc.as_bytes(),
+            |_| true,
+            |path, text| {
+                seen.push((member_key(path).map(str::to_owned), text.to_owned()));
+                None
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                (Some("version".to_owned()), "12.1".to_owned()),
+                (None, "a".to_owned()),
+                (Some("版本".to_owned()), "2022.4".to_owned()),
+            ],
+        );
+        assert_eq!(member_key(&[]), None);
+    }
+
+    #[test]
     fn array_indices_and_nesting_track_correctly() {
         let doc = r#"{"params":{"arguments":{"xs":["a",{"y":"b"},[],"c"],"n":7}},"id":"z"}"#;
         let mut seen = Vec::new();
@@ -310,7 +347,7 @@ mod tests {
                 p.first().is_some_and(|s| s.is_key("params"))
                     && p.get(1).is_some_and(|s| s.is_key("arguments"))
             },
-            |s| {
+            |_, s| {
                 seen.push(s.to_owned());
                 None
             },
@@ -328,7 +365,7 @@ mod tests {
         let out = rewrite_string_values(
             doc.as_bytes(),
             |p| p.first().is_some_and(|s| s.is_key("params")),
-            |s| (s == "hit").then(|| "X".to_string()),
+            |_, s| (s == "hit").then(|| "X".to_string()),
         )
         .unwrap()
         .unwrap();
@@ -375,7 +412,7 @@ mod tests {
             "null",
             r#""s""#,
         ] {
-            let got = rewrite_string_values(doc.as_bytes(), |_| true, |_| None).unwrap();
+            let got = rewrite_string_values(doc.as_bytes(), |_| true, |_, _| None).unwrap();
             assert!(got.is_none(), "{doc}");
         }
         // A bare root string IS a value and can be rewritten.
@@ -392,7 +429,7 @@ mod tests {
             r#"{'a':1}"#,
         ] {
             assert!(
-                rewrite_string_values(doc.as_bytes(), |_| true, |_| Some("m".into())).is_err(),
+                rewrite_string_values(doc.as_bytes(), |_| true, |_, _| Some("m".into())).is_err(),
                 "{doc}",
             );
         }
@@ -407,6 +444,6 @@ mod tests {
         for _ in 0..300 {
             doc.push(']');
         }
-        assert!(rewrite_string_values(doc.as_bytes(), |_| true, |_| None).is_err());
+        assert!(rewrite_string_values(doc.as_bytes(), |_| true, |_, _| None).is_err());
     }
 }
