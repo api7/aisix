@@ -761,9 +761,17 @@ impl MandatoryGuardrail {
                 // Carry the row name so downstream handlers can name the
                 // guardrail in the 422 envelope (#519 B.4b) — `block()` would
                 // drop it to `None` and surface an unnamed content-filter block.
+                //
+                // The `Bypass` reason IS the kind's bounded failure tag, so
+                // this conversion is the one place that knows, structurally,
+                // that the refusal is an outage rather than a policy
+                // decision — carry it (AISIX-Cloud#1365). Without it the
+                // audit trail reports a `mandatory` row's upstream outage
+                // exactly like a real content violation.
                 GuardrailVerdict::Block {
                     reason: format!("mandatory guardrail unavailable: {reason}"),
                     guardrail_name: Some(self.row_name.clone()),
+                    unavailable: Some(reason),
                 }
             }
             other => other,
@@ -1605,6 +1613,10 @@ mod tests {
             GuardrailVerdict::Block {
                 reason: "mandatory guardrail unavailable: upstream_unreachable".to_string(),
                 guardrail_name: Some("remote".to_string()),
+                // AISIX-Cloud#1365: a mandatory row's Bypass→Block is an
+                // availability failure by construction, so the bypass tag
+                // survives the conversion.
+                unavailable: Some("upstream_unreachable".to_string()),
             },
             "mandatory input Bypass must become a named Block, got {vin:?}",
         );
@@ -1614,6 +1626,10 @@ mod tests {
             GuardrailVerdict::Block {
                 reason: "mandatory guardrail unavailable: upstream_unreachable".to_string(),
                 guardrail_name: Some("remote".to_string()),
+                // AISIX-Cloud#1365: a mandatory row's Bypass→Block is an
+                // availability failure by construction, so the bypass tag
+                // survives the conversion.
+                unavailable: Some("upstream_unreachable".to_string()),
             },
             "mandatory output Bypass must become a named Block, got {vout:?}",
         );

@@ -869,11 +869,24 @@ pub struct GuardrailEnforcedHit {
     pub guardrail_name: String,
     /// Which side it fired on: `input` or `output`.
     pub hook: String,
-    /// What it did: `masked` (content was rewritten and the request
-    /// continued) or `blocked` (the request was refused).
+    /// What it did:
+    ///
+    /// - `masked` — content was rewritten and the request continued.
+    /// - `blocked` — the guardrail's content policy refused the request.
+    /// - `blocked_unavailable` — the guardrail could not evaluate the
+    ///   request and its configuration refuses what it cannot check
+    ///   (`fail_open: false`, or a mandatory rule). The request was
+    ///   refused because the check was unavailable, not because the
+    ///   content matched a policy.
     pub action: String,
+    /// Why the check was unavailable, on `blocked_unavailable` only: a
+    /// short, bounded cause such as `lakera_timeout` or
+    /// `presidio_5xx`. Empty for every other action.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error_type: String,
     /// detector/rule name → number of spans masked (`masked` only; empty
-    /// for `blocked`). Same key space as `redacted_entity_counts`.
+    /// for the two refusal actions). Same key space as
+    /// `redacted_entity_counts`.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub counts: std::collections::BTreeMap<String, u32>,
     /// Wall-clock time this guardrail spent on this hook, in

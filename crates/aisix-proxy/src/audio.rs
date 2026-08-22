@@ -124,6 +124,11 @@ pub async fn transcriptions(
     // reused by the emits below (#941) — see the note on its signature.
     let mut snapshot = None;
 
+    // See `embeddings`: filled inside `multipart_dispatch` so the failure
+    // branch — where a guardrail block lands — stamps the enforced hits
+    // too (AISIX-Cloud#1330 / #1024).
+    let mut audit = crate::usage_attr::GuardrailAudit::default();
+
     match multipart_dispatch(
         &state,
         &mut snapshot,
@@ -134,6 +139,7 @@ pub async fn transcriptions(
         "/audio/transcriptions",
         &request_id,
         &client,
+        &mut audit,
     )
     .await
     {
@@ -182,6 +188,7 @@ pub async fn transcriptions(
                     status,
                     elapsed,
                     &client,
+                    &audit,
                 );
             }
             success.response
@@ -235,6 +242,7 @@ pub async fn transcriptions(
                 status,
                 err.kind(),
                 &client,
+                crate::usage_attr::enforced_hits(&audit),
             );
             err.into_response()
         }
@@ -276,6 +284,11 @@ pub async fn translations(
     // reused by the emits below (#941) — see the note on its signature.
     let mut snapshot = None;
 
+    // See `embeddings`: filled inside `multipart_dispatch` so the failure
+    // branch — where a guardrail block lands — stamps the enforced hits
+    // too (AISIX-Cloud#1330 / #1024).
+    let mut audit = crate::usage_attr::GuardrailAudit::default();
+
     match multipart_dispatch(
         &state,
         &mut snapshot,
@@ -286,6 +299,7 @@ pub async fn translations(
         "/audio/translations",
         &request_id,
         &client,
+        &mut audit,
     )
     .await
     {
@@ -334,6 +348,7 @@ pub async fn translations(
                     status,
                     elapsed,
                     &client,
+                    &audit,
                 );
             }
             success.response
@@ -386,6 +401,7 @@ pub async fn translations(
                 status,
                 err.kind(),
                 &client,
+                crate::usage_attr::enforced_hits(&audit),
             );
             err.into_response()
         }
@@ -432,7 +448,21 @@ pub async fn speech(
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
 
-    match speech_dispatch(&state, &snapshot, &auth, body, &request_id, &client).await {
+    // See `embeddings`: filled inside `speech_dispatch` so the failure
+    // branch — where a guardrail block lands — stamps the enforced hits
+    // too (AISIX-Cloud#1330 / #1024).
+    let mut audit = crate::usage_attr::GuardrailAudit::default();
+    match speech_dispatch(
+        &state,
+        &snapshot,
+        &auth,
+        body,
+        &request_id,
+        &client,
+        &mut audit,
+    )
+    .await
+    {
         Ok(success) => {
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
@@ -493,6 +523,7 @@ pub async fn speech(
                 success.monitor_hits,
                 /* guardrail_blocked */ false,
                 success.captured_content.as_ref(),
+                &audit,
             );
             success.response
         }
@@ -538,6 +569,7 @@ pub async fn speech(
                 status,
                 err.kind(),
                 &client,
+                crate::usage_attr::enforced_hits(&audit),
             );
             err.into_response()
         }
@@ -772,6 +804,7 @@ fn observe_transcript_events(
 
 /// Collect all multipart fields, resolve the model, swap in the upstream
 /// model id, then rebuild and forward the multipart form.
+#[allow(clippy::too_many_arguments)]
 async fn multipart_dispatch(
     state: &ProxyState,
     // Out-param, not an input: the snapshot is loaded HERE, once the
@@ -786,6 +819,7 @@ async fn multipart_dispatch(
     upstream_path: &str,
     request_id: &str,
     client_ctx: &ClientContext,
+    audit_out: &mut crate::usage_attr::GuardrailAudit,
 ) -> Result<AudioDispatchSuccess, ProxyError> {
     // The request clock for the streamed relay's end-of-stream emit
     // (#998): the handler has long returned by the time it fires, so it
@@ -864,6 +898,7 @@ async fn multipart_dispatch(
     };
     let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
     let applied_guardrails = resolved_chain.applied().to_vec();
+    *audit_out = resolved_chain.audit_log();
 
     // #998: relay the upstream SSE live, or hold it back to scan it?
     // An output guardrail that can block or mask has to see the whole
@@ -898,6 +933,7 @@ async fn multipart_dispatch(
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
+                ..
             } = verdict
             {
                 // Per #153 the matched-pattern detail stays in ops logs only.
@@ -1237,6 +1273,12 @@ async fn multipart_dispatch(
             let pk_id_c = pk_entry.id.to_string();
             let api_key_id_c = auth.entry.id.clone();
             let applied_c = applied_guardrails.clone();
+            // The chain itself does not survive into the relay closure, so
+            // clone the audit handle here — the same line `applied` is
+            // snapshotted — and read it at end-of-stream. Without this the
+            // held-back relay's output-hook mask is recorded and then
+            // dropped (AISIX-Cloud#1330 / #1024).
+            let audit_c = audit_out.clone();
             let redactions_c = redactions.clone();
             let input_monitor_hits = monitor_hits.clone();
             let client_c = client_ctx.clone();
@@ -1296,6 +1338,7 @@ async fn multipart_dispatch(
                         monitor_hits,
                         /* guardrail_blocked */ false,
                         captured_content.as_ref(),
+                        &audit_c,
                     );
                 },
             );
@@ -1386,6 +1429,7 @@ async fn multipart_dispatch(
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
+                ..
             } = verdict
             {
                 // Per #153 the matched-pattern detail stays in ops logs only.
@@ -1525,6 +1569,7 @@ async fn speech_dispatch(
     mut body: Value,
     request_id: &str,
     client_ctx: &ClientContext,
+    audit_out: &mut crate::usage_attr::GuardrailAudit,
 ) -> Result<SpeechDispatchSuccess, ProxyError> {
     let model_name = body
         .get("model")
@@ -1559,6 +1604,7 @@ async fn speech_dispatch(
     // Record which guardrails govern this request (#379 parity) for the emitted
     // UsageEvent. Empty when none attached.
     let applied_guardrails = resolved_chain.applied().to_vec();
+    *audit_out = resolved_chain.audit_log();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     if !resolved_chain.is_empty() {
         let chat = speech_input_to_chat(&model_name, &body);
@@ -1568,6 +1614,7 @@ async fn speech_dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
+            ..
         } = verdict
         {
             // Per #153 the matched-pattern detail stays in ops logs only.
@@ -1934,6 +1981,7 @@ fn emit_audio_usage(
     status: u16,
     elapsed: Duration,
     client: &ClientContext,
+    audit: &crate::usage_attr::GuardrailAudit,
 ) {
     let (prompt_tokens, completion_tokens) = success.usage.unwrap_or((0, 0));
     emit_usage_event(
@@ -1958,6 +2006,7 @@ fn emit_audio_usage(
         success.monitor_hits.clone(),
         success.guardrail_blocked,
         success.captured_content.as_ref(),
+        audit,
     );
 }
 
@@ -2003,6 +2052,11 @@ fn emit_usage_event(
     // Captured request/response content (#700). Forwarded only to `fan_out`,
     // never to the CP sink.
     content: Option<&CapturedContent>,
+    // The request's enforced-guardrail audit handle (AISIX-Cloud#1330).
+    // Cloned into the streaming closure at the same point `applied` is,
+    // so the held-back relay's end-of-stream emit reports the output-hook
+    // mask that ran after the handler frame was already gone.
+    audit: &crate::usage_attr::GuardrailAudit,
 ) {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -2025,6 +2079,7 @@ fn emit_usage_event(
         redacted_entity_counts,
         guardrail_monitor_hits,
         guardrail_blocked,
+        guardrail_enforced_hits: crate::usage_attr::enforced_hits(audit),
         ..Default::default()
     };
     // Per-PK telemetry attribution, same lookup as chat / messages /
@@ -3688,4 +3743,39 @@ mod tests {
         assert!(event.guardrail_blocked, "event must be marked blocked");
         assert_eq!((event.prompt_tokens, event.completion_tokens), (21, 7));
     }
+
+    /// AISIX-Cloud#1330 / #1024: a guardrail BLOCK leaves this handler
+    /// through `Err`, so the terminal usage event is the shared
+    /// zero-token error event. That branch is the one an auditor reads —
+    /// "which policy refused this request" — and a drain wired only into
+    /// the success path misses it silently.
+    #[tokio::test]
+    async fn blocked_request_names_the_policy_on_the_usage_event() {
+        let upstream = MockServer::start().await;
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(tts_model("my-tts"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            speech_req(r#"{"model":"my-tts","input":"say BLOCKME aloud","voice":"alloy"}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for the refusal")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].hook, "input");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "blocked");
+        let wire = serde_json::to_string(&ev).unwrap();
+        assert!(!wire.contains("BLOCKME"), "{wire}");
+    }
+
 }

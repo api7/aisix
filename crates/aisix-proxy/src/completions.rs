@@ -128,7 +128,21 @@ pub async fn completions(
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
 
-    match dispatch(&state, &snapshot, &auth, body, &request_id, &client).await {
+    // See `embeddings`: the handle is filled inside `dispatch` so the
+    // failure branch — where a guardrail block lands — stamps the enforced
+    // hits too (AISIX-Cloud#1330 / #1024).
+    let mut audit = crate::usage_attr::GuardrailAudit::default();
+    match dispatch(
+        &state,
+        &snapshot,
+        &auth,
+        body,
+        &request_id,
+        &client,
+        &mut audit,
+    )
+    .await
+    {
         Ok(success) => {
             let elapsed = started.elapsed();
             // Audit MEDIUM-2 on PR #426: use the actual response
@@ -192,6 +206,7 @@ pub async fn completions(
                     success.redactions.clone(),
                     success.monitor_hits.clone(),
                     success.captured_content.as_ref(),
+                    &audit,
                 );
             }
             success.response
@@ -237,6 +252,7 @@ pub async fn completions(
                 status,
                 err.kind(),
                 &client,
+                crate::usage_attr::enforced_hits(&audit),
             );
             err.into_response()
         }
@@ -271,6 +287,7 @@ async fn dispatch(
     mut body: Value,
     request_id: &str,
     client_ctx: &ClientContext,
+    audit_out: &mut crate::usage_attr::GuardrailAudit,
 ) -> Result<CompletionDispatchSuccess, ProxyError> {
     let model_name = body
         .get("model")
@@ -303,6 +320,7 @@ async fn dispatch(
         team_id: auth.key().team_id.as_deref(),
     };
     let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    *audit_out = resolved_chain.audit_log();
     let mut input_seg_counts = crate::redact::RedactionCounts::new();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     if !resolved_chain.is_empty() {
@@ -326,6 +344,7 @@ async fn dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
+            ..
         } = verdict
         {
             // Per #153 the matched-pattern detail stays in ops logs only.
@@ -492,6 +511,7 @@ async fn dispatch(
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
+                    ..
                 } = verdict
                 {
                     // Per #153 the matched-pattern detail stays in ops logs only.
@@ -701,6 +721,8 @@ fn emit_usage_event(
     // Captured request/response content for content-capturing exporters
     // (AISIX-Cloud#947). Forwarded only to `fan_out`, never to the CP sink.
     content: Option<&CapturedContent>,
+    // The request's enforced-guardrail audit handle (AISIX-Cloud#1330).
+    audit: &crate::usage_attr::GuardrailAudit,
 ) {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -725,6 +747,7 @@ fn emit_usage_event(
         guardrail_blocked,
         redacted_entity_counts,
         guardrail_monitor_hits,
+        guardrail_enforced_hits: crate::usage_attr::enforced_hits(audit),
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);
@@ -1568,4 +1591,49 @@ mod tests {
             "a 500 must mark the model in cooldown, got {status:?}"
         );
     }
+
+    /// AISIX-Cloud#1330 / #1024: a guardrail BLOCK leaves this handler
+    /// through `Err`, so the terminal usage event is the shared
+    /// zero-token error event. That branch is the one an auditor reads —
+    /// "which policy refused this request" — and a drain wired only into
+    /// the success path misses it silently.
+    #[tokio::test]
+    async fn blocked_request_names_the_policy_on_the_usage_event() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-completions"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, hub, &cfg())
+                .without_cache()
+                .with_usage_sink(UsageSink::new(tx)),
+        );
+
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            make_req(serde_json::json!({"model": "my-completions", "prompt": "please BLOCKME"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for the refusal")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].hook, "input");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "blocked");
+        let wire = serde_json::to_string(&ev).unwrap();
+        assert!(!wire.contains("BLOCKME"), "{wire}");
+    }
+
 }

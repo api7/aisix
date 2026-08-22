@@ -601,7 +601,7 @@ impl AliyunAiGuardrail {
         if fail_open {
             GuardrailVerdict::Bypass { reason: tag.into() }
         } else {
-            GuardrailVerdict::block(format!("aliyun AI guardrail unavailable ({tag})"))
+            GuardrailVerdict::block_unavailable(format!("aliyun AI guardrail unavailable ({tag})"), tag)
         }
     }
 }

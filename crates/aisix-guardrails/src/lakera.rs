@@ -289,7 +289,7 @@ impl LakeraGuardrail {
         if fail_open {
             GuardrailVerdict::Bypass { reason: tag.into() }
         } else {
-            GuardrailVerdict::block(format!("lakera guard unavailable ({tag})"))
+            GuardrailVerdict::block_unavailable(format!("lakera guard unavailable ({tag})"), tag)
         }
     }
 }

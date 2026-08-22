@@ -364,7 +364,21 @@ pub async fn entry(
 
     let route_name = matched.entry.value.name.clone();
 
-    match dispatch(&state, &snapshot, &matched, req, &client, started).await {
+    // Filled inside `dispatch` at chain resolution, so the failure branch
+    // — where an input-guardrail block lands — stamps the enforced hits
+    // too (AISIX-Cloud#1330 / #1024).
+    let mut audit = crate::usage_attr::GuardrailAudit::default();
+    match dispatch(
+        &state,
+        &snapshot,
+        &matched,
+        req,
+        &client,
+        started,
+        &mut audit,
+    )
+    .await
+    {
         Ok(resp) => resp,
         Err(RouteError { error, auth }) => {
             let status = error.status().as_u16();
@@ -401,6 +415,7 @@ pub async fn entry(
                 status,
                 error.kind(),
                 &client,
+                crate::usage_attr::enforced_hits(&audit),
             );
             // The route matched before the pipeline failed, so a rejected
             // request still attributes to it — an operator triaging 401s
@@ -455,6 +470,7 @@ async fn dispatch(
     req: Request,
     client: &crate::client_ip::ClientContext,
     started: Instant,
+    audit_out: &mut crate::usage_attr::GuardrailAudit,
 ) -> Result<Response, RouteError> {
     let route = &matched.entry.value;
     let route_id: &str = &matched.entry.id;
@@ -616,6 +632,7 @@ async fn dispatch(
         team_id: auth.key().team_id.as_deref(),
     };
     let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    *audit_out = resolved_chain.audit_log();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
     // Envelope detection: once per exchange, from the request body's
@@ -635,6 +652,7 @@ async fn dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
+            ..
         } = verdict
         {
             // Per #153 the matched-pattern detail stays in ops logs only.
@@ -853,6 +871,7 @@ async fn dispatch(
         error_class: String::new(),
         error_message: String::new(),
         monitor_hits,
+        audit: audit_out.clone(),
         captured_prompt,
         content_cap: content_cap.map(|c| c as usize),
         response_text: String::new(),
@@ -913,6 +932,7 @@ async fn dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
+            ..
         } = verdict
         {
             tracing::warn!(
@@ -1795,7 +1815,11 @@ fn stream_response(
                         {
                             let text = format!("{overlap_tail}{scan_buf}");
                             match scan_output(&chain, &route_name, &text, &mut telemetry).await {
-                                GuardrailVerdict::Block { reason, guardrail_name } => {
+                                GuardrailVerdict::Block {
+                reason,
+                guardrail_name,
+                ..
+            } => {
                                     tracing::warn!(
                                         guardrail_hook = "output",
                                         route = %route_name,
@@ -1869,7 +1893,11 @@ fn stream_response(
             }
             let text = format!("{overlap_tail}{scan_buf}");
             if !chain.is_empty() && !text.is_empty() {
-                if let GuardrailVerdict::Block { reason, guardrail_name } =
+                if let GuardrailVerdict::Block {
+                reason,
+                guardrail_name,
+                ..
+            } =
                     scan_output(&chain, &route_name, &text, &mut telemetry).await
                 {
                     tracing::warn!(
@@ -2041,6 +2069,11 @@ struct RouteTelemetry {
     error_class: String,
     error_message: String,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// The request's ENFORCE-mode audit handle (AISIX-Cloud#1330). Held
+    /// rather than snapshotted at construction: this struct's emit runs
+    /// from the relay's `Drop`, long after the output hook has recorded
+    /// whatever it masked.
+    audit: crate::usage_attr::GuardrailAudit,
     captured_prompt: Option<String>,
     content_cap: Option<usize>,
     response_text: String,
@@ -2154,6 +2187,7 @@ impl RouteTelemetry {
             client_user_agent: self.client_user_agent.clone(),
             guardrail_blocked: self.guardrail_blocked,
             guardrail_monitor_hits: std::mem::take(&mut self.monitor_hits),
+            guardrail_enforced_hits: crate::usage_attr::enforced_hits(&self.audit),
             ..Default::default()
         };
         crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
@@ -3199,4 +3233,67 @@ mod tests {
         push_capped(&mut buf, "more", None);
         assert!(buf.len() <= 3);
     }
+
+    /// AISIX-Cloud#1330 / #1024: an input-guardrail block on a
+    /// passthrough route leaves through `RouteError`, and the terminal
+    /// event is built by the handler's failure branch — the only place a
+    /// refused passthrough request appears in Logs at all.
+    #[tokio::test]
+    async fn blocked_request_names_the_policy_on_the_usage_event() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry("http://unused"));
+        snap.apikeys.insert(apikey_entry("sk-caller", Some(&["*"])));
+        snap.passthrough_routes
+            .insert(inject_route(&upstream.uri()));
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"test-block","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,
+        )
+        .unwrap();
+        snap.guardrails.insert(ResourceEntry::new("g-1", g, 1));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        let handle = SnapshotHandle::new(snap);
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, hub, &cfg())
+                .without_cache()
+                .with_usage_sink(UsageSink::new(tx)),
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/passthrough/openai/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({"model": "x", "messages": [{"role": "user", "content": "please BLOCKME"}]})
+                    .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for the refusal")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].guardrail_name, "test-block");
+        assert_eq!(ev.guardrail_enforced_hits[0].hook, "input");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "blocked");
+        let wire = serde_json::to_string(&ev).unwrap();
+        assert!(!wire.contains("BLOCKME"), "{wire}");
+    }
+
 }

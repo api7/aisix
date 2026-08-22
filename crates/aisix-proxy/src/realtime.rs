@@ -201,6 +201,9 @@ pub(crate) async fn realtime(
                 status,
                 err.kind(),
                 &client,
+                // Refused before the handshake, so no chain was ever
+                // resolved and no guardrail can have enforced anything.
+                Vec::new(),
             );
             err.into_response()
         }
@@ -487,6 +490,9 @@ async fn run_session(
         team_id: auth.key().team_id.as_deref(),
     };
     let chain = state.guardrail_index.resolve(&guardrail_ctx);
+    // Read back on every terminal emit below — the session's own event and
+    // the upstream-connect failure (AISIX-Cloud#1330 / #1024).
+    let audit = chain.audit_log();
 
     let (mut client_tx, mut client_rx) = client_ws.split();
 
@@ -541,6 +547,7 @@ async fn run_session(
                 502,
                 "transport",
                 &client,
+                crate::usage_attr::enforced_hits(&audit),
             );
             return;
         }
@@ -772,6 +779,7 @@ async fn run_session(
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         guardrail_monitor_hits: monitor_hits,
+        guardrail_enforced_hits: crate::usage_attr::enforced_hits(&audit),
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
@@ -851,6 +859,7 @@ async fn guardrail_block_event(
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
+        ..
     } = verdict
     {
         let side = if input_side { "input" } else { "output" };
@@ -1367,4 +1376,58 @@ mod tests {
         );
         assert_eq!(rx.try_recv().expect("recorded").status_code, 405);
     }
+
+    /// AISIX-Cloud#1330 / #1024: a realtime session's terminal usage
+    /// event is emitted once, when the socket closes — including when a
+    /// guardrail refused a frame and closed it. The audit handle is read
+    /// there rather than at chain resolution because an output-hook mask
+    /// can land at any point in the session's life.
+    #[tokio::test]
+    async fn blocked_frame_names_the_policy_on_the_session_usage_event() {
+        let (up_addr, _handshake, _frames) = spawn_upstream().await;
+        let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"test-block","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,
+        )
+        .unwrap();
+        snap.guardrails
+            .insert(aisix_core::resource::ResourceEntry::new("g-1", g, 1));
+        let (addr, _state, mut rx) = serve(snap).await;
+
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("handshake");
+        let (mut tx, mut client_rx) = ws.split();
+
+        tx.send(TgMessage::Text(
+            serde_json::json!({"type": "session.update", "session": {"instructions": "please BLOCKME"}})
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+        // Drain until the gateway closes the socket, so the session's
+        // terminal emit has run.
+        while let Some(Ok(msg)) = client_rx.next().await {
+            if matches!(msg, TgMessage::Close(_)) {
+                break;
+            }
+        }
+
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the session must emit a UsageEvent")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].guardrail_name, "test-block");
+        assert_eq!(ev.guardrail_enforced_hits[0].hook, "input");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "blocked");
+        let wire = serde_json::to_string(&ev).unwrap();
+        assert!(!wire.contains("BLOCKME"), "{wire}");
+    }
+
 }

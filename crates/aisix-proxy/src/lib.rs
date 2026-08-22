@@ -9984,4 +9984,263 @@ data: [DONE]\n\n";
             "the judge produced no response, so no judge usage event"
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // AISIX-Cloud#1330 / #1024 — enforced guardrail hits on the LLM
+    // handler family's usage events.
+    //
+    // The gap these cover is SILENT: nothing errors and no metric goes to
+    // zero when the drain is missing, so the only signal is a /logs row
+    // that reads exactly like "no guardrail acted". `guardrail_blocked`
+    // covers the refusal case loudly enough; an enforced MASK on a
+    // non-`/mcp` endpoint was invisible end to end.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// A `kind: "pii"` row whose one custom pattern masks a version
+    /// string on both hooks — the in-process mask the audit chain exists
+    /// for, and the shape the POC deployment actually runs.
+    const MASKING_GUARDRAIL: &str = r#"{
+        "name": "eda-mask",
+        "kind": "pii",
+        "hook_point": "both",
+        "detectors": [],
+        "custom_patterns": [
+            {"name": "eda_version", "regex": "version\\s*:\\s*(\\d+(?:\\.\\d+)+)", "action": "mask", "replacement": "***"}
+        ]
+    }"#;
+
+    /// The enforced-hit entry a chain produces for [`MASKING_GUARDRAIL`],
+    /// asserted the same way on every endpoint so a family member that
+    /// drifts is obvious in the diff.
+    #[track_caller]
+    fn assert_masked_by_eda(event: &aisix_obs::UsageEvent, hook: &str) {
+        let hits = &event.guardrail_enforced_hits;
+        assert!(
+            !hits.is_empty(),
+            "the enforcing mask left no audit trail on the usage event: {event:?}",
+        );
+        let hit = hits
+            .iter()
+            .find(|h| h.hook == hook)
+            .unwrap_or_else(|| panic!("no `{hook}`-hook enforced hit in {hits:?}"));
+        assert_eq!(hit.guardrail_name, "eda-mask");
+        assert_eq!(hit.action, "masked");
+        assert_eq!(hit.counts.get("eda_version").copied(), Some(1));
+        // #153: names and counts only — never the value that was masked.
+        let wire = serde_json::to_string(event).expect("event serialises");
+        assert!(!wire.contains("9.9.9"), "masked value reached the event: {wire}");
+    }
+
+    fn chat_request(model: &str, streaming: bool) -> Request<Body> {
+        let body = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": streaming,
+        });
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// Non-streaming `/v1/chat/completions`: an output-hook mask names the
+    /// row that rewrote the response on the terminal usage event.
+    #[tokio::test]
+    async fn chat_usage_event_carries_the_enforced_mask() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-mask-1",
+                "model": "gpt-4o-2024-08-06",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "the version: 9.9.9 build"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub);
+        seed_guardrail(&state.snapshot, "g-mask", MASKING_GUARDRAIL);
+        let app = build_router(state.with_usage_sink(UsageSink::new(tx)));
+
+        let resp = run(app, chat_request("my-gpt4", false)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("***"), "the response was not masked: {body}");
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("sender dropped without sending");
+        assert_masked_by_eda(&event, "output");
+    }
+
+    /// Streaming `/v1/chat/completions` — pitfall (1) of #1024. The
+    /// end-of-stream event is built inside a `move` closure that runs from
+    /// a Drop guard after the handler frame is gone, so the chain is not
+    /// in scope there; the audit handle has to be cloned beside
+    /// `applied_guardrails` and read in the closure. A drain that only
+    /// covers the non-streaming branch leaves streamed traffic — which is
+    /// most Claude-Code / Codex traffic — silently unattributed.
+    #[tokio::test]
+    async fn streaming_chat_usage_event_carries_the_enforced_mask() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"cmpl-mask-2\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-mask-2\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"the version: 9.9.9 build\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-mask-2\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub);
+        seed_guardrail(&state.snapshot, "g-mask", MASKING_GUARDRAIL);
+        let app = build_router(state.with_usage_sink(UsageSink::new(tx)));
+
+        let resp = run(app, chat_request("my-gpt4", true)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("***"), "the stream was not masked: {body}");
+        assert!(!body.contains("9.9.9"), "the stream leaked the value: {body}");
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("sender dropped without sending");
+        assert_masked_by_eda(&event, "output");
+    }
+
+    /// Pitfall (2) of #1024, chat-only. When a local-model guardrail is
+    /// configured, `dispatch` re-wraps the resolved chain with
+    /// `GuardrailChain::new(vec![resolved, local])` — and `new` leaves the
+    /// OUTER chain's audit log unset. Reading the handle after that point
+    /// yields `None`, so every attachment-row hit on the chat path would
+    /// go unattributed while every sibling endpoint reported normally.
+    /// The handle is therefore taken from the attachment-resolved chain,
+    /// at the same line `applied()` is snapshotted.
+    #[tokio::test]
+    async fn chat_enforced_hits_survive_the_local_model_rewrap() {
+        use aisix_obs::UsageSink;
+
+        /// Stands in for the env-injected local-model guardrail: a member
+        /// that never blocks and never masks, present only to force the
+        /// re-wrap branch. Its own verdicts are irrelevant here — what is
+        /// under test is that wrapping does not lose the INNER chain's log.
+        struct InertLocalModel;
+        #[axum::async_trait]
+        impl aisix_guardrails::Guardrail for InertLocalModel {
+            fn name(&self) -> &'static str {
+                "local-model"
+            }
+            async fn check_input(
+                &self,
+                _req: &aisix_gateway::ChatFormat,
+            ) -> aisix_guardrails::GuardrailVerdict {
+                aisix_guardrails::GuardrailVerdict::Allow
+            }
+        }
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-mask-3",
+                "model": "gpt-4o-2024-08-06",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "the version: 9.9.9 build"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub)
+            .with_local_model_guardrail(Arc::new(InertLocalModel) as Arc<dyn aisix_guardrails::Guardrail>);
+        seed_guardrail(&state.snapshot, "g-mask", MASKING_GUARDRAIL);
+        let app = build_router(state.with_usage_sink(UsageSink::new(tx)));
+
+        let resp = run(app, chat_request("my-gpt4", false)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("sender dropped without sending");
+        assert_masked_by_eda(&event, "output");
+    }
+
+    /// The refusal path: a guardrail BLOCK leaves through `Err`, so the
+    /// terminal event is built by the failure branch. That branch is the
+    /// one an auditor reads — "which policy refused this request" — and
+    /// the one a drain wired only into the success path silently misses.
+    #[tokio::test]
+    async fn chat_usage_event_names_the_policy_that_blocked() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub);
+        seed_guardrail(
+            &state.snapshot,
+            "g-deny",
+            r#"{"name":"deny-secrets","kind":"keyword","hook_point":"input","patterns":[{"kind":"literal","value":"hello"}]}"#,
+        );
+        let app = build_router(state.with_usage_sink(UsageSink::new(tx)));
+
+        let resp = run(app, chat_request("my-gpt4", false)).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("sender dropped without sending");
+        assert!(event.guardrail_blocked);
+        assert_eq!(event.guardrail_enforced_hits.len(), 1, "{event:?}");
+        let hit = &event.guardrail_enforced_hits[0];
+        assert_eq!(hit.guardrail_name, "deny-secrets");
+        assert_eq!(hit.hook, "input");
+        // A policy decision, not an outage — AISIX-Cloud#1365 keeps the
+        // two apart, and a bare `blocked` is what "content violated the
+        // policy" must continue to mean.
+        assert_eq!(hit.action, "blocked");
+        assert!(hit.error_type.is_empty());
+    }
+
 }

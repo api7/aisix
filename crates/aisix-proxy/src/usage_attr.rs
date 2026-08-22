@@ -25,6 +25,49 @@ use crate::chat::sanitize_tag;
 use crate::client_ip::ClientContext;
 use crate::state::ProxyState;
 
+/// The request's ENFORCE-mode guardrail audit handle (AISIX-Cloud#1330),
+/// cloned off the resolved chain with
+/// [`GuardrailChain::audit_log`](aisix_guardrails::GuardrailChain::audit_log)
+/// at the point the chain is resolved.
+///
+/// Threaded rather than re-derived because the read has to happen at
+/// terminal-event time, which is routinely a different frame from the
+/// chain's: a streaming emitter runs from a `move` closure after the
+/// handler returned, and `chat.rs` erases its chain to `Arc<dyn Guardrail>`
+/// before the output hook even runs. `None` — no chain resolved, the
+/// dominant guardrail-free deployment — reads identically to an empty
+/// snapshot, so no call site needs to branch on it.
+pub(crate) type GuardrailAudit = Option<Arc<aisix_guardrails::GuardrailAuditLog>>;
+
+/// Drain `audit` into a terminal `UsageEvent`'s `guardrail_enforced_hits`.
+///
+/// Terminal events only: guardrails run once per request, not once per
+/// attempt, so stamping a per-attempt event would report the same hit
+/// once per retry. The read is non-destructive, so a handler that emits
+/// both kinds is free to call this on the terminal one after the
+/// per-attempt ones have already gone out.
+pub(crate) fn enforced_hits(audit: &GuardrailAudit) -> Vec<aisix_core::GuardrailEnforcedHit> {
+    audit.as_ref().map(|a| a.snapshot()).unwrap_or_default()
+}
+
+/// [`enforced_hits`] for the retrying families (chat / messages /
+/// responses), whose emitters serve both the terminal event and the
+/// superseded per-attempt ones and are told which they are building.
+///
+/// Written as one helper rather than an `if` at each emitter so the rule
+/// — request-scoped attribution rides the terminal event only — is stated
+/// once and cannot be applied inconsistently across the three.
+pub(crate) fn terminal_enforced_hits(
+    terminal: bool,
+    audit: &GuardrailAudit,
+) -> Vec<aisix_core::GuardrailEnforcedHit> {
+    if terminal {
+        enforced_hits(audit)
+    } else {
+        Vec::new()
+    }
+}
+
 /// Stamp how the caller established its principal onto a usage event.
 ///
 /// The ordinary credential path leaves the field empty (the shape on the
@@ -367,6 +410,12 @@ pub(crate) fn emit_error_usage_event(
     status_code: u16,
     error_class: &str,
     client: &ClientContext,
+    // The request's enforced guardrail hits. The failure path is where a
+    // `blocked` hit lands — a guardrail refusal IS the error — so the
+    // error event is the one that must not drop it. Drained by the caller
+    // (`enforced_hits(&audit)`) rather than taken as a handle: the jobs
+    // surface accumulates across two separately resolved chains.
+    enforced: Vec<aisix_core::GuardrailEnforcedHit>,
 ) {
     let event = build_error_usage_event(
         inbound_protocol,
@@ -376,6 +425,7 @@ pub(crate) fn emit_error_usage_event(
         status_code,
         error_class,
         client,
+        enforced,
     );
     // The failed request's own attribution, off the same cell
     // `request_metrics::LastTarget` reads — so the usage-event counters and
@@ -397,6 +447,7 @@ pub(crate) fn emit_error_usage_event(
 /// The [`emit_error_usage_event`] event without the emission, for a caller
 /// that attributes handler-specific fields (e.g. the passthrough route name)
 /// before handing it to [`emit_prepared_usage_event`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_error_usage_event(
     inbound_protocol: &'static str,
     request_id: &str,
@@ -405,6 +456,7 @@ pub(crate) fn build_error_usage_event(
     status_code: u16,
     error_class: &str,
     client: &ClientContext,
+    enforced: Vec<aisix_core::GuardrailEnforcedHit>,
 ) -> UsageEvent {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -416,6 +468,7 @@ pub(crate) fn build_error_usage_event(
         error_class: error_class.to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        guardrail_enforced_hits: enforced,
         ..Default::default()
     };
     apply_jwt_identity(&mut event, client.jwt.as_ref());

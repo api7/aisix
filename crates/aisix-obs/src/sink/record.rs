@@ -203,6 +203,18 @@ mod tests {
                 action: "masked".into(),
                 counts: [("eda_version".to_owned(), 2u32)].into_iter().collect(),
                 duration_us: 41,
+                ..Default::default()
+            },
+            // AISIX-Cloud#1365: the fail-closed refusal is a distinct
+            // action carrying a bounded cause, and the SOC exporters must
+            // see the distinction the /logs badge sees — an auditor
+            // reading the NDJSON drop has no control plane to ask.
+            aisix_core::GuardrailEnforcedHit {
+                guardrail_name: "lakera-prod".into(),
+                hook: "input".into(),
+                action: "blocked_unavailable".into(),
+                error_type: "lakera_timeout".into(),
+                ..Default::default()
             }],
             ..UsageEvent::default()
         });
@@ -210,10 +222,13 @@ mod tests {
         let hits = json["guardrail_enforced_hits"]
             .as_array()
             .expect("flattened onto the record, not nested under `usage`");
-        assert_eq!(hits.len(), 1);
+        assert_eq!(hits.len(), 2);
         assert_eq!(hits[0]["guardrail_name"], "eda-mask");
         assert_eq!(hits[0]["action"], "masked");
         assert_eq!(hits[0]["counts"]["eda_version"], 2);
+        assert!(hits[0].get("error_type").is_none());
+        assert_eq!(hits[1]["action"], "blocked_unavailable");
+        assert_eq!(hits[1]["error_type"], "lakera_timeout");
 
         let bare = serde_json::to_value(SinkRecord::metadata_only(UsageEvent::default())).unwrap();
         assert!(bare.get("guardrail_enforced_hits").is_none());

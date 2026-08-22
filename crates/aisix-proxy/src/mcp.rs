@@ -413,6 +413,7 @@ async fn dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
+            ..
         } = verdict
         {
             tracing::warn!(
@@ -797,6 +798,7 @@ async fn apply_output_guardrails(
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
+        ..
     } = verdict
     {
         tracing::warn!(

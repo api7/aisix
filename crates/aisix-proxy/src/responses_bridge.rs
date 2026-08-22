@@ -1286,7 +1286,11 @@ pub fn build_responses_bridge_stream(
                     seg_counts,
                 );
             }
-            if let aisix_guardrails::GuardrailVerdict::Block { reason, guardrail_name } = verdict {
+            if let aisix_guardrails::GuardrailVerdict::Block {
+                reason,
+                guardrail_name,
+                ..
+            } = verdict {
                 tracing::warn!(
                     guardrail_hook = "output",
                     model = %model_label,

@@ -236,6 +236,18 @@ pub enum GuardrailVerdict {
         /// `None` when the verdict came from a bare guardrail outside a
         /// chain.
         guardrail_name: Option<String>,
+        /// Set when this block is an AVAILABILITY failure rather than a
+        /// content decision: a remote guardrail with `fail_open: false`
+        /// (or a `mandatory` row) that could not reach its upstream blocks
+        /// instead of bypassing, and the two are otherwise
+        /// indistinguishable to every consumer downstream
+        /// (AISIX-Cloud#1365).
+        ///
+        /// Carries the same bounded per-kind failure tag a `Bypass` puts
+        /// in its reason (e.g. `lakera_timeout`) — a closed vocabulary,
+        /// never free text and never matched content, so it is safe on a
+        /// metric label and on the wire (#153).
+        unavailable: Option<String>,
     },
     Bypass {
         reason: String,
@@ -250,6 +262,35 @@ impl GuardrailVerdict {
         GuardrailVerdict::Block {
             reason: reason.into(),
             guardrail_name: None,
+            unavailable: None,
+        }
+    }
+
+    /// `Block` for a fail-CLOSED AVAILABILITY failure (AISIX-Cloud#1365):
+    /// the guardrail could not evaluate, and its configuration says an
+    /// un-evaluated request is refused rather than let through.
+    ///
+    /// `tag` is the guardrail kind's bounded failure tag — the same value
+    /// the fail-OPEN branch puts in `Bypass::reason`, so one outage reads
+    /// the same whichever way the row is configured.
+    pub fn block_unavailable(reason: impl Into<String>, tag: impl Into<String>) -> Self {
+        GuardrailVerdict::Block {
+            reason: reason.into(),
+            guardrail_name: None,
+            unavailable: Some(tag.into()),
+        }
+    }
+
+    /// The bounded failure tag when this verdict is a fail-closed
+    /// availability block; `None` for a content decision and for every
+    /// non-block verdict.
+    pub fn unavailable_tag(&self) -> Option<&str> {
+        match self {
+            GuardrailVerdict::Block {
+                unavailable: Some(tag),
+                ..
+            } => Some(tag.as_str()),
+            _ => None,
         }
     }
 
@@ -928,7 +969,22 @@ mod tests {
             GuardrailVerdict::Block {
                 reason: "x".into(),
                 guardrail_name: None,
+                unavailable: None,
             },
+        );
+        // A plain content block carries no cause; a fail-closed one does,
+        // and that is the only difference a consumer can see
+        // (AISIX-Cloud#1365).
+        assert_eq!(GuardrailVerdict::block("x").unavailable_tag(), None);
+        assert!(GuardrailVerdict::block_unavailable("x", "lakera_timeout").is_block());
+        assert_eq!(
+            GuardrailVerdict::block_unavailable("x", "lakera_timeout").unavailable_tag(),
+            Some("lakera_timeout"),
+        );
+        assert_eq!(GuardrailVerdict::Allow.unavailable_tag(), None);
+        assert_eq!(
+            GuardrailVerdict::Bypass { reason: "y".into() }.unavailable_tag(),
+            None,
         );
         assert!(!GuardrailVerdict::Allow.is_bypass());
         assert!(GuardrailVerdict::Bypass { reason: "y".into() }.is_bypass());

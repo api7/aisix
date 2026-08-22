@@ -1537,7 +1537,11 @@ pub async fn create_video(
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
 
-    match dispatch_create(&state, &snapshot, &auth, body, &client).await {
+    // See `embeddings`: filled inside `dispatch_create` so the failure
+    // branch — where a guardrail block lands — stamps the enforced hits
+    // too (AISIX-Cloud#1330 / #1024).
+    let mut audit = crate::usage_attr::GuardrailAudit::default();
+    match dispatch_create(&state, &snapshot, &auth, body, &client, &mut audit).await {
         Ok(success) => {
             let status = success.response.status().as_u16();
             // Label by the RESOLVED entry's display_name, not the requested
@@ -1571,6 +1575,7 @@ pub async fn create_video(
                     success.monitor_hits.clone(),
                     status,
                     started.elapsed(),
+                    &audit,
                 );
             }
             success.response
@@ -1592,6 +1597,7 @@ pub async fn create_video(
                 status,
                 err.kind(),
                 &client,
+                crate::usage_attr::enforced_hits(&audit),
             );
             err.into_response()
         }
@@ -1616,6 +1622,7 @@ async fn dispatch_create(
     auth: &AuthenticatedKey,
     body: VideoCreateBody,
     client: &ClientContext,
+    audit_out: &mut crate::usage_attr::GuardrailAudit,
 ) -> Result<CreateSuccess, ProxyError> {
     let model_entry = crate::model_resolve::resolve_model(snapshot, &body.model)
         .ok_or_else(|| ProxyError::ModelNotFound(body.model.clone()))?;
@@ -1660,6 +1667,7 @@ async fn dispatch_create(
     };
     let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
     let applied_guardrails = resolved_chain.applied().to_vec();
+    *audit_out = resolved_chain.audit_log();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     if !resolved_chain.is_empty() {
         let chat = aisix_gateway::ChatFormat::new(
@@ -1672,6 +1680,7 @@ async fn dispatch_create(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
+            ..
         } = verdict
         {
             // Matched-pattern detail stays in ops logs only (#153).
@@ -1989,6 +1998,8 @@ fn emit_submit_usage_event(
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     status_code: u16,
     elapsed: Duration,
+    // The request's enforced-guardrail audit handle (AISIX-Cloud#1330).
+    audit: &crate::usage_attr::GuardrailAudit,
 ) {
     let mut event = UsageEvent {
         request_id: client.request_id.clone(),
@@ -2004,6 +2015,7 @@ fn emit_submit_usage_event(
         inbound_protocol: "openai".to_string(),
         applied_guardrails: applied_guardrails.to_vec(),
         guardrail_monitor_hits,
+        guardrail_enforced_hits: crate::usage_attr::enforced_hits(audit),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
@@ -3896,4 +3908,50 @@ mod tests {
             .unwrap()
             .contains("download URL has expired"));
     }
+
+    /// AISIX-Cloud#1330 / #1024: a guardrail BLOCK leaves this handler
+    /// through `Err`, so the terminal usage event is the shared
+    /// zero-token error event. That branch is the one an auditor reads —
+    /// "which policy refused this request" — and a drain wired only into
+    /// the success path misses it silently.
+    #[tokio::test]
+    async fn blocked_request_names_the_policy_on_the_usage_event() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let snap = new_snap(&upstream.uri(), "alibaba", "");
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"test-block","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,
+        )
+        .unwrap();
+        snap.guardrails.insert(ResourceEntry::new("g-1", g, 1));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        let handle = SnapshotHandle::new(snap);
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, hub, &cfg())
+                .without_cache()
+                .with_usage_sink(UsageSink::new(tx)),
+        );
+
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            post_videos(serde_json::json!({"model": "my-video", "prompt": "please BLOCKME now"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for the refusal")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].hook, "input");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "blocked");
+        let wire = serde_json::to_string(&ev).unwrap();
+        assert!(!wire.contains("BLOCKME"), "{wire}");
+    }
+
 }

@@ -442,6 +442,10 @@ async fn scan_input_blob(
     target: &JobTarget,
     blob: &[u8],
     monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
+    // Accumulated rather than handed back as one handle: the input and
+    // output scans resolve their own chain, so a request can produce two
+    // audit logs (AISIX-Cloud#1330 / #1024).
+    enforced_hits: &mut Vec<aisix_core::GuardrailEnforcedHit>,
 ) -> Result<(), ProxyError> {
     let ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
@@ -462,9 +466,13 @@ async fn scan_input_blob(
     );
     let (verdict, hits) = aisix_guardrails::Guardrail::check_input_observed(&chain, &chat).await;
     monitor_hits.extend(hits);
+    // Drained BEFORE the block branch: a `blocked` hit is exactly the one
+    // that leaves through `Err`, and the caller's `?` would drop it.
+    enforced_hits.extend(chain.enforced_hits());
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
+        ..
     } = verdict
     {
         tracing::warn!(
@@ -487,6 +495,10 @@ async fn scan_output_blob(
     target: &JobTarget,
     blob: &[u8],
     monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
+    // Accumulated rather than handed back as one handle: the input and
+    // output scans resolve their own chain, so a request can produce two
+    // audit logs (AISIX-Cloud#1330 / #1024).
+    enforced_hits: &mut Vec<aisix_core::GuardrailEnforcedHit>,
 ) -> Result<(), ProxyError> {
     let ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
@@ -508,9 +520,12 @@ async fn scan_output_blob(
     };
     let (verdict, hits) = aisix_guardrails::Guardrail::check_output_observed(&chain, &synth).await;
     monitor_hits.extend(hits);
+    // See `scan_input_blob`.
+    enforced_hits.extend(chain.enforced_hits());
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
+        ..
     } = verdict
     {
         tracing::warn!(
@@ -580,6 +595,9 @@ fn emit_job_usage_event(
     elapsed: Duration,
     client: &ClientContext,
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    // What an ENFORCING guardrail actually did to this request
+    // (AISIX-Cloud#1330).
+    guardrail_enforced_hits: Vec<aisix_core::GuardrailEnforcedHit>,
 ) {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -596,6 +614,7 @@ fn emit_job_usage_event(
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         guardrail_monitor_hits,
+        guardrail_enforced_hits,
         ..Default::default()
     };
     let pk = crate::usage_attr::ResolvedPk::resolve(snap, &target.pk_entry.id);
@@ -674,6 +693,7 @@ fn finish(
     request_id: String,
     result: Result<(Response, JobTarget), ProxyError>,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    enforced_hits: Vec<aisix_core::GuardrailEnforcedHit>,
 ) -> Response {
     let elapsed = started.elapsed();
     // `path` carries the real job/file id — bounded route template only.
@@ -714,6 +734,7 @@ fn finish(
                 elapsed,
                 client,
                 monitor_hits,
+                enforced_hits,
             );
             if let Ok(hv) = HeaderValue::from_str(&request_id) {
                 resp.headers_mut().insert("x-aisix-request-id", hv);
@@ -755,6 +776,7 @@ fn finish(
                 status,
                 err.kind(),
                 client,
+                enforced_hits,
             );
             err.into_response()
         }
@@ -833,6 +855,7 @@ pub(crate) async fn create_file(
         }
     };
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
     // Loaded below, after the upload is drained — see the note in
     // `audio::multipart_dispatch` (#941 audit M2).
     let mut snapshot = None;
@@ -906,7 +929,7 @@ pub(crate) async fn create_file(
 
         // Batch/fine-tune input files carry end-user content — scan them
         // like any other inbound payload.
-        scan_input_blob(&state, &auth, &target, &file_bytes, &mut monitor_hits).await?;
+        scan_input_blob(&state, &auth, &target, &file_bytes, &mut monitor_hits, &mut enforced_hits).await?;
         let _reservation = crate::quota::enforce(
             &state,
             snapshot,
@@ -929,7 +952,7 @@ pub(crate) async fn create_file(
             &request_id,
         )
         .await?;
-        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits).await?;
+        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits, &mut enforced_hits).await?;
         let model = target.display_name().to_string();
         Ok((
             json_response(status, &resp_headers, bytes, Some(&model)),
@@ -952,6 +975,7 @@ pub(crate) async fn create_file(
         request_id,
         result,
         monitor_hits,
+        enforced_hits,
     )
 }
 
@@ -1106,6 +1130,7 @@ pub(crate) async fn create_batch(
     };
     let request_id = client.request_id.clone();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1149,7 +1174,7 @@ pub(crate) async fn create_batch(
         }
         let out_body = Bytes::from(serde_json::to_vec(&req_json).unwrap_or_default());
 
-        scan_input_blob(&state, &auth, &target, &out_body, &mut monitor_hits).await?;
+        scan_input_blob(&state, &auth, &target, &out_body, &mut monitor_hits, &mut enforced_hits).await?;
         let _reservation = crate::quota::enforce(
             &state,
             &snapshot,
@@ -1172,7 +1197,7 @@ pub(crate) async fn create_batch(
             &request_id,
         )
         .await?;
-        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits).await?;
+        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits, &mut enforced_hits).await?;
         let model = target.display_name().to_string();
         Ok((
             json_response(status, &resp_headers, bytes, Some(&model)),
@@ -1193,6 +1218,7 @@ pub(crate) async fn create_batch(
         request_id,
         result,
         monitor_hits,
+        enforced_hits,
     )
 }
 
@@ -1208,6 +1234,7 @@ pub(crate) async fn get_batch(
     let request_id = client.request_id.clone();
     let (raw, embedded) = routed_model_hint(&id, &params, &headers);
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1238,7 +1265,7 @@ pub(crate) async fn get_batch(
             &request_id,
         )
         .await?;
-        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits).await?;
+        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits, &mut enforced_hits).await?;
 
         // Batch cost attribution (#720): first observation of a completed
         // batch downloads the output JSONL and emits real token usage.
@@ -1268,6 +1295,7 @@ pub(crate) async fn get_batch(
         request_id,
         result,
         monitor_hits,
+        enforced_hits,
     )
 }
 
@@ -1362,6 +1390,7 @@ pub(crate) async fn create_ft_job(
     };
     let request_id = client.request_id.clone();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1402,7 +1431,7 @@ pub(crate) async fn create_ft_job(
         }
         let out_body = Bytes::from(serde_json::to_vec(&req_json).unwrap_or_default());
 
-        scan_input_blob(&state, &auth, &target, &out_body, &mut monitor_hits).await?;
+        scan_input_blob(&state, &auth, &target, &out_body, &mut monitor_hits, &mut enforced_hits).await?;
         let _reservation = crate::quota::enforce(
             &state,
             &snapshot,
@@ -1425,7 +1454,7 @@ pub(crate) async fn create_ft_job(
             &request_id,
         )
         .await?;
-        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits).await?;
+        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits, &mut enforced_hits).await?;
         let model = target.display_name().to_string();
         Ok((
             json_response(status, &resp_headers, bytes, Some(&model)),
@@ -1446,6 +1475,7 @@ pub(crate) async fn create_ft_job(
         request_id,
         result,
         monitor_hits,
+        enforced_hits,
     )
 }
 
@@ -1570,6 +1600,7 @@ async fn forward_simple(
     let log_path = spec.log_path.clone();
     let label = spec.label;
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1586,7 +1617,7 @@ async fn forward_simple(
         let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
 
         if let Some(body) = &spec.body {
-            scan_input_blob(&state, &auth, &target, body, &mut monitor_hits).await?;
+            scan_input_blob(&state, &auth, &target, body, &mut monitor_hits, &mut enforced_hits).await?;
         }
         let _reservation = crate::quota::enforce(
             &state,
@@ -1608,7 +1639,7 @@ async fn forward_simple(
         };
         let (status, resp_headers, bytes) =
             send_upstream(&state, &target, spec.method, &url, body, &request_id).await?;
-        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits).await?;
+        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits, &mut enforced_hits).await?;
 
         let resp = if spec.relay_raw_body {
             let mut resp = Response::builder()
@@ -1639,6 +1670,7 @@ async fn forward_simple(
         request_id,
         result,
         monitor_hits,
+        enforced_hits,
     )
 }
 
@@ -2529,4 +2561,69 @@ mod tests {
             "got {v}"
         );
     }
+
+    /// AISIX-Cloud#1330 / #1024: the jobs surface scans an uploaded blob
+    /// with its own resolved chain, and a block leaves through `Err`. The
+    /// hits are therefore accumulated inside the scan — BEFORE the block
+    /// branch returns — rather than read back from a chain the `?` has
+    /// already discarded.
+    #[tokio::test]
+    async fn blocked_upload_names_the_policy_on_the_usage_event() {
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(path("/v1/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "file-abc",
+                "object": "file",
+                "purpose": "batch",
+                "filename": "input.jsonl"
+            })))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        // The uploaded blob carries `custom_id`, so blocking on that
+        // literal refuses the upload without touching the fixture.
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"test-block","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"custom_id"}]}"#,
+        )
+        .unwrap();
+        snap.guardrails
+            .insert(aisix_core::resource::ResourceEntry::new("g-1", g, 1));
+        let (app, mut rx) = build_app_with_sink(snap);
+
+        let boundary = "XBOUNDARYX";
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/files")
+            .header("authorization", "Bearer sk-caller")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(multipart_body(
+                boundary,
+                Some("jobs-a"),
+            )))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for the refusal")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].guardrail_name, "test-block");
+        assert_eq!(ev.guardrail_enforced_hits[0].hook, "input");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "blocked");
+        let wire = serde_json::to_string(&ev).unwrap();
+        assert!(!wire.contains("custom_id"), "{wire}");
+    }
+
 }

@@ -1378,11 +1378,22 @@ mod tests {
                     action: "masked".into(),
                     counts: [("eda_version".to_owned(), 3u32)].into_iter().collect(),
                     duration_us: 87,
+                    ..Default::default()
                 },
                 GuardrailEnforcedHit {
                     guardrail_name: "deny-secrets".into(),
                     hook: "input".into(),
                     action: "blocked".into(),
+                    ..Default::default()
+                },
+                // AISIX-Cloud#1365: a fail-closed refusal is its own
+                // action so the naive read of `action = "blocked"` — "this
+                // content violated policy" — stays true.
+                GuardrailEnforcedHit {
+                    guardrail_name: "lakera-prod".into(),
+                    hook: "input".into(),
+                    action: "blocked_unavailable".into(),
+                    error_type: "lakera_timeout".into(),
                     ..Default::default()
                 },
             ],
@@ -1395,6 +1406,11 @@ mod tests {
         assert!(json.contains(r#""eda_version":3"#));
         assert!(json.contains(r#""duration_us":87"#));
         assert!(json.contains(r#""action":"blocked""#));
+        assert!(json.contains(r#""action":"blocked_unavailable""#));
+        assert!(json.contains(r#""error_type":"lakera_timeout""#));
+        // Only the fail-closed entry carries a cause: an ordinary policy
+        // block must not acquire one, or the two collapse again.
+        assert_eq!(json.matches(r#""error_type""#).count(), 1);
         // A block reports no counts. The fixture leaves its duration at
         // zero so both stay off the wire here; a production block does
         // carry `duration_us` — the member's own evaluation time.
