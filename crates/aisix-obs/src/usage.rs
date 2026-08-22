@@ -28,7 +28,7 @@
 //! (aisix-server), not here.
 
 use crate::metrics::UsageEventLabels;
-use aisix_core::{AppliedGuardrail, GuardrailMonitorHit};
+use aisix_core::{AppliedGuardrail, GuardrailEnforcedHit, GuardrailMonitorHit};
 use serde::Serialize;
 
 /// One usage event. Emitted at end-of-request (success / upstream error /
@@ -296,6 +296,21 @@ pub struct UsageEvent {
     /// unknown field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guardrail_monitor_hits: Vec<GuardrailMonitorHit>,
+
+    /// What each `enforcement_mode` guardrail ACTUALLY did to this request
+    /// (AISIX-Cloud#1330): one entry per `(guardrail_name, hook, action)`,
+    /// where `action` is `masked` (content rewritten, request continued) or
+    /// `blocked` (request refused), with the per-detector span counts and
+    /// the time the guardrail spent. The enforcing counterpart of
+    /// `guardrail_monitor_hits` — until this field, an enforced mask was
+    /// invisible in the audit trail and an enforced block recorded only the
+    /// boolean `guardrail_blocked`, so no consumer could say WHICH policy
+    /// acted. Names and counts only — never matched content, never the
+    /// block reason (#153). Empty (no guardrail enforced anything) is
+    /// omitted from the wire; cp-api's `/dp/telemetry` binds JSON leniently,
+    /// so older CP images ignore the unknown field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guardrail_enforced_hits: Vec<GuardrailEnforcedHit>,
 
     /// Cache outcome on this request. One of:
     ///
@@ -1345,6 +1360,49 @@ mod tests {
         // Empty set stays off the wire entirely.
         let empty = serde_json::to_string(&UsageEvent::default()).unwrap();
         assert!(!empty.contains("applied_guardrails"));
+    }
+
+    /// AISIX-Cloud#1330: the enforced-hit array reaches the wire under the
+    /// key the control plane binds, carries names and counts only, and is
+    /// omitted entirely when nothing enforced — so an empty array on a
+    /// stored row can only mean "no guardrail acted", never "the DP did
+    /// not report".
+    #[test]
+    fn guardrail_enforced_hits_serialise_when_set_and_are_absent_when_empty() {
+        let ev = UsageEvent {
+            request_id: "req-enforced".into(),
+            guardrail_enforced_hits: vec![
+                GuardrailEnforcedHit {
+                    guardrail_name: "eda-mask".into(),
+                    hook: "output".into(),
+                    action: "masked".into(),
+                    counts: [("eda_version".to_owned(), 3u32)].into_iter().collect(),
+                    duration_us: 87,
+                },
+                GuardrailEnforcedHit {
+                    guardrail_name: "deny-secrets".into(),
+                    hook: "input".into(),
+                    action: "blocked".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""guardrail_enforced_hits""#));
+        assert!(json.contains(r#""guardrail_name":"eda-mask""#));
+        assert!(json.contains(r#""action":"masked""#));
+        assert!(json.contains(r#""eda_version":3"#));
+        assert!(json.contains(r#""duration_us":87"#));
+        assert!(json.contains(r#""action":"blocked""#));
+        // A block reports no counts. The fixture leaves its duration at
+        // zero so both stay off the wire here; a production block does
+        // carry `duration_us` — the member's own evaluation time.
+        assert_eq!(json.matches(r#""counts""#).count(), 1);
+        assert_eq!(json.matches(r#""duration_us""#).count(), 1);
+
+        let empty = serde_json::to_string(&UsageEvent::default()).unwrap();
+        assert!(!empty.contains("guardrail_enforced_hits"));
     }
 
     #[test]

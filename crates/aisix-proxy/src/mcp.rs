@@ -357,6 +357,7 @@ async fn dispatch(
                     false,
                     Vec::new(),
                     crate::redact::RedactionCounts::new(),
+                    /* guardrail_chain */ None,
                     None,
                     trace,
                     /* dispatched */ false,
@@ -432,6 +433,7 @@ async fn dispatch(
                 true,
                 monitor_hits,
                 crate::redact::RedactionCounts::new(),
+                guardrail_chain.as_ref(),
                 None,
                 trace,
                 /* dispatched */ false,
@@ -497,6 +499,7 @@ async fn dispatch(
                         true,
                         monitor_hits,
                         crate::redact::RedactionCounts::new(),
+                        guardrail_chain.as_ref(),
                         None,
                         trace,
                         /* dispatched */ false,
@@ -590,6 +593,7 @@ async fn dispatch(
                         true,
                         monitor_hits,
                         redaction_counts,
+                        guardrail_chain.as_ref(),
                         None,
                         trace,
                         /* dispatched */ true,
@@ -634,6 +638,7 @@ async fn dispatch(
             false,
             monitor_hits,
             redaction_counts,
+            guardrail_chain.as_ref(),
             capture.as_ref(),
             trace,
             /* dispatched */ true,
@@ -892,6 +897,13 @@ fn emit_tool_call_usage(
     // Per-detector mask counts from the write-back passes (names only,
     // never values — #932 no-leak).
     redacted_entity_counts: crate::redact::RedactionCounts,
+    // The request's resolved chain, or `None` when the request was
+    // refused before one existed (the quota path). Source of BOTH
+    // guardrail attributions on the event: the `{kind, hook}` set that
+    // governed the call, and the enforced hits it produced
+    // (AISIX-Cloud#1330) — deriving them here rather than at each call
+    // site keeps the five emit legs from drifting apart.
+    guardrail_chain: Option<&aisix_guardrails::GuardrailChain>,
     // Post-mask captured args/result for full-content exporters
     // (AISIX-Cloud#1330); `None` when no exporter captures content.
     content: Option<&aisix_obs::CapturedContent>,
@@ -916,6 +928,12 @@ fn emit_tool_call_usage(
         mcp_tool_name: mcp_tool.to_string(),
         guardrail_blocked,
         guardrail_monitor_hits,
+        applied_guardrails: guardrail_chain
+            .map(|c| c.applied().to_vec())
+            .unwrap_or_default(),
+        guardrail_enforced_hits: guardrail_chain
+            .map(|c| c.enforced_hits())
+            .unwrap_or_default(),
         ..Default::default()
     };
     crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
@@ -2107,6 +2125,133 @@ mod tests {
         // No hit → no allocation, original bytes forwarded.
         let clean = br#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"eda__echo","arguments":{"text":"Elapsed: 12.345s"}}}"#;
         assert!(rewrite_tool_arguments(&chain, clean).unwrap().is_none());
+    }
+
+    /// AISIX-Cloud#1330 audit chain: a mask that actually fired names the
+    /// guardrail ROW that fired it, on the right hook, with the detector
+    /// counts. Before this, an enforcing mask left the row name nowhere —
+    /// `redacted_entity_counts` carries detector names, not the policy's,
+    /// so an operator could see THAT something was masked but never WHICH
+    /// policy did it.
+    #[test]
+    fn enforced_input_mask_names_the_guardrail_row() {
+        let chain = env_chain_with(&pii_mask_guard("input"));
+        assert!(chain.enforced_hits().is_empty(), "nothing has run yet");
+
+        let body = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"eda__echo","arguments":{"text":"build version: 12.1 done"}}}"#;
+        rewrite_tool_arguments(&chain, body.as_bytes())
+            .unwrap()
+            .expect("a hit rewrites");
+
+        let hits = chain.enforced_hits();
+        assert_eq!(hits.len(), 1, "one row fired: {hits:?}");
+        assert_eq!(hits[0].guardrail_name, "pii-mask");
+        assert_eq!(hits[0].hook, "input");
+        assert_eq!(hits[0].action, "masked");
+        assert_eq!(hits[0].counts.get("eda_version"), Some(&1));
+    }
+
+    /// A clean request records nothing: the audit array is evidence that
+    /// enforcement happened, so an empty one must mean it did not.
+    #[test]
+    fn a_clean_request_records_no_enforced_hit() {
+        let chain = env_chain_with(&pii_mask_guard("input"));
+        let clean = br#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"eda__echo","arguments":{"text":"Elapsed: 12.345s"}}}"#;
+        assert!(rewrite_tool_arguments(&chain, clean).unwrap().is_none());
+        assert!(chain.enforced_hits().is_empty());
+    }
+
+    /// The output hook attributes to the same row, and the many per-leaf
+    /// redact calls one tool result triggers coalesce into ONE entry whose
+    /// counts are summed — the array is bounded by the chain's member
+    /// count, not by how many strings the tool returned.
+    #[tokio::test]
+    async fn enforced_output_mask_coalesces_per_leaf_calls_into_one_entry() {
+        let chain = env_chain_with(&pii_mask_guard("output"));
+        let body = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":["#,
+            r#"{"type":"text","text":"tool version: 12.1 ok"},"#,
+            r#"{"type":"resource","resource":{"uri":"file:///run.log","mimeType":"text/plain","text":"Compile version: 2022.4 done"}}"#,
+            r#"], "structuredContent":{"log":"cfg version: 9.0 end"}}}"#,
+        );
+        let outcome =
+            apply_output_guardrails(&chain, body.as_bytes(), "report", &mut Vec::new()).await;
+        assert!(matches!(outcome, ToolResultOutcome::Allow(Some(_))));
+
+        let hits = chain.enforced_hits();
+        assert_eq!(hits.len(), 1, "three masked leaves, one entry: {hits:?}");
+        assert_eq!(hits[0].guardrail_name, "pii-mask");
+        assert_eq!(hits[0].hook, "output");
+        assert_eq!(hits[0].action, "masked");
+        assert_eq!(hits[0].counts.get("eda_version"), Some(&3));
+    }
+
+    /// An enforcing BLOCK names its row too, with no counts — the block
+    /// short-circuits before anything is rewritten, and the operator-facing
+    /// reason deliberately stays off the event (#153 no-leak).
+    #[tokio::test]
+    async fn enforced_output_block_names_the_guardrail_row_without_counts() {
+        let chain = env_chain_with(OUTPUT_GUARD);
+        let body = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"forbidden-token"}]}}"#;
+        assert!(matches!(
+            apply_output_guardrails(&chain, body, "report", &mut Vec::new()).await,
+            ToolResultOutcome::Block(Some(_)),
+        ));
+
+        let hits = chain.enforced_hits();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].guardrail_name, "mcp-output-guard");
+        assert_eq!(hits[0].hook, "output");
+        assert_eq!(hits[0].action, "blocked");
+        assert!(hits[0].counts.is_empty());
+    }
+
+    /// The end of the chain: an enforced block on a real `/mcp` request
+    /// reaches the emitted usage event, naming the row and the action.
+    /// `applied_guardrails` rides the same event — a row that says "masked
+    /// by X" while claiming no guardrail governed the call reads as a bug.
+    #[tokio::test]
+    async fn usage_event_carries_the_enforced_hit_and_the_applied_set() {
+        use aisix_obs::{UsageEvent, UsageSink};
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UsageEvent>(8);
+        let handle = SnapshotHandle::new(snapshot_with_key());
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle.clone(), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let router = build_router(state);
+        seed_guardrail(&handle, INPUT_GUARD);
+
+        let _ = router
+            .oneshot(tools_call_with_args(
+                serde_json::json!({ "q": "forbidden-token" }),
+            ))
+            .await
+            .expect("router responds");
+
+        let event = rx.try_recv().expect("usage event for the blocked call");
+        assert!(event.guardrail_blocked);
+        assert_eq!(event.guardrail_enforced_hits.len(), 1);
+        assert_eq!(
+            event.guardrail_enforced_hits[0].guardrail_name,
+            "mcp-input-guard"
+        );
+        assert_eq!(event.guardrail_enforced_hits[0].hook, "input");
+        assert_eq!(event.guardrail_enforced_hits[0].action, "blocked");
+        assert_eq!(
+            event
+                .applied_guardrails
+                .iter()
+                .map(|a| (a.kind.as_str(), a.hook.as_str()))
+                .collect::<Vec<_>>(),
+            // `hook` is the row's configured `hook_point`, which this
+            // guardrail leaves at its default — not the hook it fired on.
+            vec![("keyword", "both")],
+        );
+        // The matched token is the caller's content, not audit data.
+        let wire = serde_json::to_string(&event).expect("event serialises");
+        assert!(!wire.contains("forbidden-token"), "{wire}");
     }
 
     /// AISIX-Cloud#1330 scan-surface fix: a forbidden token that appears

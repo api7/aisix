@@ -48,10 +48,11 @@ pub use ensemble::{EnsembleConfig, Judge, PanelMember};
 pub use guardrail::{
     AliyunAiGuardrailConfig, AliyunTextModerationConfig, AppliedGuardrail,
     AzureContentSafetyConfig, AzureContentSafetyTextModerationConfig, BedrockAWSCredentials,
-    BedrockConfig, BedrockLatencyMode, Guardrail, GuardrailAttachment, GuardrailExecution,
-    GuardrailHookPoint, GuardrailKind, GuardrailMetricsSink, GuardrailMonitorHit,
-    GuardrailScopeType, KeywordConfig, KeywordPattern, LakeraConfig, OpenaiModerationConfig,
-    PiiConfig, PiiCustomPattern, PiiDetectorConfig, PresidioConfig, PresidioEntityConfig,
+    BedrockConfig, BedrockLatencyMode, Guardrail, GuardrailAttachment, GuardrailEnforcedHit,
+    GuardrailExecution, GuardrailHookPoint, GuardrailKind, GuardrailMetricsSink,
+    GuardrailMonitorHit, GuardrailScopeType, KeywordConfig, KeywordPattern, LakeraConfig,
+    OpenaiModerationConfig, PiiConfig, PiiCustomPattern, PiiDetectorConfig, PresidioConfig,
+    PresidioEntityConfig,
 };
 pub use mcp_auth_settings::McpAuthSettings;
 pub use mcp_policy::{McpAccess, McpPolicy, McpPolicyScope};

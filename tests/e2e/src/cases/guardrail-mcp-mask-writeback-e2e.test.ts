@@ -301,4 +301,62 @@ describe("mcp mask write-back e2e: /mcp", () => {
     expect(decoded).not.toContain("version: 12.1");
     expect(decoded).not.toContain("2022.4");
   });
+
+  test("audit chain: the exported event names the guardrail ROW that masked, on both hooks", async (ctx) => {
+    if (!etcdReachable || !appG || !sls) return ctx.skip();
+
+    // AISIX-Cloud#1330 audit chain. `redacted_entity_counts` (asserted
+    // above) names the DETECTOR; it cannot say which configured policy
+    // acted, so an operator reading the SOC feed could see THAT content
+    // was rewritten but never WHICH guardrail row did it. The enforced-hit
+    // array closes that: row name + hook + action + per-detector counts.
+    await waitForToken(sls, FULL_LOGSTORE, MARKER);
+    await waitForToken(sls, FULL_LOGSTORE, "阶段汇总");
+    const decoded = decodedTextFor(sls, FULL_LOGSTORE);
+
+    expect(decoded).toContain("guardrail_enforced_hits");
+    // The seeded row's name — not the detector's, not the kind's.
+    expect(decoded).toContain("mcp-writeback-guard");
+    expect(decoded).toContain('"action":"masked"');
+    // Both directions are audited: the tool arguments (input) and the tool
+    // result (output) are separate entries.
+    expect(decoded).toContain('"hook":"input"');
+    expect(decoded).toContain('"hook":"output"');
+
+    // Structured re-read of the array the sink rendered, so a shape
+    // regression fails here rather than passing a substring check that
+    // happened to match unrelated bytes.
+    type EnforcedHit = {
+      guardrail_name: string;
+      hook: string;
+      action: string;
+      counts?: Record<string, number>;
+      duration_us?: number;
+    };
+    // The SLS encoder renders each field with `serde_json::to_value`, whose
+    // objects are BTreeMap-ordered — so the array's first key is `action`,
+    // not the struct's declaration order. Accept either spelling so this
+    // does not break if the encoder changes.
+    const arrays = [...decoded.matchAll(/\[\{"(?:action|guardrail_name)":.*?\}\]/g)]
+      .map((m) => {
+        try {
+          return JSON.parse(m[0]) as EnforcedHit[];
+        } catch {
+          return null;
+        }
+      })
+      .filter((a): a is EnforcedHit[] => Array.isArray(a));
+    const hits = arrays.flat().filter((h) => h.guardrail_name === "mcp-writeback-guard");
+    expect(hits.length).toBeGreaterThan(0);
+    for (const hit of hits) {
+      expect(hit.action).toBe("masked");
+      expect(["input", "output"]).toContain(hit.hook);
+      // Names and counts only — the matched value is never carried.
+      expect(Object.keys(hit.counts ?? {})).toContain("eda_version");
+      expect(JSON.stringify(hit)).not.toContain("12.1");
+      expect(JSON.stringify(hit)).not.toContain("2022.4");
+    }
+    // Both hooks are represented across the request's events.
+    expect(new Set(hits.map((h) => h.hook))).toEqual(new Set(["input", "output"]));
+  });
 });
