@@ -32,6 +32,10 @@ aisix-obs = { path = "../aisix-obs" }
 aisix-ratelimit = { path = "../aisix-ratelimit" }
 aisix-cache = { path = "../aisix-cache" }
 aisix-guardrails = { path = "../aisix-guardrails" }
+# NOTE: the `local-model-guardrail` feature below forwards to
+# aisix-guardrails/local-model so `kind: "semantic"` rows can be
+# exercised in this crate's tests; the server crate enables it by
+# default (#1363).
 tokio.workspace = true
 axum.workspace = true
 reqwest.workspace = true
@@ -88,3 +92,10 @@ tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 wiremock.workspace = true
 # Captures the auth-denial log lines so their per-request fields are pinned.
 tracing-subscriber.workspace = true
+
+[features]
+# Forwarded to the guardrails crate so `kind: "semantic"` rows resolve
+# to a real runtime guardrail (#1363). The server crate enables this by
+# default; it is a feature here only so `cargo test -p aisix-proxy`
+# stays buildable without the ONNX Runtime link.
+local-model-guardrail = ["aisix-guardrails/local-model"]

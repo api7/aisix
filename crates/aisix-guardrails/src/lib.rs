@@ -153,7 +153,8 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
     parts.join("\n")
 }
 
-/// The guardrail `kind` discriminators compiled into this binary.
+/// The guardrail `kind` discriminators compiled into this binary whose
+/// availability is decided at COMPILE time.
 ///
 /// Every non-keyword kind sits behind a cargo feature (see `build.rs`'s
 /// `BuildError::FeatureDisabled` arms); a DP built without one silently
@@ -162,6 +163,11 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
 /// flag kinds the connected DP can't serve. Strings MUST stay equal to
 /// the serde `kind` tags in `aisix_core::models::GuardrailKind`
 /// (`GuardrailKind::kind_str`).
+///
+/// `semantic` is deliberately NOT here even when the `local-model`
+/// feature is compiled in: serving it also needs the model bundle on
+/// disk, a RUNTIME fact — heartbeat callers report
+/// [`supported_kinds_with`] instead.
 pub fn supported_kinds() -> &'static [&'static str] {
     &[
         "keyword",
@@ -185,6 +191,67 @@ pub fn supported_kinds() -> &'static [&'static str] {
     ]
 }
 
+/// [`supported_kinds`] plus the runtime-conditional `semantic` kind:
+/// advertised only while the node's model bundle stays verified (the
+/// `SemanticCapability` the runtime hands the heartbeat). Readiness
+/// means "could serve" — the control plane creating a semantic row is
+/// what triggers the lazy engine load, so gating the advert on "already
+/// active" would deadlock the create flow behind its own greying.
+pub fn supported_kinds_with(semantic_ready: bool) -> Vec<&'static str> {
+    let mut kinds = supported_kinds().to_vec();
+    #[cfg(feature = "local-model")]
+    if semantic_ready {
+        kinds.push("semantic");
+    }
+    #[cfg(not(feature = "local-model"))]
+    let _ = semantic_ready;
+    kinds
+}
+
+/// The process-wide semantic-guardrail runtime, passed to the chain
+/// builders. Always constructible — a build without the `local-model`
+/// feature, or a node without a verified model bundle, passes
+/// [`SemanticRuntimeSlot::none`] and every `kind: "semantic"` row is
+/// skipped with a warning (`BuildError::RuntimeUnavailable` /
+/// `FeatureDisabled`).
+#[derive(Clone, Default)]
+pub struct SemanticRuntimeSlot {
+    #[cfg(feature = "local-model")]
+    runtime: Option<std::sync::Arc<local_model::SemanticRuntime>>,
+}
+
+impl SemanticRuntimeSlot {
+    /// No runtime: semantic rows cannot be served.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// A verified runtime: semantic rows compile against it.
+    #[cfg(feature = "local-model")]
+    pub fn new(runtime: std::sync::Arc<local_model::SemanticRuntime>) -> Self {
+        Self {
+            runtime: Some(runtime),
+        }
+    }
+
+    #[cfg(feature = "local-model")]
+    pub(crate) fn get(&self) -> Option<&std::sync::Arc<local_model::SemanticRuntime>> {
+        self.runtime.as_ref()
+    }
+}
+
+impl std::fmt::Debug for SemanticRuntimeSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[cfg(feature = "local-model")]
+        return f
+            .debug_struct("SemanticRuntimeSlot")
+            .field("present", &self.runtime.is_some())
+            .finish();
+        #[cfg(not(feature = "local-model"))]
+        f.debug_struct("SemanticRuntimeSlot").finish()
+    }
+}
+
 #[cfg(feature = "aliyun-text-moderation")]
 pub use aliyun::AliyunTextModerationGuardrail;
 #[cfg(feature = "aliyun-text-moderation")]
@@ -201,7 +268,11 @@ pub use keyword::{KeywordBlocklist, KeywordRule};
 #[cfg(feature = "lakera")]
 pub use lakera::LakeraGuardrail;
 #[cfg(feature = "local-model")]
-pub use local_model::{LocalModelConfig, LocalModelError, LocalModelGuardrail, MODEL_DIR_ENV};
+pub use local_model::{
+    parse_lanes, CategoryCompileError, LocalModelError, ModelManifest, SemanticCapability,
+    SemanticGuardrail, SemanticRuntime, DEFAULT_MODEL_DIR, LANES_ENV, MODEL_DIR_ENV,
+    PROTOTYPES_ENV, RULE_WINDOW_ENV, THRESHOLD_ENV,
+};
 #[cfg(feature = "openai-moderation")]
 pub use openai_moderation::OpenaiModerationGuardrail;
 pub use pii::{builtin_rule, PiiAction, PiiGuardrail, PiiRule, BUILTIN_DETECTORS};

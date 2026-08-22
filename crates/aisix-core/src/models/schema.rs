@@ -1242,6 +1242,18 @@ pub fn guardrail_root_schema() -> Value {
             json!(["mask", "block"]),
         );
         set_definition_property_enum(defs, "PiiCustomPattern", "action", json!(["mask", "block"]));
+        // Semantic categories rewrite only — the `block` action does not
+        // exist for this kind, and the schema says so rather than letting
+        // a `block` value be accepted and half-honored (#963).
+        set_definition_property_enum(defs, "SemanticCategory", "action", json!(["mask"]));
+        // The write path must see candidate patterns spelled out: the
+        // serde default is `[]`, and JSON Schema's `minItems` does not
+        // apply to an ABSENT property — without `required`, a category
+        // with no patterns validates strictly and then fails category
+        // compilation, silently skipping the whole row (#963 class).
+        if let Some(cat) = defs.get_mut("SemanticCategory") {
+            require_property(cat, "candidate_patterns");
+        }
         set_definition_property_enum(
             defs,
             "PresidioEntityConfig",
@@ -1370,6 +1382,47 @@ pub fn guardrail_root_schema() -> Value {
                     set_property_enum(b, "default_action", json!(["mask", "block"]));
                     set_property_enum(b, "operator", json!(["replace", "mask", "hash", "redact"]));
                 }
+                "semantic" => {
+                    // A semantic row with no categories detects nothing;
+                    // the write path must see them spelled out (the serde
+                    // default keeps the Rust type read-tolerant), matching
+                    // the keyword branch's required `patterns`.
+                    match b.get_mut("required").and_then(Value::as_array_mut) {
+                        Some(list) => {
+                            if !list.iter().any(|v| v.as_str() == Some("categories")) {
+                                list.push(json!("categories"));
+                            }
+                        }
+                        None => {
+                            b.insert("required".to_string(), json!(["categories"]));
+                        }
+                    }
+                    // This kind rewrites and never blocks, so a runtime
+                    // failure has nothing to fail closed INTO —
+                    // `fail_open: false` would be accepted-but-inert
+                    // (#963). Pre-inserting the pinned property here wins
+                    // over the parent copy-in below (`entry().or_insert`),
+                    // so the branch keeps the closed value; omission still
+                    // gets the default.
+                    if let Some(props) = b
+                        .entry("properties".to_string())
+                        .or_insert_with(|| json!({}))
+                        .as_object_mut()
+                    {
+                        props.insert(
+                            "fail_open".to_string(),
+                            json!({
+                                "type": "boolean",
+                                "enum": [true],
+                                "default": true,
+                                "description": "Semantic guardrails always degrade open: \
+                                 an unavailable embedding model releases content \
+                                 unmasked and records the degradation, never blocks. \
+                                 Only `true` is accepted."
+                            }),
+                        );
+                    }
+                }
                 _ => {}
             }
         }
@@ -1472,6 +1525,9 @@ fn guardrail_kind_description(kind: &str) -> Option<&'static str> {
         "presidio" => {
             Some("Guardrail provider type for self-hosted Microsoft Presidio PII detection and anonymization.")
         }
+        "semantic" => Some(
+            "Guardrail provider type for in-process semantic category detection and redaction using the bundled embedding model.",
+        ),
         _ => None,
     }
 }

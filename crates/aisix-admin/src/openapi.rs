@@ -2177,6 +2177,7 @@ fn add_variant_titles(doc: &mut Value) {
                 "Lakera Guard",
                 "OpenAI Moderation",
                 "Microsoft Presidio",
+                "Semantic Categories",
             ],
         ),
         (
