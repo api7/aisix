@@ -152,6 +152,12 @@ RUN apt-get update \
 
 WORKDIR /bundle
 COPY docker/guardrail-model.manifest.json manifest.json
+# Apache-2.0 text for the redistributed model (the upstream repository
+# declares the license in its model-card metadata and carries no LICENSE
+# file of its own). Not part of manifest.json: that file is the model's
+# INTEGRITY unit, and adding entries to it would fail boot verification
+# for every already-imported bundle that predates the license copy.
+COPY docker/guardrail-model.LICENSE LICENSE
 
 ARG GUARDRAIL_MODEL_BASE=https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2/resolve/835ad14087e140460703cf0fae09f97d469d65c2
 RUN set -eu; \

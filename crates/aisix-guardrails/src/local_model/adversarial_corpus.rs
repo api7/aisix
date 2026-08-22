@@ -225,12 +225,17 @@ async fn adversarial_corpus_report() {
     // is v2 material — its probe lives in `probe_similarity_matrix`.)
     let mut model_items: Vec<(f32, bool)> = Vec::new();
     let (mut lines_correct, mut cand_correct) = (0usize, 0usize);
-    let mut wrong_lines: Vec<(&str, String, String)> = Vec::new();
+    // (category, text, actual output, corrupted): `corrupted` = a masked
+    // span no label covers. A multi-positive line where the model masks
+    // one labeled positive and releases another is a RECALL miss, not a
+    // corruption — `actual != text` alone cannot tell the two apart.
+    let mut wrong_lines: Vec<(&str, String, String, bool)> = Vec::new();
 
     for case in CORPUS {
         let labels = sensitive_ranges(case);
         let spans = cat.finder.spans(case.text);
         let mut hits: Vec<Range<usize>> = Vec::new();
+        let mut corrupted = false;
         for span in spans {
             n_candidates += 1;
             let positive = labels.iter().any(|l| overlaps(l, &span));
@@ -257,6 +262,7 @@ async fn adversarial_corpus_report() {
             };
             cand_correct += usize::from(masked == positive);
             if masked {
+                corrupted |= !positive;
                 hits.push(span);
             }
         }
@@ -278,7 +284,7 @@ async fn adversarial_corpus_report() {
         if actual == want {
             lines_correct += 1;
         } else {
-            wrong_lines.push((case.cat, case.text.to_owned(), actual));
+            wrong_lines.push((case.cat, case.text.to_owned(), actual, corrupted));
         }
     }
 
@@ -300,8 +306,9 @@ async fn adversarial_corpus_report() {
         lines_correct,
         CORPUS.len(),
     );
-    for (cat, text, actual) in &wrong_lines {
-        println!("  WRONG [{cat}] {text:?} -> {actual:?}");
+    for (cat, text, actual, corrupted) in &wrong_lines {
+        let tag = if *corrupted { "CORRUPTED" } else { "MISSED" };
+        println!("  WRONG/{tag} [{cat}] {text:?} -> {actual:?}");
     }
 
     let n_pos = model_items.iter().filter(|(_, p)| *p).count();
@@ -358,7 +365,7 @@ async fn adversarial_corpus_report() {
     // the description form's margin negative on anchor-free windows).
     let wrongly_masked = wrong_lines
         .iter()
-        .filter(|(_, text, actual)| actual != text)
+        .filter(|(_, _, _, corrupted)| *corrupted)
         .count();
     assert_eq!(
         wrongly_masked, 0,

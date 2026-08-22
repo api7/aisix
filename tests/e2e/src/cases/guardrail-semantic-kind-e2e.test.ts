@@ -198,7 +198,7 @@ describe("semantic guardrail kind e2e", () => {
     name: string,
     args: Record<string, unknown>,
   ): Promise<RpcReply> => {
-    await rpc({
+    const init = await rpc({
       jsonrpc: "2.0",
       id: 1,
       method: "initialize",
@@ -208,6 +208,8 @@ describe("semantic guardrail kind e2e", () => {
         clientInfo: { name: "semantic-kind-e2e", version: "0.1" },
       },
     });
+    expect(init.status).toBe(200);
+    expect(init.json?.error).toBeUndefined();
     return rpc({
       jsonrpc: "2.0",
       id: 3,
@@ -423,16 +425,26 @@ describe("semantic guardrail kind e2e", () => {
   test("metrics: the semantic row reports per-execution samples under its kind", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
 
-    // Driven by the chat tests above; scraped as a total because the
-    // family is cumulative across them (delta discipline lives in the
-    // degrade test).
-    const samples = await scrapeMetrics(app.metricsUrl);
-    expect(
-      sumMetric(samples, "aisix_guardrail_latency_seconds_count", {
-        kind: "semantic",
-        guardrail: "sem-guard",
-      }),
-    ).toBeGreaterThan(0);
+    // Self-driving: one guarded request inside this test, asserted as a
+    // delta — a focused run of this file's single test must pass without
+    // riding traffic from the chat tests above.
+    const labels = { kind: "semantic", guardrail: "sem-guard" };
+    const before = sumMetric(
+      await scrapeMetrics(app.metricsUrl),
+      "aisix_guardrail_latency_seconds_count",
+      labels,
+    );
+    const res = await post("/v1/chat/completions", {
+      model: "sem-guarded",
+      messages: [{ role: "user", content: SENSITIVE }],
+    });
+    expect(res.status).toBe(200);
+    const after = sumMetric(
+      await scrapeMetrics(app.metricsUrl),
+      "aisix_guardrail_latency_seconds_count",
+      labels,
+    );
+    expect(after).toBeGreaterThan(before);
   });
 
   test("/v1/messages and /v1/responses ride the same row (family lockstep)", async (ctx) => {

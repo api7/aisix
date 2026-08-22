@@ -823,13 +823,17 @@ async fn moderate_selected_segments(
     let Some(masked) = outcome.masked else {
         return SegmentPassOutcome::Keep;
     };
+    // The chain fold already refuses a member whose rewrite drifts from
+    // the offered count, so a drift HERE means the chain itself broke its
+    // contract — the same invariant-violation class as a splice failure,
+    // and it takes the same fail-closed arm.
     if masked.len() != texts.len() {
         tracing::warn!(
             offered = texts.len(),
             masked = masked.len(),
-            "mcp segment mask drifted from the collect walk; keeping originals"
+            "mcp segment mask drifted from the collect walk; blocking"
         );
-        return SegmentPassOutcome::Keep;
+        return SegmentPassOutcome::Block(None);
     }
     let mut cursor = 0usize;
     match crate::json_splice::rewrite_string_values(body, pred, |t| {

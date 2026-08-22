@@ -762,11 +762,13 @@ pub struct SemanticCategory {
     #[serde(default)]
     #[schemars(length(min = 1, max = 10))]
     pub candidate_patterns: Vec<String>,
-    /// Regular expressions that are evidence AGAINST a candidate. Each
-    /// pattern is tried against the candidate span itself, the text
-    /// immediately before it, and the text immediately after it (anchor
-    /// with `^` or `$` to pin the position); any match counts once and
-    /// strongly lowers the span's score.
+    /// Regular expressions that are evidence AGAINST a candidate. Every
+    /// pattern is tried against the candidate span itself. A pattern
+    /// whose source ends with `$` is additionally tried against the text
+    /// immediately before the span (the `$` pins the match to the span's
+    /// left edge, as in `编号\s*$`), and one whose source starts with
+    /// `^` against the text immediately after it (as in `^\s*(?:ms|s)`).
+    /// Any match counts once and strongly lowers the span's score.
     #[serde(default)]
     #[schemars(length(max = 20))]
     pub negative_patterns: Vec<String>,
@@ -1019,8 +1021,9 @@ fn is_zero_u32(value: &u32) -> bool {
 pub struct GuardrailExecution<'a> {
     /// Configured (row) name of the guardrail.
     pub guardrail_name: &'a str,
-    /// The `kind` discriminator (`GuardrailKind::kind_str`). `keyword` and
-    /// `pii` run in-process; every other kind calls a remote service.
+    /// The `kind` discriminator (`GuardrailKind::kind_str`). `keyword`,
+    /// `pii`, and `semantic` run in-process; every other kind calls a
+    /// remote service.
     pub kind: &'a str,
     /// Which side ran: `input` or `output`.
     pub phase: &'static str,
@@ -1378,6 +1381,21 @@ mod tests {
             .remove("candidate_patterns");
         assert!(crate::models::validate_guardrail(&missing).is_err());
         assert!(crate::models::validate_guardrail_lenient(&missing).is_err());
+
+        // A semantic row with no categories detects nothing — the branch
+        // requires them, matching keyword's required `patterns`.
+        let bare = json!({"name": "sem", "kind": "semantic"});
+        assert!(crate::models::validate_guardrail(&bare).is_err());
+
+        // This kind rewrites and never blocks; `fail_open: false` has
+        // nothing to fail closed into and is pinned out of the schema
+        // rather than accepted-and-inert (#963).
+        let mut closed = valid.clone();
+        closed["fail_open"] = json!(false);
+        assert!(crate::models::validate_guardrail(&closed).is_err());
+        let mut open = valid.clone();
+        open["fail_open"] = json!(true);
+        assert!(crate::models::validate_guardrail(&open).is_ok());
     }
 
     #[test]

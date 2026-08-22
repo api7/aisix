@@ -223,13 +223,17 @@ impl RuleScorer {
             score += WINDOW_EVIDENCE_SCORE;
         }
 
-        // Negative patterns: span-local shape checks, independent of the
-        // proximity window. Each pattern counts once no matter which
-        // slice it hits.
+        // Negative patterns: span-local shape checks. Each pattern counts
+        // once no matter which slice it hits. The prefix/suffix slices are
+        // clipped to the proximity window: a `$`-anchored pattern matches
+        // at the slice END (= the span edge) and a `^`-anchored one at the
+        // slice START, so clipping cannot change the verdict of any
+        // pattern shorter than the window — it only stops every span from
+        // rescanning the whole segment.
         for neg in &self.negatives {
             let hit = neg.regex.is_match(&text[span.clone()])
-                || (neg.try_prefix && neg.regex.is_match(&text[..span.start]))
-                || (neg.try_suffix && neg.regex.is_match(&text[span.end..]));
+                || (neg.try_prefix && neg.regex.is_match(&text[window.start..span.start]))
+                || (neg.try_suffix && neg.regex.is_match(&text[span.end..window.end]));
             if hit {
                 score += NEGATIVE_CLASS_SCORE;
             }
@@ -595,5 +599,35 @@ mod tests {
         assert!(cat.candidate_patterns.len() <= 10);
         assert!(cat.negative_patterns.len() <= 20);
         assert!(cat.hotword_groups.len() <= 10);
+    }
+
+    #[test]
+    fn anchored_negative_scans_clip_to_the_proximity_window() {
+        // A `$`-anchored pattern matches at the prefix slice's END (the
+        // span's left edge), so for any pattern shorter than the window
+        // the clip is invisible. This pins the boundary: a match LONGER
+        // than the window no longer fires — the price of not rescanning
+        // the whole segment per span — and window-local behavior is
+        // unchanged.
+        let negatives = vec![(
+            Regex::new("aaaaaaaaaa$").expect("compiles"),
+            "aaaaaaaaaa$".to_owned(),
+        )];
+        let scorer = RuleScorer::compile(5, &[], negatives).expect("compiles");
+
+        // 10 `a`s directly before the span, window of 5 chars: the
+        // clipped prefix holds only 5 of them, so the negative does not
+        // fire and the score stays 0.
+        let text = "aaaaaaaaaa12.1";
+        let span = 10..14;
+        assert_eq!(scorer.score(text, &span), 0);
+
+        // A pattern that fits the window still fires.
+        let negatives = vec![(
+            Regex::new("aaa$").expect("compiles"),
+            "aaa$".to_owned(),
+        )];
+        let scorer = RuleScorer::compile(5, &[], negatives).expect("compiles");
+        assert_eq!(scorer.score(text, &span), NEGATIVE_CLASS_SCORE);
     }
 }
