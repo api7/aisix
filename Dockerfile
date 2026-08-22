@@ -32,7 +32,11 @@
 # container restarts.
 
 # --- Stage 1: build ----------------------------------------------------------
-FROM rust:1.93-bookworm AS builder
+# Trixie (not bookworm): the semantic guardrail's prebuilt onnxruntime
+# static libraries are compiled against glibc >= 2.38 (`__isoc23_*`
+# symbols) and a GCC-13+ libstdc++ — bookworm's glibc 2.36 cannot link
+# them. The runtime stage must stay on the same-or-newer glibc.
+FROM rust:1.93-trixie AS builder
 
 # protoc is required by dependencies that use prost/tonic-build.
 RUN apt-get update \
@@ -140,7 +144,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 #
 # Model: ibm-granite/granite-embedding-97m-multilingual-r2 (Apache-2.0),
 # official int8 ONNX export (`onnx/model_quint8_avx2.onnx`) + tokenizer.
-FROM debian:bookworm-slim AS guardrail-model
+FROM debian:trixie-slim AS guardrail-model
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
@@ -160,7 +164,9 @@ RUN set -eu; \
     done
 
 # --- Stage 2: runtime --------------------------------------------------------
-FROM debian:bookworm-slim AS runtime
+# trixie-slim to match the builder's glibc (see the builder stage note);
+# a binary linked against glibc 2.41 symbols cannot run on bookworm.
+FROM debian:trixie-slim AS runtime
 
 # Ownership-verification label for the MCP Registry: when this image is
 # published as an MCP server entry, the registry requires this label to
