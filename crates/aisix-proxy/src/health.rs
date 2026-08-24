@@ -34,11 +34,18 @@ static TEXT_PLAIN_UTF8: HeaderValue = HeaderValue::from_static("text/plain; char
 pub struct LivezState {
     shutting_down: AtomicBool,
     /// Requests currently being served on the proxy listener, raised and
-    /// lowered by the telemetry middleware's RAII guard. Read by the
-    /// shutdown coordinator to decide when closing the listener can no
-    /// longer interrupt anything; a streaming response keeps its slot for
-    /// as long as bytes may still flow.
+    /// lowered by the telemetry middleware's RAII guard. Reported on the
+    /// drain heartbeat so an operator can watch the tail empty; a
+    /// streaming response keeps its slot for as long as bytes may still
+    /// flow.
     in_flight: AtomicUsize,
+    /// Downstream connections currently open on the proxy listener,
+    /// raised and lowered by the acceptor's RAII guard. Distinct from
+    /// `in_flight` and not derivable from it: a pooled connection sitting
+    /// idle carries no request, and during a drain a count that stays up
+    /// while `in_flight` falls is what tells an operator the load
+    /// balancer has not stopped routing here yet (AISIX-Cloud#1394).
+    connections: AtomicUsize,
 }
 
 impl LivezState {
@@ -70,6 +77,28 @@ impl LivezState {
     /// Requests in flight right now.
     pub fn in_flight(&self) -> usize {
         self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Raise the open-connection count. Pair with
+    /// [`Self::connection_closed`]; the acceptor does that through a
+    /// `Drop` guard carried by the accepted stream.
+    pub fn connection_opened(&self) {
+        self.connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Lower the open-connection count, saturating at zero for the same
+    /// reason [`Self::leave`] does.
+    pub fn connection_closed(&self) {
+        let _ = self
+            .connections
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+    }
+
+    /// Downstream connections open right now.
+    pub fn open_connections(&self) -> usize {
+        self.connections.load(Ordering::Relaxed)
     }
 
     fn shutdown_check(&self) -> Result<(), &'static str> {

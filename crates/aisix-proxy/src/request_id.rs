@@ -1,4 +1,4 @@
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderName, HeaderValue};
 use axum::middleware::Next;
 use axum::response::Response;
@@ -17,6 +17,21 @@ pub(crate) const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-aisi
 pub(crate) fn new_request_id() -> String {
     Uuid::new_v4().to_string()
 }
+
+/// The correlation id a fronting proxy stamps on the requests it
+/// forwards. `x-request-id` is what Envoy, nginx and the ingresses built
+/// on them all emit by default, which is why it is fixed here rather than
+/// configurable.
+///
+/// It is **recorded, never adopted**: whether a caller-supplied id becomes
+/// this gateway's own `request_id` stays governed by
+/// `proxy.request_id.accept_headers`, which by default takes only
+/// `x-aisix-request-id`. So a deployment behind an ingress logs two ids
+/// that mean different things — the ingress's `downstream_request_id` and
+/// the gateway's `request_id` — and neither can be mistaken for the other.
+/// When an operator does list this header in `accept_headers`, the two
+/// carry the same value, which is the honest report of what happened.
+const DOWNSTREAM_REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
 
 /// Longest caller-supplied request id accepted. Matches cp-api's
 /// `maxRequestIDLen`.
@@ -70,6 +85,18 @@ fn client_request_id(headers: &axum::http::HeaderMap, accept: &[HeaderName]) -> 
     None
 }
 
+/// The fronting proxy's own request id, when it sent an acceptable one.
+///
+/// Screened by the same [`is_acceptable`] rule as an adopted id: this
+/// value is written into logs verbatim, so it has to be visible ASCII of
+/// bounded length whether or not the gateway ever hands it back.
+fn downstream_request_id(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(&DOWNSTREAM_REQUEST_ID_HEADER)
+        .and_then(|raw| raw.to_str().ok())
+        .filter(|id| is_acceptable(id))
+}
+
 /// The per-request correlation id, stashed in the request extensions by
 /// [`ensure_request_id`] so every handler resolves the SAME id for both
 /// its usage event and the response header. Handlers with a
@@ -113,6 +140,25 @@ pub(crate) struct RequestId(pub String);
 /// across an await would leak the span onto whatever else the executor
 /// runs on this thread.
 ///
+/// Two connection-level identities ride the same span, for the same
+/// reason and with the same reach — the access log, the per-attempt
+/// `provider call completed` line, and every diagnostic in between:
+///
+/// - `peer`, the accepted socket's remote address INCLUDING its port. It
+///   is deliberately not the resolved client IP that
+///   [`ClientContext::source_ip`](crate::client_ip::ClientContext) already
+///   carries: that one answers "who is the caller", follows
+///   `proxy.real_ip`, and has no port. This one answers "which TCP
+///   connection", and the port is the whole of its value — behind a
+///   layer-4 load balancer with the gateway on the host network it is the
+///   only field that joins a gateway log line to the fronting proxy's
+///   record of the same connection.
+/// - `downstream_request_id`, from [`DOWNSTREAM_REQUEST_ID_HEADER`], so a
+///   trace id minted before the gateway can be searched for here.
+///
+/// Both are recorded rather than declared, so a request that carried
+/// neither logs neither field instead of an empty one.
+///
 /// Response-body streams (SSE) are polled after this middleware returns,
 /// so they fall outside the span. Generators that moderate streamed
 /// output re-attach it explicitly — see `chat::build_sse_stream`.
@@ -142,7 +188,21 @@ pub(crate) async fn ensure_request_id(
             remote,
         )));
 
-    let span = tracing::info_span!("request", request_id = %id);
+    let span = tracing::info_span!(
+        "request",
+        request_id = %id,
+        peer = tracing::field::Empty,
+        downstream_request_id = tracing::field::Empty,
+    );
+    if let Some(peer) = request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+    {
+        span.record("peer", tracing::field::display(peer.0));
+    }
+    if let Some(downstream) = downstream_request_id(request.headers()) {
+        span.record("downstream_request_id", downstream);
+    }
     let mut response = next.run(request).instrument(span).await;
 
     // If the handler already stamped the header (from the same id), keep

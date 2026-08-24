@@ -537,6 +537,21 @@ async fn record_request_telemetry(
         inbound_protocol_for_endpoint(endpoint),
     );
     let drain = DrainGuard::new(state.livez.clone());
+    // Arrival is only logged while draining, where it is the one window in
+    // which a request can leave no trace at all: everything else this
+    // gateway writes about a request is written when the request ENDS, and
+    // a request still running when the platform's grace period expires
+    // never gets there. Its `peer` and ids come from the request span
+    // (see request_id.rs), which is what makes the line joinable to the
+    // fronting proxy's record of the same request. Steady-state logging
+    // volume is unchanged.
+    if state.livez.is_shutting_down() {
+        tracing::info!(
+            method = %request.method(),
+            path = %request.uri().path(),
+            "request arrived while draining"
+        );
+    }
     let mut response = attribution::scope(attribution, next.run(request)).await;
     guard.armed = false;
     // Sampled AFTER the handler, not before: a request that arrived just
@@ -574,6 +589,15 @@ fn hold_until_body_done(response: Response, drain: DrainGuard) -> Response {
 /// HTTP/2 has no such header (it is a connection-specific field, forbidden
 /// by RFC 9113 §8.2.2); its drain signal is the GOAWAY that hyper emits
 /// when the listener does shut down.
+///
+/// It cannot retire a **streaming** connection at all, and no change to
+/// this function can. A streamed response returns from the handler at the
+/// first token, so its head — this header included — is already committed
+/// and on the wire; a stream whose head went out before the signal will
+/// therefore never carry `Connection: close` however long it runs
+/// afterwards, and an LLM stream routinely runs for minutes
+/// (AISIX-Cloud#1394). Retiring those connections is the listener's
+/// shutdown to do, not this header's.
 fn retire_connection(version: &axum::http::Version, response: &mut Response) {
     if *version == axum::http::Version::HTTP_2 || *version == axum::http::Version::HTTP_3 {
         return;

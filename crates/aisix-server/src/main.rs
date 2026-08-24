@@ -1188,6 +1188,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             cancel_rx.clone(),
             "admin",
             None,
+            None,
         )))
     } else {
         // Drop unused shared components so the compiler can see they
@@ -1234,6 +1235,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 cancel_rx.clone(),
                 "metrics",
                 None,
+                None,
             )))
         } else {
             None
@@ -1255,6 +1257,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         cancel_rx.clone(),
         "proxy",
         proxy_workers,
+        // Only the proxy listener's connections are counted: the drain is
+        // about client traffic, and folding the platform's probes into the
+        // number would report a connection nobody is waiting on.
+        Some(livez_state.clone()),
     );
 
     // Step 10: shutdown coordinator. Whichever of (signal, proxy, admin)
@@ -1658,6 +1664,134 @@ fn background_check_interval(snapshot: &aisix_core::AisixSnapshot) -> std::time:
 const DOWNSTREAM_NODELAY: axum_server::accept::NoDelayAcceptor =
     axum_server::accept::NoDelayAcceptor;
 
+/// Wraps [`DOWNSTREAM_NODELAY`] to keep [`LivezState::open_connections`]
+/// current, and to say so when a connection arrives after the shutdown
+/// signal.
+///
+/// Accepting is the only place either fact is observable, and during a
+/// drain the two together answer a question the logs otherwise cannot:
+/// whether what is keeping the process busy is work it had already taken
+/// on, or traffic a load balancer is still routing here
+/// (AISIX-Cloud#1394).
+///
+/// `drain` is `None` for the admin and metrics listeners, which are
+/// control surfaces: their probes would otherwise be counted as client
+/// connections a drain is waiting on.
+#[derive(Clone)]
+struct CountedAcceptor {
+    nodelay: axum_server::accept::NoDelayAcceptor,
+    drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
+}
+
+impl CountedAcceptor {
+    fn new(
+        nodelay: axum_server::accept::NoDelayAcceptor,
+        drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
+    ) -> Self {
+        Self { nodelay, drain }
+    }
+}
+
+/// Holds a connection's slot in the open-connection count for as long as
+/// the accepted stream lives.
+struct ConnectionGuard(std::sync::Arc<aisix_proxy::LivezState>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.connection_closed();
+    }
+}
+
+/// An accepted stream that lowers the open-connection count when the
+/// connection task drops it. `TcpStream` is `Unpin`, so the delegation
+/// needs no pin projection.
+struct CountedStream {
+    inner: tokio::net::TcpStream,
+    _guard: Option<ConnectionGuard>,
+}
+
+impl tokio::io::AsyncRead for CountedStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for CountedStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+impl<S> axum_server::accept::Accept<tokio::net::TcpStream, S> for CountedAcceptor {
+    type Stream = CountedStream;
+    type Service = S;
+    type Future = std::future::Ready<std::io::Result<(Self::Stream, Self::Service)>>;
+
+    fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
+        let accepted = axum_server::accept::Accept::<tokio::net::TcpStream, S>::accept(
+            &self.nodelay,
+            stream,
+            service,
+        )
+        .into_inner();
+        std::future::ready(accepted.map(|(stream, service)| {
+            let guard = self.drain.as_ref().map(|drain| {
+                drain.connection_opened();
+                if drain.is_shutting_down() {
+                    tracing::info!(
+                        peer = stream.peer_addr().ok().map(tracing::field::display),
+                        open_connections = drain.open_connections(),
+                        "accepted a new connection while draining — the load \
+                         balancer is still routing here"
+                    );
+                }
+                ConnectionGuard(drain.clone())
+            });
+            (
+                CountedStream {
+                    inner: stream,
+                    _guard: guard,
+                },
+                service,
+            )
+        }))
+    }
+}
+
 /// Completes when the process receives SIGINT or SIGTERM (best-effort on
 /// Windows — Ctrl+C only) OR when another part of the system has already
 /// flipped the cancel channel.
@@ -1671,6 +1805,7 @@ const DOWNSTREAM_NODELAY: axum_server::accept::NoDelayAcceptor =
 /// Both variants run on `axum_server` rather than `axum::serve` because
 /// only the former exposes the hyper connection builder, which is where
 /// `downstream.idle_timeout_secs` has to be applied (AISIX-Cloud#1126).
+#[allow(clippy::too_many_arguments)]
 async fn serve_http(
     addr: std::net::SocketAddr,
     router: axum::Router,
@@ -1679,6 +1814,7 @@ async fn serve_http(
     cancel: watch::Receiver<bool>,
     label: &'static str,
     workers: Option<usize>,
+    drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
 ) -> anyhow::Result<()> {
     // Resolved before binding so a bad cert path still fails with the
     // same error it always did, before a port is taken.
@@ -1708,6 +1844,7 @@ async fn serve_http(
             cancel,
             label,
             workers,
+            drain,
         )
         .await;
     }
@@ -1738,7 +1875,7 @@ async fn serve_http(
         None => {
             tracing::info!(%addr, label, "aisix listening (http)");
             let mut server = axum_server::from_tcp(listener)
-                .acceptor(DOWNSTREAM_NODELAY)
+                .acceptor(CountedAcceptor::new(DOWNSTREAM_NODELAY, drain))
                 .handle(handle);
             apply_idle_timeout(server.http_builder(), idle_timeout);
             server.serve(make_service).await?;
@@ -1746,7 +1883,7 @@ async fn serve_http(
         Some(tls_config) => {
             tracing::info!(%addr, label, "aisix listening (https)");
             let mut server = axum_server::from_tcp_rustls(listener, tls_config)
-                .map(|tls| tls.acceptor(DOWNSTREAM_NODELAY))
+                .map(|tls| tls.acceptor(CountedAcceptor::new(DOWNSTREAM_NODELAY, drain)))
                 .handle(handle);
             apply_idle_timeout(server.http_builder(), idle_timeout);
             server.serve(make_service).await?;
@@ -1771,6 +1908,7 @@ async fn serve_http(
 /// 4-tuple. That spreads evenly across many client connections and
 /// unevenly across few, which is why the mode is documented as a
 /// throughput setting rather than a latency one.
+#[allow(clippy::too_many_arguments)]
 async fn serve_http_tpc(
     addr: std::net::SocketAddr,
     router: axum::Router,
@@ -1779,6 +1917,7 @@ async fn serve_http_tpc(
     cancel: watch::Receiver<bool>,
     label: &'static str,
     workers: usize,
+    drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
 ) -> anyhow::Result<()> {
     // An address someone else already holds has to stay a loud boot
     // failure. Every socket on a `SO_REUSEPORT` address has to set the
@@ -1811,6 +1950,10 @@ async fn serve_http_tpc(
         let cancel = cancel.clone();
         let tls_config = tls_config.clone();
         let exit_tx = exit_tx.clone();
+        // Every worker raises and lowers the same process-wide count, so
+        // the drain heartbeat reports the listener as a whole rather than
+        // whichever worker happened to accept.
+        let drain = drain.clone();
         std::thread::Builder::new()
             // Names the mode in `ps -T` / `top -H`: `tpc-N` here,
             // tokio's own `tokio-rt-worker` on the shared runtime.
@@ -1830,6 +1973,7 @@ async fn serve_http_tpc(
                     cancel,
                     label,
                     worker,
+                    drain,
                 ));
             })?;
     }
@@ -1898,6 +2042,7 @@ fn run_tpc_worker(
     cancel: watch::Receiver<bool>,
     label: &'static str,
     worker: usize,
+    drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1923,7 +2068,7 @@ fn run_tpc_worker(
             None => {
                 tracing::info!(%addr, label, worker, "aisix listening (http, thread-per-core)");
                 let mut server = axum_server::from_tcp(listener)
-                    .acceptor(DOWNSTREAM_NODELAY)
+                    .acceptor(CountedAcceptor::new(DOWNSTREAM_NODELAY, drain))
                     .handle(handle);
                 apply_idle_timeout(server.http_builder(), idle_timeout);
                 server.serve(make_service).await?;
@@ -1931,7 +2076,7 @@ fn run_tpc_worker(
             Some(tls_config) => {
                 tracing::info!(%addr, label, worker, "aisix listening (https, thread-per-core)");
                 let mut server = axum_server::from_tcp_rustls(listener, tls_config)
-                    .map(|tls| tls.acceptor(DOWNSTREAM_NODELAY))
+                    .map(|tls| tls.acceptor(CountedAcceptor::new(DOWNSTREAM_NODELAY, drain)))
                     .handle(handle);
                 apply_idle_timeout(server.http_builder(), idle_timeout);
                 server.serve(make_service).await?;
@@ -2057,6 +2202,7 @@ async fn wait_for_signal(
     tracing::info!(
         min_drain_secs = min_drain.as_secs(),
         in_flight = livez_state.in_flight(),
+        open_connections = livez_state.open_connections(),
         "draining — /readyz now reports 503, still accepting new connections"
     );
 
@@ -2079,7 +2225,16 @@ async fn wait_for_signal(
             break;
         }
         if last_log.elapsed() >= DRAIN_LOG_INTERVAL {
-            tracing::info!(in_flight, "still draining in-flight requests");
+            // The open-connection count next to it separates the two
+            // reasons a drain does not end: requests this gateway already
+            // took on, versus a load balancer still routing here — only
+            // the second of which is a balancer problem
+            // (AISIX-Cloud#1394).
+            tracing::info!(
+                in_flight,
+                open_connections = livez_state.open_connections(),
+                "still draining in-flight requests"
+            );
             last_log = std::time::Instant::now();
         }
         tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
