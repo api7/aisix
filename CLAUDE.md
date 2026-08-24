@@ -155,6 +155,12 @@ Anchor on a release that has **already shipped**, never on a guess at the next v
 
 `crates/aisix-core/tests/compat_debt.rs` is the gate. It runs in the required `rust unit + coverage` job on every PR, and fails once a stable tag with a higher `MAJOR.MINOR` than the anchor exists; release candidates never count as shipped, and a patch on the anchor's own line does not come due. When it fires, either remove the code and its marker and close the tracking issue, or re-anchor deliberately to the newest release and say why in the issue. Full rules, including how a `release/X.Y` maintenance line is scoped, live in that file's module docs.
 
+## A Retired Startup-Config Key Is Tombstoned, Never Deleted
+
+**`Config` and its blocks are `deny_unknown_fields`, so deleting a startup-config field stops every gateway whose `config.yaml` still carries it from booting** — including everyone who copied it out of `config.example.yaml` and never turned it on. Removing the key is a far larger break than the dead setting ever was.
+
+Retire it instead: drop the block from `config.example.yaml` / `config.managed.yaml` so nobody discovers it again; keep the field parsing, with a doc comment saying it is consumed and ignored; make it `Option<…>`, because serde cannot otherwise tell a config that omits the block from one that wrote it out with default values; and name it in the block's `retired_settings` (see `ObservabilityConfig`) so boot warns once per key the operator actually wrote, pointing at where the capability really lives. Warn on the key being **present**, not on `enabled: true` — the copied-in disabled block is precisely the one to delete. Parsed-and-ignored is fine; parsed-and-silent is the bug (AISIX-Cloud#1380).
+
 ## AISIX Product Terminology
 
 Use the following terms in public prose, generated API descriptions, release

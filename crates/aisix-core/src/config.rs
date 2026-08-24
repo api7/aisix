@@ -842,10 +842,40 @@ pub struct ObservabilityConfig {
     #[serde(default = "ObservabilityConfig::default_access_log")]
     pub access_log: bool,
     pub metrics: MetricsConfig,
-    pub tracing: TracingConfig,
+    /// Retired; see [`TracingConfig`]. `Option` on purpose: serde cannot
+    /// otherwise tell a config that omits the block from one that wrote it
+    /// out with default values, and the boot warning has to fire only for
+    /// the operator who actually carries it.
+    pub tracing: Option<TracingConfig>,
 }
 
 impl ObservabilityConfig {
+    /// Messages for settings that are still parsed but do nothing, one per
+    /// key the operator actually wrote. The bootstrap warns with these once
+    /// at startup: the config keeps loading, but "I configured it and saw
+    /// no complaint" must not read as "it is working" (AISIX-Cloud#1380).
+    pub fn retired_settings(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.tracing.is_some() {
+            out.push(
+                "observability.tracing.otlp is set but does nothing: this gateway has \
+                 never had a built-in OTLP tracer, and the block has been removed from \
+                 the shipped example configs. Delete it. Traces are exported by an \
+                 `observability_exporters` entry with kind = otlp_http, declared in \
+                 your resources file or configured in AISIX Cloud.",
+            );
+        }
+        if self.metrics.otlp.is_some() {
+            out.push(
+                "observability.metrics.otlp is set but does nothing: this gateway does \
+                 not push OTLP metrics, and the block has been removed from the shipped \
+                 example configs. Delete it. Metrics are served on the Prometheus \
+                 endpoint at observability.metrics.prometheus.addr.",
+            );
+        }
+        out
+    }
+
     fn default_service_name() -> String {
         "aisix".into()
     }
@@ -861,7 +891,9 @@ impl ObservabilityConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct MetricsConfig {
     pub prometheus: PrometheusConfig,
-    pub otlp: OtlpConfig,
+    /// Retired; see [`OtlpConfig`]. `Option` for the same reason as
+    /// [`ObservabilityConfig::tracing`].
+    pub otlp: Option<OtlpConfig>,
     /// Operator-defined User-Agent → `client_type` mapping rules
     /// (AISIX-Cloud#1045), consulted BEFORE the built-in allowlist so a
     /// deployment can classify in-house tools (or re-bucket a built-in
@@ -948,6 +980,15 @@ impl Default for PrometheusConfig {
     }
 }
 
+/// Tombstone: `observability.metrics.otlp` is consumed and ignored, and
+/// warned about at boot ([`ObservabilityConfig::retired_settings`]). The
+/// gateway has never pushed OTLP metrics — the block was a placeholder no
+/// code ever read (AISIX-Cloud#1380). It is gone from the shipped example
+/// files and stays parseable only so a config written against them still
+/// loads; `ObservabilityConfig` denies unknown fields, so deleting the
+/// field would stop those gateways booting over a setting that did
+/// nothing. Do not read it. AISIX-Cloud#1071 tracks the real feature,
+/// which will arrive under its own configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct OtlpConfig {
@@ -961,6 +1002,13 @@ pub struct TracingConfig {
     pub otlp: OtlpTracingConfig,
 }
 
+/// Tombstone: `observability.tracing.otlp` is consumed and ignored, and
+/// warned about at boot ([`ObservabilityConfig::retired_settings`]). Trace
+/// export is an `observability_exporters` entry with `kind = otlp_http`,
+/// resolved from the live resource snapshot — never a startup switch. The
+/// block was a placeholder no code ever read (AISIX-Cloud#1380); it is
+/// gone from the shipped example files and stays parseable only so a
+/// config written against them still loads. Do not read it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct OtlpTracingConfig {
@@ -1932,6 +1980,106 @@ admin:
             format!("{err}").contains("url_rewrites"),
             "error should name the bad rule: {err}"
         );
+    }
+
+    /// The two static OTLP blocks were placeholders no code ever read, and
+    /// are gone from the shipped example files (AISIX-Cloud#1380). They
+    /// stay parseable because `ObservabilityConfig` denies unknown fields:
+    /// dropping them would stop every gateway whose config still carries
+    /// the copied-in block — almost all of them, and all of them disabled.
+    /// Loading is not silent, though: boot warns for each key written.
+    #[test]
+    fn legacy_static_otlp_blocks_load_and_are_warned_about() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+observability:
+  metrics:
+    otlp:
+      enabled: true
+      endpoint: "http://127.0.0.1:4317"
+  tracing:
+    otlp:
+      enabled: true
+      endpoint: "http://127.0.0.1:4317"
+      sample_ratio: 1.0
+"#,
+        );
+        let cfg =
+            Config::load_from_path(Some(f.path())).expect("a config carrying the old blocks loads");
+        let warnings = cfg.observability.retired_settings();
+        assert_eq!(warnings.len(), 2, "both keys must be named: {warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("otlp_http")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("observability.metrics.prometheus.addr")));
+    }
+
+    /// The warning must fire on the block being *written*, not on it being
+    /// enabled — a copied-in `enabled: false` is exactly the config the
+    /// operator should delete, and is what almost everyone carries.
+    #[test]
+    fn a_disabled_legacy_otlp_block_is_still_warned_about() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+observability:
+  tracing:
+    otlp:
+      enabled: false
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.observability.retired_settings().len(), 1);
+    }
+
+    /// ...and stays quiet for a config that never had them, including the
+    /// shipped example files, which no longer carry the blocks at all.
+    #[test]
+    fn a_config_without_the_legacy_blocks_warns_about_nothing() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+observability:
+  metrics:
+    prometheus:
+      enabled: true
+      path: "/metrics"
+      addr: "0.0.0.0:9090"
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(cfg.observability.retired_settings().is_empty());
+
+        for shipped in [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.example.yaml"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.managed.yaml"),
+        ] {
+            let cfg = Config::load_from_path(Some(Path::new(shipped))).unwrap();
+            assert!(
+                cfg.observability.retired_settings().is_empty(),
+                "{shipped} must not ship a retired setting"
+            );
+        }
     }
 
     #[test]

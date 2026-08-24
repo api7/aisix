@@ -125,9 +125,6 @@ observability:
       # address; the endpoint is unauthenticated, so restrict access at
       # the network layer.
       addr: "0.0.0.0:9090"
-    otlp:
-      enabled: false
-      endpoint: "http://127.0.0.1:4317"
     # Optional User-Agent -> client_type mapping rules for the
     # aisix_llm_tokens_by_client_total metric. Tried in order (first match
     # wins) BEFORE the built-in client allowlist, so you can classify
@@ -163,11 +160,6 @@ observability:
     #   request_e2e_latency: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 420, 600]
     #   request_ttft: [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300]
     #   guardrail_latency: [0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30]
-  tracing:
-    otlp:
-      enabled: false
-      endpoint: "http://127.0.0.1:4317"
-      sample_ratio: 1.0
 
 # Managed-mode switch. Uncomment when connecting the gateway to
 # AISIX Cloud: the admin API and Playground will NOT be bound — all
