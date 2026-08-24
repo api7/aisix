@@ -1535,6 +1535,9 @@ fn guardrail_kind_description(kind: &str) -> Option<&'static str> {
             Some("Guardrail provider type for Azure text moderation.")
         }
         "aliyun_text_moderation" => Some("Guardrail provider type for Aliyun text moderation."),
+        "aliyun_ai_guardrail" => {
+            Some("Guardrail provider type for Aliyun AI Guardrails policy-driven moderation.")
+        }
         "pii" => {
             Some("Guardrail provider type for in-process sensitive-data detection and redaction.")
         }
@@ -4655,5 +4658,36 @@ mod tests {
         });
         let err = validate_model(&v).unwrap_err();
         assert!(err.message.contains("`retries`"), "{err:?}");
+    }
+
+    /// Every guardrail kind describes itself, and no two kinds share a
+    /// sentence. The generated Admin API reference has no other source for
+    /// these descriptions: a kind left undescribed here once inherited its
+    /// neighbour's text from a positional backfill list in the OpenAPI
+    /// assembly, documenting one provider as an unrelated one (#1037).
+    #[test]
+    fn every_guardrail_kind_carries_its_own_description() {
+        let schema = guardrail_root_schema();
+        let branches = schema["oneOf"]
+            .as_array()
+            .expect("the guardrail schema is a `oneOf` over the kinds");
+        let mut by_description: std::collections::BTreeMap<&str, &str> =
+            std::collections::BTreeMap::new();
+        for branch in branches {
+            let kind = branch["properties"]["kind"]["enum"][0]
+                .as_str()
+                .expect("each branch pins exactly one kind");
+            let description = branch["properties"]["kind"]["description"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "guardrail kind `{kind}` has no description; \
+                         add an arm to `guardrail_kind_description`"
+                    )
+                });
+            if let Some(other) = by_description.insert(description, kind) {
+                panic!("`{kind}` and `{other}` share one description: {description}");
+            }
+        }
     }
 }

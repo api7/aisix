@@ -2292,42 +2292,6 @@ fn add_missing_property_descriptions(doc: &mut Value) {
             "Latency mode that stops waiting after `timeout_ms`.",
         ),
         (
-            "/components/schemas/Guardrail/oneOf/0/properties/kind",
-            "Guardrail provider type for literal and regular expression matching.",
-        ),
-        (
-            "/components/schemas/Guardrail/oneOf/1/properties/kind",
-            "Guardrail provider type for Amazon Bedrock Guardrails.",
-        ),
-        (
-            "/components/schemas/Guardrail/oneOf/2/properties/kind",
-            "Guardrail provider type for Azure Prompt Shield.",
-        ),
-        (
-            "/components/schemas/Guardrail/oneOf/3/properties/kind",
-            "Guardrail provider type for Azure text moderation.",
-        ),
-        (
-            "/components/schemas/Guardrail/oneOf/4/properties/kind",
-            "Guardrail provider type for Aliyun text moderation.",
-        ),
-        (
-            "/components/schemas/Guardrail/oneOf/5/properties/kind",
-            "Guardrail provider type for in-process sensitive-data detection and redaction.",
-        ),
-        (
-            "/components/schemas/Guardrail/oneOf/6/properties/kind",
-            "Guardrail provider type for Lakera Guard screening.",
-        ),
-        (
-            "/components/schemas/Guardrail/oneOf/7/properties/kind",
-            "Guardrail provider type for the OpenAI Moderation API.",
-        ),
-        (
-            "/components/schemas/Guardrail/oneOf/8/properties/kind",
-            "Guardrail provider type for PII detection and anonymization by a customer-run Presidio.",
-        ),
-        (
             "/components/schemas/KeywordPattern/oneOf/0/properties/kind",
             "Pattern type for matching the value as plain text.",
         ),

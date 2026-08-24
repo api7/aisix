@@ -992,6 +992,7 @@
           "description": "Where in the lifecycle this rule runs."
         },
         "kind": {
+          "description": "Guardrail provider type for Aliyun AI Guardrails policy-driven moderation.",
           "enum": [
             "aliyun_ai_guardrail"
           ],
