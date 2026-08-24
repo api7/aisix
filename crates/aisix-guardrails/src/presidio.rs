@@ -1,5 +1,5 @@
-//! kind=presidio guardrail dispatcher (#52) — self-hosted Microsoft
-//! Presidio PII detection + anonymization.
+//! kind=presidio guardrail dispatcher (#52) — PII detection +
+//! anonymization by a customer-run Presidio.
 //!
 //! Two-step API (customer-run containers, no vendor secret):
 //! - `POST {analyzer_url}/analyze` `{ text, language, entities?,
@@ -7,7 +7,7 @@
 //! - `POST {anonymizer_url}/anonymize` `{ text, analyzer_results,
 //!   anonymizers }` → `{ text, items: [{ entity_type, ... }] }`
 //!
-//! Source: <https://microsoft.github.io/presidio/api-docs/api-docs.html>
+//! Source: <https://presidio.dataprivacystack.org/api-docs/api-docs.html>
 //!
 //! Decision rule (per-entity actions, same shape as `kind: "pii"`):
 //! - any detected entity whose effective action is `block` → Block;
@@ -90,7 +90,7 @@ pub struct PresidioGuardrail {
 /// The anonymizer operator payload for one operator name. Presidio's
 /// `/anonymize` takes `{"anonymizers": {"DEFAULT": { "type": ... }}}`;
 /// unknown names are rejected at build time (`BuildError::InvalidValue`).
-/// Source: <https://microsoft.github.io/presidio/anonymizer/>
+/// Source: <https://presidio.dataprivacystack.org/anonymizer/>
 pub fn operator_config(operator: &str) -> Option<serde_json::Value> {
     match operator {
         // Presidio's default: replace the span with `<ENTITY_TYPE>`.

@@ -13,8 +13,8 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: the `presidio` guardrail (#52) — self-hosted Microsoft Presidio
-// PII detection + anonymization, two-step analyze→anonymize. We stand up
+// E2E: the `presidio` guardrail (#52) — PII detection + anonymization
+// by a customer-run Presidio, two-step analyze→anonymize. We stand up
 // ONE mock server implementing both `/analyze` (detects EMAIL occurrences
 // as EMAIL_ADDRESS with offsets, SSN-shaped digits as US_SSN) and
 // `/anonymize` (applies the requested operator: replace → <ENTITY_TYPE>,
@@ -24,7 +24,7 @@ import {
 // reassembly catches it); the hash operator; analyzer 5xx fail-open.
 //
 // References:
-// - Presidio API <https://microsoft.github.io/presidio/api-docs/api-docs.html>
+// - Presidio API <https://presidio.dataprivacystack.org/api-docs/api-docs.html>
 // - LiteLLM `presidio` (behavior baseline): per-entity MASK/BLOCK,
 //   language, skip-empty-text. Operator selection is our superset.
 

@@ -649,8 +649,8 @@ pub struct PresidioEntityConfig {
     pub action: Option<String>,
 }
 
-/// Config block for `kind: "presidio"`. Calls a self-hosted Microsoft
-/// Presidio analyzer to find PII entities and, when the effective action is
+/// Config block for `kind: "presidio"`. Calls a customer-run Presidio
+/// analyzer to find PII entities and, when the effective action is
 /// `mask`, calls the anonymizer to rewrite text before traffic continues.
 /// `block` rejects with the standard 422 content-filter envelope.
 ///
@@ -973,7 +973,7 @@ pub enum GuardrailKind {
     /// guardrail is detection-only and never rewrites content. Applies on
     /// input, output, or both, including buffered streaming output.
     OpenaiModeration(OpenaiModerationConfig),
-    /// Self-hosted Microsoft Presidio PII detection and anonymization.
+    /// PII detection and anonymization by a customer-run Presidio.
     /// Analyzer entities can mask or block per entity, and masked entities
     /// use the selected anonymize operator. Applies on input, output, or both,
     /// including buffered streaming output.
