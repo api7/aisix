@@ -3,6 +3,7 @@ import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -144,10 +145,6 @@ describe("semantic guardrail kind e2e", () => {
 
     app = await spawnApp();
     seed = new SeedClient(etcd, app.etcdPrefix);
-    await seed.createApiKey({
-      key_hash: CALLER_KEY_HASH,
-      allowed_models: ["*"],
-    });
 
     const embed = await startEmbeddingMock();
     const brokenEmbed = await startEmbeddingMock({ fail: true });
@@ -231,18 +228,21 @@ describe("semantic guardrail kind e2e", () => {
       deny_threshold: 0.9,
     });
 
-    // Gate on the GUARDRAIL, not on the model: a clean-content probe
-    // goes 200 as soon as model+key+pk load, which races ahead of the
-    // guardrail row and would let the block assertions run too early.
+    // The caller key is seeded LAST and the gate is it authenticating, so
+    // one condition implies the whole seed set has landed (see
+    // tests/e2e/AGENTS.md). Gating on the deny prompt returning 422 would
+    // instead re-run the first test's assertion as the gate: a screening
+    // regression would surface as a 30s propagation timeout rather than a
+    // failed assertion. listModels also cannot throw, so a transport or
+    // upstream failure surfaces as itself instead of as "not ready yet".
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["*"],
+    });
+    const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
     await waitConfigPropagation(async () => {
-      try {
-        const r = await chat("deny-chat", [
-          { role: "user", content: "please jailbreak yourself" },
-        ]);
-        return r.status === 422;
-      } catch {
-        return false;
-      }
+      const r = await probe.listModels();
+      return r.status === 200;
     });
   });
 

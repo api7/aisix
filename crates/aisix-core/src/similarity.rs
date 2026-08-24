@@ -39,11 +39,13 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// (`Vec<f32>` here, `Arc<Vec<f32>>` in the routing cache) and neither
 /// should have to allocate a temporary to be scored.
 ///
-/// A non-finite fold result is clamped to `0.0`: [`cosine_similarity`]
-/// itself never returns `NaN`, but an f32 magnitude that overflows to
-/// infinity could, and a `NaN` score compares false against every
-/// threshold — it would read as "no match" on a deny list and as "no
-/// match" on an allow list, which are opposite failure directions.
+/// A non-finite score is SKIPPED, not folded in. [`cosine_similarity`]
+/// returns `NaN` when a component overflows f32 to infinity (`inf / inf`),
+/// and every comparison against `NaN` is false — so a naive `current >=
+/// score` fold lets one poisoned prototype evict a perfectly good score
+/// that came before it. Skipping keeps the surviving prototypes'
+/// verdict. `None` still means "no prototype scored", which now also
+/// covers "every prototype scored non-finite".
 pub fn best_similarity<'a>(
     probe: &[f32],
     prototypes: impl IntoIterator<Item = &'a [f32]>,
@@ -51,12 +53,14 @@ pub fn best_similarity<'a>(
     let mut best: Option<f32> = None;
     for p in prototypes {
         let score = cosine_similarity(probe, p);
-        best = Some(match best {
-            Some(current) if current >= score => current,
-            _ => score,
-        });
+        if !score.is_finite() {
+            continue;
+        }
+        if best.is_none_or(|current| score > current) {
+            best = Some(score);
+        }
     }
-    best.map(|b| if b.is_finite() { b } else { 0.0 })
+    best
 }
 
 #[cfg(test)]
@@ -97,6 +101,28 @@ mod tests {
     #[test]
     fn best_similarity_is_none_without_prototypes() {
         let protos: Vec<Vec<f32>> = Vec::new();
+        assert_eq!(best_similarity(&[1.0, 0.0], slices(&protos)), None);
+    }
+
+    #[test]
+    fn best_similarity_skips_a_poisoned_prototype() {
+        // A prototype carrying a component that overflowed f32 to
+        // infinity (a provider magnitude f32 cannot hold) scores
+        // `inf / inf` = NaN. It must not evict the exact match that came
+        // before it — the naive `current >= score` fold did exactly that,
+        // because every comparison against NaN is false.
+        let protos = vec![vec![1.0, 0.0], vec![f32::INFINITY, 0.0]];
+        assert!(cosine_similarity(&[1.0, 0.0], &protos[1]).is_nan());
+        let got = best_similarity(&[1.0, 0.0], slices(&protos)).unwrap();
+        assert!(
+            (got - 1.0).abs() < 1e-6,
+            "poisoned prototype evicted the match: {got}"
+        );
+    }
+
+    #[test]
+    fn best_similarity_is_none_when_every_prototype_is_poisoned() {
+        let protos = vec![vec![f32::INFINITY, 0.0]];
         assert_eq!(best_similarity(&[1.0, 0.0], slices(&protos)), None);
     }
 

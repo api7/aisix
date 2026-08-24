@@ -938,7 +938,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 tracing::warn!(
                     var = retired,
                     "retired MVP env var is set and ignored; the smart-redaction guardrail \
-                     is configured per category on the guardrail resource (kind \"semantic\")"
+                     is configured per category on the guardrail resource (kind \"smart_redaction\")"
                 );
             }
         }
@@ -984,13 +984,13 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                         model_dir = %dir.display(),
                         error = %err,
                         "bundled smart-redaction guardrail model failed verification; \
-                         this node will not serve kind \"semantic\""
+                         this node will not serve kind \"smart_redaction\""
                     );
                 } else {
                     tracing::info!(
                         model_dir = %dir.display(),
                         "no smart-redaction guardrail model bundle; \
-                         this node will not serve kind \"semantic\""
+                         this node will not serve kind \"smart_redaction\""
                     );
                 }
                 (aisix_guardrails::LocalModelRuntimeSlot::none(), None)
