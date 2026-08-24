@@ -10154,7 +10154,7 @@ data: [DONE]\n\n";
     /// model files are needed; the test runtime's engine never loads.
     #[cfg(feature = "local-model-guardrail")]
     #[tokio::test]
-    async fn chat_enforced_hits_attribute_the_semantic_row() {
+    async fn chat_enforced_hits_attribute_the_smart_redaction_row() {
         use aisix_obs::UsageSink;
 
         let upstream = MockServer::start().await;
@@ -10180,10 +10180,10 @@ data: [DONE]\n\n";
         let state = build_state(snap, hub);
         seed_guardrail(
             &state.snapshot,
-            "g-semantic",
+            "g-smart-redaction",
             r#"{
-                "name": "eda-semantic",
-                "kind": "semantic",
+                "name": "eda-smart-redaction",
+                "kind": "smart_redaction",
                 "hook_point": "both",
                 "categories": [{
                     "name": "eda_version",
@@ -10194,7 +10194,7 @@ data: [DONE]\n\n";
                 }]
             }"#,
         );
-        // The state constructors carry no semantic runtime; rebuild the
+        // The state constructors carry no local-model runtime; rebuild the
         // index with the modelless test runtime so the row compiles.
         let index = aisix_guardrails::LiveGuardrailIndex::new_with_sink(
             state.snapshot.clone(),
@@ -10227,7 +10227,7 @@ data: [DONE]\n\n";
             .iter()
             .find(|h| h.hook == "output")
             .unwrap_or_else(|| panic!("no output-hook enforced hit in {hits:?}"));
-        assert_eq!(hit.guardrail_name, "eda-semantic");
+        assert_eq!(hit.guardrail_name, "eda-smart-redaction");
         assert_eq!(hit.action, "masked");
         assert_eq!(hit.counts.get("eda_version").copied(), Some(1));
         assert_eq!(
