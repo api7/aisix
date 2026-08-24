@@ -48,8 +48,15 @@
 //!
 //! Behavior matrix (failure modes). The effective `fail_open` is the
 //! outer `Guardrail::fail_open` on the INPUT hook and the independent
-//! `SemanticConfig::output_fail_open` (default fail-closed) on the
-//! OUTPUT hook:
+//! `SemanticConfig::output_fail_open` on the OUTPUT hook.
+//!
+//! Those two defaults point in OPPOSITE directions, and the asymmetry is
+//! inherited rather than chosen here: the row-level `fail_open` defaults
+//! to `true` for every kind that can be unavailable, while
+//! `output_fail_open` defaults to `false`. So an unscreenable REQUEST is
+//! admitted by default and an unscreenable RESPONSE is refused. An
+//! operator who wants unscreenable requests refused sets
+//! `fail_open: false` on the row:
 //!
 //! | embedding dispatch      | `fail_open` | Verdict                              |
 //! |-------------------------|-------------|--------------------------------------|
