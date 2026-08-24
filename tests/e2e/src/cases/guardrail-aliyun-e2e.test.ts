@@ -236,6 +236,71 @@ describe("aliyun guardrail e2e: TextModerationPlus blocks risky input/output", (
     await aliyun?.close();
   });
 
+  // AISIX-Cloud#1381: the guardrail joins the conversation oldest-message
+  // -first and Aliyun caps one call at 2 000 characters. Clipping to that
+  // cap meant a long conversation had its NEWEST turn — the one carrying
+  // the request being screened — dropped before the call, and the request
+  // was released under a clean "none" verdict. The content past the cap
+  // must reach the mock, across as many calls as it takes.
+  test("risky content past the per-call cap is still scanned", async (ctx) => {
+    if (!etcdReachable || !app || !benignUpstream || !aliyun) {
+      ctx.skip();
+      return;
+    }
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+
+    await waitConfigPropagation(async () => {
+      try {
+        await client.chat.completions.create({
+          model: "aliyun-e2e",
+          messages: [{ role: "user", content: `probe ${RISKY_MARKER}` }],
+        });
+        return false;
+      } catch (e) {
+        return e instanceof APIError && e.status === 422;
+      }
+    });
+
+    // A benign history well past the 2 000-char cap, then the risky turn
+    // last — exactly the shape the clip used to drop.
+    const history = "benign conversation filler ".repeat(200);
+    const seenBefore = aliyun.requests.length;
+    const upstreamBefore = benignUpstream.receivedRequests.length;
+
+    let caught: unknown;
+    try {
+      await client.chat.completions.create({
+        model: "aliyun-e2e",
+        messages: [
+          { role: "user", content: history },
+          { role: "user", content: `please do ${RISKY_MARKER} now` },
+        ],
+      });
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBeInstanceOf(APIError);
+    if (!(caught instanceof APIError)) throw new Error("unreachable");
+    expect(caught.status).toBe(422);
+    expect((caught.error as { type?: unknown })?.type).toBe("content_filter");
+    expect(benignUpstream.receivedRequests.length).toBe(upstreamBefore);
+
+    // The tail was actually submitted: it took more than one call, and the
+    // marker reached the provider rather than being clipped away.
+    const submitted = aliyun.requests.slice(seenBefore);
+    expect(submitted.length).toBeGreaterThan(1);
+    expect(submitted.some((r) => r.content.includes(RISKY_MARKER))).toBe(true);
+    // Every call stayed within the provider's documented per-call cap.
+    for (const r of submitted) {
+      expect([...r.content].length).toBeLessThanOrEqual(2000);
+    }
+  });
+
   test("risky input → 422 content_filter, upstream never called", async (ctx) => {
     if (!etcdReachable || !app || !benignUpstream) {
       ctx.skip();

@@ -27,6 +27,8 @@ mod audit;
 mod bedrock;
 mod build;
 mod chain;
+#[cfg(any(feature = "azure-content-safety", feature = "aliyun-text-moderation"))]
+mod chunk;
 mod index;
 mod keyword;
 #[cfg(feature = "lakera")]

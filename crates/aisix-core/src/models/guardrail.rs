@@ -1198,10 +1198,17 @@ pub struct Guardrail {
     #[serde(default)]
     pub hook_point: GuardrailHookPoint,
 
-    /// Behavior when a remote API guardrail cannot reach its upstream.
-    /// `true` allows the request and records the bypass reason in
-    /// `usage_events.guardrail_bypassed_reason`. `false` blocks with
-    /// 422. Keyword guardrails do not use this setting.
+    /// Behavior when a remote API guardrail cannot complete its check —
+    /// upstream unreachable, timing out, throttling, or rejecting the
+    /// call. `true` allows the request and records the bypass reason in
+    /// `usage_events.guardrail_bypassed_reason`; `false` (the default)
+    /// blocks with 422. Keyword guardrails do not use this setting.
+    ///
+    /// Defaults to fail-closed so an unchecked request is never released
+    /// on the strength of a guardrail that did not run: an operator who
+    /// prefers availability over enforcement opts in explicitly. This
+    /// matches `output_fail_open` and `on_buffer_exceeded`, which have
+    /// always defaulted closed (AISIX-Cloud#1382).
     #[serde(default = "default_fail_open")]
     pub fail_open: bool,
 
@@ -1242,7 +1249,7 @@ fn default_enabled() -> bool {
 }
 
 fn default_fail_open() -> bool {
-    true
+    false
 }
 
 fn default_enforcement_mode() -> String {
@@ -1402,7 +1409,9 @@ mod tests {
         let g: Guardrail = serde_json::from_value(v).unwrap();
         assert!(g.enabled);
         assert_eq!(g.hook_point, GuardrailHookPoint::Both);
-        assert!(g.fail_open);
+        // Fail-closed by default: a guardrail that could not run must not
+        // release the request (AISIX-Cloud#1382).
+        assert!(!g.fail_open);
     }
 
     #[test]

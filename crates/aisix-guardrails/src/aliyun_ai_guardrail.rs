@@ -67,6 +67,7 @@ use crate::aliyun::{
     extract_error_code, percent_encode, sign, AliyunFailure, ACS_REQUEST_ID_HEADER,
     MAX_ERROR_BODY_PARSE_BYTES,
 };
+use crate::chunk::chunk_text;
 use crate::{Guardrail, GuardrailVerdict, SegmentsOutcome, StreamOutputPolicy};
 
 const ACTION: &str = "MultiModalGuard";
@@ -166,6 +167,11 @@ impl AliyunAiGuardrail {
     /// `session_id` (when set) is forwarded as both
     /// `ServiceParameters.sessionId` and `.chatId` so Aliyun correlates
     /// the windows of one streamed response into one console record.
+    ///
+    /// Content over the per-call cap is split and EVERY chunk submitted,
+    /// never clipped: the blob text is assembled oldest-message-first, so
+    /// truncating to the cap released the newest turn unscanned under a
+    /// clean verdict (AISIX-Cloud#1381).
     async fn moderate(
         &self,
         service: &str,
@@ -173,11 +179,27 @@ impl AliyunAiGuardrail {
         session_id: Option<&str>,
         fail_open: bool,
     ) -> GuardrailVerdict {
-        // Aliyun caps content per call; truncate to the cap. Streaming
-        // already windows to MAX_CONTENT_CHARS; non-streaming long inputs
-        // are clamped (the leading content carries the risk in practice).
-        let content: String = text.chars().take(MAX_CONTENT_CHARS).collect();
-        let (outcome, diag) = self.call(service, &content, session_id).await;
+        for content in chunk_text(text, MAX_CONTENT_CHARS) {
+            match self
+                .moderate_chunk(service, &content, session_id, fail_open)
+                .await
+            {
+                GuardrailVerdict::Allow => continue,
+                verdict => return verdict,
+            }
+        }
+        GuardrailVerdict::Allow
+    }
+
+    /// One provider call over one already-bounded chunk.
+    async fn moderate_chunk(
+        &self,
+        service: &str,
+        content: &str,
+        session_id: Option<&str>,
+        fail_open: bool,
+    ) -> GuardrailVerdict {
+        let (outcome, diag) = self.call(service, content, session_id).await;
         match outcome {
             Ok(reply) => {
                 let blocked = matches!(reply.suggestion.as_str(), "block" | "mask");
@@ -258,94 +280,13 @@ impl AliyunAiGuardrail {
         if joined.is_empty() {
             return SegmentsOutcome::allow();
         }
-        let content: String = joined.chars().take(MAX_CONTENT_CHARS).collect();
-        let (outcome, diag) = self.call(service, &content, None).await;
-        let reply = match outcome {
-            Ok(r) => r,
-            Err(failure) => {
-                return SegmentsOutcome::from_verdict(
-                    self.handle_failure(failure, &diag, fail_open),
-                )
-            }
-        };
-        match reply.suggestion.as_str() {
-            "block" => {
-                tracing::info!(
-                    row = %self.row_name,
-                    service,
-                    aliyun_request_id = %diag.request_id,
-                    aliyun_suggestion = %diag.suggestion,
-                    aliyun_dimensions = %diag.dimensions_field(),
-                    aliyun_labels = %diag.labels_field(),
-                    "aliyun AI guardrail blocked content",
-                );
-                SegmentsOutcome::from_verdict(GuardrailVerdict::block(format!(
-                    "aliyun AI guardrail: suggestion block (row: {})",
-                    self.row_name
-                )))
-            }
-            "mask" => {
-                tracing::info!(
-                    row = %self.row_name,
-                    service,
-                    aliyun_request_id = %diag.request_id,
-                    aliyun_dimensions = %diag.dimensions_field(),
-                    aliyun_labels = %diag.labels_field(),
-                    "aliyun AI guardrail masking content",
-                );
-                self.masked_segments(texts, service, fail_open, reply, &diag)
-                    .await
-            }
-            _ => {
-                tracing::debug!(
-                    row = %self.row_name,
-                    service,
-                    aliyun_request_id = %diag.request_id,
-                    aliyun_suggestion = %diag.suggestion,
-                    aliyun_dimensions = %diag.dimensions_field(),
-                    "aliyun AI guardrail passed content",
-                );
-                SegmentsOutcome::allow()
-            }
-        }
-    }
-
-    /// Build the positionally-aligned masked replacements after the
-    /// joined call answered `mask`. See [`Self::moderate_segments`] for
-    /// the single- vs multi-segment strategy.
-    async fn masked_segments(
-        &self,
-        texts: &[String],
-        service: &str,
-        fail_open: bool,
-        first_reply: CallReply,
-        first_diag: &AigDiagnostics,
-    ) -> SegmentsOutcome {
-        let mut counts: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
-        if let [only] = texts {
-            return match first_reply.desensitization {
-                Some(masked) if !masked.is_empty() => {
-                    for label in &first_diag.labels {
-                        *counts.entry(label.clone()).or_insert(0) += 1;
-                    }
-                    SegmentsOutcome {
-                        verdict: GuardrailVerdict::Allow,
-                        masked: Some(vec![reattach_clipped_tail(only, masked)]),
-                        counts,
-                        monitor_hits: Vec::new(),
-                    }
-                }
-                _ => self.mask_without_replacement(first_diag),
-            };
-        }
-        // Multi-segment: one call per slot for aligned replacements.
-        let mut masked: Vec<String> = Vec::with_capacity(texts.len());
-        for text in texts {
-            if text.is_empty() {
-                masked.push(String::new());
-                continue;
-            }
-            let content: String = text.chars().take(MAX_CONTENT_CHARS).collect();
+        // Every cap-sized chunk of the joined text is submitted. Clipping
+        // to the cap here scanned only the OLDEST 2 000 characters and
+        // released the rest — including the newest turn — under a clean
+        // verdict (AISIX-Cloud#1381).
+        let mut scanned: Vec<ScannedChunk> = Vec::new();
+        let mut needs_mask = false;
+        for content in chunk_text(&joined, MAX_CONTENT_CHARS) {
             let (outcome, diag) = self.call(service, &content, None).await;
             let reply = match outcome {
                 Ok(r) => r,
@@ -356,25 +297,137 @@ impl AliyunAiGuardrail {
                 }
             };
             match reply.suggestion.as_str() {
-                // A segment that blocks on its own kills the request —
-                // strictest wins across the per-segment verdicts.
                 "block" => {
+                    tracing::info!(
+                        row = %self.row_name,
+                        service,
+                        aliyun_request_id = %diag.request_id,
+                        aliyun_suggestion = %diag.suggestion,
+                        aliyun_dimensions = %diag.dimensions_field(),
+                        aliyun_labels = %diag.labels_field(),
+                        "aliyun AI guardrail blocked content",
+                    );
                     return SegmentsOutcome::from_verdict(GuardrailVerdict::block(format!(
                         "aliyun AI guardrail: suggestion block (row: {})",
                         self.row_name
-                    )))
+                    )));
                 }
-                "mask" => match reply.desensitization {
-                    Some(m) if !m.is_empty() => {
-                        for label in &diag.labels {
+                "mask" => {
+                    tracing::info!(
+                        row = %self.row_name,
+                        service,
+                        aliyun_request_id = %diag.request_id,
+                        aliyun_dimensions = %diag.dimensions_field(),
+                        aliyun_labels = %diag.labels_field(),
+                        "aliyun AI guardrail masking content",
+                    );
+                    needs_mask = true;
+                }
+                _ => {
+                    tracing::debug!(
+                        row = %self.row_name,
+                        service,
+                        aliyun_request_id = %diag.request_id,
+                        aliyun_suggestion = %diag.suggestion,
+                        aliyun_dimensions = %diag.dimensions_field(),
+                        "aliyun AI guardrail passed content",
+                    );
+                }
+            }
+            scanned.push(ScannedChunk {
+                content,
+                reply,
+                diag,
+            });
+        }
+        if !needs_mask {
+            return SegmentsOutcome::allow();
+        }
+        self.masked_segments(texts, service, fail_open, scanned)
+            .await
+    }
+
+    /// Build the positionally-aligned masked replacements after the
+    /// joined scan reported `mask`. See [`Self::moderate_segments`] for
+    /// the single- vs multi-segment strategy.
+    async fn masked_segments(
+        &self,
+        texts: &[String],
+        service: &str,
+        fail_open: bool,
+        scanned: Vec<ScannedChunk>,
+    ) -> SegmentsOutcome {
+        let mut counts: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+        if let [only] = texts {
+            // The joined text IS this one segment, and the split is
+            // lossless, so the per-chunk replacements concatenate back
+            // into the whole segment — no second round of calls.
+            let mut masked = String::with_capacity(only.len());
+            for chunk in &scanned {
+                if chunk.reply.suggestion != "mask" {
+                    masked.push_str(&chunk.content);
+                    continue;
+                }
+                match chunk.reply.desensitization.as_deref() {
+                    Some(d) if !d.is_empty() => {
+                        for label in &chunk.diag.labels {
                             *counts.entry(label.clone()).or_insert(0) += 1;
                         }
-                        masked.push(reattach_clipped_tail(text, m));
+                        masked.push_str(d);
                     }
-                    _ => return self.mask_without_replacement(&diag),
-                },
-                _ => masked.push(text.clone()),
+                    _ => return self.mask_without_replacement(&chunk.diag),
+                }
             }
+            return SegmentsOutcome {
+                verdict: GuardrailVerdict::Allow,
+                masked: Some(vec![masked]),
+                counts,
+                monitor_hits: Vec::new(),
+            };
+        }
+        // Multi-segment: chunks of the joined text straddle segment
+        // boundaries, so re-scan each segment on its own for replacements
+        // that line up with `texts[i]`. Each segment is itself chunked —
+        // a segment over the cap must not lose its tail either.
+        let mut masked: Vec<String> = Vec::with_capacity(texts.len());
+        for text in texts {
+            if text.is_empty() {
+                masked.push(String::new());
+                continue;
+            }
+            let mut segment = String::with_capacity(text.len());
+            for content in chunk_text(text, MAX_CONTENT_CHARS) {
+                let (outcome, diag) = self.call(service, &content, None).await;
+                let reply = match outcome {
+                    Ok(r) => r,
+                    Err(failure) => {
+                        return SegmentsOutcome::from_verdict(
+                            self.handle_failure(failure, &diag, fail_open),
+                        )
+                    }
+                };
+                match reply.suggestion.as_str() {
+                    // A chunk that blocks on its own kills the request —
+                    // strictest wins across the per-segment verdicts.
+                    "block" => {
+                        return SegmentsOutcome::from_verdict(GuardrailVerdict::block(format!(
+                            "aliyun AI guardrail: suggestion block (row: {})",
+                            self.row_name
+                        )))
+                    }
+                    "mask" => match reply.desensitization {
+                        Some(m) if !m.is_empty() => {
+                            for label in &diag.labels {
+                                *counts.entry(label.clone()).or_insert(0) += 1;
+                            }
+                            segment.push_str(&m);
+                        }
+                        _ => return self.mask_without_replacement(&diag),
+                    },
+                    _ => segment.push_str(&content),
+                }
+            }
+            masked.push(segment);
         }
         SegmentsOutcome {
             verdict: GuardrailVerdict::Allow,
@@ -626,17 +679,14 @@ struct CallReply {
     desensitization: Option<String>,
 }
 
-/// Re-attach the tail of a segment that was clipped to
-/// [`MAX_CONTENT_CHARS`] before the call: the desensitized text Aliyun
-/// returned covers only the clipped prefix, and dropping the remainder
-/// on write-back would truncate the caller's content.
-fn reattach_clipped_tail(original: &str, masked_prefix: String) -> String {
-    let tail: String = original.chars().skip(MAX_CONTENT_CHARS).collect();
-    if tail.is_empty() {
-        masked_prefix
-    } else {
-        format!("{masked_prefix}{tail}")
-    }
+/// One cap-sized chunk of a joined scan: what was submitted, what came
+/// back, and the diagnostics that go with it. Kept so a single-segment
+/// mask can be rebuilt from the chunks already scanned instead of
+/// re-calling the provider.
+struct ScannedChunk {
+    content: String,
+    reply: CallReply,
+    diag: AigDiagnostics,
 }
 
 /// What one `MultiModalGuard` call reported about itself, for operator
@@ -1179,6 +1229,113 @@ mod tests {
         assert_eq!(seg.counts.get("1814"), Some(&1), "masked label counted");
     }
 
+    // --- per-call cap: split, never clip (AISIX-Cloud#1381) ---------------
+
+    /// The joined-scan bug: `moderate_segments` joined every segment and
+    /// clipped to `MAX_CONTENT_CHARS` before the single call that decides
+    /// pass/block/mask. A clean-looking head returned `pass` and the tail
+    /// — including the newest turn — was released without ever being
+    /// submitted.
+    #[tokio::test]
+    async fn segment_scan_covers_content_past_the_cap() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("RISKMARKER"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(suggestion_body("block")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(suggestion_body("pass")))
+            .mount(&server)
+            .await;
+
+        let g = build(&server.uri(), true);
+        let history = "benign ".repeat(MAX_CONTENT_CHARS);
+        let outcome = g
+            .moderate_input_segments(&[history, "RISKMARKER".to_owned()])
+            .await;
+        assert!(
+            outcome.verdict.is_block(),
+            "content past the per-call cap must still reach the provider",
+        );
+    }
+
+    /// Same clip on the blob path (`check_input`/`check_output`), which is
+    /// what the embeddings / rerank / audio / images endpoints use.
+    #[tokio::test]
+    async fn blob_scan_covers_content_past_the_cap() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("RISKMARKER"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(suggestion_body("block")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(suggestion_body("pass")))
+            .mount(&server)
+            .await;
+
+        let g = build(&server.uri(), true);
+        let long = format!("{}RISKMARKER", "benign ".repeat(MAX_CONTENT_CHARS));
+        assert!(g.check_input(&req(&long)).await.is_block());
+    }
+
+    /// The write-back half: a segment longer than one call must be masked
+    /// across ALL of its chunks and reassembled whole. The old code called
+    /// once on the clipped prefix and stitched the unscanned remainder
+    /// back on (`reattach_clipped_tail`) — the caller's content survived,
+    /// but the tail had never been examined.
+    #[tokio::test]
+    async fn mask_covers_every_chunk_of_an_oversized_segment() {
+        let server = MockServer::start().await;
+        // Every chunk masks, rewriting its content to a fixed marker.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mask_body(Some("[MASKED]"))))
+            .mount(&server)
+            .await;
+
+        let g = build(&server.uri(), true);
+        // Whitespace-free so the split is purely by the cap: 3 chunks.
+        let segment = "x".repeat(MAX_CONTENT_CHARS * 3);
+        let outcome = g.moderate_output_segments(&[segment]).await;
+
+        assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
+        assert_eq!(
+            outcome.masked,
+            Some(vec!["[MASKED][MASKED][MASKED]".to_owned()]),
+            "every chunk's replacement must appear — no clipped, unscanned tail",
+        );
+    }
+
+    /// A chunk that passes contributes its own text unchanged, so a
+    /// partially-masked oversized segment is reassembled losslessly rather
+    /// than losing the clean parts.
+    #[tokio::test]
+    async fn unmasked_chunks_are_reassembled_verbatim() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("SECRET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mask_body(Some("[MASKED]"))))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(suggestion_body("pass")))
+            .mount(&server)
+            .await;
+
+        let g = build(&server.uri(), true);
+        let head = "a".repeat(MAX_CONTENT_CHARS);
+        let segment = format!("{head}SECRET");
+        let outcome = g.moderate_output_segments(&[segment]).await;
+
+        assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
+        assert_eq!(
+            outcome.masked,
+            Some(vec![format!("{head}[MASKED]")]),
+            "clean chunks keep their original text; only the masked one is rewritten",
+        );
+    }
+
     /// Answers per-content: the joined call (its JSON-escaped newline
     /// percent-encodes to %5Cn) suggests mask; a re-called segment
     /// containing the marker masks with a rewrite; other segments pass.
@@ -1339,20 +1496,6 @@ mod tests {
                 "matched value {leak:?} leaked into write-back"
             );
         }
-    }
-
-    #[test]
-    fn reattach_clipped_tail_restores_overflow() {
-        // Under the cap: the masked text stands alone.
-        assert_eq!(
-            reattach_clipped_tail("short", "masked".to_owned()),
-            "masked"
-        );
-        // Over the cap: the un-scanned remainder is re-attached so the
-        // write-back doesn't truncate the caller's content.
-        let long: String = "a".repeat(MAX_CONTENT_CHARS + 5);
-        let out = reattach_clipped_tail(&long, "MASKED".to_owned());
-        assert_eq!(out, format!("MASKED{}", "a".repeat(5)));
     }
 
     #[tokio::test]

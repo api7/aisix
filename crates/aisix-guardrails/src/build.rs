@@ -137,9 +137,13 @@ fn applied_for(row: &DomainGuardrail) -> AppliedGuardrail {
 /// `monitor` wraps it in [`MonitorGuardrail`] so it observes violations
 /// without blocking. `mandatory: true` wraps the result in
 /// [`MandatoryGuardrail`] so a remote guardrail that can't evaluate blocks
-/// the request instead of failing open. `mandatory` is applied outermost:
-/// a monitored guardrail still never blocks on its *content* decisions, but
-/// being unavailable is an infra failure that mandatory makes fatal.
+/// the request instead of failing open. A monitored guardrail still never
+/// blocks on its *content* decisions, but being unavailable is an infra
+/// failure that mandatory makes fatal — enforced at both places a failed
+/// evaluation can surface: [`MandatoryGuardrail`] upgrades the `Bypass` an
+/// explicitly fail-open row emits, and [`MonitorGuardrail`] declines to
+/// downgrade the `Block { unavailable }` a fail-closed row emits (the
+/// default since AISIX-Cloud#1382).
 fn build_one(
     row: &DomainGuardrail,
     bedrock_endpoint_url: Option<&str>,
@@ -176,6 +180,7 @@ fn apply_enforcement_mode(row: &DomainGuardrail, inner: Arc<dyn Guardrail>) -> A
         "monitor" => Arc::new(MonitorGuardrail {
             row_name: row.name.clone(),
             inner,
+            keep_unavailable_fatal: row.mandatory,
         }),
         other => {
             tracing::warn!(
@@ -604,6 +609,16 @@ enum BuildError {
 struct MonitorGuardrail {
     row_name: String,
     inner: Arc<dyn Guardrail>,
+    /// Mirrors `row.mandatory`. Monitor mode suppresses *content*
+    /// decisions, but `mandatory` means the rule MUST evaluate, so an
+    /// availability failure stays fatal — see [`build_one`]. The flag
+    /// lives here because the downgrade happens here: since the row's
+    /// `fail_open` defaults to false (AISIX-Cloud#1382), an unreachable
+    /// upstream now arrives as `Block { unavailable: Some(_) }` rather
+    /// than the `Bypass` that [`MandatoryGuardrail`] upgrades on the way
+    /// out, and downgrading it here would swallow the failure before the
+    /// outer decorator ever sees it.
+    keep_unavailable_fatal: bool,
 }
 
 impl MonitorGuardrail {
@@ -622,6 +637,23 @@ impl MonitorGuardrail {
 
     fn observe(&self, hook: &'static str, verdict: GuardrailVerdict) -> GuardrailVerdict {
         match verdict {
+            GuardrailVerdict::Block {
+                reason,
+                guardrail_name,
+                unavailable: Some(tag),
+            } if self.keep_unavailable_fatal => {
+                tracing::warn!(
+                    guardrail_name = %self.row_name,
+                    hook,
+                    reason = %reason,
+                    "mandatory guardrail could not evaluate; blocking despite enforcement_mode=monitor",
+                );
+                GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                    unavailable: Some(tag),
+                }
+            }
             GuardrailVerdict::Block { reason, .. } => {
                 tracing::info!(
                     guardrail_name = %self.row_name,
@@ -1895,11 +1927,13 @@ mod tests {
         );
     }
 
-    /// The documented exception to the above: `mandatory: true` is applied
-    /// OUTSIDE the monitor wrapper (`build_one`), so provider
-    /// unavailability stays fatal even in monitor mode — the fail-open
-    /// `Bypass` passes through the monitor wrapper untouched and is then
-    /// upgraded to a named `Block`.
+    /// The documented exception to the above: `mandatory: true` means the
+    /// rule MUST evaluate, so provider unavailability stays fatal even in
+    /// monitor mode. Since `fail_open` defaults to false
+    /// (AISIX-Cloud#1382), the inner guardrail emits `Block { unavailable }`
+    /// and the monitor wrapper declines to downgrade it for a mandatory
+    /// row — see `mandatory_keeps_unavailability_fatal_when_fail_open` for
+    /// the other path into the same guarantee.
     #[tokio::test]
     async fn mandatory_keeps_unavailability_fatal_in_monitor_mode() {
         use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
@@ -1923,6 +1957,64 @@ mod tests {
         assert!(
             g.check_input(&req("hello")).await.is_block(),
             "mandatory must keep provider unavailability fatal in monitor mode",
+        );
+    }
+
+    /// The other path into the same guarantee: an operator who explicitly
+    /// opted into `fail_open: true` gets a `Bypass` from the inner
+    /// guardrail, which passes through the monitor wrapper untouched and
+    /// is upgraded by [`MandatoryGuardrail`] on the way out. `mandatory`
+    /// overriding `fail_open` is the whole point of the flag, so it must
+    /// keep working now that fail-closed is the default.
+    #[tokio::test]
+    async fn mandatory_keeps_unavailability_fatal_when_fail_open() {
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let row = aliyun_row_against(
+            &server.uri(),
+            r#", "enforcement_mode": "monitor", "mandatory": true, "fail_open": true"#,
+        );
+        let g = build_one(
+            &row,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            g.check_input(&req("hello")).await.is_block(),
+            "mandatory must override an explicit fail_open in monitor mode",
+        );
+    }
+
+    /// The guarantee must not leak the other way: a NON-mandatory monitor
+    /// row still observes without blocking, fail-closed default included.
+    #[tokio::test]
+    async fn monitor_without_mandatory_still_downgrades_unavailability() {
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let row = aliyun_row_against(&server.uri(), r#", "enforcement_mode": "monitor""#);
+        let g = build_one(
+            &row,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            g.check_input(&req("hello")).await,
+            GuardrailVerdict::Allow,
+            "monitor mode without mandatory must not block on provider failure",
         );
     }
 
