@@ -262,14 +262,43 @@ impl std::ops::DerefMut for ProxyState {
 #[cfg(test)]
 const TEST_RATE_LIMIT_CLOCK_SECS: u64 = 1_763_000_000;
 
+
+/// The embedding dispatcher `kind: "semantic"` guardrail rows compile
+/// against. Free function rather than a method because the three
+/// `ProxyState` constructors need it before `self` exists.
+fn guardrail_embedder_slot(
+    hub: &Arc<Hub>,
+    snapshot: &SnapshotHandle<AisixSnapshot>,
+    cache: &Arc<crate::semantic::SemanticVectorCache>,
+) -> aisix_guardrails::GuardrailEmbedderSlot {
+    aisix_guardrails::GuardrailEmbedderSlot::new(Arc::new(
+        crate::guardrail_embedder::ProxyGuardrailEmbedder::new(
+            Arc::clone(hub),
+            snapshot.clone(),
+            Arc::clone(cache),
+        ),
+    ))
+}
+
+impl ProxyState {
+    /// This state's embedding dispatcher, for callers that rebuild the
+    /// guardrail index (the server bootstrap swaps in the local-model
+    /// runtime and must not drop the embedder while doing so).
+    pub fn guardrail_embedder(&self) -> aisix_guardrails::GuardrailEmbedderSlot {
+        guardrail_embedder_slot(&self.hub, &self.snapshot, &self.semantic_cache)
+    }
+}
+
 impl ProxyState {
     pub fn new(snapshot: SnapshotHandle<AisixSnapshot>, hub: Arc<Hub>, cfg: &ProxyConfig) -> Self {
         let metrics = Arc::new(Metrics::new(false));
+        let semantic_cache = Arc::new(crate::semantic::SemanticVectorCache::default());
         let guardrail_index = LiveGuardrailIndex::new_with_sink(
             snapshot.clone(),
             None,
             Some(metrics.clone()),
-            aisix_guardrails::SemanticRuntimeSlot::none(),
+            aisix_guardrails::LocalModelRuntimeSlot::none(),
+            guardrail_embedder_slot(&hub, &snapshot, &semantic_cache),
         );
         // Unit tests get a frozen rate-limit clock: on the wall clock, any
         // "the next request 429s" assertion silently races the fixed-window
@@ -293,7 +322,7 @@ impl ProxyState {
             metrics,
             cache: Some(CacheBackends::memory_only()),
             routing: Arc::new(RoutingRegistry::new()),
-            semantic_cache: Arc::new(crate::semantic::SemanticVectorCache::default()),
+            semantic_cache,
             guardrail_index,
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
@@ -326,11 +355,13 @@ impl ProxyState {
         cfg: &ProxyConfig,
     ) -> Self {
         let metrics = Arc::new(Metrics::new(false));
+        let semantic_cache = Arc::new(crate::semantic::SemanticVectorCache::default());
         let guardrail_index = LiveGuardrailIndex::new_with_sink(
             snapshot.clone(),
             None,
             Some(metrics.clone()),
-            aisix_guardrails::SemanticRuntimeSlot::none(),
+            aisix_guardrails::LocalModelRuntimeSlot::none(),
+            guardrail_embedder_slot(&hub, &snapshot, &semantic_cache),
         );
         Self::from_inner(ProxyStateInner {
             snapshot,
@@ -339,7 +370,7 @@ impl ProxyState {
             metrics,
             cache: Some(CacheBackends::memory_only()),
             routing: Arc::new(RoutingRegistry::new()),
-            semantic_cache: Arc::new(crate::semantic::SemanticVectorCache::default()),
+            semantic_cache,
             guardrail_index,
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
@@ -374,11 +405,13 @@ impl ProxyState {
         cache: Option<CacheBackends>,
         cfg: &ProxyConfig,
     ) -> Self {
+        let semantic_cache = Arc::new(crate::semantic::SemanticVectorCache::default());
         let guardrail_index = LiveGuardrailIndex::new_with_sink(
             snapshot.clone(),
             None,
             Some(metrics.clone()),
-            aisix_guardrails::SemanticRuntimeSlot::none(),
+            aisix_guardrails::LocalModelRuntimeSlot::none(),
+            guardrail_embedder_slot(&hub, &snapshot, &semantic_cache),
         );
         // The bootstrap constructor is the one place the tracker gets a
         // metrics sink + snapshot handle, so cooldown transitions emit
@@ -399,7 +432,7 @@ impl ProxyState {
             metrics,
             cache,
             routing: Arc::new(RoutingRegistry::new()),
-            semantic_cache: Arc::new(crate::semantic::SemanticVectorCache::default()),
+            semantic_cache,
             guardrail_index,
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::with_flags(bookkeeping_flags)),

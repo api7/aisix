@@ -37,6 +37,7 @@ mod completions;
 pub(crate) mod cooldown;
 mod count_tokens;
 mod dispatch;
+mod guardrail_embedder;
 mod ebml;
 mod embeddings;
 mod ensemble;
@@ -10199,9 +10200,10 @@ data: [DONE]\n\n";
             state.snapshot.clone(),
             None,
             None,
-            aisix_guardrails::SemanticRuntimeSlot::new(Arc::new(
-                aisix_guardrails::SemanticRuntime::for_tests_without_model(),
+            aisix_guardrails::LocalModelRuntimeSlot::new(Arc::new(
+                aisix_guardrails::LocalModelRuntime::for_tests_without_model(),
             )),
+            state.guardrail_embedder(),
         );
         let app = build_router(
             state

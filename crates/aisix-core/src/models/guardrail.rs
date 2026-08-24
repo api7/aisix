@@ -728,7 +728,7 @@ fn default_presidio_language() -> String {
 /// once per span. Group terms by the role they play (for example trigger
 /// words, tool names) rather than listing every term in one group.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-pub struct SemanticHotwordGroup {
+pub struct SmartRedactionHotwordGroup {
     /// Literal terms. Terms containing CJK characters match as
     /// substrings; ASCII terms match on word boundaries, and may run
     /// directly into a digit (so a tool name fused to a version number
@@ -737,13 +737,13 @@ pub struct SemanticHotwordGroup {
     pub terms: Vec<String>,
 }
 
-/// One user-defined category for `kind: "semantic"`: what to look for
+/// One user-defined category for `kind: "smart_redaction"`: what to look for
 /// (regex candidate patterns), the lexical evidence that confirms or
 /// rejects a candidate (hotword groups and negative patterns), the
 /// natural-language description the embedding model judges uncertain
 /// candidates against, and how a confirmed span is rewritten.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-pub struct SemanticCategory {
+pub struct SmartRedactionCategory {
     /// Category name surfaced in the mask token (`[<NAME>_REDACTED]`),
     /// telemetry counts, and audit records. Never the matched value.
     /// Must be unique within the guardrail.
@@ -777,7 +777,7 @@ pub struct SemanticCategory {
     /// evidence that routes the span to the embedding judgement.
     #[serde(default)]
     #[schemars(length(max = 10))]
-    pub hotword_groups: Vec<SemanticHotwordGroup>,
+    pub hotword_groups: Vec<SmartRedactionHotwordGroup>,
     /// Action for spans confirmed as this category. Only `mask` is
     /// supported: this guardrail rewrites content and never blocks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -798,7 +798,7 @@ pub struct SemanticCategory {
     pub threshold: Option<f32>,
 }
 
-/// Config block for `kind: "semantic"`. Category-based semantic
+/// Config block for `kind: "smart_redaction"`. Category-based semantic
 /// detection and redaction computed inside the gateway by a bundled CPU
 /// embedding model — no external service is called and no content leaves
 /// the gateway. Each category pipelines regex candidate generation,
@@ -808,13 +808,112 @@ pub struct SemanticCategory {
 /// guardrail rewrites content and never blocks traffic, so `fail_open`
 /// must stay `true`.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-pub struct SemanticConfig {
+pub struct SmartRedactionConfig {
     /// The categories this guardrail detects. Categories are evaluated
     /// in order; each category rewrites the text the previous one
     /// produced.
     #[serde(default)]
     #[schemars(length(min = 1, max = 30))]
-    pub categories: Vec<SemanticCategory>,
+    pub categories: Vec<SmartRedactionCategory>,
+}
+
+/// Config block for `kind: "semantic"`. Embedding-similarity screening
+/// against operator-supplied EXAMPLE texts: each candidate text is
+/// embedded with `embedding_model` and scored (cosine) against the
+/// `deny_examples` and `allow_examples` prototypes. A text that clears
+/// `deny_threshold` against any deny example blocks; when
+/// `allow_examples` is non-empty, a text that clears NO allow example
+/// blocks as well. Deny wins over allow.
+///
+/// The kind is direction-neutral — `hook_point` decides whether the
+/// request, the response, or both are screened, and the same example
+/// lists apply to whichever hooks run. Two directions that need
+/// DIFFERENT examples are two guardrail rows, not one row with nested
+/// per-direction blocks.
+///
+/// Unlike `smart_redaction`, this guardrail calls an `embedding`-kind
+/// Model through the gateway's provider bridges rather than the bundled
+/// CPU model, so it is available on every node but costs one upstream
+/// embedding call per screened text (example prototypes are embedded
+/// once and cached).
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
+pub struct SemanticConfig {
+    /// Alias of an `embedding`-kind Model used to embed both the
+    /// examples and the screened text. Must resolve in the same
+    /// environment as this guardrail.
+    #[schemars(length(min = 1))]
+    pub embedding_model: String,
+    /// Example texts whose meaning must be REFUSED. A screened text
+    /// scoring at or above `deny_threshold` against any of them blocks.
+    #[serde(default)]
+    #[schemars(length(max = 100))]
+    pub deny_examples: Vec<String>,
+    /// Example texts whose meaning is PERMITTED. When non-empty, a
+    /// screened text that clears none of them blocks — an allow-list
+    /// narrows traffic to the listed topics. Empty (the default) means
+    /// "no allow-list": only `deny_examples` can block.
+    #[serde(default)]
+    #[schemars(length(max = 100))]
+    pub allow_examples: Vec<String>,
+    /// Cosine-similarity threshold for `deny_examples`, in `[-1, 1]`.
+    /// Lower it to block more.
+    #[serde(default = "default_semantic_threshold")]
+    #[schemars(range(min = -1.0, max = 1.0))]
+    pub deny_threshold: f32,
+    /// Cosine-similarity threshold for `allow_examples`, in `[-1, 1]`.
+    /// RAISE it to block more — a text must reach it to be admitted.
+    #[serde(default = "default_semantic_threshold")]
+    #[schemars(range(min = -1.0, max = 1.0))]
+    pub allow_threshold: f32,
+    /// Per-call deadline for the embedding request in milliseconds.
+    #[serde(default = "default_semantic_timeout_ms")]
+    #[schemars(range(min = 1))]
+    pub timeout_ms: u64,
+    /// Cap on how many texts ONE request screens, bounding the embedding
+    /// tokens a single request can spend. The input hook screens the
+    /// MOST RECENT messages first and drops the rest: an earlier turn
+    /// was already screened as the latest message of an earlier request,
+    /// so the dropped tail is seen history rather than unread content.
+    #[serde(default = "default_semantic_max_screened_texts")]
+    #[schemars(range(min = 1, max = 64))]
+    pub max_screened_texts: u32,
+    /// Input-hook text selection. The default screens user messages
+    /// only; the alternate mode screens every message. Ignored on the
+    /// output hook.
+    #[serde(default = "default_semantic_text_source")]
+    pub text_source: String,
+
+    // --- streaming-output controls (consumed by aisix-proxy) ---
+    // A semantic judgement needs the whole text, so this kind always
+    // uses the buffer_full policy on the output hook, like
+    // kind=pii and kind=presidio.
+    /// Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.
+    #[serde(default = "default_acs_max_buffer_bytes")]
+    #[schemars(range(min = 1))]
+    pub max_buffer_bytes: u64,
+    /// Buffer-overflow policy for streamed output when the buffer cap is hit.
+    #[serde(default = "default_acs_on_buffer_exceeded")]
+    pub on_buffer_exceeded: String,
+    /// Fail-open policy for the output hook. When disabled, an embedding
+    /// outage does not release unscreened model output.
+    #[serde(default)]
+    pub output_fail_open: bool,
+}
+
+fn default_semantic_threshold() -> f32 {
+    0.75
+}
+
+fn default_semantic_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_semantic_max_screened_texts() -> u32 {
+    8
+}
+
+fn default_semantic_text_source() -> String {
+    "user_messages".to_owned()
 }
 
 /// Provider discriminator. The kind drives which `*_config` block is
@@ -879,6 +978,13 @@ pub enum GuardrailKind {
     /// on input, output, or both, including buffered streaming output.
     /// Requires the gateway's bundled model files; nodes without them
     /// do not serve this kind.
+    SmartRedaction(SmartRedactionConfig),
+    /// Embedding-similarity screening against operator-supplied example
+    /// texts. Deny examples block on a close match; an allow-list, when
+    /// present, blocks everything that matches none of it. Calls an
+    /// `embedding`-kind Model through the gateway's provider bridges.
+    /// Detection-only — never rewrites content. Applies on input,
+    /// output, or both, including buffered streaming output.
     Semantic(SemanticConfig),
 }
 
@@ -899,6 +1005,7 @@ impl GuardrailKind {
             GuardrailKind::Lakera(_) => "lakera",
             GuardrailKind::OpenaiModeration(_) => "openai_moderation",
             GuardrailKind::Presidio(_) => "presidio",
+            GuardrailKind::SmartRedaction(_) => "smart_redaction",
             GuardrailKind::Semantic(_) => "semantic",
         }
     }
@@ -1056,13 +1163,13 @@ pub trait GuardrailMetricsSink: Send + Sync + 'static {
     /// One embedding-model inference performed by the semantic
     /// guardrail runtime. Default no-op so non-metrics sinks and tests
     /// need not care.
-    fn record_semantic_model_call(&self) {}
+    fn record_smart_redaction_model_call(&self) {}
 
     /// One semantic-guardrail degrade: a span (or category) fell back
     /// to the rule layers instead of getting its embedding judgement.
     /// `reason` is a bounded vocabulary (see the semantic runtime's
     /// degrade enum), never free text.
-    fn record_semantic_degrade(&self, reason: &'static str) {
+    fn record_smart_redaction_degrade(&self, reason: &'static str) {
         let _ = reason;
     }
 }
@@ -1351,7 +1458,7 @@ mod tests {
     fn semantic_kind_strict_schema_edges() {
         let valid = json!({
             "name": "sem",
-            "kind": "semantic",
+            "kind": "smart_redaction",
             "categories": [{
                 "name": "eda-version",
                 "description": "EDA tool version numbers",
@@ -1384,7 +1491,7 @@ mod tests {
 
         // A semantic row with no categories detects nothing — the branch
         // requires them, matching keyword's required `patterns`.
-        let bare = json!({"name": "sem", "kind": "semantic"});
+        let bare = json!({"name": "sem", "kind": "smart_redaction"});
         assert!(crate::models::validate_guardrail(&bare).is_err());
 
         // This kind rewrites and never blocks; `fail_open: false` has

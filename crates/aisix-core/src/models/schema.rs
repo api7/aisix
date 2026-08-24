@@ -1245,13 +1245,13 @@ pub fn guardrail_root_schema() -> Value {
         // Semantic categories rewrite only — the `block` action does not
         // exist for this kind, and the schema says so rather than letting
         // a `block` value be accepted and half-honored (#963).
-        set_definition_property_enum(defs, "SemanticCategory", "action", json!(["mask"]));
+        set_definition_property_enum(defs, "SmartRedactionCategory", "action", json!(["mask"]));
         // The write path must see candidate patterns spelled out: the
         // serde default is `[]`, and JSON Schema's `minItems` does not
         // apply to an ABSENT property — without `required`, a category
         // with no patterns validates strictly and then fails category
         // compilation, silently skipping the whole row (#963 class).
-        if let Some(cat) = defs.get_mut("SemanticCategory") {
+        if let Some(cat) = defs.get_mut("SmartRedactionCategory") {
             require_property(cat, "candidate_patterns");
         }
         set_definition_property_enum(
@@ -1382,7 +1382,7 @@ pub fn guardrail_root_schema() -> Value {
                     set_property_enum(b, "default_action", json!(["mask", "block"]));
                     set_property_enum(b, "operator", json!(["replace", "mask", "hash", "redact"]));
                 }
-                "semantic" => {
+                "smart_redaction" => {
                     // A semantic row with no categories detects nothing;
                     // the write path must see them spelled out (the serde
                     // default keeps the Rust type read-tolerant), matching
@@ -1525,7 +1525,7 @@ fn guardrail_kind_description(kind: &str) -> Option<&'static str> {
         "presidio" => {
             Some("Guardrail provider type for self-hosted Microsoft Presidio PII detection and anonymization.")
         }
-        "semantic" => Some(
+        "smart_redaction" => Some(
             "Guardrail provider type for in-process semantic category detection and redaction using the bundled embedding model.",
         ),
         _ => None,

@@ -159,19 +159,19 @@ pub const M_USAGE_EVENT_DROPS_TOTAL: &str = "aisix_usage_event_drops_total";
 pub const M_GUARDRAIL_BLOCKS_TOTAL: &str = "aisix_guardrail_blocks_total";
 pub const M_GUARDRAIL_BYPASSES_TOTAL: &str = "aisix_guardrail_bypasses_total";
 
-/// Semantic guardrail runtime series (#1363).
-/// `aisix_guardrail_semantic_model_calls_total` counts embedding-model
+/// Smart-redaction guardrail runtime series (#1363).
+/// `aisix_guardrail_smart_redaction_model_calls_total` counts embedding-model
 /// inferences (window judgements and description-prototype embeds).
-/// `aisix_guardrail_semantic_degraded_total{reason}` counts spans or
+/// `aisix_guardrail_smart_redaction_degraded_total{reason}` counts spans or
 /// categories that fell back to the rule layers instead of getting
 /// their embedding judgement; `reason` is the runtime's bounded degrade
 /// vocabulary (`engine_failed` / `prototype_unavailable` /
 /// `budget_exhausted` / `queue_timeout` / `inference_failed`). A
-/// non-zero degrade rate is the operator's signal that semantic rows
+/// non-zero degrade rate is the operator's signal that smart_redaction rows
 /// are running on lexical evidence alone.
-pub const M_GUARDRAIL_SEMANTIC_MODEL_CALLS_TOTAL: &str =
-    "aisix_guardrail_semantic_model_calls_total";
-pub const M_GUARDRAIL_SEMANTIC_DEGRADED_TOTAL: &str = "aisix_guardrail_semantic_degraded_total";
+pub const M_GUARDRAIL_SMART_REDACTION_MODEL_CALLS_TOTAL: &str =
+    "aisix_guardrail_smart_redaction_model_calls_total";
+pub const M_GUARDRAIL_SMART_REDACTION_DEGRADED_TOTAL: &str = "aisix_guardrail_smart_redaction_degraded_total";
 /// Per-request inbound authentication decisions
 /// (AISIX-Cloud#1080/#1081). Before this series, a rejected credential
 /// was invisible: the auth extractor short-circuits ahead of every
@@ -2092,23 +2092,23 @@ impl aisix_core::GuardrailMetricsSink for Metrics {
         Metrics::record_guardrail_execution(self, exec);
     }
 
-    fn record_semantic_model_call(&self) {
+    fn record_smart_redaction_model_call(&self) {
         self.cached_counter(
-            M_GUARDRAIL_SEMANTIC_MODEL_CALLS_TOTAL,
+            M_GUARDRAIL_SMART_REDACTION_MODEL_CALLS_TOTAL,
             1,
             |_| {},
-            || metrics::counter!(M_GUARDRAIL_SEMANTIC_MODEL_CALLS_TOTAL),
+            || metrics::counter!(M_GUARDRAIL_SMART_REDACTION_MODEL_CALLS_TOTAL),
         );
     }
 
-    fn record_semantic_degrade(&self, reason: &'static str) {
+    fn record_smart_redaction_degrade(&self, reason: &'static str) {
         self.cached_counter(
-            M_GUARDRAIL_SEMANTIC_DEGRADED_TOTAL,
+            M_GUARDRAIL_SMART_REDACTION_DEGRADED_TOTAL,
             1,
             |k| k.label(reason),
             || {
                 metrics::counter!(
-                    M_GUARDRAIL_SEMANTIC_DEGRADED_TOTAL,
+                    M_GUARDRAIL_SMART_REDACTION_DEGRADED_TOTAL,
                     "reason" => reason,
                 )
             },
