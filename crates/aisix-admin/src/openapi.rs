@@ -3139,6 +3139,14 @@ mod tests {
     /// so this is the only place their branch-to-text binding can be checked.
     /// Each sentence names its own kind, which is exactly what selecting the
     /// wrong branch breaks.
+    ///
+    /// The ReDoc tab titles are pinned here too. `add_variant_titles` still
+    /// assigns titles positionally, which is safe for adding or removing a
+    /// kind — `title_schema_variants` bails on a length mismatch and every
+    /// title in the family disappears, failing
+    /// `openapi_titles_schema_variants_for_redoc_tabs` loudly. A
+    /// length-preserving reorder is the one edit that would slip through, so
+    /// the two families that grow pin their titles by discriminator instead.
     #[tokio::test]
     async fn openapi_exporter_kind_metadata_lands_on_its_own_variant() {
         let parsed: serde_json::Value =
@@ -3158,6 +3166,34 @@ mod tests {
             assert!(
                 description.contains(&format!("`{kind}`")),
                 "exporter kind `{kind}` carries another kind's description: {description}"
+            );
+        }
+
+        let expected_titles = [
+            ("otlp_http", "OTLP HTTP"),
+            ("aliyun_sls", "Aliyun SLS"),
+            ("object_store", "Object storage"),
+            ("datadog", "Datadog"),
+        ];
+        assert_eq!(
+            branches.len(),
+            expected_titles.len(),
+            "an exporter kind was added or removed without updating this test"
+        );
+        for branch in branches {
+            let kind = branch["properties"]["kind"]["enum"][0]
+                .as_str()
+                .expect("each branch pins exactly one kind");
+            let (_, title) = expected_titles
+                .iter()
+                .find(|(expected, _)| *expected == kind)
+                .unwrap_or_else(|| {
+                    panic!("exporter kind `{kind}` has no expected ReDoc tab title")
+                });
+            assert_eq!(
+                branch["title"].as_str(),
+                Some(*title),
+                "exporter kind `{kind}` carries another kind's title"
             );
         }
 
