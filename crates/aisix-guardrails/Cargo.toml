@@ -44,15 +44,6 @@ base64 = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
-# Local-model guardrail MVP (AISIX-Cloud#1331): in-process CPU embedding
-# inference (ONNX Runtime + HF tokenizer). NOT in default features — it
-# statically links ONNX Runtime (tens of MB) and is env-var-activated
-# experimental surface; builds opt in with `--features local-model`.
-ort = { workspace = true, optional = true }
-tokenizers = { workspace = true, optional = true }
-# manifest.json integrity verification for the model bundle (#1363).
-sha2 = { workspace = true, optional = true }
-
 [features]
 default = [
     "bedrock",
@@ -86,11 +77,6 @@ aliyun-text-moderation = [
 lakera = ["dep:reqwest"]
 openai-moderation = ["dep:reqwest"]
 presidio = ["dep:reqwest"]
-# Local CPU embedding-model semantic guardrail (AISIX-Cloud#1331 →
-# #1363, `kind: "semantic"`). Statically links ONNX Runtime; the server
-# crate enables it by default — the standard image ships the capability
-# and the model bundle, and rows activate it through the control plane.
-local-model = ["dep:ort", "dep:tokenizers", "dep:sha2"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

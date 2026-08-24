@@ -2177,7 +2177,6 @@ fn add_variant_titles(doc: &mut Value) {
                 "Lakera Guard",
                 "OpenAI Moderation",
                 "Presidio",
-                "Smart Redaction",
                 "Semantic Screening",
             ],
         ),
@@ -3100,7 +3099,6 @@ mod tests {
             ("lakera", "Lakera Guard"),
             ("openai_moderation", "OpenAI Moderation"),
             ("presidio", "Presidio"),
-            ("smart_redaction", "Smart Redaction"),
             ("semantic", "Semantic Screening"),
         ];
 

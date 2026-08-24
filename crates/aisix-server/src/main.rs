@@ -923,103 +923,12 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // doesn't accidentally redirect Bedrock calls into thin air.
     let bedrock_endpoint_url = cfg.bedrock_endpoint_url.clone().filter(|s| !s.is_empty());
     let guardrail_metrics_sink = proxy_state.metrics.clone();
-    // Semantic guardrail runtime (#1363, `kind: "smart_redaction"`): verify the
-    // model bundle's manifest at boot — nothing else. ONNX sessions and
-    // category prototypes load lazily on the first semantic row, so a
-    // node with no smart-redaction guardrails pays no memory for the
-    // capability. An explicit GUARDRAIL_LOCAL_MODEL_DIR that fails
-    // verification is boot-fatal (a masking guardrail the operator asked
-    // for that silently isn't there would leak the very content it
-    // exists to rewrite); the image's bundled default path degrades to
-    // "capability absent" so a bare-metal run without the bundle still
-    // boots — the heartbeat then simply doesn't advertise `smart_redaction`.
-    #[cfg(feature = "local-model-guardrail")]
-    let (semantic_slot, semantic_capability) = {
-        for retired in [
-            aisix_guardrails::THRESHOLD_ENV,
-            aisix_guardrails::PROTOTYPES_ENV,
-            aisix_guardrails::RULE_WINDOW_ENV,
-        ] {
-            if std::env::var_os(retired).is_some() {
-                tracing::warn!(
-                    var = retired,
-                    "retired MVP env var is set and ignored; the smart-redaction guardrail \
-                     is configured per category on the guardrail resource (kind \"smart_redaction\")"
-                );
-            }
-        }
-        let explicit =
-            std::env::var_os(aisix_guardrails::MODEL_DIR_ENV).map(std::path::PathBuf::from);
-        let dir = explicit
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from(aisix_guardrails::DEFAULT_MODEL_DIR));
-        let lanes = aisix_guardrails::parse_lanes(
-            std::env::var(aisix_guardrails::LANES_ENV).ok().as_deref(),
-        );
-        let sink: Arc<dyn aisix_core::models::GuardrailMetricsSink> =
-            guardrail_metrics_sink.clone();
-        let verified = {
-            let dir = dir.clone();
-            tokio::task::spawn_blocking(move || {
-                aisix_guardrails::LocalModelRuntime::load(dir, lanes, Some(sink))
-            })
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("smart-redaction guardrail bundle verification task: {e}")
-            })?
-        };
-        match verified {
-            Ok(runtime) => {
-                let runtime = Arc::new(runtime);
-                let capability = runtime.capability();
-                (
-                    aisix_guardrails::LocalModelRuntimeSlot::new(runtime),
-                    Some(capability),
-                )
-            }
-            Err(err) if explicit.is_some() => {
-                return Err(anyhow::anyhow!(
-                    "smart-redaction guardrail model bundle at {} (from {}) failed verification: {err}",
-                    dir.display(),
-                    aisix_guardrails::MODEL_DIR_ENV,
-                ));
-            }
-            Err(err) => {
-                if dir.exists() {
-                    tracing::warn!(
-                        model_dir = %dir.display(),
-                        error = %err,
-                        "bundled smart-redaction guardrail model failed verification; \
-                         this node will not serve kind \"smart_redaction\""
-                    );
-                } else {
-                    tracing::info!(
-                        model_dir = %dir.display(),
-                        "no smart-redaction guardrail model bundle; \
-                         this node will not serve kind \"smart_redaction\""
-                    );
-                }
-                (aisix_guardrails::LocalModelRuntimeSlot::none(), None)
-            }
-        }
-    };
-    #[cfg(not(feature = "local-model-guardrail"))]
-    let semantic_slot = {
-        if std::env::var_os("GUARDRAIL_LOCAL_MODEL_DIR").is_some() {
-            tracing::warn!(
-                "GUARDRAIL_LOCAL_MODEL_DIR is set, but this binary was built without the \
-                 `local-model-guardrail` feature; ignoring"
-            );
-        }
-        aisix_guardrails::LocalModelRuntimeSlot::none()
-    };
     let guardrail_embedder = proxy_state.guardrail_embedder();
     proxy_state =
         proxy_state.with_guardrail_index(aisix_guardrails::LiveGuardrailIndex::new_with_sink(
             snapshot_handle.clone(),
             bedrock_endpoint_url,
             Some(guardrail_metrics_sink),
-            semantic_slot,
             guardrail_embedder,
         ));
     // Heartbeat worker — spawned after proxy_state exists so it can read
@@ -1055,26 +964,6 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         }));
         let fan_out = proxy_state.otlp_fan_out.clone();
         h = h.with_exporter_health_fetcher(Arc::new(move || fan_out.exporter_stats()));
-        // Advertised guardrail kinds (#1363): `smart_redaction` rides along
-        // only while the node's model bundle stays verified — readiness
-        // means "could serve"; the CP creating a smart_redaction row is what
-        // triggers the lazy engine load, and an engine that later fails
-        // drops the advert on the next beat.
-        #[cfg(feature = "local-model-guardrail")]
-        {
-            let capability = semantic_capability.clone();
-            h = h.with_supported_kinds_fetcher(Arc::new(move || {
-                aisix_guardrails::supported_kinds_with(
-                    capability.as_ref().is_some_and(|c| c.is_ready()),
-                )
-            }));
-        }
-        #[cfg(not(feature = "local-model-guardrail"))]
-        {
-            h = h.with_supported_kinds_fetcher(Arc::new(|| {
-                aisix_guardrails::supported_kinds_with(false)
-            }));
-        }
         heartbeat::spawn(h, cancel_rx.clone())
     });
 

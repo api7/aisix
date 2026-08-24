@@ -102,13 +102,6 @@ pub type ConfigHashFetcher = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 /// signal that a fleet is mid-rollout behind a newer control plane.
 pub type PartialCompatFetcher = Arc<dyn Fn() -> Vec<PartialCompatEntry> + Send + Sync>;
 
-/// Source of the advertised guardrail-kind list. Most kinds are fixed
-/// at compile time, but `semantic` also needs the node's verified model
-/// bundle — a runtime fact that can flip to "failed" after boot — so
-/// the list is re-read on every beat (#1363). `None` falls back to the
-/// compile-time list.
-pub type SupportedKindsFetcher = Arc<dyn Fn() -> Vec<&'static str> + Send + Sync>;
-
 /// File paths to the on-disk mTLS bundle the heartbeat client presents
 /// to cp-api. Same three files written by cert-bundle provisioning and
 /// re-used on every subsequent boot when the bundle is already on disk.
@@ -169,9 +162,6 @@ pub struct HeartbeatConfig {
     /// aggregate. `None` (tests / no supervisor) omits the field, same
     /// tolerance contract as the other optional fields. See #871.
     pub partial_compat_fetcher: Option<PartialCompatFetcher>,
-    /// Optional source of the advertised guardrail-kind list (#1363).
-    /// `None` (tests) reports the compile-time list.
-    pub supported_kinds_fetcher: Option<SupportedKindsFetcher>,
 }
 
 impl std::fmt::Debug for HeartbeatConfig {
@@ -203,10 +193,6 @@ impl std::fmt::Debug for HeartbeatConfig {
                 "partial_compat_fetcher",
                 &self.partial_compat_fetcher.as_ref().map(|_| "<fn>"),
             )
-            .field(
-                "supported_kinds_fetcher",
-                &self.supported_kinds_fetcher.as_ref().map(|_| "<fn>"),
-            )
             .finish()
     }
 }
@@ -235,7 +221,6 @@ impl HeartbeatConfig {
             exporter_health_fetcher: None,
             config_hash_fetcher: None,
             partial_compat_fetcher: None,
-            supported_kinds_fetcher: None,
         }
     }
 
@@ -267,12 +252,6 @@ impl HeartbeatConfig {
     /// Wire the supervisor's partially-compatible aggregate source (#871).
     pub fn with_partial_compat_fetcher(mut self, fetcher: PartialCompatFetcher) -> Self {
         self.partial_compat_fetcher = Some(fetcher);
-        self
-    }
-
-    /// Wire the advertised guardrail-kind source (#1363).
-    pub fn with_supported_kinds_fetcher(mut self, fetcher: SupportedKindsFetcher) -> Self {
-        self.supported_kinds_fetcher = Some(fetcher);
         self
     }
 }
@@ -346,10 +325,9 @@ struct HeartbeatBody<'a> {
     version: &'a str,
     /// Guardrail `kind` discriminators this node can serve (#519 B.6).
     /// Always present so cp-api can hide / flag kinds the DP can't
-    /// serve. Mostly compile-time (a build without the `bedrock`
-    /// feature), except `semantic`, which also needs the node's
-    /// verified model bundle and is re-evaluated per beat (#1363).
-    supported_guardrail_kinds: Vec<&'static str>,
+    /// serve. Fixed at compile time — a build without the `bedrock`
+    /// feature does not advertise `bedrock`.
+    supported_guardrail_kinds: &'static [&'static str],
     /// Highest etcd/kine revision the watch supervisor has applied
     /// (#519 B.3). `0` = snapshot not loaded yet. cp-api compares this
     /// against the revision returned by its own kine writes: a DP with
@@ -528,11 +506,7 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
             hostname: &cfg.hostname,
             uptime_seconds: uptime,
             version: &BUILD_VERSION,
-            supported_guardrail_kinds: cfg
-                .supported_kinds_fetcher
-                .as_ref()
-                .map(|fetcher| fetcher())
-                .unwrap_or_else(|| aisix_guardrails::supported_kinds().to_vec()),
+            supported_guardrail_kinds: aisix_guardrails::supported_kinds(),
             applied_revision,
             config_hash,
             exporter_health,

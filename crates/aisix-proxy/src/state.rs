@@ -281,8 +281,7 @@ fn guardrail_embedder_slot(
 
 impl ProxyState {
     /// This state's embedding dispatcher, for callers that rebuild the
-    /// guardrail index (the server bootstrap swaps in the local-model
-    /// runtime and must not drop the embedder while doing so).
+    /// guardrail index and must not drop the embedder while doing so.
     pub fn guardrail_embedder(&self) -> aisix_guardrails::GuardrailEmbedderSlot {
         guardrail_embedder_slot(&self.hub, &self.snapshot, &self.semantic_cache)
     }
@@ -296,7 +295,6 @@ impl ProxyState {
             snapshot.clone(),
             None,
             Some(metrics.clone()),
-            aisix_guardrails::LocalModelRuntimeSlot::none(),
             guardrail_embedder_slot(&hub, &snapshot, &semantic_cache),
         );
         // Unit tests get a frozen rate-limit clock: on the wall clock, any
@@ -359,7 +357,6 @@ impl ProxyState {
             snapshot.clone(),
             None,
             Some(metrics.clone()),
-            aisix_guardrails::LocalModelRuntimeSlot::none(),
             guardrail_embedder_slot(&hub, &snapshot, &semantic_cache),
         );
         Self::from_inner(ProxyStateInner {
@@ -409,7 +406,6 @@ impl ProxyState {
             snapshot.clone(),
             None,
             Some(metrics.clone()),
-            aisix_guardrails::LocalModelRuntimeSlot::none(),
             guardrail_embedder_slot(&hub, &snapshot, &semantic_cache),
         );
         // The bootstrap constructor is the one place the tracker gets a
