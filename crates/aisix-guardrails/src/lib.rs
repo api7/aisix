@@ -45,6 +45,7 @@ mod prompt_shield;
 mod semantic;
 #[cfg(feature = "azure-content-safety")]
 mod text_moderation;
+mod too_large;
 
 use aisix_core::models::GuardrailMonitorHit;
 use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse};

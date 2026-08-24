@@ -22,9 +22,26 @@ is how the same defect shipped twice (#448, then AISIX-Cloud#1381):
 - **Count characters, not bytes.** The vendor limits are documented in
   characters, and byte slicing halves a multi-byte character.
 
-A kind whose provider documents no limit (bedrock, lakera, presidio,
-openai_moderation) submits whole — its bound is the provider's own. Do
-not invent a local one for it.
+A kind whose provider documents no usable limit submits whole — its
+bound is the provider's own. Do not invent a local one for it, and do
+not treat "we could not find the number" as "nobody looked": the numbers
+were looked for, and they are not there to hold (AISIX-Cloud#1386).
+Bedrock's ceiling is a service quota that varies by region, policy type
+and tier and is adjustable per account; Lakera publishes no size limit
+and no error shape at all; OpenAI documents no input limit for
+`/moderations` (the real constraint is the tokens-per-minute budget, so
+its refusal is a genuine 429 and chunking would not help); Presidio's
+ceiling is whichever spaCy pipeline the operator deployed. `crate::
+too_large` carries the sources.
+
+When a provider refuses a payload for its size, that is its own failure
+class — never `Throttled` and never `ConfigError`. Both mislead: waiting
+does not help, and neither does fixing credentials. Bedrock goes further
+and re-sends the content in pieces rather than failing; the recursion is
+only safe because every step is guaranteed to make progress (batch →
+halve the slots → halve the text), so keep that property if you touch
+it. A batch budget is not a limit — it is what to try after a refusal,
+and it may be larger than the account's real ceiling.
 
 ## Fail policies default closed
 
