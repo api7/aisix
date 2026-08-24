@@ -50,10 +50,15 @@ the blocking side: a check that could not run must not release the
 request. Any new failure path gets the same default, and an operator who
 prefers availability opts in explicitly.
 
-A guardrail that could not evaluate reaches the request through **two**
-shapes, and a change to either must keep both intact: an explicitly
-fail-open row emits `Bypass` (which `MandatoryGuardrail` upgrades on the
-way out), while a fail-closed row emits `Block { unavailable: Some(tag) }`
-(which `MonitorGuardrail` must not downgrade for a `mandatory` row). Both
-carry the same bounded per-kind failure tag; neither may carry matched
-content (#153).
+A guardrail that could not evaluate reaches the request through two
+shapes, both carrying the same bounded per-kind failure tag and neither
+allowed to carry matched content (#153): an explicitly fail-open row
+emits `Bypass`, a fail-closed row emits `Block { unavailable: Some(tag) }`.
+
+**`enforcement_mode: monitor` is unconditional.** A monitored row never
+blocks, for any reason — not a content match, not a provider outage, not
+a failure policy. Do not add an exception: the value of the mode is that
+it is safe to turn on, and one edge that refuses traffic destroys it.
+Wanting an unreachable provider to refuse traffic is wanting
+enforcement, and `block` mode with `fail_open: false` is how that is
+spelled.

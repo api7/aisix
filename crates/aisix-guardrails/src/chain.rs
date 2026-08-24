@@ -253,7 +253,7 @@ struct Recorders<'a> {
 /// here would make an enforcing hit indistinguishable from a staged one.
 ///
 /// The two are told apart on the audit event (AISIX-Cloud#1365): a member
-/// with `fail_open: false` (or a `mandatory` one) whose upstream is
+/// with `fail_open: false` whose upstream is
 /// unreachable returns `Block`, not `Bypass`, and records
 /// `blocked_unavailable` plus the bounded failure tag rather than
 /// `blocked`. That matters because the naive read of `action = "blocked"`

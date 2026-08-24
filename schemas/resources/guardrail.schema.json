@@ -386,11 +386,6 @@
           ],
           "type": "string"
         },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
-        },
         "name": {
           "description": "Operator-facing name that surfaces in metric labels and error reasons.",
           "minLength": 1,
@@ -483,11 +478,6 @@
           ],
           "description": "Bedrock guardrail latency policy. Timed mode caps wait time with `timeout_ms`."
         },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
-        },
         "name": {
           "description": "Operator-facing name that surfaces in metric labels and error reasons.",
           "minLength": 1,
@@ -568,11 +558,6 @@
             "azure_content_safety"
           ],
           "type": "string"
-        },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
         },
         "name": {
           "description": "Operator-facing name that surfaces in metric labels and error reasons.",
@@ -688,11 +673,6 @@
             "azure_content_safety_text_moderation"
           ],
           "type": "string"
-        },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
         },
         "max_buffer_bytes": {
           "default": 262144,
@@ -854,11 +834,6 @@
           ],
           "type": "string"
         },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
-        },
         "max_buffer_bytes": {
           "default": 262144,
           "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.",
@@ -996,11 +971,6 @@
             "aliyun_ai_guardrail"
           ],
           "type": "string"
-        },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
         },
         "max_buffer_bytes": {
           "default": 262144,
@@ -1141,11 +1111,6 @@
           ],
           "type": "string"
         },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
-        },
         "max_buffer_bytes": {
           "default": 262144,
           "description": "Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.",
@@ -1224,11 +1189,6 @@
             "lakera"
           ],
           "type": "string"
-        },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
         },
         "max_buffer_bytes": {
           "default": 262144,
@@ -1338,11 +1298,6 @@
           ],
           "type": "string"
         },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
-        },
         "model": {
           "default": "omni-moderation-latest",
           "description": "Moderation model sent to the provider. The default is `omni-moderation-latest`; provider model names are not restricted by AISIX.",
@@ -1451,11 +1406,6 @@
           "description": "Analyzer language code.",
           "minLength": 1,
           "type": "string"
-        },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
         },
         "max_buffer_bytes": {
           "default": 262144,
@@ -1571,11 +1521,6 @@
           ],
           "type": "string"
         },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
-        },
         "name": {
           "description": "Operator-facing name that surfaces in metric labels and error reasons.",
           "minLength": 1,
@@ -1673,11 +1618,6 @@
           ],
           "type": "string"
         },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
-        },
         "max_buffer_bytes": {
           "default": 262144,
           "description": "Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.",
@@ -1770,11 +1710,6 @@
       ],
       "default": "both",
       "description": "Where in the lifecycle this rule runs."
-    },
-    "mandatory": {
-      "default": false,
-      "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-      "type": "boolean"
     },
     "name": {
       "description": "Operator-facing name that surfaces in metric labels and error reasons.",
