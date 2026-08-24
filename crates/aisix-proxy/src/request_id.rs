@@ -201,7 +201,7 @@ pub(crate) async fn ensure_request_id(
         span.record("peer", tracing::field::display(peer.0));
     }
     if let Some(downstream) = downstream_request_id(request.headers()) {
-        span.record("downstream_request_id", downstream);
+        span.record("downstream_request_id", tracing::field::display(downstream));
     }
     let mut response = next.run(request).instrument(span).await;
 
