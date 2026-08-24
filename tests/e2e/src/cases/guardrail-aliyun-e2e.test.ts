@@ -4,6 +4,7 @@ import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   pickFreePort,
   spawnApp,
@@ -203,11 +204,6 @@ describe("aliyun guardrail e2e: TextModerationPlus blocks risky input/output", (
       provider_key_id: streamPk.id,
     });
 
-    await seed.createApiKey({
-      key_hash: CALLER_KEY_HASH,
-      allowed_models: ["aliyun-e2e", "aliyun-out-e2e", "aliyun-stream-e2e"],
-    });
-
     // One env-wide guardrail covering input + output. Small window so the
     // streaming case triggers a windowed output call (and reuses the
     // stream's sessionId across windows). `endpoint` points at the mock.
@@ -226,6 +222,19 @@ describe("aliyun guardrail e2e: TextModerationPlus blocks risky input/output", (
       window_size: 16,
       window_overlap_size: 4,
     });
+
+    // The caller key is seeded LAST and readiness is it authenticating, so
+    // one condition implies the whole seed set is in the snapshot — see
+    // tests/e2e/AGENTS.md. Gating on a risky prompt returning 422 would
+    // instead make the gate exercise the behavior under test: a broken
+    // block path would surface as a 30s timeout rather than a failed
+    // assertion.
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["aliyun-e2e", "aliyun-out-e2e", "aliyun-stream-e2e"],
+    });
+    const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
   });
 
   afterAll(async () => {
@@ -234,6 +243,59 @@ describe("aliyun guardrail e2e: TextModerationPlus blocks risky input/output", (
     await riskyOutputUpstream?.close();
     await streamUpstream?.close();
     await aliyun?.close();
+  });
+
+  // AISIX-Cloud#1381: the guardrail joins the conversation oldest-message
+  // -first and Aliyun caps one call at 2 000 characters. Clipping to that
+  // cap meant a long conversation had its NEWEST turn — the one carrying
+  // the request being screened — dropped before the call, and the request
+  // was released under a clean "none" verdict. The content past the cap
+  // must reach the mock, across as many calls as it takes.
+  test("risky content past the per-call cap is still scanned", async (ctx) => {
+    if (!etcdReachable || !app || !benignUpstream || !aliyun) {
+      ctx.skip();
+      return;
+    }
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+
+    // A benign history well past the 2 000-char cap, then the risky turn
+    // last — exactly the shape the clip used to drop.
+    const history = "benign conversation filler ".repeat(200);
+    const seenBefore = aliyun.requests.length;
+    const upstreamBefore = benignUpstream.receivedRequests.length;
+
+    let caught: unknown;
+    try {
+      await client.chat.completions.create({
+        model: "aliyun-e2e",
+        messages: [
+          { role: "user", content: history },
+          { role: "user", content: `please do ${RISKY_MARKER} now` },
+        ],
+      });
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBeInstanceOf(APIError);
+    if (!(caught instanceof APIError)) throw new Error("unreachable");
+    expect(caught.status).toBe(422);
+    expect((caught.error as { type?: unknown })?.type).toBe("content_filter");
+    expect(benignUpstream.receivedRequests.length).toBe(upstreamBefore);
+
+    // The tail was actually submitted: it took more than one call, and the
+    // marker reached the provider rather than being clipped away.
+    const submitted = aliyun.requests.slice(seenBefore);
+    expect(submitted.length).toBeGreaterThan(1);
+    expect(submitted.some((r) => r.content.includes(RISKY_MARKER))).toBe(true);
+    // Every call stayed within the provider's documented per-call cap.
+    for (const r of submitted) {
+      expect([...r.content].length).toBeLessThanOrEqual(2000);
+    }
   });
 
   test("risky input → 422 content_filter, upstream never called", async (ctx) => {
@@ -248,18 +310,6 @@ describe("aliyun guardrail e2e: TextModerationPlus blocks risky input/output", (
     });
 
     // Gate on the guardrail being live: poll with a risky prompt until 422.
-    await waitConfigPropagation(async () => {
-      try {
-        await client.chat.completions.create({
-          model: "aliyun-e2e",
-          messages: [{ role: "user", content: `probe ${RISKY_MARKER}` }],
-        });
-        return false;
-      } catch (e) {
-        return e instanceof APIError && e.status === 422;
-      }
-    });
-
     // Benign request passes and hits the upstream.
     const okBefore = benignUpstream.receivedRequests.length;
     const clean = await client.chat.completions.create({

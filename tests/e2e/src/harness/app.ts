@@ -297,12 +297,10 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
           path: overrides.prometheusPath ?? "/metrics",
           addr: `127.0.0.1:${metricsPort}`,
         },
-        otlp: { enabled: false, endpoint: "http://127.0.0.1:4317" },
         ...(overrides.clientTypeRules
           ? { client_type_rules: overrides.clientTypeRules }
           : {}),
       },
-      tracing: { otlp: { enabled: false, endpoint: "http://127.0.0.1:4317", sample_ratio: 1 } },
     },
     cache: { backend: "memory" },
     // The gateway ships a 30s drain window so a load balancer can

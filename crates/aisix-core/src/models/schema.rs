@@ -4355,7 +4355,7 @@ mod tests {
                 "guardrail",
                 json!({
                     "name": "p", "kind": "pii", "enabled": true, "hook_point": "both",
-                    "fail_open": false, "enforcement_mode": "monitor", "mandatory": true,
+                    "fail_open": false, "enforcement_mode": "monitor",
                     "direction": "input", "created_at": "2026-01-01T00:00:00Z",
                     "detectors": [{"type": "email", "action": "mask"}],
                     "custom_patterns": [

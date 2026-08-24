@@ -1184,10 +1184,9 @@ pub fn build_responses_bridge_stream(
         // argument deltas can't slip through), then release or block. On the
         // live-forward path (EndOfStreamCheck — monitor-only chain,
         // AISIX-Cloud#1010) the same scan runs for observation: the bytes are
-        // already on the wire, so a Block (unreachable for monitor members;
-        // `mandatory` unavailability is the one composition that can still
-        // produce it) is signalled with a trailing error frame, mirroring the
-        // chat surface's EndOfStreamCheck behavior.
+        // already on the wire, so a Block is signalled with a trailing error
+        // frame rather than withheld bytes, mirroring the chat surface's
+        // EndOfStreamCheck behavior.
         let (text, tool_calls) = encoder.assembled_assistant_message();
         if !text.is_empty() || !tool_calls.is_empty() {
             // Live mode releases oversized streams (that's the point of

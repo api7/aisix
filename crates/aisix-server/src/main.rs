@@ -76,7 +76,7 @@ use aisix_core::{
 };
 use aisix_etcd::{EtcdConfigProvider, SnapshotCache, Supervisor};
 use aisix_gateway::{Hub, UpstreamHttpConfig};
-use aisix_obs::{init_tracing, install_otlp_tracer, Metrics};
+use aisix_obs::{init_tracing, Metrics};
 use aisix_provider_anthropic::AnthropicBridge;
 use aisix_provider_azure_openai::AzureOpenAiBridge;
 use aisix_provider_bedrock::BedrockBridge;
@@ -215,10 +215,16 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn async_main(cfg: Config) -> anyhow::Result<()> {
-    // Step 3: tracing + optional OTLP export.
+    // Step 3: process logging. Trace export is not wired here — it is an
+    // `observability_exporters` entry (kind = otlp_http) resolved from the
+    // live resource snapshot, not a boot-time pipeline.
     init_tracing(&cfg.observability).map_err(|e| anyhow::anyhow!("tracing init failed: {e}"))?;
-    let _otlp = install_otlp_tracer(&cfg.observability)
-        .map_err(|e| anyhow::anyhow!("otlp init failed: {e}"))?;
+
+    // Settings that still parse but do nothing. Warned about only now,
+    // because the subscriber above is what makes a warning visible at all.
+    for retired in cfg.observability.retired_settings() {
+        tracing::warn!("{retired}");
+    }
 
     // After tracing so the enable outcome is observable in the logs; the
     // returned outcome is already logged inside.

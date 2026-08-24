@@ -4,7 +4,7 @@
 //! the `aisix-proxy::ProxyState::guardrail_index` resolves the
 //! applicable chain per request.
 //!
-//! P0b added `enforcement_mode`, `mandatory`, and `direction` columns
+//! P0b added `enforcement_mode` and `direction` columns
 //! to the CP `guardrails` table. P0c wires them to the kine payload
 //! and adds the `GuardrailAttachment` row type (`/aisix/<env>/guardrail_attachments/<uuid>`).
 //! The outer `Guardrail` struct accepts but defaults the three new fields
@@ -1103,7 +1103,7 @@ pub struct GuardrailEnforcedHit {
     /// - `blocked` — the guardrail's content policy refused the request.
     /// - `blocked_unavailable` — the guardrail could not evaluate the
     ///   request and its configuration refuses what it cannot check
-    ///   (`fail_open: false`, or a mandatory rule). The request was
+    ///   (`fail_open: false`). The request was
     ///   refused because the check was unavailable, not because the
     ///   content matched a policy.
     pub action: String,
@@ -1200,10 +1200,17 @@ pub struct Guardrail {
     #[serde(default)]
     pub hook_point: GuardrailHookPoint,
 
-    /// Behavior when a remote API guardrail cannot reach its upstream.
-    /// `true` allows the request and records the bypass reason in
-    /// `usage_events.guardrail_bypassed_reason`. `false` blocks with
-    /// 422. Keyword guardrails do not use this setting.
+    /// Behavior when a remote API guardrail cannot complete its check —
+    /// upstream unreachable, timing out, throttling, or rejecting the
+    /// call. `true` allows the request and records the bypass reason in
+    /// `usage_events.guardrail_bypassed_reason`; `false` (the default)
+    /// blocks with 422. Keyword guardrails do not use this setting.
+    ///
+    /// Defaults to fail-closed so an unchecked request is never released
+    /// on the strength of a guardrail that did not run: an operator who
+    /// prefers availability over enforcement opts in explicitly. This
+    /// matches `output_fail_open` and `on_buffer_exceeded`, which have
+    /// always defaulted closed (AISIX-Cloud#1382).
     #[serde(default = "default_fail_open")]
     pub fail_open: bool,
 
@@ -1218,13 +1225,6 @@ pub struct Guardrail {
     /// without blocking or redacting the caller-visible response.
     #[serde(default = "default_enforcement_mode")]
     pub enforcement_mode: String,
-
-    /// Whether guardrail evaluation errors are fatal. When `true`, a remote
-    /// guardrail that cannot reach its upstream blocks the request instead of
-    /// failing open, overriding `fail_open` on the failure path. The default
-    /// `false` keeps the `fail_open` behavior.
-    #[serde(default)]
-    pub mandatory: bool,
 
     /// Attachment direction hint. Guardrail execution still follows
     /// `hook_point`.
@@ -1244,7 +1244,7 @@ fn default_enabled() -> bool {
 }
 
 fn default_fail_open() -> bool {
-    true
+    false
 }
 
 fn default_enforcement_mode() -> String {
@@ -1404,7 +1404,9 @@ mod tests {
         let g: Guardrail = serde_json::from_value(v).unwrap();
         assert!(g.enabled);
         assert_eq!(g.hook_point, GuardrailHookPoint::Both);
-        assert!(g.fail_open);
+        // Fail-closed by default: a guardrail that could not run must not
+        // release the request (AISIX-Cloud#1382).
+        assert!(!g.fail_open);
     }
 
     #[test]
@@ -1441,7 +1443,7 @@ mod tests {
 
     #[test]
     fn p0c_fields_travel_past_the_flattened_kind() {
-        // The P0c fields (`enforcement_mode`, `mandatory`, `direction`) are
+        // The P0c fields (`enforcement_mode`, `direction`) are
         // declared on the outer `Guardrail` struct with `#[serde(default)]`,
         // so serde absorbs them at the outer level before the flattened
         // inner kind sees the remaining fields. The strict schema owes them
@@ -1453,14 +1455,12 @@ mod tests {
             "kind": "keyword",
             "patterns": [],
             "enforcement_mode": "monitor",
-            "mandatory": true,
             "direction": "input"
         });
         assert!(crate::models::validate_guardrail(&v).is_ok());
         let g: Guardrail =
             serde_json::from_value(v).expect("outer fields must not reach the inner kind");
         assert_eq!(g.enforcement_mode, "monitor");
-        assert!(g.mandatory);
         assert_eq!(g.direction, "input");
     }
 

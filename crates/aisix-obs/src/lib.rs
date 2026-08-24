@@ -7,8 +7,6 @@
 //!   by the proxy handler at end-of-request.
 //! - [`metrics::Metrics`] — Prometheus counters + histogram for
 //!   requests/duration/rate-limits/tokens.
-//! - [`otlp::install_otlp_tracer`] — optional OTLP export handshake
-//!   (concrete pipeline wired in a follow-up PR).
 //! - [`sink`] — pluggable observability-sink framework: the
 //!   capability-typed [`sink::ObservabilitySink`] adapter contract
 //!   (AISIX-Cloud#692).
@@ -17,7 +15,6 @@
 
 pub mod access_log;
 pub mod metrics;
-pub mod otlp;
 pub mod otlp_http_sink;
 pub mod sink;
 pub mod trace;
@@ -34,7 +31,6 @@ pub use metrics::{
     CancelledLabels, ClientTypeClassifier, DeploymentLabels, DeploymentState, HistogramBuckets,
     LatencyLabels, LlmUsage, Metrics, RequestLabels, RequestOutcome, UsageEventLabels, UsageLabels,
 };
-pub use otlp::{install_otlp_tracer, shutdown_otlp, OtlpError, OtlpHandle};
 pub use otlp_http_sink::{content_capture_cap, OtlpHttpFanOut, OtlpSink};
 pub use sink::{
     AliyunSlsSink, BatchUnit, CapturedContent, ChannelKey, DatadogSink, EventBatch,

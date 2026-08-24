@@ -29,11 +29,13 @@
 //! config; this dispatcher only implements the non-streaming
 //! `check_input` / `check_output` hooks.
 //!
-//! NOTE: the HTTP transport (`chunk_text`, the `AcsFailure` buckets, the
-//! fail-open verdict mapping, the `Ocp-Apim-Subscription-Key` + tokio
-//! timeout call shape) is duplicated from `prompt_shield.rs`. Extracting a
-//! shared `azure_common` module is tracked as a follow-up so this slice
-//! stays surgical (it does not touch the shipped P1 dispatcher).
+//! NOTE: the HTTP transport (the `AcsFailure` buckets, the fail-open
+//! verdict mapping, the `Ocp-Apim-Subscription-Key` + tokio timeout call
+//! shape) is duplicated from `prompt_shield.rs`. Extracting a shared
+//! `azure_common` module is tracked as a follow-up so this slice stays
+//! surgical (it does not touch the shipped P1 dispatcher). The text
+//! splitting itself is no longer duplicated — it lives in `crate::chunk`,
+//! the family-wide chokepoint (AISIX-Cloud#1382).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -44,6 +46,7 @@ use aisix_gateway::{ChatFormat, ChatResponse, Role};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::chunk::chunk_text;
 use crate::{Guardrail, GuardrailVerdict, StreamOutputPolicy};
 
 /// Maximum characters per `text:analyze` call. Azure CS enforces a
@@ -389,47 +392,6 @@ impl Guardrail for TextModerationGuardrail {
         // Azure outage can't release unscanned model output.
         self.scan(&text, self.output_fail_open).await
     }
-}
-
-/// Split `text` into chunks of at most `max_chars` characters on
-/// whitespace boundaries. A single word over the limit is split into
-/// max_chars-sized pieces so the entire token is evaluated (#448).
-/// (Forked from `prompt_shield::chunk_text`; see the module note.)
-fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
-    if text.is_empty() {
-        return vec![];
-    }
-    if text.chars().count() <= max_chars {
-        return vec![text.to_owned()];
-    }
-    let mut chunks: Vec<String> = Vec::new();
-    let mut current = String::with_capacity(max_chars);
-    for word in text.split_whitespace() {
-        let word_chars = word.chars().count();
-        let sep = if current.is_empty() { 0usize } else { 1 };
-        if current.chars().count() + sep + word_chars > max_chars {
-            if !current.is_empty() {
-                chunks.push(std::mem::take(&mut current));
-            }
-            if word_chars > max_chars {
-                // Split the oversized token fully instead of truncating to
-                // the prefix, which let the trailing part bypass scanning.
-                let word_chars_vec: Vec<char> = word.chars().collect();
-                for piece in word_chars_vec.chunks(max_chars) {
-                    chunks.push(piece.iter().collect());
-                }
-                continue;
-            }
-        }
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        current.push_str(word);
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
 }
 
 // ---------------------------------------------------------------------------

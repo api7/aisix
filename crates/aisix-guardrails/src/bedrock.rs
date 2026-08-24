@@ -24,6 +24,7 @@
 //! | timeout (`latency_mode=timed`)  | false       | Block { "bedrock timeout" }    |
 //! | throttle (4xx ThrottlingException) | true     | Bypass { "bedrock_throttled" } |
 //! | throttle                        | false       | Block { "bedrock throttled" }  |
+//! | payload refused for its size    | n/a         | re-sent in pieces; only a refusal that cannot be made smaller surfaces, as Bypass { "bedrock_too_large" } / Block |
 //!
 //! `latency_mode=serial` waits unconditionally — the timeout row
 //! never fires.
@@ -51,6 +52,21 @@ use aws_smithy_runtime_api::client::result::SdkError;
 use aws_smithy_runtime_api::http::Response;
 
 use crate::{Guardrail, GuardrailVerdict, SegmentsOutcome};
+
+/// Batch size, in characters, used to re-send content AWS has already
+/// refused as too large.
+///
+/// Not a limit: AWS's real per-request ceiling is a service quota that
+/// varies by region, by policy type, by tier, and is adjustable per
+/// account (25–1 000 text units of 1 000 characters each), so it cannot
+/// be known here — see `crate::too_large`. Requests AWS accepts are
+/// always sent whole, in a single call, and this value only takes effect
+/// after a refusal. 25 000 is the smallest ceiling any region publishes
+/// (25 text units), so a batch built to it is one AWS will take
+/// everywhere; a batch that is somehow still refused is split again, so
+/// the value trades round trips against batch size and cannot fail a
+/// request on its own.
+const BEDROCK_REFUSAL_BATCH_CHARS: usize = 25_000;
 
 /// One Bedrock guardrail row, materialised into a request-time
 /// dispatcher. Built once per snapshot from
@@ -217,6 +233,147 @@ impl BedrockGuardrail {
         }
     }
 
+    /// `send`, splitting the payload only if AWS refuses it as too large.
+    ///
+    /// The whole payload goes first, so a request AWS would have accepted
+    /// still costs exactly one call. Packing into fixed batches up front
+    /// instead would split conversations AWS was happy to take whole and
+    /// multiply both billed text units and guardrail latency on traffic
+    /// that never had a size problem — and no fixed budget could avoid
+    /// that, because the real ceiling is account-specific and unknowable
+    /// here (see [`BEDROCK_REFUSAL_BATCH_CHARS`]).
+    ///
+    /// Once a refusal proves the payload is over the ceiling, a
+    /// multi-slot payload is re-sent as batches of whole slots. Batching
+    /// by slot rather than bisecting is what keeps the mask write-back
+    /// aligned: each batch's `outputs[]` lines up with the slots that
+    /// batch carried, so concatenating the batches reproduces a vector
+    /// aligned with `texts`. A single slot that is itself over the
+    /// ceiling has no slots left to divide, so its own text is split and
+    /// the pieces' replacements are joined back into that one slot.
+    ///
+    /// A real block on any piece returns immediately: callers must not
+    /// lose that verdict by continuing with the rest.
+    async fn apply_split(
+        &self,
+        source: GuardrailContentSource,
+        texts: &[String],
+    ) -> Result<SplitOutcome, BedrockFailure> {
+        match self.send(source.clone(), texts).await {
+            Ok(resp) => Ok(SplitOutcome::from_response(
+                &resp,
+                texts,
+                &self.guardrail_id,
+                &self.row_name,
+            )),
+            Err(BedrockFailure::TooLarge { detail }) => {
+                let batches = batch_by_chars(texts, BEDROCK_REFUSAL_BATCH_CHARS);
+                if batches.len() > 1 {
+                    tracing::warn!(
+                        row = %self.row_name,
+                        guardrail_id = %self.guardrail_id,
+                        slots = texts.len(),
+                        batches = batches.len(),
+                        budget = BEDROCK_REFUSAL_BATCH_CHARS,
+                        detail = %detail,
+                        "bedrock refused the payload as too large; re-sending in batches",
+                    );
+                    let mut combined = SplitOutcome::Allow {
+                        masked: Vec::new(),
+                        counts: Default::default(),
+                    };
+                    for batch in batches {
+                        let part = Box::pin(self.apply_split(source.clone(), &batch)).await?;
+                        combined = match combined.merge(part) {
+                            Some(c) => c,
+                            None => return Ok(SplitOutcome::Block),
+                        };
+                    }
+                    return Ok(combined);
+                }
+                if texts.len() > 1 {
+                    // Bin-packing made no progress: the account's real
+                    // ceiling is below our batch budget, which we cannot
+                    // know (see BEDROCK_REFUSAL_BATCH_CHARS). Halve the
+                    // slot list instead. This is also what guarantees
+                    // termination — a payload that packs back to itself
+                    // keeps halving until one slot is left, and that slot
+                    // is divided by its own text below.
+                    let (left, right) = texts.split_at(texts.len() / 2);
+                    tracing::warn!(
+                        row = %self.row_name,
+                        guardrail_id = %self.guardrail_id,
+                        slots = texts.len(),
+                        detail = %detail,
+                        "bedrock refused a payload already inside the batch budget; \
+                         halving the content blocks",
+                    );
+                    let a = Box::pin(self.apply_split(source.clone(), left)).await?;
+                    let b = Box::pin(self.apply_split(source.clone(), right)).await?;
+                    return Ok(a.merge(b).unwrap_or(SplitOutcome::Block));
+                }
+                // One slot, still too large: divide its own text.
+                let [only] = texts else {
+                    // Zero slots and a refusal: nothing to divide.
+                    return Err(BedrockFailure::TooLarge { detail });
+                };
+                // Aim for the batch budget, but never for a target that
+                // would leave the text in one piece: a slot already
+                // inside the budget and still refused has to be halved,
+                // for the same reason the slot list above does — the
+                // real ceiling is lower than anything we can assume.
+                let len = only.chars().count();
+                if len < 2 {
+                    return Err(BedrockFailure::TooLarge { detail });
+                }
+                let target = BEDROCK_REFUSAL_BATCH_CHARS.min(len.div_ceil(2));
+                let pieces = crate::chunk::chunk_text(only, target);
+                if pieces.len() < 2 {
+                    return Err(BedrockFailure::TooLarge { detail });
+                }
+                tracing::warn!(
+                    row = %self.row_name,
+                    guardrail_id = %self.guardrail_id,
+                    pieces = pieces.len(),
+                    budget = BEDROCK_REFUSAL_BATCH_CHARS,
+                    detail = %detail,
+                    "bedrock refused a single content block as too large; splitting its text",
+                );
+                let mut rebuilt = String::with_capacity(only.len());
+                let mut counts: std::collections::BTreeMap<String, u32> = Default::default();
+                for piece in &pieces {
+                    let part =
+                        Box::pin(self.apply_split(source.clone(), std::slice::from_ref(piece)))
+                            .await?;
+                    match part {
+                        SplitOutcome::Block => return Ok(SplitOutcome::Block),
+                        SplitOutcome::Allow {
+                            masked,
+                            counts: more,
+                        } => match masked.first() {
+                            // A piece AWS rewrote contributes its
+                            // replacement; one it left alone contributes
+                            // its original text, so the slot is rebuilt
+                            // whole either way.
+                            Some(m) if m != piece => {
+                                for (k, v) in more {
+                                    *counts.entry(k).or_insert(0) += v;
+                                }
+                                rebuilt.push_str(m);
+                            }
+                            _ => rebuilt.push_str(piece),
+                        },
+                    }
+                }
+                Ok(SplitOutcome::Allow {
+                    masked: vec![rebuilt],
+                    counts,
+                })
+            }
+            Err(other) => Err(other),
+        }
+    }
+
     /// Blob-mode `ApplyGuardrail`: one joined content block, verdict only.
     /// Serves `check_input`/`check_output` — the families with no mask
     /// write-back channel — so an ANONYMIZE disposition maps to Block
@@ -224,18 +381,24 @@ impl BedrockGuardrail {
     /// policy; the segment path is where masking is honored).
     async fn apply(&self, source: GuardrailContentSource, text: String) -> GuardrailVerdict {
         let fail_open = self.fail_open_for(&source);
-        match self.send(source, std::slice::from_ref(&text)).await {
-            Ok(resp) => match classify_response(&resp, &self.guardrail_id) {
-                BedrockOutcome::Allow => GuardrailVerdict::Allow,
-                BedrockOutcome::Block => GuardrailVerdict::block(format!(
-                    "bedrock guardrail {} intervened",
-                    self.guardrail_id
-                )),
-                BedrockOutcome::Mask(_) => GuardrailVerdict::block(format!(
-                    "bedrock guardrail {} anonymized content",
-                    self.guardrail_id
-                )),
-            },
+        let texts = std::slice::from_ref(&text);
+        match self.apply_split(source, texts).await {
+            Ok(SplitOutcome::Block) => GuardrailVerdict::block(format!(
+                "bedrock guardrail {} intervened",
+                self.guardrail_id
+            )),
+            Ok(outcome) => {
+                if outcome.rewrote(texts) {
+                    // No write-back channel on this path — fail toward
+                    // the policy, as before the split existed.
+                    GuardrailVerdict::block(format!(
+                        "bedrock guardrail {} anonymized content",
+                        self.guardrail_id
+                    ))
+                } else {
+                    GuardrailVerdict::Allow
+                }
+            }
             Err(failure) => self.handle_failure(failure, fail_open),
         }
     }
@@ -253,33 +416,24 @@ impl BedrockGuardrail {
         texts: &[String],
     ) -> SegmentsOutcome {
         let fail_open = self.fail_open_for(&source);
-        match self.send(source, texts).await {
-            Ok(resp) => match classify_response(&resp, &self.guardrail_id) {
-                BedrockOutcome::Allow => SegmentsOutcome::allow(),
-                BedrockOutcome::Block => SegmentsOutcome::from_verdict(GuardrailVerdict::block(
-                    format!("bedrock guardrail {} intervened", self.guardrail_id),
-                )),
-                BedrockOutcome::Mask(outputs) => {
-                    if outputs.len() == texts.len() {
-                        SegmentsOutcome {
-                            verdict: GuardrailVerdict::Allow,
-                            masked: Some(outputs),
-                            counts: anonymized_counts(&resp),
-                            monitor_hits: Vec::new(),
-                        }
-                    } else {
-                        tracing::warn!(
-                            row = %self.row_name,
-                            guardrail_id = %self.guardrail_id,
-                            expected = texts.len(),
-                            got = outputs.len(),
-                            "bedrock masked outputs don't align with input \
-                             blocks; skipping mask write-back",
-                        );
-                        SegmentsOutcome::allow()
-                    }
+        match self.apply_split(source, texts).await {
+            Ok(SplitOutcome::Block) => SegmentsOutcome::from_verdict(GuardrailVerdict::block(
+                format!("bedrock guardrail {} intervened", self.guardrail_id),
+            )),
+            Ok(outcome) => {
+                if !outcome.rewrote(texts) {
+                    return SegmentsOutcome::allow();
                 }
-            },
+                let SplitOutcome::Allow { masked, counts } = outcome else {
+                    unreachable!("Block handled above")
+                };
+                SegmentsOutcome {
+                    verdict: GuardrailVerdict::Allow,
+                    masked: Some(masked),
+                    counts,
+                    monitor_hits: Vec::new(),
+                }
+            }
             Err(failure) => SegmentsOutcome::from_verdict(self.handle_failure(failure, fail_open)),
         }
     }
@@ -303,6 +457,125 @@ impl BedrockGuardrail {
             GuardrailVerdict::block_unavailable(format!("bedrock unavailable ({reason})"), reason)
         }
     }
+}
+
+/// The result of one `apply_split` call, carrying enough to rebuild a
+/// mask vector aligned with the slots it covered.
+///
+/// `Allow.masked[i]` is always present and always corresponds to slot
+/// `i` — it holds AWS's replacement where one was returned and the
+/// original text where it was not. Keeping unchanged slots in the vector
+/// (rather than an `Option` per slot) is what lets batches concatenate:
+/// merging two batches is appending their vectors, with no index
+/// arithmetic to get wrong.
+#[derive(Debug, PartialEq, Eq)]
+enum SplitOutcome {
+    Block,
+    Allow {
+        masked: Vec<String>,
+        /// Entity-type counts AWS reported, summed across every call the
+        /// split took. Names only — never matched values (#932).
+        counts: std::collections::BTreeMap<String, u32>,
+    },
+}
+
+impl SplitOutcome {
+    fn from_response(
+        resp: &ApplyGuardrailOutput,
+        texts: &[String],
+        guardrail_id: &str,
+        row_name: &str,
+    ) -> Self {
+        match classify_response(resp, guardrail_id) {
+            BedrockOutcome::Allow => Self::Allow {
+                masked: texts.to_vec(),
+                counts: Default::default(),
+            },
+            BedrockOutcome::Block => Self::Block,
+            BedrockOutcome::Mask(outputs) => {
+                if outputs.len() == texts.len() {
+                    Self::Allow {
+                        masked: outputs,
+                        counts: anonymized_counts(resp),
+                    }
+                } else {
+                    // Same fallback the un-split path takes: an
+                    // unattributable rewrite is dropped rather than
+                    // applied to the wrong slot.
+                    tracing::warn!(
+                        row = %row_name,
+                        guardrail_id = %guardrail_id,
+                        expected = texts.len(),
+                        got = outputs.len(),
+                        "bedrock masked outputs don't align with input \
+                         blocks; skipping mask write-back",
+                    );
+                    Self::Allow {
+                        masked: texts.to_vec(),
+                        counts: Default::default(),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Append `other`'s slots after this one's. `None` means the merge
+    /// hit a block, which ends the whole scan.
+    fn merge(self, other: Self) -> Option<Self> {
+        match (self, other) {
+            (Self::Block, _) | (_, Self::Block) => None,
+            (
+                Self::Allow {
+                    mut masked,
+                    mut counts,
+                },
+                Self::Allow {
+                    masked: rest,
+                    counts: more,
+                },
+            ) => {
+                masked.extend(rest);
+                for (k, v) in more {
+                    *counts.entry(k).or_insert(0) += v;
+                }
+                Some(Self::Allow { masked, counts })
+            }
+        }
+    }
+
+    /// Whether any slot came back rewritten, i.e. whether the write-back
+    /// is worth doing at all.
+    fn rewrote(&self, texts: &[String]) -> bool {
+        match self {
+            Self::Block => false,
+            Self::Allow { masked, .. } => masked.len() == texts.len() && masked != texts,
+        }
+    }
+}
+
+/// Group `texts` into batches whose combined length stays within
+/// `budget` characters, keeping every slot whole and in order.
+///
+/// A slot longer than the budget on its own becomes its own batch — it
+/// cannot be made smaller by grouping, and `apply_split` divides its
+/// text instead.
+fn batch_by_chars(texts: &[String], budget: usize) -> Vec<Vec<String>> {
+    let mut batches: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    for text in texts {
+        let len = text.chars().count();
+        if !current.is_empty() && used + len > budget {
+            batches.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        used += len;
+        current.push(text.clone());
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
 }
 
 /// The masking-aware interpretation of an `ApplyGuardrail` response.
@@ -452,6 +725,14 @@ fn assessment_has_hard_block(a: &GuardrailAssessment) -> bool {
 enum BedrockFailure {
     Timeout,
     Throttled,
+    /// AWS refused the payload for its size. Its own detail is kept so
+    /// the log still names the exception; the variant exists separately
+    /// because it is the one failure the dispatcher can act on — the
+    /// content is re-sent in smaller pieces rather than the request
+    /// simply failing (AISIX-Cloud#1386).
+    TooLarge {
+        detail: String,
+    },
     Other {
         /// Human-readable detail for logs: the modeled service error
         /// (carries the exception code, e.g. AccessDeniedException) or
@@ -466,14 +747,23 @@ impl BedrockFailure {
     fn from_sdk(err: SdkError<ApplyGuardrailError, Response>) -> Self {
         // ThrottlingException is the SDK's named throttle variant.
         if let SdkError::ServiceError(svc) = &err {
-            if matches!(svc.err(), ApplyGuardrailError::ThrottlingException(_)) {
-                return Self::Throttled;
-            }
             // Surface the modeled service error — its Debug carries the
             // exception code (AccessDeniedException, ValidationException,
             // …) so the failure log is greppable.
+            let detail = format!("{:?}", svc.err());
+            // Size first, and by MESSAGE rather than by exception type:
+            // AWS's per-request ceiling is a service quota, so the
+            // refusal arrives as a ValidationException in the documented
+            // case and has been observed as a throttle in practice —
+            // the wording is the reliable signal, not the variant.
+            if crate::too_large::body_says_too_large(&detail) {
+                return Self::TooLarge { detail };
+            }
+            if matches!(svc.err(), ApplyGuardrailError::ThrottlingException(_)) {
+                return Self::Throttled;
+            }
             return Self::Other {
-                detail: format!("{:?}", svc.err()),
+                detail,
                 source: std::error::Error::source(&err).map(|s| s.to_string()),
             };
         }
@@ -490,6 +780,7 @@ impl BedrockFailure {
         match self {
             Self::Timeout => "bedrock_timeout",
             Self::Throttled => "bedrock_throttled",
+            Self::TooLarge { .. } => "bedrock_too_large",
             Self::Other { .. } => "bedrock_5xx",
         }
     }
@@ -501,6 +792,7 @@ impl BedrockFailure {
             Self::Other { detail, source } => {
                 (self.bypass_tag(), Some(detail.as_str()), source.as_deref())
             }
+            Self::TooLarge { detail } => (self.bypass_tag(), Some(detail.as_str()), None),
             _ => (self.bypass_tag(), None, None),
         }
     }
@@ -1021,6 +1313,256 @@ mod tests {
             fail_open,
             Some(endpoint),
         )
+    }
+
+    // --- reactive split on an over-limit refusal (AISIX-Cloud#1386) ------
+    //
+    // AWS's per-request ceiling is a service quota that varies by region,
+    // policy type and tier and is adjustable per account, so it cannot be
+    // known here and cannot be enforced ahead of the call. These mocks
+    // stand in for whatever ceiling the account has: they refuse a body
+    // over `LIMIT` the way AWS does — a ValidationException whose message
+    // names text units — and accept anything under it.
+
+    const MOCK_LIMIT: usize = 4_000;
+
+    fn clean_body() -> serde_json::Value {
+        json!({
+            "action": "NONE",
+            "outputs": [],
+            "assessments": [],
+            "usage": {
+                "topicPolicyUnits": 0, "contentPolicyUnits": 0, "wordPolicyUnits": 0,
+                "sensitiveInformationPolicyUnits": 0,
+                "sensitiveInformationPolicyFreeUnits": 0,
+                "contextualGroundingPolicyUnits": 0
+            }
+        })
+    }
+
+    /// Refuses any request body over `MOCK_LIMIT` bytes with AWS's
+    /// size wording; otherwise answers clean. Records every body it saw
+    /// so a test can prove the whole content was submitted.
+    struct SizeLimitedBedrock {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        refused: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl wiremock::Respond for SizeLimitedBedrock {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let body = String::from_utf8_lossy(&request.body).to_string();
+            if body.len() > MOCK_LIMIT {
+                self.refused
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return ResponseTemplate::new(400)
+                    .append_header("x-amzn-errortype", "ValidationException")
+                    .set_body_json(json!({
+                        "message": "Input is too long: the request exceeds the maximum \
+                                    input size in text units for this guardrail"
+                    }));
+            }
+            self.seen.lock().unwrap().push(body);
+            ResponseTemplate::new(200).set_body_json(clean_body())
+        }
+    }
+
+    /// The whole point: content AWS refuses is re-sent in pieces until it
+    /// is all scanned, instead of the request simply failing. Every
+    /// segment must appear in something the mock accepted.
+    #[tokio::test]
+    async fn over_limit_payload_is_resent_in_batches_until_all_scanned() {
+        let server = MockServer::start().await;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let refused = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(SizeLimitedBedrock {
+                seen: seen.clone(),
+                refused: refused.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        // Four slots, each well under the ceiling alone but far over it
+        // together, plus a distinct marker per slot.
+        let texts: Vec<String> = (0..4)
+            .map(|i| format!("MARKER{i}{}", "x".repeat(1_500)))
+            .collect();
+
+        let g = build_with_endpoint(server.uri(), false);
+        let outcome = g
+            .apply_segments(GuardrailContentSource::Input, &texts)
+            .await;
+
+        assert_eq!(
+            outcome.verdict,
+            GuardrailVerdict::Allow,
+            "a clean split must not fail the request",
+        );
+        assert!(
+            refused.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the payload was never refused — this test would pass without any split",
+        );
+        let accepted = seen.lock().unwrap().concat();
+        for i in 0..4 {
+            assert!(
+                accepted.contains(&format!("MARKER{i}")),
+                "slot {i} never reached the provider — it was dropped, not split",
+            );
+        }
+    }
+
+    /// A single slot bigger than the ceiling has no other slots to group
+    /// with, so its own text must be divided rather than the request
+    /// failing.
+    #[tokio::test]
+    async fn single_over_limit_slot_has_its_text_split() {
+        let server = MockServer::start().await;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let refused = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(SizeLimitedBedrock {
+                seen: seen.clone(),
+                refused: refused.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        // One slot, several times the ceiling, whitespace-separated so
+        // the split has boundaries to prefer. Sized well past MOCK_LIMIT
+        // so the refusal path is certain to fire — the assertion below
+        // pins that it did.
+        let text = (0..2_000)
+            .map(|i| format!("token{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let g = build_with_endpoint(server.uri(), false);
+        let v = g.apply(GuardrailContentSource::Input, text.clone()).await;
+
+        assert_eq!(v, GuardrailVerdict::Allow);
+        assert!(
+            refused.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the slot was never refused — this test would pass without any split",
+        );
+        let accepted = seen.lock().unwrap().concat();
+        assert!(
+            accepted.contains("token0") && accepted.contains("token1999"),
+            "both ends of the oversized slot must be scanned",
+        );
+    }
+
+    /// A block found in any piece ends the scan — the split must not let
+    /// a later clean piece overwrite an earlier refusal.
+    #[tokio::test]
+    async fn a_block_in_any_piece_blocks_the_request() {
+        let server = MockServer::start().await;
+        struct BlockOnMarker;
+        impl wiremock::Respond for BlockOnMarker {
+            fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+                let body = String::from_utf8_lossy(&request.body).to_string();
+                if body.len() > MOCK_LIMIT {
+                    return ResponseTemplate::new(400)
+                        .append_header("x-amzn-errortype", "ValidationException")
+                        .set_body_json(json!({ "message": "exceeds the maximum input size" }));
+                }
+                if body.contains("FORBIDDEN") {
+                    return ResponseTemplate::new(200).set_body_json(json!({
+                        "action": "GUARDRAIL_INTERVENED",
+                        "outputs": [{ "text": "blocked" }],
+                        "assessments": [{
+                            "topicPolicy": { "topics": [
+                                { "name": "t", "type": "DENY", "action": "BLOCKED" }
+                            ]}
+                        }],
+                        "usage": {
+                            "topicPolicyUnits": 1, "contentPolicyUnits": 0,
+                            "wordPolicyUnits": 0, "sensitiveInformationPolicyUnits": 0,
+                            "sensitiveInformationPolicyFreeUnits": 0,
+                            "contextualGroundingPolicyUnits": 0
+                        }
+                    }));
+                }
+                ResponseTemplate::new(200).set_body_json(clean_body())
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(BlockOnMarker)
+            .mount(&server)
+            .await;
+
+        // The offending content sits in the LAST slot, so a split that
+        // stopped early would miss it.
+        let mut texts: Vec<String> = (0..3)
+            .map(|i| format!("clean{i}{}", "x".repeat(1_500)))
+            .collect();
+        texts.push("FORBIDDEN".to_owned());
+
+        let g = build_with_endpoint(server.uri(), false);
+        let outcome = g
+            .apply_segments(GuardrailContentSource::Input, &texts)
+            .await;
+        assert!(
+            outcome.verdict.is_block(),
+            "a block in the final batch must still block the request",
+        );
+    }
+
+    /// A payload AWS accepts must still cost exactly one call — the
+    /// split is reactive, so it must not add round trips to traffic that
+    /// never had a size problem.
+    #[tokio::test]
+    async fn accepted_payload_is_still_a_single_call() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(clean_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let g = build_with_endpoint(server.uri(), false);
+        let texts = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let outcome = g
+            .apply_segments(GuardrailContentSource::Input, &texts)
+            .await;
+        assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
+    }
+
+    /// A refusal we cannot make smaller still fails — and fails as a size
+    /// problem, not as an outage or a throttle, so the operator is told
+    /// what actually to change.
+    #[tokio::test]
+    async fn unsplittable_refusal_reports_too_large() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .append_header("x-amzn-errortype", "ValidationException")
+                    .set_body_json(json!({ "message": "exceeds the maximum input size" })),
+            )
+            .mount(&server)
+            .await;
+        let g = build_with_endpoint(server.uri(), true);
+        // A single short slot: nothing to batch, nothing to divide.
+        let v = g.apply(GuardrailContentSource::Input, "hi".into()).await;
+        match v {
+            GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "bedrock_too_large"),
+            other => panic!("expected a size-tagged bypass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batching_keeps_slots_whole_and_ordered() {
+        let texts: Vec<String> = vec!["a".repeat(60), "b".repeat(60), "c".repeat(10)];
+        let batches = batch_by_chars(&texts, 100);
+        assert_eq!(batches.len(), 2, "60+60 exceeds 100, so it must split");
+        assert_eq!(batches.concat(), texts, "no slot may be lost or reordered");
+        // A slot bigger than the budget becomes its own batch rather than
+        // being dropped — apply_split divides its text instead.
+        let huge = vec!["z".repeat(500)];
+        assert_eq!(batch_by_chars(&huge, 100).len(), 1);
     }
 
     /// Happy-path: Bedrock returns `action=NONE` → Allow. This is the

@@ -50,6 +50,7 @@ use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::chunk::chunk_text;
 use crate::{Guardrail, GuardrailVerdict};
 
 /// Maximum characters per Prompt Shield API call. Azure CS enforces a
@@ -328,50 +329,6 @@ fn collect_input_text(req: &ChatFormat) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Split `text` into chunks of at most `max_chars` characters, breaking
-/// on whitespace boundaries. A single word that exceeds `max_chars` is
-/// hard-truncated to that limit (avoids infinite loops on pathological
-/// inputs; such strings are rejected by the Azure CS API anyway).
-fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
-    if text.is_empty() {
-        return vec![];
-    }
-    if text.chars().count() <= max_chars {
-        return vec![text.to_owned()];
-    }
-    let mut chunks: Vec<String> = Vec::new();
-    let mut current = String::with_capacity(max_chars);
-    for word in text.split_whitespace() {
-        let word_chars = word.chars().count();
-        let sep = if current.is_empty() { 0usize } else { 1 };
-        if current.chars().count() + sep + word_chars > max_chars {
-            if !current.is_empty() {
-                chunks.push(std::mem::take(&mut current));
-            }
-            if word_chars > max_chars {
-                // Single word longer than the limit — split it into
-                // max_chars-sized pieces so the ENTIRE token is evaluated.
-                // Truncating to the first max_chars (the previous behavior)
-                // let the trailing part of an oversized whitespace-free
-                // input reach the model unscanned (#448).
-                let word_chars_vec: Vec<char> = word.chars().collect();
-                for piece in word_chars_vec.chunks(max_chars) {
-                    chunks.push(piece.iter().collect());
-                }
-                continue;
-            }
-        }
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        current.push_str(word);
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
 }
 
 // ---------------------------------------------------------------------------

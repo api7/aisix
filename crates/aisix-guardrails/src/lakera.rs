@@ -47,6 +47,7 @@
 //! | timeout                         | true        | Bypass { "lakera_timeout" }      |
 //! | 429 Throttling                  | true        | Bypass { "lakera_throttled" }    |
 //! | 5xx / IO error                  | true        | Bypass { "lakera_5xx" }          |
+//! | 413, or size wording in the body | true       | Bypass { "lakera_too_large" }    |
 //! | 4xx (non-429, e.g. 401/400)     | true        | Bypass { "lakera_config_error" } |
 //! | any failure                     | false       | Block { "lakera unavailable …" } |
 
@@ -162,6 +163,9 @@ impl LakeraGuardrail {
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(LakeraFailure::Throttled);
         }
+        if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+            return Err(LakeraFailure::TooLarge);
+        }
         if status.is_server_error() {
             return Err(LakeraFailure::ServerError);
         }
@@ -177,6 +181,9 @@ impl LakeraGuardrail {
                 response_body = %response_body,
                 "lakera guard returned 4xx — check endpoint, api_key, and project_id configuration",
             );
+            if crate::too_large::body_says_too_large(&response_body) {
+                return Err(LakeraFailure::TooLarge);
+            }
             return Err(LakeraFailure::ConfigError);
         }
 
@@ -304,6 +311,11 @@ enum LakeraFailure {
     IoError,
     ServerError,
     ConfigError,
+    /// The provider refused the payload for its size. Lakera publishes
+    /// neither a size limit nor an error shape, so this is reached only
+    /// through a standard `413` or generic size wording — see
+    /// `crate::too_large` (AISIX-Cloud#1386).
+    TooLarge,
 }
 
 impl LakeraFailure {
@@ -313,6 +325,7 @@ impl LakeraFailure {
             Self::Throttled => "lakera_throttled",
             Self::IoError | Self::ServerError => "lakera_5xx",
             Self::ConfigError => "lakera_config_error",
+            Self::TooLarge => "lakera_too_large",
         }
     }
 }

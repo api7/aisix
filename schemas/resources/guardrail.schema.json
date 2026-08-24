@@ -366,8 +366,8 @@
           "type": "string"
         },
         "fail_open": {
-          "default": true,
-          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "default": false,
+          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "hook_point": {
@@ -385,11 +385,6 @@
             "keyword"
           ],
           "type": "string"
-        },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
         },
         "name": {
           "description": "Operator-facing name that surfaces in metric labels and error reasons.",
@@ -443,8 +438,8 @@
           "type": "string"
         },
         "fail_open": {
-          "default": true,
-          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "default": false,
+          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "guardrail_id": {
@@ -482,11 +477,6 @@
             }
           ],
           "description": "Bedrock guardrail latency policy. Timed mode caps wait time with `timeout_ms`."
-        },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
         },
         "name": {
           "description": "Operator-facing name that surfaces in metric labels and error reasons.",
@@ -549,8 +539,8 @@
           "type": "string"
         },
         "fail_open": {
-          "default": true,
-          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "default": false,
+          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "hook_point": {
@@ -568,11 +558,6 @@
             "azure_content_safety"
           ],
           "type": "string"
-        },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
         },
         "name": {
           "description": "Operator-facing name that surfaces in metric labels and error reasons.",
@@ -664,8 +649,8 @@
           "type": "string"
         },
         "fail_open": {
-          "default": true,
-          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "default": false,
+          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "halt_on_blocklist_hit": {
@@ -688,11 +673,6 @@
             "azure_content_safety_text_moderation"
           ],
           "type": "string"
-        },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
         },
         "max_buffer_bytes": {
           "default": 262144,
@@ -834,8 +814,8 @@
           "type": "string"
         },
         "fail_open": {
-          "default": true,
-          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "default": false,
+          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "hook_point": {
@@ -853,11 +833,6 @@
             "aliyun_text_moderation"
           ],
           "type": "string"
-        },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
         },
         "max_buffer_bytes": {
           "default": 262144,
@@ -978,8 +953,8 @@
           "type": "string"
         },
         "fail_open": {
-          "default": true,
-          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "default": false,
+          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "hook_point": {
@@ -997,11 +972,6 @@
             "aliyun_ai_guardrail"
           ],
           "type": "string"
-        },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
         },
         "max_buffer_bytes": {
           "default": 262144,
@@ -1122,8 +1092,8 @@
           "type": "string"
         },
         "fail_open": {
-          "default": true,
-          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "default": false,
+          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "hook_point": {
@@ -1141,11 +1111,6 @@
             "pii"
           ],
           "type": "string"
-        },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
         },
         "max_buffer_bytes": {
           "default": 262144,
@@ -1206,8 +1171,8 @@
           "type": "string"
         },
         "fail_open": {
-          "default": true,
-          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "default": false,
+          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "hook_point": {
@@ -1225,11 +1190,6 @@
             "lakera"
           ],
           "type": "string"
-        },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
         },
         "max_buffer_bytes": {
           "default": 262144,
@@ -1319,8 +1279,8 @@
           "type": "string"
         },
         "fail_open": {
-          "default": true,
-          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "default": false,
+          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "hook_point": {
@@ -1338,11 +1298,6 @@
             "openai_moderation"
           ],
           "type": "string"
-        },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
         },
         "model": {
           "default": "omni-moderation-latest",
@@ -1427,8 +1382,8 @@
           "type": "array"
         },
         "fail_open": {
-          "default": true,
-          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "default": false,
+          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "hook_point": {
@@ -1452,11 +1407,6 @@
           "description": "Analyzer language code.",
           "minLength": 1,
           "type": "string"
-        },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
         },
         "max_buffer_bytes": {
           "default": 262144,
@@ -1572,11 +1522,6 @@
           ],
           "type": "string"
         },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
-        },
         "name": {
           "description": "Operator-facing name that surfaces in metric labels and error reasons.",
           "minLength": 1,
@@ -1654,8 +1599,8 @@
           "type": "string"
         },
         "fail_open": {
-          "default": true,
-          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "default": false,
+          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "hook_point": {
@@ -1673,11 +1618,6 @@
             "semantic"
           ],
           "type": "string"
-        },
-        "mandatory": {
-          "default": false,
-          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-          "type": "boolean"
         },
         "max_buffer_bytes": {
           "default": 262144,
@@ -1759,8 +1699,8 @@
       "type": "string"
     },
     "fail_open": {
-      "default": true,
-      "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+      "default": false,
+      "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
       "type": "boolean"
     },
     "hook_point": {
@@ -1771,11 +1711,6 @@
       ],
       "default": "both",
       "description": "Where in the lifecycle this rule runs."
-    },
-    "mandatory": {
-      "default": false,
-      "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
-      "type": "boolean"
     },
     "name": {
       "description": "Operator-facing name that surfaces in metric labels and error reasons.",
