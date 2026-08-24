@@ -1,8 +1,8 @@
-//! Local CPU embedding-model semantic guardrail — the runtime behind
-//! `kind: "semantic"` (AISIX-Cloud#1331 → #1363).
+//! Local CPU embedding-model smart-redaction guardrail — the runtime behind
+//! `kind: "smart_redaction"` (AISIX-Cloud#1331 → #1363).
 //!
 //! Implements the three-layer pipeline per user-configured category
-//! (`aisix_core::models::SemanticCategory`). Pipeline per text segment,
+//! (`aisix_core::models::SmartRedactionCategory`). Pipeline per text segment,
 //! per category:
 //!   1. the category's candidate regexes find spans with exact byte
 //!      offsets — the layer is deliberately broad, precision lives in
@@ -28,7 +28,7 @@
 //! (the design issue's "只改写不阻断" hard constraint), and every
 //! resource cap degrades to doing less, never to blocking or stalling.
 //!
-//! Wire-in: [`SemanticGuardrail`] rows implement the async
+//! Wire-in: [`SmartRedactionGuardrail`] rows implement the async
 //! segment-moderation hooks ([`Guardrail::moderate_input_segments`] /
 //! [`Guardrail::moderate_output_segments`]) — the same mask write-back
 //! channel the Bedrock ANONYMIZE pass uses — so the proxy's existing
@@ -36,9 +36,9 @@
 //! `redact_*_text` hooks stay unimplemented: inference must not run
 //! inline on a tokio worker.
 //!
-//! Ownership: ONE process-wide [`SemanticRuntime`] (model bundle,
+//! Ownership: ONE process-wide [`LocalModelRuntime`] (model bundle,
 //! session lanes, embedding cache) is verified at boot and shared by
-//! every `kind: "semantic"` row the chain builder compiles. The heavy
+//! every `kind: "smart_redaction"` row the chain builder compiles. The heavy
 //! state is lazy: boot only verifies the bundle's `manifest.json`
 //! (per-file sha256); ONNX sessions load on the first request that needs
 //! an embedding, and each category's description prototype is embedded
@@ -46,7 +46,7 @@
 //! config-only change (say, a threshold tune) rebuilds the chain without
 //! re-embedding anything. A node with no valid bundle simply lacks the
 //! capability — rows are skipped at build with a warning and the
-//! heartbeat stops advertising `semantic`.
+//! heartbeat stops advertising `smart_redaction`.
 //!
 //! Threading (inherited from the #1271 assessment): inference runs in
 //! `spawn_blocking`, bounded by a semaphore sized to the session pool —
@@ -115,7 +115,7 @@ use ort::value::Tensor;
 use regex::Regex;
 use sha2::Digest;
 
-use aisix_core::models::{GuardrailHookPoint, GuardrailMetricsSink, SemanticCategory};
+use aisix_core::models::{GuardrailHookPoint, GuardrailMetricsSink, SmartRedactionCategory};
 
 use crate::{
     Guardrail, GuardrailVerdict, SegmentsOutcome, StreamOutputPolicy,
@@ -199,10 +199,10 @@ pub enum LocalModelError {
 
 /// Reasons a span degrades to the rule layers instead of getting its
 /// embedding judgement. Bounded vocabulary — these land on a metric
-/// label (`aisix_guardrail_semantic_degraded_total{reason}`), never
+/// label (`aisix_guardrail_smart_redaction_degraded_total{reason}`), never
 /// free text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SemanticDegradeReason {
+pub enum LocalModelDegradeReason {
     /// The ONNX engine failed to initialize (bad bundle discovered at
     /// first use, or the dimension probe disagreed with the manifest).
     EngineFailed,
@@ -216,7 +216,7 @@ pub enum SemanticDegradeReason {
     InferenceFailed,
 }
 
-impl SemanticDegradeReason {
+impl LocalModelDegradeReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::EngineFailed => "engine_failed",
@@ -490,15 +490,15 @@ fn max_cosine(prototypes: &[Vec<f32>], v: &[f32]) -> f32 {
 
 /// Boot-time capability state, shared with the heartbeat so the
 /// advertised `supported_guardrail_kinds` tracks reality (spec §5.4):
-/// `semantic` is advertised while the bundle stays verified and the
+/// `smart_redaction` is advertised while the bundle stays verified and the
 /// engine has not failed.
 #[derive(Debug)]
-pub struct SemanticCapability {
+pub struct LocalModelCapability {
     /// 0 = verified (advertise), 1 = failed (stop advertising).
     state: AtomicU8,
 }
 
-impl SemanticCapability {
+impl LocalModelCapability {
     fn verified() -> Arc<Self> {
         Arc::new(Self {
             state: AtomicU8::new(0),
@@ -509,7 +509,7 @@ impl SemanticCapability {
         self.state.store(1, Ordering::Relaxed);
     }
 
-    /// `true` while the node can serve `kind: "semantic"`.
+    /// `true` while the node can serve `kind: "smart_redaction"`.
     pub fn is_ready(&self) -> bool {
         self.state.load(Ordering::Relaxed) == 0
     }
@@ -524,10 +524,10 @@ struct Engine {
     permits: Arc<tokio::sync::Semaphore>,
 }
 
-/// The process-wide semantic-guardrail runtime: one verified model
+/// The process-wide smart-redaction runtime: one verified model
 /// bundle, lazily loaded sessions, and a content-addressed prototype
-/// cache shared by every `kind: "semantic"` row.
-pub struct SemanticRuntime {
+/// cache shared by every `kind: "smart_redaction"` row.
+pub struct LocalModelRuntime {
     model_dir: PathBuf,
     lanes: usize,
     manifest: ModelManifest,
@@ -540,15 +540,15 @@ pub struct SemanticRuntime {
     /// the exact text — the manifest (and thus the model) is fixed for
     /// the process lifetime.
     prototype_cache: Mutex<std::collections::HashMap<String, Arc<Vec<f32>>>>,
-    capability: Arc<SemanticCapability>,
-    /// Metrics receiver for the semantic-specific series (model calls,
+    capability: Arc<LocalModelCapability>,
+    /// Metrics receiver for the smart-redaction-specific series (model calls,
     /// degrades). `None` records nothing (tests).
     sink: Option<Arc<dyn GuardrailMetricsSink>>,
 }
 
-impl std::fmt::Debug for SemanticRuntime {
+impl std::fmt::Debug for LocalModelRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SemanticRuntime")
+        f.debug_struct("LocalModelRuntime")
             .field("model_dir", &self.model_dir)
             .field("lanes", &self.lanes)
             .field("model_id", &self.manifest.model_id)
@@ -556,7 +556,7 @@ impl std::fmt::Debug for SemanticRuntime {
     }
 }
 
-impl SemanticRuntime {
+impl LocalModelRuntime {
     /// Verify the bundle under `model_dir` and construct the runtime.
     /// Blocking (hashes the bundle) — the server bootstrap wraps it in
     /// `spawn_blocking`. Does NOT load ONNX sessions; those load on
@@ -573,7 +573,7 @@ impl SemanticRuntime {
             revision = manifest.revision.as_deref().unwrap_or("unpinned"),
             embedding_dim = manifest.embedding_dim,
             lanes,
-            "semantic guardrail model bundle verified"
+            "smart-redaction guardrail model bundle verified"
         );
         Ok(Self {
             model_dir,
@@ -581,14 +581,14 @@ impl SemanticRuntime {
             manifest,
             engine: tokio::sync::OnceCell::new(),
             prototype_cache: Mutex::new(std::collections::HashMap::new()),
-            capability: SemanticCapability::verified(),
+            capability: LocalModelCapability::verified(),
             sink,
         })
     }
 
     /// Test-only runtime with no verified bundle: the engine never
     /// initializes, so every model-band judgement degrades to the rule
-    /// layers. Lets proxy/unit tests exercise `kind: "semantic"` rows
+    /// layers. Lets proxy/unit tests exercise `kind: "smart_redaction"` rows
     /// without the 120 MB model files.
     pub fn for_tests_without_model() -> Self {
         Self {
@@ -604,13 +604,13 @@ impl SemanticRuntime {
             },
             engine: tokio::sync::OnceCell::new(),
             prototype_cache: Mutex::new(std::collections::HashMap::new()),
-            capability: SemanticCapability::verified(),
+            capability: LocalModelCapability::verified(),
             sink: None,
         }
     }
 
     /// The capability handle the heartbeat reads.
-    pub fn capability(&self) -> Arc<SemanticCapability> {
+    pub fn capability(&self) -> Arc<LocalModelCapability> {
         Arc::clone(&self.capability)
     }
 
@@ -619,20 +619,20 @@ impl SemanticRuntime {
         &self.manifest
     }
 
-    fn record_degrade(&self, reason: SemanticDegradeReason) {
+    fn record_degrade(&self, reason: LocalModelDegradeReason) {
         if let Some(sink) = &self.sink {
-            sink.record_semantic_degrade(reason.as_str());
+            sink.record_smart_redaction_degrade(reason.as_str());
         }
     }
 
     fn record_model_call(&self) {
         if let Some(sink) = &self.sink {
-            sink.record_semantic_model_call();
+            sink.record_smart_redaction_model_call();
         }
     }
 
     /// Drive the engine load to completion. Spawned detached at chain
-    /// build time (see `build.rs`): the load happens when a semantic
+    /// build time (see `build.rs`): the load happens when a smart_redaction
     /// row appears, and this task is the persistent awaiter that keeps
     /// the `OnceCell` init alive when request-side awaiters give up.
     pub async fn warm_engine(&self) {
@@ -665,7 +665,10 @@ impl SemanticRuntime {
                 .await;
                 match loaded {
                     Ok(Ok(embedder)) => {
-                        tracing::info!(lanes = self.lanes, "semantic guardrail engine loaded");
+                        tracing::info!(
+                            lanes = self.lanes,
+                            "smart-redaction guardrail engine loaded"
+                        );
                         Some(Arc::new(Engine {
                             embedder: Arc::new(embedder),
                             permits: Arc::new(tokio::sync::Semaphore::new(self.lanes)),
@@ -675,8 +678,8 @@ impl SemanticRuntime {
                         tracing::warn!(
                             error = %err,
                             model_dir = %self.model_dir.display(),
-                            "semantic guardrail engine failed to load; \
-                             semantic rows degrade to rule layers until restart"
+                            "smart-redaction guardrail engine failed to load; \
+                             smart_redaction rows degrade to rule layers until restart"
                         );
                         self.capability.set_failed();
                         None
@@ -684,7 +687,7 @@ impl SemanticRuntime {
                     Err(join) => {
                         tracing::warn!(
                             error = %join,
-                            "semantic guardrail engine load task failed"
+                            "smart-redaction guardrail engine load task failed"
                         );
                         self.capability.set_failed();
                         None
@@ -703,15 +706,15 @@ impl SemanticRuntime {
     /// release while the session is still busy and repeated
     /// cancellations would pile threads up toward the pool cap (audit
     /// finding on PR #999).
-    async fn embed_text(&self, text: String) -> Result<Vec<f32>, SemanticDegradeReason> {
+    async fn embed_text(&self, text: String) -> Result<Vec<f32>, LocalModelDegradeReason> {
         // The engine wait is bounded like the lane wait: while the
         // detached warm task is still loading the session, a request
         // releases its span after 500ms instead of stalling on the
         // multi-second disk-bound load.
         let engine = match tokio::time::timeout(LANE_WAIT_TIMEOUT, self.engine()).await {
             Ok(Some(engine)) => engine,
-            Ok(None) => return Err(SemanticDegradeReason::EngineFailed),
-            Err(_) => return Err(SemanticDegradeReason::QueueTimeout),
+            Ok(None) => return Err(LocalModelDegradeReason::EngineFailed),
+            Err(_) => return Err(LocalModelDegradeReason::QueueTimeout),
         };
         let permit = match tokio::time::timeout(
             LANE_WAIT_TIMEOUT,
@@ -720,8 +723,8 @@ impl SemanticRuntime {
         .await
         {
             Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => return Err(SemanticDegradeReason::EngineFailed),
-            Err(_) => return Err(SemanticDegradeReason::QueueTimeout),
+            Ok(Err(_)) => return Err(LocalModelDegradeReason::EngineFailed),
+            Err(_) => return Err(LocalModelDegradeReason::QueueTimeout),
         };
         let embedder = Arc::clone(&engine.embedder);
         self.record_model_call();
@@ -733,19 +736,19 @@ impl SemanticRuntime {
         match joined {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(err)) => {
-                tracing::warn!(error = %err, "semantic guardrail inference failed");
-                Err(SemanticDegradeReason::InferenceFailed)
+                tracing::warn!(error = %err, "smart-redaction guardrail inference failed");
+                Err(LocalModelDegradeReason::InferenceFailed)
             }
             Err(join) => {
-                tracing::warn!(error = %join, "semantic guardrail inference task join failed");
-                Err(SemanticDegradeReason::InferenceFailed)
+                tracing::warn!(error = %join, "smart-redaction guardrail inference task join failed");
+                Err(LocalModelDegradeReason::InferenceFailed)
             }
         }
     }
 
     /// The cached prototype embedding for `text` (a category
     /// description), embedding it on first use.
-    async fn prototype_for(&self, text: &str) -> Result<Arc<Vec<f32>>, SemanticDegradeReason> {
+    async fn prototype_for(&self, text: &str) -> Result<Arc<Vec<f32>>, LocalModelDegradeReason> {
         if let Some(hit) = self
             .prototype_cache
             .lock()
@@ -898,10 +901,10 @@ struct CompiledCategory {
     prototype: tokio::sync::OnceCell<Option<Arc<Vec<f32>>>>,
 }
 
-/// Compile the categories of a `kind: "semantic"` row. `default_threshold`
+/// Compile the categories of a `kind: "smart_redaction"` row. `default_threshold`
 /// comes from the runtime's manifest calibration.
 fn compile_categories(
-    categories: &[SemanticCategory],
+    categories: &[SmartRedactionCategory],
     default_threshold: f32,
 ) -> Result<Vec<CompiledCategory>, CategoryCompileError> {
     let mut seen = std::collections::HashSet::new();
@@ -968,19 +971,19 @@ fn compile_categories(
     Ok(compiled)
 }
 
-/// The runtime guardrail for one `kind: "semantic"` row. Always-`Allow`;
+/// The runtime guardrail for one `kind: "smart_redaction"` row. Always-`Allow`;
 /// masks via the segment hooks; honors the row's `hook_point`.
-pub struct SemanticGuardrail {
-    runtime: Arc<SemanticRuntime>,
+pub struct SmartRedactionGuardrail {
+    runtime: Arc<LocalModelRuntime>,
     categories: Vec<CompiledCategory>,
     hook_point: GuardrailHookPoint,
 }
 
-impl SemanticGuardrail {
+impl SmartRedactionGuardrail {
     /// Compile a row's categories against the process runtime.
     pub fn from_config(
-        runtime: Arc<SemanticRuntime>,
-        categories: &[SemanticCategory],
+        runtime: Arc<LocalModelRuntime>,
+        categories: &[SmartRedactionCategory],
         hook_point: GuardrailHookPoint,
     ) -> Result<Self, CategoryCompileError> {
         let compiled = compile_categories(categories, runtime.manifest.calibration.description)?;
@@ -1008,7 +1011,7 @@ impl SemanticGuardrail {
                 category = %cat.name,
                 candidates = spans.len(),
                 cap = MAX_RULE_SCORED_SPANS_PER_SEGMENT,
-                "semantic guardrail: candidate cap reached; the tail is released unscored"
+                "smart-redaction guardrail: candidate cap reached; the tail is released unscored"
             );
         }
         let mut hits: Vec<Range<usize>> = Vec::new();
@@ -1022,11 +1025,11 @@ impl SemanticGuardrail {
                         if !over_budget {
                             over_budget = true;
                             self.runtime
-                                .record_degrade(SemanticDegradeReason::BudgetExhausted);
+                                .record_degrade(LocalModelDegradeReason::BudgetExhausted);
                             tracing::warn!(
                                 category = %cat.name,
                                 cap = MAX_MODEL_CALLS_PER_PASS,
-                                "semantic guardrail: model-call cap reached; \
+                                "smart-redaction guardrail: model-call cap reached; \
                                  uncertain candidates left unmasked"
                             );
                         }
@@ -1043,14 +1046,14 @@ impl SemanticGuardrail {
                         .get_or_try_init(|| async {
                             match self.runtime.prototype_for(&cat.description).await {
                                 Ok(v) => Ok(Some(v)),
-                                Err(reason @ SemanticDegradeReason::EngineFailed) => {
+                                Err(reason @ LocalModelDegradeReason::EngineFailed) => {
                                     // Record the UNDERLYING cause — that is
                                     // what the operator has to fix.
                                     self.runtime.record_degrade(reason);
                                     tracing::warn!(
                                         category = %cat.name,
                                         reason = reason.as_str(),
-                                        "semantic guardrail: description prototype \
+                                        "smart-redaction guardrail: description prototype \
                                          unavailable; category degrades to rule layers"
                                     );
                                     Ok(None)
@@ -1067,7 +1070,7 @@ impl SemanticGuardrail {
                             // judged is one more degrade sample, not a
                             // one-off at failure time.
                             self.runtime
-                                .record_degrade(SemanticDegradeReason::PrototypeUnavailable);
+                                .record_degrade(LocalModelDegradeReason::PrototypeUnavailable);
                             continue;
                         }
                         Err(reason) => {
@@ -1084,7 +1087,7 @@ impl SemanticGuardrail {
                                 category = %cat.name,
                                 score,
                                 threshold = cat.threshold,
-                                "semantic guardrail window judged"
+                                "smart-redaction guardrail window judged"
                             );
                             if score >= cat.threshold {
                                 hits.push(span);
@@ -1144,9 +1147,9 @@ impl SemanticGuardrail {
 }
 
 #[async_trait]
-impl Guardrail for SemanticGuardrail {
+impl Guardrail for SmartRedactionGuardrail {
     fn name(&self) -> &'static str {
-        "semantic"
+        "smart_redaction"
     }
 
     /// Consulted through the segment hooks only (the mask write-back

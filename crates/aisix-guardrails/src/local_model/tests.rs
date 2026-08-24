@@ -1,7 +1,7 @@
-//! Unit + model-backed tests for the semantic guardrail runtime.
+//! Unit + model-backed tests for the smart-redaction guardrail runtime.
 //!
 //! Everything above the `model-backed` marker runs modelless: the rule
-//! layers are pure text work, and [`SemanticRuntime::for_tests_without_model`]
+//! layers are pure text work, and [`LocalModelRuntime::for_tests_without_model`]
 //! exercises the degrade arms (engine unavailable → model-band spans
 //! release). The `#[ignore]` tests need the real bundle:
 //!   GUARDRAIL_LOCAL_MODEL_DIR=~/.cache/aisix-local-guardrail-mvp \
@@ -28,8 +28,8 @@ pub(crate) mod fixtures {
     pub(crate) const EDA_FUSED_DL: &str =
         r"[0-9][A-Za-z0-9._-]*[A-Za-z](?:[A-Za-z0-9._-]*[A-Za-z0-9])?";
 
-    pub(crate) fn eda_category() -> SemanticCategory {
-        SemanticCategory {
+    pub(crate) fn eda_category() -> SmartRedactionCategory {
+        SmartRedactionCategory {
             name: "eda_version".into(),
             description: "EDA 软件的版本号".into(),
             candidate_patterns: vec![
@@ -59,7 +59,7 @@ pub(crate) mod fixtures {
                 r"(?:^|[^本])编号[:：]?(?:是|为)?\s*$".into(),
             ],
             hotword_groups: vec![
-                aisix_core::models::SemanticHotwordGroup {
+                aisix_core::models::SmartRedactionHotwordGroup {
                     terms: vec![
                         "版本号".into(),
                         "版本".into(),
@@ -67,7 +67,7 @@ pub(crate) mod fixtures {
                         "回退到".into(),
                     ],
                 },
-                aisix_core::models::SemanticHotwordGroup {
+                aisix_core::models::SmartRedactionHotwordGroup {
                     terms: vec![
                         "version".into(),
                         "release".into(),
@@ -76,7 +76,7 @@ pub(crate) mod fixtures {
                         "upgraded to".into(),
                     ],
                 },
-                aisix_core::models::SemanticHotwordGroup {
+                aisix_core::models::SmartRedactionHotwordGroup {
                     terms: vec![
                         "virtuoso".into(),
                         "calibre".into(),
@@ -143,16 +143,16 @@ pub(crate) mod fixtures {
 
     /// The real-model runtime, or `None` when [`MODEL_DIR_ENV`] is
     /// unset (the `#[ignore]` tests no-op then).
-    pub(crate) fn model_runtime(lanes: usize) -> Option<SemanticRuntime> {
+    pub(crate) fn model_runtime(lanes: usize) -> Option<LocalModelRuntime> {
         let dir = PathBuf::from(std::env::var_os(MODEL_DIR_ENV)?);
         ensure_manifest(&dir);
-        Some(SemanticRuntime::load(dir, lanes, None).expect("model bundle verifies"))
+        Some(LocalModelRuntime::load(dir, lanes, None).expect("model bundle verifies"))
     }
 
-    pub(crate) fn model_guardrail() -> Option<SemanticGuardrail> {
+    pub(crate) fn model_guardrail() -> Option<SmartRedactionGuardrail> {
         let rt = Arc::new(model_runtime(1)?);
         Some(
-            SemanticGuardrail::from_config(rt, &[eda_category()], GuardrailHookPoint::Both)
+            SmartRedactionGuardrail::from_config(rt, &[eda_category()], GuardrailHookPoint::Both)
                 .expect("fixture compiles"),
         )
     }
@@ -168,9 +168,9 @@ fn values_of(text: &str) -> Vec<&str> {
     spans_of(text).into_iter().map(|s| &text[s]).collect()
 }
 
-fn modelless_guardrail() -> SemanticGuardrail {
-    SemanticGuardrail::from_config(
-        Arc::new(SemanticRuntime::for_tests_without_model()),
+fn modelless_guardrail() -> SmartRedactionGuardrail {
+    SmartRedactionGuardrail::from_config(
+        Arc::new(LocalModelRuntime::for_tests_without_model()),
         &[eda_category()],
         GuardrailHookPoint::Both,
     )
@@ -384,7 +384,7 @@ fn write_bundle(dir: &Path, corrupt: bool) {
 #[test]
 fn manifest_verifies_and_rejects_corruption() {
     let dir = std::env::temp_dir().join(format!(
-        "aisix-semantic-manifest-test-{}",
+        "aisix-smart-redaction-manifest-test-{}",
         std::process::id()
     ));
     let good = dir.join("good");
@@ -410,7 +410,7 @@ fn manifest_verifies_and_rejects_corruption() {
 #[test]
 fn manifest_rejects_traversal_file_names() {
     let dir = std::env::temp_dir().join(format!(
-        "aisix-semantic-manifest-traversal-{}",
+        "aisix-smart-redaction-manifest-traversal-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -468,8 +468,8 @@ async fn model_band_releases_when_engine_unavailable() {
 
 #[tokio::test]
 async fn hook_point_gates_the_segment_hooks() {
-    let g = SemanticGuardrail::from_config(
-        Arc::new(SemanticRuntime::for_tests_without_model()),
+    let g = SmartRedactionGuardrail::from_config(
+        Arc::new(LocalModelRuntime::for_tests_without_model()),
         &[eda_category()],
         GuardrailHookPoint::Input,
     )
@@ -487,12 +487,12 @@ async fn categories_compose_and_count_separately() {
     second.description = "工单编号".into();
     second.candidate_patterns = vec![r"JIRA-\d+".into()];
     second.negative_patterns = vec![];
-    second.hotword_groups = vec![aisix_core::models::SemanticHotwordGroup {
+    second.hotword_groups = vec![aisix_core::models::SmartRedactionHotwordGroup {
         terms: vec!["工单".into()],
     }];
     second.replacement = None; // default token
-    let g = SemanticGuardrail::from_config(
-        Arc::new(SemanticRuntime::for_tests_without_model()),
+    let g = SmartRedactionGuardrail::from_config(
+        Arc::new(LocalModelRuntime::for_tests_without_model()),
         &[eda_category(), second],
         GuardrailHookPoint::Both,
     )
@@ -508,7 +508,7 @@ async fn categories_compose_and_count_separately() {
 
 // ── model-backed tests (need the real model files) ──────────────────────
 
-fn load_model_guardrail() -> Option<SemanticGuardrail> {
+fn load_model_guardrail() -> Option<SmartRedactionGuardrail> {
     fixtures::model_guardrail()
 }
 

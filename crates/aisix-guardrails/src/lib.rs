@@ -40,6 +40,7 @@ mod pii;
 mod presidio;
 #[cfg(feature = "azure-content-safety")]
 mod prompt_shield;
+mod semantic;
 #[cfg(feature = "azure-content-safety")]
 mod text_moderation;
 
@@ -164,7 +165,7 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
 /// the serde `kind` tags in `aisix_core::models::GuardrailKind`
 /// (`GuardrailKind::kind_str`).
 ///
-/// `semantic` is deliberately NOT here even when the `local-model`
+/// `smart_redaction` is deliberately NOT here even when the `local-model`
 /// feature is compiled in: serving it also needs the model bundle on
 /// disk, a RUNTIME fact — heartbeat callers report
 /// [`supported_kinds_with`] instead.
@@ -188,67 +189,163 @@ pub fn supported_kinds() -> &'static [&'static str] {
         "openai_moderation",
         #[cfg(feature = "presidio")]
         "presidio",
+        // No cargo feature and no on-disk asset: the embedding call goes
+        // out over the provider bridges every build already has.
+        "semantic",
     ]
 }
 
-/// [`supported_kinds`] plus the runtime-conditional `semantic` kind:
+/// [`supported_kinds`] plus the runtime-conditional `smart_redaction` kind:
 /// advertised only while the node's model bundle stays verified (the
-/// `SemanticCapability` the runtime hands the heartbeat). Readiness
-/// means "could serve" — the control plane creating a semantic row is
+/// `LocalModelCapability` the runtime hands the heartbeat). Readiness
+/// means "could serve" — the control plane creating a smart_redaction row is
 /// what triggers the lazy engine load, so gating the advert on "already
 /// active" would deadlock the create flow behind its own greying.
-pub fn supported_kinds_with(semantic_ready: bool) -> Vec<&'static str> {
+pub fn supported_kinds_with(smart_redaction_ready: bool) -> Vec<&'static str> {
     let mut kinds = supported_kinds().to_vec();
     #[cfg(feature = "local-model")]
-    if semantic_ready {
-        kinds.push("semantic");
+    if smart_redaction_ready {
+        kinds.push("smart_redaction");
     }
     #[cfg(not(feature = "local-model"))]
-    let _ = semantic_ready;
+    let _ = smart_redaction_ready;
     kinds
 }
 
-/// The process-wide semantic-guardrail runtime, passed to the chain
-/// builders. Always constructible — a build without the `local-model`
-/// feature, or a node without a verified model bundle, passes
-/// [`SemanticRuntimeSlot::none`] and every `kind: "semantic"` row is
-/// skipped with a warning (`BuildError::RuntimeUnavailable` /
-/// `FeatureDisabled`).
-#[derive(Clone, Default)]
-pub struct SemanticRuntimeSlot {
-    #[cfg(feature = "local-model")]
-    runtime: Option<std::sync::Arc<local_model::SemanticRuntime>>,
+/// Why a guardrail embedding dispatch produced no vector.
+///
+/// A closed vocabulary on purpose: the tag rides a `Bypass` reason and
+/// the `unavailable` field of a `Block`, both of which reach metric
+/// labels and the error envelope, so it must never carry free text or
+/// screened content (#153).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedFailure {
+    /// The alias names no `embedding`-kind Model in this environment, or
+    /// the model has no usable provider credential.
+    Unresolved,
+    /// The embedding call did not answer inside the configured deadline.
+    Timeout,
+    /// The embedding call reached the provider and failed there, or
+    /// answered with an unusable vector.
+    Upstream,
 }
 
-impl SemanticRuntimeSlot {
-    /// No runtime: semantic rows cannot be served.
+impl EmbedFailure {
+    /// The bounded tag used in verdict reasons and metric labels.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EmbedFailure::Unresolved => "semantic_embed_unresolved",
+            EmbedFailure::Timeout => "semantic_embed_timeout",
+            EmbedFailure::Upstream => "semantic_embed_upstream",
+        }
+    }
+}
+
+/// Embeds text through the gateway's own provider bridges, for
+/// `kind: "semantic"`.
+///
+/// The dispatch this needs is the one semantic ROUTING already performs
+/// (`aisix_proxy::semantic::embed_texts`), but that lives a layer up: it
+/// needs the provider hub and the model snapshot, and holding a
+/// `ProxyState` from here would close a reference cycle through the
+/// chain cache `ProxyState` itself owns. So the proxy injects an
+/// implementation the same way it injects [`LocalModelRuntimeSlot`], and
+/// the implementation keeps only the hub plus a snapshot handle.
+#[async_trait]
+pub trait GuardrailEmbedder: Send + Sync + 'static {
+    /// Embed `texts` with the `embedding`-kind Model aliased
+    /// `model_alias`, returning one vector per input, in input order.
+    ///
+    /// `cacheable` marks CONFIG-derived text — the example prototypes,
+    /// which are fixed per row and worth memoising process-wide so a
+    /// chain rebuild does not re-embed them. Request-derived text passes
+    /// `false`: its cardinality is unbounded and caching it would grow
+    /// without limit.
+    async fn embed(
+        &self,
+        model_alias: &str,
+        texts: &[String],
+        cacheable: bool,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<Vec<f32>>, EmbedFailure>;
+}
+
+/// The process-wide guardrail embedder, passed to the chain builders.
+/// Always constructible — a caller that has no dispatch to offer passes
+/// [`GuardrailEmbedderSlot::none`] and every `kind: "semantic"` row is
+/// skipped with a warning (`BuildError::RuntimeUnavailable`).
+#[derive(Clone, Default)]
+pub struct GuardrailEmbedderSlot {
+    embedder: Option<std::sync::Arc<dyn GuardrailEmbedder>>,
+}
+
+impl GuardrailEmbedderSlot {
+    /// No embedder: `semantic` rows cannot be served.
     pub fn none() -> Self {
         Self::default()
     }
 
-    /// A verified runtime: semantic rows compile against it.
+    /// An embedder: `semantic` rows compile against it.
+    pub fn new(embedder: std::sync::Arc<dyn GuardrailEmbedder>) -> Self {
+        Self {
+            embedder: Some(embedder),
+        }
+    }
+
+    pub(crate) fn get(&self) -> Option<&std::sync::Arc<dyn GuardrailEmbedder>> {
+        self.embedder.as_ref()
+    }
+}
+
+impl std::fmt::Debug for GuardrailEmbedderSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuardrailEmbedderSlot")
+            .field("present", &self.embedder.is_some())
+            .finish()
+    }
+}
+
+/// The process-wide smart-redaction runtime, passed to the chain
+/// builders. Always constructible — a build without the `local-model`
+/// feature, or a node without a verified model bundle, passes
+/// [`LocalModelRuntimeSlot::none`] and every `kind: "smart_redaction"` row is
+/// skipped with a warning (`BuildError::RuntimeUnavailable` /
+/// `FeatureDisabled`).
+#[derive(Clone, Default)]
+pub struct LocalModelRuntimeSlot {
     #[cfg(feature = "local-model")]
-    pub fn new(runtime: std::sync::Arc<local_model::SemanticRuntime>) -> Self {
+    runtime: Option<std::sync::Arc<local_model::LocalModelRuntime>>,
+}
+
+impl LocalModelRuntimeSlot {
+    /// No runtime: smart_redaction rows cannot be served.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// A verified runtime: smart_redaction rows compile against it.
+    #[cfg(feature = "local-model")]
+    pub fn new(runtime: std::sync::Arc<local_model::LocalModelRuntime>) -> Self {
         Self {
             runtime: Some(runtime),
         }
     }
 
     #[cfg(feature = "local-model")]
-    pub(crate) fn get(&self) -> Option<&std::sync::Arc<local_model::SemanticRuntime>> {
+    pub(crate) fn get(&self) -> Option<&std::sync::Arc<local_model::LocalModelRuntime>> {
         self.runtime.as_ref()
     }
 }
 
-impl std::fmt::Debug for SemanticRuntimeSlot {
+impl std::fmt::Debug for LocalModelRuntimeSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         #[cfg(feature = "local-model")]
         return f
-            .debug_struct("SemanticRuntimeSlot")
+            .debug_struct("LocalModelRuntimeSlot")
             .field("present", &self.runtime.is_some())
             .finish();
         #[cfg(not(feature = "local-model"))]
-        f.debug_struct("SemanticRuntimeSlot").finish()
+        f.debug_struct("LocalModelRuntimeSlot").finish()
     }
 }
 
@@ -269,8 +366,8 @@ pub use keyword::{KeywordBlocklist, KeywordRule};
 pub use lakera::LakeraGuardrail;
 #[cfg(feature = "local-model")]
 pub use local_model::{
-    parse_lanes, CategoryCompileError, LocalModelError, ModelManifest, SemanticCapability,
-    SemanticGuardrail, SemanticRuntime, DEFAULT_MODEL_DIR, LANES_ENV, MODEL_DIR_ENV,
+    parse_lanes, CategoryCompileError, LocalModelCapability, LocalModelError, LocalModelRuntime,
+    ModelManifest, SmartRedactionGuardrail, DEFAULT_MODEL_DIR, LANES_ENV, MODEL_DIR_ENV,
     PROTOTYPES_ENV, RULE_WINDOW_ENV, THRESHOLD_ENV,
 };
 #[cfg(feature = "openai-moderation")]
@@ -280,6 +377,7 @@ pub use pii::{builtin_rule, PiiAction, PiiGuardrail, PiiRule, BUILTIN_DETECTORS}
 pub use presidio::PresidioGuardrail;
 #[cfg(feature = "azure-content-safety")]
 pub use prompt_shield::PromptShieldGuardrail;
+pub use semantic::SemanticGuardrail;
 #[cfg(feature = "azure-content-safety")]
 pub use text_moderation::TextModerationGuardrail;
 
@@ -989,6 +1087,7 @@ mod tests {
                 "lakera",
                 "openai_moderation",
                 "presidio",
+                "semantic",
             ],
         );
         for kind in supported_kinds() {
@@ -1041,6 +1140,11 @@ mod tests {
                 "openai_moderation" => serde_json::json!({
                     "kind": "openai_moderation",
                     "api_key": "sk",
+                }),
+                "semantic" => serde_json::json!({
+                    "kind": "semantic",
+                    "embedding_model": "embed-1",
+                    "deny_examples": ["x"],
                 }),
                 "presidio" => serde_json::json!({
                     "kind": "presidio",

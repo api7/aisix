@@ -797,6 +797,7 @@ mod tests {
                 "lakera",
                 "openai_moderation",
                 "presidio",
+                "semantic",
             ]),
         );
 

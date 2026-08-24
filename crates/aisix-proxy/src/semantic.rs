@@ -7,7 +7,7 @@
 //! so semantic routing reuses all of the streaming / failover / telemetry
 //! machinery and only adds the "which target" decision on top.
 //!
-//! The scoring core ([`cosine_similarity`], [`decide`],
+//! The scoring core ([`decide`],
 //! [`embedding_failure_target`]) and the example-vector cache
 //! ([`SemanticVectorCache`]) are pure and unit-tested in isolation; the
 //! async embedding call lives in [`resolve`].
@@ -25,26 +25,12 @@ use crate::error::ProxyError;
 use crate::routing::AttemptModel;
 use crate::state::ProxyState;
 
-/// Cosine similarity of two equal-length vectors. Returns `0.0` for a
-/// length mismatch or a zero-magnitude vector, so a degenerate embedding
-/// can never inject `NaN` into the `max` aggregation.
-pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() {
-        return 0.0;
-    }
-    let mut dot = 0.0f32;
-    let mut na = 0.0f32;
-    let mut nb = 0.0f32;
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
-    if na == 0.0 || nb == 0.0 {
-        return 0.0;
-    }
-    dot / (na.sqrt() * nb.sqrt())
-}
+// Scoring primitives are shared with the `kind: "semantic"` guardrail,
+// which scores the same way against its example prototypes — one
+// implementation in `aisix-core` so the two cannot drift on the
+// degenerate cases (length mismatch, zero magnitude, empty prototype
+// set).
+pub(crate) use aisix_core::best_similarity;
 
 /// Outcome of scoring a request against a semantic router.
 #[derive(Debug, Clone, PartialEq)]
@@ -68,11 +54,12 @@ pub(crate) fn decide(
 ) -> RouteDecision {
     let mut scores = Vec::with_capacity(semantic.routes.len());
     for ex_vecs in route_example_vecs {
-        let best = ex_vecs
-            .iter()
-            .map(|v| cosine_similarity(request_vec, v))
-            .fold(f32::NEG_INFINITY, f32::max);
-        scores.push(if best.is_finite() { best } else { 0.0 });
+        // A route with no cached example vectors scores 0.0, not
+        // `-inf`: it must lose to every real route without poisoning the
+        // comparison.
+        scores.push(
+            best_similarity(request_vec, ex_vecs.iter().map(|v| v.as_slice())).unwrap_or(0.0),
+        );
     }
     let mut winner: Option<usize> = None;
     let mut best = f32::NEG_INFINITY;
@@ -211,7 +198,7 @@ pub(crate) async fn resolve(
         crate::routing::effective_timeouts(&embed_entry.value, None, state.default_timeouts).request
     });
     let vectors = match embed_texts(
-        state,
+        &state.hub,
         snapshot,
         &embed_entry,
         embed_deadline,
@@ -412,7 +399,7 @@ fn select_eligible(
 /// (`aisix-proxy::chat`), which is why the deadline arrives as a plain
 /// `Option<Duration>` rather than either feature's config type.
 pub(crate) async fn embed_texts(
-    state: &ProxyState,
+    hub: &aisix_gateway::Hub,
     snapshot: &AisixSnapshot,
     embed_entry: &ResourceEntry<Model>,
     timeout: Option<std::time::Duration>,
@@ -422,7 +409,7 @@ pub(crate) async fn embed_texts(
     let model = &embed_entry.value;
     crate::dispatch::require_provider(model)?;
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
-    let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
+    let bridge = crate::dispatch::resolve_bridge(hub, &pk_entry.value)
         .ok_or(ProxyError::ProviderUnavailable)?;
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
     let dimensions = model.embedding.as_ref().map(|e| e.dimensions);
@@ -458,7 +445,7 @@ pub(crate) async fn embed_texts(
         match obj.embedding {
             EmbeddingVector::Float(v) => {
                 // Surface a wrong-dimension response explicitly instead of
-                // letting cosine_similarity fold the length mismatch into
+                // letting cosine similarity fold the length mismatch into
                 // 0.0 (which would silently route every request to default).
                 if let Some(expected) = expected_dims {
                     if v.len() != expected {
@@ -499,28 +486,6 @@ mod tests {
 
     fn arc(v: Vec<f32>) -> Arc<Vec<f32>> {
         Arc::new(v)
-    }
-
-    #[test]
-    fn cosine_identical_is_one_orthogonal_is_zero() {
-        assert!((cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
-        assert!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
-        // Opposite direction → -1.
-        assert!((cosine_similarity(&[1.0, 0.0], &[-1.0, 0.0]) + 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn cosine_degenerate_inputs_are_zero_not_nan() {
-        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
-        assert_eq!(cosine_similarity(&[1.0, 2.0, 3.0], &[1.0, 2.0]), 0.0); // length mismatch
-        assert!(!cosine_similarity(&[0.0], &[0.0]).is_nan());
-    }
-
-    #[test]
-    fn cosine_is_scale_invariant() {
-        // Same direction, different magnitude → still ~1.
-        let s = cosine_similarity(&[1.0, 1.0], &[5.0, 5.0]);
-        assert!((s - 1.0).abs() < 1e-6, "expected ~1, got {s}");
     }
 
     fn router() -> Semantic {

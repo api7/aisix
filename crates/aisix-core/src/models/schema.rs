@@ -1245,13 +1245,13 @@ pub fn guardrail_root_schema() -> Value {
         // Semantic categories rewrite only — the `block` action does not
         // exist for this kind, and the schema says so rather than letting
         // a `block` value be accepted and half-honored (#963).
-        set_definition_property_enum(defs, "SemanticCategory", "action", json!(["mask"]));
+        set_definition_property_enum(defs, "SmartRedactionCategory", "action", json!(["mask"]));
         // The write path must see candidate patterns spelled out: the
         // serde default is `[]`, and JSON Schema's `minItems` does not
         // apply to an ABSENT property — without `required`, a category
         // with no patterns validates strictly and then fails category
         // compilation, silently skipping the whole row (#963 class).
-        if let Some(cat) = defs.get_mut("SemanticCategory") {
+        if let Some(cat) = defs.get_mut("SmartRedactionCategory") {
             require_property(cat, "candidate_patterns");
         }
         set_definition_property_enum(
@@ -1382,7 +1382,7 @@ pub fn guardrail_root_schema() -> Value {
                     set_property_enum(b, "default_action", json!(["mask", "block"]));
                     set_property_enum(b, "operator", json!(["replace", "mask", "hash", "redact"]));
                 }
-                "semantic" => {
+                "smart_redaction" => {
                     // A semantic row with no categories detects nothing;
                     // the write path must see them spelled out (the serde
                     // default keeps the Rust type read-tolerant), matching
@@ -1421,6 +1421,24 @@ pub fn guardrail_root_schema() -> Value {
                                  Only `true` is accepted."
                             }),
                         );
+                    }
+                }
+                "semantic" => {
+                    set_property_enum(b, "text_source", json!(["user_messages", "all_messages"]));
+                    set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
+                    // Required on the write path, defaulted in the type:
+                    // see the field's doc comment. A row saved without it
+                    // would screen every request against a model that
+                    // resolves to nothing.
+                    match b.get_mut("required").and_then(Value::as_array_mut) {
+                        Some(list) => {
+                            if !list.iter().any(|v| v.as_str() == Some("embedding_model")) {
+                                list.push(json!("embedding_model"));
+                            }
+                        }
+                        None => {
+                            b.insert("required".to_string(), json!(["embedding_model"]));
+                        }
                     }
                 }
                 _ => {}
@@ -1526,6 +1544,10 @@ fn guardrail_kind_description(kind: &str) -> Option<&'static str> {
             Some("Guardrail provider type for PII detection and anonymization by a customer-run Presidio.")
         }
         "semantic" => Some(
+            "Guardrail provider type for embedding-similarity screening against \
+             example texts, using an embedding-kind Model.",
+        ),
+        "smart_redaction" => Some(
             "Guardrail provider type for in-process semantic category detection and redaction using the bundled embedding model.",
         ),
         _ => None,

@@ -23,6 +23,7 @@ pub mod filesource;
 pub mod header_template;
 pub mod models;
 pub mod resource;
+pub mod similarity;
 pub mod snapshot;
 pub mod version;
 pub mod wildcard;
@@ -56,5 +57,6 @@ pub use models::{
     DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use resource::{Resource, ResourceEntry};
+pub use similarity::{best_similarity, cosine_similarity};
 pub use snapshot::{ResourceTable, SnapshotHandle};
 pub use version::BUILD_VERSION;

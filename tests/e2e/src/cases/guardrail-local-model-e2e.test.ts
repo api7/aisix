@@ -23,7 +23,7 @@ import {
 // adds the layer-③ acceptance path: a live in-process inference judges
 // the model band, and the model-call metric family counts it.
 //
-// The guardrail is a standard `kind: "semantic"` ROW (the factory EDA
+// The guardrail is a standard `kind: "smart_redaction"` ROW (the factory EDA
 // template) resolved through attachments — the MVP-era env-activated
 // global is gone.
 //
@@ -195,7 +195,7 @@ describe("local-model guardrail e2e: EDA version number masked on request and re
       name: "local-model-semantic",
       enabled: true,
       hook_point: "both",
-      kind: "semantic",
+      kind: "smart_redaction",
       categories: [EDA_CATEGORY],
     });
     // Caller key last: it authenticating implies the whole seed set is in
@@ -251,7 +251,7 @@ describe("local-model guardrail e2e: EDA version number masked on request and re
 
     const before = sumMetric(
       await scrapeMetrics(app.metricsUrl),
-      "aisix_guardrail_semantic_model_calls_total",
+      "aisix_guardrail_smart_redaction_model_calls_total",
     );
     const client = new OpenAI({
       apiKey: CALLER,
@@ -287,7 +287,7 @@ describe("local-model guardrail e2e: EDA version number masked on request and re
 
       after = sumMetric(
         await scrapeMetrics(app.metricsUrl),
-        "aisix_guardrail_semantic_model_calls_total",
+        "aisix_guardrail_smart_redaction_model_calls_total",
       );
       if (after > before || Date.now() > deadline) break;
       await new Promise((r) => setTimeout(r, 500));
