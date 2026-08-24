@@ -104,6 +104,29 @@ async fn rpm_counter_is_shared_across_replicas() {
     );
 }
 
+/// Sleep until the next whole second starts.
+///
+/// The rps counter buckets server-side: the Lua script reads `now` from
+/// `redis.call('TIME')` and derives `ws = now - (now % window)`. So the
+/// boundary that matters is Redis's clock at script-execution time, and
+/// a test that starts at an arbitrary offset into a second is racing
+/// whatever is left of it. Aligning first puts a full second between the
+/// pair and the next boundary, so only a Redis stalled for more than a
+/// second could still split them — which is a real failure, not a race.
+///
+/// This uses the client clock to align against a server-side bucket,
+/// which holds because CI runs Redis as a service container on the same
+/// host. A remote Redis with clock skew would need the alignment read
+/// from `TIME` instead.
+async fn wait_for_second_boundary() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after the epoch");
+    let remainder = Duration::from_nanos(u64::from(now.subsec_nanos()));
+    tokio::time::sleep(Duration::from_secs(1) - remainder).await;
+}
+
 #[tokio::test]
 async fn rps_window_rolls_over_on_the_shared_counter() {
     let Some(url) = redis_url() else {
@@ -117,6 +140,15 @@ async fn rps_window_rolls_over_on_the_shared_counter() {
         rps: Some(1),
         ..rl()
     };
+
+    // The rps counter buckets by whole wall-clock second, so both
+    // acquires have to land inside the SAME bucket for the second one to
+    // be rejected. Starting mid-second, two Redis round-trips can
+    // straddle the boundary and the second call is legitimately allowed
+    // — the assertion below then fails with nothing wrong in the code.
+    // Wait out whatever is left of the current second first, so the pair
+    // begins with a full one ahead of it.
+    wait_for_second_boundary().await;
 
     a.acquire(&key, &limits, "a-1")
         .await
