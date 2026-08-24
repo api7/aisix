@@ -878,7 +878,7 @@ async fn cache_semantic_embed(
             .request
     });
     match crate::semantic::embed_texts(
-        state,
+        &state.hub,
         snapshot,
         &sem.embed_entry,
         embed_deadline,

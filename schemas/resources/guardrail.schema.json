@@ -248,9 +248,9 @@
       ],
       "type": "object"
     },
-    "SemanticCategory": {
+    "SmartRedactionCategory": {
       "additionalProperties": false,
-      "description": "One user-defined category for `kind: \"semantic\"`: what to look for (regex candidate patterns), the lexical evidence that confirms or rejects a candidate (hotword groups and negative patterns), the natural-language description the embedding model judges uncertain candidates against, and how a confirmed span is rewritten.",
+      "description": "One user-defined category for `kind: \"smart_redaction\"`: what to look for (regex candidate patterns), the lexical evidence that confirms or rejects a candidate (hotword groups and negative patterns), the natural-language description the embedding model judges uncertain candidates against, and how a confirmed span is rewritten.",
       "properties": {
         "action": {
           "description": "Action for spans confirmed as this category. Only `mask` is supported: this guardrail rewrites content and never blocks.",
@@ -279,7 +279,7 @@
           "default": [],
           "description": "Hotword groups — lexical evidence FOR a candidate. A group term adjacent to the span is decisive; terms merely nearby are weak evidence that routes the span to the embedding judgement.",
           "items": {
-            "$ref": "#/definitions/SemanticHotwordGroup"
+            "$ref": "#/definitions/SmartRedactionHotwordGroup"
           },
           "maxItems": 10,
           "type": "array"
@@ -319,7 +319,7 @@
       ],
       "type": "object"
     },
-    "SemanticHotwordGroup": {
+    "SmartRedactionHotwordGroup": {
       "additionalProperties": false,
       "description": "One hotword group for a semantic category. Terms in a group are lexical evidence for the category: a term found next to a candidate span raises the span's rule score, and each group contributes at most once per span. Group terms by the role they play (for example trigger words, tool names) rather than listing every term in one group.",
       "properties": {
@@ -1521,7 +1521,7 @@
           "default": [],
           "description": "The categories this guardrail detects. Categories are evaluated in order; each category rewrites the text the previous one produced.",
           "items": {
-            "$ref": "#/definitions/SemanticCategory"
+            "$ref": "#/definitions/SmartRedactionCategory"
           },
           "maxItems": 30,
           "minItems": 1,
@@ -1567,7 +1567,7 @@
         "kind": {
           "description": "Guardrail provider type for in-process semantic category detection and redaction using the bundled embedding model.",
           "enum": [
-            "semantic"
+            "smart_redaction"
           ],
           "type": "string"
         },
@@ -1585,6 +1585,153 @@
       "required": [
         "kind",
         "categories"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "description": "Embedding-similarity screening against operator-supplied example texts. Deny examples block on a close match; an allow-list, when present, blocks everything that matches none of it. Calls an `embedding`-kind Model through the gateway's provider bridges. Detection-only — never rewrites content. Applies on input, output, or both, including buffered streaming output.",
+      "properties": {
+        "allow_examples": {
+          "default": [],
+          "description": "Example texts whose meaning is PERMITTED. When non-empty, a screened text that clears none of them blocks — an allow-list narrows traffic to the listed topics. Empty (the default) means \"no allow-list\": only `deny_examples` can block.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "type": "array"
+        },
+        "allow_threshold": {
+          "default": 0.75,
+          "description": "Cosine-similarity threshold for `allow_examples`, in `[-1, 1]`. RAISE it to block more — a text must reach it to be admitted.",
+          "format": "float",
+          "maximum": 1.0,
+          "minimum": -1.0,
+          "type": "number"
+        },
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "deny_examples": {
+          "default": [],
+          "description": "Example texts whose meaning must be REFUSED. A screened text scoring at or above `deny_threshold` against any of them blocks.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "type": "array"
+        },
+        "deny_threshold": {
+          "default": 0.75,
+          "description": "Cosine-similarity threshold for `deny_examples`, in `[-1, 1]`. Lower it to block more.",
+          "format": "float",
+          "maximum": 1.0,
+          "minimum": -1.0,
+          "type": "number"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "embedding_model": {
+          "default": "",
+          "description": "Alias of an `embedding`-kind Model used to embed both the examples and the screened text. Must resolve in the same environment as this guardrail.\n\nDefaulted at the TYPE level and required by the strict write schema instead: a row the loader cannot deserialize is skipped whole, and a screening row that vanishes is a guardrail that stopped screening. Empty resolves to nothing, so the row degrades per `fail_open` — fail-closed by default — rather than disappearing.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": true,
+          "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
+        },
+        "kind": {
+          "description": "Guardrail provider type for embedding-similarity screening against example texts, using an embedding-kind Model.",
+          "enum": [
+            "semantic"
+          ],
+          "type": "string"
+        },
+        "mandatory": {
+          "default": false,
+          "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
+          "type": "boolean"
+        },
+        "max_buffer_bytes": {
+          "default": 262144,
+          "description": "Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "max_screened_texts": {
+          "default": 8,
+          "description": "Cap on how many texts ONE request screens, bounding the embedding tokens a single request can spend. The input hook screens the MOST RECENT messages first and drops the rest: an earlier turn was already screened as the latest message of an earlier request, so the dropped tail is seen history rather than unread content.",
+          "format": "uint32",
+          "maximum": 64.0,
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "on_buffer_exceeded": {
+          "default": "fail_closed",
+          "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
+          "enum": [
+            "fail_closed",
+            "fail_open"
+          ],
+          "type": "string"
+        },
+        "output_fail_open": {
+          "default": false,
+          "description": "Fail-open policy for the output hook. When disabled, an embedding outage does not release unscreened model output.",
+          "type": "boolean"
+        },
+        "text_source": {
+          "default": "user_messages",
+          "description": "Input-hook text selection. The default screens user messages only; the alternate mode screens every message. Ignored on the output hook.",
+          "enum": [
+            "user_messages",
+            "all_messages"
+          ],
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "description": "Per-call deadline for the embedding request in milliseconds.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "embedding_model"
       ],
       "type": "object"
     }

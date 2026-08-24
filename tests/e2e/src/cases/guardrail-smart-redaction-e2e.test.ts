@@ -19,12 +19,12 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: `kind: "semantic"` guardrail rows (AISIX-Cloud#1363) as STANDARD
+// E2E: `kind: "smart_redaction"` guardrail rows (AISIX-Cloud#1363) as STANDARD
 // attachment-scoped config, against a real DP + etcd + real upstreams.
 //
 // This suite runs WITHOUT the 120 MB embedding model: the gateway boots
 // on a fake model bundle whose manifest verifies (so the node has the
-// capability and semantic rows compile) but whose engine fails on first
+// capability and smart_redaction rows compile) but whose engine fails on first
 // use. That split is the point — the rule layers (candidate regex +
 // hotword/negative evidence) carry every decisive case with zero model
 // involvement, and the model band DEGRADES OPEN (release + a counted
@@ -33,7 +33,7 @@ import {
 // (opt-in).
 //
 // Pinned contract:
-// - a semantic row masks on chat, /v1/messages, /v1/responses AND /mcp
+// - a smart_redaction row masks on chat, /v1/messages, /v1/responses AND /mcp
 //   (both directions) — the endpoint families move in lockstep;
 // - scoping is real: an mcp_server-scoped row fires on that server only
 //   (MCP-07), and a model-scoped row fires on that model only;
@@ -43,7 +43,7 @@ import {
 //   `GET /metrics` after real traffic (the "a metric family is shipped
 //   when an e2e asserts it in /metrics" rule).
 
-const CALLER = "sk-semantic-kind-e2e";
+const CALLER = "sk-smart-redaction-e2e";
 const sha256hex = (s: string | Buffer) =>
   createHash("sha256").update(s).digest("hex");
 
@@ -107,7 +107,7 @@ const EDA_CATEGORY = {
  * the capability, and the first model-band judgement flips the engine to
  * failed: exactly the degrade arm this suite pins. */
 function writeFakeBundle(): string {
-  const dir = mkdtempSync(join(tmpdir(), "aisix-semantic-e2e-bundle-"));
+  const dir = mkdtempSync(join(tmpdir(), "aisix-smart-redaction-e2e-bundle-"));
   const model = Buffer.from("not a real onnx graph");
   const tokenizer = Buffer.from("{}");
   writeFileSync(join(dir, "model.onnx"), model);
@@ -145,7 +145,7 @@ interface RpcReply {
   };
 }
 
-describe("semantic guardrail kind e2e", () => {
+describe("smart_redaction guardrail kind e2e", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let responsesUpstream: OpenAiUpstream | undefined;
@@ -154,7 +154,7 @@ describe("semantic guardrail kind e2e", () => {
   let etcdReachable = false;
 
   const reply = (content: string) => ({
-    id: "cmpl-semantic-kind",
+    id: "cmpl-smart-redaction",
     object: "chat.completion",
     created: 1_700_000_000,
     model: "gpt-4o-mini",
@@ -205,7 +205,7 @@ describe("semantic guardrail kind e2e", () => {
       params: {
         protocolVersion: "2025-11-25",
         capabilities: {},
-        clientInfo: { name: "semantic-kind-e2e", version: "0.1" },
+        clientInfo: { name: "smart-redaction-e2e", version: "0.1" },
       },
     });
     expect(init.status).toBe(200);
@@ -229,7 +229,7 @@ describe("semantic guardrail kind e2e", () => {
     // shape (the chat mock's canned chat.completion is unmappable there).
     responsesUpstream = await startOpenAiUpstream({
       nonStreamBody: {
-        id: "resp-semantic-kind",
+        id: "resp-smart-redaction",
         object: "response",
         status: "completed",
         model: "gpt-4o-mini",
@@ -259,7 +259,7 @@ describe("semantic guardrail kind e2e", () => {
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
     const pk = await seed.createProviderKey({
-      display_name: "semantic-kind-pk",
+      display_name: "smart-redaction-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
@@ -282,7 +282,7 @@ describe("semantic guardrail kind e2e", () => {
       provider_key_id: pk.id,
     });
     const responsesPk = await seed.createProviderKey({
-      display_name: "semantic-kind-responses-pk",
+      display_name: "smart-redaction-responses-pk",
       secret: "sk-mock",
       api_base: `${responsesUpstream.baseUrl}/v1`,
     });
@@ -310,7 +310,7 @@ describe("semantic guardrail kind e2e", () => {
       name: "sem-guard",
       enabled: true,
       hook_point: "both",
-      kind: "semantic",
+      kind: "smart_redaction",
       categories: [EDA_CATEGORY],
     });
     const monitor = await seed.createGuardrail({
@@ -318,7 +318,7 @@ describe("semantic guardrail kind e2e", () => {
       enabled: true,
       hook_point: "both",
       enforcement_mode: "monitor",
-      kind: "semantic",
+      kind: "smart_redaction",
       categories: [EDA_CATEGORY],
     });
 
@@ -394,7 +394,7 @@ describe("semantic guardrail kind e2e", () => {
 
     const before = sumMetric(
       await scrapeMetrics(app.metricsUrl),
-      "aisix_guardrail_semantic_degraded_total",
+      "aisix_guardrail_smart_redaction_degraded_total",
     );
     const res = await openai().chat.completions.create({
       model: "sem-guarded",
@@ -411,24 +411,24 @@ describe("semantic guardrail kind e2e", () => {
 
     // The bare number hit the model band; on this fake bundle the engine
     // fails, the span releases, and the degrade is COUNTED — the
-    // operator's signal that semantic rows run on lexical evidence only.
+    // operator's signal that smart_redaction rows run on lexical evidence only.
     // (The first failure records the underlying cause, e.g.
     // `engine_failed`; later spans on the failed category count as
     // `prototype_unavailable` — either way the family moves.)
     const after = sumMetric(
       await scrapeMetrics(app.metricsUrl),
-      "aisix_guardrail_semantic_degraded_total",
+      "aisix_guardrail_smart_redaction_degraded_total",
     );
     expect(after).toBeGreaterThan(before);
   });
 
-  test("metrics: the semantic row reports per-execution samples under its kind", async (ctx) => {
+  test("metrics: the smart_redaction row reports per-execution samples under its kind", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
 
     // Self-driving: one guarded request inside this test, asserted as a
     // delta — a focused run of this file's single test must pass without
     // riding traffic from the chat tests above.
-    const labels = { kind: "semantic", guardrail: "sem-guard" };
+    const labels = { kind: "smart_redaction", guardrail: "sem-guard" };
     const before = sumMetric(
       await scrapeMetrics(app.metricsUrl),
       "aisix_guardrail_latency_seconds_count",

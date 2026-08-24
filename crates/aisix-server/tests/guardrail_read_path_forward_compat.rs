@@ -13,7 +13,9 @@
 
 use aisix_etcd::loader::{build_snapshot, PartialCompatEntry};
 use aisix_etcd::provider::RawEntry;
-use aisix_guardrails::{build_chain_from_snapshot, Guardrail, SemanticRuntimeSlot};
+use aisix_guardrails::{
+    build_chain_from_snapshot, Guardrail, GuardrailEmbedderSlot, LocalModelRuntimeSlot,
+};
 
 /// A `kind: "pii"` guardrail whose custom pattern carries one field this
 /// build does not know — the shape `custom_patterns[].replacement` had
@@ -51,7 +53,12 @@ fn guardrail_with_an_unknown_nested_field_loads_and_still_masks() {
         "the row loads, and the operator is told which field was ignored"
     );
 
-    let chain = build_chain_from_snapshot(&snapshot.guardrails, None, &SemanticRuntimeSlot::none());
+    let chain = build_chain_from_snapshot(
+        &snapshot.guardrails,
+        None,
+        &LocalModelRuntimeSlot::none(),
+        &GuardrailEmbedderSlot::none(),
+    );
     assert_eq!(chain.len(), 1, "the loaded row must reach the chain");
     let redacted = chain
         .redact_input_text("tool version: 12.1 done")
