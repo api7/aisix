@@ -914,7 +914,7 @@
     },
     {
       "additionalProperties": false,
-      "description": "Aliyun AI Guardrails (AI 安全护栏). Policy-driven moderation via the `MultiModalGuard` action on `green-cip.<region>.aliyuncs.com`; the verdict follows the console-configured policy's `Suggestion`. On input and/or output, including streaming output.",
+      "description": "Aliyun AI Guardrails. Policy-driven moderation through the `MultiModalGuard` action: the verdict follows the policy configured in the provider's console. Content that policy marks for masking is released with the provider's desensitized text in place of the original, and blocked when no desensitized text is returned. Applies on input and/or output, including streaming output.",
       "properties": {
         "access_key_id": {
           "description": "Aliyun AccessKey ID.",
@@ -967,6 +967,7 @@
           "description": "Where in the lifecycle this rule runs."
         },
         "kind": {
+          "description": "Guardrail provider type for Aliyun AI Guardrails policy-driven moderation.",
           "enum": [
             "aliyun_ai_guardrail"
           ],

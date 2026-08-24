@@ -953,10 +953,12 @@ pub enum GuardrailKind {
     /// `TextModerationPlus` action on `green-cip.<region>.aliyuncs.com`, on
     /// input and/or output, including streaming output.
     AliyunTextModeration(AliyunTextModerationConfig),
-    /// Aliyun AI Guardrails (AI 安全护栏). Policy-driven moderation via the
-    /// `MultiModalGuard` action on `green-cip.<region>.aliyuncs.com`; the
-    /// verdict follows the console-configured policy's `Suggestion`. On
-    /// input and/or output, including streaming output.
+    /// Aliyun AI Guardrails. Policy-driven moderation through the
+    /// `MultiModalGuard` action: the verdict follows the policy configured in
+    /// the provider's console. Content that policy marks for masking is
+    /// released with the provider's desensitized text in place of the
+    /// original, and blocked when no desensitized text is returned. Applies
+    /// on input and/or output, including streaming output.
     AliyunAiGuardrail(AliyunAiGuardrailConfig),
     /// Built-in sensitive-data detection and redaction inside AISIX. Built-in
     /// detectors and custom regex patterns can mask matched spans or block
