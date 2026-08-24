@@ -41,6 +41,7 @@
 //! | timeout                         | true        | Bypass { "openai_moderation_timeout" }      |
 //! | 429 Throttling                  | true        | Bypass { "openai_moderation_throttled" }    |
 //! | 5xx / IO error                  | true        | Bypass { "openai_moderation_5xx" }          |
+//! | 413, or size wording in the body | true       | Bypass { "openai_moderation_too_large" }    |
 //! | 4xx (non-429, e.g. 401/400)     | true        | Bypass { "openai_moderation_config_error" } |
 //! | any failure                     | false       | Block { "openai moderation unavailable …" } |
 
@@ -156,7 +157,25 @@ impl OpenaiModerationGuardrail {
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(ModerationFailure::Throttled);
         }
+        if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+            return Err(ModerationFailure::TooLarge);
+        }
         if status.is_server_error() {
+            // A 5xx is normally an outage, but a Presidio-style analyzer
+            // surfaces its NLP pipeline's own length ceiling as an
+            // unhandled error here — read the body before deciding which
+            // it was, so the operator is not sent after an outage that
+            // is really a payload the deployment cannot take.
+            let response_body = crate::read_error_body_capped(resp).await;
+            if crate::too_large::body_says_too_large(&response_body) {
+                tracing::error!(
+                    row = %self.row_name,
+                    http_status = status.as_u16(),
+                    response_body = %response_body,
+                    "openai_moderation refused the payload for its size",
+                );
+                return Err(ModerationFailure::TooLarge);
+            }
             return Err(ModerationFailure::ServerError);
         }
         if !status.is_success() {
@@ -171,6 +190,9 @@ impl OpenaiModerationGuardrail {
                 response_body = %response_body,
                 "openai moderation returned 4xx — check endpoint, api_key, and model configuration",
             );
+            if crate::too_large::body_says_too_large(&response_body) {
+                return Err(ModerationFailure::TooLarge);
+            }
             return Err(ModerationFailure::ConfigError);
         }
 
@@ -254,6 +276,11 @@ enum ModerationFailure {
     IoError,
     ServerError,
     ConfigError,
+    /// The provider refused the payload for its size. Distinct from
+    /// `ConfigError` and `Throttled` because the operator's fix is
+    /// different: neither fixing credentials nor waiting helps — the
+    /// request has to get smaller (AISIX-Cloud#1386).
+    TooLarge,
 }
 
 impl ModerationFailure {
@@ -263,6 +290,7 @@ impl ModerationFailure {
             Self::Throttled => "openai_moderation_throttled",
             Self::IoError | Self::ServerError => "openai_moderation_5xx",
             Self::ConfigError => "openai_moderation_config_error",
+            Self::TooLarge => "openai_moderation_too_large",
         }
     }
 }

@@ -46,8 +46,14 @@ interface BedrockCall {
 interface MockBedrock {
   url: string;
   calls: BedrockCall[];
+  /** Body sizes the mock refused as too large, in arrival order. */
+  refusals: number[];
   close(): Promise<void>;
 }
+
+// Small enough that an ordinary multi-turn conversation trips it, so the
+// split path is exercised without megabyte fixtures.
+const SIZE_CEILING_BYTES = 6_000;
 
 // Content-driven ApplyGuardrail mock:
 // - any block containing "BLOCKME"   → INTERVENED, BLOCKED pii entity
@@ -58,6 +64,7 @@ interface MockBedrock {
 // - otherwise                        → NONE
 async function startMockBedrock(): Promise<MockBedrock> {
   const calls: BedrockCall[] = [];
+  const refusals: number[] = [];
   const server: Server = createServer((req, res) => {
     let raw = "";
     req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
@@ -73,6 +80,26 @@ async function startMockBedrock(): Promise<MockBedrock> {
         texts = (body.content ?? []).map((c) => c.text?.text ?? "");
       } catch {
         // fall through with empty texts — answered as NONE below
+      }
+      // AISIX-Cloud#1386: stand in for the account's real ApplyGuardrail
+      // ceiling, which is a per-region, per-policy, adjustable service
+      // quota the gateway cannot know. Refuse an oversized body the way
+      // AWS does — a ValidationException naming text units — so the
+      // dispatcher's reactive split is what has to get the content
+      // through. Refusals are NOT recorded as calls: `calls` is what the
+      // provider actually scanned.
+      if (raw.length > SIZE_CEILING_BYTES) {
+        refusals.push(raw.length);
+        res.statusCode = 400;
+        res.setHeader("content-type", "application/json");
+        res.setHeader("x-amzn-errortype", "ValidationException");
+        res.end(
+          JSON.stringify({
+            message:
+              "Input is too long: the request exceeds the maximum input size in text units",
+          }),
+        );
+        return;
       }
       calls.push({ source, texts });
 
@@ -125,6 +152,7 @@ async function startMockBedrock(): Promise<MockBedrock> {
   return {
     url: `http://127.0.0.1:${port}`,
     calls,
+    refusals,
     async close() {
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
@@ -315,6 +343,56 @@ describe("bedrock guardrail ANONYMIZE write-back (#932 follow-up)", () => {
         bedrock!.calls.some((c) => c.source === "OUTPUT"),
         "output hook must have scanned the reply",
       ).toBe(true);
+    },
+    60_000,
+  );
+
+  // AISIX-Cloud#1386
+  test(
+    "a payload AWS refuses as too large is re-sent in pieces, not failed",
+    async (ctx) => {
+      if (!etcdReachable) {
+        ctx.skip();
+        return;
+      }
+      const refusalsBefore = bedrock!.refusals.length;
+      const callsBefore = bedrock!.calls.length;
+
+      // A conversation comfortably past the mock's ceiling, with a
+      // distinct marker per turn so the assertions can prove each one
+      // was actually scanned rather than dropped.
+      const turns = Array.from({ length: 6 }, (_, i) => ({
+        role: "user" as const,
+        content: `TURNMARK${i} ${"filler ".repeat(200)}`,
+      }));
+
+      const r = await chat(CALLER, "bmask-e2e", turns);
+      expect(r.status).toBe(200);
+
+      // The ceiling really was hit — without this the test would pass
+      // even if nothing was ever split.
+      expect(
+        bedrock!.refusals.length,
+        "the mock never refused; the payload was under the ceiling",
+      ).toBeGreaterThan(refusalsBefore);
+
+      // Every turn reached the provider inside some accepted call.
+      const scanned = bedrock!.calls
+        .slice(callsBefore)
+        .filter((c) => c.source === "INPUT")
+        .flatMap((c) => c.texts)
+        .join("\n");
+      for (let i = 0; i < turns.length; i += 1) {
+        expect(
+          scanned.includes(`TURNMARK${i}`),
+          `turn ${i} never reached the provider — it was dropped, not split`,
+        ).toBe(true);
+      }
+
+      // And every accepted call stayed inside the ceiling.
+      for (const c of bedrock!.calls.slice(callsBefore)) {
+        expect(c.texts.join("").length).toBeLessThan(SIZE_CEILING_BYTES);
+      }
     },
     60_000,
   );

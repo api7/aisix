@@ -41,6 +41,7 @@
 //! | timeout                         | true        | Bypass { "presidio_timeout" }      |
 //! | 429 Throttling                  | true        | Bypass { "presidio_throttled" }    |
 //! | 5xx / IO error                  | true        | Bypass { "presidio_5xx" }          |
+//! | 413, or spaCy's E088 in the body | true       | Bypass { "presidio_too_large" }    |
 //! | 4xx (non-429, e.g. 400/404)     | true        | Bypass { "presidio_config_error" } |
 //! | any failure                     | false       | Block { "presidio unavailable …" } |
 
@@ -213,7 +214,25 @@ impl PresidioGuardrail {
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(PresidioFailure::Throttled);
         }
+        if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+            return Err(PresidioFailure::TooLarge);
+        }
         if status.is_server_error() {
+            // A 5xx is normally an outage, but a Presidio-style analyzer
+            // surfaces its NLP pipeline's own length ceiling as an
+            // unhandled error here — read the body before deciding which
+            // it was, so the operator is not sent after an outage that
+            // is really a payload the deployment cannot take.
+            let response_body = crate::read_error_body_capped(resp).await;
+            if crate::too_large::body_says_too_large(&response_body) {
+                tracing::error!(
+                    row = %self.row_name,
+                    http_status = status.as_u16(),
+                    response_body = %response_body,
+                    "presidio refused the payload for its size",
+                );
+                return Err(PresidioFailure::TooLarge);
+            }
             return Err(PresidioFailure::ServerError);
         }
         if !status.is_success() {
@@ -227,6 +246,9 @@ impl PresidioGuardrail {
                 response_body = %response_body,
                 "presidio returned 4xx — check analyzer_url/anonymizer_url, language, and entities configuration",
             );
+            if crate::too_large::body_says_too_large(&response_body) {
+                return Err(PresidioFailure::TooLarge);
+            }
             return Err(PresidioFailure::ConfigError);
         }
         resp.json().await.map_err(|_| PresidioFailure::ServerError)
@@ -373,6 +395,11 @@ enum PresidioFailure {
     IoError,
     ServerError,
     ConfigError,
+    /// The provider refused the payload for its size. Distinct from
+    /// `ConfigError` and `Throttled` because the operator's fix is
+    /// different: neither fixing credentials nor waiting helps — the
+    /// request has to get smaller (AISIX-Cloud#1386).
+    TooLarge,
 }
 
 impl PresidioFailure {
@@ -382,6 +409,7 @@ impl PresidioFailure {
             Self::Throttled => "presidio_throttled",
             Self::IoError | Self::ServerError => "presidio_5xx",
             Self::ConfigError => "presidio_config_error",
+            Self::TooLarge => "presidio_too_large",
         }
     }
 }
