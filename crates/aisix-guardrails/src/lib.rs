@@ -410,7 +410,7 @@ pub enum GuardrailVerdict {
         guardrail_name: Option<String>,
         /// Set when this block is an AVAILABILITY failure rather than a
         /// content decision: a remote guardrail with `fail_open: false`
-        /// (or a `mandatory` row) that could not reach its upstream blocks
+        /// that could not reach its upstream blocks
         /// instead of bypassing, and the two are otherwise
         /// indistinguishable to every consumer downstream
         /// (AISIX-Cloud#1365).
@@ -431,8 +431,8 @@ pub enum GuardrailVerdict {
 ///
 /// Every producer already passes a `bypass_tag()` constant, so this is a
 /// no-op today. It is here because the TYPE cannot say so: the tag is a
-/// `String` (`MandatoryGuardrail` forwards whatever reason the inner
-/// guardrail's `Bypass` carried), it lands on an unsanitized Prometheus
+/// `String` — a decorator can forward whatever reason the inner
+/// guardrail's `Bypass` carried — it lands on an unsanitized Prometheus
 /// label, and it reaches the usage event that #153 forbids putting content
 /// on. A future guardrail that returns a free-text bypass reason would
 /// otherwise mint one metric series per distinct string.

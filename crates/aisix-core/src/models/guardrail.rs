@@ -4,7 +4,7 @@
 //! the `aisix-proxy::ProxyState::guardrail_index` resolves the
 //! applicable chain per request.
 //!
-//! P0b added `enforcement_mode`, `mandatory`, and `direction` columns
+//! P0b added `enforcement_mode` and `direction` columns
 //! to the CP `guardrails` table. P0c wires them to the kine payload
 //! and adds the `GuardrailAttachment` row type (`/aisix/<env>/guardrail_attachments/<uuid>`).
 //! The outer `Guardrail` struct accepts but defaults the three new fields
@@ -1101,7 +1101,7 @@ pub struct GuardrailEnforcedHit {
     /// - `blocked` — the guardrail's content policy refused the request.
     /// - `blocked_unavailable` — the guardrail could not evaluate the
     ///   request and its configuration refuses what it cannot check
-    ///   (`fail_open: false`, or a mandatory rule). The request was
+    ///   (`fail_open: false`). The request was
     ///   refused because the check was unavailable, not because the
     ///   content matched a policy.
     pub action: String,
@@ -1223,13 +1223,6 @@ pub struct Guardrail {
     /// without blocking or redacting the caller-visible response.
     #[serde(default = "default_enforcement_mode")]
     pub enforcement_mode: String,
-
-    /// Whether guardrail evaluation errors are fatal. When `true`, a remote
-    /// guardrail that cannot reach its upstream blocks the request instead of
-    /// failing open, overriding `fail_open` on the failure path. The default
-    /// `false` keeps the `fail_open` behavior.
-    #[serde(default)]
-    pub mandatory: bool,
 
     /// Attachment direction hint. Guardrail execution still follows
     /// `hook_point`.
@@ -1448,7 +1441,7 @@ mod tests {
 
     #[test]
     fn p0c_fields_travel_past_the_flattened_kind() {
-        // The P0c fields (`enforcement_mode`, `mandatory`, `direction`) are
+        // The P0c fields (`enforcement_mode`, `direction`) are
         // declared on the outer `Guardrail` struct with `#[serde(default)]`,
         // so serde absorbs them at the outer level before the flattened
         // inner kind sees the remaining fields. The strict schema owes them
@@ -1460,14 +1453,12 @@ mod tests {
             "kind": "keyword",
             "patterns": [],
             "enforcement_mode": "monitor",
-            "mandatory": true,
             "direction": "input"
         });
         assert!(crate::models::validate_guardrail(&v).is_ok());
         let g: Guardrail =
             serde_json::from_value(v).expect("outer fields must not reach the inner kind");
         assert_eq!(g.enforcement_mode, "monitor");
-        assert!(g.mandatory);
         assert_eq!(g.direction, "input");
     }
 

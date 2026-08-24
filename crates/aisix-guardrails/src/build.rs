@@ -130,20 +130,16 @@ fn applied_for(row: &DomainGuardrail) -> AppliedGuardrail {
     }
 }
 
-/// Build the runtime guardrail for a row, applying its `enforcement_mode`
-/// and `mandatory` policy.
+/// Build the runtime guardrail for a row, applying its `enforcement_mode`.
 ///
-/// `enforcement_mode` `block` (the default) returns the guardrail as-is;
-/// `monitor` wraps it in [`MonitorGuardrail`] so it observes violations
-/// without blocking. `mandatory: true` wraps the result in
-/// [`MandatoryGuardrail`] so a remote guardrail that can't evaluate blocks
-/// the request instead of failing open. A monitored guardrail still never
-/// blocks on its *content* decisions, but being unavailable is an infra
-/// failure that mandatory makes fatal — enforced at both places a failed
-/// evaluation can surface: [`MandatoryGuardrail`] upgrades the `Bypass` an
-/// explicitly fail-open row emits, and [`MonitorGuardrail`] declines to
-/// downgrade the `Block { unavailable }` a fail-closed row emits (the
-/// default since AISIX-Cloud#1382).
+/// `block` (the default) returns the guardrail as-is; `monitor` wraps it
+/// in [`MonitorGuardrail`] so it observes violations without blocking.
+///
+/// Monitor mode is unconditional: a monitored row never blocks, for any
+/// reason. What to do about a failed evaluation is `fail_open`'s job, and
+/// a monitored row does not act on that decision either — an operator who
+/// wants an unreachable provider to refuse traffic is asking for
+/// enforcement, which is what `block` mode is.
 fn build_one(
     row: &DomainGuardrail,
     bedrock_endpoint_url: Option<&str>,
@@ -152,25 +148,8 @@ fn build_one(
 ) -> Result<Option<Arc<dyn Guardrail>>, BuildError> {
     Ok(
         build_one_inner(row, bedrock_endpoint_url, local_model, embedder)?
-            .map(|g| apply_enforcement_mode(row, g))
-            .map(|g| apply_mandatory(row, g)),
+            .map(|g| apply_enforcement_mode(row, g)),
     )
-}
-
-/// Wrap `inner` in [`MandatoryGuardrail`] when `row.mandatory` is set, so a
-/// fail-open remote guardrail that couldn't reach its upstream blocks
-/// instead of bypassing. A no-op for the default (`mandatory: false`) and
-/// for guardrails that never emit `Bypass` (e.g. keyword) — so it's only
-/// ever paid for by rows that opt in.
-fn apply_mandatory(row: &DomainGuardrail, inner: Arc<dyn Guardrail>) -> Arc<dyn Guardrail> {
-    if row.mandatory {
-        Arc::new(MandatoryGuardrail {
-            row_name: row.name.clone(),
-            inner,
-        })
-    } else {
-        inner
-    }
 }
 
 /// Wrap `inner` per the row's `enforcement_mode`. See [`build_one`].
@@ -180,7 +159,6 @@ fn apply_enforcement_mode(row: &DomainGuardrail, inner: Arc<dyn Guardrail>) -> A
         "monitor" => Arc::new(MonitorGuardrail {
             row_name: row.name.clone(),
             inner,
-            keep_unavailable_fatal: row.mandatory,
         }),
         other => {
             tracing::warn!(
@@ -609,16 +587,6 @@ enum BuildError {
 struct MonitorGuardrail {
     row_name: String,
     inner: Arc<dyn Guardrail>,
-    /// Mirrors `row.mandatory`. Monitor mode suppresses *content*
-    /// decisions, but `mandatory` means the rule MUST evaluate, so an
-    /// availability failure stays fatal — see [`build_one`]. The flag
-    /// lives here because the downgrade happens here: since the row's
-    /// `fail_open` defaults to false (AISIX-Cloud#1382), an unreachable
-    /// upstream now arrives as `Block { unavailable: Some(_) }` rather
-    /// than the `Bypass` that [`MandatoryGuardrail`] upgrades on the way
-    /// out, and downgrading it here would swallow the failure before the
-    /// outer decorator ever sees it.
-    keep_unavailable_fatal: bool,
 }
 
 impl MonitorGuardrail {
@@ -635,36 +603,7 @@ impl MonitorGuardrail {
         }
     }
 
-    /// Whether monitor mode must let this verdict stand: an availability
-    /// failure on a `mandatory` row, which the flag keeps fatal.
-    ///
-    /// One predicate rather than two matching arms, so the downgrade and
-    /// the telemetry that describes it cannot disagree about which Blocks
-    /// are real — `would_block` means "suppressed", and a preserved Block
-    /// was not suppressed.
-    fn preserves(&self, verdict: &GuardrailVerdict) -> bool {
-        self.keep_unavailable_fatal
-            && matches!(
-                verdict,
-                GuardrailVerdict::Block {
-                    unavailable: Some(_),
-                    ..
-                }
-            )
-    }
-
     fn observe(&self, hook: &'static str, verdict: GuardrailVerdict) -> GuardrailVerdict {
-        if self.preserves(&verdict) {
-            if let GuardrailVerdict::Block { ref reason, .. } = verdict {
-                tracing::warn!(
-                    guardrail_name = %self.row_name,
-                    hook,
-                    reason = %reason,
-                    "mandatory guardrail could not evaluate; blocking despite enforcement_mode=monitor",
-                );
-            }
-            return verdict;
-        }
         match verdict {
             GuardrailVerdict::Block { reason, .. } => {
                 tracing::info!(
@@ -714,12 +653,7 @@ impl MonitorGuardrail {
         hits: &mut Vec<GuardrailMonitorHit>,
     ) -> GuardrailVerdict {
         if let GuardrailVerdict::Block { ref reason, .. } = verdict {
-            // A preserved Block is enforced, not suppressed — reporting
-            // `would_block` for it would tell an operator the request was
-            // let through while it was in fact refused.
-            if !self.preserves(&verdict) {
-                hits.push(self.would_block_hit(hook, reason));
-            }
+            hits.push(self.would_block_hit(hook, reason));
         }
         self.observe(hook, verdict)
     }
@@ -874,100 +808,6 @@ impl Guardrail for MonitorGuardrail {
     fn redact_output_text(&self, text: &str) -> Option<Redaction> {
         self.observe_redaction("output", self.inner.redact_output_text(text));
         None
-    }
-}
-
-/// `mandatory: true` decorator. A remote guardrail that can't reach its
-/// upstream returns `Bypass` when `fail_open` is set — the request proceeds
-/// unscanned. For a guardrail an operator marked mandatory that fail-open is
-/// the wrong call: the point of `mandatory` is that the rule MUST evaluate,
-/// so an unreachable upstream is a hard failure. This decorator upgrades a
-/// `Bypass` verdict to `Block`, overriding `fail_open` on the failure path.
-/// `Allow` and `Block` pass through unchanged, and only remote guardrails
-/// ever emit `Bypass`, so keyword rows wrapped here are behaviourally
-/// untouched.
-///
-/// Stream policy + `runs_on_output` delegate to the inner guardrail so the
-/// decorator doesn't change hold-back behaviour — it only rewrites the
-/// verdict a failed evaluation produces.
-struct MandatoryGuardrail {
-    row_name: String,
-    inner: Arc<dyn Guardrail>,
-}
-
-impl MandatoryGuardrail {
-    fn enforce(&self, hook: &'static str, verdict: GuardrailVerdict) -> GuardrailVerdict {
-        match verdict {
-            GuardrailVerdict::Bypass { reason } => {
-                tracing::warn!(
-                    guardrail_name = %self.row_name,
-                    hook,
-                    reason = %reason,
-                    "mandatory guardrail could not evaluate; blocking (mandatory=true overrides fail_open)",
-                );
-                // Carry the row name so downstream handlers can name the
-                // guardrail in the 422 envelope (#519 B.4b) — `block()` would
-                // drop it to `None` and surface an unnamed content-filter block.
-                //
-                // The `Bypass` reason IS the kind's bounded failure tag, so
-                // this conversion is the one place that knows, structurally,
-                // that the refusal is an outage rather than a policy
-                // decision — carry it (AISIX-Cloud#1365). Without it the
-                // audit trail reports a `mandatory` row's upstream outage
-                // exactly like a real content violation.
-                GuardrailVerdict::Block {
-                    reason: format!("mandatory guardrail unavailable: {reason}"),
-                    guardrail_name: Some(self.row_name.clone()),
-                    unavailable: Some(crate::bounded_failure_tag(&reason)),
-                }
-            }
-            other => other,
-        }
-    }
-}
-
-#[async_trait]
-impl Guardrail for MandatoryGuardrail {
-    fn name(&self) -> &'static str {
-        self.inner.name()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
-        self.enforce("input", self.inner.check_input(req).await)
-    }
-
-    async fn check_output(&self, resp: &ChatResponse) -> GuardrailVerdict {
-        self.enforce("output", self.inner.check_output(resp).await)
-    }
-
-    fn stream_output_policy(&self) -> StreamOutputPolicy {
-        self.inner.stream_output_policy()
-    }
-
-    fn runs_on_output(&self) -> bool {
-        self.inner.runs_on_output()
-    }
-
-    // Mandatory only rewrites the failure (Bypass) verdict; redaction
-    // passes straight through to the inner guardrail.
-    fn redacts_input(&self) -> bool {
-        self.inner.redacts_input()
-    }
-
-    fn redacts_output(&self) -> bool {
-        self.inner.redacts_output()
-    }
-
-    fn redact_input_text(&self, text: &str) -> Option<Redaction> {
-        self.inner.redact_input_text(text)
-    }
-
-    fn redact_output_text(&self, text: &str) -> Option<Redaction> {
-        self.inner.redact_output_text(text)
     }
 }
 
@@ -1777,127 +1617,6 @@ mod tests {
         }
     }
 
-    /// A stub remote guardrail that always fails open (returns `Bypass`),
-    /// standing in for a Bedrock/Azure guardrail whose upstream is down.
-    struct AlwaysBypass;
-    #[async_trait]
-    impl Guardrail for AlwaysBypass {
-        fn name(&self) -> &'static str {
-            "always-bypass"
-        }
-        async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
-            GuardrailVerdict::Bypass {
-                reason: "upstream_unreachable".into(),
-            }
-        }
-        async fn check_output(&self, _resp: &ChatResponse) -> GuardrailVerdict {
-            GuardrailVerdict::Bypass {
-                reason: "upstream_unreachable".into(),
-            }
-        }
-    }
-
-    fn row_with_mandatory(mandatory: bool) -> DomainGuardrail {
-        let mut v = serde_json::json!({
-            "name": "remote",
-            "kind": "keyword",
-            "patterns": [{ "kind": "literal", "value": "x" }],
-        });
-        if mandatory {
-            v["mandatory"] = serde_json::Value::Bool(true);
-        }
-        serde_json::from_value(v).unwrap()
-    }
-
-    fn resp(text: &str) -> ChatResponse {
-        ChatResponse {
-            id: "r".into(),
-            model: "m".into(),
-            message: ChatMessage::assistant(text),
-            finish_reason: aisix_gateway::FinishReason::Stop,
-            usage: aisix_gateway::UsageStats::new(0, 0),
-        }
-    }
-
-    /// #911 finding [26]: `mandatory: true` turns a fail-open `Bypass` into a
-    /// `Block`, so a remote guardrail marked mandatory can't be silently
-    /// skipped when its upstream is unreachable. Before the fix the field was
-    /// parsed but never enforced — a mandatory guardrail still failed open.
-    #[tokio::test]
-    async fn mandatory_upgrades_bypass_to_block() {
-        let g = apply_mandatory(&row_with_mandatory(true), Arc::new(AlwaysBypass));
-        let vin = g.check_input(&req("hi")).await;
-        // The block must carry the row name so the 422 envelope can name the
-        // guardrail (#519 B.4b) rather than surfacing an unnamed block.
-        assert_eq!(
-            vin,
-            GuardrailVerdict::Block {
-                reason: "mandatory guardrail unavailable: upstream_unreachable".to_string(),
-                guardrail_name: Some("remote".to_string()),
-                // AISIX-Cloud#1365: a mandatory row's Bypass→Block is an
-                // availability failure by construction, so the bypass tag
-                // survives the conversion.
-                unavailable: Some("upstream_unreachable".to_string()),
-            },
-            "mandatory input Bypass must become a named Block, got {vin:?}",
-        );
-        let vout = g.check_output(&resp("hi")).await;
-        assert_eq!(
-            vout,
-            GuardrailVerdict::Block {
-                reason: "mandatory guardrail unavailable: upstream_unreachable".to_string(),
-                guardrail_name: Some("remote".to_string()),
-                // AISIX-Cloud#1365: a mandatory row's Bypass→Block is an
-                // availability failure by construction, so the bypass tag
-                // survives the conversion.
-                unavailable: Some("upstream_unreachable".to_string()),
-            },
-            "mandatory output Bypass must become a named Block, got {vout:?}",
-        );
-    }
-
-    /// The default (`mandatory: false`) keeps the fail-open behaviour: a
-    /// `Bypass` stays a `Bypass`.
-    #[tokio::test]
-    async fn non_mandatory_leaves_bypass_untouched() {
-        let g = apply_mandatory(&row_with_mandatory(false), Arc::new(AlwaysBypass));
-        assert!(
-            g.check_input(&req("hi")).await.is_bypass(),
-            "non-mandatory guardrail must keep failing open",
-        );
-    }
-
-    /// Mandatory only rewrites the failure verdict — `Allow` and `Block`
-    /// pass through, so a healthy mandatory guardrail never becomes a false
-    /// block and a real block is preserved.
-    #[tokio::test]
-    async fn mandatory_passes_allow_and_block_through() {
-        struct AlwaysAllow;
-        #[async_trait]
-        impl Guardrail for AlwaysAllow {
-            fn name(&self) -> &'static str {
-                "always-allow"
-            }
-            async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
-                GuardrailVerdict::Allow
-            }
-        }
-        struct AlwaysBlock;
-        #[async_trait]
-        impl Guardrail for AlwaysBlock {
-            fn name(&self) -> &'static str {
-                "always-block"
-            }
-            async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
-                GuardrailVerdict::block("nope")
-            }
-        }
-        let allow = apply_mandatory(&row_with_mandatory(true), Arc::new(AlwaysAllow));
-        assert_eq!(allow.check_input(&req("hi")).await, GuardrailVerdict::Allow);
-        let block = apply_mandatory(&row_with_mandatory(true), Arc::new(AlwaysBlock));
-        assert!(block.check_input(&req("hi")).await.is_block());
-    }
-
     fn aliyun_row_against(endpoint: &str, extra: &str) -> DomainGuardrail {
         parse(&format!(
             r#"{{
@@ -1944,73 +1663,8 @@ mod tests {
         );
     }
 
-    /// The documented exception to the above: `mandatory: true` means the
-    /// rule MUST evaluate, so provider unavailability stays fatal even in
-    /// monitor mode. Since `fail_open` defaults to false
-    /// (AISIX-Cloud#1382), the inner guardrail emits `Block { unavailable }`
-    /// and the monitor wrapper declines to downgrade it for a mandatory
-    /// row — see `mandatory_keeps_unavailability_fatal_when_fail_open` for
-    /// the other path into the same guarantee.
-    #[tokio::test]
-    async fn mandatory_keeps_unavailability_fatal_in_monitor_mode() {
-        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
-        let row = aliyun_row_against(
-            &server.uri(),
-            r#", "enforcement_mode": "monitor", "mandatory": true"#,
-        );
-        let g = build_one(
-            &row,
-            None,
-            &LocalModelRuntimeSlot::none(),
-            &GuardrailEmbedderSlot::none(),
-        )
-        .unwrap()
-        .unwrap();
-        assert!(
-            g.check_input(&req("hello")).await.is_block(),
-            "mandatory must keep provider unavailability fatal in monitor mode",
-        );
-    }
-
-    /// A preserved Block is enforced, so it must not ALSO be reported as
-    /// a suppressed one: `would_block` tells an operator "this rule would
-    /// have blocked but monitor mode let it through", which is the
-    /// opposite of what happened. Caught by CodeRabbit on #1040.
-    #[tokio::test]
-    async fn preserved_unavailability_block_emits_no_would_block_hit() {
-        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
-        let row = aliyun_row_against(
-            &server.uri(),
-            r#", "enforcement_mode": "monitor", "mandatory": true"#,
-        );
-        let g = build_one(
-            &row,
-            None,
-            &LocalModelRuntimeSlot::none(),
-            &GuardrailEmbedderSlot::none(),
-        )
-        .unwrap()
-        .unwrap();
-        let (verdict, hits) = g.check_input_observed(&req("hello")).await;
-        assert!(verdict.is_block(), "mandatory keeps the failure fatal");
-        assert!(
-            hits.is_empty(),
-            "an enforced block must not report itself as suppressed: {hits:?}",
-        );
-    }
-
-    /// The complement: a monitor row that really did suppress a Block
-    /// still reports it, so the fix above did not silence real telemetry.
+    /// A monitor row that suppressed a Block still reports it, so the
+    /// operator can see what would have happened.
     #[tokio::test]
     async fn downgraded_unavailability_block_still_emits_would_block() {
         use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
@@ -2034,42 +1688,12 @@ mod tests {
         assert_eq!(hits[0].action, "would_block");
     }
 
-    /// The other path into the same guarantee: an operator who explicitly
-    /// opted into `fail_open: true` gets a `Bypass` from the inner
-    /// guardrail, which passes through the monitor wrapper untouched and
-    /// is upgraded by [`MandatoryGuardrail`] on the way out. `mandatory`
-    /// overriding `fail_open` is the whole point of the flag, so it must
-    /// keep working now that fail-closed is the default.
+    /// Monitor mode is unconditional: a provider outage is still only
+    /// observed, fail-closed default included. There is no configuration
+    /// that makes a monitored row block — that is what `block` mode is
+    /// for.
     #[tokio::test]
-    async fn mandatory_keeps_unavailability_fatal_when_fail_open() {
-        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
-        let row = aliyun_row_against(
-            &server.uri(),
-            r#", "enforcement_mode": "monitor", "mandatory": true, "fail_open": true"#,
-        );
-        let g = build_one(
-            &row,
-            None,
-            &LocalModelRuntimeSlot::none(),
-            &GuardrailEmbedderSlot::none(),
-        )
-        .unwrap()
-        .unwrap();
-        assert!(
-            g.check_input(&req("hello")).await.is_block(),
-            "mandatory must override an explicit fail_open in monitor mode",
-        );
-    }
-
-    /// The guarantee must not leak the other way: a NON-mandatory monitor
-    /// row still observes without blocking, fail-closed default included.
-    #[tokio::test]
-    async fn monitor_without_mandatory_still_downgrades_unavailability() {
+    async fn monitor_never_blocks_on_provider_failure() {
         use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -2088,7 +1712,7 @@ mod tests {
         assert_eq!(
             g.check_input(&req("hello")).await,
             GuardrailVerdict::Allow,
-            "monitor mode without mandatory must not block on provider failure",
+            "a monitored row must not block, whatever the failure",
         );
     }
 
