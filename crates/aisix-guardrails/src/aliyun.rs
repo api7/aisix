@@ -53,6 +53,7 @@ use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha1::Sha1;
 
+use crate::chunk::chunk_text;
 use crate::{Guardrail, GuardrailVerdict, StreamOutputPolicy};
 
 type HmacSha1 = Hmac<Sha1>;
@@ -64,7 +65,9 @@ const SERVICE_OUTPUT: &str = "llm_response_moderation";
 
 /// Per-call content cap (chars). Aliyun caps `llm_query_moderation` at
 /// 2 000 and `llm_response_moderation` at 5 000; 2 000 is the safe shared
-/// bound and matches the default streaming window.
+/// bound and matches the default streaming window. It bounds one CALL,
+/// not one request — longer text is split across calls, never clipped
+/// (see `crate::chunk`).
 const MAX_CONTENT_CHARS: usize = 2_000;
 
 /// One Aliyun Text Moderation row, materialised into a request-time
@@ -136,6 +139,13 @@ impl AliyunTextModerationGuardrail {
     /// Moderate one piece of text with the given service code. `session_id`
     /// (when set) is forwarded as `ServiceParameters.sessionId` so Aliyun
     /// correlates the chunks of one streamed response.
+    ///
+    /// Aliyun caps content per call, so text over the cap is split and
+    /// EVERY chunk is submitted — the first one that reaches the risk
+    /// threshold blocks the request. It is deliberately not truncated:
+    /// the text is assembled oldest-message-first, so clipping to the cap
+    /// dropped the newest turn — the one actually being screened — and
+    /// released it under a clean verdict (AISIX-Cloud#1381).
     async fn moderate(
         &self,
         service: &str,
@@ -143,11 +153,29 @@ impl AliyunTextModerationGuardrail {
         session_id: Option<&str>,
         fail_open: bool,
     ) -> GuardrailVerdict {
-        // Aliyun caps content per call; truncate to the cap. Streaming
-        // already windows to MAX_CONTENT_CHARS; non-streaming long inputs
-        // are clamped (the leading content carries the risk in practice).
-        let content: String = text.chars().take(MAX_CONTENT_CHARS).collect();
-        let (outcome, diag) = self.call(service, &content, session_id).await;
+        for content in chunk_text(text, MAX_CONTENT_CHARS) {
+            match self
+                .moderate_chunk(service, &content, session_id, fail_open)
+                .await
+            {
+                GuardrailVerdict::Allow => continue,
+                // Block or Bypass: strictest-wins, and there is no point
+                // burning provider calls on the rest of the request.
+                verdict => return verdict,
+            }
+        }
+        GuardrailVerdict::Allow
+    }
+
+    /// One provider call over one already-bounded chunk.
+    async fn moderate_chunk(
+        &self,
+        service: &str,
+        content: &str,
+        session_id: Option<&str>,
+        fail_open: bool,
+    ) -> GuardrailVerdict {
+        let (outcome, diag) = self.call(service, content, session_id).await;
         match outcome {
             Ok(level) => {
                 let blocked = risk_rank(&level) >= self.threshold_rank;
@@ -864,6 +892,96 @@ mod tests {
 
         let g = build(&server.uri(), "high", true);
         assert_eq!(g.check_input(&req("hello")).await, GuardrailVerdict::Allow);
+    }
+
+    // --- per-call cap: split, never clip (AISIX-Cloud#1381) ---------------
+
+    /// The bug this replaced: the text is assembled oldest-message-first,
+    /// so clipping to `MAX_CONTENT_CHARS` meant the newest turn — the one
+    /// actually being screened — was never submitted. Aliyun answered
+    /// `none` for the benign history and the request was released clean.
+    #[tokio::test]
+    async fn risk_past_the_cap_in_the_newest_message_still_blocks() {
+        let server = MockServer::start().await;
+        // The benign history: every call whose content lacks the marker
+        // comes back clean.
+        Mock::given(method("POST"))
+            .and(body_string_contains("RISKMARKER"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("high")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("none")))
+            .mount(&server)
+            .await;
+
+        let history = "benign ".repeat(MAX_CONTENT_CHARS); // far past one call
+        let newest = "RISKMARKER";
+        let req = ChatFormat::new(
+            "m",
+            vec![ChatMessage::user(&history), ChatMessage::user(newest)],
+        );
+
+        let g = build(&server.uri(), "high", true);
+        assert!(
+            g.check_input(&req).await.is_block(),
+            "the newest message sits past the per-call cap; it must still be scanned",
+        );
+    }
+
+    /// The output side of the same clip (`check_output` shares `moderate`).
+    #[tokio::test]
+    async fn risk_past_the_cap_in_the_output_tail_still_blocks() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("RISKMARKER"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("high")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("none")))
+            .mount(&server)
+            .await;
+
+        let long = format!("{}RISKMARKER", "benign ".repeat(MAX_CONTENT_CHARS));
+        let g = build(&server.uri(), "high", true);
+        assert!(
+            g.check_output(&resp(&long)).await.is_block(),
+            "a response tail past the per-call cap must still be scanned",
+        );
+    }
+
+    /// Coverage is what matters, but the cost shape matters too: content
+    /// that fits stays exactly one call, and content that does not costs
+    /// one call per chunk rather than silently dropping the remainder.
+    #[tokio::test]
+    async fn content_within_the_cap_is_still_a_single_call() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("none")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let g = build(&server.uri(), "high", true);
+        assert_eq!(
+            g.check_input(&req("short and clean")).await,
+            GuardrailVerdict::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn content_over_the_cap_costs_one_call_per_chunk() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("none")))
+            // 3 chunks' worth of whitespace-free text → 3 calls, and the
+            // `expect` fails the test if the tail was dropped instead.
+            .expect(3)
+            .mount(&server)
+            .await;
+        let g = build(&server.uri(), "high", true);
+        let text = "x".repeat(MAX_CONTENT_CHARS * 3);
+        assert_eq!(g.check_input(&req(&text)).await, GuardrailVerdict::Allow);
     }
 
     #[tokio::test]
