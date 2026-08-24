@@ -8273,9 +8273,11 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     /// DeepSeek PK with `adapter: "openai"` and `api_base` pointing
     /// at `https://api.deepseek.com`. The integration test pins
     /// that an inbound OpenAI request resolves through the family
-    /// bridge and round-trips DeepSeek's OpenAI-shape response.
+    /// bridge, maps the unsupported `developer` role to `system`,
+    /// and round-trips DeepSeek's OpenAI-shape response. DeepSeek's
+    /// Chat Completions schema documents system/user/assistant/tool.
     #[tokio::test]
-    async fn matrix_openai_in_deepseek_upstream_non_streaming() {
+    async fn matrix_openai_in_deepseek_upstream_maps_developer_to_system() {
         use aisix_core::Adapter;
         use aisix_provider_openai::OpenAiBridge;
 
@@ -8283,6 +8285,12 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(header("authorization", "Bearer sk-deepseek"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "messages": [
+                    {"role": "system", "content": "Follow application instructions"},
+                    {"role": "user", "content": "hi"}
+                ]
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "cmpl-deepseek",
                 "model": "deepseek-chat",
@@ -8308,7 +8316,10 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
 
         let body = serde_json::json!({
             "model": "my-deepseek",
-            "messages": [{"role": "user", "content": "hi"}]
+            "messages": [
+                {"role": "developer", "content": "Follow application instructions"},
+                {"role": "user", "content": "hi"}
+            ]
         });
         let req = Request::builder()
             .method("POST")

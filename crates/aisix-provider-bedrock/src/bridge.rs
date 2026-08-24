@@ -1062,8 +1062,8 @@ impl BedrockBridge {
 /// Translate the gateway [`ChatFormat`] into the SDK's typed
 /// `(Vec<SystemContentBlock>, Vec<Message>)` Converse inputs.
 ///
-/// System messages → top-level `system[]` blocks (Converse splits
-/// them out of `messages[]` per AWS spec).
+/// System and developer messages → top-level `system[]` blocks
+/// (Converse splits instructions out of `messages[]` per AWS spec).
 /// User messages → `messages[]` with a text content block.
 /// Assistant messages → a text block plus a `toolUse` block per OpenAI
 /// `tool_calls` entry (#560, multi-turn history).
@@ -1092,7 +1092,7 @@ fn build_converse_inputs(
             )?);
         }
         match msg.role {
-            Role::System => {
+            Role::System | Role::Developer => {
                 let content = msg.content_str();
                 if !content.is_empty() {
                     systems.push(SystemContentBlock::Text(content.to_string()));
@@ -3576,6 +3576,26 @@ mod tests {
             chat.message.content.is_none(),
             "content must be null alongside tool_calls when there is no prose"
         );
+    }
+
+    #[test]
+    fn build_converse_inputs_lifts_developer_to_system_blocks() {
+        let req = ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::developer("follow application instructions"),
+                ChatMessage::user("hello"),
+            ],
+        );
+
+        let (systems, messages) = build_converse_inputs(&req).unwrap();
+        assert_eq!(systems.len(), 1);
+        assert_eq!(
+            systems[0],
+            SystemContentBlock::Text("follow application instructions".into())
+        );
+        assert_eq!(messages.len(), 1);
+        assert_eq!(*messages[0].role(), ConversationRole::User);
     }
 
     #[test]

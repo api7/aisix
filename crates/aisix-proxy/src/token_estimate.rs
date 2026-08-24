@@ -233,7 +233,10 @@ fn count_chat_prompt(bpe: &CoreBPE, req: &aisix_gateway::chat::ChatFormat) -> u3
     let mut has_system = false;
     for m in &req.messages {
         let role = role_label(&m.role);
-        if role == "system" {
+        if matches!(
+            m.role,
+            aisix_gateway::chat::Role::System | aisix_gateway::chat::Role::Developer
+        ) {
             has_system = true;
         }
         n = n.saturating_add(TOKENS_PER_MESSAGE);
@@ -275,6 +278,7 @@ fn count_chat_prompt(bpe: &CoreBPE, req: &aisix_gateway::chat::ChatFormat) -> u3
 fn role_label(role: &aisix_gateway::chat::Role) -> &'static str {
     match role {
         aisix_gateway::chat::Role::System => "system",
+        aisix_gateway::chat::Role::Developer => "developer",
         aisix_gateway::chat::Role::User => "user",
         aisix_gateway::chat::Role::Assistant => "assistant",
         aisix_gateway::chat::Role::Tool => "tool",
@@ -847,6 +851,25 @@ mod tests {
         assert_eq!(
             chat_est("gpt-4", with_system).count_prompt(),
             chat_est("gpt-4", without_system).count_prompt() + sys_msg_cost
+                - TOOLS_WITH_SYSTEM_DISCOUNT
+        );
+    }
+
+    #[test]
+    fn tools_with_developer_message_discount() {
+        let tools = json!([{"type": "function", "function": {"name": "f"}}]);
+        let mut with_developer = ChatFormat::new(
+            "gpt-4",
+            vec![msg(Role::Developer, "Be brief"), msg(Role::User, "Hi")],
+        );
+        with_developer.extra.insert("tools".into(), tools.clone());
+        let mut without_developer = ChatFormat::new("gpt-4", vec![msg(Role::User, "Hi")]);
+        without_developer.extra.insert("tools".into(), tools);
+        let developer_msg_cost =
+            TOKENS_PER_MESSAGE + count_text("gpt-4", "developer") + count_text("gpt-4", "Be brief");
+        assert_eq!(
+            chat_est("gpt-4", with_developer).count_prompt(),
+            chat_est("gpt-4", without_developer).count_prompt() + developer_msg_cost
                 - TOOLS_WITH_SYSTEM_DISCOUNT
         );
     }

@@ -142,6 +142,71 @@ describe("openai SDK compat: drive gateway through real client", () => {
     );
   });
 
+  test("openai.chat.completions.create() — developer role", async (ctx) => {
+    if (!etcdReachable || !app || !nonStreamUpstream) {
+      ctx.skip();
+      return;
+    }
+
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+    });
+
+    await waitConfigPropagation(seedsPropagated);
+    const baseline = nonStreamUpstream.receivedRequests.length;
+
+    const completion = await client.chat.completions.create({
+      model: "sdk-compat-sync",
+      messages: [
+        // The harness pins openai 4.65.0, whose message union predates
+        // this role; the runtime request path forwards the JSON unchanged.
+        { role: "developer", content: "Follow application instructions" },
+        { role: "user", content: "hello" },
+      ] as unknown as OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+    });
+
+    expect(completion.object).toBe("chat.completion");
+    expect(nonStreamUpstream.receivedRequests.length - baseline).toBe(1);
+    const request = nonStreamUpstream.receivedRequests[baseline];
+    expect(request?.path).toBe("/v1/chat/completions");
+    const body = JSON.parse(request!.body) as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    expect(body.messages).toEqual([
+      { role: "developer", content: "Follow application instructions" },
+      { role: "user", content: "hello" },
+    ]);
+  });
+
+  test("mis-cased developer role is rejected before upstream", async (ctx) => {
+    if (!etcdReachable || !app || !nonStreamUpstream) {
+      ctx.skip();
+      return;
+    }
+
+    await waitConfigPropagation(seedsPropagated);
+    const baseline = nonStreamUpstream.receivedRequests.length;
+    const response = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "sdk-compat-sync",
+        messages: [
+          { role: "Developer", content: "Follow application instructions" },
+          { role: "user", content: "hello" },
+        ],
+      }),
+    });
+    await response.text();
+
+    expect(response.status).toBe(400);
+    expect(nonStreamUpstream.receivedRequests.length - baseline).toBe(0);
+  });
+
   test("openai.chat.completions.create({stream:true}) — streaming", async (ctx) => {
     if (!etcdReachable || !app || !streamUpstream) {
       ctx.skip();
@@ -160,7 +225,10 @@ describe("openai SDK compat: drive gateway through real client", () => {
     const baseline = streamUpstream.receivedRequests.length;
     const stream = await client.chat.completions.create({
       model: "sdk-compat-stream",
-      messages: [{ role: "user", content: "say hello" }],
+      messages: [
+        { role: "developer", content: "Follow application instructions" },
+        { role: "user", content: "say hello" },
+      ] as unknown as OpenAI.Chat.Completions.ChatCompletionMessageParam[],
       stream: true,
     });
 
@@ -190,6 +258,12 @@ describe("openai SDK compat: drive gateway through real client", () => {
       .filter((r) => r.path === "/v1/chat/completions");
     expect(testCalls).toHaveLength(1);
     expect(testCalls[0]?.method).toBe("POST");
+    const requestBody = JSON.parse(testCalls[0]!.body) as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    expect(requestBody.messages).toEqual([
+      { role: "developer", content: "Follow application instructions" },
+      { role: "user", content: "say hello" },
+    ]);
   });
-
 });

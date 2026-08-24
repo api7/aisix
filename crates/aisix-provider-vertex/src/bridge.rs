@@ -61,8 +61,8 @@ use aisix_provider_anthropic::wire::{
 use aisix_provider_openai::wire::{
     build_request as build_openai_request, messages_from as openai_messages_from,
     response_into_chat_response as openai_response_into_chat_response,
-    stream_chunk_into_chat_chunk as openai_stream_chunk_into_chat_chunk, OpenAiResponse,
-    OpenAiStreamChunk,
+    stream_chunk_into_chat_chunk as openai_stream_chunk_into_chat_chunk, DeveloperRoleMode,
+    OpenAiResponse, OpenAiStreamChunk,
 };
 
 // Per-`ProviderKey` request/response override pipeline (#302 §5 / #339).
@@ -1212,7 +1212,7 @@ impl VertexBridge {
             || self.openai_shim_url(&creds, ctx.provider_key.api_base.as_deref()),
         )?;
 
-        let messages = openai_messages_from(req);
+        let messages = openai_messages_from(req, DeveloperRoleMode::MapToSystem);
         let typed = build_openai_request(req, upstream_id, &messages, false);
         let mut body = serde_json::to_value(&typed)
             .map_err(|e| BridgeError::Config(format!("serialize OpenAI shim request body: {e}")))?;
@@ -1273,7 +1273,7 @@ impl VertexBridge {
             || self.openai_shim_url(&creds, ctx.provider_key.api_base.as_deref()),
         )?;
 
-        let messages = openai_messages_from(req);
+        let messages = openai_messages_from(req, DeveloperRoleMode::MapToSystem);
         let typed = build_openai_request(req, upstream_id, &messages, true);
         let mut body = serde_json::to_value(&typed)
             .map_err(|e| BridgeError::Config(format!("serialize OpenAI shim request body: {e}")))?;
@@ -1417,7 +1417,7 @@ impl VertexBridge {
         // OpenAI chat-completions body — same serializer the OpenAI-shim
         // (Llama/MaaS) rail uses. The model is KEPT in the body (Mistral /
         // AI21 on Vertex expect it in both the URL and the body).
-        let messages = openai_messages_from(req);
+        let messages = openai_messages_from(req, DeveloperRoleMode::MapToSystem);
         let typed = build_openai_request(req, upstream_id, &messages, false);
         let mut body = serde_json::to_value(&typed)
             .map_err(|e| BridgeError::Config(format!("serialize OpenAI request body: {e}")))?;
@@ -1494,7 +1494,7 @@ impl VertexBridge {
             },
         )?;
 
-        let messages = openai_messages_from(req);
+        let messages = openai_messages_from(req, DeveloperRoleMode::MapToSystem);
         let typed = build_openai_request(req, upstream_id, &messages, true);
         let mut body = serde_json::to_value(&typed)
             .map_err(|e| BridgeError::Config(format!("serialize OpenAI request body: {e}")))?;
@@ -1910,8 +1910,9 @@ struct GeminiGenerationConfig {
 /// `generateContent` body.
 ///
 /// Translation rules:
-/// - System messages → top-level `systemInstruction` (concatenated
-///   with `\n\n` if multiple). They do NOT appear in `contents`.
+/// - System and developer messages → top-level `systemInstruction`
+///   (concatenated with `\n\n` if multiple). They do NOT appear in
+///   `contents`.
 /// - User messages → `{"role":"user","parts":[{"text":...}]}`
 /// - Assistant messages → `{"role":"model","parts":[{"text":...}]}`
 ///   (Gemini uses `"model"` not `"assistant"`)
@@ -1923,7 +1924,7 @@ fn build_gemini_request(req: &ChatFormat) -> GeminiGenerateContentRequest {
     let mut contents: Vec<GeminiContent> = Vec::new();
     for m in &req.messages {
         match m.role {
-            Role::System => system_parts.push(m.content_str().to_string()),
+            Role::System | Role::Developer => system_parts.push(m.content_str().to_string()),
             Role::User | Role::Tool => contents.push(GeminiContent {
                 role: "user",
                 parts: vec![GeminiPart {
@@ -2666,6 +2667,21 @@ mod tests {
     }
 
     #[test]
+    fn build_gemini_request_lifts_developer_to_system_instruction() {
+        let req = ChatFormat::new(
+            "my-gemini",
+            vec![
+                ChatMessage::developer("follow application instructions"),
+                ChatMessage::user("hi"),
+            ],
+        );
+        let body = build_gemini_request(&req);
+        assert_eq!(body.contents.len(), 1);
+        let sys = body.system_instruction.as_ref().unwrap();
+        assert_eq!(sys.parts[0].text, "follow application instructions");
+    }
+
+    #[test]
     fn build_gemini_request_concatenates_multiple_system_messages() {
         let req = ChatFormat::new(
             "my-gemini",
@@ -3249,7 +3265,13 @@ mod tests {
             sample_model_with("meta/llama-3.3-70b-instruct-maas"),
             sample_pk_with_secret(valid_secret_json()),
         );
-        let req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        let req = ChatFormat::new(
+            "my-llama",
+            vec![
+                ChatMessage::developer("Follow application instructions"),
+                ChatMessage::user("hi"),
+            ],
+        );
         let chat = bridge.chat(&req, &ctx).await.unwrap();
 
         // Customer-visible response decoded from the OpenAI envelope.
@@ -3271,11 +3293,13 @@ mod tests {
             Some("meta/llama-3.3-70b-instruct-maas"),
             "openapi shim keys off the body `model` field (kept, not stripped): {body}"
         );
-        assert!(
-            obj.get("messages")
-                .and_then(|v| v.as_array())
-                .is_some_and(|m| !m.is_empty()),
-            "messages array must carry the user turn: {body}"
+        assert_eq!(
+            obj.get("messages"),
+            Some(&serde_json::json!([
+                {"role": "system", "content": "Follow application instructions"},
+                {"role": "user", "content": "hi"}
+            ])),
+            "the compatible shim must receive developer instructions as system: {body}"
         );
     }
 
@@ -3356,7 +3380,13 @@ mod tests {
             sample_model_with("meta/llama-3.3-70b-instruct-maas"),
             sample_pk_with_secret(valid_secret_json()),
         );
-        let req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        let req = ChatFormat::new(
+            "my-llama",
+            vec![
+                ChatMessage::developer("Follow application instructions"),
+                ChatMessage::user("hi"),
+            ],
+        );
         let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
 
         let mut content = String::new();
@@ -3395,6 +3425,14 @@ mod tests {
             obj.get("model").and_then(|v| v.as_str()),
             Some("meta/llama-3.3-70b-instruct-maas"),
             "model id stays in the body (never the URL) on the stream path: {body}"
+        );
+        assert_eq!(
+            obj.get("messages"),
+            Some(&serde_json::json!([
+                {"role": "system", "content": "Follow application instructions"},
+                {"role": "user", "content": "hi"}
+            ])),
+            "the streaming compatible shim maps developer instructions to system: {body}"
         );
     }
 

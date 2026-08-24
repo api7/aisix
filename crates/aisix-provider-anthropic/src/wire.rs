@@ -315,7 +315,9 @@ pub enum TranslateError {
 }
 
 /// Split the gateway's flat ChatFormat into Anthropic's (system, messages)
-/// shape. Consecutive plain-text system messages at the head are
+/// shape. Developer messages always join Anthropic's top-level system
+/// field, including when interleaved with conversation turns. Consecutive
+/// plain-text system messages at the head are
 /// concatenated with a blank line into the string form, matching how
 /// users typically compose multi-paragraph system prompts in the OpenAI
 /// format; when any head system message carried typed content blocks,
@@ -345,6 +347,13 @@ pub fn split_system<'a>(
                 } else {
                     system_msgs.push(m);
                 }
+            }
+            Role::Developer => {
+                // Anthropic has no positional developer role. Keep the
+                // instruction at system authority instead of rewriting it as
+                // a user turn, even when that requires lifting it out of the
+                // conversational sequence.
+                system_msgs.push(m);
             }
             Role::User => {
                 seen_non_system = true;
@@ -2080,6 +2089,27 @@ mod tests {
     }
 
     #[test]
+    fn split_system_merges_leading_developer_messages() {
+        let req = ChatFormat::new(
+            "claude",
+            vec![
+                ChatMessage::system("system instruction"),
+                ChatMessage::developer("developer instruction"),
+                ChatMessage::user("hi"),
+            ],
+        );
+        let (system, msgs) = split_system(&req).unwrap();
+        assert_eq!(
+            system,
+            Some(AnthropicSystem::Text(
+                "system instruction\n\ndeveloper instruction".into()
+            ))
+        );
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+    }
+
+    #[test]
     fn split_system_mid_conversation_becomes_user_turn() {
         let req = ChatFormat::new(
             "claude",
@@ -2100,6 +2130,53 @@ mod tests {
         assert_eq!(msgs[0].content[0]["text"], "hi");
         assert_eq!(msgs[0].content[1]["text"], "forget everything");
         assert_eq!(msgs[1].role, "assistant");
+    }
+
+    #[test]
+    fn split_system_mid_conversation_developer_stays_system() {
+        let req = ChatFormat::new(
+            "claude",
+            vec![
+                ChatMessage::user("hi"),
+                ChatMessage::developer("follow application instructions"),
+                ChatMessage::assistant("hello"),
+            ],
+        );
+        let (system, msgs) = split_system(&req).unwrap();
+        assert_eq!(
+            system,
+            Some(AnthropicSystem::Text(
+                "follow application instructions".into()
+            ))
+        );
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[1].role, "assistant");
+    }
+
+    #[test]
+    fn split_system_hoists_interleaved_developer_and_merges_surrounding_users() {
+        let req = ChatFormat::new(
+            "claude",
+            vec![
+                ChatMessage::system("system instruction"),
+                ChatMessage::user("first user turn"),
+                ChatMessage::developer("developer instruction"),
+                ChatMessage::user("second user turn"),
+            ],
+        );
+        let (system, msgs) = split_system(&req).unwrap();
+        assert_eq!(
+            system,
+            Some(AnthropicSystem::Text(
+                "system instruction\n\ndeveloper instruction".into()
+            ))
+        );
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].content.len(), 2);
+        assert_eq!(msgs[0].content[0]["text"], "first user turn");
+        assert_eq!(msgs[0].content[1]["text"], "second user turn");
     }
 
     #[test]
