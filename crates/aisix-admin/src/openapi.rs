@@ -2940,6 +2940,21 @@ mod tests {
         }
     }
 
+    /// Select a `oneOf` branch by its `kind` discriminator.
+    ///
+    /// Reaching for a branch by index makes a test fail on a reorder that
+    /// left the generated document perfectly correct — the mirror image of
+    /// the defect this module now guards against (#1037), and just as
+    /// misleading.
+    fn variant_by_kind<'a>(schema: &'a serde_json::Value, kind: &str) -> &'a serde_json::Value {
+        schema["oneOf"]
+            .as_array()
+            .expect("schema is a `oneOf` over its kinds")
+            .iter()
+            .find(|branch| branch["properties"]["kind"]["enum"][0] == kind)
+            .unwrap_or_else(|| panic!("schema has no `{kind}` branch"))
+    }
+
     #[tokio::test]
     async fn openapi_documents_admin_enum_schemas() {
         let parsed: serde_json::Value =
@@ -2964,7 +2979,8 @@ mod tests {
             "Aggregate health summary derived from per-model health and config freshness. `ok` = all models healthy and config fresh; `degraded` = at least one model degraded or the config watch is stale/not yet applied; `unhealthy` = at least one model is down. Use `models[].health` and `config` for the per-dimension detail."
         );
         assert_eq!(
-            schemas["ObservabilityExporter"]["oneOf"][0]["properties"]["sample_rate"]["default"],
+            variant_by_kind(&schemas["ObservabilityExporter"], "otlp_http")["properties"]
+                ["sample_rate"]["default"],
             serde_json::json!(1.0),
             "runtime default for OTLP sampling should be visible in OpenAPI"
         );
@@ -3002,8 +3018,10 @@ mod tests {
             "optional object fields should not render as nullable ReDoc tabs"
         );
 
-        let content_mode = &parsed["components"]["schemas"]["ObservabilityExporter"]["oneOf"][0]
-            ["properties"]["content_mode"];
+        let content_mode = &variant_by_kind(
+            &parsed["components"]["schemas"]["ObservabilityExporter"],
+            "otlp_http",
+        )["properties"]["content_mode"];
         assert_eq!(
             content_mode["allOf"][0]["$ref"],
             "#/components/schemas/SlsContentMode"
@@ -3197,10 +3215,10 @@ mod tests {
             );
         }
 
-        let otlp = branches
-            .iter()
-            .find(|branch| branch["properties"]["kind"]["enum"][0] == "otlp_http")
-            .expect("the exporter family has an `otlp_http` kind");
+        let otlp = variant_by_kind(
+            &parsed["components"]["schemas"]["ObservabilityExporter"],
+            "otlp_http",
+        );
         assert_eq!(
             otlp["properties"]["sample_rate"]["default"],
             serde_json::json!(1.0),
