@@ -364,8 +364,19 @@ downstream:
 # is left in flight. In-flight requests then drain with no deadline — an
 # inference call or an SSE stream may run for minutes — so the platform
 # (Kubernetes terminationGracePeriodSeconds, systemd TimeoutStopSec) is
-# the only hard bound. Make sure that bound is generous enough for your
-# longest request.
+# the only hard bound.
+#
+# Size that bound for TWO requests back to back, not one. The gateway
+# retires a client's connection by answering `Connection: close`, which
+# rides on the response head — and a streamed response commits its head
+# at the first token, so a stream already running at SIGTERM can never
+# carry it, however long it runs. That connection returns to the client's
+# pool unmarked and gets used once more; only THAT request's head is
+# generated during the drain, carries the header, and ends the chain. So
+# the tail is the stream still running at the signal plus the one request
+# its connection is reused for, each able to run to its own client
+# timeout. The aisix Helm chart's "Termination and draining" section
+# works a default out from that.
 shutdown:
   # Minimum seconds to keep accepting new connections after the signal,
   # while /readyz already reports 503.
