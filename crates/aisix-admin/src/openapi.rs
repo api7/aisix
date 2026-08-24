@@ -2176,7 +2176,7 @@ fn add_variant_titles(doc: &mut Value) {
                 "PII Detection and Redaction",
                 "Lakera Guard",
                 "OpenAI Moderation",
-                "Microsoft Presidio",
+                "Presidio",
                 "Semantic Categories",
             ],
         ),
@@ -2324,7 +2324,7 @@ fn add_missing_property_descriptions(doc: &mut Value) {
         ),
         (
             "/components/schemas/Guardrail/oneOf/8/properties/kind",
-            "Guardrail provider type for self-hosted Microsoft Presidio PII detection and anonymization.",
+            "Guardrail provider type for PII detection and anonymization by a customer-run Presidio.",
         ),
         (
             "/components/schemas/KeywordPattern/oneOf/0/properties/kind",

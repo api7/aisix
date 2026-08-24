@@ -1523,7 +1523,7 @@ fn guardrail_kind_description(kind: &str) -> Option<&'static str> {
         "lakera" => Some("Guardrail provider type for Lakera Guard screening."),
         "openai_moderation" => Some("Guardrail provider type for the OpenAI Moderation API."),
         "presidio" => {
-            Some("Guardrail provider type for self-hosted Microsoft Presidio PII detection and anonymization.")
+            Some("Guardrail provider type for PII detection and anonymization by a customer-run Presidio.")
         }
         "semantic" => Some(
             "Guardrail provider type for in-process semantic category detection and redaction using the bundled embedding model.",
