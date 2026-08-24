@@ -15,6 +15,12 @@
 //!   produced nothing yet, so the token counts and `provider_request_id` are
 //!   necessarily absent, and `status` is the response-OPEN status: a stream
 //!   that later aborts, or whose consumer walks away, still logged `200`.
+//!   `latency` is time-to-first-token for the same reason, NOT how long the
+//!   stream ran — the two differ by the whole length of the stream, which
+//!   for an LLM is routinely minutes. A stream's real end is only on its
+//!   `UsageEvent`; reading this line as the end of the request is how a
+//!   long-running stream gets mistaken for a connection sitting idle
+//!   (AISIX-Cloud#1394).
 //! - **`/v1/realtime`** — the opposite extreme. The handler returns the
 //!   WebSocket upgrade immediately; the line is written by `run_session` on
 //!   a detached task once the session closes, so it carries the close status

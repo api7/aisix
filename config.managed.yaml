@@ -165,6 +165,11 @@ downstream:
 # in front has time to withdraw it, then waits for in-flight requests to
 # finish before closing the listener. Raise it above the detection latency
 # of your balancer's health check. In-flight drain itself is unbounded, so
-# terminationGracePeriodSeconds must cover your longest request.
+# terminationGracePeriodSeconds must cover two requests back to back: a
+# streamed response commits its head at the first token, so a stream
+# already running at SIGTERM never gets the `Connection: close` that
+# retires its connection, and the client reuses that connection once more
+# before the successor's head — generated during the drain — ends the
+# chain. See the aisix Helm chart's "Termination and draining" section.
 shutdown:
   min_drain_secs: 30
