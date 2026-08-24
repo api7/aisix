@@ -1221,6 +1221,28 @@ mod tests {
         assert!(text.contains("livez check failed"));
     }
 
+    /// The count has to survive an unpaired decrement: it is reported on
+    /// the drain heartbeat, and a wrapped counter would report billions of
+    /// open connections at exactly the moment an operator is reading the
+    /// line to decide whether traffic is still arriving.
+    #[test]
+    fn open_connections_saturates_at_zero() {
+        let state = LivezState::new();
+        assert_eq!(state.open_connections(), 0);
+
+        state.connection_closed();
+        assert_eq!(state.open_connections(), 0);
+
+        state.connection_opened();
+        state.connection_opened();
+        assert_eq!(state.open_connections(), 2);
+
+        state.connection_closed();
+        state.connection_closed();
+        state.connection_closed();
+        assert_eq!(state.open_connections(), 0);
+    }
+
     #[test]
     fn config_readiness_block_logic() {
         // No apply yet → not ready (startup).

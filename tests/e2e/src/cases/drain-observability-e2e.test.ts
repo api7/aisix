@@ -160,7 +160,10 @@ describe("access log carries the downstream connection identity", () => {
       "the access-log line for the request",
     );
     // An always-present empty field would defeat filtering on it — the
-    // same rule the failure fields on this line already follow.
+    // same rule the failure fields on this line already follow. Pinned
+    // against `peer`, which the same request DOES carry, so the assertion
+    // cannot pass merely because neither field is reported at all.
+    expect(line).toMatch(/\bpeer=\d{1,3}(?:\.\d{1,3}){3}:\d+\b/);
     expect(line).not.toContain("downstream_request_id");
   });
 
@@ -178,6 +181,7 @@ describe("access log carries the downstream connection identity", () => {
       () => accessLogFor(app!.output(), requestId),
       "the access-log line for the request",
     );
+    expect(line).toMatch(/\bpeer=\d{1,3}(?:\.\d{1,3}){3}:\d+\b/);
     expect(line).not.toContain("downstream_request_id");
   });
 });
