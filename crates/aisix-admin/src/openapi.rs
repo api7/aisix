@@ -2277,54 +2277,69 @@ fn title_schema_variants(doc: &mut Value, pointer: &str, titles: &[&str]) {
     }
 }
 
+/// Locate a property on the `oneOf` branch a schema selects through its
+/// `kind` discriminator.
+///
+/// Branch order follows the Rust enum's declaration order, so a pointer that
+/// names a branch by index addresses a different variant the moment one is
+/// inserted ahead of it — silently, because a stale index can only mislabel,
+/// never fail. That is how the `aliyun_ai_guardrail` guardrail came to be
+/// documented with the `pii` text (#1037). Select by discriminator instead.
+fn variant_property_mut<'a>(
+    doc: &'a mut Value,
+    schema: &str,
+    kind: &str,
+    property: &str,
+) -> Option<&'a mut Map<String, Value>> {
+    let Some(Value::Array(branches)) =
+        doc.pointer_mut(&format!("/components/schemas/{schema}/oneOf"))
+    else {
+        return None;
+    };
+    branches
+        .iter_mut()
+        .find(|branch| {
+            branch
+                .pointer("/properties/kind/enum/0")
+                .and_then(Value::as_str)
+                == Some(kind)
+        })
+        .and_then(|branch| branch.pointer_mut(&format!("/properties/{property}")))
+        .and_then(Value::as_object_mut)
+}
+
+/// Descriptions the derived schemas do not carry themselves. Every other
+/// `oneOf` family describes its own variants where the type is defined, in
+/// `aisix_core::models::schema`; these observability exporter kinds are the
+/// remaining set that does not, so they are filled in here.
 fn add_missing_property_descriptions(doc: &mut Value) {
-    for (pointer, description) in [
+    for (schema, kind, property, description) in [
         (
-            "/components/schemas/BedrockAWSCredentials/oneOf/0/properties/kind",
-            "Credential mode for explicitly configured AWS access keys.",
-        ),
-        (
-            "/components/schemas/BedrockLatencyMode/oneOf/0/properties/kind",
-            "Latency mode that waits for the Bedrock guardrail response.",
-        ),
-        (
-            "/components/schemas/BedrockLatencyMode/oneOf/1/properties/kind",
-            "Latency mode that stops waiting after `timeout_ms`.",
-        ),
-        (
-            "/components/schemas/KeywordPattern/oneOf/0/properties/kind",
-            "Pattern type for matching the value as plain text.",
-        ),
-        (
-            "/components/schemas/KeywordPattern/oneOf/1/properties/kind",
-            "Pattern type for matching the value as a regular expression.",
-        ),
-        (
-            "/components/schemas/KeywordPattern/oneOf/0/properties/value",
-            "Literal string to match.",
-        ),
-        (
-            "/components/schemas/KeywordPattern/oneOf/1/properties/value",
-            "Regular expression pattern to match.",
-        ),
-        (
-            "/components/schemas/ObservabilityExporter/oneOf/0/properties/kind",
+            "ObservabilityExporter",
+            "otlp_http",
+            "kind",
             "Exporter type. Use `otlp_http` to send telemetry to an OTLP HTTP endpoint.",
         ),
         (
-            "/components/schemas/ObservabilityExporter/oneOf/1/properties/kind",
+            "ObservabilityExporter",
+            "aliyun_sls",
+            "kind",
             "Exporter type. Use `aliyun_sls` to send telemetry to Aliyun SLS.",
         ),
         (
-            "/components/schemas/ObservabilityExporter/oneOf/2/properties/kind",
+            "ObservabilityExporter",
+            "object_store",
+            "kind",
             "Exporter type. Use `object_store` to write telemetry batches to object storage.",
         ),
         (
-            "/components/schemas/ObservabilityExporter/oneOf/3/properties/kind",
+            "ObservabilityExporter",
+            "datadog",
+            "kind",
             "Exporter type. Use `datadog` to send telemetry to Datadog Logs intake.",
         ),
     ] {
-        if let Some(Value::Object(map)) = doc.pointer_mut(pointer) {
+        if let Some(map) = variant_property_mut(doc, schema, kind, property) {
             map.entry("description".to_string())
                 .or_insert_with(|| Value::String(description.to_string()));
         }
@@ -2362,10 +2377,6 @@ fn add_schema_defaults(doc: &mut Value) {
             serde_json::json!([401, 408, 429, 500, 502, 503, 504]),
         ),
         (
-            "/components/schemas/ObservabilityExporter/oneOf/0/properties/sample_rate",
-            serde_json::json!(1.0),
-        ),
-        (
             "/components/schemas/RequestOverrides/properties/param_renames",
             serde_json::json!({}),
         ),
@@ -2377,6 +2388,15 @@ fn add_schema_defaults(doc: &mut Value) {
         if let Some(Value::Object(map)) = doc.pointer_mut(pointer) {
             map.entry("default".to_string()).or_insert(default_value);
         }
+    }
+
+    // Variant-scoped, so it is selected by discriminator like the
+    // descriptions above rather than by branch index.
+    if let Some(map) =
+        variant_property_mut(doc, "ObservabilityExporter", "otlp_http", "sample_rate")
+    {
+        map.entry("default".to_string())
+            .or_insert(serde_json::json!(1.0));
     }
 }
 
@@ -3035,6 +3055,120 @@ mod tests {
         assert!(
             missing.is_empty(),
             "schema properties missing descriptions: {missing:#?}"
+        );
+    }
+
+    /// Both carriers of a guardrail branch's identity are pinned by
+    /// discriminator here, because both are authored as position-ordered
+    /// lists: the ReDoc tab titles in `add_variant_titles`, and the `oneOf`
+    /// order the descriptions ride in. Reordering either one hands a kind its
+    /// neighbour's text, which nothing else fails on (#1037).
+    #[tokio::test]
+    async fn openapi_guardrail_variants_keep_their_own_metadata() {
+        let expected_titles = [
+            ("keyword", "Keyword"),
+            ("bedrock", "AWS Bedrock"),
+            (
+                "azure_content_safety",
+                "Azure AI Content Safety Prompt Shield",
+            ),
+            (
+                "azure_content_safety_text_moderation",
+                "Azure AI Content Safety Text Moderation",
+            ),
+            ("aliyun_text_moderation", "Aliyun Text Moderation"),
+            ("aliyun_ai_guardrail", "Aliyun AI Guardrails"),
+            ("pii", "PII Detection and Redaction"),
+            ("lakera", "Lakera Guard"),
+            ("openai_moderation", "OpenAI Moderation"),
+            ("presidio", "Presidio"),
+            ("smart_redaction", "Smart Redaction"),
+            ("semantic", "Semantic Screening"),
+        ];
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        let branches = parsed["components"]["schemas"]["Guardrail"]["oneOf"]
+            .as_array()
+            .expect("the guardrail schema is a `oneOf` over the kinds");
+        assert_eq!(
+            branches.len(),
+            expected_titles.len(),
+            "a guardrail kind was added or removed without updating this test"
+        );
+
+        // The kind descriptions have exactly one source, beside the type in
+        // `aisix_core`. Assembly here must not become a second one.
+        let source = aisix_core::models::schema::guardrail_root_schema();
+        let source_branches = source["oneOf"]
+            .as_array()
+            .expect("the guardrail root schema is a `oneOf` over the kinds");
+
+        for branch in branches {
+            let kind = branch["properties"]["kind"]["enum"][0]
+                .as_str()
+                .expect("each branch pins exactly one kind");
+            let (_, title) = expected_titles
+                .iter()
+                .find(|(expected, _)| *expected == kind)
+                .unwrap_or_else(|| {
+                    panic!("guardrail kind `{kind}` has no expected ReDoc tab title")
+                });
+            assert_eq!(
+                branch["title"].as_str(),
+                Some(*title),
+                "guardrail kind `{kind}` carries another kind's title"
+            );
+
+            let source_branch = source_branches
+                .iter()
+                .find(|candidate| candidate["properties"]["kind"]["enum"][0].as_str() == Some(kind))
+                .unwrap_or_else(|| {
+                    panic!("guardrail kind `{kind}` is absent from the root schema")
+                });
+            assert_eq!(
+                branch["properties"]["kind"]["description"],
+                source_branch["properties"]["kind"]["description"],
+                "guardrail kind `{kind}` was re-described during OpenAPI assembly"
+            );
+        }
+    }
+
+    /// The observability exporter kinds are the one family whose `kind`
+    /// descriptions are written during assembly rather than beside the type,
+    /// so this is the only place their branch-to-text binding can be checked.
+    /// Each sentence names its own kind, which is exactly what selecting the
+    /// wrong branch breaks.
+    #[tokio::test]
+    async fn openapi_exporter_kind_metadata_lands_on_its_own_variant() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        let branches = parsed["components"]["schemas"]["ObservabilityExporter"]["oneOf"]
+            .as_array()
+            .expect("the exporter schema is a `oneOf` over the kinds");
+        assert!(!branches.is_empty(), "the exporter family has no kinds");
+
+        for branch in branches {
+            let kind = branch["properties"]["kind"]["enum"][0]
+                .as_str()
+                .expect("each branch pins exactly one kind");
+            let description = branch["properties"]["kind"]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("exporter kind `{kind}` has no description"));
+            assert!(
+                description.contains(&format!("`{kind}`")),
+                "exporter kind `{kind}` carries another kind's description: {description}"
+            );
+        }
+
+        let otlp = branches
+            .iter()
+            .find(|branch| branch["properties"]["kind"]["enum"][0] == "otlp_http")
+            .expect("the exporter family has an `otlp_http` kind");
+        assert_eq!(
+            otlp["properties"]["sample_rate"]["default"],
+            serde_json::json!(1.0),
+            "the documented sample_rate default landed on the wrong exporter branch"
         );
     }
 
