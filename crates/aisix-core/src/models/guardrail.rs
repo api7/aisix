@@ -722,101 +722,6 @@ fn default_presidio_language() -> String {
     "en".to_owned()
 }
 
-/// One hotword group for a semantic category. Terms in a group are
-/// lexical evidence for the category: a term found next to a candidate
-/// span raises the span's rule score, and each group contributes at most
-/// once per span. Group terms by the role they play (for example trigger
-/// words, tool names) rather than listing every term in one group.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-pub struct SmartRedactionHotwordGroup {
-    /// Literal terms. Terms containing CJK characters match as
-    /// substrings; ASCII terms match on word boundaries, and may run
-    /// directly into a digit (so a tool name fused to a version number
-    /// still counts).
-    #[schemars(length(min = 1, max = 50))]
-    pub terms: Vec<String>,
-}
-
-/// One user-defined category for `kind: "smart_redaction"`: what to look for
-/// (regex candidate patterns), the lexical evidence that confirms or
-/// rejects a candidate (hotword groups and negative patterns), the
-/// natural-language description the embedding model judges uncertain
-/// candidates against, and how a confirmed span is rewritten.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-pub struct SmartRedactionCategory {
-    /// Category name surfaced in the mask token (`[<NAME>_REDACTED]`),
-    /// telemetry counts, and audit records. Never the matched value.
-    /// Must be unique within the guardrail.
-    #[schemars(length(min = 1, max = 64))]
-    pub name: String,
-    /// Natural-language description of the category, such as
-    /// `EDA 软件的版本号`. Candidates that regex and hotword evidence
-    /// cannot decide are judged by embedding similarity between their
-    /// surrounding text and this description.
-    #[schemars(length(min = 1, max = 1000))]
-    pub description: String,
-    /// Regular expressions that generate candidate spans. Only text
-    /// matched by a candidate pattern can ever be masked, so patterns
-    /// should be broad — precision comes from the hotword and negative
-    /// evidence and from the embedding judgement.
-    #[serde(default)]
-    #[schemars(length(min = 1, max = 10))]
-    pub candidate_patterns: Vec<String>,
-    /// Regular expressions that are evidence AGAINST a candidate. Every
-    /// pattern is tried against the candidate span itself. A pattern
-    /// whose source ends with `$` is additionally tried against the text
-    /// immediately before the span (the `$` pins the match to the span's
-    /// left edge, as in `编号\s*$`), and one whose source starts with
-    /// `^` against the text immediately after it (as in `^\s*(?:ms|s)`).
-    /// Any match counts once and strongly lowers the span's score.
-    #[serde(default)]
-    #[schemars(length(max = 20))]
-    pub negative_patterns: Vec<String>,
-    /// Hotword groups — lexical evidence FOR a candidate. A group term
-    /// adjacent to the span is decisive; terms merely nearby are weak
-    /// evidence that routes the span to the embedding judgement.
-    #[serde(default)]
-    #[schemars(length(max = 10))]
-    pub hotword_groups: Vec<SmartRedactionHotwordGroup>,
-    /// Action for spans confirmed as this category. Only `mask` is
-    /// supported: this guardrail rewrites content and never blocks.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action: Option<String>,
-    /// Literal text that replaces a masked span, such as `***`. When
-    /// omitted, the span is rewritten to `[<NAME>_REDACTED]`. An empty
-    /// string removes the span.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(max = 256))]
-    pub replacement: Option<String>,
-    /// Similarity threshold for the embedding judgement, in `[-1, 1]`
-    /// (cosine similarity against the category description). Omitted →
-    /// the calibrated default that ships with the bundled model. Raise
-    /// it to mask less, lower it to mask more; pair tuning with
-    /// `enforcement_mode: monitor` to preview the effect first.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = -1.0, max = 1.0))]
-    pub threshold: Option<f32>,
-}
-
-/// Config block for `kind: "smart_redaction"`. Category-based semantic
-/// detection and redaction computed inside the gateway by a bundled CPU
-/// embedding model — no external service is called and no content leaves
-/// the gateway. Each category pipelines regex candidate generation,
-/// hotword/negative-evidence scoring, and an embedding similarity
-/// judgement for the remaining uncertain spans. Confirmed spans are
-/// masked in place; everything else is returned byte-identical. This
-/// guardrail rewrites content and never blocks traffic, so `fail_open`
-/// must stay `true`.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-pub struct SmartRedactionConfig {
-    /// The categories this guardrail detects. Categories are evaluated
-    /// in order; each category rewrites the text the previous one
-    /// produced.
-    #[serde(default)]
-    #[schemars(length(min = 1, max = 30))]
-    pub categories: Vec<SmartRedactionCategory>,
-}
-
 /// Config block for `kind: "semantic"`. Embedding-similarity screening
 /// against operator-supplied EXAMPLE texts: each candidate text is
 /// embedded with `embedding_model` and scored (cosine) against the
@@ -831,11 +736,10 @@ pub struct SmartRedactionConfig {
 /// DIFFERENT examples are two guardrail rows, not one row with nested
 /// per-direction blocks.
 ///
-/// Unlike `smart_redaction`, this guardrail calls an `embedding`-kind
-/// Model through the gateway's provider bridges rather than the bundled
-/// CPU model, so it is available on every node but costs one upstream
-/// embedding call per screened text (example prototypes are embedded
-/// once and cached).
+/// This guardrail calls an `embedding`-kind Model through the gateway's
+/// provider bridges, so it is available on every node but costs one
+/// upstream embedding call per screened text (example prototypes are
+/// embedded once and cached).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct SemanticConfig {
     /// Alias of an `embedding`-kind Model used to embed both the
@@ -980,15 +884,6 @@ pub enum GuardrailKind {
     /// use the selected anonymize operator. Applies on input, output, or both,
     /// including buffered streaming output.
     Presidio(PresidioConfig),
-    /// Category-based semantic detection and redaction using a CPU
-    /// embedding model bundled with the gateway. User-defined categories
-    /// combine regex candidates, hotword evidence, and embedding
-    /// similarity against a natural-language description; confirmed
-    /// spans are masked in place. Rewrites only — never blocks. Applies
-    /// on input, output, or both, including buffered streaming output.
-    /// Requires the gateway's bundled model files; nodes without them
-    /// do not serve this kind.
-    SmartRedaction(SmartRedactionConfig),
     /// Embedding-similarity screening against operator-supplied example
     /// texts. Deny examples block on a close match; an allow-list, when
     /// present, blocks everything that matches none of it. Calls an
@@ -1015,7 +910,6 @@ impl GuardrailKind {
             GuardrailKind::Lakera(_) => "lakera",
             GuardrailKind::OpenaiModeration(_) => "openai_moderation",
             GuardrailKind::Presidio(_) => "presidio",
-            GuardrailKind::SmartRedaction(_) => "smart_redaction",
             GuardrailKind::Semantic(_) => "semantic",
         }
     }
@@ -1138,9 +1032,9 @@ fn is_zero_u32(value: &u32) -> bool {
 pub struct GuardrailExecution<'a> {
     /// Configured (row) name of the guardrail.
     pub guardrail_name: &'a str,
-    /// The `kind` discriminator (`GuardrailKind::kind_str`). `keyword`,
-    /// `pii`, and `semantic` run in-process; every other kind calls a
-    /// remote service.
+    /// The `kind` discriminator (`GuardrailKind::kind_str`). `keyword`
+    /// and `pii` run in-process; every other kind calls a remote
+    /// service.
     pub kind: &'a str,
     /// Which side ran: `input` or `output`.
     pub phase: &'static str,
@@ -1169,19 +1063,6 @@ pub struct GuardrailExecution<'a> {
 /// build time, so aisix-guardrails stays free of a metrics dependency.
 pub trait GuardrailMetricsSink: Send + Sync + 'static {
     fn record_guardrail_execution(&self, exec: &GuardrailExecution<'_>);
-
-    /// One embedding-model inference performed by the semantic
-    /// guardrail runtime. Default no-op so non-metrics sinks and tests
-    /// need not care.
-    fn record_smart_redaction_model_call(&self) {}
-
-    /// One semantic-guardrail degrade: a span (or category) fell back
-    /// to the rule layers instead of getting its embedding judgement.
-    /// `reason` is a bounded vocabulary (see the semantic runtime's
-    /// degrade enum), never free text.
-    fn record_smart_redaction_degrade(&self, reason: &'static str) {
-        let _ = reason;
-    }
 }
 
 /// Content policy evaluated before or after upstream calls.
@@ -1462,57 +1343,6 @@ mod tests {
             serde_json::from_value(v).expect("outer fields must not reach the inner kind");
         assert_eq!(g.enforcement_mode, "monitor");
         assert_eq!(g.direction, "input");
-    }
-
-    #[test]
-    fn semantic_kind_strict_schema_edges() {
-        let valid = json!({
-            "name": "sem",
-            "kind": "smart_redaction",
-            "categories": [{
-                "name": "eda-version",
-                "description": "EDA tool version numbers",
-                "candidate_patterns": ["\\d+\\.\\d+"]
-            }]
-        });
-        assert!(crate::models::validate_guardrail(&valid).is_ok());
-
-        // `block` does not exist for this kind — pinned in the schema, not
-        // accepted-and-half-honored (#963).
-        let mut blocked = valid.clone();
-        blocked["categories"][0]["action"] = json!("block");
-        assert!(crate::models::validate_guardrail(&blocked).is_err());
-
-        // A category with no candidate patterns compiles to nothing and
-        // would skip the whole row DP-side; the schema must refuse it even
-        // when the property is ABSENT (serde default `[]` — `minItems`
-        // alone does not fire on a missing property). The requirement
-        // rides the shared producer, so the READ path rejects too — safe,
-        // because no strict writer can ever have stored such a row (the
-        // kind is new), and a hand-crafted one is better rejected
-        // RED-visible than silently skipped at category compile.
-        let mut missing = valid.clone();
-        missing["categories"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("candidate_patterns");
-        assert!(crate::models::validate_guardrail(&missing).is_err());
-        assert!(crate::models::validate_guardrail_lenient(&missing).is_err());
-
-        // A semantic row with no categories detects nothing — the branch
-        // requires them, matching keyword's required `patterns`.
-        let bare = json!({"name": "sem", "kind": "smart_redaction"});
-        assert!(crate::models::validate_guardrail(&bare).is_err());
-
-        // This kind rewrites and never blocks; `fail_open: false` has
-        // nothing to fail closed into and is pinned out of the schema
-        // rather than accepted-and-inert (#963).
-        let mut closed = valid.clone();
-        closed["fail_open"] = json!(false);
-        assert!(crate::models::validate_guardrail(&closed).is_err());
-        let mut open = valid.clone();
-        open["fail_open"] = json!(true);
-        assert!(crate::models::validate_guardrail(&open).is_ok());
     }
 
     #[test]

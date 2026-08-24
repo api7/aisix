@@ -33,8 +33,6 @@ mod index;
 mod keyword;
 #[cfg(feature = "lakera")]
 mod lakera;
-#[cfg(feature = "local-model")]
-mod local_model;
 #[cfg(feature = "openai-moderation")]
 mod openai_moderation;
 mod pii;
@@ -167,11 +165,6 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
 /// flag kinds the connected DP can't serve. Strings MUST stay equal to
 /// the serde `kind` tags in `aisix_core::models::GuardrailKind`
 /// (`GuardrailKind::kind_str`).
-///
-/// `smart_redaction` is deliberately NOT here even when the `local-model`
-/// feature is compiled in: serving it also needs the model bundle on
-/// disk, a RUNTIME fact — heartbeat callers report
-/// [`supported_kinds_with`] instead.
 pub fn supported_kinds() -> &'static [&'static str] {
     &[
         "keyword",
@@ -196,23 +189,6 @@ pub fn supported_kinds() -> &'static [&'static str] {
         // out over the provider bridges every build already has.
         "semantic",
     ]
-}
-
-/// [`supported_kinds`] plus the runtime-conditional `smart_redaction` kind:
-/// advertised only while the node's model bundle stays verified (the
-/// `LocalModelCapability` the runtime hands the heartbeat). Readiness
-/// means "could serve" — the control plane creating a smart_redaction row is
-/// what triggers the lazy engine load, so gating the advert on "already
-/// active" would deadlock the create flow behind its own greying.
-pub fn supported_kinds_with(smart_redaction_ready: bool) -> Vec<&'static str> {
-    let mut kinds = supported_kinds().to_vec();
-    #[cfg(feature = "local-model")]
-    if smart_redaction_ready {
-        kinds.push("smart_redaction");
-    }
-    #[cfg(not(feature = "local-model"))]
-    let _ = smart_redaction_ready;
-    kinds
 }
 
 /// Why a guardrail embedding dispatch produced no vector.
@@ -252,8 +228,8 @@ impl EmbedFailure {
 /// needs the provider hub and the model snapshot, and holding a
 /// `ProxyState` from here would close a reference cycle through the
 /// chain cache `ProxyState` itself owns. So the proxy injects an
-/// implementation the same way it injects [`LocalModelRuntimeSlot`], and
-/// the implementation keeps only the hub plus a snapshot handle.
+/// implementation through [`GuardrailEmbedderSlot`], and the
+/// implementation keeps only the hub plus a snapshot handle.
 #[async_trait]
 pub trait GuardrailEmbedder: Send + Sync + 'static {
     /// Embed `texts` with the `embedding`-kind Model aliased
@@ -276,7 +252,7 @@ pub trait GuardrailEmbedder: Send + Sync + 'static {
 /// The process-wide guardrail embedder, passed to the chain builders.
 /// Always constructible — a caller that has no dispatch to offer passes
 /// [`GuardrailEmbedderSlot::none`] and every `kind: "semantic"` row is
-/// skipped with a warning (`BuildError::RuntimeUnavailable`).
+/// skipped with a warning (`BuildError::EmbedderUnavailable`).
 #[derive(Clone, Default)]
 pub struct GuardrailEmbedderSlot {
     embedder: Option<std::sync::Arc<dyn GuardrailEmbedder>>,
@@ -308,50 +284,6 @@ impl std::fmt::Debug for GuardrailEmbedderSlot {
     }
 }
 
-/// The process-wide smart-redaction runtime, passed to the chain
-/// builders. Always constructible — a build without the `local-model`
-/// feature, or a node without a verified model bundle, passes
-/// [`LocalModelRuntimeSlot::none`] and every `kind: "smart_redaction"` row is
-/// skipped with a warning (`BuildError::RuntimeUnavailable` /
-/// `FeatureDisabled`).
-#[derive(Clone, Default)]
-pub struct LocalModelRuntimeSlot {
-    #[cfg(feature = "local-model")]
-    runtime: Option<std::sync::Arc<local_model::LocalModelRuntime>>,
-}
-
-impl LocalModelRuntimeSlot {
-    /// No runtime: smart_redaction rows cannot be served.
-    pub fn none() -> Self {
-        Self::default()
-    }
-
-    /// A verified runtime: smart_redaction rows compile against it.
-    #[cfg(feature = "local-model")]
-    pub fn new(runtime: std::sync::Arc<local_model::LocalModelRuntime>) -> Self {
-        Self {
-            runtime: Some(runtime),
-        }
-    }
-
-    #[cfg(feature = "local-model")]
-    pub(crate) fn get(&self) -> Option<&std::sync::Arc<local_model::LocalModelRuntime>> {
-        self.runtime.as_ref()
-    }
-}
-
-impl std::fmt::Debug for LocalModelRuntimeSlot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        #[cfg(feature = "local-model")]
-        return f
-            .debug_struct("LocalModelRuntimeSlot")
-            .field("present", &self.runtime.is_some())
-            .finish();
-        #[cfg(not(feature = "local-model"))]
-        f.debug_struct("LocalModelRuntimeSlot").finish()
-    }
-}
-
 #[cfg(feature = "aliyun-text-moderation")]
 pub use aliyun::AliyunTextModerationGuardrail;
 #[cfg(feature = "aliyun-text-moderation")]
@@ -367,12 +299,6 @@ pub use index::{GuardrailIndex, RequestContext};
 pub use keyword::{KeywordBlocklist, KeywordRule};
 #[cfg(feature = "lakera")]
 pub use lakera::LakeraGuardrail;
-#[cfg(feature = "local-model")]
-pub use local_model::{
-    parse_lanes, CategoryCompileError, LocalModelCapability, LocalModelError, LocalModelRuntime,
-    ModelManifest, SmartRedactionGuardrail, DEFAULT_MODEL_DIR, LANES_ENV, MODEL_DIR_ENV,
-    PROTOTYPES_ENV, RULE_WINDOW_ENV, THRESHOLD_ENV,
-};
 #[cfg(feature = "openai-moderation")]
 pub use openai_moderation::OpenaiModerationGuardrail;
 pub use pii::{builtin_rule, PiiAction, PiiGuardrail, PiiRule, BUILTIN_DETECTORS};

@@ -68,18 +68,6 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = "0.6"
 
-[features]
-# The semantic guardrail runtime is part of the standard build (#1363):
-# the release image ships the capability plus the model bundle, and
-# `kind: "semantic"` rows activate it through the control plane —
-# nothing runs (and no model memory is spent) until a row exists.
-# `--no-default-features` remains the minimal build that skips the
-# static ONNX Runtime link. GUARDRAIL_LOCAL_MODEL_DIR overrides the
-# bundled model path (non-AISIX_ prefix on purpose: the config loader
-# claims the AISIX_* env namespace and strictly rejects unknown fields).
-default = ["local-model-guardrail"]
-local-model-guardrail = ["aisix-guardrails/local-model", "aisix-proxy/local-model-guardrail"]
-
 [dev-dependencies]
 tempfile = "3"
 wiremock = "0.6"
