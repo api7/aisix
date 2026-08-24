@@ -189,6 +189,9 @@ pub fn supported_kinds() -> &'static [&'static str] {
         "openai_moderation",
         #[cfg(feature = "presidio")]
         "presidio",
+        // No cargo feature and no on-disk asset: the embedding call goes
+        // out over the provider bridges every build already has.
+        "semantic",
     ]
 }
 
@@ -363,8 +366,8 @@ pub use keyword::{KeywordBlocklist, KeywordRule};
 pub use lakera::LakeraGuardrail;
 #[cfg(feature = "local-model")]
 pub use local_model::{
-    parse_lanes, CategoryCompileError, LocalModelError, ModelManifest, LocalModelCapability,
-    SmartRedactionGuardrail, LocalModelRuntime, DEFAULT_MODEL_DIR, LANES_ENV, MODEL_DIR_ENV,
+    parse_lanes, CategoryCompileError, LocalModelCapability, LocalModelError, LocalModelRuntime,
+    ModelManifest, SmartRedactionGuardrail, DEFAULT_MODEL_DIR, LANES_ENV, MODEL_DIR_ENV,
     PROTOTYPES_ENV, RULE_WINDOW_ENV, THRESHOLD_ENV,
 };
 #[cfg(feature = "openai-moderation")]
@@ -1084,6 +1087,7 @@ mod tests {
                 "lakera",
                 "openai_moderation",
                 "presidio",
+                "semantic",
             ],
         );
         for kind in supported_kinds() {
@@ -1136,6 +1140,11 @@ mod tests {
                 "openai_moderation" => serde_json::json!({
                     "kind": "openai_moderation",
                     "api_key": "sk",
+                }),
+                "semantic" => serde_json::json!({
+                    "kind": "semantic",
+                    "embedding_model": "embed-1",
+                    "deny_examples": ["x"],
                 }),
                 "presidio" => serde_json::json!({
                     "kind": "presidio",

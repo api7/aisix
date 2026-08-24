@@ -156,9 +156,7 @@ fn classify(err: ProxyError) -> EmbedFailure {
         ProxyError::Bridge(BridgeError::Timeout { .. }) => EmbedFailure::Timeout,
         // No bridge for the provider key, or the model has no provider /
         // upstream model name — configuration, not an outage.
-        ProxyError::ProviderUnavailable | ProxyError::InvalidRequest(_) => {
-            EmbedFailure::Unresolved
-        }
+        ProxyError::ProviderUnavailable | ProxyError::InvalidRequest(_) => EmbedFailure::Unresolved,
         _ => EmbedFailure::Upstream,
     }
 }

@@ -262,7 +262,6 @@ impl std::ops::DerefMut for ProxyState {
 #[cfg(test)]
 const TEST_RATE_LIMIT_CLOCK_SECS: u64 = 1_763_000_000;
 
-
 /// The embedding dispatcher `kind: "semantic"` guardrail rows compile
 /// against. Free function rather than a method because the three
 /// `ProxyState` constructors need it before `self` exists.

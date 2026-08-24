@@ -958,7 +958,9 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 aisix_guardrails::LocalModelRuntime::load(dir, lanes, Some(sink))
             })
             .await
-            .map_err(|e| anyhow::anyhow!("smart-redaction guardrail bundle verification task: {e}"))?
+            .map_err(|e| {
+                anyhow::anyhow!("smart-redaction guardrail bundle verification task: {e}")
+            })?
         };
         match verified {
             Ok(runtime) => {

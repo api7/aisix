@@ -171,7 +171,8 @@ pub const M_GUARDRAIL_BYPASSES_TOTAL: &str = "aisix_guardrail_bypasses_total";
 /// are running on lexical evidence alone.
 pub const M_GUARDRAIL_SMART_REDACTION_MODEL_CALLS_TOTAL: &str =
     "aisix_guardrail_smart_redaction_model_calls_total";
-pub const M_GUARDRAIL_SMART_REDACTION_DEGRADED_TOTAL: &str = "aisix_guardrail_smart_redaction_degraded_total";
+pub const M_GUARDRAIL_SMART_REDACTION_DEGRADED_TOTAL: &str =
+    "aisix_guardrail_smart_redaction_degraded_total";
 /// Per-request inbound authentication decisions
 /// (AISIX-Cloud#1080/#1081). Before this series, a rejected credential
 /// was invisible: the auth extractor short-circuits ahead of every

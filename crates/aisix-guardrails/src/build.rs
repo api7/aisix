@@ -26,9 +26,8 @@ use crate::index::{GuardrailIndex, RequestContext, ScopeKind};
 use crate::keyword::{KeywordBlocklist, KeywordRule};
 use crate::pii::{builtin_rule, PiiAction, PiiGuardrail, PiiRule};
 use crate::{
-    Guardrail, GuardrailChain, GuardrailEmbedderSlot, GuardrailVerdict,
-    LocalModelRuntimeSlot, Redaction, SegmentsOutcome,
-    StreamOutputPolicy,
+    Guardrail, GuardrailChain, GuardrailEmbedderSlot, GuardrailVerdict, LocalModelRuntimeSlot,
+    Redaction, SegmentsOutcome, StreamOutputPolicy,
 };
 
 /// A snapshot table's guardrail entries in deterministic chain order:
@@ -147,9 +146,11 @@ fn build_one(
     local_model: &LocalModelRuntimeSlot,
     embedder: &GuardrailEmbedderSlot,
 ) -> Result<Option<Arc<dyn Guardrail>>, BuildError> {
-    Ok(build_one_inner(row, bedrock_endpoint_url, local_model, embedder)?
-        .map(|g| apply_enforcement_mode(row, g))
-        .map(|g| apply_mandatory(row, g)))
+    Ok(
+        build_one_inner(row, bedrock_endpoint_url, local_model, embedder)?
+            .map(|g| apply_enforcement_mode(row, g))
+            .map(|g| apply_mandatory(row, g)),
+    )
 }
 
 /// Wrap `inner` in [`MandatoryGuardrail`] when `row.mandatory` is set, so a
@@ -1401,7 +1402,12 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(
+            &table,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        );
         assert_eq!(chain.len(), 1);
         let v = chain.check_input(&req("here is AKIAEXAMPLE")).await;
         assert!(v.is_block());
@@ -1426,7 +1432,12 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(
+            &table,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        );
         assert_eq!(chain.len(), 1, "monitor-mode row still materialises");
         // Would block under `block` mode; monitor downgrades to Allow.
         let v = chain.check_input(&req("here is AKIAEXAMPLE")).await;
@@ -1465,7 +1476,12 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(
+            &table,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        );
 
         // mask-action detector match → would_mask hit with counts.
         let (v, hits) = chain
@@ -1516,7 +1532,12 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(
+            &table,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        );
         let (v, hits) = chain
             .check_input_observed(&req("here is AKIAEXAMPLE"))
             .await;
@@ -1554,7 +1575,12 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(
+            &table,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        );
         let (v, hits) = chain
             .check_input_observed(&req("here is AKIAEXAMPLE"))
             .await;
@@ -1588,7 +1614,12 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(
+            &table,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        );
         assert!(
             !chain.stream_output_policy().holds_back(),
             "monitor-mode output rule must not hold the stream back",
@@ -1611,7 +1642,12 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(
+            &table,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        );
         assert!(
             chain
                 .check_input(&req("here is AKIAEXAMPLE"))
@@ -1642,7 +1678,12 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(
+            &table,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        );
         assert_eq!(chain.len(), 1);
         let r = chain.redact_input_text("tool version: 12.1 done").unwrap();
         assert_eq!(r.text, "tool version: *** done");
@@ -1674,7 +1715,12 @@ mod tests {
         ] {
             let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
             table.insert(entry("bad", "g-1", parse(row)));
-            let chain = build_chain_from_snapshot(&table, None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none());
+            let chain = build_chain_from_snapshot(
+                &table,
+                None,
+                &LocalModelRuntimeSlot::none(),
+                &GuardrailEmbedderSlot::none(),
+            );
             assert!(
                 chain.is_empty(),
                 "replacement+block row must be skipped, not half-honored",
@@ -1834,9 +1880,14 @@ mod tests {
             &server.uri(),
             r#", "enforcement_mode": "monitor", "fail_open": false"#,
         );
-        let g = build_one(&row, None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none())
-            .unwrap()
-            .unwrap();
+        let g = build_one(
+            &row,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             g.check_input(&req("hello")).await,
             GuardrailVerdict::Allow,
@@ -1861,9 +1912,14 @@ mod tests {
             &server.uri(),
             r#", "enforcement_mode": "monitor", "mandatory": true"#,
         );
-        let g = build_one(&row, None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none())
-            .unwrap()
-            .unwrap();
+        let g = build_one(
+            &row,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(
             g.check_input(&req("hello")).await.is_block(),
             "mandatory must keep provider unavailability fatal in monitor mode",
@@ -1887,7 +1943,12 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(
+            &table,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        );
         assert_eq!(chain.len(), 0);
     }
 
@@ -1905,7 +1966,12 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(
+            &table,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        );
         assert_eq!(chain.len(), 0, "empty list adds nothing to the chain");
     }
 
@@ -1939,7 +2005,12 @@ mod tests {
             ),
         ));
 
-        let chain = build_chain_from_snapshot(&table, None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(
+            &table,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        );
         // Only the good row makes it in.
         assert_eq!(chain.len(), 1);
         let v = chain.check_input(&req("ok")).await;
@@ -1965,7 +2036,12 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(
+            &table,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        );
         assert_eq!(chain.len(), 0, "out-of-range threshold row must be skipped");
     }
 
@@ -2008,7 +2084,12 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(
+            &table,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        );
         // Both rows compose. We don't probe the bedrock arm — its
         // own tests cover the dispatch path; this one only pins the
         // chain composition contract.
@@ -2019,7 +2100,12 @@ mod tests {
     async fn live_chain_rebuilds_on_snapshot_swap() {
         let initial = AisixSnapshot::new();
         let handle = SnapshotHandle::new(initial);
-        let live = LiveGuardrailChain::new(handle.clone(), None, LocalModelRuntimeSlot::none(), GuardrailEmbedderSlot::none());
+        let live = LiveGuardrailChain::new(
+            handle.clone(),
+            None,
+            LocalModelRuntimeSlot::none(),
+            GuardrailEmbedderSlot::none(),
+        );
 
         // Empty snapshot → no rules → input passes.
         assert!(!live.check_input(&req("AKIA-EXAMPLE")).await.is_block());
@@ -2097,8 +2183,12 @@ mod tests {
     /// assertion fails intermittently (#519 B.4a).
     #[test]
     fn chain_order_is_created_at_ascending_with_id_tiebreak() {
-        let chain =
-            build_chain_from_snapshot(&shuffled_table(), None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(
+            &shuffled_table(),
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        );
         assert_eq!(chain.member_names(), EXPECTED_ORDER);
     }
 
@@ -2110,7 +2200,12 @@ mod tests {
         for (id, name) in [("g-3", "z"), ("g-1", "y"), ("g-2", "x")] {
             table.insert(entry(name, id, keyword_row(name, None)));
         }
-        let chain = build_chain_from_snapshot(&table, None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(
+            &table,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        );
         assert_eq!(chain.member_names(), ["y", "x", "z"]);
     }
 
@@ -2628,7 +2723,12 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(
+            &table,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        );
         // input check fires...
         assert!(chain.check_input(&req("secret")).await.is_block());
         // ...but output check is a noop on this rule.
@@ -2678,7 +2778,12 @@ mod tests {
             ),
         ));
 
-        let chain = build_chain_from_snapshot(&table, None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(
+            &table,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        );
         // `applied` mirrors the chain 1:1 (pushed in lockstep); the absolute
         // member order is a `ResourceTable::entries()` concern tested
         // elsewhere, so sort by hook before comparing to pin only that BOTH
@@ -2736,7 +2841,12 @@ mod tests {
             ),
         ));
 
-        let chain = build_chain_from_snapshot(&table, None, &LocalModelRuntimeSlot::none(), &GuardrailEmbedderSlot::none());
+        let chain = build_chain_from_snapshot(
+            &table,
+            None,
+            &LocalModelRuntimeSlot::none(),
+            &GuardrailEmbedderSlot::none(),
+        );
         assert_eq!(chain.len(), 1, "only the live row materialises");
         assert_eq!(
             chain.applied(),

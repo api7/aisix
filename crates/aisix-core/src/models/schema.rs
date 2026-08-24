@@ -1423,6 +1423,24 @@ pub fn guardrail_root_schema() -> Value {
                         );
                     }
                 }
+                "semantic" => {
+                    set_property_enum(b, "text_source", json!(["user_messages", "all_messages"]));
+                    set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
+                    // Required on the write path, defaulted in the type:
+                    // see the field's doc comment. A row saved without it
+                    // would screen every request against a model that
+                    // resolves to nothing.
+                    match b.get_mut("required").and_then(Value::as_array_mut) {
+                        Some(list) => {
+                            if !list.iter().any(|v| v.as_str() == Some("embedding_model")) {
+                                list.push(json!("embedding_model"));
+                            }
+                        }
+                        None => {
+                            b.insert("required".to_string(), json!(["embedding_model"]));
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1525,6 +1543,10 @@ fn guardrail_kind_description(kind: &str) -> Option<&'static str> {
         "presidio" => {
             Some("Guardrail provider type for self-hosted Microsoft Presidio PII detection and anonymization.")
         }
+        "semantic" => Some(
+            "Guardrail provider type for embedding-similarity screening against \
+             example texts, using an embedding-kind Model.",
+        ),
         "smart_redaction" => Some(
             "Guardrail provider type for in-process semantic category detection and redaction using the bundled embedding model.",
         ),

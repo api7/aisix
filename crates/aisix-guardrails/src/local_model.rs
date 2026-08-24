@@ -665,7 +665,10 @@ impl LocalModelRuntime {
                 .await;
                 match loaded {
                     Ok(Ok(embedder)) => {
-                        tracing::info!(lanes = self.lanes, "smart-redaction guardrail engine loaded");
+                        tracing::info!(
+                            lanes = self.lanes,
+                            "smart-redaction guardrail engine loaded"
+                        );
                         Some(Arc::new(Engine {
                             embedder: Arc::new(embedder),
                             permits: Arc::new(tokio::sync::Semaphore::new(self.lanes)),

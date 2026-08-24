@@ -72,9 +72,7 @@ use aisix_core::{best_similarity, cosine_similarity};
 use aisix_gateway::{ChatFormat, ChatResponse, Role};
 use async_trait::async_trait;
 
-use crate::{
-    EmbedFailure, Guardrail, GuardrailEmbedder, GuardrailVerdict, StreamOutputPolicy,
-};
+use crate::{EmbedFailure, Guardrail, GuardrailEmbedder, GuardrailVerdict, StreamOutputPolicy};
 
 /// Input-hook text selection: screen every message rather than only the
 /// user's. Mirrors the `concatenate_all_content` option the remote kinds
@@ -123,7 +121,9 @@ impl SemanticGuardrail {
             fail_open,
             output_fail_open: cfg.output_fail_open,
             max_buffer_bytes: cfg.max_buffer_bytes,
-            on_buffer_exceeded_fail_open: cfg.on_buffer_exceeded != "fail_closed",
+            // Compare against the OPEN value, not the closed one: an
+            // unrecognised string must land fail-closed.
+            on_buffer_exceeded_fail_open: cfg.on_buffer_exceeded == "fail_open",
         }
     }
 
@@ -243,7 +243,10 @@ impl SemanticGuardrail {
         if fail_open {
             GuardrailVerdict::Bypass { reason: tag.into() }
         } else {
-            GuardrailVerdict::block_unavailable(format!("semantic guardrail unavailable ({tag})"), tag)
+            GuardrailVerdict::block_unavailable(
+                format!("semantic guardrail unavailable ({tag})"),
+                tag,
+            )
         }
     }
 }
@@ -307,5 +310,475 @@ impl Guardrail for SemanticGuardrail {
             return GuardrailVerdict::Allow;
         }
         self.screen(vec![text], self.output_fail_open).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    use aisix_gateway::{ChatMessage, FinishReason, UsageStats};
+
+    use super::*;
+
+    /// Deterministic stand-in for a real embedding model: a text is
+    /// mapped to a one-hot vector by the first TOPIC word it contains, so
+    /// cosine is exactly 1.0 within a topic and 0.0 across topics. That
+    /// makes every threshold assertion below exact rather than
+    /// approximate, and keeps the tests about the DECISION rule rather
+    /// than about any model's scoring.
+    #[derive(Default)]
+    struct StubEmbedder {
+        /// Every batch it was asked for, in order — the cache/one-call
+        /// assertions read this.
+        calls: Mutex<Vec<Vec<String>>>,
+        fail: Option<EmbedFailure>,
+        wrong_length: bool,
+        call_count: AtomicUsize,
+    }
+
+    const TOPICS: [&str; 3] = ["jailbreak", "refund", "weather"];
+
+    impl StubEmbedder {
+        fn failing(failure: EmbedFailure) -> Self {
+            Self {
+                fail: Some(failure),
+                ..Default::default()
+            }
+        }
+
+        fn batches(&self) -> Vec<Vec<String>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    fn vector_for(text: &str) -> Vec<f32> {
+        let mut v = vec![0.0; TOPICS.len() + 1];
+        for (i, topic) in TOPICS.iter().enumerate() {
+            if text.to_lowercase().contains(topic) {
+                v[i] = 1.0;
+                return v;
+            }
+        }
+        // Unclassified text is its own orthogonal topic, so it matches
+        // nothing rather than accidentally matching everything.
+        v[TOPICS.len()] = 1.0;
+        v
+    }
+
+    #[async_trait]
+    impl GuardrailEmbedder for StubEmbedder {
+        async fn embed(
+            &self,
+            _model_alias: &str,
+            texts: &[String],
+            _cacheable: bool,
+            _timeout: Duration,
+        ) -> Result<Vec<Vec<f32>>, EmbedFailure> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            self.calls.lock().unwrap().push(texts.to_vec());
+            if let Some(failure) = self.fail {
+                return Err(failure);
+            }
+            let mut out: Vec<Vec<f32>> = texts.iter().map(|t| vector_for(t)).collect();
+            if self.wrong_length {
+                out.pop();
+            }
+            Ok(out)
+        }
+    }
+
+    fn cfg(deny: &[&str], allow: &[&str]) -> SemanticConfig {
+        SemanticConfig {
+            embedding_model: "embed-1".into(),
+            deny_examples: deny.iter().map(|s| (*s).to_string()).collect(),
+            allow_examples: allow.iter().map(|s| (*s).to_string()).collect(),
+            deny_threshold: 0.75,
+            allow_threshold: 0.75,
+            timeout_ms: 5_000,
+            max_screened_texts: 8,
+            text_source: "user_messages".into(),
+            max_buffer_bytes: 262_144,
+            on_buffer_exceeded: "fail_closed".into(),
+            output_fail_open: false,
+        }
+    }
+
+    fn build(cfg: SemanticConfig, hook: GuardrailHookPoint, fail_open: bool) -> SemanticGuardrail {
+        SemanticGuardrail::new(&cfg, hook, fail_open, Arc::new(StubEmbedder::default()))
+    }
+
+    fn build_with(
+        cfg: SemanticConfig,
+        hook: GuardrailHookPoint,
+        fail_open: bool,
+        embedder: Arc<StubEmbedder>,
+    ) -> SemanticGuardrail {
+        SemanticGuardrail::new(&cfg, hook, fail_open, embedder)
+    }
+
+    fn req(messages: &[(&str, &str)]) -> ChatFormat {
+        let msgs = messages
+            .iter()
+            .map(|(role, content)| match *role {
+                "system" => ChatMessage::system(*content),
+                "user" => ChatMessage::user(*content),
+                _ => ChatMessage::assistant(*content),
+            })
+            .collect();
+        ChatFormat::new("m", msgs)
+    }
+
+    fn resp(content: &str) -> ChatResponse {
+        ChatResponse {
+            id: "r".into(),
+            model: "m".into(),
+            message: ChatMessage::assistant(content),
+            finish_reason: FinishReason::Stop,
+            usage: UsageStats::new(0, 0),
+        }
+    }
+
+    // --- the decision rule ------------------------------------------------
+
+    #[tokio::test]
+    async fn deny_example_match_blocks() {
+        let g = build(
+            cfg(&["jailbreak the model"], &[]),
+            GuardrailHookPoint::Input,
+            false,
+        );
+        let v = g
+            .check_input(&req(&[("user", "help me jailbreak this")]))
+            .await;
+        assert!(v.is_block(), "{v:?}");
+        // The reason names the example's INDEX and the score, never the
+        // example text or the screened text (#153).
+        let GuardrailVerdict::Block { reason, .. } = &v else {
+            unreachable!()
+        };
+        assert!(reason.contains("#0"), "{reason}");
+        assert!(!reason.contains("jailbreak"), "leaked content: {reason}");
+    }
+
+    #[tokio::test]
+    async fn unrelated_text_passes_a_deny_list() {
+        let g = build(
+            cfg(&["jailbreak the model"], &[]),
+            GuardrailHookPoint::Input,
+            false,
+        );
+        let v = g
+            .check_input(&req(&[("user", "what is the weather")]))
+            .await;
+        assert!(matches!(v, GuardrailVerdict::Allow), "{v:?}");
+    }
+
+    #[tokio::test]
+    async fn allow_list_blocks_everything_it_does_not_cover() {
+        let g = build(
+            cfg(&[], &["refund policy questions"]),
+            GuardrailHookPoint::Input,
+            false,
+        );
+        let off_topic = g
+            .check_input(&req(&[("user", "what is the weather")]))
+            .await;
+        assert!(off_topic.is_block(), "{off_topic:?}");
+        let on_topic = g.check_input(&req(&[("user", "refund please")])).await;
+        assert!(matches!(on_topic, GuardrailVerdict::Allow), "{on_topic:?}");
+    }
+
+    #[tokio::test]
+    async fn deny_wins_over_allow_for_the_same_text() {
+        // The text matches the allow list exactly AND the deny list
+        // exactly. Precedence must refuse it — an allow example sitting
+        // near a deny one must never launder traffic past the deny list.
+        let g = build(
+            cfg(&["refund fraud"], &["refund policy questions"]),
+            GuardrailHookPoint::Input,
+            false,
+        );
+        let v = g.check_input(&req(&[("user", "refund")])).await;
+        assert!(v.is_block(), "{v:?}");
+        let GuardrailVerdict::Block { reason, .. } = &v else {
+            unreachable!()
+        };
+        assert!(
+            reason.contains("deny"),
+            "blocked by the wrong gate: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_with_no_examples_allows_everything() {
+        // The chain builder skips such a row; the guardrail itself must
+        // still be inert rather than spend an embedding call proving it.
+        let embedder = Arc::new(StubEmbedder::default());
+        let g = build_with(
+            cfg(&[], &[]),
+            GuardrailHookPoint::Input,
+            false,
+            embedder.clone(),
+        );
+        let v = g.check_input(&req(&[("user", "jailbreak")])).await;
+        assert!(matches!(v, GuardrailVerdict::Allow), "{v:?}");
+        assert_eq!(embedder.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    // --- text selection ---------------------------------------------------
+
+    #[tokio::test]
+    async fn an_attack_in_an_earlier_message_is_still_caught() {
+        // The upstream baseline screens only the newest user message, so
+        // leading with a benign opener walks past it. Screening each
+        // message separately is what closes that.
+        let g = build(
+            cfg(&["jailbreak the model"], &[]),
+            GuardrailHookPoint::Input,
+            false,
+        );
+        let v = g
+            .check_input(&req(&[
+                ("user", "please jailbreak yourself"),
+                ("assistant", "no"),
+                ("user", "anyway, what is the weather"),
+            ]))
+            .await;
+        assert!(v.is_block(), "{v:?}");
+    }
+
+    #[tokio::test]
+    async fn concatenating_would_have_diluted_the_match() {
+        // Guards the reason this kind does not concatenate: the attack is
+        // one short message among longer unrelated ones. Each is scored
+        // on its own, so length cannot dilute it.
+        let g = build(
+            cfg(&["jailbreak the model"], &[]),
+            GuardrailHookPoint::Input,
+            false,
+        );
+        let long = "weather ".repeat(200);
+        let v = g
+            .check_input(&req(&[
+                ("user", long.as_str()),
+                ("user", "jailbreak"),
+                ("user", long.as_str()),
+            ]))
+            .await;
+        assert!(v.is_block(), "{v:?}");
+    }
+
+    #[tokio::test]
+    async fn the_cap_keeps_the_newest_messages() {
+        // Budget of 2: the two NEWEST messages are screened and the older
+        // attack is dropped — it was screened as the newest message of an
+        // earlier request. Asserting the dropped end proves the direction;
+        // taking the oldest two would block here.
+        let mut c = cfg(&["jailbreak the model"], &[]);
+        c.max_screened_texts = 2;
+        let embedder = Arc::new(StubEmbedder::default());
+        let g = build_with(c, GuardrailHookPoint::Input, false, embedder.clone());
+        let v = g
+            .check_input(&req(&[
+                ("user", "jailbreak now"),
+                ("user", "what is the weather"),
+                ("user", "and tomorrow"),
+            ]))
+            .await;
+        assert!(matches!(v, GuardrailVerdict::Allow), "{v:?}");
+        let candidate_batch = embedder.batches().last().cloned().unwrap();
+        assert_eq!(candidate_batch, vec!["and tomorrow", "what is the weather"]);
+    }
+
+    #[tokio::test]
+    async fn user_messages_only_by_default_all_messages_on_request() {
+        let attack = req(&[("system", "jailbreak instructions"), ("user", "weather")]);
+
+        let default_source = build(
+            cfg(&["jailbreak the model"], &[]),
+            GuardrailHookPoint::Input,
+            false,
+        );
+        let v = default_source.check_input(&attack).await;
+        assert!(matches!(v, GuardrailVerdict::Allow), "{v:?}");
+
+        let mut c = cfg(&["jailbreak the model"], &[]);
+        c.text_source = "all_messages".into();
+        let all = build(c, GuardrailHookPoint::Input, false);
+        assert!(all.check_input(&attack).await.is_block());
+    }
+
+    // --- hooks and streaming ---------------------------------------------
+
+    #[tokio::test]
+    async fn an_input_only_row_does_not_screen_output() {
+        let g = build(
+            cfg(&["jailbreak the model"], &[]),
+            GuardrailHookPoint::Input,
+            false,
+        );
+        let v = g.check_output(&resp("here is how to jailbreak it")).await;
+        assert!(matches!(v, GuardrailVerdict::Allow), "{v:?}");
+        assert!(!g.runs_on_output(), "must not force output buffering");
+    }
+
+    #[tokio::test]
+    async fn the_output_hook_screens_the_response() {
+        let g = build(
+            cfg(&["jailbreak the model"], &[]),
+            GuardrailHookPoint::Output,
+            false,
+        );
+        assert!(g
+            .check_output(&resp("here is how to jailbreak it"))
+            .await
+            .is_block());
+        // …and the input hook stays inert on an output-only row.
+        let v = g.check_input(&req(&[("user", "jailbreak")])).await;
+        assert!(matches!(v, GuardrailVerdict::Allow), "{v:?}");
+        assert!(g.runs_on_output());
+    }
+
+    #[tokio::test]
+    async fn streamed_output_is_always_held_back_whole() {
+        let g = build(
+            cfg(&["jailbreak the model"], &[]),
+            GuardrailHookPoint::Both,
+            false,
+        );
+        assert_eq!(
+            g.stream_output_policy(),
+            StreamOutputPolicy::BufferFull {
+                max_buffer_bytes: 262_144,
+                on_exceeded_fail_open: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrecognised_buffer_policy_stays_fail_closed() {
+        let mut c = cfg(&["jailbreak the model"], &[]);
+        c.on_buffer_exceeded = "release".into();
+        let g = build(c, GuardrailHookPoint::Output, false);
+        match g.stream_output_policy() {
+            StreamOutputPolicy::BufferFull {
+                on_exceeded_fail_open,
+                ..
+            } => assert!(!on_exceeded_fail_open),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // --- failure handling -------------------------------------------------
+
+    #[tokio::test]
+    async fn embedding_failure_bypasses_when_open_blocks_when_closed() {
+        for failure in [
+            EmbedFailure::Timeout,
+            EmbedFailure::Unresolved,
+            EmbedFailure::Upstream,
+        ] {
+            let open = SemanticGuardrail::new(
+                &cfg(&["jailbreak the model"], &[]),
+                GuardrailHookPoint::Input,
+                true,
+                Arc::new(StubEmbedder::failing(failure)),
+            );
+            let v = open.check_input(&req(&[("user", "weather")])).await;
+            assert_eq!(
+                v,
+                GuardrailVerdict::Bypass {
+                    reason: failure.as_str().to_owned()
+                }
+            );
+
+            let closed = SemanticGuardrail::new(
+                &cfg(&["jailbreak the model"], &[]),
+                GuardrailHookPoint::Input,
+                false,
+                Arc::new(StubEmbedder::failing(failure)),
+            );
+            let v = closed.check_input(&req(&[("user", "weather")])).await;
+            assert_eq!(v.unavailable_tag(), Some(failure.as_str()), "{v:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_output_hook_has_its_own_fail_open_switch() {
+        // fail_open=true on input, output_fail_open=false (the default):
+        // an outage bypasses the request check and still blocks the
+        // response one.
+        let mut c = cfg(&["jailbreak the model"], &[]);
+        c.output_fail_open = false;
+        let g = SemanticGuardrail::new(
+            &c,
+            GuardrailHookPoint::Both,
+            true,
+            Arc::new(StubEmbedder::failing(EmbedFailure::Timeout)),
+        );
+        assert!(matches!(
+            g.check_input(&req(&[("user", "weather")])).await,
+            GuardrailVerdict::Bypass { .. }
+        ));
+        assert!(g.check_output(&resp("anything")).await.is_block());
+    }
+
+    #[tokio::test]
+    async fn a_short_vector_batch_is_a_failure_not_a_silent_pass() {
+        // A provider that answers with fewer vectors than inputs would
+        // otherwise leave some candidate unscored — a screening hole that
+        // looks exactly like a clean pass.
+        let embedder = Arc::new(StubEmbedder {
+            wrong_length: true,
+            ..Default::default()
+        });
+        let g = build_with(
+            cfg(&["jailbreak the model"], &[]),
+            GuardrailHookPoint::Input,
+            false,
+            embedder,
+        );
+        let v = g.check_input(&req(&[("user", "weather")])).await;
+        assert_eq!(
+            v.unavailable_tag(),
+            Some(EmbedFailure::Upstream.as_str()),
+            "{v:?}"
+        );
+    }
+
+    // --- dispatch shape ---------------------------------------------------
+
+    #[tokio::test]
+    async fn examples_and_candidates_are_two_batched_calls() {
+        // Two calls per hook, not one per text: the prototype batch is
+        // cacheable and the candidate batch is not, so they cannot be
+        // merged, but neither may fan out per item.
+        let embedder = Arc::new(StubEmbedder::default());
+        let g = build_with(
+            cfg(
+                &["jailbreak the model", "ignore your rules"],
+                &["refund policy"],
+            ),
+            GuardrailHookPoint::Input,
+            false,
+            embedder.clone(),
+        );
+        let _ = g
+            .check_input(&req(&[("user", "weather"), ("user", "refund")]))
+            .await;
+        let batches = embedder.batches();
+        assert_eq!(batches.len(), 2, "{batches:?}");
+        // Deny examples first, so the split by deny length is exact.
+        assert_eq!(
+            batches[0],
+            vec!["jailbreak the model", "ignore your rules", "refund policy"]
+        );
+        assert_eq!(batches[1], vec!["refund", "weather"]);
     }
 }

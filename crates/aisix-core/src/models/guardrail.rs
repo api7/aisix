@@ -841,6 +841,14 @@ pub struct SemanticConfig {
     /// Alias of an `embedding`-kind Model used to embed both the
     /// examples and the screened text. Must resolve in the same
     /// environment as this guardrail.
+    ///
+    /// Defaulted at the TYPE level and required by the strict write
+    /// schema instead: a row the loader cannot deserialize is skipped
+    /// whole, and a screening row that vanishes is a guardrail that
+    /// stopped screening. Empty resolves to nothing, so the row degrades
+    /// per `fail_open` — fail-closed by default — rather than
+    /// disappearing.
+    #[serde(default)]
     #[schemars(length(min = 1))]
     pub embedding_model: String,
     /// Example texts whose meaning must be REFUSED. A screened text

@@ -488,9 +488,6 @@ mod tests {
         Arc::new(v)
     }
 
-
-
-
     fn router() -> Semantic {
         semantic(
             r#"{
