@@ -90,8 +90,6 @@ observability:
       # deployment and point Prometheus at it. Override with
       # AISIX_OBSERVABILITY__METRICS__PROMETHEUS__ADDR.
       addr: "0.0.0.0:9090"
-    otlp:
-      enabled: false
     # Optional User-Agent -> client_type mapping rules for the
     # aisix_llm_tokens_by_client_total metric (first match wins, tried
     # before the built-in allowlist; regex, case-insensitive). See
@@ -106,10 +104,6 @@ observability:
     # AISIX_OBSERVABILITY__METRICS__BUCKETS__REQUEST_TTFT=0.1,0.5,1,5,30,300
     # buckets:
     #   request_ttft: [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300]
-  tracing:
-    otlp:
-      enabled: false
-      sample_ratio: 1.0
 
 managed:
   enabled: true
