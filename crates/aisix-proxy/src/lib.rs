@@ -543,12 +543,23 @@ async fn record_request_telemetry(
     // a request still running when the platform's grace period expires
     // never gets there. Its `peer` and ids come from the request span
     // (see request_id.rs), which is what makes the line joinable to the
-    // fronting proxy's record of the same request. Steady-state logging
-    // volume is unchanged.
-    if state.livez.is_shutting_down() {
+    // fronting proxy's record of the same request. No line is added to
+    // steady-state logging.
+    //
+    // The health endpoints are excluded because they are served on THIS
+    // listener and the platform keeps probing them right through the
+    // drain — the shipped chart every 3s and 10s — so including them would
+    // bury the handful of real arrivals under a probe every few seconds.
+    // A probe always reaches its completion line anyway, which is the
+    // reason this line exists for anything else.
+    //
+    // `path` is caller-controlled, so it is recorded as a string: that
+    // renders it quoted and escaped, the same way the access log writes
+    // it, rather than raw into a space-delimited line.
+    if state.livez.is_shutting_down() && !matches!(endpoint, "/livez" | "/readyz") {
         tracing::info!(
             method = %request.method(),
-            path = %request.uri().path(),
+            path = request.uri().path(),
             "request arrived while draining"
         );
     }
@@ -590,14 +601,16 @@ fn hold_until_body_done(response: Response, drain: DrainGuard) -> Response {
 /// by RFC 9113 §8.2.2); its drain signal is the GOAWAY that hyper emits
 /// when the listener does shut down.
 ///
-/// It cannot retire a **streaming** connection at all, and no change to
-/// this function can. A streamed response returns from the handler at the
-/// first token, so its head — this header included — is already committed
-/// and on the wire; a stream whose head went out before the signal will
-/// therefore never carry `Connection: close` however long it runs
-/// afterwards, and an LLM stream routinely runs for minutes
-/// (AISIX-Cloud#1394). Retiring those connections is the listener's
-/// shutdown to do, not this header's.
+/// It cannot retire a stream that was ALREADY RUNNING when the signal
+/// landed, and no change to this function can. This mutates a response
+/// the middleware still holds, so a streamed response whose handler
+/// returns DURING the drain does get the header like any other; what it
+/// cannot reach is a head that already went out. A stream is where that
+/// matters, because its connection then stays busy for minutes while the
+/// drain runs, whereas a buffered response's connection comes back for
+/// the next request and is retired on that one (AISIX-Cloud#1394).
+/// Retiring the still-running ones is the listener's shutdown to do, not
+/// this header's.
 fn retire_connection(version: &axum::http::Version, response: &mut Response) {
     if *version == axum::http::Version::HTTP_2 || *version == axum::http::Version::HTTP_3 {
         return;

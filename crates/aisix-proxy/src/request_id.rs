@@ -201,7 +201,11 @@ pub(crate) async fn ensure_request_id(
         span.record("peer", tracing::field::display(peer.0));
     }
     if let Some(downstream) = downstream_request_id(request.headers()) {
-        span.record("downstream_request_id", tracing::field::display(downstream));
+        // Recorded as a string, not `display`: the value is caller-supplied
+        // and `is_acceptable` permits `{`, `}` and `:` — the characters the
+        // fmt subscriber delimits a span's field list with. As a string it
+        // is rendered quoted and escaped, so it cannot forge one.
+        span.record("downstream_request_id", downstream);
     }
     let mut response = next.run(request).instrument(span).await;
 

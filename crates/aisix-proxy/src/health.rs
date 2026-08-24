@@ -34,10 +34,11 @@ static TEXT_PLAIN_UTF8: HeaderValue = HeaderValue::from_static("text/plain; char
 pub struct LivezState {
     shutting_down: AtomicBool,
     /// Requests currently being served on the proxy listener, raised and
-    /// lowered by the telemetry middleware's RAII guard. Reported on the
-    /// drain heartbeat so an operator can watch the tail empty; a
-    /// streaming response keeps its slot for as long as bytes may still
-    /// flow.
+    /// lowered by the telemetry middleware's RAII guard. Read by the
+    /// shutdown coordinator to decide when closing the listener can no
+    /// longer interrupt anything, and reported on the drain heartbeat so
+    /// an operator can watch the tail empty; a streaming response keeps
+    /// its slot for as long as bytes may still flow.
     in_flight: AtomicUsize,
     /// Downstream connections currently open on the proxy listener,
     /// raised and lowered by the acceptor's RAII guard. Distinct from

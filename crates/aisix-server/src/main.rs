@@ -1669,14 +1669,19 @@ const DOWNSTREAM_NODELAY: axum_server::accept::NoDelayAcceptor =
 /// signal.
 ///
 /// Accepting is the only place either fact is observable, and during a
-/// drain the two together answer a question the logs otherwise cannot:
-/// whether what is keeping the process busy is work it had already taken
-/// on, or traffic a load balancer is still routing here
-/// (AISIX-Cloud#1394).
+/// drain they are what separates work the gateway had already taken on
+/// from traffic still being routed at it (AISIX-Cloud#1394).
+///
+/// Neither can tell a client apart from the platform, though: `/livez`
+/// and `/readyz` are served on the proxy listener too, and the probes
+/// keep arriving throughout the drain, each on its own connection. So the
+/// count includes them and the accept line does not claim to know who
+/// connected — the arrival line in `record_request_telemetry` knows the
+/// path and is where that judgement is made. This line covers what the
+/// arrival line cannot: a connection opened and never used.
 ///
 /// `drain` is `None` for the admin and metrics listeners, which are
-/// control surfaces: their probes would otherwise be counted as client
-/// connections a drain is waiting on.
+/// control surfaces nothing routes client traffic to.
 #[derive(Clone)]
 struct CountedAcceptor {
     nodelay: axum_server::accept::NoDelayAcceptor,
@@ -1775,8 +1780,7 @@ impl<S> axum_server::accept::Accept<tokio::net::TcpStream, S> for CountedAccepto
                     tracing::info!(
                         peer = stream.peer_addr().ok().map(tracing::field::display),
                         open_connections = drain.open_connections(),
-                        "accepted a new connection while draining — the load \
-                         balancer is still routing here"
+                        "accepted a new downstream connection while draining"
                     );
                 }
                 ConnectionGuard(drain.clone())
@@ -2706,6 +2710,55 @@ models:
             .await
             .expect("accept");
         assert!(accepted.nodelay().expect("read nodelay"));
+    }
+
+    /// The slot has to be released with the stream. Nothing else checks
+    /// it: every drain assertion is "at least one", so a guard that
+    /// outlived its connection would keep them all green while the count
+    /// climbed for the life of the process.
+    #[tokio::test]
+    async fn the_counted_acceptor_releases_the_slot_when_the_stream_drops() {
+        use axum_server::accept::Accept;
+
+        let livez = std::sync::Arc::new(aisix_proxy::LivezState::new());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (accepted, _peer) = listener.accept().await.expect("accept");
+
+        let acceptor = CountedAcceptor::new(DOWNSTREAM_NODELAY, Some(livez.clone()));
+        let (stream, ()) = acceptor.accept(accepted, ()).await.expect("accept");
+        assert_eq!(livez.open_connections(), 1);
+
+        drop(stream);
+        assert_eq!(
+            livez.open_connections(),
+            0,
+            "the slot must go back when the connection task drops the stream",
+        );
+        drop(client);
+    }
+
+    /// A listener that counts nothing must still accept: the admin and
+    /// metrics surfaces pass `None`, and a panic or a miscount there would
+    /// take down control traffic for a number nobody reads.
+    #[tokio::test]
+    async fn the_counted_acceptor_is_a_passthrough_without_a_drain_state() {
+        use axum_server::accept::Accept;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let _client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (accepted, _peer) = listener.accept().await.expect("accept");
+
+        let acceptor = CountedAcceptor::new(DOWNSTREAM_NODELAY, None);
+        let (stream, ()) = acceptor.accept(accepted, ()).await.expect("accept");
+        // The acceptor still has to do the job it wraps.
+        assert!(stream.inner.nodelay().expect("read nodelay"));
     }
 
     /// Four listeners are served — HTTP and HTTPS, on the shared runtime

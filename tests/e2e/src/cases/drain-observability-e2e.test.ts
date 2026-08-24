@@ -21,9 +21,13 @@ import {
 const CALLER_PLAINTEXT = "sk-drain-obs-caller";
 const CALLER_KEY_ENV = "DRAIN_OBS_CALLER_KEY";
 
-/** Long enough that the drain heartbeat (5s) fires at least once. */
+/** Short, so the in-flight wait is reached while the requests still run. */
 const DRAIN_WINDOW_SECS = 2;
-/** Outlives the window several times over, so requests span the drain. */
+/**
+ * Long enough that requests are still in flight for more than the 5s
+ * heartbeat interval after the window elapses — which is what makes the
+ * heartbeat fire, not the window length.
+ */
 const SLOW_UPSTREAM_MS = 14_000;
 
 function resources(upstreamBase: string): string {
@@ -144,7 +148,9 @@ describe("access log carries the downstream connection identity", () => {
       () => accessLogFor(app!.output(), requestId),
       "the access-log line for the request",
     );
-    expect(line).toContain(`downstream_request_id=${downstreamId}`);
+    // Quoted, because the value is caller-supplied: rendered raw it could
+    // carry the characters the span prefix is delimited with.
+    expect(line).toContain(`downstream_request_id="${downstreamId}"`);
   });
 
   test("omits the field for a request that carried no downstream id", async () => {
@@ -236,6 +242,17 @@ describe("the drain reports what is still arriving and what is still open", () =
       expect(startLine).toMatch(/\bin_flight=\d+\b/);
       expect(startLine).toMatch(/\bopen_connections=[1-9]\d*\b/);
 
+      // The platform keeps probing the health endpoints on this same
+      // listener for the whole grace period — the shipped chart every 3s
+      // and 10s. Drive a few by hand now; the absence of an arrival line
+      // for them is asserted at the end of the test, by which point plenty
+      // of later output has been read.
+      for (let i = 0; i < 3; i++) {
+        const probe = await fetch(`${proxyUrl}/readyz`);
+        expect(probe.status).toBe(503);
+        await probe.text();
+      }
+
       // A second request, on a new connection, inside the window — the
       // shape that says the balancer has not withdrawn this instance yet.
       const duringDrain = chat(proxyUrl, { "x-request-id": "ingress-during" });
@@ -245,7 +262,9 @@ describe("the drain reports what is still arriving and what is still open", () =
           app!
             .output()
             .split("\n")
-            .find((l) => l.includes("accepted a new connection while draining")),
+            .find((l) =>
+              l.includes("accepted a new downstream connection while draining"),
+            ),
         "the accept-during-drain line",
       );
       expect(acceptLine).toMatch(/\bpeer=\d{1,3}(?:\.\d{1,3}){3}:\d+\b/);
@@ -260,12 +279,12 @@ describe("the drain reports what is still arriving and what is still open", () =
         "the arrival-during-drain line",
       );
       expect(arrivalLine).toContain("method=POST");
-      expect(arrivalLine).toContain("path=/v1/chat/completions");
+      expect(arrivalLine).toContain('path="/v1/chat/completions"');
       // Arrival is written before anything about the request is known, so
       // its only identity is the connection's — which is exactly what a
       // request killed before it could complete leaves behind.
       expect(arrivalLine).toMatch(/\bpeer=\d{1,3}(?:\.\d{1,3}){3}:\d+\b/);
-      expect(arrivalLine).toContain("downstream_request_id=ingress-during");
+      expect(arrivalLine).toContain('downstream_request_id="ingress-during"');
 
       // Past the window, with both requests still running: the heartbeat
       // separates work already taken on from connections still held.
@@ -279,6 +298,18 @@ describe("the drain reports what is still arriving and what is still open", () =
       );
       expect(heartbeat).toMatch(/\bin_flight=[1-9]\d*\b/);
       expect(heartbeat).toMatch(/\bopen_connections=[1-9]\d*\b/);
+
+      // Health probes must not produce arrival lines. They are served on
+      // this listener and keep coming for the whole grace period, so
+      // logging them would bury the real arrivals this line exists for —
+      // and a probe reaches its completion line regardless.
+      const probeArrivals = app
+        .output()
+        .split("\n")
+        .filter(
+          (l) => l.includes("request arrived while draining") && l.includes("readyz"),
+        );
+      expect(probeArrivals, `probe arrivals were logged: ${probeArrivals}`).toEqual([]);
 
       for (const pending of [beforeSignal, duringDrain]) {
         const res = await pending;
