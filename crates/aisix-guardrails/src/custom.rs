@@ -179,11 +179,7 @@ impl CustomGuardrail {
 
     /// Run one exported hook function against `ctx_json`.
     async fn run_hook(&self, func: &str, ctx_json: String, fail_open: bool) -> GuardrailVerdict {
-        let outcome = tokio::time::timeout(
-            self.budget,
-            self.invoke(func, ctx_json),
-        )
-        .await;
+        let outcome = tokio::time::timeout(self.budget, self.invoke(func, ctx_json)).await;
 
         match outcome {
             // The wall-clock budget covers a script parked on a pending
@@ -234,14 +230,18 @@ impl CustomGuardrail {
                 let module = Module::declare(ctx.clone(), MODULE_NAME, script.as_str())
                     .catch(&ctx)
                     .map_err(|e| threw(&row_name, "parse", e))?;
-                let (module, pending) =
-                    module.eval().catch(&ctx).map_err(|e| threw(&row_name, "eval", e))?;
+                let (module, pending) = module
+                    .eval()
+                    .catch(&ctx)
+                    .map_err(|e| threw(&row_name, "eval", e))?;
                 pending
                     .into_future::<()>()
                     .await
                     .catch(&ctx)
                     .map_err(|e| threw(&row_name, "eval", e))?;
 
+                // A script may cover one direction only; the hook it does
+                // not export is an Allow, not a misconfiguration.
                 let Ok(hook) = module.get::<_, rquickjs::Function<'_>>(func.as_str()) else {
                     return Ok(None);
                 };
@@ -272,12 +272,25 @@ impl CustomGuardrail {
                     .json_stringify(resolved)
                     .catch(&ctx)
                     .map_err(|e| threw(&row_name, "verdict", e))?;
-                Ok(json.and_then(|s| s.to_string().ok()))
+                // Distinguished here, while the two are still separable: a
+                // hook the module never exported is an Allow above, whereas
+                // a hook that returned `undefined` decided nothing and must
+                // not be read as one.
+                match json.and_then(|s| s.to_string().ok()) {
+                    Some(json) => Ok(Some(json)),
+                    None => {
+                        tracing::warn!(
+                            row = %row_name,
+                            "custom guardrail returned undefined instead of a verdict",
+                        );
+                        Err(ScriptFailure::BadVerdict)
+                    }
+                }
             })
             .await;
 
         match raw? {
-            None => Err(ScriptFailure::BadVerdict),
+            None => Ok(None),
             Some(json) => self.parse_verdict(&json).map(Some),
         }
     }
@@ -483,20 +496,17 @@ fn install_host(
         .set("__hostFetch", host_fetch)
         .map_err(|_| ScriptFailure::Engine)?;
 
-    let host_log = rquickjs::Function::new(
-        ctx.clone(),
-        move |level: String, message: String| {
-            // Operator-authored text at operator-chosen levels. Bounded so a
-            // script cannot write an unbounded line into the gateway's log.
-            let message: String = message.chars().take(2048).collect();
-            match level.as_str() {
-                "error" => tracing::error!(row = %row_name, "custom guardrail script: {message}"),
-                "warn" => tracing::warn!(row = %row_name, "custom guardrail script: {message}"),
-                "debug" => tracing::debug!(row = %row_name, "custom guardrail script: {message}"),
-                _ => tracing::info!(row = %row_name, "custom guardrail script: {message}"),
-            }
-        },
-    )
+    let host_log = rquickjs::Function::new(ctx.clone(), move |level: String, message: String| {
+        // Operator-authored text at operator-chosen levels. Bounded so a
+        // script cannot write an unbounded line into the gateway's log.
+        let message: String = message.chars().take(2048).collect();
+        match level.as_str() {
+            "error" => tracing::error!(row = %row_name, "custom guardrail script: {message}"),
+            "warn" => tracing::warn!(row = %row_name, "custom guardrail script: {message}"),
+            "debug" => tracing::debug!(row = %row_name, "custom guardrail script: {message}"),
+            _ => tracing::info!(row = %row_name, "custom guardrail script: {message}"),
+        }
+    })
     .map_err(|_| ScriptFailure::Engine)?;
     globals
         .set("__hostLog", host_log)
@@ -555,7 +565,11 @@ async fn host_fetch(
     let headers: BTreeMap<String, String> = response
         .headers()
         .iter()
-        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().to_owned(), v.to_owned())))
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|v| (k.as_str().to_owned(), v.to_owned()))
+        })
         .collect();
     let body = crate::read_body_capped(&mut response, body_cap).await;
 
@@ -672,5 +686,321 @@ impl ScriptFailure {
             Self::BadVerdict => "custom_bad_verdict",
             Self::Engine => "custom_engine_error",
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aisix_gateway::{ChatFormat, ChatMessage};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn config(script: &str) -> CustomConfig {
+        CustomConfig {
+            script: script.to_owned(),
+            secrets: BTreeMap::new(),
+            timeout_ms: 2_000,
+            max_memory_bytes: 16 * 1024 * 1024,
+            stream_processing_mode: "window".to_owned(),
+            window_size: 10_000,
+            window_overlap_size: 256,
+            max_buffer_bytes: 262_144,
+            on_buffer_exceeded: "fail_closed".to_owned(),
+            output_fail_open: false,
+        }
+    }
+
+    fn guardrail(cfg: &CustomConfig, fail_open: bool) -> CustomGuardrail {
+        CustomGuardrail::new("row", cfg, GuardrailHookPoint::Both, fail_open)
+            .expect("script compiles")
+    }
+
+    fn request(text: &str) -> ChatFormat {
+        ChatFormat::new("gpt-4o", vec![ChatMessage::user(text)])
+    }
+
+    #[test]
+    fn validate_rejects_a_syntax_error_with_the_engine_message() {
+        let err = validate("export async function checkInput(ctx) { return {").unwrap_err();
+        assert!(
+            matches!(err, CompileError::Syntax(ref m) if m.contains(MODULE_NAME)),
+            "syntax error should name the module: {err:?}",
+        );
+    }
+
+    #[test]
+    fn validate_accepts_a_well_formed_module_without_running_it() {
+        // The module body would throw if it were evaluated. Validation must
+        // parse only, so a row still builds and the throw surfaces per
+        // request under the fail-open policy rather than at config-apply.
+        validate("throw new Error('boom'); export function checkInput() {}")
+            .expect("parses without evaluating");
+    }
+
+    #[tokio::test]
+    async fn allow_verdict_passes() {
+        let cfg = config("export function checkInput() { return { action: 'none' }; }");
+        let verdict = guardrail(&cfg, false).check_input(&request("hello")).await;
+        assert!(matches!(verdict, GuardrailVerdict::Allow), "{verdict:?}");
+    }
+
+    #[tokio::test]
+    async fn block_verdict_composes_reason_without_leaking_scanned_text() {
+        let cfg = config(
+            "export function checkInput(ctx) {
+               return ctx.text.includes('bomb')
+                 ? { action: 'block', reason_code: 'weapons', reason: 'policy hit' }
+                 : { action: 'none' };
+             }",
+        );
+        let verdict = guardrail(&cfg, false).check_input(&request("a bomb")).await;
+        let GuardrailVerdict::Block {
+            reason,
+            unavailable,
+            ..
+        } = verdict
+        else {
+            panic!("expected Block, got {verdict:?}");
+        };
+        assert!(reason.contains("weapons"), "{reason}");
+        assert!(reason.contains("policy hit"), "{reason}");
+        assert!(reason.contains("row: row"), "{reason}");
+        assert!(
+            unavailable.is_none(),
+            "a content decision is not an availability failure",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hook_the_module_does_not_export_allows() {
+        let cfg = config("export function checkOutput() { return { action: 'block' }; }");
+        let verdict = guardrail(&cfg, false).check_input(&request("hello")).await;
+        assert!(matches!(verdict, GuardrailVerdict::Allow), "{verdict:?}");
+    }
+
+    #[tokio::test]
+    async fn a_throwing_script_blocks_when_fail_closed() {
+        let cfg = config("export function checkInput() { throw new Error('boom'); }");
+        let verdict = guardrail(&cfg, false).check_input(&request("hello")).await;
+        let GuardrailVerdict::Block { unavailable, .. } = verdict else {
+            panic!("expected Block, got {verdict:?}");
+        };
+        assert_eq!(unavailable.as_deref(), Some("custom_script_error"));
+    }
+
+    #[tokio::test]
+    async fn a_throwing_script_bypasses_when_fail_open() {
+        let cfg = config("export function checkInput() { throw new Error('boom'); }");
+        let verdict = guardrail(&cfg, true).check_input(&request("hello")).await;
+        let GuardrailVerdict::Bypass { reason } = verdict else {
+            panic!("expected Bypass, got {verdict:?}");
+        };
+        assert_eq!(reason, "custom_script_error");
+    }
+
+    #[tokio::test]
+    async fn a_verdict_that_is_not_a_verdict_is_a_failure_not_an_allow() {
+        // Returning nothing must not read as "allow" — that would let a
+        // buggy script silently disable the policy it implements.
+        let cfg = config("export function checkInput() { return 42; }");
+        let verdict = guardrail(&cfg, false).check_input(&request("hello")).await;
+        let GuardrailVerdict::Block { unavailable, .. } = verdict else {
+            panic!("expected Block, got {verdict:?}");
+        };
+        assert_eq!(unavailable.as_deref(), Some("custom_bad_verdict"));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_action_is_a_failure() {
+        let cfg = config("export function checkInput() { return { action: 'maybe' }; }");
+        let verdict = guardrail(&cfg, false).check_input(&request("hello")).await;
+        let GuardrailVerdict::Block { unavailable, .. } = verdict else {
+            panic!("expected Block, got {verdict:?}");
+        };
+        assert_eq!(unavailable.as_deref(), Some("custom_bad_verdict"));
+    }
+
+    #[tokio::test]
+    async fn a_runaway_loop_is_cut_by_the_interrupt_handler() {
+        // The outer wall-clock timeout cannot catch this: a tight loop
+        // never yields to the executor.
+        let mut cfg = config("export function checkInput() { for (;;) {} }");
+        cfg.timeout_ms = 200;
+        let started = Instant::now();
+        let verdict = guardrail(&cfg, false).check_input(&request("hello")).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "should not hang"
+        );
+        let GuardrailVerdict::Block { unavailable, .. } = verdict else {
+            panic!("expected Block, got {verdict:?}");
+        };
+        // Whichever budget wins the race, the row must fail closed.
+        assert!(
+            matches!(
+                unavailable.as_deref(),
+                Some("custom_timeout" | "custom_script_error")
+            ),
+            "{unavailable:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hung_call_is_cut_by_the_wall_clock_budget() {
+        // The mirror case: the script is parked on a pending response, so
+        // the interrupt handler never runs and only the outer timeout fires.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/scan"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+            .mount(&upstream)
+            .await;
+        let mut cfg = config(&format!(
+            "export async function checkInput(ctx) {{
+               await fetch('{}/scan', {{ method: 'POST', body: ctx.text }});
+               return {{ action: 'none' }};
+             }}",
+            upstream.uri(),
+        ));
+        cfg.timeout_ms = 300;
+        let started = Instant::now();
+        let verdict = guardrail(&cfg, false).check_input(&request("hello")).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "should not hang"
+        );
+        let GuardrailVerdict::Block { unavailable, .. } = verdict else {
+            panic!("expected Block, got {verdict:?}");
+        };
+        assert_eq!(unavailable.as_deref(), Some("custom_timeout"));
+    }
+
+    #[tokio::test]
+    async fn the_script_reaches_a_real_service_and_uses_its_answer() {
+        // The whole point of the kind: an adapter written inside the
+        // gateway, talking to a service with its own protocol.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/scan"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "outcome": { "deny": true, "rule": "R-17" }
+            })))
+            .mount(&upstream)
+            .await;
+        let cfg = config(&format!(
+            "export async function checkInput(ctx) {{
+               const resp = await fetch('{}/scan', {{
+                 method: 'POST',
+                 headers: {{ 'content-type': 'application/json', 'x-api-key': ctx.secrets.SCAN_KEY }},
+                 body: JSON.stringify({{ text: ctx.text }}),
+               }});
+               if (!resp.ok) {{ throw new Error('screening unavailable: ' + resp.status); }}
+               const body = await resp.json();
+               return body.outcome.deny
+                 ? {{ action: 'block', reason_code: body.outcome.rule }}
+                 : {{ action: 'none' }};
+             }}",
+            upstream.uri(),
+        ));
+        let verdict = guardrail(&cfg, false).check_input(&request("hello")).await;
+        let GuardrailVerdict::Block { reason, .. } = verdict else {
+            panic!("expected Block, got {verdict:?}");
+        };
+        assert!(reason.contains("R-17"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn secrets_reach_the_script_and_the_wire() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/whoami"))
+            .and(wiremock::matchers::header("x-api-key", "sk-live-42"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&upstream)
+            .await;
+        let mut cfg = config(&format!(
+            "export async function checkInput(ctx) {{
+               const resp = await fetch('{}/whoami', {{ headers: {{ 'x-api-key': ctx.secrets.SCAN_KEY }} }});
+               return resp.status === 204 ? {{ action: 'none' }} : {{ action: 'block' }};
+             }}",
+            upstream.uri(),
+        ));
+        cfg.secrets
+            .insert("SCAN_KEY".to_owned(), "sk-live-42".to_owned());
+        let verdict = guardrail(&cfg, false).check_input(&request("hello")).await;
+        assert!(
+            matches!(verdict, GuardrailVerdict::Allow),
+            "the mock only answers 204 when the secret arrived: {verdict:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_is_catchable_by_the_script() {
+        // fetch rejects rather than returning a sentinel, so an operator
+        // can decide their own policy for an unreachable service.
+        let cfg = config(
+            "export async function checkInput(ctx) {
+               try {
+                 await fetch('http://127.0.0.1:1/nope');
+                 return { action: 'none' };
+               } catch (e) {
+                 return { action: 'block', reason_code: 'screening_down' };
+               }
+             }",
+        );
+        let verdict = guardrail(&cfg, true).check_input(&request("hello")).await;
+        let GuardrailVerdict::Block { reason, .. } = verdict else {
+            panic!("expected Block, got {verdict:?}");
+        };
+        assert!(reason.contains("screening_down"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn no_state_survives_between_invocations() {
+        // A fresh sandbox per call is what makes one request unable to
+        // influence the next.
+        let cfg = config(
+            "globalThis.seen = (globalThis.seen || 0) + 1;
+             export function checkInput() {
+               return globalThis.seen === 1 ? { action: 'none' } : { action: 'block' };
+             }",
+        );
+        let g = guardrail(&cfg, false);
+        for _ in 0..3 {
+            let verdict = g.check_input(&request("hello")).await;
+            assert!(matches!(verdict, GuardrailVerdict::Allow), "{verdict:?}");
+        }
+    }
+
+    #[test]
+    fn streaming_defaults_to_the_sliding_window() {
+        // Detection-only, so a streamed response does not need holding
+        // whole; buffering it would stall an SSE client for no gain.
+        let cfg = config("export function checkOutput() { return { action: 'none' }; }");
+        assert!(matches!(
+            guardrail(&cfg, false).stream_output_policy(),
+            StreamOutputPolicy::Window {
+                size_chars: 10_000,
+                overlap_chars: 256
+            },
+        ));
+    }
+
+    #[test]
+    fn streaming_honors_an_explicit_buffer_full_choice() {
+        let mut cfg = config("export function checkOutput() { return { action: 'none' }; }");
+        cfg.stream_processing_mode = "buffer_full".to_owned();
+        assert!(matches!(
+            guardrail(&cfg, false).stream_output_policy(),
+            StreamOutputPolicy::BufferFull {
+                on_exceeded_fail_open: false,
+                ..
+            },
+        ));
     }
 }

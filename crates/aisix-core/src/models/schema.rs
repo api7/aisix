@@ -4641,6 +4641,7 @@ mod tests {
             "azure_content_safety",
             "azure_content_safety_text_moderation",
             "bedrock",
+            "custom",
             "keyword",
             "lakera",
             "openai_moderation",
