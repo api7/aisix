@@ -121,9 +121,9 @@ describe("livez e2e: public liveness route is /livez and /health is gone", () =>
     // Gate on readiness having withdrawn rather than on a sleep: it
     // proves the drain has actually begun AND that the process is still
     // serving, which is the window the liveness assertion below is
-    // about. The default `shutdown.min_drain_secs` is 30, so the window
-    // is wide.
-    const deadline = Date.now() + 5000;
+    // about. `beforeAll` gives that window 5 seconds, and the poll below
+    // gives up before it closes.
+    const deadline = Date.now() + 3000;
     let draining = false;
     while (Date.now() < deadline) {
       const res = await harnessRequest(`${app.proxyUrl}/readyz`, { method: "GET" });
