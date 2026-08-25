@@ -67,22 +67,12 @@ const OPENAPI_JSON_BASE: &str = r##"{
                 }
               }
             }
-          },
-          "503": {
-            "description": "Process is shutting down (graceful drain)",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
           }
         },
         "tags": [
           "Health"
         ],
-        "description": "Process liveness: 200 while the process is alive, 503 once graceful shutdown has begun (an expected drain, not a crash). Use /readyz for traffic eligibility (readiness)."
+        "description": "Process liveness: should this instance be restarted? Answers 200 whenever it answers at all, including throughout a graceful drain \u2014 draining is deliberate work, and restarting an instance that is finishing the requests it accepted would kill exactly those. Use /readyz for traffic eligibility (readiness), which is what reports the drain."
       }
     },
     "/readyz": {
@@ -3472,8 +3462,12 @@ mod tests {
             "verbose"
         );
         // Graceful shutdown is documented as 503 (drain), not 500 (#591).
-        assert!(parsed["paths"]["/livez"]["get"]["responses"]["503"].is_object());
+        // Liveness has no failure response to document: a draining
+        // instance answers 200 like any other, and an instance that
+        // cannot answer does not reply at all.
+        assert!(parsed["paths"]["/livez"]["get"]["responses"]["503"].is_null());
         assert!(parsed["paths"]["/livez"]["get"]["responses"]["500"].is_null());
+        assert!(parsed["paths"]["/readyz"]["get"]["responses"]["503"].is_object());
         // /readyz is documented with 200 + 503 (readiness).
         assert!(parsed["paths"]["/readyz"]["get"]["responses"]["200"].is_object());
         assert!(parsed["paths"]["/readyz"]["get"]["responses"]["503"].is_object());
