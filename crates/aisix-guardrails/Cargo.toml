@@ -38,15 +38,23 @@ reqwest.workspace = true
 # something an operator can be asked to rebuild the gateway for.
 rquickjs.workspace = true
 
+# The crypto surface kind=custom exposes to scripts. Unconditional for the
+# same reason: signing is what a screening service's own protocol most
+# often needs (the built-in Aliyun kind signs with HMAC-SHA1, AWS SigV4
+# chains HMAC-SHA256), and a script that cannot sign cannot reach those
+# services at all.
+sha2.workspace = true
+hex.workspace = true
+
 # kind=aliyun_text_moderation guardrail (#603). The Aliyun green-cip
 # TextModerationPlus call is signed (RPC signature v1, HMAC-SHA1) and POSTed
 # over the shared reqwest client. There is no official Aliyun Rust SDK, so the
 # RPC signature is hand-rolled with these primitives (all workspace deps).
-hmac = { workspace = true, optional = true }
-sha1 = { workspace = true, optional = true }
-base64 = { workspace = true, optional = true }
+hmac.workspace = true
+sha1.workspace = true
+base64.workspace = true
 chrono = { workspace = true, optional = true }
-uuid = { workspace = true, optional = true }
+uuid.workspace = true
 
 [features]
 default = [
@@ -68,13 +76,7 @@ bedrock = [
     "aisix-gateway/aws",
 ]
 azure-content-safety = []
-aliyun-text-moderation = [
-    "dep:hmac",
-    "dep:sha1",
-    "dep:base64",
-    "dep:chrono",
-    "dep:uuid",
-]
+aliyun-text-moderation = ["dep:chrono"]
 # kind=lakera / kind=openai_moderation / kind=presidio guardrails (#52).
 # Plain HTTP dispatchers over the shared reqwest client.
 lakera = []

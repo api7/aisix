@@ -1518,7 +1518,7 @@
     },
     {
       "additionalProperties": false,
-      "description": "Screening by an operator-supplied script the gateway runs in a sandboxed engine, for a screening service that speaks its own protocol. Detection-only — never rewrites content. Applies on input, output, or both, including streaming output.",
+      "description": "Screening by an operator-supplied script the gateway runs in a sandboxed engine, for a screening service that speaks its own protocol. The script can allow, block, or rewrite content. Applies on input, output, or both, including streaming output.",
       "properties": {
         "created_at": {
           "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",

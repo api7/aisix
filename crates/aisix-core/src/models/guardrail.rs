@@ -852,10 +852,13 @@ fn default_semantic_text_source() -> String {
 /// }
 /// ```
 ///
-/// This guardrail is detection-only and never rewrites content: rewriting is
-/// a synchronous path, and a script whose purpose is to call an external
-/// service cannot participate in it. Applies on input, output, or both,
-/// including streamed output.
+/// A script can allow, block, or rewrite content. Rewriting returns a
+/// replacement for each slot in `ctx.segments`; where the call site cannot
+/// substitute text back, a rewrite request blocks instead of releasing the
+/// original. Scripts also get signing primitives (`crypto`) and access to
+/// the environment's embedding model (`aisix.embed`), so a script can
+/// express what the built-in kinds express. Applies on input, output, or
+/// both, including streamed output.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct CustomConfig {
     /// The script source, as an ES module exporting `checkInput` and/or
@@ -984,8 +987,8 @@ pub enum GuardrailKind {
     Semantic(SemanticConfig),
     /// Screening by an operator-supplied script the gateway runs in a
     /// sandboxed engine, for a screening service that speaks its own
-    /// protocol. Detection-only — never rewrites content. Applies on input,
-    /// output, or both, including streaming output.
+    /// protocol. The script can allow, block, or rewrite content. Applies
+    /// on input, output, or both, including streaming output.
     Custom(CustomConfig),
 }
 

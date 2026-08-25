@@ -12,14 +12,28 @@
 //! export async function checkOutput(ctx) { /* -> verdict */ }
 //! ```
 //!
-//! `ctx` carries `{ hook, text, messages, model, request_id, secrets }`. A
-//! verdict is `{ action: "none" }` or
-//! `{ action: "block", reason, reason_code }`. A hook whose function the
-//! module does not export is an Allow, so one script may cover one direction.
+//! `ctx` carries `{ hook, text, segments, messages, model, secrets }`. A
+//! verdict is `{ action: "none" }`, `{ action: "block", reason,
+//! reason_code }`, or `{ action: "mask", segments, counts }` where
+//! `segments` is positionally aligned with `ctx.segments`. A hook whose
+//! function the module does not export is an Allow, so one script may
+//! cover one direction.
 //!
-//! Detection-only: it blocks, never rewrites. Rewriting is a synchronous
-//! path ([`Guardrail::redact_input_text`]) and a script whose purpose is to
-//! await an external call cannot participate in it.
+//! A script can allow, block, OR rewrite. Rewriting rides the same async
+//! segment pass the built-in remote redacting kinds use
+//! ([`Guardrail::moderate_input_segments`]): the script receives the text
+//! slots as `ctx.segments` and returns a replacement per slot. On a call
+//! site that cannot substitute text back, a `mask` decision becomes a
+//! Block rather than an Allow — releasing the original would honor half
+//! the policy, which is the bug class #963 names. Same posture as
+//! kind=presidio.
+//!
+//! Scripts also get the primitives the built-in kinds need in order to
+//! reach their own providers, so the kind can express what they express:
+//! `crypto` (HMAC-SHA1/SHA256 with chainable key encodings, SHA-1/SHA-256,
+//! base64, UUID) for signed provider protocols, and `aisix.embed` for
+//! semantic screening against the environment's own embedding model
+//! through the gateway's provider bridge.
 //!
 //! **Two independent budgets, because neither covers the other.** The
 //! engine's interrupt handler is called while bytecode executes, so it stops
@@ -48,6 +62,9 @@
 //! | returns `{action:"none"}`              | n/a         | Allow                              |
 //! | hook function not exported             | n/a         | Allow                              |
 //! | returns `{action:"block"}`             | n/a         | Block { reason }                   |
+//! | returns `{action:"mask"}`              | n/a         | Allow with rewritten segments      |
+//! | `mask` where write-back is impossible  | n/a         | Block (never a silent Allow)       |
+//! | `mask` with a mismatched slot count    | true        | Bypass { "custom_bad_verdict" }    |
 //! | wall-clock budget elapsed              | true        | Bypass { "custom_timeout" }        |
 //! | script threw                           | true        | Bypass { "custom_script_error" }   |
 //! | returned a shape that is not a verdict | true        | Bypass { "custom_bad_verdict" }    |
@@ -63,7 +80,7 @@ use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 use rquickjs::{CatchResultExt, Module};
 
-use crate::{Guardrail, GuardrailVerdict, StreamOutputPolicy};
+use crate::{Guardrail, GuardrailVerdict, SegmentsOutcome, StreamOutputPolicy};
 
 /// Module name the script is compiled under. Shows up in the JS stack trace
 /// a thrown error carries, so keep it recognisable to the operator.
@@ -109,6 +126,31 @@ globalThis.console = {
   error: function () { __hostLog("error", __fmt(arguments)); },
   debug: function () { __hostLog("debug", __fmt(arguments)); },
 };
+globalThis.crypto = {
+  // key/out encodings are what make a signing CHAIN expressible: AWS SigV4
+  // feeds each HMAC's raw output in as the next one's key, so the key has
+  // to be acceptable as hex, not only as text.
+  hmac: function (alg, key, data, outEncoding, keyEncoding) {
+    return __hostHmac(alg, String(key), keyEncoding || "utf8", String(data), outEncoding || "hex");
+  },
+  hash: function (alg, data, outEncoding) {
+    return __hostHash(alg, String(data), outEncoding || "hex");
+  },
+  base64Encode: function (data) { return __hostBase64("encode", String(data)); },
+  base64Decode: function (data) { return __hostBase64("decode", String(data)); },
+  randomUUID: function () { return __hostUuid(); },
+};
+globalThis.aisix = {
+  // Screening against the environment's own embedding model, through the
+  // same provider bridge the built-in semantic kind uses — a script cannot
+  // reach it any other way without being handed separate credentials.
+  embed: async function (model, texts) {
+    const raw = await __hostEmbed(String(model), JSON.stringify(texts));
+    const r = JSON.parse(raw);
+    if (r.error) { throw new Error(r.error); }
+    return r.vectors;
+  },
+};
 "#;
 
 /// One `kind: custom` row, materialised into a request-time runner.
@@ -135,6 +177,11 @@ pub struct CustomGuardrail {
     max_buffer_bytes: usize,
     on_buffer_exceeded_fail_open: bool,
     http: Arc<reqwest::Client>,
+    /// The gateway's own embedding dispatcher, so a script can screen
+    /// semantically against the environment's configured embedding model.
+    /// Empty when the chain was built without one — `aisix.embed` then
+    /// throws, which the script can catch.
+    embedder: crate::GuardrailEmbedderSlot,
 }
 
 impl CustomGuardrail {
@@ -147,6 +194,7 @@ impl CustomGuardrail {
         cfg: &CustomConfig,
         hook_point: GuardrailHookPoint,
         fail_open: bool,
+        embedder: crate::GuardrailEmbedderSlot,
     ) -> Result<Self, CompileError> {
         validate(&cfg.script)?;
         // Same connection-layer settings as every provider call: a bound
@@ -170,6 +218,7 @@ impl CustomGuardrail {
             max_buffer_bytes: usize::try_from(cfg.max_buffer_bytes).unwrap_or(usize::MAX),
             on_buffer_exceeded_fail_open: cfg.on_buffer_exceeded == "fail_open",
             http: Arc::new(http),
+            embedder,
         })
     }
 
@@ -178,26 +227,102 @@ impl CustomGuardrail {
     }
 
     /// Run one exported hook function against `ctx_json`.
-    async fn run_hook(&self, func: &str, ctx_json: String, fail_open: bool) -> GuardrailVerdict {
-        let outcome = tokio::time::timeout(self.budget, self.invoke(func, ctx_json)).await;
-
-        match outcome {
+    async fn run_hook(&self, func: &str, ctx_json: String) -> Result<ScriptOutcome, ScriptFailure> {
+        match tokio::time::timeout(self.budget, self.invoke(func, ctx_json)).await {
             // The wall-clock budget covers a script parked on a pending
             // call, which the interrupt handler never sees.
-            Err(_elapsed) => self.handle_failure(ScriptFailure::Timeout, fail_open),
-            Ok(Err(failure)) => self.handle_failure(failure, fail_open),
-            Ok(Ok(None)) => GuardrailVerdict::Allow,
-            Ok(Ok(Some(verdict))) => verdict,
+            Err(_elapsed) => Err(ScriptFailure::Timeout),
+            Ok(other) => other,
+        }
+    }
+
+    /// Run a hook at a call site that CANNOT write rewritten text back.
+    ///
+    /// A `mask` decision becomes a Block here rather than an Allow: the
+    /// script asked for content to be rewritten and this site cannot do it,
+    /// so releasing the original would honor half the policy — the #963
+    /// class. Mirrors what kind=presidio does on the same path.
+    async fn run_blocking_hook(
+        &self,
+        func: &str,
+        ctx_json: String,
+        fail_open: bool,
+    ) -> GuardrailVerdict {
+        match self.run_hook(func, ctx_json).await {
+            Err(failure) => self.handle_failure(failure, fail_open),
+            Ok(ScriptOutcome::NotExported | ScriptOutcome::Allow) => GuardrailVerdict::Allow,
+            Ok(ScriptOutcome::Block(verdict)) => verdict,
+            Ok(ScriptOutcome::Mask { .. }) => GuardrailVerdict::block(format!(
+                "custom script asked to rewrite content on a call site that cannot \
+                 apply it (row: {})",
+                self.row_name
+            )),
+        }
+    }
+
+    /// Run a hook at a call site that CAN write rewritten text back.
+    async fn run_segment_hook(
+        &self,
+        func: &str,
+        texts: &[String],
+        hook: &'static str,
+        model: Option<&str>,
+        fail_open: bool,
+    ) -> SegmentsOutcome {
+        let messages: Vec<ScriptMessage> = texts
+            .iter()
+            .map(|t| ScriptMessage {
+                role: aisix_gateway::Role::User,
+                text: t.clone(),
+            })
+            .collect();
+        let joined = texts.join("\n");
+        let ctx = ScriptContext {
+            hook,
+            text: &joined,
+            segments: texts,
+            messages: &messages,
+            model,
+            secrets: &self.secrets,
+        };
+        let Ok(json) = serde_json::to_string(&ctx) else {
+            return SegmentsOutcome::from_verdict(
+                self.handle_failure(ScriptFailure::Engine, fail_open),
+            );
+        };
+
+        match self.run_hook(func, json).await {
+            Err(failure) => SegmentsOutcome::from_verdict(self.handle_failure(failure, fail_open)),
+            Ok(ScriptOutcome::NotExported | ScriptOutcome::Allow) => SegmentsOutcome::allow(),
+            Ok(ScriptOutcome::Block(verdict)) => SegmentsOutcome::from_verdict(verdict),
+            Ok(ScriptOutcome::Mask { segments, counts }) => {
+                // Positional substitution is the whole contract; a script
+                // that returns a different number of slots would silently
+                // shift content from one message onto another.
+                if segments.len() != texts.len() {
+                    tracing::warn!(
+                        row = %self.row_name,
+                        returned = segments.len(),
+                        expected = texts.len(),
+                        "custom guardrail returned a mismatched number of masked segments",
+                    );
+                    return SegmentsOutcome::from_verdict(
+                        self.handle_failure(ScriptFailure::BadVerdict, fail_open),
+                    );
+                }
+                SegmentsOutcome {
+                    verdict: GuardrailVerdict::Allow,
+                    masked: Some(segments),
+                    counts,
+                    monitor_hits: Vec::new(),
+                }
+            }
         }
     }
 
     /// One invocation in a brand-new sandbox. `Ok(None)` means the module
     /// does not export `func`, which is an Allow rather than an error.
-    async fn invoke(
-        &self,
-        func: &str,
-        ctx_json: String,
-    ) -> Result<Option<GuardrailVerdict>, ScriptFailure> {
+    async fn invoke(&self, func: &str, ctx_json: String) -> Result<ScriptOutcome, ScriptFailure> {
         let runtime = rquickjs::AsyncRuntime::new().map_err(|e| {
             tracing::error!(row = %self.row_name, error = %e, "custom guardrail engine start failed");
             ScriptFailure::Engine
@@ -222,10 +347,19 @@ impl CustomGuardrail {
         let row_name = self.row_name.clone();
         let func = func.to_owned();
         let body_cap = self.max_memory_bytes;
+        let embedder = self.embedder.clone();
+        let embed_budget = self.budget;
 
         let raw: Result<Option<String>, ScriptFailure> = context
             .async_with(async |ctx| {
-                install_host(&ctx, http, row_name.clone(), body_cap)?;
+                install_host(
+                    &ctx,
+                    http,
+                    row_name.clone(),
+                    body_cap,
+                    embedder,
+                    embed_budget,
+                )?;
 
                 let module = Module::declare(ctx.clone(), MODULE_NAME, script.as_str())
                     .catch(&ctx)
@@ -290,13 +424,13 @@ impl CustomGuardrail {
             .await;
 
         match raw? {
-            None => Ok(None),
-            Some(json) => self.parse_verdict(&json).map(Some),
+            None => Ok(ScriptOutcome::NotExported),
+            Some(json) => self.parse_verdict(&json),
         }
     }
 
-    /// Translate the script's return value into a verdict.
-    fn parse_verdict(&self, json: &str) -> Result<GuardrailVerdict, ScriptFailure> {
+    /// Translate the script's return value into an outcome.
+    fn parse_verdict(&self, json: &str) -> Result<ScriptOutcome, ScriptFailure> {
         let parsed: ScriptVerdict = serde_json::from_str(json).map_err(|e| {
             tracing::warn!(
                 row = %self.row_name,
@@ -306,7 +440,7 @@ impl CustomGuardrail {
             ScriptFailure::BadVerdict
         })?;
         match parsed.action.as_str() {
-            "none" => Ok(GuardrailVerdict::Allow),
+            "none" => Ok(ScriptOutcome::Allow),
             "block" => {
                 // Both fields are operator-authored and land in ops logs
                 // only — `Block.reason` never reaches the wire envelope
@@ -317,10 +451,23 @@ impl CustomGuardrail {
                     (None, Some(reason)) => reason.to_owned(),
                     (None, None) => "no reason given".to_owned(),
                 };
-                Ok(GuardrailVerdict::block(format!(
+                Ok(ScriptOutcome::Block(GuardrailVerdict::block(format!(
                     "custom script blocked ({detail}) (row: {})",
                     self.row_name
-                )))
+                ))))
+            }
+            "mask" => {
+                let Some(segments) = parsed.segments else {
+                    tracing::warn!(
+                        row = %self.row_name,
+                        "custom guardrail asked to mask without returning segments",
+                    );
+                    return Err(ScriptFailure::BadVerdict);
+                };
+                Ok(ScriptOutcome::Mask {
+                    segments,
+                    counts: parsed.counts.unwrap_or_default(),
+                })
             }
             other => {
                 tracing::warn!(
@@ -392,14 +539,12 @@ impl Guardrail for CustomGuardrail {
         if messages.is_empty() {
             return GuardrailVerdict::Allow;
         }
-        let text = messages
-            .iter()
-            .map(|m| m.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let segments: Vec<String> = messages.iter().map(|m| m.text.clone()).collect();
+        let text = segments.join("\n");
         let ctx = ScriptContext {
             hook: "input",
             text: &text,
+            segments: &segments,
             messages: &messages,
             model: Some(req.model.as_str()),
             secrets: &self.secrets,
@@ -407,7 +552,8 @@ impl Guardrail for CustomGuardrail {
         let Ok(json) = serde_json::to_string(&ctx) else {
             return self.handle_failure(ScriptFailure::Engine, self.fail_open);
         };
-        self.run_hook("checkInput", json, self.fail_open).await
+        self.run_blocking_hook("checkInput", json, self.fail_open)
+            .await
     }
 
     async fn check_output(&self, resp: &ChatResponse) -> GuardrailVerdict {
@@ -422,9 +568,11 @@ impl Guardrail for CustomGuardrail {
             role: aisix_gateway::Role::Assistant,
             text: text.clone(),
         }];
+        let segments = [text.clone()];
         let ctx = ScriptContext {
             hook: "output",
             text: &text,
+            segments: &segments,
             messages: &messages,
             model: None,
             secrets: &self.secrets,
@@ -432,7 +580,30 @@ impl Guardrail for CustomGuardrail {
         let Ok(json) = serde_json::to_string(&ctx) else {
             return self.handle_failure(ScriptFailure::Engine, self.output_fail_open);
         };
-        self.run_hook("checkOutput", json, self.output_fail_open)
+        self.run_blocking_hook("checkOutput", json, self.output_fail_open)
+            .await
+    }
+
+    /// kind=custom moderates via the segment pass wherever the call site
+    /// supports mask write-back, so a script can rewrite content the way
+    /// the built-in redacting kinds do.
+    fn moderates_segments(&self) -> bool {
+        true
+    }
+
+    async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
+        if !self.hook_enabled(GuardrailHookPoint::Input) {
+            return SegmentsOutcome::allow();
+        }
+        self.run_segment_hook("checkInput", texts, "input", None, self.fail_open)
+            .await
+    }
+
+    async fn moderate_output_segments(&self, texts: &[String]) -> SegmentsOutcome {
+        if !self.hook_enabled(GuardrailHookPoint::Output) {
+            return SegmentsOutcome::allow();
+        }
+        self.run_segment_hook("checkOutput", texts, "output", None, self.output_fail_open)
             .await
     }
 }
@@ -474,11 +645,14 @@ pub enum CompileError {
 // Host surface
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn install_host(
     ctx: &rquickjs::Ctx<'_>,
     http: Arc<reqwest::Client>,
     row_name: String,
     body_cap: usize,
+    embedder: crate::GuardrailEmbedderSlot,
+    embed_budget: Duration,
 ) -> Result<(), ScriptFailure> {
     let globals = ctx.globals();
 
@@ -496,15 +670,16 @@ fn install_host(
         .set("__hostFetch", host_fetch)
         .map_err(|_| ScriptFailure::Engine)?;
 
+    let log_row = row_name.clone();
     let host_log = rquickjs::Function::new(ctx.clone(), move |level: String, message: String| {
         // Operator-authored text at operator-chosen levels. Bounded so a
         // script cannot write an unbounded line into the gateway's log.
         let message: String = message.chars().take(2048).collect();
         match level.as_str() {
-            "error" => tracing::error!(row = %row_name, "custom guardrail script: {message}"),
-            "warn" => tracing::warn!(row = %row_name, "custom guardrail script: {message}"),
-            "debug" => tracing::debug!(row = %row_name, "custom guardrail script: {message}"),
-            _ => tracing::info!(row = %row_name, "custom guardrail script: {message}"),
+            "error" => tracing::error!(row = %log_row, "custom guardrail script: {message}"),
+            "warn" => tracing::warn!(row = %log_row, "custom guardrail script: {message}"),
+            "debug" => tracing::debug!(row = %log_row, "custom guardrail script: {message}"),
+            _ => tracing::info!(row = %log_row, "custom guardrail script: {message}"),
         }
     })
     .map_err(|_| ScriptFailure::Engine)?;
@@ -512,10 +687,166 @@ fn install_host(
         .set("__hostLog", host_log)
         .map_err(|_| ScriptFailure::Engine)?;
 
+    let host_hmac = rquickjs::Function::new(
+        ctx.clone(),
+        |alg: String, key: String, key_encoding: String, data: String, out: String| {
+            hmac_hex(&alg, &key, &key_encoding, &data, &out).unwrap_or_default()
+        },
+    )
+    .map_err(|_| ScriptFailure::Engine)?;
+    globals
+        .set("__hostHmac", host_hmac)
+        .map_err(|_| ScriptFailure::Engine)?;
+
+    let host_hash =
+        rquickjs::Function::new(ctx.clone(), |alg: String, data: String, out: String| {
+            hash_hex(&alg, data.as_bytes(), &out).unwrap_or_default()
+        })
+        .map_err(|_| ScriptFailure::Engine)?;
+    globals
+        .set("__hostHash", host_hash)
+        .map_err(|_| ScriptFailure::Engine)?;
+
+    let host_base64 = rquickjs::Function::new(ctx.clone(), |mode: String, data: String| {
+        use base64::Engine as _;
+        match mode.as_str() {
+            "decode" => base64::engine::general_purpose::STANDARD
+                .decode(data.as_bytes())
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .unwrap_or_default(),
+            _ => base64::engine::general_purpose::STANDARD.encode(data.as_bytes()),
+        }
+    })
+    .map_err(|_| ScriptFailure::Engine)?;
+    globals
+        .set("__hostBase64", host_base64)
+        .map_err(|_| ScriptFailure::Engine)?;
+
+    let host_uuid = rquickjs::Function::new(ctx.clone(), || uuid::Uuid::new_v4().to_string())
+        .map_err(|_| ScriptFailure::Engine)?;
+    globals
+        .set("__hostUuid", host_uuid)
+        .map_err(|_| ScriptFailure::Engine)?;
+
+    let embed_row = row_name.clone();
+    let host_embed = rquickjs::Function::new(
+        ctx.clone(),
+        rquickjs::function::Async(move |model: String, texts_json: String| {
+            let embedder = embedder.clone();
+            let row = embed_row.clone();
+            let budget = embed_budget;
+            async move {
+                Ok::<_, rquickjs::Error>(host_embed(embedder, row, model, texts_json, budget).await)
+            }
+        }),
+    )
+    .map_err(|_| ScriptFailure::Engine)?;
+    globals
+        .set("__hostEmbed", host_embed)
+        .map_err(|_| ScriptFailure::Engine)?;
+
     ctx.eval::<(), _>(PRELUDE)
         .catch(ctx)
         .map_err(|_| ScriptFailure::Engine)?;
     Ok(())
+}
+
+/// HMAC over `data`, keyed by `key` read as `key_encoding`, rendered as
+/// `out`. The key encoding matters: a signing chain (AWS SigV4) uses one
+/// HMAC's raw output as the next one's key.
+fn hmac_hex(alg: &str, key: &str, key_encoding: &str, data: &str, out: &str) -> Option<String> {
+    use hmac::Mac;
+    let key_bytes: Vec<u8> = match key_encoding {
+        "hex" => hex::decode(key).ok()?,
+        "base64" => {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.decode(key).ok()?
+        }
+        _ => key.as_bytes().to_vec(),
+    };
+    let digest: Vec<u8> = match alg {
+        "sha1" => {
+            let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(&key_bytes).ok()?;
+            mac.update(data.as_bytes());
+            mac.finalize().into_bytes().to_vec()
+        }
+        "sha256" => {
+            let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&key_bytes).ok()?;
+            mac.update(data.as_bytes());
+            mac.finalize().into_bytes().to_vec()
+        }
+        _ => return None,
+    };
+    Some(encode_digest(&digest, out))
+}
+
+fn hash_hex(alg: &str, data: &[u8], out: &str) -> Option<String> {
+    use sha2::Digest as _;
+    let digest: Vec<u8> = match alg {
+        "sha1" => {
+            use sha1::Digest as _;
+            sha1::Sha1::digest(data).to_vec()
+        }
+        "sha256" => sha2::Sha256::digest(data).to_vec(),
+        _ => return None,
+    };
+    Some(encode_digest(&digest, out))
+}
+
+fn encode_digest(digest: &[u8], out: &str) -> String {
+    match out {
+        "base64" => {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(digest)
+        }
+        _ => hex::encode(digest),
+    }
+}
+
+/// Embed on the script's behalf through the gateway's own dispatcher, so a
+/// semantic screen can use the environment's configured embedding model
+/// rather than a second set of credentials the operator has to manage.
+async fn host_embed(
+    embedder: crate::GuardrailEmbedderSlot,
+    row_name: String,
+    model: String,
+    texts_json: String,
+    budget: Duration,
+) -> String {
+    let Some(embedder) = embedder.get().cloned() else {
+        return embed_error("no embedding dispatcher available in this build".to_owned());
+    };
+    let texts: Vec<String> = match serde_json::from_str(&texts_json) {
+        Ok(t) => t,
+        Err(e) => return embed_error(format!("invalid texts argument: {e}")),
+    };
+    match embedder.embed(&model, &texts, false, budget).await {
+        Ok(vectors) => serde_json::to_string(&EmbedResult {
+            error: None,
+            vectors,
+        })
+        .unwrap_or_else(|e| embed_error(e.to_string())),
+        Err(failure) => {
+            tracing::warn!(row = %row_name, model = %model, failure = ?failure, "custom guardrail embed failed");
+            embed_error(format!("{failure:?}"))
+        }
+    }
+}
+
+fn embed_error(message: String) -> String {
+    serde_json::to_string(&EmbedResult {
+        error: Some(message),
+        vectors: Vec::new(),
+    })
+    .unwrap_or_else(|_| r#"{"error":"embed failed"}"#.to_owned())
+}
+
+#[derive(serde::Serialize)]
+struct EmbedResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    vectors: Vec<Vec<f32>>,
 }
 
 /// Perform one outbound request on the script's behalf and encode the result
@@ -607,6 +938,10 @@ fn threw(row_name: &str, stage: &str, err: rquickjs::CaughtError<'_>) -> ScriptF
 struct ScriptContext<'a> {
     hook: &'static str,
     text: &'a str,
+    /// The text slots this hook is scanning, in the order the caller will
+    /// substitute them back. A masking script returns a replacement per
+    /// slot; a detection-only one can ignore them and read `text`.
+    segments: &'a [String],
     messages: &'a [ScriptMessage],
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<&'a str>,
@@ -627,6 +962,15 @@ struct ScriptVerdict {
     reason: Option<String>,
     #[serde(default)]
     reason_code: Option<String>,
+    /// `action: "mask"` only: the rewritten segments, positionally aligned
+    /// with `ctx.segments`. The whole point of aligning them is that the
+    /// caller can substitute slot for slot.
+    #[serde(default)]
+    segments: Option<Vec<String>>,
+    /// What the script detected, by name, for the usage event. Names only —
+    /// never matched content (#153).
+    #[serde(default)]
+    counts: Option<BTreeMap<String, u32>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -661,6 +1005,22 @@ struct FetchResult {
     ok: bool,
     headers: BTreeMap<String, String>,
     body: String,
+}
+
+/// What one hook invocation decided, before it is mapped onto the verdict
+/// the call site can actually express.
+enum ScriptOutcome {
+    /// The module exports no such hook — one script may cover a single
+    /// direction, so this is an Allow rather than a misconfiguration.
+    NotExported,
+    Allow,
+    Block(GuardrailVerdict),
+    /// Rewrite the scanned slots. Only a call site that substitutes text
+    /// back can honor this; the others turn it into a Block.
+    Mask {
+        segments: Vec<String>,
+        counts: BTreeMap<String, u32>,
+    },
 }
 
 /// Failure cause buckets. `bypass_tag()` maps to the strings stored in
@@ -716,8 +1076,14 @@ mod tests {
     }
 
     fn guardrail(cfg: &CustomConfig, fail_open: bool) -> CustomGuardrail {
-        CustomGuardrail::new("row", cfg, GuardrailHookPoint::Both, fail_open)
-            .expect("script compiles")
+        CustomGuardrail::new(
+            "row",
+            cfg,
+            GuardrailHookPoint::Both,
+            fail_open,
+            crate::GuardrailEmbedderSlot::none(),
+        )
+        .expect("script compiles")
     }
 
     fn request(text: &str) -> ChatFormat {
@@ -975,6 +1341,175 @@ mod tests {
             let verdict = g.check_input(&request("hello")).await;
             assert!(matches!(verdict, GuardrailVerdict::Allow), "{verdict:?}");
         }
+    }
+
+    // --- parity with the built-in kinds -----------------------------------
+    //
+    // Each of these re-implements, in a script, something a built-in kind
+    // does natively. They are the standing check that the kind stays a
+    // superset rather than drifting into a half-feature.
+
+    #[tokio::test]
+    async fn a_script_can_rewrite_content_the_way_the_redacting_kinds_do() {
+        // kind=pii / presidio / lakera parity: mask spans in place.
+        let cfg = config(
+            "export function checkInput(ctx) {
+               const out = ctx.segments.map(s => s.replace(/\\d{3}-\\d{2}-\\d{4}/g, '<SSN>'));
+               const hits = ctx.segments.length - out.filter((s, i) => s === ctx.segments[i]).length;
+               if (hits === 0) return { action: 'none' };
+               return { action: 'mask', segments: out, counts: { US_SSN: hits } };
+             }",
+        );
+        let outcome = guardrail(&cfg, false)
+            .moderate_input_segments(&["my ssn is 123-45-6789".to_owned(), "hello".to_owned()])
+            .await;
+        assert!(matches!(outcome.verdict, GuardrailVerdict::Allow));
+        assert_eq!(
+            outcome.masked.as_deref(),
+            Some(["my ssn is <SSN>".to_owned(), "hello".to_owned()].as_slice()),
+        );
+        assert_eq!(outcome.counts.get("US_SSN"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn a_rewrite_blocks_where_it_cannot_be_written_back() {
+        // Never half-honor a knob (#963): a call site with no write-back
+        // must not release the text the script asked to rewrite.
+        let cfg = config(
+            "export function checkInput(ctx) {
+               return { action: 'mask', segments: ctx.segments.map(() => '<redacted>') };
+             }",
+        );
+        let verdict = guardrail(&cfg, false).check_input(&request("secret")).await;
+        let GuardrailVerdict::Block { reason, .. } = verdict else {
+            panic!("expected Block, got {verdict:?}");
+        };
+        assert!(reason.contains("cannot"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_slot_count_is_a_failure_not_a_silent_shift() {
+        let cfg = config(
+            "export function checkInput() { return { action: 'mask', segments: ['only one'] }; }",
+        );
+        let outcome = guardrail(&cfg, false)
+            .moderate_input_segments(&["a".to_owned(), "b".to_owned()])
+            .await;
+        let GuardrailVerdict::Block { unavailable, .. } = outcome.verdict else {
+            panic!("expected Block, got {:?}", outcome.verdict);
+        };
+        assert_eq!(unavailable.as_deref(), Some("custom_bad_verdict"));
+        assert!(outcome.masked.is_none(), "nothing may be substituted");
+    }
+
+    #[tokio::test]
+    async fn a_script_can_sign_a_request_the_way_the_aliyun_kind_does() {
+        // kind=aliyun_text_moderation parity: its RPC signature is
+        // HMAC-SHA1 over a canonical string, base64-encoded.
+        let cfg = config(
+            "export function checkInput() {
+               const sig = crypto.hmac('sha1', 'key&', 'GET&%2F&foo', 'base64');
+               return sig === '' ? { action: 'block' } : { action: 'block', reason_code: sig };
+             }",
+        );
+        let verdict = guardrail(&cfg, false).check_input(&request("x")).await;
+        let GuardrailVerdict::Block { reason, .. } = verdict else {
+            panic!("expected Block, got {verdict:?}");
+        };
+        // Cross-checked against the same primitive the built-in kind uses.
+        let expect = hmac_hex("sha1", "key&", "utf8", "GET&%2F&foo", "base64").unwrap();
+        assert!(reason.contains(&expect), "{reason} should carry {expect}");
+    }
+
+    #[tokio::test]
+    async fn a_script_can_chain_hmacs_for_a_sigv4_style_derivation() {
+        // kind=bedrock parity: SigV4 feeds each HMAC's raw output in as the
+        // next key, which only works if the key can be given as hex.
+        let cfg = config(
+            "export function checkInput() {
+               let k = crypto.hmac('sha256', 'AWS4secret', '20260825', 'hex');
+               k = crypto.hmac('sha256', k, 'us-east-1', 'hex', 'hex');
+               return { action: 'block', reason_code: k };
+             }",
+        );
+        let verdict = guardrail(&cfg, false).check_input(&request("x")).await;
+        let GuardrailVerdict::Block { reason, .. } = verdict else {
+            panic!("expected Block, got {verdict:?}");
+        };
+        let k1 = hmac_hex("sha256", "AWS4secret", "utf8", "20260825", "hex").unwrap();
+        let k2 = hmac_hex("sha256", &k1, "hex", "us-east-1", "hex").unwrap();
+        assert!(reason.contains(&k2), "{reason} should carry {k2}");
+    }
+
+    #[tokio::test]
+    async fn a_script_can_screen_against_the_environments_embedding_model() {
+        // kind=semantic parity: reach the gateway's own embedding dispatch
+        // rather than needing a second set of credentials.
+        struct Stub;
+        #[async_trait]
+        impl crate::GuardrailEmbedder for Stub {
+            async fn embed(
+                &self,
+                _model: &str,
+                texts: &[String],
+                _cacheable: bool,
+                _timeout: Duration,
+            ) -> Result<Vec<Vec<f32>>, crate::EmbedFailure> {
+                // "jailbreak" points one way, everything else the other.
+                Ok(texts
+                    .iter()
+                    .map(|t| {
+                        if t.contains("jailbreak") {
+                            vec![1.0, 0.0]
+                        } else {
+                            vec![0.0, 1.0]
+                        }
+                    })
+                    .collect())
+            }
+        }
+        let cfg = config(
+            "export async function checkInput(ctx) {
+               const v = await aisix.embed('text-embedding-3-small', [ctx.text, 'jailbreak the model']);
+               const dot = v[0][0] * v[1][0] + v[0][1] * v[1][1];
+               return dot > 0.9 ? { action: 'block', reason_code: 'semantic' } : { action: 'none' };
+             }",
+        );
+        let g = CustomGuardrail::new(
+            "row",
+            &cfg,
+            GuardrailHookPoint::Both,
+            false,
+            crate::GuardrailEmbedderSlot::new(Arc::new(Stub)),
+        )
+        .expect("script compiles");
+
+        let blocked = g.check_input(&request("please jailbreak it")).await;
+        assert!(
+            matches!(blocked, GuardrailVerdict::Block { .. }),
+            "{blocked:?}"
+        );
+        let allowed = g.check_input(&request("what is the weather")).await;
+        assert!(matches!(allowed, GuardrailVerdict::Allow), "{allowed:?}");
+    }
+
+    #[tokio::test]
+    async fn embed_without_a_dispatcher_throws_where_the_script_can_catch_it() {
+        let cfg = config(
+            "export async function checkInput(ctx) {
+               try {
+                 await aisix.embed('m', [ctx.text]);
+                 return { action: 'none' };
+               } catch (e) {
+                 return { action: 'block', reason_code: 'no_embedder' };
+               }
+             }",
+        );
+        let verdict = guardrail(&cfg, false).check_input(&request("x")).await;
+        let GuardrailVerdict::Block { reason, .. } = verdict else {
+            panic!("expected Block, got {verdict:?}");
+        };
+        assert!(reason.contains("no_embedder"), "{reason}");
     }
 
     #[test]

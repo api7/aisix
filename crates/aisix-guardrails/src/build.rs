@@ -475,6 +475,7 @@ fn build_one_inner(
                 cfg,
                 row.hook_point,
                 row.fail_open,
+                embedder.clone(),
             )
             .map_err(BuildError::ScriptCompile)?;
             Ok(Some(Arc::new(g)))
