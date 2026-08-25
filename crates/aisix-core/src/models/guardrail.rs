@@ -864,6 +864,15 @@ pub struct CustomConfig {
     /// The script source, as an ES module exporting `checkInput` and/or
     /// `checkOutput`. A hook whose function the module does not export is
     /// skipped, so a script may cover one direction only.
+    ///
+    /// Defaulted at the TYPE level and required by the strict write schema
+    /// instead (AGENTS.md: never make a projected field required at the
+    /// type level). A row the loader cannot deserialize is skipped whole,
+    /// and a screening row that vanishes is a guardrail that stopped
+    /// screening. An empty script is rejected at chain-build time, so such
+    /// a row is reported rather than silently admitting everything it was
+    /// meant to screen.
+    #[serde(default)]
     #[schemars(length(min = 1))]
     pub script: String,
     /// Values the script reads as `ctx.secrets.<NAME>`, for credentials the

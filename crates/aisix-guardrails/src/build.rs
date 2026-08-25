@@ -466,6 +466,17 @@ fn build_one_inner(
             Ok(Some(Arc::new(g)))
         }
         GuardrailKind::Custom(cfg) => {
+            // `script` carries a serde default so an older or malformed row
+            // still deserializes (AGENTS.md), which means an empty one can
+            // reach here. It must not build: an empty module parses, exports
+            // no hook, and every hook would return Allow — a row that looks
+            // configured and screens nothing.
+            if cfg.script.trim().is_empty() {
+                return Err(BuildError::InvalidValue {
+                    field: "script",
+                    value: String::new(),
+                });
+            }
             // Compiling here (rather than on the first request that hits
             // the row) is what turns a script typo into a rejected
             // resource the operator sees at save time. It parses only —
@@ -1213,6 +1224,32 @@ mod tests {
         // `name` is documentary at the call site; the row's own
         // `name` field is what the chain logs as.
         ResourceEntry::new(id, row, 1)
+    }
+
+    #[test]
+    fn an_empty_custom_script_is_rejected_rather_than_admitting_everything() {
+        // `script` defaults at the type level so a row an older or broken
+        // writer produced still deserializes (AGENTS.md), which makes the
+        // empty case reachable here. An empty ES module parses and exports
+        // nothing, so every hook would return Allow — a row that reads as
+        // configured and screens nothing. It must not build.
+        let row = parse(
+            r#"{
+                "id": "00000000-0000-0000-0000-0000000000ff",
+                "name": "empty-script",
+                "enabled": true,
+                "hook_point": "both",
+                "kind": "custom",
+                "script": "   "
+            }"#,
+        );
+        match build_one(&row, None, &GuardrailEmbedderSlot::none()) {
+            Err(BuildError::InvalidValue {
+                field: "script", ..
+            }) => {}
+            Err(other) => panic!("wrong error: {other:?}"),
+            Ok(_) => panic!("an empty script must not build"),
+        }
     }
 
     fn parse(json: &str) -> DomainGuardrail {

@@ -1596,7 +1596,8 @@
           "type": "boolean"
         },
         "script": {
-          "description": "The script source, as an ES module exporting `checkInput` and/or `checkOutput`. A hook whose function the module does not export is skipped, so a script may cover one direction only.",
+          "default": "",
+          "description": "The script source, as an ES module exporting `checkInput` and/or `checkOutput`. A hook whose function the module does not export is skipped, so a script may cover one direction only.\n\nDefaulted at the TYPE level and required by the strict write schema instead (AGENTS.md: never make a projected field required at the type level). A row the loader cannot deserialize is skipped whole, and a screening row that vanishes is a guardrail that stopped screening. An empty script is rejected at chain-build time, so such a row is reported rather than silently admitting everything it was meant to screen.",
           "minLength": 1,
           "type": "string"
         },
@@ -1642,8 +1643,7 @@
         }
       },
       "required": [
-        "kind",
-        "script"
+        "kind"
       ],
       "type": "object"
     }

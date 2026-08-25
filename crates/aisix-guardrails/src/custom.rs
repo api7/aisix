@@ -86,6 +86,12 @@ use crate::{Guardrail, GuardrailVerdict, SegmentsOutcome, StreamOutputPolicy};
 /// a thrown error carries, so keep it recognisable to the operator.
 const MODULE_NAME: &str = "guardrail.js";
 
+/// Share of the sandbox heap one fetch body may occupy. A body has to fit
+/// alongside the host JSON that carries it, the `JSON.parse` result, and
+/// the response object built from it — so spending the whole heap on the
+/// body guarantees the parse that follows cannot run.
+const MAX_BODY_HEAP_FRACTION: usize = 4;
+
 /// Engine stack ceiling. Independent of `max_memory_bytes`: deep recursion
 /// exhausts the native stack long before the JS heap, and the default would
 /// let it reach the host's guard page.
@@ -346,7 +352,7 @@ impl CustomGuardrail {
         let http = Arc::clone(&self.http);
         let row_name = self.row_name.clone();
         let func = func.to_owned();
-        let body_cap = self.max_memory_bytes;
+        let body_cap = self.max_memory_bytes / MAX_BODY_HEAP_FRACTION;
         let embedder = self.embedder.clone();
         let embed_budget = self.budget;
 
@@ -363,16 +369,16 @@ impl CustomGuardrail {
 
                 let module = Module::declare(ctx.clone(), MODULE_NAME, script.as_str())
                     .catch(&ctx)
-                    .map_err(|e| threw(&row_name, "parse", e))?;
+                    .map_err(|e| threw(&row_name, "parse", e, deadline))?;
                 let (module, pending) = module
                     .eval()
                     .catch(&ctx)
-                    .map_err(|e| threw(&row_name, "eval", e))?;
+                    .map_err(|e| threw(&row_name, "eval", e, deadline))?;
                 pending
                     .into_future::<()>()
                     .await
                     .catch(&ctx)
-                    .map_err(|e| threw(&row_name, "eval", e))?;
+                    .map_err(|e| threw(&row_name, "eval", e, deadline))?;
 
                 // A script may cover one direction only; the hook it does
                 // not export is an Allow, not a misconfiguration.
@@ -383,11 +389,11 @@ impl CustomGuardrail {
                 let arg = ctx
                     .json_parse(ctx_json)
                     .catch(&ctx)
-                    .map_err(|e| threw(&row_name, "context", e))?;
+                    .map_err(|e| threw(&row_name, "context", e, deadline))?;
                 let returned: rquickjs::Value<'_> = hook
                     .call((arg,))
                     .catch(&ctx)
-                    .map_err(|e| threw(&row_name, "call", e))?;
+                    .map_err(|e| threw(&row_name, "call", e, deadline))?;
 
                 // The contract is `async function`, but a plain function
                 // returning a verdict object is just as valid — resolve
@@ -398,14 +404,14 @@ impl CustomGuardrail {
                         .into_future::<rquickjs::Value<'_>>()
                         .await
                         .catch(&ctx)
-                        .map_err(|e| threw(&row_name, "call", e))?,
+                        .map_err(|e| threw(&row_name, "call", e, deadline))?,
                     None => returned,
                 };
 
                 let json = ctx
                     .json_stringify(resolved)
                     .catch(&ctx)
-                    .map_err(|e| threw(&row_name, "verdict", e))?;
+                    .map_err(|e| threw(&row_name, "verdict", e, deadline))?;
                 // Distinguished here, while the two are still separable: a
                 // hook the module never exported is an Allow above, whereas
                 // a hook that returned `undefined` decided nothing and must
@@ -887,7 +893,15 @@ async fn host_fetch(
     let mut response = match request.send().await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(row = %row_name, url = %url, error = %e, "custom guardrail fetch failed");
+            // Never the full URL: scripts commonly build it from a secret
+            // (`${base}/scan?key=${ctx.secrets.SCAN_KEY}`), and this line
+            // goes to the operator's log.
+            tracing::warn!(
+                row = %row_name,
+                target = %redact_url(&url),
+                error = %e,
+                "custom guardrail fetch failed",
+            );
             return fetch_error(e.to_string());
         }
     };
@@ -903,6 +917,15 @@ async fn host_fetch(
         })
         .collect();
     let body = crate::read_body_capped(&mut response, body_cap).await;
+    if body.len() >= body_cap {
+        // Reported rather than handed over: a truncated body makes
+        // `resp.json()` throw a parse error that reads like a bug in the
+        // script, when the cause is the size limit.
+        tracing::warn!(row = %row_name, cap = body_cap, "custom guardrail fetch body hit the cap");
+        return fetch_error(format!(
+            "response body exceeded {body_cap} bytes (a quarter of max_memory_bytes)"
+        ));
+    }
 
     serde_json::to_string(&FetchResult {
         error: None,
@@ -912,6 +935,15 @@ async fn host_fetch(
         body,
     })
     .unwrap_or_else(|e| fetch_error(e.to_string()))
+}
+
+/// Scheme, authority and path only — the query string is where a
+/// script-built URL carries its credential.
+fn redact_url(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(u) => format!("{}://{}{}", u.scheme(), u.authority(), u.path()),
+        Err(_) => "<unparsable url>".to_owned(),
+    }
 }
 
 fn fetch_error(message: String) -> String {
@@ -925,7 +957,21 @@ fn fetch_error(message: String) -> String {
     .unwrap_or_else(|_| r#"{"error":"fetch failed"}"#.to_owned())
 }
 
-fn threw(row_name: &str, stage: &str, err: rquickjs::CaughtError<'_>) -> ScriptFailure {
+/// Classify a raised error. The interrupt handler aborts with an
+/// UNCATCHABLE exception, which arrives here looking like any other throw
+/// — so a script that burned its budget in a tight loop would be filed
+/// under `custom_script_error` and an operator filtering on
+/// `custom_timeout` would never see it. The deadline separates them.
+fn threw(
+    row_name: &str,
+    stage: &str,
+    err: rquickjs::CaughtError<'_>,
+    deadline: Instant,
+) -> ScriptFailure {
+    if Instant::now() >= deadline {
+        tracing::warn!(row = %row_name, stage = %stage, "custom guardrail script exceeded its budget");
+        return ScriptFailure::Timeout;
+    }
     tracing::warn!(row = %row_name, stage = %stage, error = %err, "custom guardrail script threw");
     ScriptFailure::Threw
 }
@@ -1206,14 +1252,10 @@ mod tests {
         let GuardrailVerdict::Block { unavailable, .. } = verdict else {
             panic!("expected Block, got {verdict:?}");
         };
-        // Whichever budget wins the race, the row must fail closed.
-        assert!(
-            matches!(
-                unavailable.as_deref(),
-                Some("custom_timeout" | "custom_script_error")
-            ),
-            "{unavailable:?}",
-        );
+        // The interrupt raises an uncatchable exception that otherwise
+        // reads as an ordinary throw; it must still be filed as a timeout
+        // so an operator filtering on that tag sees CPU exhaustion too.
+        assert_eq!(unavailable.as_deref(), Some("custom_timeout"));
     }
 
     #[tokio::test]
@@ -1510,6 +1552,46 @@ mod tests {
             panic!("expected Block, got {verdict:?}");
         };
         assert!(reason.contains("no_embedder"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn an_oversize_body_is_reported_not_silently_truncated() {
+        // A truncated body makes resp.json() throw a parse error that
+        // reads like a bug in the script, when the cause is the cap.
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/big"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(2 * 1024 * 1024)))
+            .mount(&upstream)
+            .await;
+        let mut cfg = config(&format!(
+            "export async function checkInput() {{
+               try {{
+                 await fetch('{}/big');
+                 return {{ action: 'none' }};
+               }} catch (e) {{
+                 return {{ action: 'block', reason_code: 'too_large' }};
+               }}
+             }}",
+            upstream.uri(),
+        ));
+        cfg.max_memory_bytes = 2 * 1024 * 1024;
+        let verdict = guardrail(&cfg, false).check_input(&request("hello")).await;
+        let GuardrailVerdict::Block { reason, .. } = verdict else {
+            panic!("expected Block, got {verdict:?}");
+        };
+        assert!(reason.contains("too_large"), "{reason}");
+    }
+
+    #[test]
+    fn a_failing_url_is_logged_without_its_query_string() {
+        // Scripts build the URL from a secret often enough that the query
+        // string has to be treated as one.
+        assert_eq!(
+            redact_url("https://scan.internal:8443/v1/scan?key=sk-live-42&x=1"),
+            "https://scan.internal:8443/v1/scan",
+        );
+        assert_eq!(redact_url("not a url"), "<unparsable url>");
     }
 
     #[test]
