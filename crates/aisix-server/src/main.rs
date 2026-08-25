@@ -580,6 +580,15 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     };
 
     let (cancel_tx, cancel_rx) = watch::channel(false);
+    // Flipped when the drain STARTS, where `cancel` is flipped when it
+    // ends. Only a listener reads it, and only to hand an HTTP/2
+    // downstream its GOAWAY without closing the listener under traffic
+    // a balancer is still routing here (AISIX-Cloud#1395).
+    let (retire_tx, retire_rx) = watch::channel(false);
+    let shutdown = ShutdownWatch {
+        retire: retire_rx,
+        cancel: cancel_rx.clone(),
+    };
 
     // Steps 4-6: the resource source — either the standalone resources
     // file (`resources_file` in config) or etcd + watch supervisor.
@@ -1074,7 +1083,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             admin_router,
             admin_tls,
             downstream_idle_timeout,
-            cancel_rx.clone(),
+            shutdown.clone(),
             "admin",
             None,
             None,
@@ -1121,7 +1130,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 metrics_router,
                 None,
                 downstream_idle_timeout,
-                cancel_rx.clone(),
+                shutdown.clone(),
                 "metrics",
                 None,
                 None,
@@ -1143,7 +1152,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         proxy_router,
         proxy_tls,
         downstream_idle_timeout,
-        cancel_rx.clone(),
+        shutdown,
         "proxy",
         proxy_workers,
         // Only the proxy listener's connections are counted: the drain is
@@ -1156,6 +1165,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // completes first triggers the rest.
     let signal_task = tokio::spawn(wait_for_signal(
         cancel_tx.clone(),
+        retire_tx,
         livez_state,
         Duration::from_secs(cfg.shutdown.min_drain_secs),
     ));
@@ -1532,62 +1542,75 @@ fn background_check_interval(snapshot: &aisix_core::AisixSnapshot) -> std::time:
     std::time::Duration::from_secs(min_interval.max(1))
 }
 
-/// Set on every connection the gateway accepts from a client.
+/// The two moments a listener has to tell apart during a shutdown.
 ///
-/// Nagle's algorithm holds a small segment back until the previous one
-/// has been acknowledged. A short buffered answer leaves in a single
-/// segment and never notices — which is why this is invisible in the
-/// throughput benchmark — but a streamed one writes a frame at a time,
-/// and a frame that lands while an earlier one is still unacknowledged
-/// waits out the client's delayed ACK (up to 40ms on Linux) before it
-/// leaves the box. HTTP/2 control frames and the WebSocket surfaces run
-/// on the same accepted socket and inherit the option.
+/// `retire` flips when the drain STARTS (SIGTERM): open connections are
+/// told to stop taking new work while the listener KEEPS accepting,
+/// because a balancer only learns about the `/readyz` 503 on its next
+/// probe and refusing everything it routes in between is the failure a
+/// graceful shutdown exists to avoid. `cancel` flips when the drain is
+/// OVER: stop accepting, and close what is left.
 ///
-/// `axum_server` accepts with the option off, and the gateway had never
-/// turned it on. reqwest already sets it on the upstream side.
-///
-/// A `set_nodelay` failure fails that connection: on Linux the option
-/// carries no socket-state precondition and cannot fail, and elsewhere
-/// it reports a peer that has already gone away — a connection that was
-/// not answerable regardless.
-const DOWNSTREAM_NODELAY: axum_server::accept::NoDelayAcceptor =
-    axum_server::accept::NoDelayAcceptor;
-
-/// Wraps [`DOWNSTREAM_NODELAY`] to keep [`LivezState::open_connections`]
-/// current, and to say so when a connection arrives after the shutdown
-/// signal.
-///
-/// Accepting is the only place either fact is observable, and during a
-/// drain they are what separates work the gateway had already taken on
-/// from traffic still being routed at it (AISIX-Cloud#1394).
-///
-/// Neither can tell a client apart from the platform, though: `/livez`
-/// and `/readyz` are served on the proxy listener too, and the probes
-/// keep arriving throughout the drain, each on its own connection. So the
-/// count includes them and the accept line does not claim to know who
-/// connected — the arrival line in `record_request_telemetry` knows the
-/// path and is where that judgement is made. This line covers what the
-/// arrival line cannot: a connection opened and never used.
-///
-/// `drain` is `None` for the admin and metrics listeners, which are
-/// control surfaces nothing routes client traffic to.
+/// The two must stay separate signals. Collapsing them into one is the
+/// same as having no HTTP/2 retirement signal at all, because the only
+/// way to retire a connection would be to close the listener with it
+/// (AISIX-Cloud#1395).
 #[derive(Clone)]
-struct CountedAcceptor {
-    nodelay: axum_server::accept::NoDelayAcceptor,
-    drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
+struct ShutdownWatch {
+    retire: watch::Receiver<bool>,
+    cancel: watch::Receiver<bool>,
 }
 
-impl CountedAcceptor {
-    fn new(
-        nodelay: axum_server::accept::NoDelayAcceptor,
-        drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
-    ) -> Self {
-        Self { nodelay, drain }
+impl ShutdownWatch {
+    /// Resolves once `rx` is true — immediately when it was already true
+    /// before this connection was accepted, which is the case for every
+    /// connection accepted during a drain. `Receiver::changed` would
+    /// wait for the NEXT flip and so never return for those.
+    ///
+    /// A dropped sender resolves too: the process is going away, and
+    /// "retire now" is the safe reading of that.
+    async fn signalled(rx: &mut watch::Receiver<bool>) {
+        let _ = rx.wait_for(|flag| *flag).await;
+    }
+
+    /// Whichever comes first. `cancel` belongs here because it can flip
+    /// without `retire` ever flipping: a failure elsewhere in the
+    /// process cancels it without a drain.
+    async fn retire_or_cancel(&mut self) {
+        tokio::select! {
+            _ = Self::signalled(&mut self.retire) => {}
+            _ = Self::signalled(&mut self.cancel) => {}
+        }
+    }
+
+    async fn cancelled(&mut self) {
+        Self::signalled(&mut self.cancel).await;
     }
 }
 
-/// Holds a connection's slot in the open-connection count for as long as
-/// the accepted stream lives.
+/// Which HTTP version an accepted connection settled on.
+///
+/// The gateway decides this itself rather than leaving it to
+/// `hyper_util`'s auto builder, because the version decides which
+/// retirement signal the connection can be handed and the auto
+/// connection does not report which version it negotiated. Its
+/// `graceful_shutdown` is version-blind, and on an HTTP/1.1 connection
+/// it means "close as soon as idle" — the server-initiated close of a
+/// pooled connection that AISIX-Cloud#1394 ruled out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Downstream {
+    Http1,
+    Http2,
+}
+
+/// Holds a connection's slot in [`LivezState::open_connections`] for as
+/// long as the connection's task runs.
+///
+/// The count is what separates work the gateway had already taken on
+/// from traffic still being routed at it during a drain: a pooled
+/// connection sitting idle carries no in-flight request, so a count that
+/// stays up while `in_flight` falls is how an operator sees that the
+/// balancer has not stopped routing here yet (AISIX-Cloud#1394).
 struct ConnectionGuard(std::sync::Arc<aisix_proxy::LivezState>);
 
 impl Drop for ConnectionGuard {
@@ -1596,25 +1619,42 @@ impl Drop for ConnectionGuard {
     }
 }
 
-/// An accepted stream that lowers the open-connection count when the
-/// connection task drops it. `TcpStream` is `Unpin`, so the delegation
-/// needs no pin projection.
-struct CountedStream {
-    inner: tokio::net::TcpStream,
-    _guard: Option<ConnectionGuard>,
+/// Replays the bytes the version sniff had to consume, so hyper still
+/// sees the connection from byte zero.
+struct Rewind<I> {
+    prefix: Vec<u8>,
+    replayed: usize,
+    inner: I,
 }
 
-impl tokio::io::AsyncRead for CountedStream {
+impl<I> Rewind<I> {
+    fn new(prefix: Vec<u8>, inner: I) -> Self {
+        Self {
+            prefix,
+            replayed: 0,
+            inner,
+        }
+    }
+}
+
+impl<I: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Rewind<I> {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        let me = &mut *self;
+        if me.replayed < me.prefix.len() && buf.remaining() > 0 {
+            let n = (me.prefix.len() - me.replayed).min(buf.remaining());
+            buf.put_slice(&me.prefix[me.replayed..me.replayed + n]);
+            me.replayed += n;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut me.inner).poll_read(cx, buf)
     }
 }
 
-impl tokio::io::AsyncWrite for CountedStream {
+impl<I: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Rewind<I> {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -1650,79 +1690,86 @@ impl tokio::io::AsyncWrite for CountedStream {
     }
 }
 
-impl<S> axum_server::accept::Accept<tokio::net::TcpStream, S> for CountedAcceptor {
-    type Stream = CountedStream;
-    type Service = S;
-    type Future = std::future::Ready<std::io::Result<(Self::Stream, Self::Service)>>;
+/// Read enough of a plaintext connection to tell HTTP/2 from HTTP/1.1,
+/// and hand back a stream that still starts at byte zero.
+///
+/// Four bytes settle it: RFC 9113 §3.4 reserves the `PRI` method for the
+/// client connection preface precisely so that no HTTP/1 request can
+/// begin with it. `hyper_util` reads the same bytes one layer down and
+/// keeps the answer to itself.
+///
+/// A TLS listener never reaches here — ALPN has already answered.
+async fn sniff_downstream_version(
+    mut stream: tokio::net::TcpStream,
+    first_bytes_timeout: Option<Duration>,
+) -> std::io::Result<(Downstream, Rewind<tokio::net::TcpStream>)> {
+    use tokio::io::AsyncReadExt;
 
-    fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
-        let accepted = axum_server::accept::Accept::<tokio::net::TcpStream, S>::accept(
-            &self.nodelay,
-            stream,
-            service,
-        )
-        .into_inner();
-        std::future::ready(accepted.map(|(stream, service)| {
-            let guard = self.drain.as_ref().map(|drain| {
-                drain.connection_opened();
-                if drain.is_shutting_down() {
-                    tracing::info!(
-                        peer = stream.peer_addr().ok().map(tracing::field::display),
-                        open_connections = drain.open_connections(),
-                        "accepted a new downstream connection while draining"
-                    );
-                }
-                ConnectionGuard(drain.clone())
-            });
-            (
-                CountedStream {
-                    inner: stream,
-                    _guard: guard,
-                },
-                service,
+    const PREFACE_HEAD: &[u8] = b"PRI ";
+
+    let mut head = [0u8; PREFACE_HEAD.len()];
+    let mut filled = 0;
+    let read = async {
+        while filled < head.len() {
+            match stream.read(&mut head[filled..]).await? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    };
+
+    match first_bytes_timeout {
+        // The same window `downstream.idle_timeout_secs` gives a request
+        // head, applied here because this read happens BEFORE hyper has
+        // a connection to arm its own timer on. hyper's version read has
+        // no timer of its own, so without this a peer that connects and
+        // then says nothing holds its slot until the platform reclaims
+        // the socket (AISIX-Cloud#1126).
+        Some(d) => tokio::time::timeout(d, read).await.map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "downstream opened a connection and sent nothing",
             )
-        }))
+        })??,
+        None => read.await?,
     }
+
+    let version = if head[..filled] == *PREFACE_HEAD {
+        Downstream::Http2
+    } else {
+        Downstream::Http1
+    };
+    Ok((version, Rewind::new(head[..filled].to_vec(), stream)))
 }
 
-/// Completes when the process receives SIGINT or SIGTERM (best-effort on
-/// Windows — Ctrl+C only) OR when another part of the system has already
-/// flipped the cancel channel.
 /// Serve `router` on `addr`, choosing HTTPS when `tls` is configured and
-/// plain HTTP otherwise. Both variants honour the shared `cancel` watch for
-/// graceful shutdown so the proxy/admin surfaces stop in lockstep with the
-/// rest of the process. Wired for #473: `proxy.tls` / `admin.tls` were
-/// parsed but never reached the listener, so the documented config silently
-/// served plain HTTP.
+/// plain HTTP otherwise. Wired for #473: `proxy.tls` / `admin.tls` were
+/// parsed but never reached the listener, so the documented config
+/// silently served plain HTTP.
 ///
-/// Both variants run on `axum_server` rather than `axum::serve` because
-/// only the former exposes the hyper connection builder, which is where
-/// `downstream.idle_timeout_secs` has to be applied (AISIX-Cloud#1126).
+/// The gateway runs its own accept loop rather than `axum::serve` or
+/// `axum_server`. Two things it has to do are not reachable through
+/// either: applying `downstream.idle_timeout_secs` needs the hyper
+/// connection builder (AISIX-Cloud#1126), which `axum::serve` does not
+/// expose; and retiring a connection WITHOUT closing the listener needs
+/// the connection future (AISIX-Cloud#1395), which `axum_server` owns
+/// internally and only retires together with the listener.
 #[allow(clippy::too_many_arguments)]
 async fn serve_http(
     addr: std::net::SocketAddr,
     router: axum::Router,
     tls: Option<aisix_core::TlsConfig>,
     idle_timeout: Option<Duration>,
-    cancel: watch::Receiver<bool>,
+    shutdown: ShutdownWatch,
     label: &'static str,
     workers: Option<usize>,
     drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
 ) -> anyhow::Result<()> {
     // Resolved before binding so a bad cert path still fails with the
     // same error it always did, before a port is taken.
-    let tls_config = match tls {
-        Some(tls) => Some(
-            axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_file, &tls.key_file)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "{label}.tls: failed to load cert_file={:?} / key_file={:?}: {e}",
-                        tls.cert_file,
-                        tls.key_file
-                    )
-                })?,
-        ),
+    let tls = match tls {
+        Some(tls) => Some(downstream_tls_acceptor(&tls, label).await?),
         None => None,
     };
 
@@ -1732,9 +1779,9 @@ async fn serve_http(
         return serve_http_tpc(
             addr,
             router,
-            tls_config,
+            tls,
             idle_timeout,
-            cancel,
+            shutdown,
             label,
             workers,
             drain,
@@ -1744,45 +1791,335 @@ async fn serve_http(
 
     let listener = std::net::TcpListener::bind(addr)
         .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?;
-    listener.set_nonblocking(true)?;
+    match tls {
+        None => tracing::info!(%addr, label, "aisix listening (http)"),
+        Some(_) => tracing::info!(%addr, label, "aisix listening (https)"),
+    }
+    accept_loop(listener, router, tls, idle_timeout, shutdown, label, drain).await
+}
 
-    let handle = axum_server::Handle::new();
-    tokio::spawn({
-        let handle = handle.clone();
-        async move {
-            shutdown_signal(cancel, label).await;
-            // `None` = drain without a deadline: an in-flight LLM stream
-            // can run for minutes, and the platform (k8s
-            // terminationGracePeriodSeconds, systemd TimeoutStopSec)
-            // already caps how long that may take. Idle connections are
-            // closed immediately either way.
-            handle.graceful_shutdown(None);
-        }
-    });
+/// Build the downstream TLS acceptor from the configured PEM files.
+///
+/// ALPN offers `h2` ahead of `http/1.1`, which is what the gateway has
+/// always advertised — a downstream that prefers HTTP/2 has to keep
+/// getting it. (#535/#536 guard the dp-manager's REST *clients* against
+/// negotiating h2; this is the server side, and it does offer it.)
+async fn downstream_tls_acceptor(
+    tls: &aisix_core::TlsConfig,
+    label: &'static str,
+) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
+    let failed = |e: String| {
+        anyhow::anyhow!(
+            "{label}.tls: failed to load cert_file={:?} / key_file={:?}: {e}",
+            tls.cert_file,
+            tls.key_file,
+        )
+    };
+
+    let cert_pem = tokio::fs::read(&tls.cert_file)
+        .await
+        .map_err(|e| failed(e.to_string()))?;
+    let key_pem = tokio::fs::read(&tls.key_file)
+        .await
+        .map_err(|e| failed(e.to_string()))?;
+
+    let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| failed(e.to_string()))?;
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .map_err(|e| failed(e.to_string()))?
+        .ok_or_else(|| failed("no private key in key_file".to_string()))?;
+
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| failed(e.to_string()))?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)))
+}
+
+/// Accept and serve on `listener` until the drain ends, then wait for
+/// the connections still open to finish.
+///
+/// The single accept path for every listener the gateway binds — both
+/// serving modes, TLS and plaintext, proxy and control surfaces. The
+/// per-listener differences are all parameters, so a rule proved on one
+/// listener holds on all of them.
+#[allow(clippy::too_many_arguments)]
+async fn accept_loop(
+    listener: std::net::TcpListener,
+    router: axum::Router,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    idle_timeout: Option<Duration>,
+    mut shutdown: ShutdownWatch,
+    label: &'static str,
+    drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
+) -> anyhow::Result<()> {
+    listener.set_nonblocking(true)?;
+    let listener = tokio::net::TcpListener::from_std(listener)?;
 
     // ConnectInfo<SocketAddr> exposes the TCP peer to the proxy's real-ip
     // resolver (#492). Harmless for the admin listener, which ignores it.
-    let make_service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let mut make_service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
 
-    match tls_config {
-        None => {
-            tracing::info!(%addr, label, "aisix listening (http)");
-            let mut server = axum_server::from_tcp(listener)
-                .acceptor(CountedAcceptor::new(DOWNSTREAM_NODELAY, drain))
-                .handle(handle);
-            apply_idle_timeout(server.http_builder(), idle_timeout);
-            server.serve(make_service).await?;
-        }
-        Some(tls_config) => {
-            tracing::info!(%addr, label, "aisix listening (https)");
-            let mut server = axum_server::from_tcp_rustls(listener, tls_config)
-                .map(|tls| tls.acceptor(CountedAcceptor::new(DOWNSTREAM_NODELAY, drain)))
-                .handle(handle);
-            apply_idle_timeout(server.http_builder(), idle_timeout);
-            server.serve(make_service).await?;
-        }
+    // Close an accepted HTTP/1.1 connection that sits idle for
+    // `idle_timeout`. hyper arms this timer only when it is waiting for a
+    // request head, and it only waits for one once the previous response
+    // has been fully written (`Conn::can_read_head` requires the read
+    // half to be back at `Init`, which `try_keep_alive` reaches only when
+    // reading *and* writing are done). So a slow model or a long SSE
+    // stream is never interrupted — the timer covers exactly the
+    // between-requests window.
+    //
+    // hyper defaults this to 30s but drops the default unless a timer is
+    // installed, and axum does not install one — which is why the gateway
+    // held idle connections forever before AISIX-Cloud#1126.
+    //
+    // HTTP/2 has no equivalent knob in hyper; h2 connections are
+    // unaffected. `sniff_downstream_version` covers the one window that
+    // precedes either builder.
+    let mut http1 = hyper::server::conn::http1::Builder::new();
+    if let Some(d) = idle_timeout {
+        http1
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(d);
     }
+    let http2 = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+
+    // Every connection task holds a clone of the sender; the receiver
+    // below completes once the last one is dropped. Cheaper than keeping
+    // join handles, and it cannot leak one for a connection that already
+    // ended.
+    let (alive, mut all_connections_ended) = tokio::sync::mpsc::channel::<()>(1);
+
+    loop {
+        let accepted = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                tracing::info!(label, "shutdown signal observed — stopping listener");
+                break;
+            }
+            accepted = listener.accept() => accepted,
+        };
+
+        let (stream, peer) = match accepted {
+            Ok(accepted) => accepted,
+            // Transient: fd exhaustion, or a peer that vanished between
+            // the SYN and the accept. Backing off keeps a listener that
+            // cannot accept from spinning a core.
+            Err(e) => {
+                tracing::debug!(label, error = %e, "accept failed");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+
+        // Nagle's algorithm holds a small segment back until the previous
+        // one has been acknowledged. A short buffered answer leaves in a
+        // single segment and never notices — which is why this is
+        // invisible in the throughput benchmark — but a streamed one
+        // writes a frame at a time, and a frame that lands while an
+        // earlier one is still unacknowledged waits out the client's
+        // delayed ACK (up to 40ms on Linux) before it leaves the box.
+        // HTTP/2 control frames and the WebSocket surfaces run on the
+        // same accepted socket and inherit the option. reqwest already
+        // sets it on the upstream side.
+        //
+        // A failure fails that connection: on Linux the option carries no
+        // socket-state precondition and cannot fail, and elsewhere it
+        // reports a peer that has already gone away — a connection that
+        // was not answerable regardless.
+        if let Err(e) = stream.set_nodelay(true) {
+            tracing::debug!(label, error = %e, "TCP_NODELAY failed; dropping connection");
+            continue;
+        }
+
+        // `SocketAddr` is `Connected` both for a bare peer address and
+        // for axum's own `IncomingStream`, so the target type has to be
+        // named or the make-service call is ambiguous.
+        std::future::poll_fn(|cx| {
+            tower::Service::<std::net::SocketAddr>::poll_ready(&mut make_service, cx)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{label} make_service not ready: {e}"))?;
+        let service =
+            match tower::Service::<std::net::SocketAddr>::call(&mut make_service, peer).await {
+                Ok(service) => service,
+                Err(never) => match never {},
+            };
+
+        // Accepting is the only place either fact is observable, and
+        // during a drain they are what separates work the gateway had
+        // already taken on from traffic still being routed at it
+        // (AISIX-Cloud#1394).
+        //
+        // Neither can tell a client apart from the platform, though:
+        // `/livez` and `/readyz` are served on the proxy listener too,
+        // and the probes keep arriving throughout the drain, each on its
+        // own connection. So the count includes them and the accept line
+        // does not claim to know who connected — the arrival line in
+        // `record_request_telemetry` knows the path and is where that
+        // judgement is made. This line covers what the arrival line
+        // cannot: a connection opened and never used.
+        //
+        // `drain` is `None` for the admin and metrics listeners, which
+        // are control surfaces nothing routes client traffic to.
+        let counted = drain.as_ref().map(|drain| {
+            drain.connection_opened();
+            if drain.is_shutting_down() {
+                tracing::info!(
+                    peer = %peer,
+                    open_connections = drain.open_connections(),
+                    "accepted a new downstream connection while draining"
+                );
+            }
+            ConnectionGuard(drain.clone())
+        });
+
+        let alive = alive.clone();
+        let shutdown = shutdown.clone();
+        let http1 = http1.clone();
+        let http2 = http2.clone();
+        let tls = tls.clone();
+        tokio::spawn(async move {
+            let _alive = alive;
+            let _counted = counted;
+            // The TLS handshake and the version read both wait on the
+            // peer, so they belong to the connection's own task: a client
+            // that stalls in either must not hold up the accept loop.
+            match tls {
+                Some(tls) => match tls.accept(stream).await {
+                    Ok(stream) => {
+                        let version = match stream.get_ref().1.alpn_protocol() {
+                            Some(proto) if proto == b"h2" => Downstream::Http2,
+                            _ => Downstream::Http1,
+                        };
+                        serve_connection(stream, version, service, &http1, &http2, shutdown, label)
+                            .await;
+                    }
+                    Err(e) => tracing::debug!(label, error = %e, "TLS handshake failed"),
+                },
+                None => match sniff_downstream_version(stream, idle_timeout).await {
+                    Ok((version, stream)) => {
+                        serve_connection(stream, version, service, &http1, &http2, shutdown, label)
+                            .await;
+                    }
+                    Err(e) => {
+                        tracing::debug!(label, error = %e, "reading the request preface failed")
+                    }
+                },
+            }
+        });
+    }
+
+    // Refuse connections immediately rather than letting the ones the
+    // kernel already queued hang: tokio accepts into that queue whether
+    // or not this loop is still reading from it.
+    drop(listener);
+
+    // The drain has already run every in-flight request to completion, so
+    // what is left here is idle pooled connections; each one's task ends
+    // as soon as `serve_connection` hands it the cancel signal.
+    drop(alive);
+    let _ = all_connections_ended.recv().await;
     Ok(())
+}
+
+/// Serve one accepted connection to completion, giving it the retirement
+/// signal its protocol can actually carry.
+///
+/// The two versions are dispatched here rather than left to
+/// `hyper_util`'s auto builder because they retire at different moments,
+/// and the difference is a deliberate one:
+///
+/// * **HTTP/2 is retired when the drain STARTS**, with GOAWAY. hyper
+///   sends RFC 9113 §6.8's two-phase form — an advisory
+///   `GOAWAY(2^31-1)`, a PING, then a second GOAWAY naming the last
+///   stream it actually processed. The peer finishes the streams it had
+///   already dispatched and opens no new ones, and nothing closes until
+///   they are done, so there is no race with a request in flight. It is
+///   the only in-band retirement signal h2 has: RFC 9113 §8.2.2 forbids
+///   `Connection: close`, and before this the gateway had no way to send
+///   one during a drain (AISIX-Cloud#1395).
+/// * **HTTP/1.1 is retired in band**, by `Connection: close` on the
+///   responses served during the drain
+///   (`aisix_proxy::retire_connection`), and hears nothing here until
+///   the drain ENDS. hyper retires an h1 connection by disabling
+///   keep-alive, which closes an IDLE one at once — a server-initiated
+///   close of a pooled connection, where a client dispatching onto it in
+///   that same instant loses the request. AISIX-Cloud#1394 ruled that
+///   out: a long connection is the client's to close, and the server's
+///   job is only to say so.
+async fn serve_connection<I, S>(
+    io: I,
+    version: Downstream,
+    service: S,
+    http1: &hyper::server::conn::http1::Builder,
+    http2: &hyper::server::conn::http2::Builder<hyper_util::rt::TokioExecutor>,
+    mut shutdown: ShutdownWatch,
+    label: &'static str,
+) where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tower::Service<
+            axum::http::Request<hyper::body::Incoming>,
+            Response = axum::http::Response<axum::body::Body>,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+{
+    let io = hyper_util::rt::TokioIo::new(io);
+    let service = hyper_util::service::TowerToHyperService::new(service);
+
+    let served = match version {
+        Downstream::Http1 => {
+            // `with_upgrades` keeps the WebSocket surfaces (`/v1/realtime`)
+            // working: hyper cannot upgrade a connection it does not own.
+            let conn = http1.serve_connection(io, service).with_upgrades();
+            tokio::pin!(conn);
+            let mut retired = false;
+            loop {
+                tokio::select! {
+                    served = conn.as_mut() => break served.map_err(|e| e.to_string()),
+                    _ = shutdown.cancelled(), if !retired => {
+                        conn.as_mut().graceful_shutdown();
+                        retired = true;
+                    }
+                }
+            }
+        }
+        Downstream::Http2 => {
+            // Needs h2 >= 0.4.14. A peer that answers our GOAWAY with one
+            // of its own — Node's HTTP/2 client does, on any graceful
+            // GOAWAY — sends `last_stream_id: 0`, because a client's
+            // last-stream-id speaks only for server-PUSHED streams.
+            // Before hyperium/h2#886 the server applied it to every
+            // stream in the store, so the reciprocal frame reset each
+            // request still running on the connection: the drain would
+            // kill exactly the in-flight work it exists to protect.
+            // Pinned by the `graceful-drain-h2` e2e spec, which fails
+            // against 0.4.13.
+            let conn = http2.serve_connection(io, service);
+            tokio::pin!(conn);
+            let mut retired = false;
+            loop {
+                tokio::select! {
+                    served = conn.as_mut() => break served.map_err(|e| e.to_string()),
+                    _ = shutdown.retire_or_cancel(), if !retired => {
+                        conn.as_mut().graceful_shutdown();
+                        retired = true;
+                    }
+                }
+            }
+        }
+    };
+
+    if let Err(e) = served {
+        // A downstream that hangs up mid-request lands here, which is
+        // ordinary traffic rather than a fault.
+        tracing::debug!(label, error = %e, "downstream connection ended");
+    }
 }
 
 /// Serve from `workers` independent threads, each with its own runtime
@@ -1805,9 +2142,9 @@ async fn serve_http(
 async fn serve_http_tpc(
     addr: std::net::SocketAddr,
     router: axum::Router,
-    tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
     idle_timeout: Option<Duration>,
-    cancel: watch::Receiver<bool>,
+    shutdown: ShutdownWatch,
     label: &'static str,
     workers: usize,
     drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
@@ -1832,7 +2169,6 @@ async fn serve_http_tpc(
     for _ in 0..workers {
         let listener = bind_reuseport_listener(addr)
             .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?;
-        listener.set_nonblocking(true)?;
         listeners.push(listener);
     }
 
@@ -1840,8 +2176,8 @@ async fn serve_http_tpc(
     let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel::<anyhow::Result<()>>(workers);
     for (worker, listener) in listeners.into_iter().enumerate() {
         let router = router.clone();
-        let cancel = cancel.clone();
-        let tls_config = tls_config.clone();
+        let shutdown = shutdown.clone();
+        let tls = tls.clone();
         let exit_tx = exit_tx.clone();
         // Every worker raises and lowers the same process-wide count, so
         // the drain heartbeat reports the listener as a whole rather than
@@ -1861,9 +2197,9 @@ async fn serve_http_tpc(
                     addr,
                     listener,
                     router,
-                    tls_config,
+                    tls,
                     idle_timeout,
-                    cancel,
+                    shutdown,
                     label,
                     worker,
                     drain,
@@ -1882,7 +2218,7 @@ async fn serve_http_tpc(
     // loop failing, a panic unwinding, or a worker stopping without a
     // shutdown signal has to bring the process down rather than leave it
     // serving on fewer listeners than it reported binding.
-    let shutdown_seen = cancel;
+    let shutdown_seen = shutdown.cancel;
     tokio::task::spawn_blocking(move || {
         for _ in 0..workers {
             match exit_rx.recv() {
@@ -1930,9 +2266,9 @@ fn run_tpc_worker(
     addr: std::net::SocketAddr,
     listener: std::net::TcpListener,
     router: axum::Router,
-    tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
     idle_timeout: Option<Duration>,
-    cancel: watch::Receiver<bool>,
+    shutdown: ShutdownWatch,
     label: &'static str,
     worker: usize,
     drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
@@ -1945,37 +2281,15 @@ fn run_tpc_worker(
     // it. Marked inside the worker because the marker is per thread.
     aisix_gateway::upstream_tls::mark_worker_thread();
     rt.block_on(async move {
-        let handle = axum_server::Handle::new();
-        tokio::spawn({
-            let handle = handle.clone();
-            async move {
-                shutdown_signal(cancel, label).await;
-                // `None` = drain without a deadline, as on the shared
-                // runtime: an in-flight LLM stream can run for minutes.
-                handle.graceful_shutdown(None);
-            }
-        });
-
-        let make_service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
-        match tls_config {
+        match tls {
             None => {
-                tracing::info!(%addr, label, worker, "aisix listening (http, thread-per-core)");
-                let mut server = axum_server::from_tcp(listener)
-                    .acceptor(CountedAcceptor::new(DOWNSTREAM_NODELAY, drain))
-                    .handle(handle);
-                apply_idle_timeout(server.http_builder(), idle_timeout);
-                server.serve(make_service).await?;
+                tracing::info!(%addr, label, worker, "aisix listening (http, thread-per-core)")
             }
-            Some(tls_config) => {
-                tracing::info!(%addr, label, worker, "aisix listening (https, thread-per-core)");
-                let mut server = axum_server::from_tcp_rustls(listener, tls_config)
-                    .map(|tls| tls.acceptor(CountedAcceptor::new(DOWNSTREAM_NODELAY, drain)))
-                    .handle(handle);
-                apply_idle_timeout(server.http_builder(), idle_timeout);
-                server.serve(make_service).await?;
+            Some(_) => {
+                tracing::info!(%addr, label, worker, "aisix listening (https, thread-per-core)")
             }
         }
-        Ok(())
+        accept_loop(listener, router, tls, idle_timeout, shutdown, label, drain).await
     })
 }
 
@@ -2012,44 +2326,6 @@ fn bind_reuseport_listener(addr: std::net::SocketAddr) -> std::io::Result<std::n
     }
 }
 
-/// Close an accepted HTTP/1.1 connection that sits idle for `idle_timeout`.
-///
-/// hyper arms this timer only when it is waiting for a request head, and
-/// it only waits for one once the previous response has been fully written
-/// (`Conn::can_read_head` requires the read half to be back at `Init`,
-/// which `try_keep_alive` reaches only when reading *and* writing are
-/// done). So a slow model or a long SSE stream is never interrupted — the
-/// timer covers exactly the between-requests window.
-///
-/// hyper defaults this to 30s but drops the default unless a timer is
-/// installed, and neither axum nor axum_server installs one — which is why
-/// the gateway held idle connections forever before this.
-///
-/// HTTP/2 has no equivalent knob in hyper; h2 connections are unaffected.
-fn apply_idle_timeout(
-    builder: &mut hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>,
-    idle_timeout: Option<Duration>,
-) {
-    if let Some(d) = idle_timeout {
-        builder
-            .http1()
-            .timer(hyper_util::rt::TokioTimer::new())
-            .header_read_timeout(d);
-    }
-}
-
-async fn shutdown_signal(mut cancel: watch::Receiver<bool>, label: &'static str) {
-    loop {
-        if *cancel.borrow() {
-            tracing::info!(label, "shutdown signal observed — stopping listener");
-            return;
-        }
-        if cancel.changed().await.is_err() {
-            return;
-        }
-    }
-}
-
 /// How often the drain loop re-reads the in-flight count once the
 /// minimum window has elapsed.
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -2061,6 +2337,7 @@ const DRAIN_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 async fn wait_for_signal(
     cancel_tx: watch::Sender<bool>,
+    retire_tx: watch::Sender<bool>,
     livez_state: std::sync::Arc<aisix_proxy::LivezState>,
     min_drain: Duration,
 ) {
@@ -2092,6 +2369,12 @@ async fn wait_for_signal(
     // check, and closing the listener before then refuses every
     // connection it routes in between.
     livez_state.mark_shutting_down();
+    // Retirement rides the same moment. An HTTP/1.1 connection is
+    // retired in band, on the next response it carries; an HTTP/2 one
+    // has no such header (RFC 9113 §8.2.2) and gets its GOAWAY here,
+    // which asks the peer to finish the streams it has and open no new
+    // ones without closing anything (AISIX-Cloud#1395).
+    let _ = retire_tx.send(true);
     tracing::info!(
         min_drain_secs = min_drain.as_secs(),
         in_flight = livez_state.in_flight(),
@@ -2574,69 +2857,146 @@ models:
         );
     }
 
-    /// The acceptor has to leave `TCP_NODELAY` set on the socket the
-    /// gateway will write responses to. Asserted against a real accepted
-    /// connection, including that the option is off beforehand — the
-    /// default this exists to change.
-    #[tokio::test]
-    async fn the_downstream_acceptor_sets_tcp_nodelay() {
-        use axum_server::accept::Accept;
+    /// One accept path, and it has to keep setting `TCP_NODELAY`.
+    ///
+    /// This stays a source probe because the option is invisible from
+    /// outside: a listener wired without it serves correctly, benchmarks
+    /// identically, and only pays the delayed-ACK tax on streamed
+    /// responses. One accept path is what makes that cheap to guard, so
+    /// the invariant is that there is still only one — a second would be
+    /// a second place to forget the option, the connection count and the
+    /// version sniff.
+    #[test]
+    fn the_gateway_has_one_accept_path_and_it_sets_tcp_nodelay() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .expect("production half");
 
+        let sites: Vec<usize> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("listener.accept()"))
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(
+            sites.len(),
+            1,
+            "expected exactly one accept site, found {}. A second one is a \
+             second place TCP_NODELAY, the connection count and the version \
+             sniff can be forgotten; fold it into `accept_loop` instead",
+            sites.len(),
+        );
+
+        let armed: Vec<usize> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("set_nodelay(true)"))
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(
+            armed.len(),
+            1,
+            "expected exactly one TCP_NODELAY site, found {}",
+            armed.len(),
+        );
+        assert!(
+            sites[0] < armed[0],
+            "TCP_NODELAY must be set on the socket this accept produced",
+        );
+
+        // And on the accept path itself, not inside the connection task:
+        // a socket handed off before the option is set would serve a
+        // request or two with Nagle still on.
+        let lines: Vec<&str> = production.lines().collect();
+        let between = lines[sites[0]..armed[0]].join(" ");
+        assert!(
+            !between.contains("tokio::spawn("),
+            "TCP_NODELAY must be set before the connection is handed to a task",
+        );
+    }
+
+    /// The preface decides, and the bytes it consumed have to come back.
+    /// A sniff that swallowed them would leave hyper reading an HTTP/2
+    /// connection that starts four bytes in.
+    #[tokio::test]
+    async fn sniffing_recognises_the_http2_preface_and_replays_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("local addr");
-        let _client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client.write_all(PREFACE).await.expect("write preface");
         let (accepted, _peer) = listener.accept().await.expect("accept");
 
-        assert!(
-            !accepted.nodelay().expect("read nodelay"),
-            "a plain accepted socket is expected to have Nagle on; if the \
-             platform default changed, this test no longer proves anything",
-        );
-        let (accepted, ()) = DOWNSTREAM_NODELAY
-            .accept(accepted, ())
+        let (version, mut stream) = sniff_downstream_version(accepted, None)
             .await
-            .expect("accept");
-        assert!(accepted.nodelay().expect("read nodelay"));
+            .expect("sniff");
+        assert_eq!(version, Downstream::Http2);
+
+        let mut seen = vec![0u8; PREFACE.len()];
+        stream
+            .read_exact(&mut seen)
+            .await
+            .expect("replayed preface");
+        assert_eq!(
+            seen, PREFACE,
+            "hyper must still see the connection from byte zero"
+        );
     }
 
-    /// The slot has to be released with the stream. Nothing else checks
-    /// it: every drain assertion is "at least one", so a guard that
-    /// outlived its connection would keep them all green while the count
-    /// climbed for the life of the process.
+    /// The HTTP/1.1 side of the same contract.
     #[tokio::test]
-    async fn the_counted_acceptor_releases_the_slot_when_the_stream_drops() {
-        use axum_server::accept::Accept;
+    async fn sniffing_falls_back_to_http1_and_replays_what_it_read() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let livez = std::sync::Arc::new(aisix_proxy::LivezState::new());
+        const HEAD: &[u8] = b"GET /livez HTTP/1.1\r\n\r\n";
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client.write_all(HEAD).await.expect("write head");
+        let (accepted, _peer) = listener.accept().await.expect("accept");
+
+        let (version, mut stream) = sniff_downstream_version(accepted, None)
+            .await
+            .expect("sniff");
+        assert_eq!(version, Downstream::Http1);
+
+        let mut seen = vec![0u8; HEAD.len()];
+        stream.read_exact(&mut seen).await.expect("replayed head");
+        assert_eq!(seen, HEAD);
+    }
+
+    /// A peer that opens a connection and closes it without speaking
+    /// must not be read as HTTP/2, and must not hang the task.
+    #[tokio::test]
+    async fn sniffing_treats_an_empty_connection_as_http1() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let client = tokio::net::TcpStream::connect(addr).await.expect("connect");
         let (accepted, _peer) = listener.accept().await.expect("accept");
-
-        let acceptor = CountedAcceptor::new(DOWNSTREAM_NODELAY, Some(livez.clone()));
-        let (stream, ()) = acceptor.accept(accepted, ()).await.expect("accept");
-        assert_eq!(livez.open_connections(), 1);
-
-        drop(stream);
-        assert_eq!(
-            livez.open_connections(),
-            0,
-            "the slot must go back when the connection task drops the stream",
-        );
         drop(client);
+
+        let (version, _stream) = sniff_downstream_version(accepted, None)
+            .await
+            .expect("sniff");
+        assert_eq!(version, Downstream::Http1);
     }
 
-    /// A listener that counts nothing must still accept: the admin and
-    /// metrics surfaces pass `None`, and a panic or a miscount there would
-    /// take down control traffic for a number nobody reads.
+    /// A peer that connects and then says nothing holds a connection
+    /// slot. hyper's own version read has no timer, so this is the one
+    /// place the configured idle timeout can bound it
+    /// (AISIX-Cloud#1126).
     #[tokio::test]
-    async fn the_counted_acceptor_is_a_passthrough_without_a_drain_state() {
-        use axum_server::accept::Accept;
-
+    async fn sniffing_gives_up_on_a_peer_that_sends_nothing() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind");
@@ -2644,74 +3004,375 @@ models:
         let _client = tokio::net::TcpStream::connect(addr).await.expect("connect");
         let (accepted, _peer) = listener.accept().await.expect("accept");
 
-        let acceptor = CountedAcceptor::new(DOWNSTREAM_NODELAY, None);
-        let (stream, ()) = acceptor.accept(accepted, ()).await.expect("accept");
-        // The acceptor still has to do the job it wraps.
-        assert!(stream.inner.nodelay().expect("read nodelay"));
+        let err = match sniff_downstream_version(accepted, Some(Duration::from_millis(50))).await {
+            Ok(_) => panic!("a silent peer must not be waited on forever"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 
-    /// Four listeners are served — HTTP and HTTPS, on the shared runtime
-    /// and on each thread-per-core worker — and a fifth is one config
-    /// surface away. A listener wired without the acceptor fails in the
-    /// way nothing catches: it serves correctly, benchmarks identically,
-    /// and only pays the delayed-ACK tax on streamed responses.
-    ///
-    /// The TLS sites also have to wire it with `map`, not `acceptor`:
-    /// `Server::acceptor` *replaces* the acceptor, so
-    /// `from_tcp_rustls(..).acceptor(DOWNSTREAM_NODELAY)` compiles, drops
-    /// the rustls acceptor, and serves plaintext on the TLS port — while
-    /// satisfying a check that only looks for the constant's name.
-    #[test]
-    fn every_listener_sets_tcp_nodelay() {
-        let src = include_str!("main.rs");
-        let production = src
-            .split("\n#[cfg(test)]\nmod ")
-            .next()
-            .expect("production half");
-        // Spelled out at the call site rather than imported, so this
-        // probe sees every listener. (`use axum_server::…` in production
-        // would hide one from it.)
-        assert!(
-            !production.contains("use axum_server::"),
-            "importing the listener constructor hides the site from this \
-             check; call it as `axum_server::from_tcp…` instead",
-        );
-        let lines: Vec<&str> = production.lines().collect();
+    /// The replay has to survive a reader that takes fewer bytes than
+    /// are buffered — hyper reads into whatever buffer it has.
+    #[tokio::test]
+    async fn rewind_replays_across_short_reads() {
+        use tokio::io::AsyncReadExt;
 
-        let mut sites = 0;
-        let mut offenders = Vec::new();
-        for (n, line) in lines.iter().enumerate() {
-            if !(line.contains("axum_server::from_tcp") || line.contains("axum_server::bind")) {
-                continue;
-            }
-            sites += 1;
-            // The acceptor is wired in the same statement, which the
-            // formatter keeps within the next two lines.
-            let statement = lines[n..(n + 3).min(lines.len())].join(" ");
-            if !statement.contains("DOWNSTREAM_NODELAY") {
-                offenders.push(format!("main.rs:{}: no TCP_NODELAY acceptor", n + 1));
-            } else if line.contains("_rustls") && !statement.contains(".map(") {
-                offenders.push(format!(
-                    "main.rs:{}: TLS listener must slot the acceptor under rustls with \
-                     `.map(|tls| tls.acceptor(DOWNSTREAM_NODELAY))`; `.acceptor(..)` \
-                     replaces the rustls acceptor and serves plaintext",
-                    n + 1
-                ));
-            }
+        let (mut client, server) = tokio::io::duplex(64);
+        tokio::io::AsyncWriteExt::write_all(&mut client, b"XYZ")
+            .await
+            .expect("write tail");
+        drop(client);
+
+        let mut stream = Rewind::new(b"PRI ".to_vec(), server);
+        let mut all = Vec::new();
+        let mut one = [0u8; 1];
+        while stream.read(&mut one).await.expect("read") == 1 {
+            all.push(one[0]);
         }
+        assert_eq!(all, b"PRI XYZ");
+    }
+
+    /// A listener running the real `accept_loop`, plus the two levers a
+    /// shutdown pulls: `retire` at the start of the drain, `cancel` at
+    /// the end.
+    struct DrainHarness {
+        addr: std::net::SocketAddr,
+        retire: watch::Sender<bool>,
+        cancel: watch::Sender<bool>,
+        serving: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    async fn drain_harness() -> DrainHarness {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let (retire, retire_rx) = watch::channel(false);
+        let (cancel, cancel_rx) = watch::channel(false);
+        let router = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .route(
+                "/slow",
+                axum::routing::get(|| async {
+                    tokio::time::sleep(Duration::from_millis(1_500)).await;
+                    "ok"
+                }),
+            );
+        let serving = tokio::spawn(accept_loop(
+            listener,
+            router,
+            None,
+            None,
+            ShutdownWatch {
+                retire: retire_rx,
+                cancel: cancel_rx,
+            },
+            "test",
+            None,
+        ));
+        DrainHarness {
+            addr,
+            retire,
+            cancel,
+            serving,
+        }
+    }
+
+    async fn get_ok<B>(sender: &mut hyper::client::conn::http1::SendRequest<B>) -> hyper::Result<()>
+    where
+        B: hyper::body::Body + Default + Send + 'static + Unpin,
+        B::Data: Send,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        use http_body_util::BodyExt;
+        let response = sender
+            .send_request(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(B::default())
+                    .expect("request"),
+            )
+            .await?;
+        assert_eq!(response.status(), 200);
+        // An HTTP/1.1 connection cannot carry the next request until the
+        // previous body is read off it.
+        response.into_body().collect().await?;
+        Ok(())
+    }
+
+    /// The whole of AISIX-Cloud#1395: an HTTP/2 downstream is told to
+    /// retire when the drain STARTS, not when the listener finally
+    /// closes. Asserted against a real hyper client, because GOAWAY is
+    /// only observable as a peer: the connection future resolves once
+    /// the frame lands and the streams it permits are done.
+    #[tokio::test]
+    async fn an_http2_downstream_is_retired_when_the_drain_starts() {
+        use http_body_util::BodyExt;
+
+        let harness = drain_harness().await;
+        let tcp = tokio::net::TcpStream::connect(harness.addr)
+            .await
+            .expect("connect");
+        let (mut sender, conn) = hyper::client::conn::http2::handshake::<_, _, axum::body::Body>(
+            hyper_util::rt::TokioExecutor::new(),
+            hyper_util::rt::TokioIo::new(tcp),
+        )
+        .await
+        .expect("h2 handshake");
+        let driving = tokio::spawn(conn);
+
+        let response = sender
+            .send_request(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("first request");
+        assert_eq!(response.status(), 200);
+        response.into_body().collect().await.expect("body");
+
+        // A stream still running when the drain starts. GOAWAY asks the
+        // peer to open no NEW streams; RFC 9113 §6.8's second frame names
+        // this one as processed, so it has to be answered, not reset.
+        let slow = sender
+            .send_request(
+                axum::http::Request::builder()
+                    .uri("/slow")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await;
+
+        // The drain starts. The listener is NOT closed; the only thing
+        // that can reach this peer is a frame.
+        harness.retire.send(true).expect("retire");
+
+        let slow = slow.expect("in-flight response head");
+        assert_eq!(slow.status(), 200);
+        assert_eq!(
+            slow.into_body()
+                .collect()
+                .await
+                .expect("in-flight body")
+                .to_bytes(),
+            "ok".as_bytes(),
+            "GOAWAY must not cut off a stream it named as processed",
+        );
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), driving)
+            .await
+            .expect("the h2 connection must end after GOAWAY, not hang until the listener closes")
+            .expect("join");
+        assert!(
+            ended.is_ok(),
+            "GOAWAY should end the connection cleanly, not error it: {ended:?}",
+        );
+
+        harness.cancel.send(true).expect("cancel");
+        let _ = tokio::time::timeout(Duration::from_secs(5), harness.serving).await;
+    }
+
+    /// The other half of the same decision. An HTTP/1.1 connection is
+    /// retired in band, by `Connection: close` on the responses it
+    /// carries — never by the server closing it. Disabling keep-alive
+    /// here would close an idle pooled connection, and a client
+    /// dispatching onto it in that instant loses the request
+    /// (AISIX-Cloud#1394).
+    #[tokio::test]
+    async fn an_http1_downstream_is_not_closed_when_the_drain_starts() {
+        let harness = drain_harness().await;
+        let tcp = tokio::net::TcpStream::connect(harness.addr)
+            .await
+            .expect("connect");
+        let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, axum::body::Body>(
+            hyper_util::rt::TokioIo::new(tcp),
+        )
+        .await
+        .expect("h1 handshake");
+        let driving = tokio::spawn(conn);
+
+        get_ok(&mut sender).await.expect("first request");
+
+        harness.retire.send(true).expect("retire");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        get_ok(&mut sender)
+            .await
+            .expect("the connection must still serve after the drain starts");
+        assert!(
+            !driving.is_finished(),
+            "h1 connection was closed by the server"
+        );
+
+        harness.cancel.send(true).expect("cancel");
+        let _ = tokio::time::timeout(Duration::from_secs(5), harness.serving).await;
+    }
+
+    /// Retiring connections must not take the listener with it. A
+    /// balancer only learns about the `/readyz` 503 on its next probe,
+    /// and everything it routes here in between still has to be served.
+    #[tokio::test]
+    async fn the_listener_keeps_accepting_after_the_drain_starts() {
+        let harness = drain_harness().await;
+        harness.retire.send(true).expect("retire");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let tcp = tokio::net::TcpStream::connect(harness.addr)
+            .await
+            .expect("a connection opened during the drain must be accepted");
+        let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, axum::body::Body>(
+            hyper_util::rt::TokioIo::new(tcp),
+        )
+        .await
+        .expect("h1 handshake");
+        let _driving = tokio::spawn(conn);
+        get_ok(&mut sender)
+            .await
+            .expect("a request arriving during the drain must be served");
+
+        harness.cancel.send(true).expect("cancel");
+        let _ = tokio::time::timeout(Duration::from_secs(5), harness.serving).await;
+    }
+
+    /// The listener staying open is only worth something if what it
+    /// accepts is actually served. A connection opened during the drain
+    /// is retired the moment it is accepted, because `retire` is already
+    /// true — so this asks the question that matters: does its FIRST
+    /// request still get an answer, or did retiring it refuse exactly
+    /// the traffic the open listener exists to take?
+    ///
+    /// RFC 9113 §6.8's two-phase form is what makes the answer yes. The
+    /// advisory `GOAWAY(2^31-1)` goes out first and explicitly allows
+    /// in-flight stream creation; the settled GOAWAY that bounds it only
+    /// follows a PING round trip. The request lands inside that window
+    /// and is one of the streams the second frame names as processed.
+    #[tokio::test]
+    async fn an_http2_connection_opened_during_the_drain_still_serves_its_request() {
+        use http_body_util::BodyExt;
+
+        let harness = drain_harness().await;
+        harness.retire.send(true).expect("retire");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let tcp = tokio::net::TcpStream::connect(harness.addr)
+            .await
+            .expect("a connection opened during the drain must be accepted");
+        let (mut sender, conn) = hyper::client::conn::http2::handshake::<_, _, axum::body::Body>(
+            hyper_util::rt::TokioExecutor::new(),
+            hyper_util::rt::TokioIo::new(tcp),
+        )
+        .await
+        .expect("h2 handshake");
+        let _driving = tokio::spawn(conn);
+
+        let response = sender
+            .send_request(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("a request arriving during the drain must be served");
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes(),
+            "ok".as_bytes(),
+        );
+
+        harness.cancel.send(true).expect("cancel");
+        let _ = tokio::time::timeout(Duration::from_secs(5), harness.serving).await;
+    }
+
+    /// And the end of the drain does close it, and does return — an
+    /// accept loop that outlived its cancel would hold the process up
+    /// until the platform killed it.
+    #[tokio::test]
+    async fn the_listener_stops_accepting_when_the_drain_ends() {
+        let harness = drain_harness().await;
+        let tcp = tokio::net::TcpStream::connect(harness.addr)
+            .await
+            .expect("connect");
+        let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, axum::body::Body>(
+            hyper_util::rt::TokioIo::new(tcp),
+        )
+        .await
+        .expect("h1 handshake");
+        let _driving = tokio::spawn(conn);
+        get_ok(&mut sender).await.expect("first request");
+
+        harness.cancel.send(true).expect("cancel");
+        let served = tokio::time::timeout(Duration::from_secs(5), harness.serving)
+            .await
+            .expect("accept_loop must return once the drain ends")
+            .expect("join");
+        assert!(served.is_ok(), "{served:?}");
 
         assert!(
-            sites >= 4,
-            "found {sites} listener construction sites, expected at least 4 — \
-             the probe no longer matches the code and this test proves nothing. \
-             If the listeners were deliberately consolidated, lower this count \
-             on purpose",
+            tokio::net::TcpStream::connect(harness.addr)
+                .await
+                .and_then(|s| s.peer_addr())
+                .is_err(),
+            "the listener must be closed once the drain has ended",
         );
-        assert!(
-            offenders.is_empty(),
-            "these listeners accept connections with Nagle left on, which \
-             delays streamed response frames; wire `DOWNSTREAM_NODELAY`:\n{}",
-            offenders.join("\n"),
+    }
+
+    /// The count is what tells an operator during a drain whether the
+    /// balancer has stopped routing here. Nothing else checks that the
+    /// slot comes back: every drain assertion is "at least one", so a
+    /// guard that outlived its connection would keep them all green
+    /// while the number climbed for the life of the process.
+    #[tokio::test]
+    async fn an_accepted_connection_holds_a_slot_until_its_task_ends() {
+        let livez = std::sync::Arc::new(aisix_proxy::LivezState::new());
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let (_retire, retire_rx) = watch::channel(false);
+        let (cancel, cancel_rx) = watch::channel(false);
+        let router = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let serving = tokio::spawn(accept_loop(
+            listener,
+            router,
+            None,
+            None,
+            ShutdownWatch {
+                retire: retire_rx,
+                cancel: cancel_rx,
+            },
+            "test",
+            Some(livez.clone()),
+        ));
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, axum::body::Body>(
+            hyper_util::rt::TokioIo::new(tcp),
+        )
+        .await
+        .expect("h1 handshake");
+        let driving = tokio::spawn(conn);
+        get_ok(&mut sender).await.expect("first request");
+        assert_eq!(livez.open_connections(), 1);
+
+        drop(sender);
+        let _ = driving.await;
+        for _ in 0..50 {
+            if livez.open_connections() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            livez.open_connections(),
+            0,
+            "the slot must go back when the connection's task ends",
         );
+
+        cancel.send(true).expect("cancel");
+        let _ = tokio::time::timeout(Duration::from_secs(5), serving).await;
     }
 }

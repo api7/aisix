@@ -41,7 +41,16 @@ async-trait = "0.1"
 
 # HTTP server
 axum = { version = "0.7", features = ["macros", "ws", "tracing", "multipart"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+# The gateway serves its own accept loop on hyper directly; see
+# `serve_http` in aisix-server for why neither `axum::serve` nor
+# `axum_server` can express what the listener has to do.
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+# Declared only to hold a floor: hyper asks for `h2 = "0.4.6"`, and
+# anything below 0.4.14 resets every in-flight request on a
+# connection whose peer answers our GOAWAY with one of its own —
+# see the HTTP/2 branch of `serve_connection`. No code names it.
+h2 = "0.4.19"
+tokio-rustls = "0.26"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "limit", "compression-gzip", "set-header"] }
 http = "1.2"

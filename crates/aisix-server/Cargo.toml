@@ -29,7 +29,12 @@ aisix-ratelimit = { path = "../aisix-ratelimit" }
 aisix-cache = { path = "../aisix-cache", features = ["redis"] }
 tokio.workspace = true
 axum.workspace = true
-axum-server.workspace = true
+hyper.workspace = true
+# Unused in code; carries the h2 floor the drain's GOAWAY depends on.
+h2.workspace = true
+tokio-rustls.workspace = true
+tower.workspace = true
+rustls-pemfile.workspace = true
 rustls.workspace = true
 clap.workspace = true
 config.workspace = true
@@ -51,10 +56,10 @@ x509-parser = "0.16"
 # without the feature today only because other dependencies happen to
 # enable it on the same socket2, which a version bump would end.
 socket2 = { version = "0.5", features = ["all"] }
-# Only for the hyper connection builder `axum_server::Server::http_builder()`
-# hands back — where `downstream.idle_timeout_secs` is applied. Same 0.1.x
-# axum-server itself depends on, so the builder types unify.
-hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+# `TokioIo`/`TokioExecutor`/`TokioTimer` and the tower->hyper service
+# bridge the accept loop needs. Version dispatch is the gateway's own
+# (`Downstream`), so `server-auto` is deliberately not enabled.
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 
 # jemalloc as the global allocator, only on the targets we ship and
 # bench (Linux glibc — the Docker image and both supported production
@@ -70,5 +75,9 @@ tikv-jemalloc-ctl = "0.6"
 
 [dev-dependencies]
 tempfile = "3"
+# An HTTP/2 client, so the accept loop's retirement behaviour can be
+# asserted against a real peer rather than inspected.
+hyper = { workspace = true, features = ["client"] }
+http-body-util.workspace = true
 wiremock = "0.6"
 tokio = { workspace = true, features = ["test-util"] }

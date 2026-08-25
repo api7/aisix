@@ -609,13 +609,11 @@ fn hold_until_body_done(response: Response, drain: DrainGuard) -> Response {
 /// this header's.
 ///
 /// HTTP/2 forbids this header (RFC 9113 §8.2.2 — it is connection-specific)
-/// and has no header in its place: the h2 retirement signal is GOAWAY, a
-/// connection-level frame. hyper emits one when the listener shuts down,
-/// which is after the drain, so an h2 downstream goes the whole window
-/// unsignalled. Emitting it at SIGTERM instead needs the hyper connection
-/// future, which `axum_server` owns internally and only retires together
-/// with the listener (AISIX-Cloud#1395) — nothing added to the response
-/// here can reach an h2 peer.
+/// and has no header in its place, so nothing added to the response here
+/// can reach an h2 peer. Its retirement signal is GOAWAY, a
+/// connection-level frame, and the listener sends it when the drain
+/// starts — see `serve_connection` in the aisix-server binary
+/// (AISIX-Cloud#1395).
 fn retire_connection(version: &axum::http::Version, response: &mut Response) {
     if *version == axum::http::Version::HTTP_2 || *version == axum::http::Version::HTTP_3 {
         return;
