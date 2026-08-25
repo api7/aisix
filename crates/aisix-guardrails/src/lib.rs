@@ -29,6 +29,7 @@ mod build;
 mod chain;
 #[cfg(any(feature = "azure-content-safety", feature = "aliyun-text-moderation"))]
 mod chunk;
+mod custom;
 mod index;
 mod keyword;
 #[cfg(feature = "lakera")]
@@ -94,13 +95,6 @@ pub(crate) async fn read_error_body_capped(mut resp: reqwest::Response) -> Strin
 /// body needs a different budget from one that logs a snippet of it: a snippet
 /// can stop anywhere, whereas a truncated body may simply not contain the field
 /// being looked for. See `aliyun::MAX_ERROR_BODY_PARSE_BYTES`.
-#[cfg(any(
-    feature = "azure-content-safety",
-    feature = "aliyun-text-moderation",
-    feature = "lakera",
-    feature = "openai-moderation",
-    feature = "presidio",
-))]
 pub(crate) async fn read_body_capped(resp: &mut reqwest::Response, cap: usize) -> String {
     let mut buf: Vec<u8> = Vec::new();
     while buf.len() < cap {

@@ -1515,6 +1515,138 @@
         "embedding_model"
       ],
       "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "description": "Screening by an operator-supplied script the gateway runs in a sandboxed engine, for a screening service that speaks its own protocol. The script can allow, block, or rewrite content. Applies on input, output, or both, including streaming output.",
+      "properties": {
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": false,
+          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
+        },
+        "kind": {
+          "description": "Guardrail provider type for screening by an operator-supplied script the gateway runs in a sandboxed engine.",
+          "enum": [
+            "custom"
+          ],
+          "type": "string"
+        },
+        "max_buffer_bytes": {
+          "default": 262144,
+          "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "max_memory_bytes": {
+          "default": 16777216,
+          "description": "Memory ceiling for the script engine, in bytes. A script that exceeds it is terminated and the hook's fail-open policy applies.",
+          "format": "uint64",
+          "maximum": 536870912.0,
+          "minimum": 1048576.0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "on_buffer_exceeded": {
+          "default": "fail_closed",
+          "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
+          "enum": [
+            "fail_closed",
+            "fail_open"
+          ],
+          "type": "string"
+        },
+        "output_fail_open": {
+          "default": false,
+          "description": "Fail-open policy for the output hook. When disabled (the default), a script failure blocks model output instead of releasing unscanned content. The input hook uses the top-level `fail_open` policy.",
+          "type": "boolean"
+        },
+        "script": {
+          "default": "",
+          "description": "The script source, as an ES module exporting `checkInput` and/or `checkOutput`. A hook whose function the module does not export is skipped, so a script may cover one direction only.\n\nDefaulted at the TYPE level and required by the strict write schema instead (AGENTS.md: never make a projected field required at the type level). A row the loader cannot deserialize is skipped whole, and a screening row that vanishes is a guardrail that stopped screening. An empty script is rejected at chain-build time, so such a row is reported rather than silently admitting everything it was meant to screen.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "secrets": {
+          "additionalProperties": {
+            "description": "Value the script reads as ctx.secrets under this name.",
+            "type": "string"
+          },
+          "description": "Values the script reads as `ctx.secrets.<NAME>`, for credentials the screening service requires. Stored encrypted and decrypted before projection; plaintext is held in memory only and is never logged.",
+          "type": "object"
+        },
+        "stream_processing_mode": {
+          "default": "window",
+          "description": "Streaming output moderation mode: sliding-window incremental release or whole-response hold-back.",
+          "enum": [
+            "window",
+            "buffer_full"
+          ],
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "description": "Wall-clock budget for one hook invocation, in milliseconds, covering the script's own execution and every call it makes. `fail_open` and `output_fail_open` govern the verdict when it elapses. Per-call timeouts within the budget are the script's own to set.",
+          "format": "uint32",
+          "maximum": 300000.0,
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "window_overlap_size": {
+          "default": 256,
+          "description": "Chars carried between windows so a span split across a boundary is still caught.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "window_size": {
+          "default": 10000,
+          "description": "Sliding-window size in characters for window mode.",
+          "format": "uint32",
+          "maximum": 10000.0,
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "script"
+      ],
+      "type": "object"
     }
   ],
   "properties": {

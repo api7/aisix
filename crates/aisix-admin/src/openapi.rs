@@ -2168,6 +2168,7 @@ fn add_variant_titles(doc: &mut Value) {
                 "OpenAI Moderation",
                 "Presidio",
                 "Semantic Screening",
+                "Custom Script",
             ],
         ),
         (
@@ -3090,6 +3091,7 @@ mod tests {
             ("openai_moderation", "OpenAI Moderation"),
             ("presidio", "Presidio"),
             ("semantic", "Semantic Screening"),
+            ("custom", "Custom Script"),
         ];
 
         let parsed: serde_json::Value =

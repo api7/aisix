@@ -82,6 +82,12 @@ lz4_flex = "0.11"
 # (api7/aisix#860).
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots", "gzip", "multipart"] }
 
+# kind=custom guardrail: the sandboxed engine that runs operator-supplied
+# screening scripts. Vendors quickjs-ng; `futures` makes Rust futures
+# awaitable from the script (that is how `fetch` works) and `parallel`
+# makes the runtime Send so a hook can run on any worker thread.
+rquickjs = { version = "0.12", features = ["futures", "parallel"] }
+
 # TLS. The root-store crates are direct dependencies because the
 # outbound paths that are not reqwest — the Realtime WebSocket — have to
 # assemble the same trust store by hand (aisix-gateway::upstream_tls).
