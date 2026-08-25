@@ -203,6 +203,41 @@ wiremock = "0.6"
 testcontainers = "0.28"
 tempfile = "3.13"
 
+# Full DWARF is the largest single thing in `target/` here: it is 83% of
+# every test binary, and `cargo test --workspace` links 44 of them. Line
+# tables keep what a failing test needs while costing much less to emit.
+# Measured on one worktree replaying four real commits off main, same
+# commands, only this setting varied:
+#
+#   debug = 2                 42.1 GiB target, 22.0 GiB of test bins
+#   debug = line-tables-only  19.8 GiB target,  8.3 GiB of test bins
+#
+# Timing was measured separately, since a single build run is noisy: a
+# clean `cargo test --workspace --no-run`, three runs per setting,
+# alternating so machine drift hits both equally, came out at a 92s
+# median (90-111s spread) against 70s (70s on every run). So 53% off the
+# tree and about a quarter off the wall clock -- emitting debuginfo
+# costs both, which is why the two move together rather than trading off.
+#
+# Panic backtraces keep file and line. On rustc 1.97.1 the frames came
+# out identical to `debug = 2`, column included, but treat only file and
+# line as durable -- the column is not something to rely on across a
+# toolchain bump.
+#
+# What line tables drop is variable inspection under gdb/lldb: a
+# breakpoint still stops and still reports its line, but `print x` finds
+# no symbol. Recover it for one build with the same escape hatch
+# [profile.release] documents below:
+#   CARGO_PROFILE_DEV_DEBUG=2 cargo test -p aisix-proxy
+#
+# Coverage survives this, but not for the reason [profile.coverage]
+# suggests: nothing passes `--profile coverage`, so `cargo llvm-cov`
+# builds under this profile too. It reads the `__llvm_covmap` section
+# that `-C instrument-coverage` emits, not DWARF, so line-level coverage
+# is unaffected -- the coverage gate passes on this commit.
+[profile.dev]
+debug = "line-tables-only"
+
 # Shipped binaries must stay profileable in the field (perf / cargo
 # flamegraph against the very build a user runs), so keep the symbol
 # table: function-level flame graphs cost ~10 MiB over stripped. DWARF
