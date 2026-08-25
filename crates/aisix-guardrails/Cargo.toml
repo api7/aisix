@@ -29,10 +29,14 @@ aws-credential-types = { workspace = true, optional = true }
 aws-smithy-async = { workspace = true, optional = true }
 aws-smithy-runtime-api = { workspace = true, optional = true }
 
-# kind=azure_content_safety guardrail (PRD-09c §6 P1). reqwest is the
-# HTTP client for the Prompt Shield API call; behind a default feature
-# so a slim build can opt out.
-reqwest = { workspace = true, optional = true }
+# HTTP client shared by every remote guardrail kind. Unconditional
+# because kind=custom is always compiled in and its host `fetch` needs it.
+reqwest.workspace = true
+
+# kind=custom guardrail: the sandboxed engine for operator-supplied
+# screening scripts. Always compiled in — a custom guardrail is not
+# something an operator can be asked to rebuild the gateway for.
+rquickjs.workspace = true
 
 # kind=aliyun_text_moderation guardrail (#603). The Aliyun green-cip
 # TextModerationPlus call is signed (RPC signature v1, HMAC-SHA1) and POSTed
@@ -63,9 +67,8 @@ bedrock = [
     # provider bridge's does.
     "aisix-gateway/aws",
 ]
-azure-content-safety = ["dep:reqwest"]
+azure-content-safety = []
 aliyun-text-moderation = [
-    "dep:reqwest",
     "dep:hmac",
     "dep:sha1",
     "dep:base64",
@@ -74,9 +77,9 @@ aliyun-text-moderation = [
 ]
 # kind=lakera / kind=openai_moderation / kind=presidio guardrails (#52).
 # Plain HTTP dispatchers over the shared reqwest client.
-lakera = ["dep:reqwest"]
-openai-moderation = ["dep:reqwest"]
-presidio = ["dep:reqwest"]
+lakera = []
+openai-moderation = []
+presidio = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

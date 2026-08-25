@@ -48,7 +48,8 @@ pub use ensemble::{EnsembleConfig, Judge, PanelMember};
 pub use guardrail::{
     AliyunAiGuardrailConfig, AliyunTextModerationConfig, AppliedGuardrail,
     AzureContentSafetyConfig, AzureContentSafetyTextModerationConfig, BedrockAWSCredentials,
-    BedrockConfig, BedrockLatencyMode, Guardrail, GuardrailAttachment, GuardrailEnforcedHit,
+    BedrockConfig, BedrockLatencyMode, CustomConfig, Guardrail, GuardrailAttachment,
+    GuardrailEnforcedHit,
     GuardrailExecution, GuardrailHookPoint, GuardrailKind, GuardrailMetricsSink,
     GuardrailMonitorHit, GuardrailScopeType, KeywordConfig, KeywordPattern, LakeraConfig,
     OpenaiModerationConfig, PiiConfig, PiiCustomPattern, PiiDetectorConfig, PresidioConfig,

@@ -43,6 +43,9 @@
 //!     detection-only block.
 //!   * `presidio` — self-hosted Presidio analyze→anonymize; per-entity
 //!     `mask`/`block` + selectable anonymize operator.
+//!   * `custom` — operator-supplied script run in a sandboxed engine in the
+//!     DP process; reaches a screening service that speaks its own protocol
+//!     without a separate adapter deployment. Detection-only.
 //!
 //! See `aisix-guardrails/src/keyword.rs` for the runtime semantics
 //! the snapshot is parsed into.
@@ -828,6 +831,94 @@ fn default_semantic_text_source() -> String {
     "user_messages".to_owned()
 }
 
+/// Config block for `kind: "custom"`. Runs an operator-supplied script in a
+/// sandboxed engine inside the gateway, so a screening service that speaks
+/// its own protocol can be reached without deploying a separate adapter.
+///
+/// The script is an ES module exporting `checkInput` and/or `checkOutput`.
+/// Each receives a context object and returns a verdict:
+///
+/// ```js
+/// export async function checkInput(ctx) {
+///   const resp = await fetch("https://screening.internal/scan", {
+///     method: "POST",
+///     headers: { "content-type": "application/json" },
+///     body: JSON.stringify({ text: ctx.text }),
+///   });
+///   const result = await resp.json();
+///   return result.verdict === "deny"
+///     ? { action: "block", reason_code: "policy" }
+///     : { action: "none" };
+/// }
+/// ```
+///
+/// This guardrail is detection-only and never rewrites content: rewriting is
+/// a synchronous path, and a script whose purpose is to call an external
+/// service cannot participate in it. Applies on input, output, or both,
+/// including streamed output.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
+pub struct CustomConfig {
+    /// The script source, as an ES module exporting `checkInput` and/or
+    /// `checkOutput`. A hook whose function the module does not export is
+    /// skipped, so a script may cover one direction only.
+    #[schemars(length(min = 1))]
+    pub script: String,
+    /// Values the script reads as `ctx.secrets.<NAME>`, for credentials the
+    /// screening service requires. Stored encrypted and decrypted before
+    /// projection; plaintext is held in memory only and is never logged.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub secrets: std::collections::BTreeMap<String, String>,
+    /// Wall-clock budget for one hook invocation, in milliseconds, covering
+    /// the script's own execution and every call it makes. `fail_open` and
+    /// `output_fail_open` govern the verdict when it elapses. Per-call
+    /// timeouts within the budget are the script's own to set.
+    #[serde(default = "default_custom_timeout_ms")]
+    #[schemars(range(min = 1, max = 300_000))]
+    pub timeout_ms: u32,
+    /// Memory ceiling for the script engine, in bytes. A script that exceeds
+    /// it is terminated and the hook's fail-open policy applies.
+    #[serde(default = "default_custom_max_memory_bytes")]
+    #[schemars(range(min = 1_048_576, max = 536_870_912u64))]
+    pub max_memory_bytes: u64,
+
+    // --- streaming-output controls (consumed by aisix-proxy build_sse_stream) ---
+    /// Streaming output moderation mode: sliding-window incremental release
+    /// or whole-response hold-back.
+    #[serde(default = "default_custom_stream_processing_mode")]
+    pub stream_processing_mode: String,
+    /// Sliding-window size in characters for window mode.
+    #[serde(default = "default_acs_window_size")]
+    #[schemars(range(min = 1, max = 10_000))]
+    pub window_size: u32,
+    /// Chars carried between windows so a span split across a boundary is still caught.
+    #[serde(default = "default_acs_window_overlap_size")]
+    pub window_overlap_size: u32,
+    /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.
+    #[serde(default = "default_acs_max_buffer_bytes")]
+    #[schemars(range(min = 1))]
+    pub max_buffer_bytes: u64,
+    /// Buffer-overflow policy for streamed output when the buffer cap is hit.
+    #[serde(default = "default_acs_on_buffer_exceeded")]
+    pub on_buffer_exceeded: String,
+    /// Fail-open policy for the output hook. When disabled (the default), a
+    /// script failure blocks model output instead of releasing unscanned
+    /// content. The input hook uses the top-level `fail_open` policy.
+    #[serde(default)]
+    pub output_fail_open: bool,
+}
+
+fn default_custom_timeout_ms() -> u32 {
+    5_000
+}
+
+fn default_custom_max_memory_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
+fn default_custom_stream_processing_mode() -> String {
+    "window".to_owned()
+}
+
 /// Provider discriminator. The kind drives which `*_config` block is
 /// expected. Serde's `tag = "kind"` keeps us honest at parse time.
 ///
@@ -891,6 +982,11 @@ pub enum GuardrailKind {
     /// Detection-only — never rewrites content. Applies on input,
     /// output, or both, including buffered streaming output.
     Semantic(SemanticConfig),
+    /// Screening by an operator-supplied script the gateway runs in a
+    /// sandboxed engine, for a screening service that speaks its own
+    /// protocol. Detection-only — never rewrites content. Applies on input,
+    /// output, or both, including streaming output.
+    Custom(CustomConfig),
 }
 
 impl GuardrailKind {
@@ -911,6 +1007,7 @@ impl GuardrailKind {
             GuardrailKind::OpenaiModeration(_) => "openai_moderation",
             GuardrailKind::Presidio(_) => "presidio",
             GuardrailKind::Semantic(_) => "semantic",
+            GuardrailKind::Custom(_) => "custom",
         }
     }
 }

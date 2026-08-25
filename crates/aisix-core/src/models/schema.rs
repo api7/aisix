@@ -1388,6 +1388,19 @@ pub fn guardrail_root_schema() -> Value {
                         }
                     }
                 }
+                "custom" => {
+                    set_property_enum(
+                        b,
+                        "stream_processing_mode",
+                        json!(["window", "buffer_full"]),
+                    );
+                    set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
+                    set_property_additional_properties_description(
+                        b,
+                        "secrets",
+                        "Value the script reads as ctx.secrets under this name.",
+                    );
+                }
                 _ => {}
             }
         }
@@ -1496,6 +1509,10 @@ fn guardrail_kind_description(kind: &str) -> Option<&'static str> {
         "semantic" => Some(
             "Guardrail provider type for embedding-similarity screening against \
              example texts, using an embedding-kind Model.",
+        ),
+        "custom" => Some(
+            "Guardrail provider type for screening by an operator-supplied \
+             script the gateway runs in a sandboxed engine.",
         ),
         _ => None,
     }

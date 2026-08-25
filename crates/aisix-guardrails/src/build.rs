@@ -465,6 +465,20 @@ fn build_one_inner(
             );
             Ok(Some(Arc::new(g)))
         }
+        GuardrailKind::Custom(cfg) => {
+            // Compiling here (rather than on the first request that hits
+            // the row) is what turns a script typo into a rejected
+            // resource the operator sees at save time. It parses only —
+            // nothing the operator wrote runs on the config-apply path.
+            let g = crate::custom::CustomGuardrail::new(
+                row.name.clone(),
+                cfg,
+                row.hook_point,
+                row.fail_open,
+            )
+            .map_err(BuildError::ScriptCompile)?;
+            Ok(Some(Arc::new(g)))
+        }
     }
 }
 
@@ -510,6 +524,11 @@ enum BuildError {
          treating row as disabled"
     )]
     EmbedderUnavailable,
+    /// A `kind: "custom"` row whose script does not compile. Carries the
+    /// engine's own message, which names the offending line and column, so
+    /// the operator sees the same diagnostic their editor would show.
+    #[error("custom guardrail script does not compile: {0}")]
+    ScriptCompile(crate::custom::CompileError),
 }
 
 /// `enforcement_mode: monitor` decorator. Runs the wrapped guardrail exactly
