@@ -30,6 +30,8 @@ aisix-cache = { path = "../aisix-cache", features = ["redis"] }
 tokio.workspace = true
 axum.workspace = true
 hyper.workspace = true
+# Unused in code; carries the h2 floor the drain's GOAWAY depends on.
+h2.workspace = true
 tokio-rustls.workspace = true
 tower.workspace = true
 rustls-pemfile.workspace = true

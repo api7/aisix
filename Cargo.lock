@@ -443,6 +443,7 @@ dependencies = [
  "clap",
  "config",
  "etcd-client",
+ "h2",
  "hostname",
  "http-body-util",
  "hyper",

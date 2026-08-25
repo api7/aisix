@@ -3234,6 +3234,61 @@ models:
         let _ = tokio::time::timeout(Duration::from_secs(5), harness.serving).await;
     }
 
+    /// The listener staying open is only worth something if what it
+    /// accepts is actually served. A connection opened during the drain
+    /// is retired the moment it is accepted, because `retire` is already
+    /// true — so this asks the question that matters: does its FIRST
+    /// request still get an answer, or did retiring it refuse exactly
+    /// the traffic the open listener exists to take?
+    ///
+    /// RFC 9113 §6.8's two-phase form is what makes the answer yes. The
+    /// advisory `GOAWAY(2^31-1)` goes out first and explicitly allows
+    /// in-flight stream creation; the settled GOAWAY that bounds it only
+    /// follows a PING round trip. The request lands inside that window
+    /// and is one of the streams the second frame names as processed.
+    #[tokio::test]
+    async fn an_http2_connection_opened_during_the_drain_still_serves_its_request() {
+        use http_body_util::BodyExt;
+
+        let harness = drain_harness().await;
+        harness.retire.send(true).expect("retire");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let tcp = tokio::net::TcpStream::connect(harness.addr)
+            .await
+            .expect("a connection opened during the drain must be accepted");
+        let (mut sender, conn) = hyper::client::conn::http2::handshake::<_, _, axum::body::Body>(
+            hyper_util::rt::TokioExecutor::new(),
+            hyper_util::rt::TokioIo::new(tcp),
+        )
+        .await
+        .expect("h2 handshake");
+        let _driving = tokio::spawn(conn);
+
+        let response = sender
+            .send_request(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("a request arriving during the drain must be served");
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes(),
+            "ok".as_bytes(),
+        );
+
+        harness.cancel.send(true).expect("cancel");
+        let _ = tokio::time::timeout(Duration::from_secs(5), harness.serving).await;
+    }
+
     /// And the end of the drain does close it, and does return — an
     /// accept loop that outlived its cancel would hold the process up
     /// until the platform killed it.

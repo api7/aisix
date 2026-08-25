@@ -68,6 +68,21 @@ function chatOverH2(session: http2.ClientHttp2Session): Promise<H2Response> {
   });
 }
 
+function getOverH2(session: http2.ClientHttp2Session, path: string): Promise<H2Response> {
+  return new Promise((resolve, reject) => {
+    const stream = session.request({ ":method": "GET", ":path": path });
+    let status = 0;
+    const chunks: Buffer[] = [];
+    stream.on("response", (headers) => {
+      status = Number(headers[":status"] ?? 0);
+    });
+    stream.on("data", (chunk: Buffer) => chunks.push(chunk));
+    stream.on("end", () => resolve({ status, body: Buffer.concat(chunks).toString() }));
+    stream.on("error", reject);
+    stream.end();
+  });
+}
+
 /** Resolves with the GOAWAY's last-stream-id, or rejects on timeout. */
 function goaway(session: http2.ClientHttp2Session, timeoutMs: number): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -189,12 +204,19 @@ describe("graceful drain e2e: an HTTP/2 downstream is retired with GOAWAY", () =
         during.once("connect", () => resolve());
         during.once("error", reject);
       });
-      during.close();
-      // Answered rather than refused is the point; 503 is what `/readyz`
-      // has been reporting since the signal.
-      const probe = await fetch(`${proxyUrl}/readyz`);
+
+      // And what it accepts has to be SERVED. This connection is retired
+      // the instant it is accepted, since the drain has already started —
+      // so its first request is the one that would be lost if retiring a
+      // connection meant refusing it. RFC 9113 §6.8's advisory
+      // `GOAWAY(2^31-1)` goes out first and explicitly allows in-flight
+      // stream creation, which is what makes this request land inside the
+      // window the settled GOAWAY then names as processed. A 503 is the
+      // answer `/readyz` owes during a drain; answered rather than
+      // refused is the point.
+      const probe = await getOverH2(during, "/readyz");
       expect(probe.status).toBe(503);
-      await probe.text();
+      during.close();
 
       // GOAWAY asks the peer to stop opening streams; it does not cut off
       // the ones already running.
