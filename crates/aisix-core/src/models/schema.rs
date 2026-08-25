@@ -1389,6 +1389,20 @@ pub fn guardrail_root_schema() -> Value {
                     }
                 }
                 "custom" => {
+                    // Required on the write path, defaulted in the type:
+                    // see the field's doc comment. A row saved without it
+                    // would be accepted here and then rejected by the
+                    // gateway, i.e. a configuration that screens nothing.
+                    match b.get_mut("required").and_then(Value::as_array_mut) {
+                        Some(list) => {
+                            if !list.iter().any(|v| v.as_str() == Some("script")) {
+                                list.push(json!("script"));
+                            }
+                        }
+                        None => {
+                            b.insert("required".to_string(), json!(["script"]));
+                        }
+                    }
                     set_property_enum(
                         b,
                         "stream_processing_mode",
@@ -4631,6 +4645,25 @@ mod tests {
     /// binding is pinned rather than merely the presence: comparing against
     /// [`guardrail_kind_description`] fails if a second source ever starts
     /// writing these, however plausible the sentence it writes.
+    #[test]
+    fn the_custom_branch_requires_a_script_on_the_write_path() {
+        // `script` defaults at the TYPE level so a projected row still
+        // loads, which means only the strict schema stands between a
+        // scriptless config and a guardrail the gateway will reject.
+        let schema = guardrail_root_schema();
+        let branch = schema["oneOf"]
+            .as_array()
+            .expect("the guardrail schema is a `oneOf` over the kinds")
+            .iter()
+            .find(|b| b["properties"]["kind"]["enum"][0] == "custom")
+            .expect("the custom branch exists");
+        let required: Vec<&str> = branch["required"]
+            .as_array()
+            .map(|l| l.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        assert!(required.contains(&"script"), "required = {required:?}");
+    }
+
     #[test]
     fn every_guardrail_kind_carries_its_own_description() {
         // Independent of the enum's declaration order, which is what a

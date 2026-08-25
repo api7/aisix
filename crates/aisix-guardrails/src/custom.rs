@@ -132,18 +132,23 @@ globalThis.console = {
   error: function () { __hostLog("error", __fmt(arguments)); },
   debug: function () { __hostLog("debug", __fmt(arguments)); },
 };
+const __unwrap = function (raw) {
+  const r = JSON.parse(raw);
+  if (r.error) { throw new Error(r.error); }
+  return r.value;
+};
 globalThis.crypto = {
   // key/out encodings are what make a signing CHAIN expressible: AWS SigV4
   // feeds each HMAC's raw output in as the next one's key, so the key has
   // to be acceptable as hex, not only as text.
   hmac: function (alg, key, data, outEncoding, keyEncoding) {
-    return __hostHmac(alg, String(key), keyEncoding || "utf8", String(data), outEncoding || "hex");
+    return __unwrap(__hostHmac(alg, String(key), keyEncoding || "utf8", String(data), outEncoding || "hex"));
   },
   hash: function (alg, data, outEncoding) {
-    return __hostHash(alg, String(data), outEncoding || "hex");
+    return __unwrap(__hostHash(alg, String(data), outEncoding || "hex"));
   },
-  base64Encode: function (data) { return __hostBase64("encode", String(data)); },
-  base64Decode: function (data) { return __hostBase64("decode", String(data)); },
+  base64Encode: function (data) { return __unwrap(__hostBase64("encode", String(data))); },
+  base64Decode: function (data) { return __unwrap(__hostBase64("decode", String(data))); },
   randomUUID: function () { return __hostUuid(); },
 };
 globalThis.aisix = {
@@ -696,7 +701,12 @@ fn install_host(
     let host_hmac = rquickjs::Function::new(
         ctx.clone(),
         |alg: String, key: String, key_encoding: String, data: String, out: String| {
-            hmac_hex(&alg, &key, &key_encoding, &data, &out).unwrap_or_default()
+            crypto_envelope(
+                hmac_hex(&alg, &key, &key_encoding, &data, &out),
+                format!(
+                    "crypto.hmac: unsupported alg {alg:?}, or a key that is not valid {key_encoding}"
+                ),
+            )
         },
     )
     .map_err(|_| ScriptFailure::Engine)?;
@@ -706,7 +716,10 @@ fn install_host(
 
     let host_hash =
         rquickjs::Function::new(ctx.clone(), |alg: String, data: String, out: String| {
-            hash_hex(&alg, data.as_bytes(), &out).unwrap_or_default()
+            crypto_envelope(
+                hash_hex(&alg, data.as_bytes(), &out),
+                format!("crypto.hash: unsupported alg {alg:?}"),
+            )
         })
         .map_err(|_| ScriptFailure::Engine)?;
     globals
@@ -716,12 +729,17 @@ fn install_host(
     let host_base64 = rquickjs::Function::new(ctx.clone(), |mode: String, data: String| {
         use base64::Engine as _;
         match mode.as_str() {
-            "decode" => base64::engine::general_purpose::STANDARD
-                .decode(data.as_bytes())
-                .ok()
-                .and_then(|b| String::from_utf8(b).ok())
-                .unwrap_or_default(),
-            _ => base64::engine::general_purpose::STANDARD.encode(data.as_bytes()),
+            "decode" => crypto_envelope(
+                base64::engine::general_purpose::STANDARD
+                    .decode(data.as_bytes())
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok()),
+                "crypto.base64Decode: not valid base64, or not valid UTF-8 once decoded".to_owned(),
+            ),
+            _ => crypto_envelope(
+                Some(base64::engine::general_purpose::STANDARD.encode(data.as_bytes())),
+                String::new(),
+            ),
         }
     })
     .map_err(|_| ScriptFailure::Engine)?;
@@ -761,6 +779,34 @@ fn install_host(
 /// HMAC over `data`, keyed by `key` read as `key_encoding`, rendered as
 /// `out`. The key encoding matters: a signing chain (AWS SigV4) uses one
 /// HMAC's raw output as the next one's key.
+/// Wrap a crypto result the way `fetch` and `embed` wrap theirs: the
+/// prelude turns an `error` envelope into a thrown exception.
+///
+/// Failing loudly matters more here than anywhere else in the host
+/// surface. A silent empty string is indistinguishable from a real digest,
+/// and in a signing chain it seeds the next step with an empty key and
+/// still produces a plausible-looking result.
+fn crypto_envelope(value: Option<String>, error: String) -> String {
+    let result = match value {
+        Some(v) => CryptoResult {
+            error: None,
+            value: v,
+        },
+        None => CryptoResult {
+            error: Some(error),
+            value: String::new(),
+        },
+    };
+    serde_json::to_string(&result).unwrap_or_else(|_| r#"{"error":"crypto failed"}"#.to_owned())
+}
+
+#[derive(serde::Serialize)]
+struct CryptoResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    value: String,
+}
+
 fn hmac_hex(alg: &str, key: &str, key_encoding: &str, data: &str, out: &str) -> Option<String> {
     use hmac::Mac;
     let key_bytes: Vec<u8> = match key_encoding {
@@ -1581,6 +1627,73 @@ mod tests {
             panic!("expected Block, got {verdict:?}");
         };
         assert!(reason.contains("too_large"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_crypto_failure_throws_instead_of_returning_an_empty_string() {
+        // An empty string would be indistinguishable from a real digest,
+        // and in a signing chain it seeds the next step with an empty key.
+        let cfg = config(
+            "export function checkInput() {
+               try {
+                 crypto.hmac('md5', 'k', 'data', 'hex');
+                 return { action: 'none' };
+               } catch (e) {
+                 return { action: 'block', reason_code: 'crypto_threw' };
+               }
+             }",
+        );
+        let verdict = guardrail(&cfg, false).check_input(&request("x")).await;
+        let GuardrailVerdict::Block { reason, .. } = verdict else {
+            panic!("expected Block, got {verdict:?}");
+        };
+        assert!(reason.contains("crypto_threw"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_bad_base64_decode_throws() {
+        let cfg = config(
+            "export function checkInput() {
+               try {
+                 crypto.base64Decode('!!!not base64!!!');
+                 return { action: 'none' };
+               } catch (e) {
+                 return { action: 'block', reason_code: 'b64_threw' };
+               }
+             }",
+        );
+        let verdict = guardrail(&cfg, false).check_input(&request("x")).await;
+        let GuardrailVerdict::Block { reason, .. } = verdict else {
+            panic!("expected Block, got {verdict:?}");
+        };
+        assert!(reason.contains("b64_threw"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn every_crypto_primitive_round_trips() {
+        // A positive assertion per primitive, because a host function that
+        // returns the wrong SHAPE still throws — which a test that only
+        // checks "it threw" reads as success.
+        let cfg = config(
+            "export function checkInput() {
+               const parts = [
+                 crypto.base64Decode(crypto.base64Encode('hello')),
+                 crypto.hash('sha256', 'abc', 'hex').slice(0, 8),
+                 crypto.hmac('sha1', 'k', 'd', 'base64').length > 0 ? 'hmac-ok' : 'hmac-empty',
+                 crypto.randomUUID().length === 36 ? 'uuid-ok' : 'uuid-bad',
+               ];
+               return { action: 'block', reason_code: parts.join('|') };
+             }",
+        );
+        let verdict = guardrail(&cfg, false).check_input(&request("x")).await;
+        let GuardrailVerdict::Block { reason, .. } = verdict else {
+            panic!("expected Block, got {verdict:?}");
+        };
+        // sha256("abc") starts with ba7816bf.
+        assert!(
+            reason.contains("hello|ba7816bf|hmac-ok|uuid-ok"),
+            "{reason}",
+        );
     }
 
     #[test]

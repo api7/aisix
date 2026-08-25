@@ -1643,7 +1643,8 @@
         }
       },
       "required": [
-        "kind"
+        "kind",
+        "script"
       ],
       "type": "object"
     }
