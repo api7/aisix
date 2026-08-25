@@ -197,6 +197,27 @@ wiremock = "0.6"
 testcontainers = "0.28"
 tempfile = "3.13"
 
+# Full DWARF is the largest single thing in `target/` here: it is 83% of
+# every test binary, and `cargo test --workspace` links 44 of them. Line
+# tables keep exactly what a failing test needs — panic backtraces stay
+# byte-for-byte identical, file:line:col included — and cost less to
+# emit, so the tree and the wall clock both halve. Measured on one
+# worktree replaying four real commits off main, same commands, only
+# this setting varied:
+#
+#   debug = 2                 42.1 GiB target, 22.0 GiB of test bins, 243s
+#   debug = line-tables-only  19.8 GiB target,  8.3 GiB of test bins, 171s
+#
+# What line tables drop is variable inspection under gdb/lldb. Recover it
+# for one build with the same escape hatch [profile.release] documents
+# below:
+#   CARGO_PROFILE_DEV_DEBUG=2 cargo test -p aisix-proxy
+#
+# [profile.coverage] sets `debug = 2` explicitly, so llvm-cov is
+# unaffected.
+[profile.dev]
+debug = "line-tables-only"
+
 # Shipped binaries must stay profileable in the field (perf / cargo
 # flamegraph against the very build a user runs), so keep the symbol
 # table: function-level flame graphs cost ~10 MiB over stripped. DWARF
