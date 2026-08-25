@@ -203,10 +203,14 @@ tempfile = "3.13"
 # Measured on one worktree replaying four real commits off main, same
 # commands, only this setting varied:
 #
-#   debug = 2                 42.1 GiB target, 22.0 GiB of test bins, 243s
-#   debug = line-tables-only  19.8 GiB target,  8.3 GiB of test bins, 171s
+#   debug = 2                 42.1 GiB target, 22.0 GiB of test bins
+#   debug = line-tables-only  19.8 GiB target,  8.3 GiB of test bins
 #
-# So 53% off the tree and 30% off the wall clock -- emitting debuginfo
+# Timing was measured separately, since a single build run is noisy: a
+# clean `cargo test --workspace --no-run`, three runs per setting,
+# alternating so machine drift hits both equally, came out at a 92s
+# median (90-111s spread) against 70s (70s on every run). So 53% off the
+# tree and about a quarter off the wall clock -- emitting debuginfo
 # costs both, which is why the two move together rather than trading off.
 #
 # Panic backtraces keep file and line. On rustc 1.97.1 the frames came
