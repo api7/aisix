@@ -105,6 +105,34 @@ fn downstream_request_id(headers: &axum::http::HeaderMap) -> Option<&str> {
 #[derive(Debug, Clone)]
 pub(crate) struct RequestId(pub String);
 
+/// The downstream protocol, as a bounded label for the request span.
+///
+/// It rides the span alongside `peer` because it is the same kind of
+/// fact — a property of the connection rather than of the request — and
+/// so reaches the access log, the per-attempt `provider call completed`
+/// line, and every diagnostic in between without 29 call sites having to
+/// thread it down.
+///
+/// It is worth a field because the two protocols retire differently
+/// during a drain, and an operator sizing
+/// `terminationGracePeriodSeconds` has to know which they have: an
+/// HTTP/1.1 connection retires itself through `Connection: close` as it
+/// is used, while an HTTP/2 one retires on the GOAWAY the listener sends
+/// when the drain starts (AISIX-Cloud#1395). Until this field existed
+/// nothing the gateway logged said which a deployment was seeing.
+///
+/// The set is closed, so it is safe as a metric label too.
+fn http_version_label(version: axum::http::Version) -> &'static str {
+    match version {
+        axum::http::Version::HTTP_09 => "0.9",
+        axum::http::Version::HTTP_10 => "1.0",
+        axum::http::Version::HTTP_11 => "1.1",
+        axum::http::Version::HTTP_2 => "2",
+        axum::http::Version::HTTP_3 => "3",
+        _ => "other",
+    }
+}
+
 /// Ingress+egress middleware that resolves the request id — the caller's
 /// own when they supplied one, a fresh UUID otherwise — and gives every
 /// proxied response an `x-aisix-request-id` header derived from the same id
@@ -159,6 +187,9 @@ pub(crate) struct RequestId(pub String);
 /// Both are recorded rather than declared, so a request that carried
 /// neither logs neither field instead of an empty one.
 ///
+/// `http_version` is the third, and it is always known, so it is
+/// declared. See [`http_version_label`] for why it is worth a field.
+///
 /// Response-body streams (SSE) are polled after this middleware returns,
 /// so they fall outside the span. Generators that moderate streamed
 /// output re-attach it explicitly — see `chat::build_sse_stream`.
@@ -191,6 +222,7 @@ pub(crate) async fn ensure_request_id(
     let span = tracing::info_span!(
         "request",
         request_id = %id,
+        http_version = http_version_label(request.version()),
         peer = tracing::field::Empty,
         downstream_request_id = tracing::field::Empty,
     );
@@ -321,6 +353,18 @@ mod tests {
     use axum::Router;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    /// The label is a metric-safe closed set, and the two versions that
+    /// actually reach the proxy listener have to be told apart — that is
+    /// the whole reason the field exists.
+    #[test]
+    fn http_version_labels_are_a_closed_set() {
+        assert_eq!(http_version_label(axum::http::Version::HTTP_11), "1.1");
+        assert_eq!(http_version_label(axum::http::Version::HTTP_2), "2");
+        assert_eq!(http_version_label(axum::http::Version::HTTP_10), "1.0");
+        assert_eq!(http_version_label(axum::http::Version::HTTP_09), "0.9");
+        assert_eq!(http_version_label(axum::http::Version::HTTP_3), "3");
+    }
 
     fn state_accepting(accept_headers: &[&str]) -> ProxyState {
         ProxyState::new(
