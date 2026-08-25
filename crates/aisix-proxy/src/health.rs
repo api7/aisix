@@ -143,46 +143,40 @@ pub fn config_readiness_block(last_apply_age: Option<Duration>) -> Option<&'stat
     }
 }
 
-pub fn livez_response(livez: &LivezState, verbose: bool) -> Response {
-    let mut body = String::new();
-    let mut failed = false;
-
-    body.push_str("[+]ping ok\n");
-    match livez.shutdown_check() {
-        Ok(()) => body.push_str("[+]shutdown ok\n"),
-        Err(_) => {
-            failed = true;
-            body.push_str("[-]shutdown failed: reason withheld\n");
-        }
-    }
-
+/// `GET /livez` — process liveness: should this instance be RESTARTED?
+///
+/// Answering at all is the check. The listener is bound and the runtime
+/// is servicing requests, which is the whole of what a liveness probe
+/// decides, so this never fails.
+///
+/// A draining instance answers `200` like any other. Draining is
+/// deliberate work, not a fault: an instance that has been told to shut
+/// down is finishing the requests it already accepted, and restarting it
+/// kills exactly those. That is what a failing liveness probe asks a
+/// platform to do, which is why "stop sending traffic here" belongs on
+/// [`readyz_response`] instead — the two questions are what separates
+/// the endpoints, and answering both with the drain state collapses them
+/// into one.
+///
+/// The platform is not the only caller that matters: the gateway also
+/// runs as a single container under docker or systemd, where a
+/// supervisor watching this endpoint would restart a healthy draining
+/// process mid-flight.
+///
+/// [`LivezState`] is deliberately not a parameter. The drain state is the
+/// one thing this answer must not depend on, and not taking it is a
+/// stronger guarantee than a comment saying so.
+pub fn livez_response(verbose: bool) -> Response {
     let headers = [
         (CONTENT_TYPE, TEXT_PLAIN_UTF8.clone()),
         (X_CONTENT_TYPE_OPTIONS.clone(), NOSNIFF.clone()),
     ];
 
-    if failed {
-        // Graceful shutdown is an expected drain, not an internal error —
-        // 503 so Kubernetes stops routing without treating it as a crash
-        // loop (#591).
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            headers,
-            format!("{body}livez check failed"),
-        )
-            .into_response();
-    }
-
     if !verbose {
         return (StatusCode::OK, headers, "ok").into_response();
     }
 
-    (
-        StatusCode::OK,
-        headers,
-        format!("{body}livez check passed\n"),
-    )
-        .into_response()
+    (StatusCode::OK, headers, "[+]ping ok\nlivez check passed\n").into_response()
 }
 
 /// `GET /readyz` — readiness (traffic eligibility), distinct from `/livez`
@@ -1188,8 +1182,7 @@ mod tests {
 
     #[tokio::test]
     async fn livez_default_success_is_plain_ok() {
-        let state = LivezState::new();
-        let resp = livez_response(&state, false);
+        let resp = livez_response(false);
 
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
@@ -1198,28 +1191,34 @@ mod tests {
 
     #[tokio::test]
     async fn livez_verbose_success_lists_checks() {
-        let state = LivezState::new();
-        let resp = livez_response(&state, true);
+        let resp = livez_response(true);
 
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.contains("[+]ping ok"));
-        assert!(text.contains("[+]shutdown ok"));
         assert!(text.contains("livez check passed"));
     }
 
+    /// A draining instance is healthy and must not be restarted:
+    /// restarting it kills the in-flight requests the drain exists to
+    /// finish. Liveness therefore stays `200` throughout, and it is
+    /// `/readyz` that withdraws the instance from traffic — the test
+    /// below pins the other half.
     #[tokio::test]
-    async fn livez_failure_returns_503_with_reason_withheld() {
+    async fn livez_stays_ok_while_draining() {
         let state = LivezState::new();
         state.mark_shutting_down();
-        let resp = livez_response(&state, false);
 
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
-        let text = std::str::from_utf8(&body).unwrap();
-        assert!(text.contains("[-]shutdown failed: reason withheld"));
-        assert!(text.contains("livez check failed"));
+        let resp = livez_response(false);
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let readyz = readyz_response(&state, None, false);
+        assert_eq!(
+            readyz.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the drain has to be visible somewhere, and readiness is where",
+        );
     }
 
     /// The count has to survive an unpaired decrement: it is reported on

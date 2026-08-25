@@ -11,7 +11,13 @@ describe("livez e2e: public liveness route is /livez and /health is gone", () =>
     if (!etcdReachable) return;
     // Held-back: this test drives the admin listener's health endpoint,
     // so it keeps admin bound (the suite default is now admin-off).
-    app = await spawnApp({ admin: true });
+    //
+    // A drain window is needed too. The harness default is
+    // `min_drain_secs: 0`, which lets the process exit within
+    // milliseconds of SIGTERM — leaving no interval in which to observe
+    // what the health endpoints report WHILE draining, which is the
+    // whole of what the last test asserts.
+    app = await spawnApp({ admin: true, extra: { shutdown: { min_drain_secs: 5 } } });
   });
 
   afterAll(async () => {
@@ -90,7 +96,21 @@ describe("livez e2e: public liveness route is /livez and /health is gone", () =>
     expect(await adminReadyz.body.text()).toBe("ok");
   });
 
-  test("proxy /livez turns unhealthy after SIGTERM before exit", async (ctx) => {
+  // A drain withdraws traffic; it does not make the process a candidate
+  // for restarting. Those are the two different questions the two
+  // endpoints answer, and a drain has to move exactly one of them:
+  // `/readyz` reports it so the balancer stops routing here, `/livez`
+  // stays `200` because a failing liveness probe asks the platform to
+  // restart the instance — which would kill the very requests the drain
+  // is staying alive to finish.
+  //
+  // Kubernetes stops probing liveness once a pod enters graceful
+  // termination, so a rolling update does not act on the answer. That
+  // makes this a contract about the endpoint rather than about kubelet,
+  // and it is not academic: the gateway also runs as a single container
+  // under docker or systemd, where a supervisor watching `/livez` does
+  // act on it.
+  test("a drain moves /readyz to 503 and leaves /livez at 200", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
       return;
@@ -98,25 +118,31 @@ describe("livez e2e: public liveness route is /livez and /health is gone", () =>
 
     app.signal("SIGTERM");
 
-    const deadline = Date.now() + 3000;
-    let observedUnhealthy = false;
+    // Gate on readiness having withdrawn rather than on a sleep: it
+    // proves the drain has actually begun AND that the process is still
+    // serving, which is the window the liveness assertion below is
+    // about. The default `shutdown.min_drain_secs` is 30, so the window
+    // is wide.
+    const deadline = Date.now() + 5000;
+    let draining = false;
     while (Date.now() < deadline) {
-      try {
-        const res = await harnessRequest(`${app.proxyUrl}/livez`, { method: "GET" });
-        if (res.statusCode !== 200) {
-          observedUnhealthy = true;
-          await res.body.dump();
-          break;
-        }
-        await res.body.dump();
-      } catch {
-        observedUnhealthy = true;
+      const res = await harnessRequest(`${app.proxyUrl}/readyz`, { method: "GET" });
+      const status = res.statusCode;
+      await res.body.dump();
+      if (status === 503) {
+        draining = true;
         break;
       }
       await new Promise((r) => setTimeout(r, 50));
     }
+    expect(draining, "/readyz never reported 503 after SIGTERM").toBe(true);
 
-    expect(observedUnhealthy).toBe(true);
-    app = undefined;
+    for (const url of [`${app.proxyUrl}/livez`, `${app.adminUrl}/livez`]) {
+      const res = await harnessRequest(url, { method: "GET" });
+      const status = res.statusCode;
+      const body = await res.body.text();
+      expect(status, `${url} must stay live while draining`).toBe(200);
+      expect(body).toBe("ok");
+    }
   });
 });

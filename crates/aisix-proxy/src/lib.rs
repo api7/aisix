@@ -1010,11 +1010,13 @@ fn warn_allowed(outcome: DrainOutcome) -> bool {
     true
 }
 
+/// Takes no [`ProxyState`]: liveness answers whether the process should
+/// be restarted, and nothing about the gateway's state changes that
+/// answer. See [`crate::health::livez_response`].
 async fn livez(
-    State(state): State<ProxyState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    crate::health::livez_response(&state.livez, params.contains_key("verbose"))
+    crate::health::livez_response(params.contains_key("verbose"))
 }
 
 async fn readyz(
@@ -1800,7 +1802,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn livez_returns_503_when_shutting_down() {
+    async fn livez_stays_200_when_shutting_down() {
         let hub = Arc::new(Hub::new());
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
         let state = build_state(snap, hub);
@@ -1814,10 +1816,12 @@ mod tests {
             .unwrap();
 
         let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
-        let text = std::str::from_utf8(&bytes).unwrap();
-        assert!(text.contains("livez check failed"));
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a draining process is healthy; failing liveness asks the platform \
+             to restart it, which kills the requests the drain is finishing",
+        );
     }
 
     #[tokio::test]
