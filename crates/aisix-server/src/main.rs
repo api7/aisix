@@ -242,24 +242,43 @@ async fn async_main(cfg: Config) -> anyhow::Result<()> {
 /// `aisix validate --resources <file>`: run the identical file-source
 /// pipeline (read → interpolate → desugar → canonical schema validation
 /// → typed decode → cross-reference checks) that boot and SIGHUP reload
-/// use, without booting any listener. Exit 0 on success; on failure the
+/// use, without booting any listener, then check that every enabled
+/// guardrail row actually builds. Exit 0 on success; on failure the
 /// aggregated error report (every problem, with kind / entry / field
 /// context) goes to stderr and the process exits non-zero.
 fn run_validate(resources: &Path) -> anyhow::Result<()> {
-    match aisix_core::filesource::load_resources_file(resources, 1) {
-        Ok(snapshot) => {
-            println!(
-                "OK: {} loaded {} resource(s)",
-                resources.display(),
-                snapshot.total_entries(),
-            );
-            Ok(())
-        }
+    let snapshot = match aisix_core::filesource::load_resources_file(resources, 1) {
+        Ok(snapshot) => snapshot,
         Err(report) => {
             eprintln!("{report}");
             std::process::exit(1);
         }
+    };
+    // Loading only proves the file parses. A guardrail row whose config
+    // does not build — an invalid regex, an unknown detector, a
+    // `kind: custom` script with a syntax error — is dropped from the
+    // chain with a warn line and nothing else: the gateway serves, the
+    // config status stays `synced` with an empty `rejected` list, and the
+    // screening that row describes never runs. Reporting OK for that
+    // would validate the file while missing the thing the file is for.
+    let unbuildable = aisix_guardrails::unbuildable_guardrail_rows(&snapshot.guardrails, None);
+    if !unbuildable.is_empty() {
+        eprintln!(
+            "resources file {}: {} guardrail(s) load but cannot run:",
+            resources.display(),
+            unbuildable.len(),
+        );
+        for row in &unbuildable {
+            eprintln!("  - guardrails ({:?}): {}", row.name, row.reason);
+        }
+        std::process::exit(1);
     }
+    println!(
+        "OK: {} loaded {} resource(s)",
+        resources.display(),
+        snapshot.total_entries(),
+    );
+    Ok(())
 }
 
 /// SIGHUP → re-run the whole file-source pipeline against the same
