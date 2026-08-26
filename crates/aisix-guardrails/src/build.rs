@@ -117,6 +117,53 @@ pub fn build_chain_from_snapshot(
     GuardrailChain::new_with_applied(chain, applied)
 }
 
+/// One enabled guardrail row that would not join the chain.
+///
+/// Returned by [`unbuildable_guardrail_rows`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnbuildableGuardrailRow {
+    /// Operator-facing row name, as written in the configuration.
+    pub name: String,
+    /// Why the row does not build, in the same wording the boot log uses.
+    /// A `kind: custom` script error carries the engine's line and column.
+    pub reason: String,
+}
+
+/// Report the enabled guardrail rows in `table` whose configuration does
+/// not build — [`build_chain_from_snapshot`]'s error arm, made returnable.
+///
+/// The gateway logs those errors and keeps serving, which is right for a
+/// running node but wrong for anything checking a configuration before it
+/// is deployed: the row silently not existing IS the defect. A screening
+/// rule that never runs is indistinguishable from one that never matched,
+/// and nothing downstream says otherwise — the load itself succeeded, so
+/// the config status stays `synced` with an empty `rejected` list.
+///
+/// [`BuildError::EmbedderUnavailable`] is deliberately excluded. The
+/// embedding dispatcher is a runtime capability, not part of the
+/// configuration, so a `kind: semantic` row fails to build here for a
+/// reason that says nothing about the file being checked.
+pub fn unbuildable_guardrail_rows(
+    table: &ResourceTable<DomainGuardrail>,
+    bedrock_endpoint_url: Option<&str>,
+) -> Vec<UnbuildableGuardrailRow> {
+    let embedder = GuardrailEmbedderSlot::none();
+    sorted_guardrail_entries(table)
+        .iter()
+        .filter(|entry| entry.value.enabled)
+        .filter_map(
+            |entry| match build_one(&entry.value, bedrock_endpoint_url, &embedder) {
+                Ok(_) => None,
+                Err(BuildError::EmbedderUnavailable) => None,
+                Err(err) => Some(UnbuildableGuardrailRow {
+                    name: entry.value.name.clone(),
+                    reason: err.to_string(),
+                }),
+            },
+        )
+        .collect()
+}
+
 /// The `{kind, hook}` telemetry descriptor for a guardrail row that
 /// materialised into a chain (#379). Captured here — the build points are the
 /// only place the domain row's `kind` + `hook_point` are in scope alongside

@@ -286,7 +286,8 @@ pub use audit::GuardrailAuditLog;
 #[cfg(feature = "bedrock")]
 pub use bedrock::BedrockGuardrail;
 pub use build::{
-    build_chain_from_snapshot, build_index_from_snapshot, LiveGuardrailChain, LiveGuardrailIndex,
+    build_chain_from_snapshot, build_index_from_snapshot, unbuildable_guardrail_rows,
+    LiveGuardrailChain, LiveGuardrailIndex, UnbuildableGuardrailRow,
 };
 pub use chain::GuardrailChain;
 pub use index::{GuardrailIndex, RequestContext};
