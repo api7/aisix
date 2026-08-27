@@ -210,8 +210,8 @@ pub fn build_router(state: ProxyState) -> Router {
         )
         // Path-prefix passthrough routes match here, AFTER every typed
         // route has had its chance — a route can never shadow the
-        // gateway's own API. No-match requests keep the plain 404 (or the
-        // `/passthrough/*` 410 migration tombstone) inside the handler.
+        // gateway's own API. No-match requests keep the plain 404 inside
+        // the handler.
         // Registered before the layers so fallback traffic gets the same
         // body-limit / telemetry / Server-header treatment as the routes.
         .fallback(passthrough_route::entry);
@@ -366,9 +366,10 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         _ if path.starts_with("/v1/fine_tuning/jobs/") => "/v1/fine_tuning/jobs/:id",
         _ if path.starts_with("/mcp/") => "/mcp/{server}",
         _ if path.starts_with("/a2a/") => "/a2a",
-        // The removed implicit tunnel: 410-tombstoned requests and any
-        // path-prefix route an operator claims under the old namespace
-        // both label as the passthrough_route family.
+        // Any path-prefix route an operator claims under this namespace
+        // labels as the passthrough_route family; unclaimed paths reach
+        // the router's miss path and are labelled here only by the
+        // pre-routing in-flight gauge, which must stay bounded (#451).
         _ if path.starts_with("/passthrough/") => "/passthrough_route",
         _ => "other",
     }

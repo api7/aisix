@@ -6,9 +6,9 @@ import { EtcdClient, spawnApp, type SpawnedApp } from "../harness/index.js";
 // route matching; pre-fix it used the raw request path as the `endpoint`
 // label, so each unique /passthrough/<provider>/<unique> path created a
 // new Prometheus time series — an unauthenticated cardinality DoS. The
-// namespace now belongs to explicit passthrough routes (unclaimed paths
-// answer the 410 tombstone), and every shape collapses to the single
-// `/passthrough_route` label.
+// namespace belongs to explicit passthrough routes, and every shape
+// collapses to the single `/passthrough_route` label whether or not a
+// route claims the path.
 //
 // We fire many unique unauthenticated passthrough paths, then scrape
 // /metrics and assert the endpoint label is collapsed to the family

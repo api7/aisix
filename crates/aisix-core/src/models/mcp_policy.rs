@@ -101,30 +101,6 @@ pub struct McpAccess {
     /// effective grant, using the same single-`*` glob matching as `allow`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
-
-    /// Compatibility tombstone for the pre-0.10.0 `mode` selector. The
-    /// control plane projected `"mode": "deny"` alongside the layered
-    /// shape so a 0.9.x data plane — where `mode` is required and `deny`
-    /// means "no MCP tool access" — still loaded the whole api_key row,
-    /// fail-closed, instead of skipping it (a skipped row stops the key
-    /// authenticating for EVERY kind of traffic). This generation
-    /// consumes and ignores the value; the field exists only so the
-    /// loader does not report the tombstone as partial compat on every
-    /// row. Any JSON shape is accepted so a malformed tombstone can
-    /// never kill the row. Hidden from the schemas — the strict write
-    /// path closes unknown fields, so resource authors cannot set it —
-    /// and never re-serialized.
-    ///
-    /// COMPAT-SINCE: 0.10.0 #1009 — the control plane stopped emitting this
-    /// tombstone at the 0.10.0 compat floor, but documents written before the
-    /// run-once reprojection still carry `mode`, so this generation reads and
-    /// drops it rather than reporting partial compat on every row.
-    ///
-    /// Retiring it removes the field, the `#[schemars(skip)]` exclusion, and
-    /// the loader test that pins the tolerance.
-    #[serde(default, rename = "mode", skip_serializing)]
-    #[schemars(skip)]
-    pub legacy_mode: Option<serde_json::Value>,
 }
 
 impl Resource for McpPolicy {
@@ -247,25 +223,6 @@ mod tests {
         let blocked: McpAccess = serde_json::from_str(r#"{"allow":[]}"#).unwrap();
         assert!(blocked.allow.is_empty());
         assert!(blocked.deny.is_empty());
-    }
-
-    #[test]
-    fn mcp_access_consumes_the_legacy_mode_tombstone() {
-        // The CP projects `"mode": "deny"` next to the layered shape so a
-        // 0.9.x DP loads the row fail-closed. This generation reads its
-        // own half, tolerates any tombstone shape, and never re-emits it.
-        let a: McpAccess =
-            serde_json::from_str(r#"{"mode":"deny","allow":["github__*"],"deny":["x__y"]}"#)
-                .unwrap();
-        assert_eq!(a.allow, vec!["github__*"]);
-        assert_eq!(a.deny, vec!["x__y"]);
-        assert_eq!(a.legacy_mode, Some(serde_json::json!("deny")));
-
-        let malformed: McpAccess = serde_json::from_str(r#"{"allow":[],"mode":5}"#).unwrap();
-        assert_eq!(malformed.legacy_mode, Some(serde_json::json!(5)));
-
-        let v = serde_json::to_value(&a).unwrap();
-        assert!(v.get("mode").is_none());
     }
 
     #[test]

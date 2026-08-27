@@ -1058,12 +1058,13 @@ mod tests {
     }
 
     #[test]
-    fn api_key_legacy_mcp_access_mode_tombstone_is_not_partial_compat() {
-        // The CP projects `"mode": "deny"` inside `mcp_access` so a 0.9.x
-        // DP — where `mode` is required — loads the row fail-closed
-        // instead of skipping it. This generation consumes the tombstone
-        // (`McpAccess::legacy_mode`); it must not surface as a
-        // partial-compat field on every key that carries a block.
+    fn api_key_retired_mcp_access_mode_selector_is_an_unknown_field() {
+        // `mcp_access.mode` is no longer consumed by the typed struct, so a
+        // document a pre-0.10.0 control plane wrote takes the ordinary
+        // unknown-field path: the api_key row still LOADS — a skipped row
+        // would stop the key authenticating every kind of traffic, not just
+        // MCP — with its own half read and the retired selector reported
+        // through the partial-compat channel.
         let entries = vec![raw(
             "/aisix/api_keys/k-tombstone",
             br#"{
@@ -1075,7 +1076,14 @@ mod tests {
         )];
         let (snap, stats) = build_snapshot("/aisix", &entries);
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
-        assert!(stats.partially_compatible.is_empty());
+        assert_eq!(
+            stats.partially_compatible,
+            vec![PartialCompatEntry {
+                kind: "api_keys".into(),
+                field: "mcp_access.mode".into(),
+                count: 1,
+            }]
+        );
         let entry = snap.apikeys.get_by_id("k-tombstone").unwrap();
         let access = entry.value.mcp_access.as_ref().unwrap();
         assert_eq!(access.allow, vec!["github__*"]);
