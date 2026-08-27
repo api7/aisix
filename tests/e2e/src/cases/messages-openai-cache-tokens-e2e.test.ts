@@ -4,6 +4,7 @@ import { gunzipSync } from "node:zlib";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   pickFreePort,
   spawnApp,
@@ -106,6 +107,8 @@ const STREAM_EVENTS = [
 interface CapturedLog {
   path: string;
   logs: Record<string, unknown>[];
+  /** Set when the intake body did not decode as gzipped JSON. */
+  decodeError?: string;
 }
 
 interface MockDatadog {
@@ -124,14 +127,20 @@ async function startMockDatadog(): Promise<MockDatadog> {
       const path = (req.url ?? "").split("?")[0];
       if (req.method === "POST" && path === INTAKE_PATH) {
         let logs: Record<string, unknown>[] = [];
+        let decodeError: string | undefined;
         try {
           const parsed: unknown = JSON.parse(gunzipSync(Buffer.concat(chunks)).toString("utf8"));
-          if (Array.isArray(parsed)) logs = parsed as Record<string, unknown>[];
-        } catch {
-          // Leave empty: the poll below times out loudly rather than
-          // letting a malformed intake read as "nothing to assert".
+          if (Array.isArray(parsed)) {
+            logs = parsed as Record<string, unknown>[];
+          } else {
+            decodeError = `intake body decoded to ${typeof parsed}, expected a JSON array`;
+          }
+        } catch (err) {
+          // Keep the reason. Swallowing it would turn "the DP changed its
+          // intake encoding" into an unrelated poll timeout below.
+          decodeError = `intake body is not gzipped JSON: ${String(err)}`;
         }
-        requests.push({ path, logs });
+        requests.push({ path, logs, decodeError });
       }
       res.statusCode = 202;
       res.end();
@@ -165,6 +174,9 @@ async function waitForUsageEvent(
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     for (const req of dd.requests) {
+      // A body the mock could not decode is a harness/wire failure, not a
+      // slow event — fail on it as itself instead of waiting out the poll.
+      if (req.decodeError) throw new Error(req.decodeError);
       const hit = req.logs.find((l) => l["aisix.requested_model"] === model);
       if (hit) return hit;
     }
@@ -262,19 +274,24 @@ describe("/v1/messages keeps an OpenAI upstream's prompt-cache hit (AISIX-Cloud#
         provider_key_id: pk.id,
       });
     }
+    // Caller key last, so gating on it authenticating implies the whole
+    // seed set has landed (tests/e2e/AGENTS.md).
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: [NON_STREAM_MODEL, STREAM_MODEL],
     });
 
+    // Gate on an independent, non-throwing condition: driving `/v1/messages`
+    // here would let a usage regression surface as a propagation timeout
+    // instead of as the assertion that actually broke.
+    const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
     await waitConfigPropagation(async () => {
-      try {
-        const r = await postMessages(app!, NON_STREAM_MODEL, false);
-        await r.text();
-        return r.status === 200;
-      } catch {
-        return false;
-      }
+      const res = await probe.listModels();
+      if (res.status !== 200) return false;
+      const data = (res.body as { data?: Array<{ id?: string }> }).data ?? [];
+      return [NON_STREAM_MODEL, STREAM_MODEL].every((m) =>
+        data.some((row) => row.id === m),
+      );
     });
   });
 
