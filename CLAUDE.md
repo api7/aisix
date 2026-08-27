@@ -104,6 +104,17 @@ This repo is developed end-to-end by agents — no human reviewer needs small re
 
 (Two recurrences of the same lesson: #471 — a Model-Group dispatch fix landed only on `/v1/messages` while `/v1/responses` and `count_tokens` had the identical gap; then #715 — `least_busy`'s in-flight counter shipped fed by chat.rs only (#684 left messages/responses as an un-filed "follow-up"), so the strategy silently degraded to declaration order for Claude Code / Codex traffic until #716. The EWMA for `least_latency` (#682) wired all three endpoints at once and never had this problem — that's the standard.)
 
+## Usage Converts at the Client Boundary, Never at the Telemetry One
+
+**`UsageStats` carries two *disjoint* cache representations with opposite arithmetic, and a cross-protocol handler must convert one for the client while leaving the UsageEvent in the upstream's own shape.**
+
+- OpenAI-shape upstreams report the prompt-cache hit as `cached_prompt_tokens`, a **subset already inside** `prompt_tokens`. Anthropic-shape upstreams report `cache_creation_tokens` / `cache_read_tokens` as counters **on top of** `prompt_tokens`. Each provider's wire fills one family and zeroes the other; never map between them inside `UsageStats`, and never add `cached_prompt_tokens` into a total (`total_tokens_with_cache` deliberately takes only the additive pair).
+- **The client-facing renderer converts** — an Anthropic client's `input_tokens` means non-cached input, so an OpenAI upstream's hit has to move out into `cache_read_input_tokens`, and the reverse renderer faces the mirror problem. Emit a cache counter only when non-zero: a fabricated `0` reads as "the provider reported no hit" rather than "the provider doesn't report this".
+- **The UsageEvent does NOT convert.** It carries the upstream's own shape, so one upstream call bills identically whichever inbound protocol addressed it — and because cp-api prices it that way: it charges `prompt_tokens - cached_prompt_tokens` at the prompt rate plus `cached_prompt_tokens` at the cache-read rate, and **rejects an event whose `cached_prompt_tokens` exceeds its `prompt_tokens`**. Converting on this side is a silent cost error, not a display choice.
+- A dropped counter here is invisible from the dashboard: no cache detail is indistinguishable from a provider that never cached, so nothing looks wrong while the whole prompt bills uncached.
+
+(Lesson from AISIX-Cloud#1405: the `/v1/messages` → OpenAI-compatible bridge parsed `prompt_tokens_details.cached_tokens` correctly into `UsageStats` and then dropped it at **both** exits — `AnthropicUsageMetrics` had no field for it and the Anthropic renderer emitted `input_tokens` / `output_tokens` only. `/v1/chat/completions` had carried it since #542.)
+
 ## A Config Knob Isn't Shipped Until the Control Plane Exposes It
 
 **A user-configurable data-plane feature is NOT delivered when the Rust side works — it's delivered when a user can reach it through the control plane. DP-only is a half-feature nobody can turn on.**

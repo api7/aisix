@@ -1618,6 +1618,68 @@ fn translate_assistant_blocks(blocks: &[serde_json::Value]) -> ChatMessage {
 // ─────────────────────────────────────────────────────────────────────
 // Outbound translation — internal ChatResponse  →  Anthropic JSON.
 
+/// The Anthropic-shape `usage` view of the gateway's canonical
+/// [`UsageStats`], for a response rendered back to a `/v1/messages`
+/// client (AISIX-Cloud#1405).
+///
+/// `UsageStats` carries two *disjoint* cache representations and they
+/// fold in opposite directions:
+///
+/// - An OpenAI-shape upstream reports its cache hit as
+///   `cached_prompt_tokens`, a SUBSET already counted inside
+///   `prompt_tokens`. Anthropic's `input_tokens` means NON-cached
+///   input, so the subset is subtracted back out.
+/// - An Anthropic-shape upstream reports `cache_creation_tokens` /
+///   `cache_read_tokens` as counters ON TOP of `prompt_tokens`, which
+///   is already Anthropic's `input_tokens` — nothing to subtract.
+///
+/// Because the two never co-occur (`wire.rs` in each provider fills one
+/// family and zeroes the other), summing them is the same as picking
+/// whichever the upstream actually reported. Either way the client sees
+/// the identity Anthropic guarantees: `input_tokens + cache_creation +
+/// cache_read` is the total input the model processed.
+///
+/// LiteLLM's `/v1/messages` adapter derives the same three numbers the
+/// same way; it subtracts BOTH cache counters from `prompt_tokens`
+/// because its single `Usage` object has already folded the
+/// Anthropic-shape counters in, which ours deliberately has not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AnthropicInputUsage {
+    /// `usage.input_tokens` — non-cached input.
+    input_tokens: u32,
+    cache_creation_input_tokens: u32,
+    cache_read_input_tokens: u32,
+}
+
+impl AnthropicInputUsage {
+    fn from_usage(u: &UsageStats) -> Self {
+        Self {
+            input_tokens: u.prompt_tokens.saturating_sub(u.cached_prompt_tokens),
+            cache_creation_input_tokens: u.cache_creation_tokens,
+            cache_read_input_tokens: u.cache_read_tokens.saturating_add(u.cached_prompt_tokens),
+        }
+    }
+
+    /// Add the cache counters to an Anthropic `usage` object, omitting
+    /// each when zero: an upstream that reports no prompt cache at all
+    /// must not be handed a fabricated `0` the client would read as
+    /// "cache reported, nothing hit".
+    fn insert_cache_fields(&self, usage: &mut serde_json::Map<String, serde_json::Value>) {
+        if self.cache_creation_input_tokens > 0 {
+            usage.insert(
+                "cache_creation_input_tokens".into(),
+                self.cache_creation_input_tokens.into(),
+            );
+        }
+        if self.cache_read_input_tokens > 0 {
+            usage.insert(
+                "cache_read_input_tokens".into(),
+                self.cache_read_input_tokens.into(),
+            );
+        }
+    }
+}
+
 /// Render an internal [`ChatResponse`] as the JSON an Anthropic
 /// `/v1/messages` client expects. The reverse of
 /// `response_into_chat_response`. `model_display_name` is the
@@ -1658,6 +1720,12 @@ pub fn chat_response_into_anthropic_json(
         content.push(serde_json::json!({"type": "text", "text": ""}));
     }
 
+    let input = AnthropicInputUsage::from_usage(&resp.usage);
+    let mut usage = serde_json::Map::new();
+    usage.insert("input_tokens".into(), input.input_tokens.into());
+    usage.insert("output_tokens".into(), resp.usage.completion_tokens.into());
+    input.insert_cache_fields(&mut usage);
+
     serde_json::json!({
         "id": resp.id,
         "type": "message",
@@ -1666,10 +1734,7 @@ pub fn chat_response_into_anthropic_json(
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": serde_json::Value::Null,
-        "usage": {
-            "input_tokens": resp.usage.prompt_tokens,
-            "output_tokens": resp.usage.completion_tokens,
-        },
+        "usage": serde_json::Value::Object(usage),
     })
 }
 
@@ -1743,6 +1808,13 @@ pub struct AnthropicSseEncoder {
     /// robust to providers that double-emit usage.
     seen_input_tokens: u32,
     seen_output_tokens: u32,
+    /// Cache counters seen on the stream, in both of `UsageStats`'
+    /// representations — folded into the Anthropic shape by
+    /// [`AnthropicInputUsage`] when the closing pair is built
+    /// (AISIX-Cloud#1405).
+    seen_cached_prompt_tokens: u32,
+    seen_cache_creation_tokens: u32,
+    seen_cache_read_tokens: u32,
     usage_seen: bool,
 }
 
@@ -1769,6 +1841,9 @@ impl AnthropicSseEncoder {
             pending_stop_reason: None,
             seen_input_tokens: 0,
             seen_output_tokens: 0,
+            seen_cached_prompt_tokens: 0,
+            seen_cache_creation_tokens: 0,
+            seen_cache_read_tokens: 0,
             usage_seen: false,
         }
     }
@@ -1784,6 +1859,11 @@ impl AnthropicSseEncoder {
             self.usage_seen = true;
             self.seen_input_tokens = self.seen_input_tokens.max(u.prompt_tokens);
             self.seen_output_tokens = self.seen_output_tokens.max(u.completion_tokens);
+            self.seen_cached_prompt_tokens =
+                self.seen_cached_prompt_tokens.max(u.cached_prompt_tokens);
+            self.seen_cache_creation_tokens =
+                self.seen_cache_creation_tokens.max(u.cache_creation_tokens);
+            self.seen_cache_read_tokens = self.seen_cache_read_tokens.max(u.cache_read_tokens);
         }
 
         // Closing pair withheld at the stop chunk: only the trailing
@@ -1948,13 +2028,25 @@ impl AnthropicSseEncoder {
     /// best-known cumulative usage. `input_tokens` is included when
     /// known — on a translated stream `message_start` fires before any
     /// usage frame exists and always reports 0, so this is the only
-    /// place the client can learn the prompt token count.
+    /// place the client can learn the prompt token count. The same goes
+    /// for the cache counters (AISIX-Cloud#1405).
     fn closing_pair(&mut self, stop_reason: &'static str) -> Vec<AnthropicSseEvent> {
+        let input = AnthropicInputUsage::from_usage(&UsageStats {
+            prompt_tokens: self.seen_input_tokens,
+            cached_prompt_tokens: self.seen_cached_prompt_tokens,
+            cache_creation_tokens: self.seen_cache_creation_tokens,
+            cache_read_tokens: self.seen_cache_read_tokens,
+            ..UsageStats::default()
+        });
         let mut usage = serde_json::Map::new();
+        // Gate on the RAW prompt count, not the cache-adjusted one: a
+        // fully-cached prompt is a real `input_tokens: 0`, distinct from
+        // an upstream that reported no input count at all.
         if self.seen_input_tokens > 0 {
-            usage.insert("input_tokens".into(), self.seen_input_tokens.into());
+            usage.insert("input_tokens".into(), input.input_tokens.into());
         }
         usage.insert("output_tokens".into(), self.seen_output_tokens.into());
+        input.insert_cache_fields(&mut usage);
         self.finished = true;
         vec![
             AnthropicSseEvent {
@@ -3552,6 +3644,97 @@ mod tests {
         assert_eq!(mk(FinishReason::Other("vendor".into())), "end_turn");
     }
 
+    #[test]
+    fn render_anthropic_response_maps_openai_cache_hit_to_cache_read() {
+        // AISIX-Cloud#1405: an OpenAI-compatible upstream reports its
+        // prompt-cache hit as `prompt_tokens_details.cached_tokens`, a
+        // subset of `prompt_tokens`. Anthropic's `input_tokens` means
+        // NON-cached input, so the hit moves out into
+        // `cache_read_input_tokens` — pre-fix it vanished entirely and
+        // an Anthropic client billed the whole prompt at full rate.
+        let resp = ChatResponse {
+            id: "chatcmpl-cache-test".into(),
+            model: "MiniMax-M3".into(),
+            message: ChatMessage::assistant("ok"),
+            finish_reason: FinishReason::Stop,
+            usage: UsageStats {
+                prompt_tokens: 68_274,
+                completion_tokens: 497,
+                total_tokens: 68_771,
+                cached_prompt_tokens: 60_000,
+                ..UsageStats::default()
+            },
+        };
+        let usage = &chat_response_into_anthropic_json(&resp, "tencent-minimax-m3")["usage"];
+        assert_eq!(usage["input_tokens"], 8_274);
+        assert_eq!(usage["cache_read_input_tokens"], 60_000);
+        assert_eq!(usage["output_tokens"], 497);
+        // Not reported by an OpenAI upstream — never fabricated as 0.
+        assert!(usage.get("cache_creation_input_tokens").is_none());
+        // The Anthropic identity holds: input + cache = the prompt the
+        // model processed, so the client's own total stays P + O.
+        assert_eq!(
+            usage["input_tokens"].as_u64().unwrap()
+                + usage["cache_read_input_tokens"].as_u64().unwrap()
+                + usage["output_tokens"].as_u64().unwrap(),
+            68_771
+        );
+    }
+
+    #[test]
+    fn render_anthropic_response_keeps_anthropic_shape_counters_additive() {
+        // The other representation: an Anthropic-shape bridged upstream
+        // (bedrock/vertex Claude without the anthropic adapter) already
+        // reports `prompt_tokens` EXCLUDING cache, so the counters ride
+        // on top and nothing is subtracted.
+        let resp = ChatResponse {
+            id: "x".into(),
+            model: "u".into(),
+            message: ChatMessage::assistant("ok"),
+            finish_reason: FinishReason::Stop,
+            usage: UsageStats::with_cache(10, 4, 200, 800),
+        };
+        let usage = &chat_response_into_anthropic_json(&resp, "m")["usage"];
+        assert_eq!(usage["input_tokens"], 10);
+        assert_eq!(usage["cache_creation_input_tokens"], 200);
+        assert_eq!(usage["cache_read_input_tokens"], 800);
+    }
+
+    #[test]
+    fn render_anthropic_response_omits_cache_fields_when_upstream_reports_none() {
+        let resp = ChatResponse {
+            id: "x".into(),
+            model: "u".into(),
+            message: ChatMessage::assistant("ok"),
+            finish_reason: FinishReason::Stop,
+            usage: UsageStats::new(7, 3),
+        };
+        let usage = &chat_response_into_anthropic_json(&resp, "m")["usage"];
+        assert_eq!(usage["input_tokens"], 7);
+        assert!(usage.get("cache_read_input_tokens").is_none());
+        assert!(usage.get("cache_creation_input_tokens").is_none());
+    }
+
+    #[test]
+    fn render_anthropic_response_fully_cached_prompt_reports_zero_input() {
+        let resp = ChatResponse {
+            id: "x".into(),
+            model: "u".into(),
+            message: ChatMessage::assistant("ok"),
+            finish_reason: FinishReason::Stop,
+            usage: UsageStats {
+                prompt_tokens: 900,
+                completion_tokens: 5,
+                total_tokens: 905,
+                cached_prompt_tokens: 900,
+                ..UsageStats::default()
+            },
+        };
+        let usage = &chat_response_into_anthropic_json(&resp, "m")["usage"];
+        assert_eq!(usage["input_tokens"], 0);
+        assert_eq!(usage["cache_read_input_tokens"], 900);
+    }
+
     // ─── AnthropicSseEncoder ──────────────────────────────────────
 
     #[test]
@@ -3696,6 +3879,89 @@ mod tests {
         assert_eq!(events[0].data["usage"]["input_tokens"], 17);
         assert_eq!(events[0].data["usage"]["output_tokens"], 23);
         assert!(enc.is_finished());
+    }
+
+    /// AISIX-Cloud#1405, streaming half: an OpenAI-compatible upstream
+    /// attaches `prompt_tokens_details.cached_tokens` to its trailing
+    /// `include_usage` frame. The closing `message_delta` is the only
+    /// place a translated stream can carry it — pre-fix the encoder
+    /// tracked input/output only and the cache hit never reached the
+    /// client.
+    #[test]
+    fn sse_encoder_closing_pair_carries_openai_cache_hit_as_cache_read() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "tencent-minimax-m3", 0);
+        let _ = enc.next_events(&delta_chunk("ok"));
+        let stop_no_usage = ChatChunk {
+            id: "chatcmpl-cache-test".into(),
+            model: "MiniMax-M3".into(),
+            delta: ChatDelta::default(),
+            finish_reason: Some(FinishReason::Stop),
+            usage: None,
+        };
+        let _ = enc.next_events(&stop_no_usage);
+
+        let usage_only = ChatChunk {
+            id: "chatcmpl-cache-test".into(),
+            model: "MiniMax-M3".into(),
+            delta: ChatDelta::default(),
+            finish_reason: None,
+            usage: Some(UsageStats {
+                prompt_tokens: 68_274,
+                completion_tokens: 497,
+                total_tokens: 68_771,
+                cached_prompt_tokens: 60_000,
+                ..UsageStats::default()
+            }),
+        };
+        let events = enc.next_events(&usage_only);
+        let usage = &events[0].data["usage"];
+        assert_eq!(usage["input_tokens"], 8_274);
+        assert_eq!(usage["cache_read_input_tokens"], 60_000);
+        assert_eq!(usage["output_tokens"], 497);
+        assert!(usage.get("cache_creation_input_tokens").is_none());
+    }
+
+    #[test]
+    fn sse_encoder_closing_pair_keeps_anthropic_shape_counters_additive() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "m", 0);
+        let _ = enc.next_events(&delta_chunk("ok"));
+        let stop_with_usage = ChatChunk {
+            id: "c".into(),
+            model: "u".into(),
+            delta: ChatDelta::default(),
+            finish_reason: Some(FinishReason::Stop),
+            usage: Some(UsageStats::with_cache(10, 4, 200, 800)),
+        };
+        let events = enc.next_events(&stop_with_usage);
+        let delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("closing pair emitted");
+        assert_eq!(delta.data["usage"]["input_tokens"], 10);
+        assert_eq!(delta.data["usage"]["cache_creation_input_tokens"], 200);
+        assert_eq!(delta.data["usage"]["cache_read_input_tokens"], 800);
+    }
+
+    #[test]
+    fn sse_encoder_closing_pair_omits_cache_fields_without_upstream_cache() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "m", 0);
+        let _ = enc.next_events(&delta_chunk("ok"));
+        let events = enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "u".into(),
+            delta: ChatDelta::default(),
+            finish_reason: Some(FinishReason::Stop),
+            usage: Some(UsageStats::new(17, 23)),
+        });
+        let delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("closing pair emitted");
+        assert_eq!(delta.data["usage"]["input_tokens"], 17);
+        assert!(delta.data["usage"].get("cache_read_input_tokens").is_none());
+        assert!(delta.data["usage"]
+            .get("cache_creation_input_tokens")
+            .is_none());
     }
 
     /// An upstream that ignores `stream_options` never sends the usage
