@@ -427,8 +427,11 @@ async fn authenticate(
         }
         return crate::auth::authenticate_token(state, token, ctx).await;
     }
-    if let Some(proto) = headers.get("sec-websocket-protocol") {
-        let s = proto.to_str().map_err(|_| ProxyError::MissingAuth)?;
+    // List-valued and splittable across repeated fields, like the beta
+    // opt-in above: reading only the first field 401s a caller whose
+    // credential rides a later one.
+    for proto in headers.get_all("sec-websocket-protocol").iter() {
+        let Ok(s) = proto.to_str() else { continue };
         for item in s.split(',') {
             if let Some(token) = item.trim().strip_prefix(SUBPROTOCOL_KEY_PREFIX) {
                 if !token.is_empty() {
@@ -1208,6 +1211,46 @@ mod tests {
             "the gateway must echo the `realtime` subprotocol"
         );
         drop(ws);
+    }
+
+    /// A browser may split its subprotocol offer across repeated header
+    /// fields; the credential must still be found wherever it lands.
+    #[tokio::test]
+    async fn subprotocol_credential_is_found_in_a_repeated_header_field() {
+        let (up_addr, handshake, _frames) = spawn_upstream().await;
+        let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
+        let (addr, _state, _rx) = serve(snap).await;
+
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        // Two fields: the credential and the beta opt-in ride the second.
+        req.headers_mut()
+            .append("sec-websocket-protocol", "realtime".parse().unwrap());
+        req.headers_mut().append(
+            "sec-websocket-protocol",
+            "openai-insecure-api-key.sk-caller, openai-beta.realtime-v1"
+                .parse()
+                .unwrap(),
+        );
+        let (ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("a credential in a later subprotocol field must authenticate");
+        let (mut tx, mut client_rx) = ws.split();
+        tx.send(TgMessage::Text(
+            serde_json::json!({"type": "session.update"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(3), client_rx.next()).await;
+
+        // The opt-in rode the same later field, so it reaches upstream.
+        let (_uri, _auth, beta) = handshake
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("handshake recorded");
+        assert_eq!(beta.as_deref(), Some("realtime=v1"));
     }
 
     /// The predicate itself: neither channel set => GA (no header).
