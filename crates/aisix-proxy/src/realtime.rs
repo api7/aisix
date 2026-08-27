@@ -73,10 +73,25 @@ const AZURE_REALTIME_API_VERSION: &str = "2024-10-01-preview";
 /// Subprotocol item carrying the caller's API key in the browser flow.
 const SUBPROTOCOL_KEY_PREFIX: &str = "openai-insecure-api-key.";
 
+/// Header value by which a client opts into the legacy beta event shape.
+const HEADER_BETA_VALUE: &str = "realtime=v1";
+
 /// Subprotocol item by which a browser client opts into the legacy beta
 /// event shape (a subprotocol token cannot contain `=`, so the header's
 /// `realtime=v1` is spelled `realtime-v1` here).
 const SUBPROTOCOL_BETA_ITEM: &str = "openai-beta.realtime-v1";
+
+/// Is `needle` one of the comma-separated items across every value of
+/// `name`? Both headers are list-valued and may repeat, so a first-value
+/// substring test would both miss a repeat and accept `realtime=v10`.
+fn header_list_has(headers: &HeaderMap, name: &str, needle: &str) -> bool {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|item| item.trim().eq_ignore_ascii_case(needle))
+}
 
 /// Did the caller ask for the legacy beta Realtime shape?
 ///
@@ -87,18 +102,8 @@ const SUBPROTOCOL_BETA_ITEM: &str = "openai-beta.realtime-v1";
 /// header (server-side clients) or the `sec-websocket-protocol` item
 /// (browser clients, which cannot set headers).
 fn client_requested_beta_realtime(headers: &HeaderMap) -> bool {
-    if let Some(v) = headers.get("openai-beta").and_then(|v| v.to_str().ok()) {
-        if v.to_ascii_lowercase().contains("realtime=v1") {
-            return true;
-        }
-    }
-    headers
-        .get("sec-websocket-protocol")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| {
-            s.split(',')
-                .any(|i| i.trim().eq_ignore_ascii_case(SUBPROTOCOL_BETA_ITEM))
-        })
+    header_list_has(headers, "openai-beta", HEADER_BETA_VALUE)
+        || header_list_has(headers, "sec-websocket-protocol", SUBPROTOCOL_BETA_ITEM)
 }
 
 /// Dial the upstream Realtime endpoint under the deployment's outbound
@@ -1237,6 +1242,30 @@ mod tests {
             "openai-beta",
             "assistants=v2"
         )));
+        // A near match must NOT opt in: the value is a list item, not a
+        // substring, so a future `realtime=v10` stays GA.
+        assert!(!client_requested_beta_realtime(&hm(
+            "openai-beta",
+            "realtime=v10"
+        )));
+        // List-valued: the opt-in counts wherever it sits in the list.
+        assert!(client_requested_beta_realtime(&hm(
+            "openai-beta",
+            "assistants=v2, realtime=v1"
+        )));
+        // Repeated headers: `HeaderMap::get` would only see the first.
+        let mut repeated = HeaderMap::new();
+        repeated.append("openai-beta", "assistants=v2".parse().unwrap());
+        repeated.append("openai-beta", "realtime=v1".parse().unwrap());
+        assert!(client_requested_beta_realtime(&repeated));
+        // Same for the subprotocol list, which browsers may also repeat.
+        let mut split_proto = HeaderMap::new();
+        split_proto.append("sec-websocket-protocol", "realtime".parse().unwrap());
+        split_proto.append(
+            "sec-websocket-protocol",
+            "openai-beta.realtime-v1".parse().unwrap(),
+        );
+        assert!(client_requested_beta_realtime(&split_proto));
     }
 
     /// A caller that DOES opt in still gets the beta header forwarded,
