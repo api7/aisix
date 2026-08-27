@@ -362,7 +362,7 @@ async fn dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } = verdict
         {
             // Per #153 keep the matched-pattern detail in ops logs only; the
@@ -373,8 +373,10 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked /v1/embeddings request",
             );
-            return Err(ProxyError::ContentFiltered(
-                crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
+            return Err(crate::error::guardrail_block_error(
+                "request",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
             ));
         }
     }

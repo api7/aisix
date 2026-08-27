@@ -460,7 +460,7 @@ pub async fn chat_completions(
             // budget / rate-limit / bridge error after that point still
             // records which model the request targeted. ContentFiltered
             // (guardrail) sets `guardrail_blocked` for the Blocked tab.
-            let guardrail_blocked = matches!(err, ProxyError::ContentFiltered(_));
+            let guardrail_blocked = matches!(err, ProxyError::ContentFiltered { .. });
             let model_id_str = resolved_model_id.as_deref().unwrap_or("");
             // AISIX-Cloud#1013: failed requests carry the (post-mask)
             // request body so a 4xx/5xx can be triaged from the log alone.
@@ -1319,7 +1319,7 @@ async fn dispatch(
         GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } => {
             // The verdict's `reason` carries matched-pattern detail
             // (e.g. `"input blocked by literal \"forbidden-token\""`).
@@ -1345,8 +1345,10 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked request"
             );
-            return Err(with_model(ProxyError::ContentFiltered(
-                crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
+            return Err(with_model(crate::error::guardrail_block_error(
+                "request",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
             )));
         }
         GuardrailVerdict::Bypass { reason } => {
@@ -2433,7 +2435,7 @@ async fn dispatch(
                     GuardrailVerdict::Block {
                         reason,
                         guardrail_name,
-                        ..
+                        unavailable,
                     } => {
                         tracing::warn!(
                             guardrail_hook = "output",
@@ -2441,11 +2443,10 @@ async fn dispatch(
                             reason = %reason,
                             "guardrail blocked cached response",
                         );
-                        return Err(with_model(ProxyError::ContentFiltered(
-                            crate::error::guardrail_block_message(
-                                "response",
-                                guardrail_name.as_deref(),
-                            ),
+                        return Err(with_model(crate::error::guardrail_block_error(
+                            "response",
+                            guardrail_name.as_deref(),
+                            unavailable.as_deref(),
                         )));
                     }
                     GuardrailVerdict::Bypass { reason } => {
@@ -3020,7 +3021,7 @@ async fn dispatch(
         GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } => {
             // Output filter fires AFTER the upstream call, so the
             // provider has already billed for these tokens. Surface
@@ -3068,10 +3069,11 @@ async fn dispatch(
             return Err(DispatchFailure::new(
                 Some(model_id.clone()),
                 Some(charge),
-                ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                crate::error::guardrail_block_error(
                     "response",
                     guardrail_name.as_deref(),
-                )),
+                    unavailable.as_deref(),
+                ),
             )
             .with_routing(routing));
         }
@@ -4066,7 +4068,7 @@ async fn dispatch_ensemble(
         GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } => {
             tracing::warn!(
                 guardrail_hook = "output",
@@ -4087,10 +4089,11 @@ async fn dispatch_ensemble(
             return Err(DispatchFailure::new(
                 Some(model_id.to_string()),
                 None,
-                ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                crate::error::guardrail_block_error(
                     "response",
                     guardrail_name.as_deref(),
-                )),
+                    unavailable.as_deref(),
+                ),
             ));
         }
         GuardrailVerdict::Bypass { reason } => {
@@ -5290,7 +5293,7 @@ where
                                     aisix_guardrails::GuardrailVerdict::Block {
                                         reason,
                                         guardrail_name,
-                                        ..
+                                        unavailable,
                                     } => {
                                         tracing::warn!(
                                             guardrail_hook = "output",
@@ -5307,7 +5310,7 @@ where
                                                     &crate::error::guardrail_block_message(
                                                         "response",
                                                         guardrail_name.as_deref(),
-                                                    ),
+                                                     unavailable.as_deref()),
                                                 ),
                                             ),
                                         );
@@ -5374,7 +5377,11 @@ where
                                 yield Ok::<_, Infallible>(
                                     Event::default().event("error").data(error_frame_payload(
                                         "content_filter",
-                                        "response blocked by content policy",
+                                        &crate::error::guardrail_block_message(
+                                            "response",
+                                            None,
+                                            Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+                                        ),
                                     )),
                                 );
                                 break;
@@ -5498,7 +5505,7 @@ where
                             aisix_guardrails::GuardrailVerdict::Block {
                                 reason,
                                 guardrail_name,
-                                ..
+                                unavailable,
                             } => {
                                 tracing::warn!(
                                     guardrail_hook = "output",
@@ -5514,7 +5521,7 @@ where
                                         &crate::error::guardrail_block_message(
                                             "response",
                                             guardrail_name.as_deref(),
-                                        ),
+                                         unavailable.as_deref()),
                                     )),
                                 );
                                 true
@@ -5586,7 +5593,7 @@ where
                     aisix_guardrails::GuardrailVerdict::Block {
                         reason,
                         guardrail_name,
-                        ..
+                        unavailable,
                     } => {
                         // Mirror the non-streaming path's #153
                         // redaction contract: the wire-level message
@@ -5610,7 +5617,7 @@ where
                                     &crate::error::guardrail_block_message(
                                         "response",
                                         guardrail_name.as_deref(),
-                                    ),
+                                     unavailable.as_deref()),
                                 )),
                         );
                     }

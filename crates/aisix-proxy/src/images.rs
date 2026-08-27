@@ -302,7 +302,7 @@ async fn dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } = verdict
         {
             // Per #153 the matched-pattern detail stays in ops logs only.
@@ -312,8 +312,10 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked /v1/images/generations request",
             );
-            return Err(ProxyError::ContentFiltered(
-                crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
+            return Err(crate::error::guardrail_block_error(
+                "request",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
             ));
         }
     }

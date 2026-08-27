@@ -1175,7 +1175,7 @@ pub fn build_responses_bridge_stream(
                 "streaming /v1/responses (cross-provider) output exceeded buffer cap; failing closed",
             );
             guard.comp().guardrail_blocked = true;
-            yield Ok(bytes::Bytes::from(guardrail_error_frame(None)));
+            yield Ok(bytes::Bytes::from(guardrail_error_frame(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED))));
             return;
         }
 
@@ -1288,7 +1288,7 @@ pub fn build_responses_bridge_stream(
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
-                ..
+                unavailable,
             } = verdict {
                 tracing::warn!(
                     guardrail_hook = "output",
@@ -1297,7 +1297,7 @@ pub fn build_responses_bridge_stream(
                     "guardrail blocked streaming /v1/responses (cross-provider) response",
                 );
                 guard.comp().guardrail_blocked = true;
-                yield Ok(bytes::Bytes::from(guardrail_error_frame(guardrail_name.as_deref())));
+                yield Ok(bytes::Bytes::from(guardrail_error_frame(guardrail_name.as_deref(), unavailable.as_deref())));
                 return;
             }
             if seg_rewrote {
@@ -1347,13 +1347,13 @@ pub fn build_responses_bridge_stream(
 
 /// Responses-API SSE `error` frame for an output-guardrail block. Carries the
 /// firing guardrail's name (#519 B.4b) but never the matched-pattern detail.
-fn guardrail_error_frame(guardrail_name: Option<&str>) -> String {
+fn guardrail_error_frame(guardrail_name: Option<&str>, unavailable: Option<&str>) -> String {
     format!(
         "event: error\ndata: {}\n\n",
         json!({
             "type": "error",
             "code": "content_filter",
-            "message": crate::error::guardrail_block_message("response", guardrail_name),
+            "message": crate::error::guardrail_block_message("response", guardrail_name, unavailable),
         })
     )
 }

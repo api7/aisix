@@ -290,8 +290,26 @@ pub enum ProxyError {
     /// [`guardrail_block_message`] — generic policy wording plus the NAME
     /// of the guardrail that fired (#519 B.4b) — and emits the rich
     /// detail to `tracing` for operators.
-    #[error("{0}")]
-    ContentFiltered(String),
+    ///
+    /// `unavailable` carries the guardrail's bounded failure tag when the
+    /// refusal was an AVAILABILITY failure on a `fail_open: false` row —
+    /// the screening service was unreachable, or an operator-supplied
+    /// script produced no usable verdict — rather than a content decision.
+    /// It is the same closed, label-safe vocabulary
+    /// `GuardrailVerdict::Block::unavailable` carries, never free text and
+    /// never matched content, so it is safe on the wire.
+    ///
+    /// Keeping the two inside ONE variant is deliberate: `status()`,
+    /// `kind()`, and the dispatch-loop predicates must not diverge between
+    /// them (a guardrail refusal is a guardrail refusal for retry,
+    /// failover and outcome-classification purposes), so the distinction
+    /// lives only where it is read by a human or branched on by an SDK —
+    /// the message and `error.code`.
+    #[error("{message}")]
+    ContentFiltered {
+        message: String,
+        unavailable: Option<String>,
+    },
     // Carries cp-api's structured reason. Display forwards the cp-api
     // message verbatim (it's already a complete customer sentence —
     // "<scope> budget '<name>' exceeded ($X/period). Resets …"); the
@@ -330,6 +348,20 @@ pub enum ProxyError {
     Bridge(#[from] BridgeError),
 }
 
+/// Failure tags for the two refusals the PROXY itself raises on a
+/// guardrail's behalf, where no `GuardrailVerdict` exists to carry one.
+/// Same closed, label-safe vocabulary as a kind's own tag, and here for
+/// the same reason: in both cases the content was never screened, so
+/// telling the caller its content violated a policy states something that
+/// did not happen.
+///
+/// `output_buffer_exceeded` — a streamed response outgrew the hold-back
+/// cap and the row is fail-closed, so it is refused unscanned.
+/// `mask_writeback_failed` — a mask verdict could not be spliced back into
+/// the body, so the request is refused rather than forwarded unmasked.
+pub(crate) const TAG_OUTPUT_BUFFER_EXCEEDED: &str = "output_buffer_exceeded";
+pub(crate) const TAG_MASK_WRITEBACK_FAILED: &str = "mask_writeback_failed";
+
 /// The caller-visible message for a guardrail `Block` verdict.
 ///
 /// Carries WHICH guardrail fired — `guardrail_name` is operator-assigned
@@ -341,10 +373,46 @@ pub enum ProxyError {
 /// family builds its rejection text through this helper so the wording can't
 /// drift between siblings, even where the envelope differs (422 or an SSE
 /// error event on the LLM routes; an `isError` tool result on `/mcp`).
-pub(crate) fn guardrail_block_message(side: &str, guardrail_name: Option<&str>) -> String {
-    match guardrail_name {
-        Some(name) => format!("{side} blocked by content policy (guardrail '{name}')"),
-        None => format!("{side} blocked by content policy"),
+///
+/// `unavailable` splits the sentence in two. A guardrail that REFUSED the
+/// content and a guardrail that COULD NOT EVALUATE it are the same 422 to
+/// every consumer downstream, and until this parameter existed they were
+/// also the same sentence — so an operator whose fail-closed row was
+/// broken (a screening service down, a script returning a verdict the
+/// gateway does not understand) saw their own working policy's message on
+/// every single request, with nothing in the response to suggest
+/// otherwise. AISIX-Cloud#1365 split the two on the audit event and the
+/// metric; this is the third surface, the one the caller actually reads.
+/// The tag is named in the text because it is what an operator greps for
+/// and what the dashboard shows.
+pub(crate) fn guardrail_block_message(
+    side: &str,
+    guardrail_name: Option<&str>,
+    unavailable: Option<&str>,
+) -> String {
+    match (unavailable, guardrail_name) {
+        (Some(tag), Some(name)) => {
+            format!("{side} rejected: guardrail '{name}' could not evaluate it ({tag})")
+        }
+        (Some(tag), None) => format!("{side} rejected: a guardrail could not evaluate it ({tag})"),
+        (None, Some(name)) => format!("{side} blocked by content policy (guardrail '{name}')"),
+        (None, None) => format!("{side} blocked by content policy"),
+    }
+}
+
+/// [`guardrail_block_message`] wrapped in the error the LLM handlers
+/// return. The `Option<String>` sites (SSE error frames, `/mcp` tool
+/// results, hand-built JSON bodies) use the message helper directly; every
+/// site that returns a [`ProxyError`] goes through this one so the message
+/// and the `unavailable` tag can never be set from different verdicts.
+pub(crate) fn guardrail_block_error(
+    side: &str,
+    guardrail_name: Option<&str>,
+    unavailable: Option<&str>,
+) -> ProxyError {
+    ProxyError::ContentFiltered {
+        message: guardrail_block_message(side, guardrail_name, unavailable),
+        unavailable: unavailable.map(str::to_owned),
     }
 }
 
@@ -373,7 +441,7 @@ impl ProxyError {
             ProxyError::WebSocketUpgradeRequired { status, .. } => *status,
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::AllCandidatesUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
-            ProxyError::ContentFiltered(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            ProxyError::ContentFiltered { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             ProxyError::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             ProxyError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
@@ -411,7 +479,7 @@ impl ProxyError {
             ProxyError::RequestTooLarge { .. } => "invalid_request_error",
             ProxyError::ProviderUnavailable => "provider_unavailable",
             ProxyError::AllCandidatesUnavailable { .. } => "all_candidates_unavailable",
-            ProxyError::ContentFiltered(_) => "content_filter",
+            ProxyError::ContentFiltered { .. } => "content_filter",
             ProxyError::BudgetExceeded(_) => "billing_error",
             ProxyError::RateLimit(_) => "rate_limit_exceeded",
             ProxyError::PolicyRateLimit { .. } => "rate_limit_exceeded",
@@ -533,6 +601,18 @@ impl ProxyError {
             }
             ProxyError::JwtIdentityUnmapped => env.with_code("jwt_identity_unmapped"),
             ProxyError::JwksUnavailable => env.with_code("jwks_unavailable"),
+            // Same stable-code convention, for the one distinction a
+            // caller cannot make from `error.type`: `content_filter`
+            // covers both a policy refusal and a fail-closed row that
+            // could not evaluate the request. The `type` stays
+            // `content_filter` — it is a shipped contract and both really
+            // are guardrail refusals — while the code lets an SDK branch,
+            // and lets an operator's dashboard stop counting a broken
+            // script as policy volume.
+            ProxyError::ContentFiltered {
+                unavailable: Some(_),
+                ..
+            } => env.with_code("guardrail_unavailable"),
             _ => env,
         }
     }
@@ -1115,6 +1195,56 @@ mod tests {
         json
     }
 
+    #[test]
+    fn a_guardrail_that_could_not_evaluate_does_not_claim_a_content_decision() {
+        // The whole defect in one assertion: the two refusals shared a
+        // sentence, so a broken fail-closed row looked exactly like a
+        // working policy to the caller.
+        let policy = guardrail_block_error("request", Some("my-guard"), None);
+        let broken = guardrail_block_error("request", Some("my-guard"), Some("custom_no_verdict"));
+        assert_eq!(
+            policy.to_string(),
+            "request blocked by content policy (guardrail 'my-guard')"
+        );
+        assert_ne!(policy.to_string(), broken.to_string());
+        assert!(broken.to_string().contains("could not evaluate"));
+        assert!(!broken.to_string().contains("content policy"));
+        // The tag is named so an operator can grep the message straight
+        // onto the dashboard series that carries the same value.
+        assert!(broken.to_string().contains("custom_no_verdict"));
+        // Both still name the firing row (#519 B.4b) and neither carries
+        // matched content (#153).
+        assert!(broken.to_string().contains("my-guard"));
+    }
+
+    #[test]
+    fn an_unattributed_availability_refusal_still_says_which_kind_of_refusal_it_is() {
+        let msg = guardrail_block_message("response", None, Some("output_buffer_exceeded"));
+        assert_eq!(
+            msg,
+            "response rejected: a guardrail could not evaluate it (output_buffer_exceeded)"
+        );
+    }
+
+    #[test]
+    fn the_availability_refusal_keeps_the_status_and_type_but_adds_a_machine_readable_code() {
+        let policy = guardrail_block_error("request", Some("g"), None);
+        let broken = guardrail_block_error("request", Some("g"), Some("custom_unknown_action"));
+        // Same shipped contract: an SDK branching on status or type sees
+        // no change, and an operator alert on `content_filter` keeps
+        // counting both.
+        assert_eq!(policy.status(), broken.status());
+        assert_eq!(policy.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(policy.kind(), "content_filter");
+        assert_eq!(broken.kind(), "content_filter");
+        // The code is the new discriminator.
+        assert_eq!(policy.envelope().error.code, None);
+        assert_eq!(
+            broken.envelope().error.code.as_deref(),
+            Some("guardrail_unavailable")
+        );
+    }
+
     #[tokio::test]
     async fn anthropic_envelope_404_maps_to_not_found_error() {
         let err = ProxyError::ModelNotFound("claude-x".into());
@@ -1171,7 +1301,7 @@ mod tests {
         // Content-filter rejections share 422 with the OpenAI side;
         // Anthropic-canonical 422 maps to `invalid_request_error`
         // (no dedicated content-filter type in the SDK literal).
-        let err = ProxyError::ContentFiltered("request blocked by content policy".into());
+        let err = guardrail_block_error("request", None, None);
         let resp = err.into_anthropic_response();
         assert_anthropic_envelope(
             resp,

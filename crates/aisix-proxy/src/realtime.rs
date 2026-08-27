@@ -678,9 +678,10 @@ async fn run_session(
                                 })))
                                 .await;
                             close_status = 400;
-                            session_error = Some(ProxyError::ContentFiltered(
-                                "realtime frame blocked by a guardrail".into(),
-                            ));
+                            session_error = Some(ProxyError::ContentFiltered {
+                                message: "realtime frame blocked by a guardrail".into(),
+                                unavailable: None,
+                            });
                             break;
                         }
                     }
@@ -724,9 +725,10 @@ async fn run_session(
                                 })))
                                 .await;
                             close_status = 400;
-                            session_error = Some(ProxyError::ContentFiltered(
-                                "realtime frame blocked by a guardrail".into(),
-                            ));
+                            session_error = Some(ProxyError::ContentFiltered {
+                                message: "realtime frame blocked by a guardrail".into(),
+                                unavailable: None,
+                            });
                             break;
                         }
                     }
@@ -916,7 +918,7 @@ async fn guardrail_block_event(
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
-        ..
+        unavailable,
     } = verdict
     {
         let side = if input_side { "input" } else { "output" };
@@ -928,6 +930,7 @@ async fn guardrail_block_event(
         let msg = crate::error::guardrail_block_message(
             if input_side { "request" } else { "response" },
             guardrail_name.as_deref(),
+            unavailable.as_deref(),
         );
         return Some(
             serde_json::json!({

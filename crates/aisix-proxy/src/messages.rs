@@ -624,7 +624,7 @@ async fn dispatch(
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
-                ..
+                unavailable,
             } = verdict
             {
                 // AISIX-Cloud#1013: mask before returning so the failure
@@ -639,13 +639,12 @@ async fn dispatch(
                     reason = %reason,
                     "guardrail blocked /v1/messages request",
                 );
-                return Err(
-                    ProxyError::ContentFiltered(crate::error::guardrail_block_message(
-                        "request",
-                        guardrail_name.as_deref(),
-                    ))
-                    .into(),
-                );
+                return Err(crate::error::guardrail_block_error(
+                    "request",
+                    guardrail_name.as_deref(),
+                    unavailable.as_deref(),
+                )
+                .into());
             }
         }
         // #932: mask-action PII rules rewrite the Anthropic-native body in
@@ -1623,7 +1622,7 @@ async fn anthropic_passthrough_dispatch(
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                    ..
+                    unavailable,
                 } = verdict
                 {
                     tracing::warn!(
@@ -1632,11 +1631,10 @@ async fn anthropic_passthrough_dispatch(
                         reason = %reason,
                         "guardrail blocked /v1/messages passthrough response",
                     );
-                    return Err(ProxyError::ContentFiltered(
-                        crate::error::guardrail_block_message(
-                            "response",
-                            guardrail_name.as_deref(),
-                        ),
+                    return Err(crate::error::guardrail_block_error(
+                        "response",
+                        guardrail_name.as_deref(),
+                        unavailable.as_deref(),
                     ));
                 }
             }
@@ -2225,7 +2223,7 @@ async fn cross_provider_dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } = verdict
         {
             tracing::warn!(
@@ -2234,8 +2232,10 @@ async fn cross_provider_dispatch(
                 reason = %reason,
                 "guardrail blocked /v1/messages response",
             );
-            return Err(ProxyError::ContentFiltered(
-                crate::error::guardrail_block_message("response", guardrail_name.as_deref()),
+            return Err(crate::error::guardrail_block_error(
+                "response",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
             ));
         }
     }
@@ -2461,7 +2461,7 @@ fn build_anthropic_sse_stream(
                                 max_buffer_bytes = max_hold,
                                 "streaming /v1/messages response exceeded hold-back cap; failing closed",
                             );
-                            yield Ok(bytes::Bytes::from(guardrail_block_frame(None)));
+                            yield Ok(bytes::Bytes::from(guardrail_block_frame(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED))));
                             return;
                         }
                         held_chunks.push(chunk);
@@ -2558,7 +2558,7 @@ fn build_anthropic_sse_stream(
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                    ..
+                    unavailable,
                 } = verdict
                 {
                     tracing::warn!(
@@ -2569,7 +2569,7 @@ fn build_anthropic_sse_stream(
                     );
                     // Hold-back: the held chunks are dropped — the matched
                     // content never reached the wire.
-                    let frame = guardrail_block_frame(guardrail_name.as_deref());
+                    let frame = guardrail_block_frame(guardrail_name.as_deref(), unavailable.as_deref());
                     yield Ok(bytes::Bytes::from(frame));
                     return;
                 }
@@ -2624,14 +2624,14 @@ fn build_anthropic_sse_stream(
 /// with serde_json so an operator-supplied guardrail name is JSON-escaped
 /// correctly; the message carries the firing guardrail's name (#519 B.4b)
 /// but never the matched-pattern detail (#153).
-fn guardrail_block_frame(guardrail_name: Option<&str>) -> String {
+fn guardrail_block_frame(guardrail_name: Option<&str>, unavailable: Option<&str>) -> String {
     format!(
         "event: error\ndata: {}\n\n",
         serde_json::json!({
             "type": "error",
             "error": {
                 "type": "content_filter",
-                "message": crate::error::guardrail_block_message("response", guardrail_name),
+                "message": crate::error::guardrail_block_message("response", guardrail_name, unavailable),
             }
         })
     )
@@ -3489,7 +3489,7 @@ where
                             max_buffer_bytes = max_hold,
                             "streaming /v1/messages passthrough exceeded hold-back cap; failing closed",
                         );
-                        yield Ok(Bytes::from(guardrail_block_frame(None)));
+                        yield Ok(Bytes::from(guardrail_block_frame(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED))));
                         return;
                     }
                     held.extend_from_slice(bytes);
@@ -3591,7 +3591,7 @@ where
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                    ..
+                    unavailable,
                 } = verdict
                 {
                     tracing::warn!(
@@ -3601,7 +3601,7 @@ where
                         "guardrail blocked streaming /v1/messages passthrough response",
                     );
                     blocked = true;
-                    let frame = guardrail_block_frame(guardrail_name.as_deref());
+                    let frame = guardrail_block_frame(guardrail_name.as_deref(), unavailable.as_deref());
                     yield Ok(Bytes::from(frame));
                 }
             }
