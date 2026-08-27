@@ -526,8 +526,8 @@ pub(crate) fn usage_event_model_label<'a>(
 /// Pair that label with the ProviderKey the event is attributed to.
 ///
 /// Takes the resolved key rather than an id for the same reason
-/// `request_metrics::Upstream` does: the readable name can only come off
-/// the row its id names.
+/// `request_metrics::Upstream` does: the readable name and the upstream
+/// protocol can only come off the row its id names.
 pub(crate) fn usage_event_labels<'a>(
     model: &'a str,
     pk: &'a ResolvedPk<'_>,
@@ -545,6 +545,10 @@ pub(crate) fn usage_event_labels<'a>(
             labels.id()
         },
         provider_key_name: labels.name(),
+        // Same `PkLabels` the request families read (AISIX-Cloud#1403), so
+        // `aisix_usage_events_emitted_total` joins with them on
+        // `upstream_protocol` instead of dropping out of the aggregation.
+        upstream_protocol: labels.protocol(),
     }
 }
 
@@ -763,6 +767,44 @@ mod tests {
             "anthropic",
             "an open vendor string cannot stand in for the adapter"
         );
+    }
+
+    /// …and the usage-event counter's label set is built off that same
+    /// resolved key, so `aisix_usage_events_emitted_total` reports the
+    /// protocol of the key its `provider_key_id` names.
+    ///
+    /// It was the one family carrying `inbound_protocol` that had the
+    /// value in hand and did not emit it (found in 0.11.0-rc.2 QA), which
+    /// left it unjoinable with the families that did:
+    /// `sum by (upstream_protocol)` returned an aggregate with this
+    /// counter silently missing from it.
+    #[test]
+    fn usage_event_labels_carry_the_resolved_upstream_protocol() {
+        let snap = snap_with_pk("prod-openai", "");
+        let pk = ResolvedPk::resolve(&snap, PK_ID);
+        let labels = usage_event_labels("gpt-4o", &pk);
+        assert_eq!(labels.provider_key_id, PK_ID);
+        assert_eq!(labels.provider_key_name, "prod-openai");
+        // The UPSTREAM's protocol. An Anthropic-protocol caller served by
+        // this key must still read `openai` here — the inbound protocol
+        // travels on its own label.
+        assert_eq!(labels.upstream_protocol, "openai");
+
+        // Nothing resolved: `unknown`, matching the id/name fallback
+        // beside it and the value the request families use for a
+        // pre-dispatch rejection.
+        let unresolved = ResolvedPk::unresolved();
+        let labels = usage_event_labels("unknown", &unresolved);
+        assert_eq!(labels.provider_key_id, UNKNOWN_PK);
+        assert_eq!(labels.upstream_protocol, "unknown");
+
+        // A deleted id keeps reaching the label verbatim, but there is no
+        // row left to read a protocol off.
+        let empty = AisixSnapshot::new();
+        let gone = ResolvedPk::resolve(&empty, "pk-deleted");
+        let labels = usage_event_labels("gpt-4o", &gone);
+        assert_eq!(labels.provider_key_id, "pk-deleted");
+        assert_eq!(labels.upstream_protocol, "unknown");
     }
 
     /// The id reaches the label verbatim even when it resolves to nothing —
