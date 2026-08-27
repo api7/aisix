@@ -388,6 +388,10 @@ pub(crate) fn record(
         // families can't disagree with `aisix_proxy_in_flight_requests`
         // about which protocol a route speaks.
         inbound_protocol: crate::inbound_protocol_for_endpoint(endpoint),
+        // Read off the SAME ProviderKey row that produced the id and name
+        // beside it (`usage_attr::ResolvedPk`), so a request can never be
+        // labelled with one key's identity and another's protocol.
+        upstream_protocol: upstream.pk.protocol(),
         provider: upstream.provider,
         model: upstream.model,
         upstream_model: upstream.upstream_model,
@@ -422,6 +426,19 @@ pub(crate) struct Tokens<'a> {
     /// traffic, and this value is what the by-client series reports as
     /// `token_type="total"`.
     pub total: u32,
+    /// Upstream prompt-cache detail (AISIX-Cloud#1404), each field
+    /// forwarded exactly as the upstream reported it and never folded
+    /// into `input` / `total` — the two accounting shapes are
+    /// incompatible, so the split is what makes a cross-protocol cache
+    /// ratio computable at all. `cached` is `UsageStats::
+    /// cached_prompt_tokens` (already inside `input`); `cache_read` and
+    /// `cache_creation` are the Anthropic-shape counters that sit
+    /// outside `input` and inside `total`. All three are 0 on the
+    /// endpoints and providers that report no cache detail, which emits
+    /// no series.
+    pub cached: u32,
+    pub cache_read: u32,
+    pub cache_creation: u32,
     pub spend_usd: f64,
     /// Normalised inbound client for the by-client series
     /// (`state.client_classifier.classify(&client.user_agent)`).
@@ -465,6 +482,7 @@ pub(crate) fn record_usage(
         UsageLabels {
             endpoint,
             inbound_protocol: crate::inbound_protocol_for_endpoint(endpoint),
+            upstream_protocol: upstream.pk.protocol(),
             provider: upstream.provider,
             model: upstream.model,
             upstream_model: upstream.upstream_model,
@@ -479,6 +497,9 @@ pub(crate) fn record_usage(
             input_tokens: tokens.input,
             output_tokens: tokens.output,
             total_tokens: tokens.total,
+            cached_input_tokens: tokens.cached,
+            cache_read_input_tokens: tokens.cache_read,
+            cache_creation_input_tokens: tokens.cache_creation,
             spend_usd: tokens.spend_usd,
         },
     );

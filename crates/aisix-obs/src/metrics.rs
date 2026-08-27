@@ -47,6 +47,44 @@ pub const M_LLM_SPEND_MICRO_USD_TOTAL: &str = "aisix_llm_spend_micro_usd_total";
 pub const M_LLM_INPUT_TOKENS_TOTAL: &str = "aisix_llm_input_tokens_total";
 pub const M_LLM_OUTPUT_TOKENS_TOTAL: &str = "aisix_llm_output_tokens_total";
 pub const M_LLM_TOTAL_TOKENS_TOTAL: &str = "aisix_llm_total_tokens_total";
+// ── Upstream prompt-cache token detail (AISIX-Cloud#1404) ───────────────
+//
+// The upstream provider's OWN prompt cache, not the gateway's response /
+// semantic cache — that one is `aisix_cache_requests_total{outcome}`, and
+// mixing the two is the whole reason these carry `input` in the name.
+//
+// Three counters rather than two because the providers report cache reads
+// under two INCOMPATIBLE accounting rules, and folding them together makes
+// every cross-protocol ratio wrong:
+//
+// - OpenAI-shape (`prompt_tokens_details.cached_tokens`, DeepSeek's
+//   `prompt_cache_hit_tokens`, Gemini's `cachedContentTokenCount`) is a
+//   SUBSET of the reported prompt tokens — already inside
+//   `aisix_llm_input_tokens_total`.
+// - Anthropic-shape (`cache_read_input_tokens` / `cache_creation_input_tokens`,
+//   Bedrock's `cacheReadInputTokens` / `cacheWriteInputTokens`) is reported
+//   ALONGSIDE `input_tokens` — outside `aisix_llm_input_tokens_total`, and
+//   folded into `aisix_llm_total_tokens_total` by `total_tokens_with_cache`.
+//
+// So the cache-inclusive input a request really consumed is
+// `input + cache_read + cache_creation`, and the part of it served from
+// cache is `cached_input + cache_read`. Both expressions hold for either
+// provider shape precisely because the two reads stay separate here.
+//
+// All three are sparse: a series appears only once its value is non-zero,
+// so providers that report no cache detail mint nothing.
+/// Prompt-cache hits the upstream reported as part of its prompt token
+/// count — already included in [`M_LLM_INPUT_TOKENS_TOTAL`].
+pub const M_LLM_CACHED_INPUT_TOKENS_TOTAL: &str = "aisix_llm_cached_input_tokens_total";
+/// Prompt-cache hits the upstream reported as a counter separate from its
+/// input tokens — NOT included in [`M_LLM_INPUT_TOKENS_TOTAL`], and
+/// included in [`M_LLM_TOTAL_TOKENS_TOTAL`].
+pub const M_LLM_CACHE_READ_INPUT_TOKENS_TOTAL: &str = "aisix_llm_cache_read_input_tokens_total";
+/// Input tokens written INTO the upstream's prompt cache. Reported as a
+/// counter separate from input tokens, and billed at a premium by every
+/// provider that reports it.
+pub const M_LLM_CACHE_CREATION_INPUT_TOKENS_TOTAL: &str =
+    "aisix_llm_cache_creation_input_tokens_total";
 pub const M_LLM_REQUESTS_TOTAL: &str = "aisix_llm_requests_total";
 pub const M_LLM_REQUEST_DURATION: &str = "aisix_llm_request_duration_seconds";
 pub const M_LLM_API_LATENCY: &str = "aisix_llm_api_latency_seconds";
@@ -538,6 +576,9 @@ struct UsageSeriesHandles {
     input_tokens: OnceLock<metrics::Counter>,
     output_tokens: OnceLock<metrics::Counter>,
     total_tokens: OnceLock<metrics::Counter>,
+    cached_input_tokens: OnceLock<metrics::Counter>,
+    cache_read_input_tokens: OnceLock<metrics::Counter>,
+    cache_creation_input_tokens: OnceLock<metrics::Counter>,
     spend_micro_usd: OnceLock<metrics::Counter>,
 }
 
@@ -1427,6 +1468,7 @@ impl Metrics {
             |k| {
                 k.label(labels.endpoint);
                 k.label(labels.inbound_protocol);
+                k.label(labels.upstream_protocol);
                 k.label(labels.provider);
                 k.label(labels.model);
                 k.label(labels.upstream_model);
@@ -1452,6 +1494,7 @@ impl Metrics {
             |k| {
                 k.label(labels.endpoint);
                 k.label(labels.inbound_protocol);
+                k.label(labels.upstream_protocol);
                 k.label(labels.provider);
                 k.label(labels.model);
                 k.label(labels.upstream_model);
@@ -1587,11 +1630,22 @@ impl Metrics {
         });
     }
 
+    /// The terminal token + spend emit for one request.
+    ///
+    /// The three prompt-cache counters (AISIX-Cloud#1404) are recorded
+    /// ALONGSIDE `input_tokens` / `total_tokens`, never folded into
+    /// them: this function must not change what the existing three
+    /// counters report, or every cost figure built on them shifts. The
+    /// caller supplies each field exactly as the upstream reported it —
+    /// see [`LlmUsage`] for which accounting shape each one carries.
     pub fn record_llm_usage(&self, labels: UsageLabels<'_>, usage: LlmUsage) {
         let spend_micro_usd = usage.spend_micro_usd();
         if usage.input_tokens == 0
             && usage.output_tokens == 0
             && usage.total_tokens == 0
+            && usage.cached_input_tokens == 0
+            && usage.cache_read_input_tokens == 0
+            && usage.cache_creation_input_tokens == 0
             && spend_micro_usd.is_none()
         {
             return;
@@ -1615,6 +1669,24 @@ impl Metrics {
                 })
                 .increment(u64::from(usage.total_tokens));
             }
+            if usage.cached_input_tokens > 0 {
+                self.init_handle(&handles.cached_input_tokens, || {
+                    labels.counter(M_LLM_CACHED_INPUT_TOKENS_TOTAL)
+                })
+                .increment(u64::from(usage.cached_input_tokens));
+            }
+            if usage.cache_read_input_tokens > 0 {
+                self.init_handle(&handles.cache_read_input_tokens, || {
+                    labels.counter(M_LLM_CACHE_READ_INPUT_TOKENS_TOTAL)
+                })
+                .increment(u64::from(usage.cache_read_input_tokens));
+            }
+            if usage.cache_creation_input_tokens > 0 {
+                self.init_handle(&handles.cache_creation_input_tokens, || {
+                    labels.counter(M_LLM_CACHE_CREATION_INPUT_TOKENS_TOTAL)
+                })
+                .increment(u64::from(usage.cache_creation_input_tokens));
+            }
             if let Some(value) = spend_micro_usd {
                 self.init_handle(&handles.spend_micro_usd, || {
                     labels.counter(M_LLM_SPEND_MICRO_USD_TOTAL)
@@ -1634,6 +1706,7 @@ impl Metrics {
             |k| {
                 k.label(labels.endpoint);
                 k.label(labels.inbound_protocol);
+                k.label(labels.upstream_protocol);
                 k.label(labels.provider);
                 k.label(labels.model);
                 k.label(labels.upstream_model);
@@ -1649,6 +1722,7 @@ impl Metrics {
                     M_LLM_TTFT,
                     "endpoint" => labels.endpoint.to_string(),
                     "inbound_protocol" => labels.inbound_protocol.to_string(),
+                    "upstream_protocol" => labels.upstream_protocol.to_string(),
                     "provider" => labels.provider.to_string(),
                     "model" => labels.model.to_string(),
                     "upstream_model" => labels.upstream_model.to_string(),
@@ -2333,6 +2407,22 @@ fn valid_client_label(label: &str) -> bool {
 pub struct RequestLabels<'a> {
     pub endpoint: &'a str,
     pub inbound_protocol: &'a str,
+    /// The upstream API protocol the selected target actually speaks —
+    /// the ProviderKey adapter's wire value, as resolved by the SAME
+    /// two-tier rule dispatch uses (AISIX-Cloud#1403).
+    ///
+    /// A bounded set: `openai` / `anthropic` / `bedrock` / `vertex` /
+    /// `azure-openai`, plus `unknown` for a request that never selected
+    /// an upstream (a pre-dispatch rejection, or a non-inference route
+    /// like `/mcp`). Distinct from `inbound_protocol`, which is the
+    /// protocol the CALLER spoke: a request arriving on `/v1/messages`
+    /// and served by an OpenAI-shape upstream carries
+    /// `inbound_protocol="anthropic", upstream_protocol="openai"`.
+    ///
+    /// `provider` cannot stand in for it: vendor identity is an open
+    /// string, and the same vendor can be reached through different
+    /// adapters (a `byo` key with `adapter: anthropic`, say).
+    pub upstream_protocol: &'a str,
     pub provider: &'a str,
     pub model: &'a str,
     pub upstream_model: &'a str,
@@ -2366,6 +2456,7 @@ impl Default for RequestLabels<'_> {
         Self {
             endpoint: "unknown",
             inbound_protocol: "openai",
+            upstream_protocol: "unknown",
             provider: "unknown",
             model: "unknown",
             upstream_model: "unknown",
@@ -2389,6 +2480,7 @@ impl RequestLabels<'_> {
             metric,
             "endpoint" => self.endpoint.to_string(),
             "inbound_protocol" => self.inbound_protocol.to_string(),
+            "upstream_protocol" => self.upstream_protocol.to_string(),
             "provider" => self.provider.to_string(),
             "model" => self.model.to_string(),
             "upstream_model" => self.upstream_model.to_string(),
@@ -2410,6 +2502,7 @@ impl RequestLabels<'_> {
             metric,
             "endpoint" => self.endpoint.to_string(),
             "inbound_protocol" => self.inbound_protocol.to_string(),
+            "upstream_protocol" => self.upstream_protocol.to_string(),
             "provider" => self.provider.to_string(),
             "model" => self.model.to_string(),
             "upstream_model" => self.upstream_model.to_string(),
@@ -2430,6 +2523,22 @@ impl RequestLabels<'_> {
 pub struct UsageLabels<'a> {
     pub endpoint: &'a str,
     pub inbound_protocol: &'a str,
+    /// The upstream API protocol the selected target actually speaks —
+    /// the ProviderKey adapter's wire value, as resolved by the SAME
+    /// two-tier rule dispatch uses (AISIX-Cloud#1403).
+    ///
+    /// A bounded set: `openai` / `anthropic` / `bedrock` / `vertex` /
+    /// `azure-openai`, plus `unknown` for a request that never selected
+    /// an upstream (a pre-dispatch rejection, or a non-inference route
+    /// like `/mcp`). Distinct from `inbound_protocol`, which is the
+    /// protocol the CALLER spoke: a request arriving on `/v1/messages`
+    /// and served by an OpenAI-shape upstream carries
+    /// `inbound_protocol="anthropic", upstream_protocol="openai"`.
+    ///
+    /// `provider` cannot stand in for it: vendor identity is an open
+    /// string, and the same vendor can be reached through different
+    /// adapters (a `byo` key with `adapter: anthropic`, say).
+    pub upstream_protocol: &'a str,
     pub provider: &'a str,
     pub model: &'a str,
     pub upstream_model: &'a str,
@@ -2448,6 +2557,7 @@ impl Default for UsageLabels<'_> {
         Self {
             endpoint: "unknown",
             inbound_protocol: "openai",
+            upstream_protocol: "unknown",
             provider: "unknown",
             model: "unknown",
             upstream_model: "unknown",
@@ -2467,6 +2577,7 @@ impl UsageLabels<'_> {
             metric,
             "endpoint" => self.endpoint.to_string(),
             "inbound_protocol" => self.inbound_protocol.to_string(),
+            "upstream_protocol" => self.upstream_protocol.to_string(),
             "provider" => self.provider.to_string(),
             "model" => self.model.to_string(),
             "upstream_model" => self.upstream_model.to_string(),
@@ -2485,6 +2596,17 @@ pub struct LlmUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub total_tokens: u32,
+    /// Upstream prompt-cache hits already counted inside `input_tokens`
+    /// — the OpenAI accounting shape (AISIX-Cloud#1404). See
+    /// [`M_LLM_CACHED_INPUT_TOKENS_TOTAL`].
+    pub cached_input_tokens: u32,
+    /// Upstream prompt-cache hits reported ALONGSIDE `input_tokens` —
+    /// the Anthropic accounting shape. See
+    /// [`M_LLM_CACHE_READ_INPUT_TOKENS_TOTAL`].
+    pub cache_read_input_tokens: u32,
+    /// Input tokens written into the upstream's prompt cache. See
+    /// [`M_LLM_CACHE_CREATION_INPUT_TOKENS_TOTAL`].
+    pub cache_creation_input_tokens: u32,
     pub spend_usd: f64,
 }
 
@@ -2842,6 +2964,7 @@ mod tests {
         let labels = RequestLabels {
             endpoint: "/v1/chat/completions",
             inbound_protocol: "openai",
+            upstream_protocol: "anthropic",
             provider: "openai",
             model: "gpt",
             upstream_model: "gpt-4o",
@@ -2859,6 +2982,7 @@ mod tests {
         let usage_labels = UsageLabels {
             endpoint: "/v1/chat/completions",
             inbound_protocol: "openai",
+            upstream_protocol: "anthropic",
             provider: "openai",
             model: "gpt",
             upstream_model: "gpt-4o",
@@ -2883,6 +3007,9 @@ mod tests {
                 input_tokens: 5,
                 output_tokens: 7,
                 total_tokens: 12,
+                cached_input_tokens: 3,
+                cache_read_input_tokens: 800,
+                cache_creation_input_tokens: 200,
                 spend_usd: 0.001,
             },
         );
@@ -2926,6 +3053,77 @@ mod tests {
                 );
             }
         }
+        // AISIX-Cloud#1403: the cross-protocol pair. The labels above spell
+        // an OpenAI caller served by an Anthropic upstream, and both halves
+        // have to survive onto the same sample or the conversion is
+        // invisible.
+        assert!(rendered.contains("inbound_protocol=\"openai\""));
+        assert!(rendered.contains("upstream_protocol=\"anthropic\""));
+        for family in [
+            M_PROXY_REQUESTS_TOTAL,
+            M_LLM_REQUESTS_TOTAL,
+            M_LLM_REQUEST_DURATION,
+            M_PROXY_REQUEST_DURATION,
+            M_LLM_INPUT_TOKENS_TOTAL,
+            M_LLM_SPEND_MICRO_USD_TOTAL,
+            M_LLM_TTFT,
+        ] {
+            let mut samples = rendered
+                .lines()
+                .filter(|line| line.starts_with(family) && line.contains('{'))
+                .peekable();
+            assert!(samples.peek().is_some(), "{family} rendered no samples");
+            for line in samples {
+                // Every sample of a family must carry the label, or
+                // `sum by (upstream_protocol)` silently drops the ones
+                // that do not.
+                assert!(
+                    line.contains("upstream_protocol="),
+                    "{family} sample is missing upstream_protocol: {line}"
+                );
+            }
+        }
+        // AISIX-Cloud#1404: each cache counter carries its own value and
+        // none of them was folded into input or total.
+        assert!(rendered.contains(M_LLM_CACHED_INPUT_TOKENS_TOTAL));
+        assert!(rendered.contains(M_LLM_CACHE_READ_INPUT_TOKENS_TOTAL));
+        assert!(rendered.contains(M_LLM_CACHE_CREATION_INPUT_TOKENS_TOTAL));
+        let value_of = |family: &str| -> f64 {
+            rendered
+                .lines()
+                .find(|line| line.starts_with(family) && line.contains('{'))
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("{family} rendered no sample"))
+        };
+        assert_eq!(value_of(M_LLM_CACHED_INPUT_TOKENS_TOTAL), 3.0);
+        assert_eq!(value_of(M_LLM_CACHE_READ_INPUT_TOKENS_TOTAL), 800.0);
+        assert_eq!(value_of(M_LLM_CACHE_CREATION_INPUT_TOKENS_TOTAL), 200.0);
+        assert_eq!(value_of(M_LLM_INPUT_TOKENS_TOTAL), 5.0);
+        assert_eq!(value_of(M_LLM_TOTAL_TOKENS_TOTAL), 12.0);
+    }
+
+    /// A request that reported only cache tokens still records them. The
+    /// all-zero short-circuit in `record_llm_usage` guards series
+    /// sparsity, and before #1404 it only knew about input / output /
+    /// total / spend — so a usage report whose only non-zero field is a
+    /// cache counter must not be swallowed by it.
+    #[test]
+    fn cache_only_usage_is_not_swallowed_by_the_zero_short_circuit() {
+        let m = Metrics::new(false);
+        m.record_llm_usage(
+            UsageLabels::default(),
+            LlmUsage {
+                cache_read_input_tokens: 64,
+                ..Default::default()
+            },
+        );
+        let rendered = m.render();
+        assert!(rendered.contains(M_LLM_CACHE_READ_INPUT_TOKENS_TOTAL));
+        // …and the counters that reported nothing stay absent, so the
+        // scrape does not gain a zero-valued series per request.
+        assert!(!rendered.contains(M_LLM_CACHED_INPUT_TOKENS_TOTAL));
+        assert!(!rendered.contains(M_LLM_INPUT_TOKENS_TOTAL));
     }
 
     #[test]
@@ -4015,6 +4213,7 @@ mod tests {
                             output_tokens: 2,
                             total_tokens: 3,
                             spend_usd: 0.000001,
+                            ..Default::default()
                         },
                     );
                 })

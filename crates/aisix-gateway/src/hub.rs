@@ -31,6 +31,42 @@ use std::sync::Arc;
 
 use crate::bridge::Bridge;
 
+/// The `upstream_protocol` metric label for a request that never
+/// selected an upstream, or one whose ProviderKey resolves to no bridge
+/// at all (AISIX-Cloud#1403).
+///
+/// Deliberately the SAME spelling the other unresolved metric
+/// dimensions use (`provider`, `provider_key_id`, …): a second sentinel
+/// would split every query that filters the unresolved traffic out.
+pub const UPSTREAM_PROTOCOL_UNKNOWN: &str = "unknown";
+
+/// The upstream API protocol a request dispatched through `pk` speaks,
+/// as the bounded `upstream_protocol` metric label value
+/// (AISIX-Cloud#1403).
+///
+/// Mirrors [`Hub::dispatch_two_tier`] exactly, and must keep doing so:
+/// a ProviderKey whose `provider` has a specialized bridge never
+/// reaches the adapter tier, so reading `pk.adapter` alone would report
+/// `unknown` for the canonical `provider: "openai"` key that cp-api
+/// writes without one. `upstream_protocol_label_matches_dispatched_bridge`
+/// in aisix-server pins the agreement against the real registrations.
+///
+/// A free function rather than a [`Hub`] method because it is called
+/// from the metric emit path, which resolves the ProviderKey row once
+/// per request (`usage_attr::ResolvedPk`) and has no Hub in hand.
+pub fn upstream_protocol(pk: &ProviderKey) -> &'static str {
+    match pk.provider.as_str() {
+        // The two vendors `build_hub()` registers a specialized bridge
+        // for. Both speak their own name on the wire.
+        "openai" => Adapter::Openai.wire_protocol(),
+        "anthropic" => Adapter::Anthropic.wire_protocol(),
+        _ => pk
+            .adapter
+            .map(Adapter::wire_protocol)
+            .unwrap_or(UPSTREAM_PROTOCOL_UNKNOWN),
+    }
+}
+
 /// Registry of vendor strings + adapter families → bridges.
 ///
 /// `DashMap` lets us register bridges after construction (useful for tests
@@ -83,6 +119,20 @@ impl Hub {
     /// [`Hub::get_specialized`] for the family tier.
     pub fn family_bridge_for(&self, adapter: Adapter) -> Option<Arc<dyn Bridge>> {
         self.family_bridges.get(&adapter).map(|r| r.clone())
+    }
+
+    /// The vendor strings a specialized bridge is registered for.
+    ///
+    /// Exposed so `upstream_protocol_label_matches_dispatched_bridge`
+    /// can sweep the REGISTERED set rather than a hand-maintained copy
+    /// of it — registering a third specialized vendor without teaching
+    /// [`upstream_protocol`] about it then fails that test instead of
+    /// silently mislabelling the vendor's traffic.
+    pub fn specialized_vendors(&self) -> Vec<String> {
+        self.specialized_bridges
+            .iter()
+            .map(|r| r.key().clone())
+            .collect()
     }
 
     /// Two-tier dispatch: specialized vendor bridge first, then the

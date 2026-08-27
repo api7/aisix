@@ -1420,6 +1420,10 @@ async fn anthropic_passthrough_dispatch(
                     completion_tokens: usage.completion_tokens,
                     cache_creation_tokens: usage.cache_creation_tokens,
                     cache_read_tokens: usage.cache_read_tokens,
+                    // Native Anthropic passthrough: the accumulator is fed
+                    // from raw Anthropic SSE frames, which carry no
+                    // OpenAI-shape `cached_tokens`.
+                    cached_prompt_tokens: 0,
                     usage_estimated: usage.usage_estimated,
                     provider_request_id: usage.provider_request_id,
                     provider_model_version: usage.provider_model_version,
@@ -1780,6 +1784,9 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
     let usage = body.get("usage");
     AnthropicUsageMetrics {
         usage_estimated: false,
+        // A native Anthropic body has no OpenAI-shape `cached_tokens`;
+        // its cache reads arrive in `cache_read_input_tokens` below.
+        cached_prompt_tokens: 0,
         prompt_tokens: usage
             .and_then(|u| u.get("input_tokens"))
             .and_then(Value::as_u64)
@@ -2076,6 +2083,7 @@ async fn cross_provider_dispatch(
                     completion_tokens: comp.completion_tokens,
                     cache_creation_tokens: comp.cache_creation_tokens,
                     cache_read_tokens: comp.cache_read_tokens,
+                    cached_prompt_tokens: comp.cached_prompt_tokens,
                     usage_estimated: comp.usage_estimated,
                     provider_request_id: comp.provider_request_id,
                     provider_model_version: comp.provider_model_version,
@@ -2245,6 +2253,7 @@ async fn cross_provider_dispatch(
         completion_tokens: resp.usage.completion_tokens,
         cache_creation_tokens: resp.usage.cache_creation_tokens,
         cache_read_tokens: resp.usage.cache_read_tokens,
+        cached_prompt_tokens: resp.usage.cached_prompt_tokens,
         usage_estimated: false,
         provider_request_id: crate::usage_attr::sanitize_provider_response_id(&resp.id),
         provider_model_version: resp.model.clone(),
@@ -2397,6 +2406,8 @@ fn build_anthropic_sse_stream(
                         comp.cache_creation_tokens =
                             comp.cache_creation_tokens.max(u.cache_creation_tokens);
                         comp.cache_read_tokens = comp.cache_read_tokens.max(u.cache_read_tokens);
+                        comp.cached_prompt_tokens =
+                            comp.cached_prompt_tokens.max(u.cached_prompt_tokens);
                     }
                     if output_guardrail.is_some() {
                         if let Some(t) = chunk.delta.content.as_deref() {
@@ -2650,6 +2661,12 @@ struct AnthropicStreamCompletion {
     completion_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// The bridged upstream's OpenAI-shape cache hit, a SUBSET of
+    /// `prompt_tokens` (AISIX-Cloud#1404). This accumulator is fed from
+    /// the bridge's `UsageStats`, so a `/v1/messages` caller served by an
+    /// OpenAI-shape upstream reports it here; a native Anthropic upstream
+    /// leaves it 0 and fills the two counters above instead.
+    cached_prompt_tokens: u32,
     /// True when the Drop guard filled any token counter from the local
     /// estimator (AISIX-Cloud#1074).
     usage_estimated: bool,
@@ -2788,6 +2805,15 @@ struct AnthropicUsageMetrics {
     completion_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// The OpenAI-shape cache hit count, which is a SUBSET of
+    /// `prompt_tokens` rather than a counter beside it. Non-zero only on
+    /// the cross-protocol path — an OpenAI-shape upstream serving
+    /// `/v1/messages` — and 0 for a native Anthropic upstream, which
+    /// reports its cache reads in `cache_read_tokens` instead. Kept
+    /// separate from the two Anthropic counters for that reason: folding
+    /// it in would double-count it against `prompt_tokens`
+    /// (AISIX-Cloud#1404).
+    cached_prompt_tokens: u32,
     /// True when any token counter was filled by the local estimator
     /// because the upstream reported no usage (AISIX-Cloud#1074).
     usage_estimated: bool,
@@ -2951,6 +2977,9 @@ fn emit_anthropic_usage_event(
             input: metrics.prompt_tokens,
             output: metrics.completion_tokens,
             total: total_tokens_all.min(u64::from(u32::MAX)) as u32,
+            cached: metrics.cached_prompt_tokens,
+            cache_read: metrics.cache_read_tokens,
+            cache_creation: metrics.cache_creation_tokens,
             spend_usd: 0.0,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
@@ -2973,6 +3002,7 @@ fn emit_anthropic_usage_event(
             UsageLabels {
                 endpoint: "/v1/messages",
                 inbound_protocol: "anthropic",
+                upstream_protocol: pk.labels().protocol(),
                 provider,
                 model: bounded_model.as_ref(),
                 upstream_model: bounded_upstream.as_ref(),

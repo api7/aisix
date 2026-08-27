@@ -661,6 +661,10 @@ impl Bridge for VertexBridge {
         self.name
     }
 
+    fn wire_protocol(&self) -> &'static str {
+        aisix_core::Adapter::Vertex.wire_protocol()
+    }
+
     async fn chat(
         &self,
         req: &ChatFormat,
@@ -1752,6 +1756,7 @@ fn gemini_chunk_into_chat_chunks(
             u.prompt_token_count
                 .saturating_add(u.candidates_token_count)
         },
+        cached_prompt_tokens: u.cached_content_token_count,
         ..Default::default()
     });
 
@@ -2002,6 +2007,12 @@ struct GeminiUsageMetadata {
     candidates_token_count: u32,
     #[serde(default, rename = "totalTokenCount")]
     total_token_count: u32,
+    /// Context-cache hits, which Gemini reports as a SUBSET of
+    /// `promptTokenCount` — the OpenAI accounting shape, so it maps onto
+    /// `UsageStats::cached_prompt_tokens` and must not be added to the
+    /// prompt total (AISIX-Cloud#1404).
+    #[serde(default, rename = "cachedContentTokenCount")]
+    cached_content_token_count: u32,
 }
 
 /// Translate Gemini's response into the gateway's [`ChatResponse`].
@@ -2040,6 +2051,7 @@ fn gemini_response_into_chat_response(
                 u.prompt_token_count
                     .saturating_add(u.candidates_token_count)
             },
+            cached_prompt_tokens: u.cached_content_token_count,
             ..Default::default()
         })
         .unwrap_or_default();
@@ -2716,6 +2728,53 @@ mod tests {
         assert_eq!(chat.message.role, Role::Assistant);
         assert_eq!(chat.finish_reason, FinishReason::Stop);
         assert_eq!(chat.usage.total_tokens, 6);
+    }
+
+    /// AISIX-Cloud#1404: Gemini reports context-cache hits in
+    /// `cachedContentTokenCount`, which is a SUBSET of
+    /// `promptTokenCount` — the OpenAI accounting shape. It therefore
+    /// maps onto `cached_prompt_tokens` and must NOT be added to the
+    /// prompt or total counts, which already contain it.
+    #[test]
+    fn gemini_response_maps_cached_content_tokens_as_a_prompt_subset() {
+        let raw: GeminiGenerateContentResponse = serde_json::from_str(
+            r#"{
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "hello"}]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 100,
+                    "candidatesTokenCount": 10,
+                    "totalTokenCount": 110,
+                    "cachedContentTokenCount": 80
+                }
+            }"#,
+        )
+        .unwrap();
+        let chat = gemini_response_into_chat_response(raw, "gemini-1.5-pro");
+        assert_eq!(chat.usage.cached_prompt_tokens, 80);
+        assert_eq!(chat.usage.prompt_tokens, 100);
+        assert_eq!(chat.usage.total_tokens, 110);
+        // The Anthropic-shape counters stay empty: Gemini reports no
+        // cache tokens outside its prompt count.
+        assert_eq!(chat.usage.cache_read_tokens, 0);
+        assert_eq!(chat.usage.cache_creation_tokens, 0);
+    }
+
+    /// An upstream that omits the field reports no cache hit, rather
+    /// than one inferred from the prompt size.
+    #[test]
+    fn gemini_response_without_cached_content_reports_no_cache_hit() {
+        let raw: GeminiGenerateContentResponse = serde_json::from_str(
+            r#"{
+                "candidates": [{"content": {"parts": [{"text": "hi"}]}, "finishReason": "STOP"}],
+                "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 1, "totalTokenCount": 6}
+            }"#,
+        )
+        .unwrap();
+        let chat = gemini_response_into_chat_response(raw, "gemini-1.5-pro");
+        assert_eq!(chat.usage.cached_prompt_tokens, 0);
     }
 
     #[test]

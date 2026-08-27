@@ -39,6 +39,34 @@ pub enum Adapter {
     AzureOpenai,
 }
 
+impl Adapter {
+    /// Every variant, for the exhaustive sweeps that cannot express
+    /// themselves as a `match` — the `upstream_protocol` metric label's
+    /// agreement test walks this against the registered bridges. Kept
+    /// next to [`Adapter::wire_protocol`] so a new variant, which the
+    /// match below refuses to compile without, is added to both.
+    pub const ALL: [Adapter; 5] = [
+        Self::Openai,
+        Self::Anthropic,
+        Self::Bedrock,
+        Self::Vertex,
+        Self::AzureOpenai,
+    ];
+
+    /// The adapter's wire value — the serde representation, spelled out
+    /// so it can be used where a `&'static str` is needed (Prometheus
+    /// label values) without a serialization round-trip.
+    pub fn wire_protocol(self) -> &'static str {
+        match self {
+            Self::Openai => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Bedrock => "bedrock",
+            Self::Vertex => "vertex",
+            Self::AzureOpenai => "azure-openai",
+        }
+    }
+}
+
 /// Per-token cost for budget tracking. Both values are in USD per 1,000 tokens.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct ModelCost {
@@ -905,6 +933,23 @@ mod tests {
             serde_json::to_string(&Adapter::AzureOpenai).unwrap(),
             "\"azure-openai\""
         );
+    }
+
+    /// `wire_protocol()` is the serde wire value handed out as a
+    /// `&'static str`. The two must not drift: the `upstream_protocol`
+    /// metric label is documented as "the ProviderKey adapter's wire
+    /// value", so a divergence would make the label a third spelling
+    /// that matches neither the API nor the stored document.
+    #[test]
+    fn adapter_wire_protocol_matches_serde_wire_value() {
+        for adapter in Adapter::ALL {
+            let serialized = serde_json::to_string(&adapter).unwrap();
+            assert_eq!(
+                format!("\"{}\"", adapter.wire_protocol()),
+                serialized,
+                "{adapter:?}"
+            );
+        }
     }
 
     #[test]

@@ -267,6 +267,10 @@ impl Bridge for AnthropicBridge {
         "anthropic"
     }
 
+    fn wire_protocol(&self) -> &'static str {
+        aisix_core::Adapter::Anthropic.wire_protocol()
+    }
+
     async fn chat(
         &self,
         req: &ChatFormat,

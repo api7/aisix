@@ -84,6 +84,12 @@ struct CompletionDispatchSuccess {
 struct CompletionUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// `prompt_tokens_details.cached_tokens` — the upstream prompt-cache
+    /// hits, already counted INSIDE `prompt_tokens` (AISIX-Cloud#1404).
+    /// Reported by this endpoint for the same providers that report it
+    /// on `/v1/chat/completions`; 0 when the upstream omits it, never
+    /// inferred.
+    cached_prompt_tokens: u32,
     /// True when any counter was filled by the local estimator because
     /// the upstream reported no usage (AISIX-Cloud#1074).
     usage_estimated: bool,
@@ -442,6 +448,7 @@ async fn dispatch(
                 let mut u = extract_completion_usage(&resp_json).unwrap_or(CompletionUsage {
                     prompt_tokens: 0,
                     completion_tokens: 0,
+                    cached_prompt_tokens: 0,
                     usage_estimated: false,
                 });
                 let est_model = model.upstream_model().unwrap_or("unknown");
@@ -638,9 +645,15 @@ fn extract_completion_usage(body: &Value) -> Option<CompletionUsage> {
         .get("completion_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
+    let cached_prompt_tokens = usage
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
     Some(CompletionUsage {
         prompt_tokens,
         completion_tokens,
+        cached_prompt_tokens,
         usage_estimated: false,
     })
 }
@@ -781,6 +794,12 @@ fn emit_usage_event(
             input: usage.prompt_tokens,
             output: usage.completion_tokens,
             total: usage.prompt_tokens.saturating_add(usage.completion_tokens),
+            cached: usage.cached_prompt_tokens,
+            // The legacy completions surface is OpenAI-shape only: its
+            // cache hits are the subset above, never a counter beside
+            // the prompt tokens.
+            cache_read: 0,
+            cache_creation: 0,
             spend_usd: 0.0,
             client_type: state.client_classifier.classify(&client.user_agent),
         },

@@ -2746,6 +2746,93 @@ models:
         assert!(err.to_string().contains("cp_base_url"), "unexpected: {err}");
     }
 
+    /// The `upstream_protocol` metric label (AISIX-Cloud#1403) MUST
+    /// agree with the bridge `build_hub()` actually dispatches to.
+    ///
+    /// `aisix_gateway::upstream_protocol` is a pure function of the
+    /// ProviderKey row — it has to be, because the metric emit path
+    /// resolves the row once per request and has no Hub in hand. That
+    /// makes it a SECOND copy of `Hub::dispatch_two_tier`'s rule, and
+    /// this test is what keeps the copy honest: it sweeps the REGISTERED
+    /// specialized vendors (so a third one cannot be added without being
+    /// covered) crossed with every `Adapter` variant plus the absent
+    /// adapter, and asserts the label equals the dispatched bridge's own
+    /// `wire_protocol()`.
+    ///
+    /// A mismatch is not a cosmetic label bug: it puts one ProviderKey's
+    /// traffic under a protocol it never spoke, which is exactly the
+    /// misattribution the label was added to remove.
+    #[test]
+    fn upstream_protocol_label_matches_dispatched_bridge() {
+        let hub = build_hub();
+        let mut vendors = hub.specialized_vendors();
+        // A vendor with no specialized registration, to exercise the
+        // family tier the long-tail catalog resolves through.
+        vendors.push("some-long-tail-vendor".to_string());
+
+        let adapters: Vec<Option<aisix_core::Adapter>> = std::iter::once(None)
+            .chain(aisix_core::Adapter::ALL.into_iter().map(Some))
+            .collect();
+
+        for vendor in &vendors {
+            for adapter in &adapters {
+                let adapter_field = match adapter {
+                    Some(a) => format!(r#","adapter":"{}""#, a.wire_protocol()),
+                    None => String::new(),
+                };
+                let pk: aisix_core::ProviderKey = serde_json::from_str(&format!(
+                    r#"{{"display_name":"pk","secret":"k","provider":"{vendor}"{adapter_field}}}"#
+                ))
+                .unwrap();
+                let dispatched = hub
+                    .dispatch_two_tier(&pk)
+                    .map(|b| b.wire_protocol())
+                    .unwrap_or(aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN);
+                assert_eq!(
+                    aisix_gateway::upstream_protocol(&pk),
+                    dispatched,
+                    "provider={vendor:?} adapter={adapter:?}: the upstream_protocol \
+                     label disagrees with the bridge dispatch selects",
+                );
+            }
+        }
+    }
+
+    /// A vendor with no specialized bridge and no `adapter` reaches no
+    /// bridge at all, so its protocol is genuinely unknown rather than a
+    /// guess at the most common wire shape. Pinned separately because
+    /// the sweep above would still pass if BOTH sides defaulted to
+    /// `"openai"`.
+    #[test]
+    fn upstream_protocol_is_unknown_without_a_resolvable_bridge() {
+        let pk: aisix_core::ProviderKey = serde_json::from_str(
+            r#"{"display_name":"pk","secret":"k","provider":"some-long-tail-vendor"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            aisix_gateway::upstream_protocol(&pk),
+            "unknown",
+            "an unresolvable ProviderKey must not be labelled with a guessed protocol",
+        );
+        assert!(build_hub().dispatch_two_tier(&pk).is_none());
+    }
+
+    /// The canonical `provider: "openai"` / `provider: "anthropic"` keys
+    /// cp-api writes reach a SPECIALIZED bridge, so their protocol comes
+    /// from the vendor tier — reading `pk.adapter` alone would report
+    /// `unknown` for a key that omits it.
+    #[test]
+    fn upstream_protocol_reads_the_specialized_tier_before_the_adapter() {
+        for (vendor, want) in [("openai", "openai"), ("anthropic", "anthropic")] {
+            let pk: aisix_core::ProviderKey = serde_json::from_str(&format!(
+                r#"{{"display_name":"pk","secret":"k","provider":"{vendor}"}}"#
+            ))
+            .unwrap();
+            assert!(pk.adapter.is_none());
+            assert_eq!(aisix_gateway::upstream_protocol(&pk), want);
+        }
+    }
+
     /// `build_hub()` must NOT register `cohere` as a specialized chat
     /// bridge. Post-#302 Phase A, Cohere's chat surface is served by
     /// the `Adapter::Openai` family bridge: cp-api stores Cohere's PK
