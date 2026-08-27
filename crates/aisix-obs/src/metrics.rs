@@ -87,7 +87,6 @@ pub const M_LLM_CACHE_CREATION_INPUT_TOKENS_TOTAL: &str =
     "aisix_llm_cache_creation_input_tokens_total";
 pub const M_LLM_REQUESTS_TOTAL: &str = "aisix_llm_requests_total";
 pub const M_LLM_REQUEST_DURATION: &str = "aisix_llm_request_duration_seconds";
-pub const M_LLM_API_LATENCY: &str = "aisix_llm_api_latency_seconds";
 pub const M_LLM_TTFT: &str = "aisix_llm_time_to_first_token_seconds";
 /// Issue #890 req-4: token volume sliced by inbound client type — a
 /// DEDICATED low-cardinality series so the client dimension never multiplies
@@ -2815,6 +2814,46 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
+    /// This file's own source with the test module cut off. Every guard
+    /// below reads the production half only — a mention from inside the
+    /// tests is not a use.
+    fn production_source() -> &'static str {
+        include_str!("metrics.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production half")
+    }
+
+    /// Every metric-name constant this module declares: `M_FOO` ->
+    /// "aisix_foo", so failures name the metric an operator would grep for
+    /// rather than a Rust identifier. Whitespace-tolerant: the longer
+    /// constants wrap their value onto the next line.
+    ///
+    /// Read out of the source so the set is never a list someone has to
+    /// remember to extend.
+    fn declared_metric_names() -> BTreeMap<&'static str, &'static str> {
+        let production = production_source();
+        let names: BTreeMap<&str, &str> = production
+            .match_indices("pub const M_")
+            .filter_map(|(at, marker)| {
+                let decl = &production[at + marker.len()..];
+                let (tail, rest) = decl.split_once(": &str =")?;
+                let value = rest.trim_start().strip_prefix('"')?;
+                let start = at + marker.len() - "M_".len();
+                let ident = &production[start..start + "M_".len() + tail.len()];
+                Some((ident, value.split('"').next()?))
+            })
+            .collect();
+        assert!(
+            names.len() > 40,
+            "the constant scan found only {} metric names — the `pub const` \
+             spelling it keys off has changed and the guards built on it are \
+             no longer looking at anything",
+            names.len()
+        );
+        names
+    }
+
     /// One `metrics::{counter,histogram,gauge}!` invocation in this file's
     /// production half: the family it emits (resolved to the metric NAME
     /// where the first argument is one of this module's `M_*` constants,
@@ -2826,24 +2865,8 @@ mod tests {
     /// exercises, which is precisely where the omission this guards
     /// against hides.
     fn emit_sites() -> Vec<(String, BTreeSet<String>)> {
-        let src = include_str!("metrics.rs");
-        let production = src
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("production half");
-
-        // `M_FOO` -> "aisix_foo", so failures name the metric an operator
-        // would grep for rather than a Rust identifier. Whitespace-tolerant:
-        // the longer constants wrap their value onto the next line.
-        let names: BTreeMap<&str, &str> = production
-            .match_indices("pub const M_")
-            .filter_map(|(at, marker)| {
-                let decl = &production[at + marker.len()..];
-                let (ident, rest) = decl.split_once(": &str =")?;
-                let value = rest.trim_start().strip_prefix('"')?;
-                Some((ident, value.split('"').next()?))
-            })
-            .collect();
+        let production = production_source();
+        let names = declared_metric_names();
 
         let mut sites = Vec::new();
         for macro_name in ["counter", "histogram", "gauge"] {
@@ -2875,9 +2898,8 @@ mod tests {
                     .expect("a family argument")
                     .trim()
                     .to_string();
-                let display = family
-                    .strip_prefix("M_")
-                    .and_then(|ident| names.get(ident))
+                let display = names
+                    .get(family.as_str())
                     .map(|name| (*name).to_string())
                     // A shared helper takes the family as a parameter, so
                     // the site has no name of its own — identify it by the
@@ -2910,6 +2932,66 @@ mod tests {
             sites.len()
         );
         sites
+    }
+
+    /// Every `M_*` constant this module declares must be referred to by
+    /// the production code below it — a name nothing else mentions cannot
+    /// reach an emit site, whatever the plumbing in between.
+    ///
+    /// `aisix_llm_api_latency_seconds` sat here declared and emitted by
+    /// nothing at all, found by accident rather than by a check. Both
+    /// sides of this assertion are read out of the source, so a constant
+    /// added tomorrow is covered without anyone remembering to extend a
+    /// list — a list-shaped test would have been typed from the families
+    /// that DO emit and would have passed.
+    ///
+    /// Deliberately checks the mention and not the emit itself. A family
+    /// argument reaches `metrics::{counter,histogram,gauge}!` through
+    /// five different helper shapes and, in `record_routing_fallback`,
+    /// through a local binding chosen by an `if` — resolving that
+    /// statically needs a dataflow model of the module, which would be
+    /// far more likely to break on an innocent refactor than to catch a
+    /// second dead constant. The weaker signal is the one that is both
+    /// robust and sufficient for the defect it guards.
+    #[test]
+    fn every_metric_name_constant_is_used_by_production_code() {
+        // Doc comments cross-reference constants by the dozen, and a
+        // rustdoc link is not a use.
+        let code: String = production_source()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let is_ident_char = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let mentions = |ident: &str| -> usize {
+            let mut count = 0usize;
+            let mut cursor = 0usize;
+            while let Some(offset) = code[cursor..].find(ident) {
+                let at = cursor + offset;
+                let end = at + ident.len();
+                let bounded = !code[..at].chars().next_back().is_some_and(&is_ident_char)
+                    && !code[end..].chars().next().is_some_and(&is_ident_char);
+                if bounded {
+                    count += 1;
+                }
+                cursor = end;
+            }
+            count
+        };
+
+        // The declaration itself is one mention; anything reachable has a
+        // second one somewhere.
+        let unused: Vec<&str> = declared_metric_names()
+            .into_iter()
+            .filter(|(ident, _)| mentions(ident) < 2)
+            .map(|(_, name)| name)
+            .collect();
+        assert!(
+            unused.is_empty(),
+            "declared but never used by any production code — nothing can \
+             emit these, so the series do not exist to scrape: {unused:?}"
+        );
     }
 
     /// The families that carry `inbound_protocol` and deliberately do NOT
