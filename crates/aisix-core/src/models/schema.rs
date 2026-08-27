@@ -266,10 +266,9 @@ pub fn open_unknown_fields(schema: &mut Value) {
 /// would be silent.
 ///
 /// A resource listed here must not carry a schema-hidden but
-/// serde-consumed field — a `#[schemars(skip)]` tombstone like
-/// `McpAccess::legacy_mode`. This walk reads known field names off the
-/// schema, so a field the schema does not mention would be reported as
-/// unknown on every row that carries it.
+/// serde-consumed field — a `#[schemars(skip)]` tombstone. This walk reads
+/// known field names off the schema, so a field the schema does not mention
+/// would be reported as unknown on every row that carries it.
 static REPORT_SCHEMAS: Lazy<Vec<(&'static str, Value)>> = Lazy::new(|| {
     [
         "guardrail",
@@ -2385,10 +2384,11 @@ mod tests {
 
     #[test]
     fn apikey_mcp_access_rejects_the_removed_mode_field() {
-        // Write path: `mode` is gone from the authored shape. Read path:
-        // the CP projects `"mode": "deny"` as a tombstone so 0.9.x DPs
-        // load the row fail-closed, and this generation's loader must
-        // keep accepting the hybrid document.
+        // Write path: `mode` is gone from the authored shape and stays
+        // rejected. Read path: a document a pre-0.10.0 control plane wrote
+        // still carries the retired selector, and the lenient validator
+        // must keep accepting it — the api_key row authenticates every
+        // kind of traffic, so it must never be skipped over a dead key.
         let v = json!({
             "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
             "allowed_models":[],

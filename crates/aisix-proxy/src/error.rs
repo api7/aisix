@@ -260,11 +260,6 @@ pub enum ProxyError {
     /// `allowed_routes` grants.
     #[error("API key is not allowed to use passthrough route {0:?}")]
     RouteForbidden(String),
-    /// A removed endpoint whose replacement exists: 410 with a fixed
-    /// migration message (the implicit `/passthrough/:provider/*rest`
-    /// tunnel, superseded by explicit passthrough routes).
-    #[error("{0}")]
-    Gone(String),
     #[error("request payload is invalid: {0}")]
     InvalidRequest(String),
     /// A non-WebSocket request reached the WebSocket-only realtime
@@ -372,7 +367,6 @@ impl ProxyError {
             ProxyError::ModelIpRestricted(_) => StatusCode::FORBIDDEN,
             ProxyError::RouteIpRestricted(_) => StatusCode::FORBIDDEN,
             ProxyError::RouteForbidden(_) => StatusCode::FORBIDDEN,
-            ProxyError::Gone(_) => StatusCode::GONE,
             ProxyError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::VideoNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
@@ -410,7 +404,6 @@ impl ProxyError {
             ProxyError::ModelIpRestricted(_) => "permission_denied",
             ProxyError::RouteIpRestricted(_) => "permission_denied",
             ProxyError::RouteForbidden(_) => "permission_denied",
-            ProxyError::Gone(_) => "invalid_request_error",
             ProxyError::ModelNotFound(_) => "model_not_found",
             ProxyError::VideoNotFound(_) => "video_not_found",
             ProxyError::InvalidRequest(_) => "invalid_request_error",
@@ -521,9 +514,6 @@ impl ProxyError {
             // ModelForbidden (#557 AC-1).
             ProxyError::ModelIpRestricted(_) => env.with_code("ip_restricted"),
             ProxyError::RouteIpRestricted(_) => env.with_code("ip_restricted"),
-            // Stable code so migration tooling can detect the removed
-            // tunnel without matching on the message text.
-            ProxyError::Gone(_) => env.with_code("endpoint_removed"),
             // Stable machine-readable codes so SDKs can branch on the
             // lifecycle reason without parsing the message, while the
             // `error.type` stays the family-wide `invalid_api_key`.

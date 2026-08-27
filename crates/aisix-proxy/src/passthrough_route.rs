@@ -31,8 +31,8 @@
 //! - [`entry`] — the proxy router's **fallback** handler. Path-prefix
 //!   routes match here, after every typed route has had its chance, so a
 //!   route can never shadow `/v1/*`, `/mcp`, or `/a2a`. A no-match request
-//!   keeps the pre-existing plain 404; `/passthrough/*` no-matches return
-//!   the 410 migration tombstone.
+//!   keeps the pre-existing plain 404, `/passthrough/*` included — that
+//!   namespace is claimed by explicit routes like any other.
 //! - [`host_dispatch`] — a **pre-routing** middleware (outermost wrap in
 //!   `build_router`). A request whose `Host` matches an enabled route's
 //!   `hosts` was never addressed to this gateway's own API, so it must not
@@ -85,10 +85,6 @@ const PASSTHROUGH_MODEL_LABEL: &str = "passthrough";
 /// ProviderKey to take a provider name from.
 const BYO_PROVIDER_LABEL: &str = "byo";
 
-/// `provider` label for 410-tombstoned hits on the removed tunnel's
-/// namespace — the caller-supplied path segment must never mint a series.
-const UNRESOLVED_LABEL: &str = "unresolved";
-
 /// Endpoint label for metrics/usage attribution: one family for all
 /// passthrough-route traffic (route names are operator data, not label
 /// space).
@@ -124,20 +120,6 @@ const ALWAYS_STRIP: &[&str] = &[
     // upstream as a duplicate.
     "x-aisix-request-id",
 ];
-
-/// Fixed 410 message for the removed implicit tunnel.
-///
-/// COMPAT-SINCE: 0.10.0 #1010 — 0.10.0 removed the implicit
-/// `/passthrough/:provider/*rest` tunnel, and a migration pointer beats a
-/// bare 404 while un-migrated callers are still out there; the public docs
-/// promise the 410 for one release, then plain 404s.
-///
-/// Retiring it drops this constant, the `entry` branch that serves it, its
-/// WARN and the `UNRESOLVED_LABEL` metric series, and leaves the namespace
-/// entirely the operator's to claim with explicit routes.
-const LEGACY_TUNNEL_GONE: &str = "the implicit /passthrough/:provider tunnel has been removed; \
-     configure an explicit passthrough_route resource for this path \
-     (see the provider passthrough documentation for the migration)";
 
 // ---------------------------------------------------------------------------
 // Routing entry points
@@ -319,46 +301,9 @@ pub async fn entry(
     let request_id = client.request_id.clone();
 
     let Some(matched) = match_route(&snapshot, host.as_deref(), &path) else {
-        if path.starts_with("/passthrough/") {
-            // The removed implicit tunnel's namespace: a fixed 410 with
-            // the migration pointer beats a bare 404 while callers migrate
-            // (release-debt marker on LEGACY_TUNNEL_GONE).
-            // Logged AND counted (unresolved-provider labels, like the
-            // old tunnel's failure path) so operators can locate and
-            // size un-migrated callers.
-            tracing::warn!(
-                path = %path,
-                "removed /passthrough tunnel hit with no matching passthrough_route (410)",
-            );
-            let err = ProxyError::Gone(LEGACY_TUNNEL_GONE.into());
-            let status = err.status().as_u16();
-            let elapsed = started.elapsed();
-            emit_access_log(
-                &method,
-                &path,
-                UNRESOLVED_LABEL,
-                "",
-                status,
-                elapsed,
-                &request_id,
-                None,
-                Some(&err),
-            );
-            crate::request_metrics::record(
-                &state,
-                ENDPOINT_LABEL,
-                crate::request_metrics::Caller::unattributed(None),
-                crate::request_metrics::Upstream {
-                    provider: UNRESOLVED_LABEL,
-                    model: PASSTHROUGH_MODEL_LABEL,
-                    ..Default::default()
-                },
-                status,
-                elapsed,
-            );
-            return err.into_response();
-        }
-        // Preserve the router's pre-existing no-match behavior exactly.
+        // Every unmatched path, `/passthrough/*` included, takes the
+        // router's ordinary miss path: the namespace is entirely the
+        // operator's to claim with explicit `passthrough_route` resources.
         return StatusCode::NOT_FOUND.into_response();
     };
 
@@ -2380,8 +2325,11 @@ mod tests {
         crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache())
     }
 
+    /// The `/passthrough/*` namespace carries no special case: with no
+    /// route claiming the path it is an ordinary router miss — a bare 404
+    /// with an empty body, like any other unmatched path.
     #[tokio::test]
-    async fn legacy_tunnel_answers_410_with_migration_pointer() {
+    async fn unclaimed_passthrough_path_takes_the_plain_404() {
         let app = build_app(AisixSnapshot::new());
         let req = Request::builder()
             .method("POST")
@@ -2390,14 +2338,13 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::GONE);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["code"], "endpoint_removed");
-        assert!(v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("passthrough_route"));
+        assert!(
+            bytes.is_empty(),
+            "the miss path carries no error envelope, got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
     }
 
     #[tokio::test]
@@ -2587,8 +2534,8 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        // Disabled → no match → the tunnel namespace answers the 410.
-        assert_eq!(resp.status(), StatusCode::GONE);
+        // Disabled → no match → the ordinary router miss.
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

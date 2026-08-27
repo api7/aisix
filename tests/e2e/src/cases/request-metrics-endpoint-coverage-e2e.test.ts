@@ -28,6 +28,8 @@ const CALLER_KEY_HASH = createHash("sha256")
   .digest("hex");
 
 const MODEL = "reqmetrics-gpt";
+const PT_ROUTE = "reqmetrics-ptr";
+const PT_PREFIX = "/passthrough/reqmetrics";
 
 describe("request metrics endpoint coverage e2e", () => {
   let app: SpawnedApp | undefined;
@@ -54,9 +56,16 @@ describe("request metrics endpoint coverage e2e", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
+    await seed.createPassthroughRoute({
+      name: PT_ROUTE,
+      path_prefix: PT_PREFIX,
+      target_url: `${upstream.baseUrl}/v1`,
+      provider_key_id: pk.id,
+    });
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: [MODEL],
+      allowed_routes: [PT_ROUTE],
     });
   });
 
@@ -157,21 +166,27 @@ describe("request metrics endpoint coverage e2e", () => {
       return;
     }
 
-    // An unclaimed tunnel path: the 410 tombstone is still counted, and
-    // the caller-supplied path segment must never become a label — the
-    // same #451 contract the old tunnel's failure path carried.
-    const res = await fetch(
-      `${app.proxyUrl}/passthrough/reqmetrics-bogus-provider/v1/anything`,
-      {
+    const hit = (suffix: string) =>
+      fetch(`${app!.proxyUrl}${PT_PREFIX}${suffix}`, {
         method: "POST",
         headers: {
           authorization: `Bearer ${CALLER_PLAINTEXT}`,
           "content-type": "application/json",
         },
         body: JSON.stringify({ hello: "world" }),
-      },
-    );
-    expect(res.status).toBe(410);
+      });
+
+    await waitConfigPropagation(async () => {
+      const probe = await hit("/ready");
+      await probe.text();
+      return probe.status === 200;
+    });
+
+    // The caller-supplied remainder must never become a label — the #451
+    // contract, which now rides on the routes that claim the namespace.
+    const res = await hit("/reqmetrics-bogus-segment");
+    await res.text();
+    expect(res.status).toBe(200);
 
     const text = await scrape(app);
     const endpoint = "/passthrough_route";
@@ -179,15 +194,13 @@ describe("request metrics endpoint coverage e2e", () => {
     expect(seriesFor(text, "aisix_proxy_requests_total", endpoint)).not.toHaveLength(
       0,
     );
-    // The tier split: a tunnelled request reaches no model, so it must stay
+    // The tier split: a routed request reaches no model, so it must stay
     // out of the LLM families or every tokens-per-request average is wrong.
     expect(seriesFor(text, "aisix_llm_requests_total", endpoint)).toHaveLength(0);
 
-    // Cardinality: the bogus provider name must not have become a label.
-    expect(text).not.toContain("reqmetrics-bogus-provider");
-    expect(
-      seriesFor(text, "aisix_proxy_requests_total", endpoint).join("\n"),
-    ).toContain('provider="unresolved"');
+    // Cardinality: neither the route's remainder nor its name is a label.
+    expect(text).not.toContain("reqmetrics-bogus-segment");
+    expect(text).not.toContain(PT_ROUTE);
   }, 30_000);
 });
 
