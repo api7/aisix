@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -166,25 +167,28 @@ describe("request metrics endpoint coverage e2e", () => {
       return;
     }
 
-    const hit = (suffix: string) =>
-      fetch(`${app!.proxyUrl}${PT_PREFIX}${suffix}`, {
+    // The caller key is seeded after every other resource, so it
+    // authenticating implies the route is in the snapshot too. Gating on the
+    // route itself would fail by 30s timeout instead of by an assertion.
+    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(async () => {
+      const probe = await proxy.listModels();
+      return probe.status === 200;
+    });
+
+    // The caller-supplied remainder must never become a label — the #451
+    // contract, which now rides on the routes that claim the namespace.
+    const res = await fetch(
+      `${app.proxyUrl}${PT_PREFIX}/reqmetrics-bogus-segment`,
+      {
         method: "POST",
         headers: {
           authorization: `Bearer ${CALLER_PLAINTEXT}`,
           "content-type": "application/json",
         },
         body: JSON.stringify({ hello: "world" }),
-      });
-
-    await waitConfigPropagation(async () => {
-      const probe = await hit("/ready");
-      await probe.text();
-      return probe.status === 200;
-    });
-
-    // The caller-supplied remainder must never become a label — the #451
-    // contract, which now rides on the routes that claim the namespace.
-    const res = await hit("/reqmetrics-bogus-segment");
+      },
+    );
     await res.text();
     expect(res.status).toBe(200);
 
