@@ -15,6 +15,14 @@
 //! per-provider `transform_realtime_request/response` modules) — that is
 //! a separate feature, not part of this endpoint.
 //!
+//! OpenAI's Realtime API is GA and its GA endpoint **rejects**
+//! `openai-beta: realtime=v1` (`beta_api_shape_disabled`), so the
+//! gateway does not send it on its own. Beta and GA use different event
+//! vocabularies, so the opt-in belongs to the caller that parses those
+//! events: a client that sends the beta opt-in — as the `openai-beta`
+//! header, or as the `openai-beta.realtime-v1` subprotocol item that the
+//! browser flow uses — has it forwarded upstream, and nothing else does.
+//!
 //! ## Auth
 //!
 //! Two credential channels, checked before the upgrade completes:
@@ -64,6 +72,39 @@ const AZURE_REALTIME_API_VERSION: &str = "2024-10-01-preview";
 
 /// Subprotocol item carrying the caller's API key in the browser flow.
 const SUBPROTOCOL_KEY_PREFIX: &str = "openai-insecure-api-key.";
+
+/// Header value by which a client opts into the legacy beta event shape.
+const HEADER_BETA_VALUE: &str = "realtime=v1";
+
+/// Subprotocol item by which a browser client opts into the legacy beta
+/// event shape (a subprotocol token cannot contain `=`, so the header's
+/// `realtime=v1` is spelled `realtime-v1` here).
+const SUBPROTOCOL_BETA_ITEM: &str = "openai-beta.realtime-v1";
+
+/// Is `needle` one of the comma-separated items across every value of
+/// `name`? Both headers are list-valued and may repeat, so a first-value
+/// substring test would both miss a repeat and accept `realtime=v10`.
+fn header_list_has(headers: &HeaderMap, name: &str, needle: &str) -> bool {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|item| item.trim().eq_ignore_ascii_case(needle))
+}
+
+/// Did the caller ask for the legacy beta Realtime shape?
+///
+/// OpenAI's beta and GA Realtime APIs use different event vocabularies,
+/// so the opt-in belongs to the client that has to parse those events —
+/// not to us. We forward `openai-beta: realtime=v1` upstream only when
+/// the caller sent the same opt-in, via either channel it has: the
+/// header (server-side clients) or the `sec-websocket-protocol` item
+/// (browser clients, which cannot set headers).
+fn client_requested_beta_realtime(headers: &HeaderMap) -> bool {
+    header_list_has(headers, "openai-beta", HEADER_BETA_VALUE)
+        || header_list_has(headers, "sec-websocket-protocol", SUBPROTOCOL_BETA_ITEM)
+}
 
 /// Dial the upstream Realtime endpoint under the deployment's outbound
 /// TLS trust.
@@ -126,7 +167,7 @@ pub(crate) async fn realtime(
                 // auth extractor; do the same here so the session clone
                 // and the error emits below attribute the JWT identity.
                 client.jwt = auth.jwt.clone();
-                prepare(&state, &snapshot, &params, &client, auth.clone())
+                prepare(&state, &snapshot, &params, &headers, &client, auth.clone())
                     .await
                     .map(|prep| (ws, prep))
                     .map_err(|err| (Some(auth), err))
@@ -225,9 +266,11 @@ async fn prepare(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     params: &HashMap<String, String>,
+    headers: &HeaderMap,
     client: &ClientContext,
     auth: AuthenticatedKey,
 ) -> Result<Prepared, ProxyError> {
+    let beta_realtime = client_requested_beta_realtime(headers);
     let requested_model = params
         .get("model")
         .map(String::as_str)
@@ -277,10 +320,16 @@ async fn prepare(
                     ProxyError::InvalidRequest("provider secret is not header-safe".into())
                 })?,
             );
-            // LiteLLM parity (OpenAIRealtime.async_realtime): the beta
-            // header is sent unconditionally; GA endpoints ignore it.
-            req.headers_mut()
-                .insert("openai-beta", "realtime=v1".parse().unwrap());
+            // Only when the CALLER opted into the legacy beta shape.
+            // OpenAI's GA `/v1/realtime` rejects the header outright
+            // (`beta_api_shape_disabled`) and closes the session, so
+            // sending it unconditionally broke every GA connection.
+            // LiteLLM parity (OpenAIRealtime._get_additional_headers):
+            // forward it iff the client asked for it.
+            if beta_realtime {
+                req.headers_mut()
+                    .insert("openai-beta", "realtime=v1".parse().unwrap());
+            }
             req
         }
         Some(Adapter::AzureOpenai) => {
@@ -378,8 +427,11 @@ async fn authenticate(
         }
         return crate::auth::authenticate_token(state, token, ctx).await;
     }
-    if let Some(proto) = headers.get("sec-websocket-protocol") {
-        let s = proto.to_str().map_err(|_| ProxyError::MissingAuth)?;
+    // List-valued and splittable across repeated fields, like the beta
+    // opt-in above: reading only the first field 401s a caller whose
+    // credential rides a later one.
+    for proto in headers.get_all("sec-websocket-protocol").iter() {
+        let Ok(s) = proto.to_str() else { continue };
         for item in s.split(',') {
             if let Some(token) = item.trim().strip_prefix(SUBPROTOCOL_KEY_PREFIX) {
                 if !token.is_empty() {
@@ -1000,14 +1052,16 @@ mod tests {
     }
 
     /// Scripted mock upstream: accepts ONE WebSocket, records the request
-    /// path + auth header, waits for one text frame, replies with a
-    /// `response.done` usage frame, then closes.
+    /// path + auth header + any `openai-beta` header, waits for one text
+    /// frame, replies with a `response.done` usage frame, then closes.
+    type SeenHandshake = Option<(String, String, Option<String>)>;
+
     async fn spawn_upstream() -> (
         std::net::SocketAddr,
-        Arc<Mutex<Option<(String, String)>>>,
+        Arc<Mutex<SeenHandshake>>,
         Arc<Mutex<Vec<String>>>,
     ) {
-        let seen_handshake: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
+        let seen_handshake: Arc<Mutex<SeenHandshake>> = Arc::new(Mutex::new(None));
         let seen_frames: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1026,7 +1080,12 @@ mod tests {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("")
                         .to_string();
-                    *hs2.lock().unwrap() = Some((req.uri().to_string(), auth));
+                    let beta = req
+                        .headers()
+                        .get("openai-beta")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    *hs2.lock().unwrap() = Some((req.uri().to_string(), auth, beta));
                     Ok(resp)
                 },
             )
@@ -1096,7 +1155,7 @@ mod tests {
         // Upstream saw the relayed client frame + the gateway's provider auth.
         assert_eq!(frames.lock().unwrap().len(), 1);
         assert!(frames.lock().unwrap()[0].contains("session.update"));
-        let (uri, auth) = handshake
+        let (uri, auth, beta) = handshake
             .lock()
             .unwrap()
             .clone()
@@ -1106,6 +1165,11 @@ mod tests {
             "upstream URI must be the realtime path with the UPSTREAM model id, got {uri}"
         );
         assert_eq!(auth, "Bearer sk-up");
+        assert_eq!(
+            beta, None,
+            "a caller that did not opt in must not have `openai-beta` forwarded upstream: \
+             OpenAI's GA endpoint rejects it with beta_api_shape_disabled"
+        );
 
         // Session-aggregate usage event.
         let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
@@ -1147,6 +1211,143 @@ mod tests {
             "the gateway must echo the `realtime` subprotocol"
         );
         drop(ws);
+    }
+
+    /// A browser may split its subprotocol offer across repeated header
+    /// fields; the credential must still be found wherever it lands.
+    #[tokio::test]
+    async fn subprotocol_credential_is_found_in_a_repeated_header_field() {
+        let (up_addr, handshake, _frames) = spawn_upstream().await;
+        let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
+        let (addr, _state, _rx) = serve(snap).await;
+
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        // Two fields: the credential and the beta opt-in ride the second.
+        req.headers_mut()
+            .append("sec-websocket-protocol", "realtime".parse().unwrap());
+        req.headers_mut().append(
+            "sec-websocket-protocol",
+            "openai-insecure-api-key.sk-caller, openai-beta.realtime-v1"
+                .parse()
+                .unwrap(),
+        );
+        let (ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("a credential in a later subprotocol field must authenticate");
+        let (mut tx, mut client_rx) = ws.split();
+        tx.send(TgMessage::Text(
+            serde_json::json!({"type": "session.update"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(3), client_rx.next()).await;
+
+        // The opt-in rode the same later field, so it reaches upstream.
+        let (_uri, _auth, beta) = handshake
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("handshake recorded");
+        assert_eq!(beta.as_deref(), Some("realtime=v1"));
+    }
+
+    /// The predicate itself: neither channel set => GA (no header).
+    #[test]
+    fn beta_opt_in_is_recognised_on_both_channels() {
+        let hm = |k: &'static str, v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(k, v.parse().unwrap());
+            h
+        };
+        assert!(!client_requested_beta_realtime(&HeaderMap::new()));
+        assert!(client_requested_beta_realtime(&hm(
+            "openai-beta",
+            "realtime=v1"
+        )));
+        assert!(client_requested_beta_realtime(&hm(
+            "openai-beta",
+            "Realtime=v1"
+        )));
+        // Browser flow: the opt-in rides the subprotocol list.
+        assert!(client_requested_beta_realtime(&hm(
+            "sec-websocket-protocol",
+            "realtime, openai-insecure-api-key.sk-x, openai-beta.realtime-v1"
+        )));
+        // A plain browser handshake carrying only the credential is GA.
+        assert!(!client_requested_beta_realtime(&hm(
+            "sec-websocket-protocol",
+            "realtime, openai-insecure-api-key.sk-x"
+        )));
+        // Assistants-style beta values are not the realtime opt-in.
+        assert!(!client_requested_beta_realtime(&hm(
+            "openai-beta",
+            "assistants=v2"
+        )));
+        // A near match must NOT opt in: the value is a list item, not a
+        // substring, so a future `realtime=v10` stays GA.
+        assert!(!client_requested_beta_realtime(&hm(
+            "openai-beta",
+            "realtime=v10"
+        )));
+        // List-valued: the opt-in counts wherever it sits in the list.
+        assert!(client_requested_beta_realtime(&hm(
+            "openai-beta",
+            "assistants=v2, realtime=v1"
+        )));
+        // Repeated headers: `HeaderMap::get` would only see the first.
+        let mut repeated = HeaderMap::new();
+        repeated.append("openai-beta", "assistants=v2".parse().unwrap());
+        repeated.append("openai-beta", "realtime=v1".parse().unwrap());
+        assert!(client_requested_beta_realtime(&repeated));
+        // Same for the subprotocol list, which browsers may also repeat.
+        let mut split_proto = HeaderMap::new();
+        split_proto.append("sec-websocket-protocol", "realtime".parse().unwrap());
+        split_proto.append(
+            "sec-websocket-protocol",
+            "openai-beta.realtime-v1".parse().unwrap(),
+        );
+        assert!(client_requested_beta_realtime(&split_proto));
+    }
+
+    /// A caller that DOES opt in still gets the beta header forwarded,
+    /// so legacy beta clients keep working against upstreams that serve
+    /// the beta shape.
+    #[tokio::test]
+    async fn client_beta_opt_in_is_forwarded_upstream() {
+        let (up_addr, handshake, _frames) = spawn_upstream().await;
+        let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
+        let (addr, _state, _rx) = serve(snap).await;
+
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        req.headers_mut()
+            .insert("openai-beta", "realtime=v1".parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("handshake");
+        let (mut tx, mut client_rx) = ws.split();
+        tx.send(TgMessage::Text(
+            serde_json::json!({"type": "session.update"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(3), client_rx.next()).await;
+
+        let (_uri, _auth, beta) = handshake
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("handshake recorded");
+        assert_eq!(
+            beta.as_deref(),
+            Some("realtime=v1"),
+            "an explicit client opt-in must reach the upstream"
+        );
     }
 
     #[tokio::test]
