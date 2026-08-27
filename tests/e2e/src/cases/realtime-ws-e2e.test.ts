@@ -34,6 +34,10 @@ import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 //      key or the gateway alias.
 //   4. Auth failure rejects the HTTP upgrade (native client fires
 //      an error/close, never `open`).
+//   5. The `openai-beta: realtime=v1` opt-in is CLIENT-driven: forwarded
+//      upstream only when the caller asked for it. Sending it
+//      unconditionally made OpenAI's GA endpoint kill the session with
+//      `beta_api_shape_disabled`.
 
 const CALLER_PLAINTEXT = "sk-realtime-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -42,7 +46,7 @@ const CALLER_KEY_HASH = createHash("sha256")
 
 interface RealtimeUpstream {
   port: number;
-  handshakes: { url: string; authorization: string }[];
+  handshakes: { url: string; authorization: string; openaiBeta?: string }[];
   frames: string[];
   close(): Promise<void>;
 }
@@ -57,6 +61,7 @@ async function startRealtimeUpstream(): Promise<RealtimeUpstream> {
     handshakes.push({
       url: req.url ?? "",
       authorization: (req.headers.authorization as string) ?? "",
+      openaiBeta: req.headers["openai-beta"] as string | undefined,
     });
     socket.on("message", (data) => {
       frames.push(data.toString());
@@ -234,8 +239,42 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     );
     expect(upstream.handshakes[0].url).toContain("model=gpt-realtime-mock");
     expect(upstream.handshakes[0].url).not.toContain(CALLER_PLAINTEXT);
+    // This client offered `openai-beta.realtime-v1`, so the opt-in is
+    // forwarded upstream in the header form.
+    expect(upstream.handshakes[0].openaiBeta).toBe("realtime=v1");
 
     ws.close();
+  });
+
+  test("a caller that did not opt in gets NO openai-beta header upstream", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    // The regression: the gateway used to send `openai-beta: realtime=v1`
+    // on every upstream dial. OpenAI's GA /v1/realtime answers that with
+    // `beta_api_shape_disabled` and closes the session before the client
+    // can send anything, so a plain GA caller must dial clean.
+    const before = upstream.handshakes.length;
+    const wsUrl = `${app.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=realtime-e2e-model`;
+    // `ws` sets headers: a server-side caller with no beta opt-in.
+    const c = new WsClient(wsUrl, {
+      headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+    });
+    const relayed = await new Promise<string>((resolve, reject) => {
+      c.on("open", () => c.send(JSON.stringify({ type: "session.update" })));
+      c.on("message", (d) => resolve(d.toString()));
+      c.on("unexpected-response", (_q, res) =>
+        reject(new Error(`upgrade refused: ${res.statusCode}`)),
+      );
+      c.on("error", (e) => reject(e));
+    });
+    expect(JSON.parse(relayed).type).toBe("response.done");
+    c.terminate();
+
+    const hs = upstream.handshakes[before];
+    expect(hs).toBeDefined();
+    expect(hs.openaiBeta).toBeUndefined();
   });
 
   test("a plain http GET answers the envelope, not a bare rejection", async (ctx) => {
