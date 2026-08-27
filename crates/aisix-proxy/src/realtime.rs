@@ -819,6 +819,11 @@ async fn run_session(
             input: usage.input_tokens.min(u32::MAX as u64) as u32,
             output: usage.output_tokens.min(u32::MAX as u64) as u32,
             total: total_tokens.min(u32::MAX as u64) as u32,
+            // The Realtime session reports its cache hits in the
+            // OpenAI shape — inside `input_tokens`, never beside it.
+            cached: usage.cached_tokens.min(u32::MAX as u64) as u32,
+            cache_read: 0,
+            cache_creation: 0,
             spend_usd: event.cost_usd,
             client_type: state.client_classifier.classify(&client.user_agent),
         },

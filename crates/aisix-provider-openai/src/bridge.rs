@@ -383,6 +383,10 @@ impl Bridge for OpenAiBridge {
         "openai"
     }
 
+    fn wire_protocol(&self) -> &'static str {
+        aisix_core::Adapter::Openai.wire_protocol()
+    }
+
     async fn chat(
         &self,
         req: &ChatFormat,

@@ -2973,6 +2973,9 @@ fn emit_anthropic_usage_event(
             input: metrics.prompt_tokens,
             output: metrics.completion_tokens,
             total: total_tokens_all.min(u64::from(u32::MAX)) as u32,
+            cached: metrics.cached_prompt_tokens,
+            cache_read: metrics.cache_read_tokens,
+            cache_creation: metrics.cache_creation_tokens,
             spend_usd: 0.0,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
@@ -2995,6 +2998,7 @@ fn emit_anthropic_usage_event(
             UsageLabels {
                 endpoint: "/v1/messages",
                 inbound_protocol: "anthropic",
+                upstream_protocol: pk.labels().protocol(),
                 provider,
                 model: bounded_model.as_ref(),
                 upstream_model: bounded_upstream.as_ref(),

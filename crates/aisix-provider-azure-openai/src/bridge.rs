@@ -689,6 +689,10 @@ impl Bridge for AzureOpenAiBridge {
         self.name
     }
 
+    fn wire_protocol(&self) -> &'static str {
+        aisix_core::Adapter::AzureOpenai.wire_protocol()
+    }
+
     async fn chat(
         &self,
         req: &ChatFormat,

@@ -637,6 +637,10 @@ impl Bridge for BedrockBridge {
         self.name
     }
 
+    fn wire_protocol(&self) -> &'static str {
+        aisix_core::Adapter::Bedrock.wire_protocol()
+    }
+
     async fn chat(
         &self,
         req: &ChatFormat,
@@ -1238,12 +1242,19 @@ fn converse_output_into_chat_response(
         }
         _ => (ChatMessage::assistant(String::new()), FinishReason::Stop),
     };
+    // Converse reports prompt-cache tokens as counters SEPARATE from
+    // `inputTokens`, the Anthropic accounting shape — so they map onto
+    // the Anthropic-shape `UsageStats` fields, not `cached_prompt_tokens`
+    // (AISIX-Cloud#1404). Absent for models and regions with no prompt
+    // caching, which reads as 0 and emits no series.
     let usage = resp
         .usage()
         .map(|u| UsageStats {
             prompt_tokens: u.input_tokens().max(0) as u32,
             completion_tokens: u.output_tokens().max(0) as u32,
             total_tokens: u.total_tokens().max(0) as u32,
+            cache_read_tokens: u.cache_read_input_tokens().unwrap_or(0).max(0) as u32,
+            cache_creation_tokens: u.cache_write_input_tokens().unwrap_or(0).max(0) as u32,
             ..Default::default()
         })
         .unwrap_or_default();
@@ -1417,6 +1428,11 @@ fn emit_converse_chunk(
                         prompt_tokens: u.input_tokens.max(0) as u32,
                         completion_tokens: u.output_tokens.max(0) as u32,
                         total_tokens: u.total_tokens.max(0) as u32,
+                        // Same mapping as the non-streaming branch — the
+                        // metadata event carries the identical shape.
+                        cache_read_tokens: u.cache_read_input_tokens.unwrap_or(0).max(0) as u32,
+                        cache_creation_tokens: u.cache_write_input_tokens.unwrap_or(0).max(0)
+                            as u32,
                         ..Default::default()
                     }),
                 });
@@ -3576,6 +3592,142 @@ mod tests {
             chat.message.content.is_none(),
             "content must be null alongside tool_calls when there is no prose"
         );
+    }
+
+    /// AISIX-Cloud#1404: Converse reports prompt-cache tokens as
+    /// counters SEPARATE from `inputTokens` — the Anthropic accounting
+    /// shape — so they must land on the Anthropic-shape `UsageStats`
+    /// fields and leave `inputTokens` alone. Before this mapping the
+    /// bridge discarded them, and every Bedrock prompt-cache series read
+    /// as a permanent zero.
+    #[tokio::test]
+    async fn chat_converse_maps_prompt_cache_tokens_beside_the_input_count() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": {"message": {"role": "assistant", "content": [{"text": "cached"}]}},
+                "stopReason": "end_turn",
+                "usage": {
+                    "inputTokens": 40,
+                    "outputTokens": 11,
+                    "totalTokens": 51,
+                    "cacheReadInputTokens": 800,
+                    "cacheWriteInputTokens": 200
+                },
+                "metrics": {"latencyMs": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        // Nova rather than Claude: Anthropic-on-Bedrock dispatches
+        // through the legacy `/invoke` path, so Converse is only
+        // reachable with a publisher `chat()` routes there.
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("amazon.nova-lite-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-nova", vec![ChatMessage::user("cached prompt")]);
+        let chat = bridge.chat(&req, &ctx).await.unwrap();
+
+        assert_eq!(chat.usage.cache_read_tokens, 800);
+        assert_eq!(chat.usage.cache_creation_tokens, 200);
+        // The upstream's own input and total counts pass through
+        // untouched — the cache counters sit beside them, and adding
+        // them in here would double-count against the gateway's
+        // cache-inclusive total.
+        assert_eq!(chat.usage.prompt_tokens, 40);
+        assert_eq!(chat.usage.total_tokens, 51);
+        // Bedrock reports no OpenAI-shape cached subset.
+        assert_eq!(chat.usage.cached_prompt_tokens, 0);
+    }
+
+    /// Claude on Bedrock dispatches through the legacy `/invoke` path,
+    /// not Converse, so that is where Bedrock prompt-cache traffic
+    /// actually lands today. The Anthropic wire decoder already carries
+    /// the two counters; this pins that they survive the Bedrock
+    /// envelope rather than being dropped on the way through.
+    #[tokio::test]
+    async fn chat_invoke_anthropic_carries_prompt_cache_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_bedrock_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-3-5-haiku-20241022",
+                "content": [{"type": "text", "text": "cached"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 40,
+                    "output_tokens": 11,
+                    "cache_read_input_tokens": 800,
+                    "cache_creation_input_tokens": 200
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("anthropic.claude-3-5-haiku-20241022-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let chat = bridge
+            .chat(
+                &ChatFormat::new("my-claude", vec![ChatMessage::user("cached prompt")]),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(chat.usage.cache_read_tokens, 800);
+        assert_eq!(chat.usage.cache_creation_tokens, 200);
+        assert_eq!(chat.usage.prompt_tokens, 40);
+        // The cache-inclusive total folds them in (#906), and the
+        // OpenAI-shape subset stays empty.
+        assert_eq!(chat.usage.total_tokens, 40 + 11 + 800 + 200);
+        assert_eq!(chat.usage.cached_prompt_tokens, 0);
+    }
+
+    /// A model or region without prompt caching omits both fields, which
+    /// must read as zero rather than as an inferred value.
+    #[tokio::test]
+    async fn chat_converse_without_cache_fields_reports_no_cache_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": {"message": {"role": "assistant", "content": [{"text": "hi"}]}},
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 5, "outputTokens": 4, "totalTokens": 9},
+                "metrics": {"latencyMs": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("amazon.nova-lite-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let chat = bridge
+            .chat(
+                &ChatFormat::new("my-nova", vec![ChatMessage::user("hi")]),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(chat.usage.cache_read_tokens, 0);
+        assert_eq!(chat.usage.cache_creation_tokens, 0);
     }
 
     #[test]

@@ -144,6 +144,13 @@ pub(crate) struct ResolvedPk<'a> {
     /// or names a row with a blank display name. Borrowed in the
     /// fallback case so the common pre-dispatch failure allocates nothing.
     name: Cow<'a, str>,
+    /// The upstream wire protocol this key dispatches through
+    /// (AISIX-Cloud#1403) — [`aisix_gateway::upstream_protocol`] of the
+    /// resolved row, [`aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN`] when
+    /// there is no row. Computed HERE rather than at the emit so it
+    /// rides along with the id and name the same row produced, on the
+    /// one snapshot read this type exists to make.
+    protocol: &'static str,
     entry: Option<Arc<ResourceEntry<ProviderKey>>>,
 }
 
@@ -169,7 +176,16 @@ impl<'a> ResolvedPk<'a> {
             }
             None => Cow::Borrowed(UNKNOWN_PK),
         };
-        Self { id, name, entry }
+        let protocol = entry
+            .as_ref()
+            .map(|e| aisix_gateway::upstream_protocol(&e.value))
+            .unwrap_or(aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN);
+        Self {
+            id,
+            name,
+            protocol,
+            entry,
+        }
     }
 
     /// A completion that never reached a ProviderKey — the pre-dispatch
@@ -180,15 +196,17 @@ impl<'a> ResolvedPk<'a> {
         ResolvedPk {
             id: "",
             name: Cow::Borrowed(UNKNOWN_PK),
+            protocol: aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN,
             entry: None,
         }
     }
 
-    /// The id + name pair for the metric label set.
+    /// The ProviderKey dimensions of the metric label set.
     pub(crate) fn labels(&self) -> PkLabels<'_> {
         PkLabels {
             id: self.id,
             name: &self.name,
+            protocol: self.protocol,
         }
     }
 
@@ -204,17 +222,19 @@ impl<'a> ResolvedPk<'a> {
     }
 }
 
-/// The ProviderKey dimensions of a metric label set: the id and the
-/// readable name that is 1:1 with it (so the pair adds no series).
+/// The ProviderKey dimensions of a metric label set: the id, the
+/// readable name, and the upstream wire protocol — all three functions
+/// of one ProviderKey row, so the trio adds no series beyond the id.
 ///
 /// The fields are private on purpose. [`ResolvedPk::labels`] and
-/// [`PkLabels::default`] are the only ways to build one, so a name can
-/// never be paired with an id it was not read off — which is the whole
-/// reason `Upstream` takes this type instead of a bare id.
+/// [`PkLabels::default`] are the only ways to build one, so a name or a
+/// protocol can never be paired with an id it was not read off — which
+/// is the whole reason `Upstream` takes this type instead of a bare id.
 #[derive(Clone, Copy)]
 pub(crate) struct PkLabels<'a> {
     id: &'a str,
     name: &'a str,
+    protocol: &'static str,
 }
 
 impl<'a> PkLabels<'a> {
@@ -225,6 +245,11 @@ impl<'a> PkLabels<'a> {
     pub(crate) fn name(self) -> &'a str {
         self.name
     }
+
+    /// The `upstream_protocol` label (AISIX-Cloud#1403).
+    pub(crate) fn protocol(self) -> &'static str {
+        self.protocol
+    }
 }
 
 impl Default for PkLabels<'_> {
@@ -232,6 +257,7 @@ impl Default for PkLabels<'_> {
         Self {
             id: UNKNOWN_PK,
             name: UNKNOWN_PK,
+            protocol: aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN,
         }
     }
 }
@@ -706,10 +732,37 @@ mod tests {
             ResolvedPk::resolve(&snap, PK_ID),
         ] {
             assert_eq!(pk.labels().name, "unknown");
+            // AISIX-Cloud#1403: same fallback, same reason — a request
+            // that reached no key reached no protocol either.
+            assert_eq!(pk.labels().protocol, "unknown");
             assert_eq!(pk.telemetry_tags(), aisix_core::TelemetryTags::default());
         }
         assert_eq!(PkLabels::default().id, "unknown");
         assert_eq!(PkLabels::default().name, "unknown");
+        assert_eq!(PkLabels::default().protocol, "unknown");
+    }
+
+    /// AISIX-Cloud#1403: the protocol is read off the SAME row as the id
+    /// and the name, on the one lookup this type exists to make, so the
+    /// three can never describe different keys.
+    #[test]
+    fn resolved_key_carries_its_upstream_protocol() {
+        let snap = snap_with_pk("prod-openai", "");
+        let pk = ResolvedPk::resolve(&snap, PK_ID);
+        assert_eq!(pk.labels().id, PK_ID);
+        assert_eq!(pk.labels().protocol, "openai");
+
+        // A key whose vendor has no specialized bridge takes its
+        // adapter's wire value.
+        let json = r#"{"display_name":"byo-anthropic","secret":"sk","provider":"byo","adapter":"anthropic"}"#;
+        let byo: ProviderKey = serde_json::from_str(json).unwrap();
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, byo, 1));
+        assert_eq!(
+            ResolvedPk::resolve(&snap, PK_ID).labels().protocol,
+            "anthropic",
+            "an open vendor string cannot stand in for the adapter"
+        );
     }
 
     /// The id reaches the label verbatim even when it resolves to nothing —

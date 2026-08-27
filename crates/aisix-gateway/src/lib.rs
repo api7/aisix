@@ -44,7 +44,7 @@ pub use chat::{
     EmbeddingResponse, EmbeddingUsage, EmbeddingVector, FinishReason, Role, UsageStats,
 };
 pub use credential::credential_fingerprint;
-pub use hub::Hub;
+pub use hub::{upstream_protocol, Hub, UPSTREAM_PROTOCOL_UNKNOWN};
 pub use sse::{SseDecoder, SseEvent};
 pub use upstream_headers::{
     apply_request_headers, resolve_extra_headers, CallerIdentity, UpstreamHeaderContext,

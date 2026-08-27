@@ -646,6 +646,23 @@ pub trait Bridge: Send + Sync + 'static {
     /// upgrades so dashboards don't break.
     fn name(&self) -> &'static str;
 
+    /// The upstream API protocol this bridge speaks on the wire, as the
+    /// bounded `upstream_protocol` metric label value
+    /// (AISIX-Cloud#1403).
+    ///
+    /// NOT [`Bridge::name`]: a bridge names itself after the vendor
+    /// family it serves, which for Bedrock varies per model family
+    /// (`"anthropic"`, `"meta"`, …) while the wire shape stays
+    /// `"bedrock"` throughout.
+    ///
+    /// The default is [`crate::hub::UPSTREAM_PROTOCOL_UNKNOWN`] so a
+    /// stub bridge in a test does not have to answer. Every bridge
+    /// reachable from `build_hub()` overrides it, which
+    /// `upstream_protocol_label_matches_dispatched_bridge` pins.
+    fn wire_protocol(&self) -> &'static str {
+        crate::hub::UPSTREAM_PROTOCOL_UNKNOWN
+    }
+
     /// Non-streaming call: one request, one response.
     async fn chat(
         &self,
