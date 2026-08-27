@@ -1172,6 +1172,7 @@ mod tests {
                 model: "customer-chat",
                 provider_key_id: "pk-1",
                 provider_key_name: "openai-prod",
+                upstream_protocol: "openai",
             },
         );
 

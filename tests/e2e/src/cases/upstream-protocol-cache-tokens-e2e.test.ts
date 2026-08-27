@@ -43,6 +43,26 @@ const CALLER_KEY_HASH = createHash("sha256")
 const OPENAI_MODEL = "proto-openai-upstream";
 const ANTHROPIC_MODEL = "proto-anthropic-upstream";
 
+/**
+ * The families that carry `inbound_protocol` and deliberately do NOT carry
+ * `upstream_protocol`, mirroring `upstream_protocol_exempt_families` in
+ * `crates/aisix-obs/src/metrics.rs` — where the reason for each one is
+ * written at the metric's own definition. Both are counted at a point
+ * where no upstream has been selected.
+ */
+const UPSTREAM_PROTOCOL_EXEMPT = new Set([
+  "aisix_proxy_in_flight_requests",
+  "aisix_proxy_request_body_limit_rejections_total",
+]);
+
+/** Collapse a histogram's `_bucket` / `_sum` / `_count` back to its family. */
+function histogramFamily(name: string): string {
+  for (const suffix of ["_bucket", "_sum", "_count"]) {
+    if (name.endsWith(suffix)) return name.slice(0, -suffix.length);
+  }
+  return name;
+}
+
 // OpenAI-shape usage: `cached_tokens` is part of the 120 prompt tokens.
 const OAI_PROMPT_TOKENS = 120;
 const OAI_COMPLETION_TOKENS = 7;
@@ -336,6 +356,19 @@ describe("upstream_protocol + prompt-cache token metrics e2e", () => {
     expect(
       metricDelta(before, after, "aisix_llm_input_tokens_total", want),
     ).toBe(OAI_PROMPT_TOKENS);
+
+    // The usage-event counter answers the same question about the same
+    // request and has to land on the same protocol, or an operator
+    // grouping the two families together gets one of them back empty. It
+    // names the surface by handler rather than route template.
+    expect(
+      metricDelta(before, after, "aisix_usage_events_emitted_total", {
+        handler: "messages",
+        inbound_protocol: "anthropic",
+        upstream_protocol: "openai",
+        model: OPENAI_MODEL,
+      }),
+    ).toBe(1);
   });
 
   test("a request that selects no upstream is labelled unknown, not dropped", async (ctx) => {
@@ -362,35 +395,55 @@ describe("upstream_protocol + prompt-cache token metrics e2e", () => {
         upstream_protocol: "unknown",
       }),
     ).toBe(1);
+    // …and the usage-event counter reads `unknown` rather than borrowing
+    // the caller's protocol for an upstream that was never chosen.
+    expect(
+      metricDelta(before, after, "aisix_usage_events_emitted_total", {
+        handler: "chat",
+        inbound_protocol: "openai",
+        upstream_protocol: "unknown",
+      }),
+    ).toBe(1);
   });
 
-  test("every sample of a family carries upstream_protocol", async (ctx) => {
+  test("every scraped sample carrying inbound_protocol carries upstream_protocol", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
       return;
     }
-    const samples = await scrape();
-    const families = [
-      "aisix_llm_requests_total",
-      "aisix_proxy_requests_total",
-      "aisix_llm_input_tokens_total",
-      "aisix_llm_output_tokens_total",
-      "aisix_llm_total_tokens_total",
-      "aisix_llm_cached_input_tokens_total",
-      "aisix_llm_cache_read_input_tokens_total",
-      "aisix_llm_cache_creation_input_tokens_total",
-    ];
-    for (const family of families) {
-      const rows = samples.filter((s) => s.name === family);
-      expect(rows.length, `${family} has no samples to check`).toBeGreaterThan(
-        0,
-      );
-      for (const row of rows) {
-        // A partially-labelled family breaks `sum by (upstream_protocol)`
-        // and any alert built on it, so this is the invariant, not a
-        // spot-check of the paths exercised above.
-        expect(row.labels.upstream_protocol, family).toBeTruthy();
-      }
+    // Derived from the scrape rather than a list of family names. The
+    // predecessor of this test named eight families by hand and passed
+    // while `aisix_usage_events_emitted_total` shipped a whole release
+    // candidate without the label: a hand-written list only ever pins the
+    // set that existed when someone typed it.
+    const withInbound = (await scrape()).filter(
+      (s) => s.labels.inbound_protocol,
+    );
+    expect(
+      withInbound.length,
+      "the scrape carries no inbound_protocol samples at all — the traffic \
+above did not reach the metrics listener, so this test checked nothing",
+    ).toBeGreaterThan(0);
+
+    const offenders = withInbound
+      .filter((s) => !UPSTREAM_PROTOCOL_EXEMPT.has(histogramFamily(s.name)))
+      .filter((s) => !s.labels.upstream_protocol);
+    expect(
+      [...new Set(offenders.map((s) => s.name))],
+      "these families carry inbound_protocol without upstream_protocol, so \
+`sum by (upstream_protocol)` drops them out of any join with the rest",
+    ).toEqual([]);
+
+    // An exemption that stopped being true is a hole in the check above,
+    // so assert the other direction too. Whether each exempt family still
+    // EXISTS is the Rust guard's job — it reads the emit sites and so
+    // sees families no traffic here would render.
+    for (const row of withInbound) {
+      if (!UPSTREAM_PROTOCOL_EXEMPT.has(histogramFamily(row.name))) continue;
+      expect(
+        row.labels.upstream_protocol,
+        `${row.name} is exempted from upstream_protocol but now emits it`,
+      ).toBeUndefined();
     }
   });
 });

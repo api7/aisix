@@ -100,6 +100,21 @@ pub const M_LLM_TTFT: &str = "aisix_llm_time_to_first_token_seconds";
 /// client_type × model × token_type — per-key/team/user dimensions belong to
 /// the `aisix_llm_*_tokens_total` families (or UsageEvent/logs), never here.
 pub const M_LLM_TOKENS_BY_CLIENT_TOTAL: &str = "aisix_llm_tokens_by_client_total";
+/// Requests currently inside a handler, by `endpoint` and
+/// `inbound_protocol`.
+///
+/// Deliberately carries NO `upstream_protocol` (AISIX-Cloud#1403). This
+/// gauge is a matched pair of edges — `InFlightGuard::new` increments on
+/// the way in, its `Drop` decrements on the way out — and the increment
+/// runs in the proxy middleware, BEFORE routing has selected a target, so
+/// at that moment the label has no value but `unknown`. Resolving it only
+/// on the decrement would be worse than useless: the two edges would
+/// address different series, leaving the `unknown` one pinned at a
+/// non-zero count forever on an endpoint that has long gone idle.
+///
+/// Callers wanting concurrency by upstream protocol take it from the
+/// request families, which label the completed request with the target it
+/// actually reached.
 pub const M_PROXY_IN_FLIGHT: &str = "aisix_proxy_in_flight_requests";
 pub const M_PROXY_REQUESTS_TOTAL: &str = "aisix_proxy_requests_total";
 pub const M_PROXY_FAILED_REQUESTS_TOTAL: &str = "aisix_proxy_failed_requests_total";
@@ -134,6 +149,11 @@ pub const M_PROXY_CLIENT_CANCELLED_TOTAL: &str = "aisix_proxy_client_cancelled_r
 /// suppress the log's rate-limited warnings, never this counter. Both
 /// label sets are bounded by construction — `endpoint` is a route
 /// template (#451) and `outcome` a fixed vocabulary.
+///
+/// Deliberately carries NO `upstream_protocol` (AISIX-Cloud#1403): the
+/// cap rejects the request while draining its body, before any handler
+/// runs and therefore before a target is selected, so the label would be
+/// the constant `unknown` on every sample this family can ever produce.
 pub const M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL: &str =
     "aisix_proxy_request_body_limit_rejections_total";
 /// Per-DEPLOYMENT (one concrete Model row = one upstream target) call
@@ -239,6 +259,12 @@ pub const M_GUARDRAIL_LATENCY_SECONDS: &str = "aisix_guardrail_latency_seconds";
 ///   1000-value cardinality blowup of raw u16 codes).
 /// - `inbound_protocol`: `openai` / `anthropic`. Matches the
 ///   wire-level field on UsageEvent.
+/// - `upstream_protocol`: the wire protocol of the ProviderKey the event
+///   was attributed to, so this family joins with the request and usage
+///   families on that dimension (AISIX-Cloud#1403). Read off the SAME
+///   resolved row as `provider_key_id` / `provider_key_name`, and
+///   `unknown` for an event that never selected an upstream (a
+///   pre-dispatch rejection, or a non-inference tunnel like `/mcp`).
 ///
 /// Paired with `aisix_usage_event_drops_total{reason}` for the
 /// `try_send` failure paths (sink full / closed).
@@ -1976,6 +2002,15 @@ impl Metrics {
     /// same attribution as the emit counter (AISIX-Cloud#1317): a dropped
     /// event is a hole in the usage record, and the operator's question is
     /// whose data is missing, which `reason` alone cannot answer.
+    ///
+    /// "The same attribution" means every dimension [`UsageEventLabels`]
+    /// supplies, `upstream_protocol` included (AISIX-Cloud#1403) — the
+    /// pair is read as `emitted == delivered + dropped`, and a slice of
+    /// that invariant exists only on dimensions BOTH sides carry. The
+    /// protocol is a function of the ProviderKey row `provider_key_id`
+    /// already names, so like `provider_key_name` it adds no series here.
+    /// (`handler` / `status_code` / `inbound_protocol` are the emit
+    /// counter's own arguments, not attribution, and stay one-sided.)
     pub fn record_usage_event_drop(&self, reason: &str, labels: UsageEventLabels<'_>) {
         self.cached_counter(
             M_USAGE_EVENT_DROPS_TOTAL,
@@ -1985,6 +2020,7 @@ impl Metrics {
                 k.label(labels.model);
                 k.label(labels.provider_key_id);
                 k.label(labels.provider_key_name);
+                k.label(labels.upstream_protocol);
             },
             || {
                 metrics::counter!(
@@ -1993,6 +2029,7 @@ impl Metrics {
                     "model" => labels.model.to_string(),
                     "provider_key_id" => labels.provider_key_id.to_string(),
                     "provider_key_name" => labels.provider_key_name.to_string(),
+                    "upstream_protocol" => labels.upstream_protocol.to_string(),
                 )
             },
         );
@@ -2012,12 +2049,13 @@ impl Metrics {
     ///   `"openai"` / `"anthropic"` / `"other"` (audit MEDIUM-3 —
     ///   `&'static str` here prevents user-controlled cardinality)
     ///
-    /// [`UsageEventLabels`] adds the model and ProviderKey the event was
-    /// attributed to (AISIX-Cloud#1317). Those cannot be `&'static str`,
-    /// so they are bounded at the proxy's emit chokepoint instead — see
-    /// that type. The dimensions they add are ones
-    /// `aisix_llm_requests_total` already carries, so this counter stays
-    /// well inside the request families' series count.
+    /// [`UsageEventLabels`] adds the model, the ProviderKey the event was
+    /// attributed to (AISIX-Cloud#1317) and that key's `upstream_protocol`
+    /// (AISIX-Cloud#1403). Those cannot be `&'static str`, so they are
+    /// bounded at the proxy's emit chokepoint instead — see that type. The
+    /// dimensions they add are ones `aisix_llm_requests_total` already
+    /// carries, so this counter stays well inside the request families'
+    /// series count.
     pub fn record_usage_event_emit(
         &self,
         handler: &'static str,
@@ -2036,6 +2074,7 @@ impl Metrics {
                 k.label(labels.model);
                 k.label(labels.provider_key_id);
                 k.label(labels.provider_key_name);
+                k.label(labels.upstream_protocol);
             },
             || {
                 metrics::counter!(
@@ -2043,6 +2082,7 @@ impl Metrics {
                     "handler" => handler,
                     "status_code" => status_class,
                     "inbound_protocol" => inbound_protocol,
+                    "upstream_protocol" => labels.upstream_protocol.to_string(),
                     "model" => labels.model.to_string(),
                     "provider_key_id" => labels.provider_key_id.to_string(),
                     "provider_key_name" => labels.provider_key_name.to_string(),
@@ -2639,6 +2679,18 @@ pub struct UsageEventLabels<'a> {
     pub model: &'a str,
     pub provider_key_id: &'a str,
     pub provider_key_name: &'a str,
+    /// The upstream wire protocol of the key named by `provider_key_id`
+    /// (AISIX-Cloud#1403) — the same value, resolved the same way, that
+    /// the request and usage families carry, so an operator can align
+    /// this counter with them under `sum by (upstream_protocol)`.
+    ///
+    /// Must be read off the SAME ProviderKey row as the id and name
+    /// beside it (`usage_attr::ResolvedPk`), never looked up separately:
+    /// three dimensions describing three different keys is exactly the
+    /// drift `PkLabels` exists to prevent. `unknown` when nothing was
+    /// resolved — the pre-dispatch failures, and the tunnels that have
+    /// no LLM upstream at all (`/mcp`, `/a2a`).
+    pub upstream_protocol: &'a str,
 }
 
 impl Default for UsageEventLabels<'_> {
@@ -2647,6 +2699,7 @@ impl Default for UsageEventLabels<'_> {
             model: "unknown",
             provider_key_id: "unknown",
             provider_key_name: "unknown",
+            upstream_protocol: "unknown",
         }
     }
 }
@@ -2760,6 +2813,233 @@ impl RequestOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// One `metrics::{counter,histogram,gauge}!` invocation in this file's
+    /// production half: the family it emits (resolved to the metric NAME
+    /// where the first argument is one of this module's `M_*` constants,
+    /// otherwise the argument text itself) and the label keys it writes.
+    ///
+    /// Read out of the source deliberately. Only `aisix-obs` depends on
+    /// the `metrics` crate and every invocation lives in this file, so
+    /// the scan sees the WHOLE emit surface — including families no test
+    /// exercises, which is precisely where the omission this guards
+    /// against hides.
+    fn emit_sites() -> Vec<(String, BTreeSet<String>)> {
+        let src = include_str!("metrics.rs");
+        let production = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production half");
+
+        // `M_FOO` -> "aisix_foo", so failures name the metric an operator
+        // would grep for rather than a Rust identifier. Whitespace-tolerant:
+        // the longer constants wrap their value onto the next line.
+        let names: BTreeMap<&str, &str> = production
+            .match_indices("pub const M_")
+            .filter_map(|(at, marker)| {
+                let decl = &production[at + marker.len()..];
+                let (ident, rest) = decl.split_once(": &str =")?;
+                let value = rest.trim_start().strip_prefix('"')?;
+                Some((ident, value.split('"').next()?))
+            })
+            .collect();
+
+        let mut sites = Vec::new();
+        for macro_name in ["counter", "histogram", "gauge"] {
+            let opener = format!("metrics::{macro_name}!(");
+            let mut cursor = 0usize;
+            while let Some(offset) = production[cursor..].find(&opener) {
+                let open = cursor + offset + opener.len() - 1;
+                let mut depth = 0usize;
+                let mut end = open;
+                for (i, c) in production[open..].char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = open + i;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(end > open, "unbalanced `{opener}` at byte {open}");
+                let body = &production[open + 1..end];
+                let line = production[..open].lines().count();
+                let family = body
+                    .split(',')
+                    .next()
+                    .expect("a family argument")
+                    .trim()
+                    .to_string();
+                let display = family
+                    .strip_prefix("M_")
+                    .and_then(|ident| names.get(ident))
+                    .map(|name| (*name).to_string())
+                    // A shared helper takes the family as a parameter, so
+                    // the site has no name of its own — identify it by the
+                    // helper it lives in, which is what a reader has to go
+                    // edit.
+                    .unwrap_or_else(|| {
+                        let enclosing = production[..open]
+                            .rsplit_once("    fn ")
+                            .and_then(|(_, tail)| tail.split('(').next())
+                            .unwrap_or(family.as_str());
+                        format!("{enclosing}() (metrics.rs:{line})")
+                    });
+                let labels = body
+                    .split('"')
+                    .skip(1)
+                    .step_by(2)
+                    .zip(body.split('"').skip(2).step_by(2))
+                    .filter(|(_, after)| after.trim_start().starts_with("=>"))
+                    .map(|(key, _)| key.to_string())
+                    .collect();
+                sites.push((display, labels));
+                cursor = end;
+            }
+        }
+        assert!(
+            sites.len() > 20,
+            "the emit-site scan found only {} sites — the macro spelling it \
+             keys off has changed and this guard is no longer looking at \
+             anything",
+            sites.len()
+        );
+        sites
+    }
+
+    /// The families that carry `inbound_protocol` and deliberately do NOT
+    /// carry `upstream_protocol`. Both are counted at a point where no
+    /// upstream has been selected — the reason is spelled out at each
+    /// metric's own definition, which is what a reader hits first.
+    ///
+    /// Membership here is a decision, not a backlog: adding a family is
+    /// how you state "this one is excluded on purpose", and the assertions
+    /// below reject an entry that is stale (the family gained the label
+    /// anyway) or dangling (the family no longer carries
+    /// `inbound_protocol`).
+    fn upstream_protocol_exempt_families() -> BTreeSet<&'static str> {
+        BTreeSet::from([
+            // Incremented in the proxy middleware, before routing picks a
+            // target; the matching decrement must address the same series.
+            M_PROXY_IN_FLIGHT,
+            // The body cap rejects before any handler runs.
+            M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL,
+        ])
+    }
+
+    /// Every rendered sample that carries `inbound_protocol` must carry
+    /// `upstream_protocol` too, unless its family is a stated exclusion.
+    ///
+    /// The exposition half of
+    /// `upstream_protocol_covers_every_inbound_protocol_family`: that one
+    /// reads the emit sites and cannot see whether the label survives to
+    /// the wire; this one reads what a Prometheus scrape would actually
+    /// get. Both derive the family set instead of listing it — the caller
+    /// hands over a rendering, not a set of names to check.
+    fn assert_upstream_protocol_rides_along(rendered: &str) {
+        let exempt = upstream_protocol_exempt_families();
+        let mut checked = 0usize;
+        for line in rendered.lines() {
+            if line.starts_with('#') || !line.contains("inbound_protocol=") {
+                continue;
+            }
+            let family = line.split('{').next().expect("a sample name");
+            // Histogram suffixes are the same family.
+            let base = family
+                .strip_suffix("_bucket")
+                .or_else(|| family.strip_suffix("_sum"))
+                .or_else(|| family.strip_suffix("_count"))
+                .unwrap_or(family);
+            if exempt.contains(base) {
+                continue;
+            }
+            // Every sample of a family must carry the label, or
+            // `sum by (upstream_protocol)` silently drops the ones that
+            // do not — an operator's dashboard then joins across a
+            // subset and reads as merely incomplete data.
+            assert!(
+                line.contains("upstream_protocol="),
+                "{base} sample carries inbound_protocol without \
+                 upstream_protocol: {line}"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "no sample carrying inbound_protocol was rendered — this \
+             assertion checked nothing"
+        );
+    }
+
+    /// AISIX-Cloud#1403: `upstream_protocol` must sit on every family that
+    /// carries `inbound_protocol`, minus the ones deliberately excluded.
+    ///
+    /// Derived from the emit sites rather than restated as a list of
+    /// family names. A hand-written list only ever freezes the set that
+    /// existed when someone typed it: the label originally reached
+    /// exactly the families that share a label STRUCT — `RequestLabels`,
+    /// `UsageLabels` — and the three that build their label list inline
+    /// here were never considered. Two of those are the deliberate
+    /// exclusions below; the third,
+    /// `aisix_usage_events_emitted_total`, had the value in hand beside
+    /// `provider_key_id` and simply did not emit it, so
+    /// `sum by (upstream_protocol)` dropped it out of every join with the
+    /// rest. A list-shaped test would have been written to match the
+    /// families that did get it, and passed.
+    #[test]
+    fn upstream_protocol_covers_every_inbound_protocol_family() {
+        let sites = emit_sites();
+        let with = |label: &str| -> BTreeSet<String> {
+            sites
+                .iter()
+                .filter(|(_, labels)| labels.contains(label))
+                .map(|(family, _)| family.clone())
+                .collect()
+        };
+        let inbound = with("inbound_protocol");
+        let upstream = with("upstream_protocol");
+        let exempt: BTreeSet<String> = upstream_protocol_exempt_families()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        let missing: Vec<&String> = inbound
+            .iter()
+            .filter(|f| !upstream.contains(*f) && !exempt.contains(*f))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these families carry `inbound_protocol` without \
+             `upstream_protocol`: {missing:?}. Either resolve the value off \
+             the request's `usage_attr::ResolvedPk` the way the request \
+             families do — never a second ProviderKey lookup — or add the \
+             family to `upstream_protocol_exempt_families` and say at its \
+             definition why the value cannot exist at emit time.",
+        );
+
+        let stale: Vec<&String> = exempt.iter().filter(|f| upstream.contains(*f)).collect();
+        assert!(
+            stale.is_empty(),
+            "these families are listed as deliberately without \
+             `upstream_protocol` but now emit it: {stale:?}. Drop them from \
+             `upstream_protocol_exempt_families` and from the exclusion note \
+             at their definition.",
+        );
+
+        let dangling: Vec<&String> = exempt.iter().filter(|f| !inbound.contains(*f)).collect();
+        assert!(
+            dangling.is_empty(),
+            "these families are listed as deliberately without \
+             `upstream_protocol` but no longer carry `inbound_protocol` \
+             either: {dangling:?}. The exemption is about a comparison that \
+             no longer exists — remove it.",
+        );
+    }
 
     #[test]
     fn outcome_from_status_maps_correctly() {
@@ -3059,30 +3339,7 @@ mod tests {
         // invisible.
         assert!(rendered.contains("inbound_protocol=\"openai\""));
         assert!(rendered.contains("upstream_protocol=\"anthropic\""));
-        for family in [
-            M_PROXY_REQUESTS_TOTAL,
-            M_LLM_REQUESTS_TOTAL,
-            M_LLM_REQUEST_DURATION,
-            M_PROXY_REQUEST_DURATION,
-            M_LLM_INPUT_TOKENS_TOTAL,
-            M_LLM_SPEND_MICRO_USD_TOTAL,
-            M_LLM_TTFT,
-        ] {
-            let mut samples = rendered
-                .lines()
-                .filter(|line| line.starts_with(family) && line.contains('{'))
-                .peekable();
-            assert!(samples.peek().is_some(), "{family} rendered no samples");
-            for line in samples {
-                // Every sample of a family must carry the label, or
-                // `sum by (upstream_protocol)` silently drops the ones
-                // that do not.
-                assert!(
-                    line.contains("upstream_protocol="),
-                    "{family} sample is missing upstream_protocol: {line}"
-                );
-            }
-        }
+        assert_upstream_protocol_rides_along(&rendered);
         // AISIX-Cloud#1404: each cache counter carries its own value and
         // none of them was folded into input or total.
         assert!(rendered.contains(M_LLM_CACHED_INPUT_TOKENS_TOTAL));
@@ -3937,6 +4194,7 @@ mod tests {
         model: "gpt-4o",
         provider_key_id: "pk-1",
         provider_key_name: "openai-prod",
+        upstream_protocol: "openai",
     };
 
     #[test]
@@ -3969,7 +4227,55 @@ mod tests {
                 ..PK_A
             },
         );
-        assert_one_series_per_label_set(&m.render(), M_USAGE_EVENT_EMITS_TOTAL, 6);
+        // AISIX-Cloud#1403: and so does the upstream protocol. A key
+        // repointed at an Anthropic-shape upstream keeps its id, so
+        // leaving this out of the cache key would report the new traffic
+        // under the old protocol for as long as the worker lives.
+        m.record_usage_event_emit(
+            "chat",
+            200,
+            "openai",
+            UsageEventLabels {
+                upstream_protocol: "anthropic",
+                ..PK_A
+            },
+        );
+        assert_one_series_per_label_set(&m.render(), M_USAGE_EVENT_EMITS_TOTAL, 7);
+    }
+
+    /// AISIX-Cloud#1403: the label survives onto the exposition, with the
+    /// UPSTREAM's protocol rather than the caller's, and `unknown` where
+    /// no upstream was selected.
+    ///
+    /// The family this test exists for is the one 0.11.0-rc.2 shipped
+    /// without the label: it had the resolved ProviderKey right beside
+    /// `provider_key_id` and emitted everything but its protocol.
+    #[test]
+    fn usage_event_emit_reports_the_upstream_protocol_not_the_callers() {
+        let m = Metrics::new(false);
+        // An Anthropic-protocol caller served by an OpenAI-shape upstream.
+        m.record_usage_event_emit("messages", 200, "anthropic", PK_A);
+        // A request that never reached a key — a pre-dispatch rejection,
+        // or a tunnel with no LLM upstream at all.
+        m.record_usage_event_emit("chat", 401, "openai", UsageEventLabels::default());
+        let rendered = m.render();
+
+        assert!(
+            rendered.contains(
+                "handler=\"messages\",status_code=\"2xx\",\
+                 inbound_protocol=\"anthropic\",upstream_protocol=\"openai\""
+            ),
+            "cross-protocol sample must report the upstream's protocol:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "handler=\"chat\",status_code=\"4xx\",\
+                 inbound_protocol=\"openai\",upstream_protocol=\"unknown\""
+            ),
+            "an unresolved upstream must read `unknown`, never borrow the \
+             inbound protocol:\n{rendered}"
+        );
+        assert_upstream_protocol_rides_along(&rendered);
     }
 
     #[test]
@@ -3992,24 +4298,57 @@ mod tests {
     /// `emitted == delivered + dropped`. A per-model or per-key slice of
     /// that invariant only exists if BOTH sides carry the same attribution,
     /// which is why `try_emit` hands one label set to both.
+    ///
+    /// Derived, not a list of label names: the drop sample must carry
+    /// everything the emit sample does EXCEPT the three dimensions
+    /// `record_usage_event_emit` takes as its own arguments. So a field
+    /// added to [`UsageEventLabels`] and wired into the emit counter fails
+    /// this test until it reaches the drop counter too — which is how
+    /// `upstream_protocol` reached only one side in the first place
+    /// (AISIX-Cloud#1403).
     #[test]
     fn emits_and_drops_carry_the_same_attribution_labels() {
         let m = Metrics::new(false);
         m.record_usage_event_emit("chat", 200, "openai", PK_A);
         m.record_usage_event_drop("sink_full", PK_A);
         let rendered = m.render();
-        for metric in [M_USAGE_EVENT_EMITS_TOTAL, M_USAGE_EVENT_DROPS_TOTAL] {
+
+        let labels_of = |metric: &str| -> BTreeSet<String> {
             let line = series_lines(&rendered, metric)
                 .pop()
                 .unwrap_or_else(|| panic!("{metric} must render\n{rendered}"));
-            for want in [
-                r#"model="gpt-4o""#,
-                r#"provider_key_id="pk-1""#,
-                r#"provider_key_name="openai-prod""#,
-            ] {
-                assert!(line.contains(want), "{metric} is missing {want}: {line}");
-            }
-        }
+            line.split_once('{')
+                .and_then(|(_, rest)| rest.rsplit_once('}'))
+                .expect("a labelled sample")
+                .0
+                .split(',')
+                .filter_map(|pair| pair.split_once('=').map(|(k, _)| k.to_string()))
+                .collect()
+        };
+        // The emit counter's own arguments — a surface of the emitting
+        // handler, not of the event's attribution.
+        let emit_only: BTreeSet<String> = ["handler", "status_code", "inbound_protocol"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let attribution: BTreeSet<String> = labels_of(M_USAGE_EVENT_EMITS_TOTAL)
+            .difference(&emit_only)
+            .cloned()
+            .collect();
+        assert!(
+            attribution.contains("model") && attribution.contains("provider_key_id"),
+            "the attribution set looks wrong: {attribution:?}"
+        );
+
+        let dropped = labels_of(M_USAGE_EVENT_DROPS_TOTAL);
+        let missing: Vec<&String> = attribution.difference(&dropped).collect();
+        assert!(
+            missing.is_empty(),
+            "the drop counter is missing attribution the emit counter \
+             carries: {missing:?}. Both sides take one `UsageEventLabels`, \
+             so a dimension on only one of them makes that slice of \
+             `emitted == delivered + dropped` unanswerable.",
+        );
     }
 
     #[test]
