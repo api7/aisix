@@ -152,13 +152,26 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
 /// The guardrail `kind` discriminators compiled into this binary whose
 /// availability is decided at COMPILE time.
 ///
-/// Every non-keyword kind sits behind a cargo feature (see `build.rs`'s
-/// `BuildError::FeatureDisabled` arms); a DP built without one silently
-/// rejects rows of that kind while the dashboard still offers it
-/// (#519 B.6). The heartbeat reports this list so cp-api can hide /
-/// flag kinds the connected DP can't serve. Strings MUST stay equal to
-/// the serde `kind` tags in `aisix_core::models::GuardrailKind`
-/// (`GuardrailKind::kind_str`).
+/// This is the DP's capability advertisement: the heartbeat forwards it as
+/// `supported_guardrail_kinds`, cp-api unions it across the connected data
+/// planes, and the dashboard disables any kind absent from that union. So a
+/// kind missing here is not a cosmetic gap — the kind becomes unreachable in
+/// the UI and an operator asking "can this DP run that rule" is answered
+/// "no" for something the DP runs perfectly well.
+///
+/// The list therefore covers the WHOLE `GuardrailKind` vocabulary, minus only
+/// the kinds whose cargo feature is off in this build (see `build.rs`'s
+/// `BuildError::FeatureDisabled` arms): a DP built without one silently
+/// rejects rows of that kind, so advertising it would be the mirror-image
+/// lie (#519 B.6). `keyword`, `pii`, `semantic` and `custom` have no feature
+/// gate and are always present.
+///
+/// Strings MUST stay equal to the serde `kind` tags in
+/// `aisix_core::models::GuardrailKind` (`GuardrailKind::kind_str`);
+/// `supported_kinds_advertises_every_schema_kind_this_build_can_run` pins
+/// both halves against the schema `schemars` derives from that enum, so a
+/// newly added kind fails the test until it is either advertised here or
+/// declared feature-gated.
 pub fn supported_kinds() -> &'static [&'static str] {
     &[
         "keyword",
@@ -182,6 +195,9 @@ pub fn supported_kinds() -> &'static [&'static str] {
         // No cargo feature and no on-disk asset: the embedding call goes
         // out over the provider bridges every build already has.
         "semantic",
+        // No cargo feature either: the script engine is an unconditional
+        // dependency, so every build can run a custom guardrail.
+        "custom",
     ]
 }
 
@@ -837,6 +853,7 @@ pub(crate) fn keep_callsites_enabled() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn truncate_error_body_short_passes_through() {
@@ -983,42 +1000,104 @@ mod tests {
         ));
     }
 
-    /// Pins `supported_kinds()` under the default feature set (all
-    /// features on): exact contents, and every string round-trips
-    /// through the config parser to the matching
-    /// `GuardrailKind::kind_str` — so the heartbeat-reported list can
-    /// never drift from the wire `kind` discriminators (#519 B.6).
-    #[cfg(all(
-        feature = "bedrock",
-        feature = "azure-content-safety",
-        feature = "aliyun-text-moderation",
-        feature = "lakera",
-        feature = "openai-moderation",
-        feature = "presidio"
-    ))]
+    /// Every top-level guardrail `kind` in the resource vocabulary, read out
+    /// of the schema `schemars` DERIVES from `GuardrailKind`.
+    ///
+    /// Derived rather than restated on purpose. The predecessor of this
+    /// helper was a hand-written list, which froze the bug it was meant to
+    /// catch: `custom` shipped without ever reaching `supported_kinds()`, the
+    /// list was written to match, and the test passed all the way into a
+    /// release candidate. A variant added to the enum lands in this set with
+    /// nobody editing this file, so the assertions below fail until the new
+    /// kind is either advertised or declared feature-gated.
+    ///
+    /// Only the top-level `oneOf` is read: the tagged sub-enums nested inside
+    /// a kind (`literal`/`regex` keyword patterns, the `static` credential
+    /// and `serial`/`timed` latency modes of `bedrock`) live under
+    /// `definitions` and are not selectable provider kinds.
+    fn schema_kind_vocabulary() -> BTreeSet<String> {
+        aisix_core::models::schema::guardrail_root_schema()["oneOf"]
+            .as_array()
+            .expect("the guardrail root schema is a `oneOf` over the kinds")
+            .iter()
+            .map(|branch| {
+                branch["properties"]["kind"]["enum"][0]
+                    .as_str()
+                    .expect("each branch pins exactly one kind")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// The kinds this build deliberately keeps OUT of the advertisement
+    /// because their cargo feature is off — the only legitimate reason for
+    /// a schema kind to be absent. Under the default feature set this is
+    /// empty and every kind must be advertised.
+    fn feature_disabled_kinds() -> BTreeSet<&'static str> {
+        #[allow(unused_mut)]
+        let mut disabled = BTreeSet::new();
+        #[cfg(not(feature = "azure-content-safety"))]
+        {
+            disabled.insert("azure_content_safety");
+            disabled.insert("azure_content_safety_text_moderation");
+        }
+        #[cfg(not(feature = "aliyun-text-moderation"))]
+        {
+            disabled.insert("aliyun_text_moderation");
+            disabled.insert("aliyun_ai_guardrail");
+        }
+        #[cfg(not(feature = "bedrock"))]
+        disabled.insert("bedrock");
+        #[cfg(not(feature = "lakera"))]
+        disabled.insert("lakera");
+        #[cfg(not(feature = "openai-moderation"))]
+        disabled.insert("openai_moderation");
+        #[cfg(not(feature = "presidio"))]
+        disabled.insert("presidio");
+        disabled
+    }
+
+    /// The capability advertisement must equal "every kind in the schema
+    /// vocabulary that this build can actually run" — in BOTH directions, and
+    /// under any feature set. Under-advertising makes a working kind
+    /// unreachable from the dashboard (which disables anything absent from
+    /// the union the connected DPs report); over-advertising offers an
+    /// operator a kind whose rows this binary drops on load.
     #[test]
-    fn supported_kinds_matches_kind_str_under_default_features() {
+    fn supported_kinds_advertises_every_schema_kind_this_build_can_run() {
+        let vocabulary = schema_kind_vocabulary();
+        let disabled = feature_disabled_kinds();
+        let expected: BTreeSet<&str> = vocabulary
+            .iter()
+            .map(String::as_str)
+            .filter(|kind| !disabled.contains(kind))
+            .collect();
+
+        let advertised: BTreeSet<&str> = supported_kinds().iter().copied().collect();
         assert_eq!(
+            advertised.len(),
+            supported_kinds().len(),
+            "supported_kinds() repeats a kind: {:?}",
             supported_kinds(),
-            &[
-                "keyword",
-                "pii",
-                "azure_content_safety",
-                "azure_content_safety_text_moderation",
-                "aliyun_text_moderation",
-                "aliyun_ai_guardrail",
-                "bedrock",
-                "lakera",
-                "openai_moderation",
-                "presidio",
-                "semantic",
-            ],
         );
-        for kind in supported_kinds() {
-            // Minimal valid config per kind; parse failure or a
-            // kind_str mismatch means the heartbeat list drifted from
-            // the schema's serde tags.
-            let config = match *kind {
+        assert_eq!(
+            advertised, expected,
+            "supported_kinds() drifted from the guardrail schema vocabulary; \
+             a kind this build runs must be advertised, and one it cannot \
+             must be listed in feature_disabled_kinds()",
+        );
+    }
+
+    /// Every kind in the vocabulary parses from a minimal config and reports
+    /// itself under the same discriminator, so the advertised strings, the
+    /// serde tags and `GuardrailKind::kind_str` (three hand-written surfaces
+    /// over one vocabulary) cannot drift apart. Feature-independent: parsing
+    /// lives in `aisix-core`, which compiles every kind regardless of this
+    /// crate's features.
+    #[test]
+    fn every_schema_kind_round_trips_to_its_kind_str() {
+        for kind in schema_kind_vocabulary() {
+            let config = match kind.as_str() {
                 "keyword" => serde_json::json!({
                     "kind": "keyword",
                     "patterns": [{"kind": "literal", "value": "x"}],
@@ -1075,11 +1154,17 @@ mod tests {
                     "analyzer_url": "http://analyzer:3000",
                     "anonymizer_url": "http://anonymizer:3000",
                 }),
-                other => panic!("no parse fixture for kind {other:?}"),
+                "custom" => serde_json::json!({
+                    "kind": "custom",
+                    "script": "export function on_input() { return { action: 'allow' }; }",
+                }),
+                other => panic!(
+                    "guardrail kind {other:?} joined the schema vocabulary with no parse fixture"
+                ),
             };
             let parsed: aisix_core::models::GuardrailKind = serde_json::from_value(config)
                 .unwrap_or_else(|e| panic!("kind {kind:?} failed to parse: {e}"));
-            assert_eq!(parsed.kind_str(), *kind);
+            assert_eq!(parsed.kind_str(), kind);
         }
     }
 

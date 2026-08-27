@@ -1418,12 +1418,11 @@ async fn anthropic_passthrough_dispatch(
                 let metrics = AnthropicUsageMetrics {
                     prompt_tokens: usage.prompt_tokens,
                     completion_tokens: usage.completion_tokens,
+                    // Anthropic upstream: the cache hit arrives as
+                    // `cache_read_input_tokens`, never the OpenAI-shape subset.
+                    cached_prompt_tokens: 0,
                     cache_creation_tokens: usage.cache_creation_tokens,
                     cache_read_tokens: usage.cache_read_tokens,
-                    // Native Anthropic passthrough: the accumulator is fed
-                    // from raw Anthropic SSE frames, which carry no
-                    // OpenAI-shape `cached_tokens`.
-                    cached_prompt_tokens: 0,
                     usage_estimated: usage.usage_estimated,
                     provider_request_id: usage.provider_request_id,
                     provider_model_version: usage.provider_model_version,
@@ -1784,8 +1783,7 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
     let usage = body.get("usage");
     AnthropicUsageMetrics {
         usage_estimated: false,
-        // A native Anthropic body has no OpenAI-shape `cached_tokens`;
-        // its cache reads arrive in `cache_read_input_tokens` below.
+        // Anthropic upstream: see the streaming sibling — no OpenAI-shape subset.
         cached_prompt_tokens: 0,
         prompt_tokens: usage
             .and_then(|u| u.get("input_tokens"))
@@ -2081,9 +2079,9 @@ async fn cross_provider_dispatch(
                 let metrics = AnthropicUsageMetrics {
                     prompt_tokens: comp.prompt_tokens,
                     completion_tokens: comp.completion_tokens,
+                    cached_prompt_tokens: comp.cached_prompt_tokens,
                     cache_creation_tokens: comp.cache_creation_tokens,
                     cache_read_tokens: comp.cache_read_tokens,
-                    cached_prompt_tokens: comp.cached_prompt_tokens,
                     usage_estimated: comp.usage_estimated,
                     provider_request_id: comp.provider_request_id,
                     provider_model_version: comp.provider_model_version,
@@ -2251,9 +2249,9 @@ async fn cross_provider_dispatch(
     let mut metrics = AnthropicUsageMetrics {
         prompt_tokens: resp.usage.prompt_tokens,
         completion_tokens: resp.usage.completion_tokens,
+        cached_prompt_tokens: resp.usage.cached_prompt_tokens,
         cache_creation_tokens: resp.usage.cache_creation_tokens,
         cache_read_tokens: resp.usage.cache_read_tokens,
-        cached_prompt_tokens: resp.usage.cached_prompt_tokens,
         usage_estimated: false,
         provider_request_id: crate::usage_attr::sanitize_provider_response_id(&resp.id),
         provider_model_version: resp.model.clone(),
@@ -2403,11 +2401,11 @@ fn build_anthropic_sse_stream(
                     if let Some(u) = chunk.usage.as_ref() {
                         comp.prompt_tokens = comp.prompt_tokens.max(u.prompt_tokens);
                         comp.completion_tokens = comp.completion_tokens.max(u.completion_tokens);
+                        comp.cached_prompt_tokens =
+                            comp.cached_prompt_tokens.max(u.cached_prompt_tokens);
                         comp.cache_creation_tokens =
                             comp.cache_creation_tokens.max(u.cache_creation_tokens);
                         comp.cache_read_tokens = comp.cache_read_tokens.max(u.cache_read_tokens);
-                        comp.cached_prompt_tokens =
-                            comp.cached_prompt_tokens.max(u.cached_prompt_tokens);
                     }
                     if output_guardrail.is_some() {
                         if let Some(t) = chunk.delta.content.as_deref() {
@@ -2659,14 +2657,10 @@ struct AnthropicStreamCompletion {
     reached_end: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// See [`AnthropicUsageMetrics::cached_prompt_tokens`].
+    cached_prompt_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
-    /// The bridged upstream's OpenAI-shape cache hit, a SUBSET of
-    /// `prompt_tokens` (AISIX-Cloud#1404). This accumulator is fed from
-    /// the bridge's `UsageStats`, so a `/v1/messages` caller served by an
-    /// OpenAI-shape upstream reports it here; a native Anthropic upstream
-    /// leaves it 0 and fills the two counters above instead.
-    cached_prompt_tokens: u32,
     /// True when the Drop guard filled any token counter from the local
     /// estimator (AISIX-Cloud#1074).
     usage_estimated: bool,
@@ -2803,17 +2797,18 @@ impl From<ProxyError> for MessagesDispatchError {
 struct AnthropicUsageMetrics {
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// OpenAI-shape prompt-cache hit — a SUBSET of `prompt_tokens`,
+    /// non-zero only on the bridged path where the upstream speaks
+    /// OpenAI (AISIX-Cloud#1405). Kept in the upstream's own shape so a
+    /// given upstream call produces the same UsageEvent whichever
+    /// inbound protocol addressed it, and so cp-api's pricing split
+    /// (`prompt - cached` at the prompt rate, `cached` at the cache-read
+    /// rate) stays correct. Never summed into a total — that would
+    /// double-count it, unlike the two Anthropic-shape counters below,
+    /// which sit ON TOP of `prompt_tokens`.
+    cached_prompt_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
-    /// The OpenAI-shape cache hit count, which is a SUBSET of
-    /// `prompt_tokens` rather than a counter beside it. Non-zero only on
-    /// the cross-protocol path — an OpenAI-shape upstream serving
-    /// `/v1/messages` — and 0 for a native Anthropic upstream, which
-    /// reports its cache reads in `cache_read_tokens` instead. Kept
-    /// separate from the two Anthropic counters for that reason: folding
-    /// it in would double-count it against `prompt_tokens`
-    /// (AISIX-Cloud#1404).
-    cached_prompt_tokens: u32,
     /// True when any token counter was filled by the local estimator
     /// because the upstream reported no usage (AISIX-Cloud#1074).
     usage_estimated: bool,
@@ -2896,6 +2891,7 @@ fn emit_anthropic_usage_event(
         requested_model: model.to_string(),
         prompt_tokens: metrics.prompt_tokens,
         completion_tokens: metrics.completion_tokens,
+        cached_prompt_tokens: metrics.cached_prompt_tokens,
         cache_creation_tokens: metrics.cache_creation_tokens,
         cache_read_tokens: metrics.cache_read_tokens,
         usage_estimated: metrics.usage_estimated,
@@ -4781,6 +4777,177 @@ data: [DONE]\n\n";
         assert_eq!(v["stop_reason"], "end_turn");
         assert_eq!(v["usage"]["input_tokens"], 8);
         assert_eq!(v["usage"]["output_tokens"], 4);
+    }
+
+    /// AISIX-Cloud#1405: `/v1/messages` in front of an OpenAI-compatible
+    /// upstream that reports a prompt-cache hit. Pre-fix the hit was
+    /// dropped on BOTH exits — the client's Anthropic `usage` and the
+    /// UsageEvent that drives Logs/billing — so the whole 68k prompt
+    /// billed at the uncached rate and no cache detail existed to
+    /// reconcile against the provider's own bill.
+    ///
+    /// The numbers are the reporter's: MiniMax M3 behind an
+    /// OpenAI-compatible provider, addressed by the Claude CLI.
+    #[tokio::test]
+    async fn messages_openai_upstream_cache_hit_reaches_client_and_usage_event() {
+        use aisix_obs::UsageSink;
+        use aisix_provider_openai::OpenAiBridge;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-cache-test",
+                "model": "MiniMax-M3",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 68_274,
+                    "completion_tokens": 497,
+                    "total_tokens": 68_771,
+                    "prompt_tokens_details": {"cached_tokens": 60_000}
+                }
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("tencent-minimax-m3"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_family(
+            aisix_core::Adapter::Anthropic,
+            Arc::new(AnthropicBridge::new()),
+        );
+        hub.register_family(aisix_core::Adapter::Openai, Arc::new(OpenAiBridge::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = crate::build_router(
+            crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+                .without_cache()
+                .with_usage_sink(UsageSink::new(tx)),
+        );
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "tencent-minimax-m3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
+
+        // Client side: Anthropic semantics — input_tokens excludes the
+        // cache read, which gets its own counter.
+        assert_eq!(v["usage"]["input_tokens"], 8_274);
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 60_000);
+        assert_eq!(v["usage"]["output_tokens"], 497);
+        assert!(
+            v["usage"].get("cache_creation_input_tokens").is_none(),
+            "an OpenAI upstream reports no cache write — never fabricate one"
+        );
+
+        // Telemetry side: the upstream's OWN shape, so this call bills
+        // identically whether OpenAI or Anthropic protocol addressed it,
+        // and cp-api's `prompt - cached` split stays correct.
+        let event = rx.recv().await.expect("usage event was never emitted");
+        assert_eq!(event.prompt_tokens, 68_274);
+        assert_eq!(event.cached_prompt_tokens, 60_000);
+        assert_eq!(event.completion_tokens, 497);
+        // The cache hit is a SUBSET of prompt_tokens, so the Anthropic-shape
+        // additive counters stay 0 and the total is not double-counted.
+        assert_eq!(event.cache_read_tokens, 0);
+        assert_eq!(event.cache_creation_tokens, 0);
+        assert_eq!(
+            crate::usage_attr::total_tokens_with_cache(
+                event.prompt_tokens,
+                event.completion_tokens,
+                event.cache_creation_tokens,
+                event.cache_read_tokens,
+            ),
+            68_771
+        );
+    }
+
+    /// Streaming half of the above: the cache hit rides the trailing
+    /// `include_usage` frame, so the closing `message_delta` is the only
+    /// place the client can learn it.
+    #[tokio::test]
+    async fn messages_openai_upstream_cache_hit_streams_and_reaches_usage_event() {
+        use aisix_obs::UsageSink;
+        use aisix_provider_openai::OpenAiBridge;
+        use futures::StreamExt;
+
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"chatcmpl-cache-test\",\"model\":\"MiniMax-M3\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"chatcmpl-cache-test\",\"model\":\"MiniMax-M3\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: {\"id\":\"chatcmpl-cache-test\",\"model\":\"MiniMax-M3\",\"choices\":[],\"usage\":{\"prompt_tokens\":68274,\"completion_tokens\":497,\"total_tokens\":68771,\"prompt_tokens_details\":{\"cached_tokens\":60000}}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("tencent-minimax-m3"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_family(
+            aisix_core::Adapter::Anthropic,
+            Arc::new(AnthropicBridge::new()),
+        );
+        hub.register_family(aisix_core::Adapter::Openai, Arc::new(OpenAiBridge::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = crate::build_router(
+            crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+                .without_cache()
+                .with_usage_sink(UsageSink::new(tx)),
+        );
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "tencent-minimax-m3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100,
+                "stream": true
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut stream = resp.into_body().into_data_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let sse_out = String::from_utf8(bytes).unwrap();
+        let closing = sse_out
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+            .find(|v| v["type"] == "message_delta")
+            .expect("closing message_delta emitted");
+        assert_eq!(closing["usage"]["input_tokens"], 8_274);
+        assert_eq!(closing["usage"]["cache_read_input_tokens"], 60_000);
+        assert_eq!(closing["usage"]["output_tokens"], 497);
+
+        let event = rx.recv().await.expect("usage event was never emitted");
+        assert_eq!(event.prompt_tokens, 68_274);
+        assert_eq!(event.cached_prompt_tokens, 60_000);
+        assert_eq!(event.completion_tokens, 497);
+        assert_eq!(event.cache_read_tokens, 0);
     }
 
     /// (Anthropic inbound) × (DeepSeek upstream).
