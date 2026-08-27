@@ -757,22 +757,14 @@ mod tests {
         let received = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
 
-        // B.6 — exact compiled-in kinds under default features.
+        // B.6 — the compiled-in kinds reach the wire verbatim, in order.
+        // Compared against the crate that owns the list rather than a copy
+        // of it: a second hand-written list here would only freeze whatever
+        // the first one says. What the list must CONTAIN is pinned against
+        // the schema vocabulary in `aisix_guardrails`.
         assert_eq!(
             body["supported_guardrail_kinds"],
-            serde_json::json!([
-                "keyword",
-                "pii",
-                "azure_content_safety",
-                "azure_content_safety_text_moderation",
-                "aliyun_text_moderation",
-                "aliyun_ai_guardrail",
-                "bedrock",
-                "lakera",
-                "openai_moderation",
-                "presidio",
-                "semantic",
-            ]),
+            serde_json::json!(aisix_guardrails::supported_kinds()),
         );
 
         // B.3 — the fetched applied revision.
