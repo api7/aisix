@@ -2002,6 +2002,15 @@ impl Metrics {
     /// same attribution as the emit counter (AISIX-Cloud#1317): a dropped
     /// event is a hole in the usage record, and the operator's question is
     /// whose data is missing, which `reason` alone cannot answer.
+    ///
+    /// "The same attribution" means every dimension [`UsageEventLabels`]
+    /// supplies, `upstream_protocol` included (AISIX-Cloud#1403) — the
+    /// pair is read as `emitted == delivered + dropped`, and a slice of
+    /// that invariant exists only on dimensions BOTH sides carry. The
+    /// protocol is a function of the ProviderKey row `provider_key_id`
+    /// already names, so like `provider_key_name` it adds no series here.
+    /// (`handler` / `status_code` / `inbound_protocol` are the emit
+    /// counter's own arguments, not attribution, and stay one-sided.)
     pub fn record_usage_event_drop(&self, reason: &str, labels: UsageEventLabels<'_>) {
         self.cached_counter(
             M_USAGE_EVENT_DROPS_TOTAL,
@@ -2011,6 +2020,7 @@ impl Metrics {
                 k.label(labels.model);
                 k.label(labels.provider_key_id);
                 k.label(labels.provider_key_name);
+                k.label(labels.upstream_protocol);
             },
             || {
                 metrics::counter!(
@@ -2019,6 +2029,7 @@ impl Metrics {
                     "model" => labels.model.to_string(),
                     "provider_key_id" => labels.provider_key_id.to_string(),
                     "provider_key_name" => labels.provider_key_name.to_string(),
+                    "upstream_protocol" => labels.upstream_protocol.to_string(),
                 )
             },
         );
@@ -4287,24 +4298,57 @@ mod tests {
     /// `emitted == delivered + dropped`. A per-model or per-key slice of
     /// that invariant only exists if BOTH sides carry the same attribution,
     /// which is why `try_emit` hands one label set to both.
+    ///
+    /// Derived, not a list of label names: the drop sample must carry
+    /// everything the emit sample does EXCEPT the three dimensions
+    /// `record_usage_event_emit` takes as its own arguments. So a field
+    /// added to [`UsageEventLabels`] and wired into the emit counter fails
+    /// this test until it reaches the drop counter too — which is how
+    /// `upstream_protocol` reached only one side in the first place
+    /// (AISIX-Cloud#1403).
     #[test]
     fn emits_and_drops_carry_the_same_attribution_labels() {
         let m = Metrics::new(false);
         m.record_usage_event_emit("chat", 200, "openai", PK_A);
         m.record_usage_event_drop("sink_full", PK_A);
         let rendered = m.render();
-        for metric in [M_USAGE_EVENT_EMITS_TOTAL, M_USAGE_EVENT_DROPS_TOTAL] {
+
+        let labels_of = |metric: &str| -> BTreeSet<String> {
             let line = series_lines(&rendered, metric)
                 .pop()
                 .unwrap_or_else(|| panic!("{metric} must render\n{rendered}"));
-            for want in [
-                r#"model="gpt-4o""#,
-                r#"provider_key_id="pk-1""#,
-                r#"provider_key_name="openai-prod""#,
-            ] {
-                assert!(line.contains(want), "{metric} is missing {want}: {line}");
-            }
-        }
+            line.split_once('{')
+                .and_then(|(_, rest)| rest.rsplit_once('}'))
+                .expect("a labelled sample")
+                .0
+                .split(',')
+                .filter_map(|pair| pair.split_once('=').map(|(k, _)| k.to_string()))
+                .collect()
+        };
+        // The emit counter's own arguments — a surface of the emitting
+        // handler, not of the event's attribution.
+        let emit_only: BTreeSet<String> = ["handler", "status_code", "inbound_protocol"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let attribution: BTreeSet<String> = labels_of(M_USAGE_EVENT_EMITS_TOTAL)
+            .difference(&emit_only)
+            .cloned()
+            .collect();
+        assert!(
+            attribution.contains("model") && attribution.contains("provider_key_id"),
+            "the attribution set looks wrong: {attribution:?}"
+        );
+
+        let dropped = labels_of(M_USAGE_EVENT_DROPS_TOTAL);
+        let missing: Vec<&String> = attribution.difference(&dropped).collect();
+        assert!(
+            missing.is_empty(),
+            "the drop counter is missing attribution the emit counter \
+             carries: {missing:?}. Both sides take one `UsageEventLabels`, \
+             so a dimension on only one of them makes that slice of \
+             `emitted == delivered + dropped` unanswerable.",
+        );
     }
 
     #[test]
