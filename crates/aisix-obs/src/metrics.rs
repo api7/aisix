@@ -260,11 +260,15 @@ pub const M_GUARDRAIL_LATENCY_SECONDS: &str = "aisix_guardrail_latency_seconds";
 ///   embeddings / responses / completions / rerank / audio /
 ///   images / messages). Fixed enumeration, low cardinality.
 /// - `status_code`: bucketed as `2xx` / `4xx` / `5xx`.
-/// - `http_status_code`: the raw code (`429`, `502`, ...), so a query can
-///   name one failure mode instead of a whole family (AISIX-Cloud#1389).
-///   It adds no series over `status_code` alone — the raw code determines
-///   the family — and `status_code` is kept so existing dashboards and
-///   alerts written against `status_code="4xx"` keep working unchanged.
+/// - `status`: the raw code (`429`, `502`, ...), so a query can name one
+///   failure mode instead of a whole family (AISIX-Cloud#1389). Named to
+///   match `aisix_proxy_requests_total`'s own raw-code label, so one
+///   spelling works across both families — and deliberately NOT
+///   `http_status_code`, which contains `status_code` as a substring and
+///   would make every `status_code="…"` matcher ambiguous. It adds no
+///   series over `status_code` alone (the raw code determines the family),
+///   and `status_code` is kept so dashboards and alerts written against
+///   `status_code="4xx"` keep working unchanged.
 /// - `user_id`: the org member behind the request, from
 ///   [`UsageEventLabels`].
 /// - `inbound_protocol`: `openai` / `anthropic`. Matches the
@@ -2019,7 +2023,7 @@ impl Metrics {
     /// that invariant exists only on dimensions BOTH sides carry. The
     /// protocol is a function of the ProviderKey row `provider_key_id`
     /// already names, so like `provider_key_name` it adds no series here.
-    /// (`handler` / `status_code` / `http_status_code` / `inbound_protocol`
+    /// (`handler` / `status_code` / `status` / `inbound_protocol`
     /// are the emit counter's own arguments, not attribution, and stay
     /// one-sided — `emitted == delivered + dropped` is an invariant over
     /// the attribution dimensions, which is why `user_id` DOES appear on
@@ -2098,7 +2102,7 @@ impl Metrics {
                     M_USAGE_EVENT_EMITS_TOTAL,
                     "handler" => handler,
                     "status_code" => status_class,
-                    "http_status_code" => status_code.to_string(),
+                    "status" => status_code.to_string(),
                     "inbound_protocol" => inbound_protocol,
                     "upstream_protocol" => labels.upstream_protocol.to_string(),
                     "model" => labels.model.to_string(),
@@ -4379,14 +4383,14 @@ mod tests {
 
         assert!(
             rendered.contains(
-                "handler=\"messages\",status_code=\"2xx\",http_status_code=\"200\",\
+                "handler=\"messages\",status_code=\"2xx\",status=\"200\",\
                  inbound_protocol=\"anthropic\",upstream_protocol=\"openai\""
             ),
             "cross-protocol sample must report the upstream's protocol:\n{rendered}"
         );
         assert!(
             rendered.contains(
-                "handler=\"chat\",status_code=\"4xx\",http_status_code=\"401\",\
+                "handler=\"chat\",status_code=\"4xx\",status=\"401\",\
                  inbound_protocol=\"openai\",upstream_protocol=\"unknown\""
             ),
             "an unresolved upstream must read `unknown`, never borrow the \
@@ -4444,15 +4448,10 @@ mod tests {
         };
         // The emit counter's own arguments — a surface of the emitting
         // handler, not of the event's attribution.
-        let emit_only: BTreeSet<String> = [
-            "handler",
-            "status_code",
-            "http_status_code",
-            "inbound_protocol",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+        let emit_only: BTreeSet<String> = ["handler", "status_code", "status", "inbound_protocol"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         let attribution: BTreeSet<String> = labels_of(M_USAGE_EVENT_EMITS_TOTAL)
             .difference(&emit_only)
             .cloned()

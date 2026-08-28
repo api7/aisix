@@ -1232,7 +1232,7 @@ mod tests {
                 // The raw code sits beside the family, so a query can name
                 // one failure mode without giving up the family rollup.
                 ("status_code", "4xx"),
-                ("http_status_code", "429"),
+                ("status", "429"),
             ],
         );
         let dropped = parse_counter_value(

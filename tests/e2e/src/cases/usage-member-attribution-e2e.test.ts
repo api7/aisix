@@ -270,7 +270,7 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
     expect(
       metricDelta(before, after, "aisix_usage_events_emitted_total", {
         user_id: ALICE,
-        http_status_code: "429",
+        status: "429",
       }),
     ).toBeGreaterThanOrEqual(1);
     // The status family survives beside the raw code, so a dashboard
@@ -285,7 +285,7 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
     expect(
       metricDelta(before, after, "aisix_usage_events_emitted_total", {
         user_id: "unknown",
-        http_status_code: "429",
+        status: "429",
       }),
     ).toBe(0);
   });

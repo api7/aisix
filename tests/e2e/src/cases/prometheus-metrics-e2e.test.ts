@@ -175,10 +175,19 @@ describe("prometheus metrics e2e", () => {
     expect(after).toMatch(
       /aisix_usage_events_emitted_total\{[^}]*inbound_protocol="openai"[^}]*\}/,
     );
-    // Status codes MUST be bucketed (2xx / 4xx / 5xx) — raw "200"
-    // would explode cardinality at ~1000 series per handler×protocol.
+    // `status_code` MUST stay bucketed (2xx / 4xx / 5xx): dashboards and
+    // alerts are written against it, and AISIX-Cloud#1389 added the raw
+    // code as a SEPARATE label rather than redefining this one.
     expect(after).not.toMatch(
       /aisix_usage_events_emitted_total\{[^}]*status_code="200"/,
+    );
+    // …and that separate label is `status`, the same name the request
+    // family gives the raw code. The two live side by side, so a query can
+    // ask for one exact failure mode without giving up the family rollup
+    // (#1389). Deliberately not `http_status_code`: it would contain
+    // `status_code` as a substring and make the assertion above ambiguous.
+    expect(after).toMatch(
+      /aisix_usage_events_emitted_total\{[^}]*[,{]status="200"/,
     );
 
     const afterCount = parseUsageEmittedCount(after, "chat", "2xx", "openai");
