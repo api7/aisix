@@ -710,12 +710,13 @@ async fn an_enforced_surface_reports_the_refusal_it_makes() {
             ));
             continue;
         }
-        // `/a2a` is exempt: its counters are the gateway's own reading of
-        // the words, flagged `usage_estimated` and never charged — they are
-        // filled from the request before the chain even runs.
-        if *surface == "/a2a/:agent" {
-            continue;
-        }
+        // No surface is exempt here, `/a2a` included —
+        // `guardrail_blocked_telemetry` has to exempt it because its
+        // counters are the gateway's own reading of the request text,
+        // filled before the chain runs, and that file's fixtures carry
+        // real text. These are contentless by construction, so zero is
+        // the honest answer on every one of them and an exemption would
+        // protect nothing while hiding a surface that started billing.
         for event in &events {
             if event.prompt_tokens != 0 || event.completion_tokens != 0 {
                 wrong.push(format!(

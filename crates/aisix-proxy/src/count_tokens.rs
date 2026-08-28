@@ -172,6 +172,7 @@ pub async fn count_tokens(
                 &model_name,
                 &api_key_id,
                 status,
+                success.upstream_elapsed,
                 elapsed,
                 &client,
                 &screening,
@@ -343,6 +344,12 @@ struct CountTokensSuccess {
     /// its members, and `UsageEvent::model_id` records that target while
     /// `requested_model` keeps the alias the caller addressed.
     model_id: String,
+    /// How long the WINNING attempt took. Not the handler's own elapsed:
+    /// this route fails over across a group's Anthropic targets and
+    /// retries within one, so on a group the two diverge by every attempt
+    /// that lost — and `upstream_latency_ms` is attempt-scoped everywhere
+    /// else in Logs (`downstream_latency_ms` is the request-scoped one).
+    upstream_elapsed: Duration,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -552,6 +559,7 @@ async fn count_tokens_to_target(
     request_id: &str,
     client: &ClientContext,
 ) -> Result<CountTokensSuccess, ProxyError> {
+    let attempt_started = Instant::now();
     let mut body = body.clone();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
@@ -720,6 +728,7 @@ async fn count_tokens_to_target(
         upstream_model,
         provider_key_id: pk_entry.id.to_string(),
         model_id: model_id.to_string(),
+        upstream_elapsed: attempt_started.elapsed(),
     })
 }
 
@@ -746,6 +755,10 @@ fn emit_usage_event(
     requested_model: &str,
     api_key_id: &str,
     status_code: u16,
+    // Attempt-scoped, from the winning attempt; see `CountTokensSuccess`.
+    upstream_elapsed: Duration,
+    // Request-scoped: what the caller actually waited for, guardrails and
+    // any lost attempts included.
     elapsed: Duration,
     client: &ClientContext,
     screening: &InputScreening,
@@ -756,9 +769,7 @@ fn emit_usage_event(
         model_id: model_id.to_string(),
         api_key_id: api_key_id.to_string(),
         requested_model: requested_model.to_string(),
-        // Single-attempt route: the attempt spans the whole request, so the
-        // upstream figure and what the caller waited for coincide.
-        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        upstream_latency_ms: upstream_elapsed.as_millis().min(u32::MAX as u128) as u32,
         downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "anthropic".to_string(),
@@ -784,8 +795,9 @@ fn emit_usage_event(
         "count_tokens",
         event,
         crate::usage_attr::usage_event_labels(&usage_model, pk),
-        // Nothing to capture: the response body is the token count, and the
-        // request body was already screened by the input hook.
+        // Content capture (#700) is not wired on this route — it is a
+        // separate, per-exporter opt-in capability, and #1435 is about the
+        // event existing at all.
         None,
         client.trace.as_ref(),
         /* terminal */ true,
