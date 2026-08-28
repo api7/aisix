@@ -591,7 +591,7 @@ async fn dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } = verdict
         {
             // Per #153 the matched-pattern detail stays in ops logs only.
@@ -602,10 +602,11 @@ async fn dispatch(
                 "guardrail blocked passthrough-route request",
             );
             return Err(RouteError::of(
-                ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                crate::error::guardrail_block_error(
                     "request",
                     guardrail_name.as_deref(),
-                )),
+                    unavailable.as_deref(),
+                ),
                 &auth,
             ));
         }
@@ -871,7 +872,7 @@ async fn dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } = verdict
         {
             tracing::warn!(
@@ -885,10 +886,11 @@ async fn dispatch(
             // let the shared error path report the 422.
             telemetry.emitted = true;
             return Err(RouteError::of(
-                ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                crate::error::guardrail_block_error(
                     "response",
                     guardrail_name.as_deref(),
-                )),
+                    unavailable.as_deref(),
+                ),
                 &auth,
             ));
         }
@@ -1641,11 +1643,11 @@ fn frame_delta(protocol: PassthroughProtocol, frame: &[u8]) -> (String, Option<P
 }
 
 /// The SSE error frame appended when an output guardrail blocks mid-relay.
-fn guardrail_error_frame(guardrail_name: Option<&str>) -> Bytes {
+fn guardrail_error_frame(guardrail_name: Option<&str>, unavailable: Option<&str>) -> Bytes {
     let payload = serde_json::json!({
         "error": {
             "type": "content_filter",
-            "message": crate::error::guardrail_block_message("response", guardrail_name),
+            "message": crate::error::guardrail_block_message("response", guardrail_name, unavailable),
         }
     });
     Bytes::from(format!("event: error\ndata: {payload}\n\n"))
@@ -1757,7 +1759,7 @@ fn stream_response(
                                 GuardrailVerdict::Block {
                                     reason,
                                     guardrail_name,
-                                    ..
+                                    unavailable,
                                 } => {
                                     tracing::warn!(
                                         guardrail_hook = "output",
@@ -1766,7 +1768,7 @@ fn stream_response(
                                         "guardrail blocked passthrough-route stream (window)",
                                     );
                                     blocked = true;
-                                    yield Ok(guardrail_error_frame(guardrail_name.as_deref()));
+                                    yield Ok(guardrail_error_frame(guardrail_name.as_deref(), unavailable.as_deref()));
                                     break 'outer;
                                 }
                                 _ => {
@@ -1800,7 +1802,7 @@ fn stream_response(
                                     "passthrough-route stream exceeded the guardrail buffer cap (fail-closed)",
                                 );
                                 blocked = true;
-                                yield Ok(guardrail_error_frame(None));
+                                yield Ok(guardrail_error_frame(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
                                 break 'outer;
                             }
                         }
@@ -1835,7 +1837,7 @@ fn stream_response(
                 if let GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
-                ..
+                unavailable,
             } =
                     scan_output(&chain, &route_name, &text, &mut telemetry).await
                 {
@@ -1849,7 +1851,7 @@ fn stream_response(
                     // forwarded under EndOfStreamCheck cannot be unsent —
                     // the error frame is the caller-visible signal either way.
                     pending.clear();
-                    yield Ok(guardrail_error_frame(guardrail_name.as_deref()));
+                    yield Ok(guardrail_error_frame(guardrail_name.as_deref(), unavailable.as_deref()));
                     telemetry.guardrail_blocked = true;
                     telemetry.stream_reached_end = true;
                     telemetry.emit();

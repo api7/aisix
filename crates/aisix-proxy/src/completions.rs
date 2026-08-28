@@ -350,7 +350,7 @@ async fn dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } = verdict
         {
             // Per #153 the matched-pattern detail stays in ops logs only.
@@ -360,8 +360,10 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked /v1/completions request",
             );
-            return Err(ProxyError::ContentFiltered(
-                crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
+            return Err(crate::error::guardrail_block_error(
+                "request",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
             ));
         }
     }
@@ -518,7 +520,7 @@ async fn dispatch(
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                    ..
+                    unavailable,
                 } = verdict
                 {
                     // Per #153 the matched-pattern detail stays in ops logs only.
@@ -535,11 +537,10 @@ async fn dispatch(
                     // under-report spend the customer was charged for. Same
                     // output analog as responses.rs #543 / chat.rs UpstreamCharge.
                     return Ok(CompletionDispatchSuccess {
-                        response: ProxyError::ContentFiltered(
-                            crate::error::guardrail_block_message(
-                                "response",
-                                guardrail_name.as_deref(),
-                            ),
+                        response: crate::error::guardrail_block_error(
+                            "response",
+                            guardrail_name.as_deref(),
+                            unavailable.as_deref(),
                         )
                         .into_response(),
                         provider: provider_label,

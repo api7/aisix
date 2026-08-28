@@ -314,7 +314,7 @@ pub(crate) fn attempt_error_from_proxy(err: &ProxyError) -> (String, String) {
 pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
     match err {
         ProxyError::Bridge(be) => be.reached_upstream(),
-        ProxyError::ContentFiltered(_) => true,
+        ProxyError::ContentFiltered { .. } => true,
         ProxyError::MissingAuth
         | ProxyError::MissingRouteAuthHeader(_)
         | ProxyError::InvalidApiKey
@@ -400,9 +400,10 @@ mod tests {
 
         // Only the output hook can fire inside a dispatch call, so the
         // provider had already answered — the attempt did reach it.
-        assert!(attempt_reached_upstream(&ProxyError::ContentFiltered(
-            "blocked by response guardrail".into()
-        )));
+        assert!(attempt_reached_upstream(&ProxyError::ContentFiltered {
+            message: "blocked by response guardrail".into(),
+            unavailable: None,
+        }));
         // Gateway-side refusals never contacted anyone.
         assert!(!attempt_reached_upstream(&ProxyError::ModelNotFound(
             "nope".into()

@@ -472,7 +472,7 @@ async fn scan_input_blob(
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
-        ..
+        unavailable,
     } = verdict
     {
         tracing::warn!(
@@ -481,8 +481,10 @@ async fn scan_input_blob(
             reason = %reason,
             "guardrail blocked jobs request",
         );
-        return Err(ProxyError::ContentFiltered(
-            crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
+        return Err(crate::error::guardrail_block_error(
+            "request",
+            guardrail_name.as_deref(),
+            unavailable.as_deref(),
         ));
     }
     Ok(())
@@ -525,7 +527,7 @@ async fn scan_output_blob(
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
-        ..
+        unavailable,
     } = verdict
     {
         tracing::warn!(
@@ -534,8 +536,10 @@ async fn scan_output_blob(
             reason = %reason,
             "guardrail blocked jobs response",
         );
-        return Err(ProxyError::ContentFiltered(
-            crate::error::guardrail_block_message("response", guardrail_name.as_deref()),
+        return Err(crate::error::guardrail_block_error(
+            "response",
+            guardrail_name.as_deref(),
+            unavailable.as_deref(),
         ));
     }
     Ok(())

@@ -240,9 +240,14 @@ pub const M_AUTH_DECISIONS_TOTAL: &str = "aisix_auth_decisions_total";
 /// - `phase`: `input` / `output`.
 /// - `result`: `allowed` / `blocked` / `masked` / `bypassed` (remote
 ///   failure + fail-open) / `would_block` / `would_mask` (monitor mode).
-/// - `error_type`: bounded failure tag (e.g. `lakera_timeout`) when
-///   `result="bypassed"`, else `none`. Fail-closed failures surface as
-///   `blocked` (the timeout budget shows up in the latency distribution).
+/// - `error_type`: bounded failure tag (e.g. `lakera_timeout`,
+///   `custom_unknown_action`) whenever the guardrail could not EVALUATE
+///   the content, else `none`. It is populated on `result="bypassed"`
+///   (fail-open) and equally on the `result="blocked"` a fail-CLOSED row
+///   produces for the same cause (AISIX-Cloud#1365) — `result` stays
+///   `blocked` there so a shipped alert on it keeps counting, and
+///   `error_type != "none"` is what separates "this content violated a
+///   policy" from "this guardrail is broken or its provider is down".
 ///
 /// The `_count` series doubles as a per-guardrail execution counter, so
 /// there is no separate `aisix_guardrail_requests_total` (LiteLLM's

@@ -270,7 +270,17 @@ describe("custom script guardrail e2e: operator script screens against its own s
     // a block: the row is a security control, so its failure must not be
     // an open door.
     const before = upstream!.receivedRequests.length;
-    await expectBlocked(`please help with ${OUTAGE_MARKER}`);
+    const caught = await expectBlocked(`please help with ${OUTAGE_MARKER}`);
     expect(upstream!.receivedRequests.length).toBe(before);
+
+    // ...and it must not look like the block above. Same status and the
+    // same `content_filter` type — both really are guardrail refusals —
+    // but the outage says so, in the message and in a machine-readable
+    // code, so an operator is not left debugging a policy that is fine.
+    const err = caught.error as { message?: string; code?: string };
+    expect(err.message).not.toContain("blocked by content policy");
+    expect(err.message).toContain("could not evaluate");
+    expect(err.message).toContain("custom_script_error");
+    expect(err.code).toBe("guardrail_unavailable");
   });
 });

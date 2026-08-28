@@ -55,6 +55,26 @@ shapes, both carrying the same bounded per-kind failure tag and neither
 allowed to carry matched content (#153): an explicitly fail-open row
 emits `Bypass`, a fail-closed row emits `Block { unavailable: Some(tag) }`.
 
+**Carry that tag all the way to the caller.** A fail-closed availability
+block and a content block are the same 422 with the same `error.type`, so
+the tag is the only thing that separates "your policy fired" from "your
+guardrail is broken" — drop it and an operator debugs a policy that is
+fine while their traffic is refused. Every block site in `aisix-proxy`
+therefore builds its message through `error::guardrail_block_message` /
+`guardrail_block_error` and passes the verdict's `unavailable` through;
+the tag also lands on `error.code = "guardrail_unavailable"`, the audit
+hit's `blocked_unavailable`, and the histogram's `error_type`. A refusal
+the proxy raises on a guardrail's behalf (a hold-back cap, a failed mask
+splice) carries one too — see `error::TAG_*`.
+
+**Give each failure cause its own tag.** Tags are what a dashboard shows,
+so collapsing distinct operator mistakes into one catch-all costs the
+operator the diagnosis: `custom_unknown_action` (a word we do not know)
+and `custom_no_verdict` (no decision at all) need different fixes, and
+neither is `custom_script_error` (their service is down). And a verdict
+we cannot read is always a FAILURE, never an Allow — reading silence as
+consent is the open door `fail_open: false` exists to close.
+
 **`enforcement_mode: monitor` is unconditional.** A monitored row never
 blocks, for any reason — not a content match, not a provider outage, not
 a failure policy. Do not add an exception: the value of the mode is that

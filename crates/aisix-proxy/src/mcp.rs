@@ -418,7 +418,7 @@ async fn dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } = verdict
         {
             tracing::warn!(
@@ -444,7 +444,12 @@ async fn dispatch(
                 trace,
                 /* dispatched */ false,
             );
-            return jsonrpc_guardrail_block(rpc_id, "tool call", guardrail_name.as_deref());
+            return jsonrpc_guardrail_block(
+                rpc_id,
+                "tool call",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
+            );
         }
     }
 
@@ -510,7 +515,12 @@ async fn dispatch(
                         trace,
                         /* dispatched */ false,
                     );
-                    return jsonrpc_guardrail_block(rpc_id, "tool call", None);
+                    return jsonrpc_guardrail_block(
+                        rpc_id,
+                        "tool call",
+                        None,
+                        Some(crate::error::TAG_MASK_WRITEBACK_FAILED),
+                    );
                 }
             }
         }
@@ -535,7 +545,10 @@ async fn dispatch(
                     );
                     axum::body::Bytes::from(rewritten)
                 }
-                SegmentPassOutcome::Block(guardrail_name) => {
+                SegmentPassOutcome::Block {
+                    guardrail_name,
+                    unavailable,
+                } => {
                     emit_tool_call_usage(
                         state,
                         &snapshot,
@@ -553,7 +566,12 @@ async fn dispatch(
                         trace,
                         /* dispatched */ false,
                     );
-                    return jsonrpc_guardrail_block(rpc_id, "tool call", guardrail_name.as_deref());
+                    return jsonrpc_guardrail_block(
+                        rpc_id,
+                        "tool call",
+                        guardrail_name.as_deref(),
+                        unavailable.as_deref(),
+                    );
                 }
             }
         }
@@ -629,7 +647,10 @@ async fn dispatch(
         };
         if let Some(chain) = &guardrail_chain {
             match apply_output_guardrails(chain, &resp_bytes, &mcp_tool, &mut monitor_hits).await {
-                ToolResultOutcome::Block(guardrail_name) => {
+                ToolResultOutcome::Block {
+                    guardrail_name,
+                    unavailable,
+                } => {
                     emit_tool_call_usage(
                         state,
                         &snapshot,
@@ -651,6 +672,7 @@ async fn dispatch(
                         rpc_id,
                         "tool result",
                         guardrail_name.as_deref(),
+                        unavailable.as_deref(),
                     );
                 }
                 ToolResultOutcome::Allow(Some((rewritten, counts))) => {
@@ -750,9 +772,15 @@ enum SegmentPassOutcome {
     Keep,
     /// Masked replacements were spliced in.
     Rewritten(Vec<u8>),
-    /// A segment-moderating member blocked; the value is the firing
-    /// guardrail's name (`None` for a fail-closed walk failure).
-    Block(Option<String>),
+    /// A segment-moderating member blocked. Carries the firing
+    /// guardrail's name and, when the refusal was an availability failure
+    /// rather than a content decision, its bounded failure tag — the same
+    /// two the `Block` verdict carries, so the `/mcp` tool result says
+    /// which of the two happened just like every other family does.
+    Block {
+        guardrail_name: Option<String>,
+        unavailable: Option<String>,
+    },
 }
 
 /// Segment pass over the request's `params.arguments` string leaves.
@@ -796,7 +824,10 @@ async fn moderate_selected_segments(
         // Structurally impossible (every caller's body already parsed as
         // JSON) — fail closed rather than let content bypass the pass.
         tracing::warn!(error = %err, "mcp segment collect walk failed; blocking");
-        return SegmentPassOutcome::Block(None);
+        return SegmentPassOutcome::Block {
+            guardrail_name: None,
+            unavailable: Some(crate::error::TAG_UNSCANNABLE_BODY.to_owned()),
+        };
     }
     if texts.is_empty() {
         return SegmentPassOutcome::Keep;
@@ -810,7 +841,7 @@ async fn moderate_selected_segments(
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
-        ..
+        unavailable,
     } = outcome.verdict
     {
         tracing::warn!(
@@ -818,7 +849,10 @@ async fn moderate_selected_segments(
             reason = %reason,
             "guardrail blocked MCP content in the segment pass"
         );
-        return SegmentPassOutcome::Block(guardrail_name);
+        return SegmentPassOutcome::Block {
+            guardrail_name,
+            unavailable,
+        };
     }
     let Some(masked) = outcome.masked else {
         return SegmentPassOutcome::Keep;
@@ -833,7 +867,10 @@ async fn moderate_selected_segments(
             masked = masked.len(),
             "mcp segment mask drifted from the collect walk; blocking"
         );
-        return SegmentPassOutcome::Block(None);
+        return SegmentPassOutcome::Block {
+            guardrail_name: None,
+            unavailable: Some(crate::error::TAG_MASK_WRITEBACK_FAILED.to_owned()),
+        };
     }
     let mut cursor = 0usize;
     match crate::json_splice::rewrite_string_values(body, pred, |t| {
@@ -851,7 +888,10 @@ async fn moderate_selected_segments(
         }
         Err(err) => {
             tracing::warn!(error = %err, "mcp segment mask splice failed; blocking");
-            SegmentPassOutcome::Block(None)
+            SegmentPassOutcome::Block {
+                guardrail_name: None,
+                unavailable: Some(crate::error::TAG_MASK_WRITEBACK_FAILED.to_owned()),
+            }
         }
     }
 }
@@ -881,10 +921,14 @@ fn tool_call_capture(
 
 /// Outcome of the output-hook guardrail pass over an MCP tool result.
 enum ToolResultOutcome {
-    /// Reject the tool result. The inner value is the firing guardrail's
-    /// name, or `None` for a fail-closed block (unparseable body / splice
-    /// failure).
-    Block(Option<String>),
+    /// Reject the tool result. Carries the firing guardrail's name (or
+    /// `None` for a fail-closed block on an unparseable body / splice
+    /// failure) and, when the refusal was an availability failure rather
+    /// than a content decision, its bounded failure tag.
+    Block {
+        guardrail_name: Option<String>,
+        unavailable: Option<String>,
+    },
     /// Release the tool result; `Some` carries the mask-rewritten body
     /// bytes and the per-detector counts.
     Allow(Option<(Vec<u8>, crate::redact::RedactionCounts)>),
@@ -910,7 +954,12 @@ async fn apply_output_guardrails(
     // guardrail — block rather than allow.
     let value: serde_json::Value = match serde_json::from_slice(response_bytes) {
         Ok(value) => value,
-        Err(_) => return ToolResultOutcome::Block(None),
+        Err(_) => {
+            return ToolResultOutcome::Block {
+                guardrail_name: None,
+                unavailable: Some(crate::error::TAG_UNSCANNABLE_BODY.to_owned()),
+            }
+        }
     };
     // A protocol-level error envelope (no `result`) has no tool output to scan.
     let Some(result) = value.get("result") else {
@@ -984,7 +1033,7 @@ async fn apply_output_guardrails(
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
-        ..
+        unavailable,
     } = verdict
     {
         tracing::warn!(
@@ -993,7 +1042,10 @@ async fn apply_output_guardrails(
             reason = %reason,
             "guardrail blocked MCP tool result"
         );
-        return ToolResultOutcome::Block(guardrail_name);
+        return ToolResultOutcome::Block {
+            guardrail_name,
+            unavailable,
+        };
     }
     // Mask write-back over the same surface the scan covers
     // (`tool_result_path`; `name`/`uri` stay untouched — they address a
@@ -1023,7 +1075,10 @@ async fn apply_output_guardrails(
                     error = %err,
                     "mcp output mask splice failed; blocking tool result",
                 );
-                return ToolResultOutcome::Block(None);
+                return ToolResultOutcome::Block {
+                    guardrail_name: None,
+                    unavailable: Some(crate::error::TAG_MASK_WRITEBACK_FAILED.to_owned()),
+                };
             }
         }
     }
@@ -1041,8 +1096,14 @@ async fn apply_output_guardrails(
         {
             SegmentPassOutcome::Keep => {}
             SegmentPassOutcome::Rewritten(bytes) => current = Some(bytes),
-            SegmentPassOutcome::Block(guardrail_name) => {
-                return ToolResultOutcome::Block(guardrail_name)
+            SegmentPassOutcome::Block {
+                guardrail_name,
+                unavailable,
+            } => {
+                return ToolResultOutcome::Block {
+                    guardrail_name,
+                    unavailable,
+                }
             }
         }
     }
@@ -1218,8 +1279,9 @@ fn jsonrpc_guardrail_block(
     id: Option<serde_json::Value>,
     side: &str,
     guardrail_name: Option<&str>,
+    unavailable: Option<&str>,
 ) -> Response {
-    let message = crate::error::guardrail_block_message(side, guardrail_name);
+    let message = crate::error::guardrail_block_message(side, guardrail_name, unavailable);
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id.unwrap_or(serde_json::Value::Null),
@@ -2217,7 +2279,7 @@ mod tests {
         monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
     ) -> Option<Option<String>> {
         match apply_output_guardrails(chain, response_bytes, tool, monitor_hits).await {
-            ToolResultOutcome::Block(name) => Some(name),
+            ToolResultOutcome::Block { guardrail_name, .. } => Some(guardrail_name),
             ToolResultOutcome::Allow(_) => None,
         }
     }
@@ -2266,7 +2328,7 @@ mod tests {
             other => panic!(
                 "expected a rewritten Allow, got {}",
                 match other {
-                    ToolResultOutcome::Block(_) => "Block",
+                    ToolResultOutcome::Block { .. } => "Block",
                     ToolResultOutcome::Allow(None) => "Allow(None)",
                     ToolResultOutcome::Allow(_) => unreachable!(),
                 }
@@ -2384,7 +2446,10 @@ mod tests {
         let body = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"forbidden-token"}]}}"#;
         assert!(matches!(
             apply_output_guardrails(&chain, body, "report", &mut Vec::new()).await,
-            ToolResultOutcome::Block(Some(_)),
+            ToolResultOutcome::Block {
+                guardrail_name: Some(_),
+                ..
+            },
         ));
 
         let hits = chain.enforced_hits();
@@ -2681,6 +2746,7 @@ mod tests {
             Some(serde_json::json!(42)),
             "tool result",
             Some("mcp-output-guard"),
+            None,
         );
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(

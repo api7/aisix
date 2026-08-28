@@ -590,7 +590,7 @@ async fn dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } = verdict
         {
             // Per #153 the matched-pattern detail stays in ops logs only; the
@@ -609,13 +609,12 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked /v1/responses request",
             );
-            return Err(
-                ProxyError::ContentFiltered(crate::error::guardrail_block_message(
-                    "request",
-                    guardrail_name.as_deref(),
-                ))
-                .into(),
-            );
+            return Err(crate::error::guardrail_block_error(
+                "request",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
+            )
+            .into());
         }
         // #932: mask-action PII rules rewrite the Responses body in place
         // AFTER the block check passes — both the verbatim passthrough and
@@ -1316,8 +1315,10 @@ async fn responses_to_target(
                         max_buffer_bytes,
                         "streaming /v1/responses output exceeded buffer cap; failing closed",
                     );
-                    return Err(ProxyError::ContentFiltered(
-                        "response blocked by content policy".into(),
+                    return Err(crate::error::guardrail_block_error(
+                        "response",
+                        None,
+                        Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
                     ));
                 }
                 buf.extend_from_slice(&chunk);
@@ -1349,7 +1350,7 @@ async fn responses_to_target(
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
-                ..
+                unavailable,
             } = verdict
             {
                 // Per #153 the matched-pattern detail stays in ops logs only.
@@ -1359,8 +1360,10 @@ async fn responses_to_target(
                     reason = %reason,
                     "guardrail blocked streaming /v1/responses response",
                 );
-                return Err(ProxyError::ContentFiltered(
-                    crate::error::guardrail_block_message("response", guardrail_name.as_deref()),
+                return Err(crate::error::guardrail_block_error(
+                    "response",
+                    guardrail_name.as_deref(),
+                    unavailable.as_deref(),
                 ));
             }
             // #932: the whole SSE response is held here — mask the frames
@@ -1748,7 +1751,7 @@ async fn responses_to_target(
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
-                ..
+                unavailable,
             } = verdict
             {
                 // Per #153 the matched-pattern detail stays in ops logs only.
@@ -1764,10 +1767,11 @@ async fn responses_to_target(
                 // customer's ledger underreport spend they were charged for.
                 // This is the output analog of chat.rs's UpstreamCharge.
                 return Ok(ResponseDispatchSuccess {
-                    response: ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                    response: crate::error::guardrail_block_error(
                         "response",
                         guardrail_name.as_deref(),
-                    ))
+                        unavailable.as_deref(),
+                    )
                     .into_response(),
                     provider: provider_label,
                     usage,
@@ -2259,7 +2263,7 @@ async fn responses_cross_provider_to_target(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } = verdict
         {
             tracing::warn!(
@@ -2272,10 +2276,11 @@ async fn responses_cross_provider_to_target(
             // carry the billed usage (marked guardrail_blocked) so the
             // ledger doesn't underreport spend.
             return Ok(ResponseDispatchSuccess {
-                response: ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                response: crate::error::guardrail_block_error(
                     "response",
                     guardrail_name.as_deref(),
-                ))
+                    unavailable.as_deref(),
+                )
                 .into_response(),
                 provider: provider_label,
                 usage: Some(usage),

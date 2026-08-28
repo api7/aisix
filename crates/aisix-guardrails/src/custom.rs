@@ -13,11 +13,24 @@
 //! ```
 //!
 //! `ctx` carries `{ hook, text, segments, messages, model, secrets }`. A
-//! verdict is `{ action: "none" }`, `{ action: "block", reason,
-//! reason_code }`, or `{ action: "mask", segments, counts }` where
-//! `segments` is positionally aligned with `ctx.segments`. A hook whose
-//! function the module does not export is an Allow, so one script may
-//! cover one direction.
+//! verdict is `{ action: "none" }` (or the synonym `{ action: "allow" }`),
+//! `{ action: "block", reason, reason_code }`, or `{ action: "mask",
+//! segments, counts }` where `segments` is positionally aligned with
+//! `ctx.segments`. A hook whose function the module does not export is an
+//! Allow, so one script may cover one direction.
+//!
+//! The vocabulary is CLOSED — [`ACTION_VOCABULARY`] is all of it. A hook
+//! that returns anything else, or returns nothing, has not screened the
+//! content, so it is a script FAULT and not a decision: `fail_open`
+//! settles what happens to the request, and the failure is reported as a
+//! fault everywhere an operator looks. It never wears a content block's
+//! clothes — not in the caller's error envelope (which says the guardrail
+//! could not evaluate the request and carries `error.code =
+//! "guardrail_unavailable"`), not in the audit hit (`blocked_unavailable`),
+//! and not in the `error_type` on the latency histogram. An operator
+//! reading any one of those three can tell "my script is broken" from "my
+//! policy is firing", which is the whole point: the two are otherwise the
+//! same 422 and the same universal-block symptom.
 //!
 //! A script can allow, block, OR rewrite. Rewriting rides the same async
 //! segment pass the built-in remote redacting kinds use
@@ -59,7 +72,7 @@
 //!
 //! | Outcome                                | `fail_open` | Verdict                            |
 //! |----------------------------------------|-------------|------------------------------------|
-//! | returns `{action:"none"}`              | n/a         | Allow                              |
+//! | returns `{action:"none"}` / `"allow"`  | n/a         | Allow                              |
 //! | hook function not exported             | n/a         | Allow                              |
 //! | returns `{action:"block"}`             | n/a         | Block { reason }                   |
 //! | returns `{action:"mask"}`              | n/a         | Allow with rewritten segments      |
@@ -67,9 +80,11 @@
 //! | `mask` with a mismatched slot count    | true        | Bypass { "custom_bad_verdict" }    |
 //! | wall-clock budget elapsed              | true        | Bypass { "custom_timeout" }        |
 //! | script threw                           | true        | Bypass { "custom_script_error" }   |
+//! | returned an action outside the vocabulary | true     | Bypass { "custom_unknown_action" } |
+//! | returned nothing / no `action` field   | true        | Bypass { "custom_no_verdict" }     |
 //! | returned a shape that is not a verdict | true        | Bypass { "custom_bad_verdict" }    |
 //! | engine could not start                 | true        | Bypass { "custom_engine_error" }   |
-//! | any failure                            | false       | Block { "custom script unavailable …" } |
+//! | any failure                            | false       | Block { unavailable: <that tag> }  |
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -85,6 +100,14 @@ use crate::{Guardrail, GuardrailVerdict, SegmentsOutcome, StreamOutputPolicy};
 /// Module name the script is compiled under. Shows up in the JS stack trace
 /// a thrown error carries, so keep it recognisable to the operator.
 const MODULE_NAME: &str = "guardrail.js";
+
+/// The complete set of `action` values a verdict may carry, as one string.
+///
+/// It rides every diagnostic a verdict mistake produces, because the whole
+/// failure mode is an operator who does not know what the vocabulary is:
+/// a log line that says "unknown action" and stops has told them their
+/// script is wrong without telling them what right looks like.
+const ACTION_VOCABULARY: &str = "none | allow | block | mask";
 
 /// Share of the sandbox heap one fetch body may occupy. A body has to fit
 /// alongside the host JSON that carries it, the `JSON.parse` result, and
@@ -426,9 +449,12 @@ impl CustomGuardrail {
                     None => {
                         tracing::warn!(
                             row = %row_name,
-                            "custom guardrail returned undefined instead of a verdict",
+                            expected = ACTION_VOCABULARY,
+                            "custom guardrail hook returned nothing instead of a verdict; \
+                             the request is NOT screened and will be refused unless \
+                             fail_open is set",
                         );
-                        Err(ScriptFailure::BadVerdict)
+                        Err(ScriptFailure::NoVerdict)
                     }
                 }
             })
@@ -442,16 +468,18 @@ impl CustomGuardrail {
 
     /// Translate the script's return value into an outcome.
     fn parse_verdict(&self, json: &str) -> Result<ScriptOutcome, ScriptFailure> {
-        let parsed: ScriptVerdict = serde_json::from_str(json).map_err(|e| {
-            tracing::warn!(
-                row = %self.row_name,
-                error = %e,
-                "custom guardrail returned a value that is not a verdict object",
-            );
-            ScriptFailure::BadVerdict
-        })?;
+        let parsed: ScriptVerdict = match serde_json::from_str(json) {
+            Ok(parsed) => parsed,
+            Err(e) => return Err(self.malformed_verdict(json, &e)),
+        };
         match parsed.action.as_str() {
-            "none" => Ok(ScriptOutcome::Allow),
+            // `none` is the original spelling and `allow` the word most
+            // operators reach for first; both mean the same decision, and
+            // refusing one of them buys nothing but a support ticket. The
+            // vocabulary stays CLOSED at these four — an open-ended synonym
+            // list can never be complete, so anything else is reported as
+            // the authoring mistake it is rather than silently guessed at.
+            "none" | "allow" => Ok(ScriptOutcome::Allow),
             "block" => {
                 // Both fields are operator-authored and land in ops logs
                 // only — `Block.reason` never reaches the wire envelope
@@ -471,7 +499,8 @@ impl CustomGuardrail {
                 let Some(segments) = parsed.segments else {
                     tracing::warn!(
                         row = %self.row_name,
-                        "custom guardrail asked to mask without returning segments",
+                        "custom guardrail asked to mask without returning segments; the \
+                         request is NOT screened and will be refused unless fail_open is set",
                     );
                     return Err(ScriptFailure::BadVerdict);
                 };
@@ -484,11 +513,45 @@ impl CustomGuardrail {
                 tracing::warn!(
                     row = %self.row_name,
                     action = %other,
-                    "custom guardrail returned an unknown action",
+                    expected = ACTION_VOCABULARY,
+                    "custom guardrail returned an unknown action; the request is NOT \
+                     screened and will be refused unless fail_open is set",
                 );
-                Err(ScriptFailure::BadVerdict)
+                Err(ScriptFailure::UnknownAction)
             }
         }
+    }
+
+    /// Classify a return value `serde` could not read as a verdict.
+    ///
+    /// "Decided nothing" and "returned a shape that is not a verdict" are
+    /// different authoring mistakes with different fixes, so they get
+    /// different tags — `{}` / `null` is a script that fell off a path,
+    /// while `"block"` / `42` is a script written against the wrong
+    /// contract. Both stay failures: a hook that did not state a decision
+    /// has not screened the content, and reading silence as consent is
+    /// exactly the open door `fail_open: false` exists to close.
+    fn malformed_verdict(&self, json: &str, err: &serde_json::Error) -> ScriptFailure {
+        let value: Option<serde_json::Value> = serde_json::from_str(json).ok();
+        let (failure, detail) = match &value {
+            None | Some(serde_json::Value::Null) => (ScriptFailure::NoVerdict, "no value"),
+            Some(serde_json::Value::Object(map)) if !map.contains_key("action") => {
+                (ScriptFailure::NoVerdict, "object without an `action` field")
+            }
+            Some(serde_json::Value::Object(_)) => {
+                (ScriptFailure::BadVerdict, "`action` is not a string")
+            }
+            Some(_) => (ScriptFailure::BadVerdict, "not an object"),
+        };
+        tracing::warn!(
+            row = %self.row_name,
+            error = %err,
+            detail = detail,
+            expected = ACTION_VOCABULARY,
+            "custom guardrail returned a value that is not a verdict object; the \
+             request is NOT screened and will be refused unless fail_open is set",
+        );
+        failure
     }
 
     fn handle_failure(&self, failure: ScriptFailure, fail_open: bool) -> GuardrailVerdict {
@@ -1116,15 +1179,34 @@ enum ScriptOutcome {
 }
 
 /// Failure cause buckets. `bypass_tag()` maps to the strings stored in
-/// `usage_events.guardrail_bypassed_reason` — changing them is a breaking
-/// change for operators who filter on these values.
+/// `usage_events.guardrail_bypassed_reason`, the `error_type` label on
+/// `aisix_guardrail_latency_seconds`, and — since AISIX-Cloud#1365 — the
+/// `error_type` of a fail-closed `blocked_unavailable` audit hit. Changing
+/// them is a breaking change for operators who filter on these values.
+///
+/// The three script-authoring mistakes are separate buckets on purpose.
+/// They collapse to one caller-facing outcome (fail-closed refusal), so
+/// the tag is the only thing that tells an operator watching a dashboard
+/// WHICH mistake their script is making — "you returned an action I do not
+/// know" and "you returned nothing at all" need different fixes, and
+/// neither is "your screening service is down".
 #[derive(Debug)]
 enum ScriptFailure {
     /// The wall-clock budget elapsed, or the interrupt handler fired.
     Timeout,
     /// The script raised, or the module body did.
     Threw,
-    /// The script returned something that is not a verdict object.
+    /// The hook stated a decision, but not one this kind understands —
+    /// `{action: "permit"}`. Almost always a vocabulary slip.
+    UnknownAction,
+    /// The hook stated no decision at all: no `return`, `undefined`,
+    /// `null`, or an object with no `action` field. Distinct from
+    /// [`Self::UnknownAction`] because the fix is different — the script
+    /// fell off an unhandled path rather than typing the wrong word.
+    NoVerdict,
+    /// The hook returned something that is not a verdict object at all (a
+    /// string, a number, an array), or a verdict this kind cannot carry
+    /// out (a `mask` with no segments, or the wrong number of them).
     BadVerdict,
     /// The engine could not be started, or the host surface not installed.
     Engine,
@@ -1135,6 +1217,8 @@ impl ScriptFailure {
         match self {
             Self::Timeout => "custom_timeout",
             Self::Threw => "custom_script_error",
+            Self::UnknownAction => "custom_unknown_action",
+            Self::NoVerdict => "custom_no_verdict",
             Self::BadVerdict => "custom_bad_verdict",
             Self::Engine => "custom_engine_error",
         }
@@ -1280,7 +1364,92 @@ mod tests {
         let GuardrailVerdict::Block { unavailable, .. } = verdict else {
             panic!("expected Block, got {verdict:?}");
         };
-        assert_eq!(unavailable.as_deref(), Some("custom_bad_verdict"));
+        // Its own tag, not the catch-all: the operator's mistake is a word,
+        // and the tag is what tells them so from a dashboard.
+        assert_eq!(unavailable.as_deref(), Some("custom_unknown_action"));
+    }
+
+    #[tokio::test]
+    async fn allow_is_accepted_as_a_synonym_of_none() {
+        // The word an operator reaches for first. It used to land in the
+        // unknown-action arm, which — under the fail-closed default — meant
+        // a one-word slip refused EVERY request with the same 422 a
+        // correctly-firing policy produces.
+        let cfg = config("export function checkInput() { return { action: 'allow' }; }");
+        let verdict = guardrail(&cfg, false).check_input(&request("hello")).await;
+        assert!(
+            matches!(verdict, GuardrailVerdict::Allow),
+            "expected Allow, got {verdict:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_action_vocabulary_stays_closed() {
+        // `allow` is a synonym, not the start of a synonym list: anything
+        // else is still reported as the authoring mistake it is, rather
+        // than guessed at.
+        for word in ["pass", "ok", "permit", "deny", "reject", "safe"] {
+            let cfg = config(&format!(
+                "export function checkInput() {{ return {{ action: '{word}' }}; }}"
+            ));
+            let verdict = guardrail(&cfg, false).check_input(&request("hello")).await;
+            let GuardrailVerdict::Block { unavailable, .. } = verdict else {
+                panic!("expected Block for {word}, got {verdict:?}");
+            };
+            assert_eq!(
+                unavailable.as_deref(),
+                Some("custom_unknown_action"),
+                "{word}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hook_that_decides_nothing_is_its_own_failure_mode() {
+        // All four are "the script stated no decision", which is a
+        // different fix from "the script typed the wrong word" — so it is
+        // a different tag, even though both refuse the request.
+        for body in [
+            "return;",
+            "",
+            "return null;",
+            "return {};",
+            "return { reason: 'oops' };",
+        ] {
+            let cfg = config(&format!("export function checkInput() {{ {body} }}"));
+            let verdict = guardrail(&cfg, false).check_input(&request("hello")).await;
+            let GuardrailVerdict::Block { unavailable, .. } = verdict else {
+                panic!("expected Block for {body:?}, got {verdict:?}");
+            };
+            assert_eq!(
+                unavailable.as_deref(),
+                Some("custom_no_verdict"),
+                "{body:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_script_fault_still_fails_closed_and_never_reads_as_an_allow() {
+        // The fix is about how the refusal is REPORTED, not about whether
+        // it happens: a hook that produced no usable verdict has screened
+        // nothing, and reading that as consent is the open door
+        // `fail_open: false` exists to close.
+        for body in ["return { action: 'allowed' };", "return;", "return 'none';"] {
+            let cfg = config(&format!("export function checkInput() {{ {body} }}"));
+            let verdict = guardrail(&cfg, false).check_input(&request("hello")).await;
+            assert!(
+                matches!(verdict, GuardrailVerdict::Block { .. }),
+                "{body:?} must refuse, got {verdict:?}"
+            );
+            // ...and it is still a fail-OPEN row's decision to let it pass,
+            // reported as a bypass rather than as an allow.
+            let verdict = guardrail(&cfg, true).check_input(&request("hello")).await;
+            assert!(
+                matches!(verdict, GuardrailVerdict::Bypass { .. }),
+                "{body:?} must bypass when fail_open, got {verdict:?}"
+            );
+        }
     }
 
     #[tokio::test]

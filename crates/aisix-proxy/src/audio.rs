@@ -933,7 +933,7 @@ async fn multipart_dispatch(
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
-                ..
+                unavailable,
             } = verdict
             {
                 // Per #153 the matched-pattern detail stays in ops logs only.
@@ -943,8 +943,10 @@ async fn multipart_dispatch(
                     reason = %reason,
                     "guardrail blocked audio request (prompt field)",
                 );
-                return Err(ProxyError::ContentFiltered(
-                    crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
+                return Err(crate::error::guardrail_block_error(
+                    "request",
+                    guardrail_name.as_deref(),
+                    unavailable.as_deref(),
                 ));
             }
         }
@@ -1432,7 +1434,7 @@ async fn multipart_dispatch(
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
-                ..
+                unavailable,
             } = verdict
             {
                 // Per #153 the matched-pattern detail stays in ops logs only.
@@ -1444,10 +1446,11 @@ async fn multipart_dispatch(
                 );
                 return Ok(AudioDispatchSuccess {
                     usage_handled_by_stream: false,
-                    response: ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                    response: crate::error::guardrail_block_error(
                         "response",
                         guardrail_name.as_deref(),
-                    ))
+                        unavailable.as_deref(),
+                    )
                     .into_response(),
                     model_name,
                     provider: provider_label,
@@ -1617,7 +1620,7 @@ async fn speech_dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } = verdict
         {
             // Per #153 the matched-pattern detail stays in ops logs only.
@@ -1627,8 +1630,10 @@ async fn speech_dispatch(
                 reason = %reason,
                 "guardrail blocked /v1/audio/speech request",
             );
-            return Err(ProxyError::ContentFiltered(
-                crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
+            return Err(crate::error::guardrail_block_error(
+                "request",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
             ));
         }
     }
