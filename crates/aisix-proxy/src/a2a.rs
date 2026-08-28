@@ -13,7 +13,14 @@
 //! control (the key's `allowed_agents`), rate-limit + budget (`quota::enforce`),
 //! and a usage event into the shared sink. The upstream credential is held
 //! gateway-side and never reaches the caller. Guardrails over A2A message
-//! content are a later step.
+//! content run on the INPUT hook: the caller's message text is screened
+//! before the agent is contacted, on the same env / api-key / team scopes
+//! an LLM request resolves. `/a2a` carries no model or MCP-server id, so a
+//! guardrail attached to one of those scopes does not apply here (the
+//! attachment schema says as much) — an env-wide DLP rule does. The OUTPUT
+//! hook is not wired: an A2A answer arrives as artifacts and status updates
+//! across a stream that may run for hours, and moderating it needs the
+//! streamed-output machinery the LLM surfaces have, not a one-shot check.
 //!
 //! The request body is forwarded verbatim to the upstream agent, so the caller
 //! speaks whichever A2A wire version the agent is pinned to; the gateway does
@@ -271,6 +278,27 @@ async fn dispatch(
     // Read before the upstream is contacted, so a call that never lands still
     // records which task the caller was asking about.
     call.facts.observe_request(&value);
+
+    // Input guardrails. Before the reservation, like every other surface
+    // (#542): a content-policy refusal must not burn an RPM slot. This
+    // endpoint used to run no chain at all, so an operator's env-wide
+    // policy was a no-op the moment a caller switched from `/v1/*` to
+    // `/a2a/*` with the same key.
+    if let Some(response) = guardrail_block_response(
+        state,
+        &snapshot,
+        &auth,
+        request_id,
+        agent,
+        &call,
+        &value,
+        rpc_id.clone(),
+        trace.as_ref(),
+    )
+    .await
+    {
+        return response;
+    }
 
     // Reuse the LLM path's rate-limit + budget gate. The reservation is held
     // for the call and released without committing tokens: the counts this
@@ -677,6 +705,84 @@ fn a2a_error_status(err: &A2aError) -> StatusCode {
     match err {
         A2aError::Connect(_) | A2aError::Request(_) => StatusCode::BAD_GATEWAY,
     }
+}
+
+/// Screen the caller's A2A message text on the input hook. `Some(response)`
+/// = blocked, and the blocked call is recorded as an undispatched usage
+/// event the way a quota refusal is.
+///
+/// The scanned text is `params.message` — the only caller-authored content
+/// the protocol carries — extracted with the same walker telemetry uses, but
+/// uncapped: the telemetry cap exists to bound a metric, and scanning a
+/// prefix would leave the tail of a long message unscreened. The body is
+/// already bounded by `request_body_limit_bytes`.
+///
+/// Operations that carry no message (`tasks/get`, `tasks/cancel`) still run
+/// the chain on empty text. That is the point: a guardrail that decides
+/// about the CALL rather than about its words must get to decide.
+#[allow(clippy::too_many_arguments)]
+async fn guardrail_block_response(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    request_id: &str,
+    agent: &str,
+    call: &A2aCall,
+    value: &serde_json::Value,
+    rpc_id: Option<serde_json::Value>,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+) -> Option<Response> {
+    let chain = state
+        .guardrail_index
+        .resolve(&aisix_guardrails::RequestContext {
+            passthrough_route_id: "",
+            model_id: "",
+            mcp_server_id: "",
+            api_key_id: &auth.entry.id,
+            team_id: auth.key().team_id.as_deref(),
+        });
+    if chain.is_empty() {
+        return None;
+    }
+    let text = request_text(value, |buf, s| buf.push_str(s));
+    let chat = aisix_gateway::ChatFormat::new(
+        A2A_MODEL_LABEL,
+        vec![aisix_gateway::ChatMessage::user(text)],
+    );
+    let (verdict, _hits) = aisix_guardrails::Guardrail::check_input_observed(&chain, &chat).await;
+    let aisix_guardrails::GuardrailVerdict::Block {
+        reason,
+        guardrail_name,
+        unavailable,
+    } = verdict
+    else {
+        return None;
+    };
+    tracing::warn!(
+        guardrail_hook = "input",
+        agent = %agent,
+        reason = %reason,
+        "guardrail blocked A2A request",
+    );
+    let message = crate::error::guardrail_block_message(
+        "request",
+        guardrail_name.as_deref(),
+        unavailable.as_deref(),
+    );
+    let response = a2a_error_response(rpc_id, StatusCode::UNPROCESSABLE_ENTITY, &message);
+    emit_a2a_usage(
+        state,
+        snapshot,
+        auth,
+        request_id,
+        agent,
+        call,
+        response.status().as_u16(),
+        Duration::ZERO,
+        trace,
+        /* dispatched */ false,
+    );
+    Some(response)
 }
 
 /// Build a JSON-RPC error envelope for a gateway-side failure, echoing the

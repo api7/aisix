@@ -334,7 +334,14 @@ async fn dispatch(
             .filter(|s| !s.is_empty())
             .map(|s| ChatMessage::user(s.to_string()))
             .collect();
-        if !prompt_messages.is_empty() {
+        // The chain runs whether or not a `prompt` part was supplied.
+        // Gating on "we found text" made the check a text matcher's
+        // privilege: a guardrail that decides about the CALL — a policy
+        // script, an unconditional block scoped to this model — never
+        // fired on the ordinary shape of this endpoint (an edit with no `prompt` part),
+        // so an operator's rule silently allowed exactly the requests
+        // that carry nothing to match.
+        {
             let chat = aisix_gateway::ChatFormat::new(&model_name, prompt_messages);
             let (verdict, hits) =
                 aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;

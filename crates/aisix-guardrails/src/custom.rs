@@ -610,9 +610,14 @@ impl Guardrail for CustomGuardrail {
             })
             .filter(|m| !m.text.is_empty())
             .collect();
-        if messages.is_empty() {
-            return GuardrailVerdict::Allow;
-        }
+        // No early return when there is nothing to scan. A script is a
+        // policy over the CALL, not a text matcher: `checkInput` may block
+        // on `ctx.model`, on a secret-backed lookup, or unconditionally,
+        // and an operator who wrote such a rule expects it to decide a
+        // request that happens to carry no text (an argument-less MCP tool
+        // call, a transcription with no `prompt`). Running a local sandbox
+        // on an empty context is cheap; the remote kinds keep their own
+        // empty-text guards, so this costs no provider round-trip.
         let segments: Vec<String> = messages.iter().map(|m| m.text.clone()).collect();
         let text = segments.join("\n");
         let ctx = ScriptContext {
@@ -635,9 +640,12 @@ impl Guardrail for CustomGuardrail {
             return GuardrailVerdict::Allow;
         }
         let text = resp.guardrail_output_text();
-        if text.is_empty() {
-            return GuardrailVerdict::Allow;
-        }
+        // Same rule as `check_input`: an empty response still gets a
+        // verdict. This hook is reached once per response by the call
+        // sites that use the plain `check_output` fold (jobs, passthrough,
+        // realtime frames) — the LLM and streaming families route a
+        // segment moderator through `moderate_output_segments` instead —
+        // so it adds at most one sandbox run to a response with no text.
         let messages = [ScriptMessage {
             role: aisix_gateway::Role::Assistant,
             text: text.clone(),
@@ -1315,6 +1323,72 @@ mod tests {
         assert!(
             unavailable.is_none(),
             "a content decision is not an availability failure",
+        );
+    }
+
+    /// A script's verdict is a decision about the CALL, not a text match,
+    /// so it must be consulted even when the request carries nothing to
+    /// scan. This is the bug that let an MCP `tools/call` with
+    /// `"arguments": {}` — and an audio upload with no `prompt` — execute
+    /// under an unconditional block rule.
+    #[tokio::test]
+    async fn empty_input_still_reaches_the_script() {
+        let cfg = config("export function checkInput() { return { action: 'block' }; }");
+        let g = guardrail(&cfg, false);
+        for req in [
+            request(""),
+            ChatFormat::new("gpt-4o", vec![]),
+            ChatFormat::new("gpt-4o", vec![ChatMessage::user(""), ChatMessage::user("")]),
+        ] {
+            let verdict = g.check_input(&req).await;
+            assert!(
+                matches!(verdict, GuardrailVerdict::Block { .. }),
+                "an unconditional block must fire with no text to scan: {verdict:?}",
+            );
+        }
+    }
+
+    /// The segment hook — the path the MCP and LLM families take for a
+    /// segment-moderating member — has the same obligation with zero slots.
+    #[tokio::test]
+    async fn empty_segment_list_still_reaches_the_script() {
+        let cfg = config("export function checkInput() { return { action: 'block' }; }");
+        let outcome = guardrail(&cfg, false).moderate_input_segments(&[]).await;
+        assert!(
+            matches!(outcome.verdict, GuardrailVerdict::Block { .. }),
+            "{:?}",
+            outcome.verdict,
+        );
+    }
+
+    /// The other half of the same rule: a script that DOES look at the text
+    /// must still see an empty context as a clean one, so removing the
+    /// short-circuit cannot turn "no text" into a spurious block.
+    #[tokio::test]
+    async fn empty_input_allows_a_text_matching_script() {
+        let cfg = config(
+            "export function checkInput(ctx) {
+               return ctx.text.includes('bomb') ? { action: 'block' } : { action: 'none' };
+             }",
+        );
+        let verdict = guardrail(&cfg, false).check_input(&request("")).await;
+        assert!(matches!(verdict, GuardrailVerdict::Allow), "{verdict:?}");
+    }
+
+    #[tokio::test]
+    async fn empty_output_still_reaches_the_script() {
+        let cfg = config("export function checkOutput() { return { action: 'block' }; }");
+        let resp = aisix_gateway::ChatResponse {
+            id: String::new(),
+            model: "gpt-4o".into(),
+            message: aisix_gateway::ChatMessage::assistant(String::new()),
+            finish_reason: aisix_gateway::FinishReason::Stop,
+            usage: aisix_gateway::UsageStats::default(),
+        };
+        let verdict = guardrail(&cfg, false).check_output(&resp).await;
+        assert!(
+            matches!(verdict, GuardrailVerdict::Block { .. }),
+            "{verdict:?}",
         );
     }
 

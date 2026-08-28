@@ -42,6 +42,8 @@ mod embeddings;
 mod ensemble;
 mod error;
 mod error_translate;
+#[cfg(test)]
+mod guardrail_coverage;
 mod guardrail_embedder;
 mod guardrail_stream;
 pub mod health;

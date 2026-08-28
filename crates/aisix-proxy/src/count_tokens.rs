@@ -13,16 +13,24 @@
 //! (`/messages/count_tokens`), the absence of streaming, and the tiny
 //! `{"input_tokens": <int>}` response, which is forwarded verbatim.
 //!
-//! Guardrails: this surface is intentionally **exempt** from the
-//! content-moderation guardrail chain (#545). It is a pre-flight sizing
-//! call — no content reaches a model and the response is only an integer
-//! token count, never generated content — so there is nothing for a
-//! content-moderation hook to moderate on either side, and the same
-//! `messages` payload is scanned when the caller issues the actual
-//! `/v1/messages` request. (A DLP/egress policy is a separate concern: the
-//! `messages` are forwarded to the provider's count endpoint here before the
-//! real call, so a DLP guardrail attached at env-scope would not see them —
-//! tracked in #555, out of scope for #545.)
+//! Guardrails: the **input** hook runs here, exactly as on `/v1/messages`;
+//! the **output** hook does not (#555, revising #545).
+//!
+//! The two halves are asymmetric because the endpoint is. The response is
+//! `{"input_tokens": <int>}` — the provider generated nothing, so an output
+//! guardrail has no content to moderate and running one would be theatre.
+//! The REQUEST is a different matter: this route ships the caller's entire
+//! `system` + `messages` + `tools` payload to the provider, which is
+//! precisely the transmission a PII / DLP / data-exfiltration guardrail
+//! exists to govern. The original exemption argued the same payload gets
+//! scanned when the caller issues the real `/v1/messages` call — but nothing
+//! obliges a caller to ever issue it. `count_tokens` on its own is a
+//! complete egress channel, and an operator's input policy was silently not
+//! applied to it.
+//!
+//! Mask-action rules rewrite the body here too, before it is forwarded. That
+//! also keeps the answer honest: `/v1/messages` masks the same spans, so the
+//! count now describes the body the gateway would really send.
 //!
 //! Scope: Anthropic-backed models only. `count_tokens` has no upstream
 //! equivalent for OpenAI/Gemini/DeepSeek, so a non-Anthropic Model is
@@ -70,7 +78,7 @@ pub async fn count_tokens(
         Err(e) => return e.into_anthropic_response(),
     };
     let started = Instant::now();
-    let Json(body) = match body {
+    let Json(mut body) = match body {
         Ok(j) => j,
         // Answer through `reject` — see messages.rs.
         Err(rej) => {
@@ -99,7 +107,7 @@ pub async fn count_tokens(
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
 
-    match dispatch(&state, &snapshot, &auth, &body, &request_id, &client).await {
+    match dispatch(&state, &snapshot, &auth, &mut body, &request_id, &client).await {
         Ok(success) => {
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
@@ -164,6 +172,91 @@ pub async fn count_tokens(
     }
 }
 
+/// Run the resolved input guardrail chain over the Anthropic-shaped body,
+/// blocking before dispatch and writing mask-action rewrites back into
+/// `body` (which is what `count_tokens_to_target` forwards upstream).
+///
+/// Deliberately mirrors `messages::dispatch_inner`'s block rather than
+/// sharing a helper with it: that one also threads applied-guardrail,
+/// audit and monitor-hit telemetry into a UsageEvent, and this route emits
+/// none (see [`CountTokensSuccess`]). Keeping the shapes parallel is what
+/// the `guardrail_coverage` census asserts.
+async fn screen_input(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    model_entry_id: &str,
+    model_name: &str,
+    body: &mut Value,
+) -> Result<(), ProxyError> {
+    let chain = state
+        .guardrail_index
+        .resolve(&aisix_guardrails::RequestContext {
+            passthrough_route_id: "",
+            model_id: model_entry_id,
+            mcp_server_id: "",
+            api_key_id: &auth.entry.id,
+            team_id: auth.key().team_id.as_deref(),
+        });
+    if chain.is_empty() {
+        return Ok(());
+    }
+    // Fail closed on a body the scanner cannot read — see the same arm in
+    // `messages.rs`.
+    let chat = match aisix_provider_anthropic::parse_inbound_request(body) {
+        Ok(chat) => chat,
+        Err(err) => {
+            tracing::warn!(
+                guardrail_hook = "input",
+                model = %model_name,
+                error = %err,
+                "cannot scan /v1/messages/count_tokens body for guardrails; blocking",
+            );
+            return Err(crate::error::guardrail_block_error(
+                "request",
+                None,
+                Some(crate::error::TAG_UNSCANNABLE_BODY),
+            ));
+        }
+    };
+    // Monitor-mode hits and redaction counts are collected and dropped:
+    // this route emits no UsageEvent (see [`CountTokensSuccess`]), so there
+    // is nothing to attach them to. Both are out-params of the shared
+    // helpers rather than optional, hence the sinks.
+    let (verdict, _monitor_hits) =
+        aisix_guardrails::Guardrail::check_input_non_segment_observed(&chain, &chat).await;
+    let mut counts = crate::redact::RedactionCounts::new();
+    let verdict = crate::redact::moderate_body(
+        &chain,
+        crate::redact::Direction::Input,
+        verdict,
+        &mut counts,
+        &mut Vec::new(),
+        |g| crate::redact::redact_anthropic_request(g, body),
+    )
+    .await;
+    if let aisix_guardrails::GuardrailVerdict::Block {
+        reason,
+        guardrail_name,
+        unavailable,
+    } = verdict
+    {
+        tracing::warn!(
+            guardrail_hook = "input",
+            model = %model_name,
+            reason = %reason,
+            "guardrail blocked /v1/messages/count_tokens request",
+        );
+        return Err(crate::error::guardrail_block_error(
+            "request",
+            guardrail_name.as_deref(),
+            unavailable.as_deref(),
+        ));
+    }
+    // Mask-action rules rewrite the body that is about to be forwarded.
+    crate::redact::redact_anthropic_request(&chain, body);
+    Ok(())
+}
+
 /// What the winning attempt resolved. `/v1/messages/count_tokens` emits no
 /// UsageEvent, so the only consumer is the request-metric label set — which
 /// still has to match what chat / messages / responses report
@@ -179,7 +272,7 @@ async fn dispatch(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
-    body: &Value,
+    body: &mut Value,
     request_id: &str,
     client: &ClientContext,
 ) -> Result<CountTokensSuccess, ProxyError> {
@@ -198,6 +291,12 @@ async fn dispatch(
 
     // Client-IP allowlist gate (#557): reject before quota / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client.source_ip)?;
+
+    // Input guardrails (#555). Same chain, same order and same ordering
+    // rationale as the `/v1/messages` sibling: before the reservation, so a
+    // content-policy refusal doesn't burn an RPM slot. See the module doc
+    // for why the input hook applies here and the output hook does not.
+    screen_input(state, auth, &model_entry.id, &model_name, body).await?;
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
