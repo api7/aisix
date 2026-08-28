@@ -2079,14 +2079,13 @@ impl Metrics {
         labels: UsageEventLabels<'_>,
     ) {
         let status_class = status_bucket(status_code);
-        let http_status_code = status_code.to_string();
         self.cached_counter(
             M_USAGE_EVENT_EMITS_TOTAL,
             1,
             |k| {
                 k.label(handler);
                 k.label(status_class);
-                k.label(&http_status_code);
+                k.label_u16(status_code);
                 k.label(inbound_protocol);
                 k.label(labels.model);
                 k.label(labels.provider_key_id);
@@ -2099,7 +2098,7 @@ impl Metrics {
                     M_USAGE_EVENT_EMITS_TOTAL,
                     "handler" => handler,
                     "status_code" => status_class,
-                    "http_status_code" => http_status_code.clone(),
+                    "http_status_code" => status_code.to_string(),
                     "inbound_protocol" => inbound_protocol,
                     "upstream_protocol" => labels.upstream_protocol.to_string(),
                     "model" => labels.model.to_string(),
