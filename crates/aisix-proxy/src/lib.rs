@@ -43,6 +43,8 @@ mod ensemble;
 mod error;
 mod error_translate;
 #[cfg(test)]
+mod guardrail_blocked_telemetry;
+#[cfg(test)]
 mod guardrail_coverage;
 mod guardrail_embedder;
 mod guardrail_stream;

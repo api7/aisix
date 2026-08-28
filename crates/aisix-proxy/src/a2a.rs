@@ -323,6 +323,9 @@ async fn dispatch(
                 Duration::ZERO,
                 trace.as_ref(),
                 /* dispatched */ false,
+                // A quota refusal is not a guardrail decision.
+                /* guardrail_blocked */
+                false,
             );
             return response;
         }
@@ -370,6 +373,7 @@ async fn dispatch(
                 latency,
                 trace.as_ref(),
                 /* dispatched */ true,
+                /* guardrail_blocked */ false,
             );
             axum::Json(response_value).into_response()
         }
@@ -387,6 +391,7 @@ async fn dispatch(
                 latency,
                 trace.as_ref(),
                 /* dispatched */ true,
+                /* guardrail_blocked */ false,
             );
             a2a_error_response(rpc_id, status, &err.to_string())
         }
@@ -457,6 +462,7 @@ impl Drop for StreamUsageOnDrop {
             self.started.elapsed(),
             self.trace.as_ref(),
             /* dispatched */ true,
+            /* guardrail_blocked */ false,
         );
     }
 }
@@ -501,6 +507,7 @@ async fn dispatch_stream(
                 started.elapsed(),
                 trace.as_ref(),
                 /* dispatched */ true,
+                /* guardrail_blocked */ false,
             );
             return a2a_error_response(rpc_id, status, &err.to_string());
         }
@@ -781,6 +788,8 @@ async fn guardrail_block_response(
         Duration::ZERO,
         trace,
         /* dispatched */ false,
+        // This IS the guardrail refusal.
+        /* guardrail_blocked */ true,
     );
     Some(response)
 }
@@ -833,6 +842,10 @@ fn emit_a2a_usage(
     // Whether the call reached the upstream agent — false for a quota
     // rejection, which refuses before any upstream contact.
     dispatched: bool,
+    // Whether a guardrail refused the call. `/a2a` emits exactly one event
+    // per call, so this row is the only place a refusal can appear to the
+    // dashboard's "Guardrail blocks" view (AISIX-Cloud#1428).
+    guardrail_blocked: bool,
 ) {
     // No model resolves on this endpoint, so the estimator falls back to its
     // default encoding — the same thing it does for any non-OpenAI model.
@@ -873,6 +886,7 @@ fn emit_a2a_usage(
             .ttfb
             .map(|d| d.as_millis().min(u32::MAX as u128) as u32)
             .unwrap_or_default(),
+        guardrail_blocked,
         ..Default::default()
     };
     crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());

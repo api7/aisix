@@ -247,6 +247,17 @@ pub struct UsageEvent {
     pub cost_usd: f64,
 
     /// True when a guardrail rejected the request (input or output).
+    ///
+    /// cp-api indexes this and the dashboard's Logs "Guardrail blocks"
+    /// view is the exact predicate `guardrail_blocked = true`, so it is
+    /// the ONLY thing that puts a refusal in front of an operator — a
+    /// refused request whose event leaves the field at its `false`
+    /// default is still in the unfiltered feed, which makes the empty
+    /// Blocked view read as "no guardrail activity" rather than as a
+    /// missing row (AISIX-Cloud#1428). Every emitter on a failure path
+    /// must therefore set it from `ProxyError::is_guardrail_block`,
+    /// including a stream refused after its 200 head went out: there the
+    /// status stays 200 and this bool is the whole record of the block.
     pub guardrail_blocked: bool,
 
     /// Set when at least one remote-API guardrail (today: kind=bedrock)

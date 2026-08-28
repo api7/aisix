@@ -459,8 +459,11 @@ pub async fn chat_completions(
             // `req.model` resolves against the snapshot, so a guardrail /
             // budget / rate-limit / bridge error after that point still
             // records which model the request targeted. ContentFiltered
-            // (guardrail) sets `guardrail_blocked` for the Blocked tab.
-            let guardrail_blocked = matches!(err, ProxyError::ContentFiltered { .. });
+            // (guardrail) sets `guardrail_blocked` for the Blocked tab —
+            // through the shared predicate every handler now reads, so the
+            // family cannot answer this question two different ways
+            // (AISIX-Cloud#1428).
+            let guardrail_blocked = err.is_guardrail_block();
             let model_id_str = resolved_model_id.as_deref().unwrap_or("");
             // AISIX-Cloud#1013: failed requests carry the (post-mask)
             // request body so a 4xx/5xx can be triaged from the log alone.

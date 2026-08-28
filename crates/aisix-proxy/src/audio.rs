@@ -241,6 +241,7 @@ pub async fn transcriptions(
                 &api_key_id,
                 status,
                 err.kind(),
+                err.is_guardrail_block(),
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
             );
@@ -400,6 +401,7 @@ pub async fn translations(
                 &api_key_id,
                 status,
                 err.kind(),
+                err.is_guardrail_block(),
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
             );
@@ -568,6 +570,7 @@ pub async fn speech(
                 &api_key_id,
                 status,
                 err.kind(),
+                err.is_guardrail_block(),
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
             );

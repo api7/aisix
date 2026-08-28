@@ -353,6 +353,7 @@ pub async fn entry(
                 api_key_id,
                 status,
                 error.kind(),
+                error.is_guardrail_block(),
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
             );
