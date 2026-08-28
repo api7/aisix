@@ -25,6 +25,17 @@
 //! point at a dead upstream, so a clean request fails too, and a flag that
 //! merely tracked "the request failed" would pass the blocked run and fail
 //! the clean one.
+//!
+//! The list below is hand-written, and AISIX-Cloud#1435 is what a
+//! hand-written list costs: `/v1/messages/count_tokens` gained the chain
+//! and the flag in the same release, was not on it, and emitted no usage
+//! event at all. So the "no surface may be missing" half now lives in
+//! `guardrail_coverage`, whose set is parsed out of the router — add a
+//! route and it is checked whether or not anyone edits a list. What stays
+//! here is what that census cannot express: the CLEAN control above, which
+//! needs a text-dependent guardrail rather than the census's unconditional
+//! script, and `/passthrough/byo`, which needs a configured route prefix
+//! the census snapshot does not carry.
 
 use std::sync::Arc;
 

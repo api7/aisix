@@ -32,6 +32,20 @@
 //! also keeps the answer honest: `/v1/messages` masks the same spans, so the
 //! count now describes the body the gateway would really send.
 //!
+//! Telemetry: this route is NOT metered and still emits a terminal
+//! `UsageEvent` on every outcome, with `prompt_tokens`/`completion_tokens`
+//! at zero. Those are two different questions, and the route answered only
+//! the first: it generates nothing, so there is nothing to bill — but it
+//! does forward the caller's whole payload to a real upstream, so every
+//! question Logs exists to answer (did this request happen, which key sent
+//! it, how long did it take, did a guardrail refuse it) had no row to read.
+//! A refusal was the sharp end: `/v1/messages/count_tokens` can be blocked
+//! by an input guardrail, and a refusal that emits no event is a 422 the
+//! caller definitely saw and the "Guardrail blocks" view cannot find
+//! (AISIX-Cloud#1435, the same failure mode as AISIX-Cloud#1428).
+//! `guardrail_coverage`'s census asserts the reporting half over the
+//! surfaces it reads out of the router, so this cannot regress quietly.
+//!
 //! Scope: Anthropic-backed models only. `count_tokens` has no upstream
 //! equivalent for OpenAI/Gemini/DeepSeek, so a non-Anthropic Model is
 //! rejected with a 400 at the gateway boundary (parallel to `/v1/rerank`
@@ -107,7 +121,20 @@ pub async fn count_tokens(
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
 
-    match dispatch(&state, &snapshot, &auth, &mut body, &request_id, &client).await {
+    // Filled inside `dispatch`, so the failure branch — where a guardrail
+    // block lands — stamps the enforced hits too (AISIX-Cloud#1330 / #1024).
+    let mut screening = InputScreening::default();
+    match dispatch(
+        &state,
+        &snapshot,
+        &auth,
+        &mut body,
+        &request_id,
+        &client,
+        &mut screening,
+    )
+    .await
+    {
         Ok(success) => {
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
@@ -135,6 +162,20 @@ pub async fn count_tokens(
                 },
                 status,
                 elapsed,
+            );
+            emit_usage_event(
+                &state,
+                &snapshot,
+                &pk,
+                &request_id,
+                &success.model_id,
+                &model_name,
+                &api_key_id,
+                status,
+                success.upstream_elapsed,
+                elapsed,
+                &client,
+                &screening,
             );
             success.response
         }
@@ -165,6 +206,23 @@ pub async fn count_tokens(
                 status,
                 elapsed,
             );
+            // A failed count_tokens is a request the operator has to be
+            // able to find, and a guardrail refusal is the one that must
+            // carry the flag the "Guardrail blocks" view filters on.
+            crate::usage_attr::emit_error_usage_event(
+                &state,
+                &snapshot,
+                "count_tokens",
+                "anthropic",
+                &request_id,
+                &model_name,
+                &api_key_id,
+                status,
+                err.kind(),
+                err.is_guardrail_block(),
+                &client,
+                crate::usage_attr::enforced_hits(&screening.audit),
+            );
             // Anthropic-shape envelope (#336) — count_tokens callers are
             // the Anthropic SDK, not OpenAI-compatible clients.
             err.into_anthropic_response()
@@ -172,21 +230,40 @@ pub async fn count_tokens(
     }
 }
 
+/// What the input hook produced, for the terminal `UsageEvent` to carry.
+///
+/// An out-param rather than part of [`CountTokensSuccess`] because the
+/// failure branch needs it too — a guardrail refusal IS the error, so the
+/// error event is the one that must not drop the audit.
+#[derive(Default)]
+struct InputScreening {
+    /// The request's ENFORCE-mode audit handle (AISIX-Cloud#1330).
+    audit: crate::usage_attr::GuardrailAudit,
+    /// The `{kind, hook}` set of guardrails that governed the request
+    /// (#379 parity) — surfaced on the event so Logs can show them.
+    applied: Vec<aisix_core::AppliedGuardrail>,
+    /// Monitor-mode observations (AISIX-Cloud#562).
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// Per-detector PII mask counts (#932/#696). Empty = no redaction.
+    redactions: crate::redact::RedactionCounts,
+}
+
 /// Run the resolved input guardrail chain over the Anthropic-shaped body,
 /// blocking before dispatch and writing mask-action rewrites back into
 /// `body` (which is what `count_tokens_to_target` forwards upstream).
 ///
 /// Deliberately mirrors `messages::dispatch_inner`'s block rather than
-/// sharing a helper with it: that one also threads applied-guardrail,
-/// audit and monitor-hit telemetry into a UsageEvent, and this route emits
-/// none (see [`CountTokensSuccess`]). Keeping the shapes parallel is what
-/// the `guardrail_coverage` census asserts.
+/// sharing a helper with it: that one threads the same telemetry through a
+/// retrying per-attempt emitter, and this route has a single terminal
+/// event. Keeping the shapes parallel is what the `guardrail_coverage`
+/// census asserts.
 async fn screen_input(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     model_entry_id: &str,
     model_name: &str,
     body: &mut Value,
+    screening: &mut InputScreening,
 ) -> Result<(), ProxyError> {
     let chain = state
         .guardrail_index
@@ -197,6 +274,8 @@ async fn screen_input(
             api_key_id: &auth.entry.id,
             team_id: auth.key().team_id.as_deref(),
         });
+    screening.applied = chain.applied().to_vec();
+    screening.audit = chain.audit_log();
     if chain.is_empty() {
         return Ok(());
     }
@@ -218,18 +297,14 @@ async fn screen_input(
             ));
         }
     };
-    // Monitor-mode hits and redaction counts are collected and dropped:
-    // this route emits no UsageEvent (see [`CountTokensSuccess`]), so there
-    // is nothing to attach them to. Both are out-params of the shared
-    // helpers rather than optional, hence the sinks.
-    let (verdict, _monitor_hits) =
+    let (verdict, monitor_hits) =
         aisix_guardrails::Guardrail::check_input_non_segment_observed(&chain, &chat).await;
-    let mut counts = crate::redact::RedactionCounts::new();
+    screening.monitor_hits = monitor_hits;
     let verdict = crate::redact::moderate_body(
         &chain,
         crate::redact::Direction::Input,
         verdict,
-        &mut counts,
+        &mut screening.redactions,
         &mut Vec::new(),
         |g| crate::redact::redact_anthropic_request(g, body),
     )
@@ -253,21 +328,38 @@ async fn screen_input(
         ));
     }
     // Mask-action rules rewrite the body that is about to be forwarded.
-    crate::redact::redact_anthropic_request(&chain, body);
+    // Merged, not discarded: `/v1/messages` merges the same pass into the
+    // counts its event reports (#932), and the two routes screen the same
+    // body with the same chain — a mask this side under-reported would
+    // read as the sibling route masking more of the same payload.
+    crate::redact::merge_counts(
+        &mut screening.redactions,
+        crate::redact::redact_anthropic_request(&chain, body),
+    );
     Ok(())
 }
 
-/// What the winning attempt resolved. `/v1/messages/count_tokens` emits no
-/// UsageEvent, so the only consumer is the request-metric label set — which
-/// still has to match what chat / messages / responses report
-/// (AISIX-Cloud#1234).
+/// What the winning attempt resolved, for the request-metric label set —
+/// which has to match what chat / messages / responses report
+/// (AISIX-Cloud#1234) — and for the terminal `UsageEvent`.
 struct CountTokensSuccess {
     response: Response,
     provider: String,
     upstream_model: String,
     provider_key_id: String,
+    /// The DISPATCHED target's Model row id: a group resolves to one of
+    /// its members, and `UsageEvent::model_id` records that target while
+    /// `requested_model` keeps the alias the caller addressed.
+    model_id: String,
+    /// How long the WINNING attempt took. Not the handler's own elapsed:
+    /// this route fails over across a group's Anthropic targets and
+    /// retries within one, so on a group the two diverge by every attempt
+    /// that lost — and `upstream_latency_ms` is attempt-scoped everywhere
+    /// else in Logs (`downstream_latency_ms` is the request-scoped one).
+    upstream_elapsed: Duration,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
@@ -275,6 +367,7 @@ async fn dispatch(
     body: &mut Value,
     request_id: &str,
     client: &ClientContext,
+    screening: &mut InputScreening,
 ) -> Result<CountTokensSuccess, ProxyError> {
     let model_name = body
         .get("model")
@@ -296,7 +389,7 @@ async fn dispatch(
     // rationale as the `/v1/messages` sibling: before the reservation, so a
     // content-policy refusal doesn't burn an RPM slot. See the module doc
     // for why the input hook applies here and the output hook does not.
-    screen_input(state, auth, &model_entry.id, &model_name, body).await?;
+    screen_input(state, auth, &model_entry.id, &model_name, body, screening).await?;
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
@@ -473,6 +566,7 @@ async fn count_tokens_to_target(
     request_id: &str,
     client: &ClientContext,
 ) -> Result<CountTokensSuccess, ProxyError> {
+    let attempt_started = Instant::now();
     let mut body = body.clone();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
@@ -640,7 +734,82 @@ async fn count_tokens_to_target(
         provider: "anthropic".to_string(),
         upstream_model,
         provider_key_id: pk_entry.id.to_string(),
+        model_id: model_id.to_string(),
+        upstream_elapsed: attempt_started.elapsed(),
     })
+}
+
+/// The terminal `UsageEvent` for a served count_tokens.
+///
+/// Token counters stay at zero, deliberately: the `{"input_tokens": N}` the
+/// caller gets back is a MEASUREMENT of a prompt, not tokens any upstream
+/// consumed or billed. Copying it into `prompt_tokens` would put spend on
+/// a request that cost nothing and double-count the prompt once the caller
+/// goes on to issue the real `/v1/messages` call.
+///
+/// No `request_metrics::record_usage` call for the same reason — the
+/// `aisix_llm_*_tokens_total` families are token/spend families, and this
+/// route contributes neither. The request families already carry the call
+/// (`request_metrics::record`, above), and `aisix_usage_events_emitted_total`
+/// counts this event under `handler="count_tokens"`.
+#[allow(clippy::too_many_arguments)]
+fn emit_usage_event(
+    state: &ProxyState,
+    snap: &aisix_core::AisixSnapshot,
+    pk: &crate::usage_attr::ResolvedPk<'_>,
+    request_id: &str,
+    model_id: &str,
+    requested_model: &str,
+    api_key_id: &str,
+    status_code: u16,
+    // Attempt-scoped, from the winning attempt; see `CountTokensSuccess`.
+    upstream_elapsed: Duration,
+    // Request-scoped: what the caller actually waited for, guardrails and
+    // any lost attempts included.
+    elapsed: Duration,
+    client: &ClientContext,
+    screening: &InputScreening,
+) {
+    let mut event = aisix_obs::UsageEvent {
+        request_id: request_id.to_string(),
+        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        model_id: model_id.to_string(),
+        api_key_id: api_key_id.to_string(),
+        requested_model: requested_model.to_string(),
+        upstream_latency_ms: upstream_elapsed.as_millis().min(u32::MAX as u128) as u32,
+        downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        status_code,
+        inbound_protocol: "anthropic".to_string(),
+        applied_guardrails: screening.applied.clone(),
+        client_source_ip: client.source_ip.clone(),
+        client_user_agent: client.user_agent.clone(),
+        redacted_entity_counts: screening.redactions.clone(),
+        guardrail_monitor_hits: screening.monitor_hits.clone(),
+        guardrail_enforced_hits: crate::usage_attr::enforced_hits(&screening.audit),
+        ..Default::default()
+    };
+    crate::usage_attr::apply_pk_telemetry(&mut event, pk);
+    crate::usage_attr::apply_caller_identity(
+        &mut event,
+        client.jwt.as_ref(),
+        client.caller.user_id.as_deref(),
+    );
+    let usage_model =
+        crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
+    crate::usage_attr::emit_usage(
+        state,
+        snap,
+        "count_tokens",
+        event,
+        crate::usage_attr::usage_event_labels(&usage_model, pk),
+        // Content capture (#700) is not wired on this route — it is a
+        // separate, per-exporter opt-in capability, and #1435 is about the
+        // event existing at all.
+        None,
+        client.trace.as_ref(),
+        /* terminal */ true,
+        /* dispatched */ true,
+    );
 }
 
 fn emit_access_log(
@@ -767,6 +936,89 @@ mod tests {
             .header("content-type", "application/json")
             .body(axum::body::Body::from(body.to_string()))
             .unwrap()
+    }
+
+    /// AISIX-Cloud#1435: the served request leaves a row, and that row
+    /// carries what the guardrail chain did to the body.
+    ///
+    /// The mask count is the part worth pinning. `/v1/messages` merges the
+    /// post-block-check masking pass into the counts its event reports
+    /// (#932), and this route screens the same body with the same chain —
+    /// so a mask counted on one and not the other reads as the sibling
+    /// route masking more of the same payload. It is also invisible from
+    /// the audit side: the enforced hit carries its own copy, so a reader
+    /// checking only that would see the mask recorded while the field
+    /// cp-api persists stayed empty. The upstream answers
+    /// `input_tokens: 42`, which must NOT become spend: it measures a
+    /// prompt, it does not consume one.
+    #[tokio::test]
+    async fn a_served_request_emits_a_zero_token_row_carrying_the_mask_it_applied() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 42})),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(anthropic_model("ct-mask"));
+        snap.apikeys.insert(apikey_entry(&["ct-mask"]));
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{
+                "name": "eda-mask",
+                "kind": "pii",
+                "hook_point": "input",
+                "detectors": [],
+                "custom_patterns": [
+                    {"name": "eda_version", "regex": "version\\s*:\\s*(\\d+(?:\\.\\d+)+)", "action": "mask", "replacement": "***"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        snap.guardrails.insert(ResourceEntry::new("g-mask", row, 1));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized(
+            "anthropic",
+            Arc::new(aisix_provider_anthropic::AnthropicBridge::new()),
+        );
+        let handle = SnapshotHandle::new(snap);
+        let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone(), None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, hub, &cfg())
+                .without_cache()
+                .with_guardrail_index(index)
+                .with_usage_sink(UsageSink::new(tx)),
+        );
+
+        let res = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "ct-mask",
+                "messages": [{ "role": "user", "content": "version: 9.9.9" }],
+            })))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("count_tokens must emit a usage event")
+            .expect("channel open");
+        assert_eq!(event.status_code, 200);
+        assert_eq!(event.inbound_protocol, "anthropic");
+        assert_eq!(event.requested_model, "ct-mask");
+        assert_eq!(event.prompt_tokens, 0);
+        assert_eq!(event.completion_tokens, 0);
+        assert_eq!(
+            event.redacted_entity_counts.get("eda_version").copied(),
+            Some(1),
+            "the mask this route applied is missing from its own row: {event:?}",
+        );
     }
 
     /// Mixed group [anthropic, openai]: the openai target is `continue`d
