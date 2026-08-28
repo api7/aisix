@@ -539,7 +539,8 @@ where
             }
             if !ignored.is_empty() {
                 // YELLOW: loaded, but fields this build does not know were
-                // ignored — typically written by a newer control plane.
+                // ignored. Which side is ahead is not knowable here — see
+                // `warn_partial_compat_deduped`.
                 ignored.sort_unstable();
                 ignored.dedup();
                 // A single document can carry an arbitrary number of
@@ -653,6 +654,21 @@ fn merge_partial_compat_fields(stats: &mut BuildStats, key: &str, kind: &str, fi
 /// combinations keep logging (never silently dropped) but are no longer
 /// remembered, so a pathological fleet re-logs on each resync instead
 /// of growing memory without bound.
+///
+/// The message names what this build knows and stops there. It used to
+/// add "likely written by a newer control plane", which is wrong exactly
+/// half the time and wrong in the situation that produces most of these
+/// lines: an UPGRADE, where the new data plane meets rows an OLDER
+/// control plane wrote with a field this build has since dropped
+/// (AISIX-Cloud#1435 saw `ignored_fields=mandatory` reported that way).
+/// A misdirected diagnostic on the one path where unknown fields are
+/// expected sends the reader looking at the wrong side of the fleet.
+///
+/// The direction is not merely unreported, it is unobservable from here:
+/// a retired field leaves no trace in this build — no tombstone, no
+/// "must not exist" list — so "unknown" cannot be split into "added
+/// since" and "removed since". Naming the field and its consequence is
+/// the whole of what this side can say.
 fn warn_partial_compat_deduped(key: &str, kind: &str, fields: &[String]) {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
@@ -676,8 +692,9 @@ fn warn_partial_compat_deduped(key: &str, kind: &str, fields: &[String]) {
         key = %key,
         kind = %kind,
         ignored_fields = %entry.1,
-        "row loaded with unknown fields ignored (partially compatible; \
-         likely written by a newer control plane)"
+        "row loaded with unknown fields ignored (partially compatible); this \
+         build does not define them, so whatever they configure is not \
+         enforced here"
     );
     if warned.len() < MAX_REMEMBERED {
         warned.insert(entry);
