@@ -42,6 +42,15 @@ import {
 //     the report, and it is the one a join on api_key_id gets wrong;
 //   - an unowned key stamps nobody, so a member filter cannot sweep up
 //     traffic that was never theirs.
+//
+// The last case pins the OTHER half of the report's driving question. A 429
+// reaches a caller two ways — the upstream throttled us, or the gateway's
+// own rate limit refused the request before any upstream was contacted —
+// and only the first is an upstream *attempt*. The gateway's own refusal
+// leaves the failure path with zero attempts, which is a genuinely
+// different code path (`chat.rs`'s `match charge` zero-attempt arm rather
+// than its per-attempt loop). Both must reach the usage feed carrying the
+// member, or "show me Alice's 429s" silently answers half the question.
 
 const OWNED_PLAINTEXT = "sk-usage-member-owned";
 const UNOWNED_PLAINTEXT = "sk-usage-member-unowned";
@@ -56,6 +65,9 @@ const MODEL = "uma-model";
 // ("show me Alice's 429s") needs a 429 that actually reaches an upstream and
 // therefore produces a per-attempt usage row.
 const THROTTLED_MODEL = "uma-throttled";
+// A member-owned key whose OWN rpm is 1, so its second request is refused
+// by the gateway rather than by any upstream.
+const GATEWAY_LIMITED_PLAINTEXT = "sk-usage-member-gateway-limited";
 // The member every owned credential in this case belongs to. A uuid-shaped
 // value because that is what cp-api projects (`api_keys.user_id`).
 const ALICE = "3f1b7c62-9d4e-4a51-8f0b-2c6d5e4a1b90";
@@ -168,6 +180,15 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
       allowed_models: [MODEL],
     });
 
+    // Alice's third credential, rate-limited at the key level. Its 429 never
+    // reaches an upstream, so it exercises the zero-attempt failure path.
+    await seed.createApiKey({
+      key_hash: hash(GATEWAY_LIMITED_PLAINTEXT),
+      allowed_models: [MODEL],
+      user_id: ALICE,
+      rate_limit: { rpm: 1 },
+    });
+
     // Written LAST so the readiness gate below implies everything above is
     // already in the snapshot (one watch, applied in revision order).
     await seed.createApiKey({
@@ -243,6 +264,42 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
     // Absent, not a placeholder: a member filter must not sweep up traffic
     // that belongs to no member.
     expect(log.get("user_id")).toBeUndefined();
+  });
+
+  test("a gateway rate-limit 429 reaches the feed with the member on it", async (ctx) => {
+    if (!etcdReachable || !app || !sls) {
+      ctx.skip();
+      return;
+    }
+    const before: MetricSample[] = await scrapeMetrics(app.metricsUrl);
+    // rpm=1: the first request consumes the budget, the second is refused
+    // by the gateway itself — no upstream is contacted, so this event comes
+    // from the zero-attempt path rather than from a failed attempt.
+    expect((await chat(GATEWAY_LIMITED_PLAINTEXT, "uma-gw429-first")).status).toBe(200);
+    expect((await chat(GATEWAY_LIMITED_PLAINTEXT, "uma-gw429-refused")).status).toBe(429);
+    const after: MetricSample[] = await scrapeMetrics(app.metricsUrl);
+
+    const log = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (l) => (l.get("prompt") ?? "").includes("uma-gw429-refused"),
+      "gateway-throttled usage row",
+    );
+    expect(log.get("status_code")).toBe("429");
+    expect(log.get("user_id")).toBe(ALICE);
+    // The gateway's own refusal, not an upstream's — the two 429s are
+    // distinguishable by error class, which is what lets an operator tell
+    // "we throttled them" from "the provider throttled us".
+    expect(log.get("error_class")).toBe("rate_limit_exceeded");
+    // Nothing was sent upstream, so nothing is billed.
+    expect(log.get("prompt_tokens") ?? "0").toBe("0");
+
+    expect(
+      metricDelta(before, after, "aisix_usage_events_emitted_total", {
+        user_id: ALICE,
+        status: "429",
+      }),
+    ).toBeGreaterThanOrEqual(1);
   });
 
   test("a member's 429 is addressable by member and by raw status code", async (ctx) => {
