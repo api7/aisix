@@ -27,9 +27,9 @@ Pushing the tag triggers two workflows:
   curated-notes scaffold to fill in, then GitHub's auto-generated **What's
   Changed** list as a starting skeleton.
 
-### PGO is mandatory and fail-closed
+### PGO applies to the stable release tag only — and it is fail-closed there
 
-Published images are profile-guided-optimized (#967): the Docker build
+The `vX.Y.Z` image is profile-guided-optimized (#967): the Docker build
 compiles an instrumented gateway, drives the committed training matrix
 (`bench/pgo-training/`) against it, and rebuilds with the merged profile.
 Any phase failing — instrumented build, training, profile merge, optimized
@@ -43,6 +43,35 @@ shipped image's marker:
 docker run --rm --entrypoint cat ghcr.io/api7/aisix:X.Y.Z \
   /usr/local/share/aisix/pgo-verified.json
 ```
+
+**`-rc.N`, `:dev` and PR images are NOT PGO'd** — PGO cost ~20 min on every
+one of the ~40 main pushes per cycle and none of those images are what a
+customer runs. Two things follow, and both belong to the release flow:
+
+- **The QA'd candidate is not bit-identical to the shipped image.** PGO
+  changes code layout, inlining and block ordering — never semantics; the
+  workspace contains no `unsafe`, so there is no undefined behaviour for a
+  different inlining decision to expose. The functional QA result therefore
+  still describes the shipped build. What it does *not* describe is the
+  released image's performance: any perf number must come from a `vX.Y.Z`
+  image or a local `--build-arg PGO=on` build, never from `:dev` or an rc.
+- **The release tag is the first build to run the PGO pipeline on that
+  commit**, so a training-shape regression surfaces *after* QA has passed —
+  the most expensive moment to find it, since the fix moves the commit and
+  costs a fresh rc plus a re-run of QA. Pre-flight it instead: once the
+  release commit is final and before tagging, run the `docker-image`
+  workflow via `workflow_dispatch` on that commit with **pgo = true**. It
+  builds the exact three-phase path and asserts the proof marker, publishing
+  only a `:sha-<short>` tag that moves no pointer.
+
+```bash
+gh workflow run docker-image.yml --ref <release-sha> -f pgo=true
+```
+
+A PR that touches `Dockerfile`, `Cargo.toml`, `Cargo.lock`,
+`rust-toolchain.toml`, `bench/pgo-training/**` or the workflow itself still
+flips to PGO=on automatically — that is the one pre-tag exercise of the
+pipeline that needs no one to remember it.
 
 Local note: each retrained profile is content-addressed, so repeated local
 PGO builds accumulate build artifacts in the persistent BuildKit cache

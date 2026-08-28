@@ -5,22 +5,22 @@ name: docker-image
 # Tag strategy. Every push always carries a :sha-<shortsha> tag for
 # traceability; the other tags layer on top based on the trigger:
 #   - push to main              → :dev + :sha-<shortsha>
-#   - push to poc               → :poc + :sha-<shortsha>
 #   - push tag vX.Y.Z           → :X.Y.Z + :X.Y + :X + :latest
 #                                 + :sha-<shortsha>
 #   - push tag vX.Y.Z-rc.N      → :X.Y.Z-rc.N + :sha-<shortsha>  (NO rolling tags)
 #   - pull request              → build-only (no push), sanity check
 #   - workflow_dispatch         → :sha-<shortsha> + optional tag input
 #
-# Pre-release tags exist so a release candidate can be QA'd on the exact
-# artifacts customers receive before anything points at it. They must move
-# no rolling pointer: docker/metadata-action already skips :X.Y and :X for
+# Pre-release tags exist so a release candidate can be QA'd on the artifacts
+# customers receive before anything points at it — bar the PGO difference
+# noted at "Decide PGO build mode" below. They must move no rolling
+# pointer: docker/metadata-action already skips :X.Y and :X for
 # pre-release semver, and the guards below keep :latest and the published
 # `openapi-latest.json` on the last stable release.
 
 on:
   push:
-    branches: [main, poc]
+    branches: [main]
     tags: ["v*.*.*"]
   pull_request:
     branches: [main]
@@ -39,6 +39,10 @@ on:
       tag:
         description: "Optional extra tag to publish (e.g. aisix-e2e)"
         required: false
+      pgo:
+        description: "Run the full PGO build (pre-flight the release build path)"
+        type: boolean
+        default: false
 
 env:
   REGISTRY: ghcr.io
@@ -56,27 +60,54 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # PGO builds (#967) compile the workspace twice (instrumented + optimized)
-    # with a training run in between — roughly 2.5x the plain fat-LTO build
-    # that used to fit in 45 minutes.
+    # A PGO build (#967) compiles the workspace twice (instrumented +
+    # optimized) with a training run in between — ~30 min against ~11 min
+    # for the single-compile build. Only stable release tags take that path
+    # (see "Decide PGO build mode"), but the timeout has to cover them.
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6
 
-      # PGO build mode (#967). Push builds (dev/poc/tags/dispatch) are always
-      # PGO=on: shipped artifacts are PGO'd, fail-closed, no fallback. PR
-      # builds default to PGO=off so review latency stays at one compile —
-      # EXCEPT when the PR touches the build pipeline or the training assets,
-      # in which case the full three-phase build must prove itself pre-merge.
+      # PGO build mode (#967). PGO is reserved for the artifact customers
+      # actually run: a STABLE release tag (vX.Y.Z). Everything else — PR,
+      # main/:dev, `-rc.N` candidates, plain dispatch — builds in one compile,
+      # because PGO cost ~20 min on every one of the ~40 main pushes per
+      # release cycle and bought nothing those images are used for.
+      #
+      # Two consequences are load-bearing and documented in RELEASING.md:
+      #   - the QA'd `-rc.N` image is NOT PGO'd while the released image is.
+      #     PGO changes code layout, never semantics (the workspace has no
+      #     `unsafe`), so the QA result still describes the shipped build —
+      #     but the two binaries are not bit-identical.
+      #   - the release tag is therefore the FIRST build to exercise the
+      #     three-phase pipeline on that commit. A training-shape regression
+      #     surfaces there, after QA. Pre-flight it on the release commit
+      #     with `workflow_dispatch` + pgo=true before tagging.
+      #
+      # The PR escape hatch survives and matters more now: it is the only
+      # pre-tag exercise of the PGO path that happens automatically.
       - name: Decide PGO build mode
         id: pgomode
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
         run: |
           set -eu
-          mode=on
+          mode=off
+          case "$GITHUB_REF" in
+            # Stable release tag only: `-rc.N` (and any other pre-release
+            # suffix) keeps the fast path. Same predicate the :latest tag
+            # guard uses, so the PGO'd image and :latest never disagree.
+            refs/tags/v*)
+              case "$GITHUB_REF_NAME" in
+                *-*) ;;
+                *) mode=on ;;
+              esac
+              ;;
+          esac
+          if [ "${{ github.event.inputs.pgo }}" = "true" ]; then
+            mode=on
+          fi
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            mode=off
             git fetch --no-tags --depth=1 origin "$BASE_SHA"
             # Capture the diff as a CHECKED command before matching: inside
             # an `if` condition a git failure is exempt from `set -e` and
@@ -107,8 +138,8 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Release tags (vX.Y.Z) are additionally mirrored to the api7
-      # Docker Hub org for private/offline deployments (#789). dev / poc
-      # / sha builds stay GHCR-only.
+      # Docker Hub org for private/offline deployments (#789). dev / sha
+      # builds stay GHCR-only.
       - name: Log in to Docker Hub
         if: startsWith(github.ref, 'refs/tags/v')
         uses: docker/login-action@v4
@@ -131,7 +162,6 @@ jobs:
           # and {{major}} for pre-release semver.
           tags: |
             type=raw,value=dev,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-            type=raw,value=poc,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/poc' }}
             type=ref,event=pr
             type=sha,prefix=sha-,format=short
             type=semver,pattern={{version}}
@@ -205,12 +235,16 @@ jobs:
       # profile-optimized build succeeds. An absent marker, a short shape
       # list, or an undersized merged profile fails the workflow here —
       # before signing, and before any human treats the artifact as good.
-      # The `if` is deliberately NOT just `pgomode == 'on'`: every push build
-      # asserts unconditionally, so a future bug in the pgomode step itself
-      # (empty output, renamed id) cannot skip both the PGO build AND its
-      # guard in the same breath.
+      #
+      # The second clause is deliberately NOT derived from `pgomode`: it
+      # re-derives "stable release tag" from github.ref, so a future bug in
+      # the pgomode step (empty output, renamed id, a broken case pattern)
+      # cannot skip the PGO build AND its guard in the same breath. That
+      # independence is what keeps the now-default-off mode logic safe —
+      # a release tag that somehow built without PGO fails here instead of
+      # shipping silently un-optimized.
       - name: Assert PGO proof marker (#967)
-        if: github.event_name != 'pull_request' || steps.pgomode.outputs.value == 'on'
+        if: steps.pgomode.outputs.value == 'on' || (startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-'))
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build.outputs.digest }}
