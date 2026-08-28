@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   slsLogsFor,
   spawnApp,
@@ -155,11 +156,6 @@ describe("guardrail_blocked e2e: a /v1/responses refusal reaches the Blocked vie
       },
     });
 
-    await seed.createApiKey({
-      key_hash: CALLER_KEY_HASH,
-      allowed_models: [DIRECT_MODEL, GROUP_MODEL],
-    });
-
     // Env-scoped input guardrail: it governs the entry the caller
     // addresses, group parent included.
     await seed.createGuardrail({
@@ -170,15 +166,22 @@ describe("guardrail_blocked e2e: a /v1/responses refusal reaches the Blocked vie
       patterns: [{ kind: "literal", value: FORBIDDEN_WORD }],
     });
 
-    // Gate on the guardrail being live for BOTH entries — a 422 here is
-    // the only proof the rule propagated, and the group resolving is the
-    // only proof its targets did.
-    await waitConfigPropagation(async () => {
-      const direct = await responses(DIRECT_MODEL, `probe ${FORBIDDEN_WORD}`, false);
-      if (direct.status !== 422) return false;
-      const group = await responses(GROUP_MODEL, `probe ${FORBIDDEN_WORD}`, false);
-      return group.status === 422;
+    // The caller key is written LAST, after every other resource above.
+    // The gateway runs one etcd watch over one prefix and applies its
+    // events in revision order (`aisix-etcd`), so the moment this key
+    // authenticates, everything written ahead of it — models, the routing
+    // group, the guardrail, the exporter — is already in the snapshot.
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: [DIRECT_MODEL, GROUP_MODEL],
     });
+
+    // ...which is why the readiness gate can stay independent of what the
+    // tests assert. Gating on the guardrail's own 422 would make a
+    // guardrail regression surface as a propagation timeout in `beforeAll`
+    // instead of a failed assertion pointing at the cause.
+    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
   });
 
   afterAll(async () => {
