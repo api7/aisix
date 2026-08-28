@@ -68,9 +68,18 @@ customer runs. Two things follow, and both belong to the release flow:
   tag time would put ~30 minutes on the critical path of every release for a
   result that was already knowable hours earlier.
 
+`--ref` takes a **branch or tag name, never a raw commit SHA**, so dispatch on
+the release line's branch — at this point its HEAD *is* the candidate commit.
+Do NOT dispatch on the `vX.Y.Z-rc.N` tag: a tag ref makes metadata-action
+re-emit the candidate's own image tags, republishing the very artifact QA is
+testing as a PGO'd build QA never saw. A branch ref publishes one GHCR
+`:sha-<short>` and nothing else.
+
 ```bash
 # when the candidate is cut — fire and carry on
-gh workflow run docker-image.yml --ref <candidate-sha> -f pgo=true
+gh workflow run docker-image.yml --ref release/<X.Y> -f pgo=true
+# confirm it caught the candidate commit and not a later push to the branch
+gh run list --workflow=docker-image.yml --limit 1 --json databaseId,headSha --jq '.[0]'
 # when you come to tag — a lookup, not a wait
 gh run view <run-id> --json conclusion --jq .conclusion
 ```
