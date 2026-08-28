@@ -826,7 +826,7 @@ async fn moderate_selected_segments(
         tracing::warn!(error = %err, "mcp segment collect walk failed; blocking");
         return SegmentPassOutcome::Block {
             guardrail_name: None,
-            unavailable: Some(crate::error::TAG_MASK_WRITEBACK_FAILED.to_owned()),
+            unavailable: Some(crate::error::TAG_UNSCANNABLE_BODY.to_owned()),
         };
     }
     if texts.is_empty() {
@@ -957,7 +957,7 @@ async fn apply_output_guardrails(
         Err(_) => {
             return ToolResultOutcome::Block {
                 guardrail_name: None,
-                unavailable: Some(crate::error::TAG_MASK_WRITEBACK_FAILED.to_owned()),
+                unavailable: Some(crate::error::TAG_UNSCANNABLE_BODY.to_owned()),
             }
         }
     };

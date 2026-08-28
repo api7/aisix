@@ -357,9 +357,12 @@ pub enum ProxyError {
 ///
 /// `output_buffer_exceeded` — a streamed response outgrew the hold-back
 /// cap and the row is fail-closed, so it is refused unscanned.
+/// `unscannable_body` — the body could not be walked, so the guardrail was
+/// never offered the content to scan.
 /// `mask_writeback_failed` — a mask verdict could not be spliced back into
 /// the body, so the request is refused rather than forwarded unmasked.
 pub(crate) const TAG_OUTPUT_BUFFER_EXCEEDED: &str = "output_buffer_exceeded";
+pub(crate) const TAG_UNSCANNABLE_BODY: &str = "unscannable_body";
 pub(crate) const TAG_MASK_WRITEBACK_FAILED: &str = "mask_writeback_failed";
 
 /// The caller-visible message for a guardrail `Block` verdict.
