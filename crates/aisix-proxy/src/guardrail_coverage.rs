@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, ApiKey, ProxyConfig, ResourceEntry};
+use aisix_obs::{UsageEvent, UsageSink};
 use axum::body::Body;
 use axum::http::Request;
 use tower::ServiceExt;
@@ -412,6 +413,23 @@ fn census_router() -> axum::Router {
     crate::build_router(state)
 }
 
+/// [`census_router`] plus the receiver its usage events land in.
+///
+/// One router per surface rather than a shared one: the sink is a single
+/// channel, so surfaces driven through the same router would interleave
+/// their events and "which surface emitted nothing" would stop being
+/// answerable — which is the whole question below.
+fn census_router_with_usage() -> (axum::Router, tokio::sync::mpsc::Receiver<UsageEvent>) {
+    let handle = SnapshotHandle::new(census_snapshot());
+    let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone(), None);
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    let state = crate::ProxyState::new(handle, census_hub(), &cfg())
+        .without_cache()
+        .with_guardrail_index(index)
+        .with_usage_sink(UsageSink::new(tx));
+    (crate::build_router(state), rx)
+}
+
 const MULTIPART_BOUNDARY: &str = "censusboundary";
 
 /// A multipart body with the parts named, in order. Values are inline
@@ -630,6 +648,90 @@ async fn enforced_surfaces_refuse_a_blocking_guardrail() {
         "a guardrail that blocks unconditionally did NOT refuse these surfaces — the input chain \
          either did not run or did not decide:\n{}",
         not_refused.join("\n"),
+    );
+}
+
+/// AISIX-Cloud#1435: refusing is half the job — the refusal also has to be
+/// REPORTED, and on the same router-derived set.
+///
+/// `guardrail_blocked_telemetry` already pins this invariant, but against a
+/// hand-written list of surfaces, and that is exactly how the gap it was
+/// written for came back: `/v1/messages/count_tokens` gained the chain
+/// (#1064) and the flag (#1065) in the same release, was absent from the
+/// list, and emitted no usage event at all — so it refused correctly and
+/// the refusal was unfindable, on a route whose whole job is to ship the
+/// caller's entire payload to a provider. Here the set comes out of the
+/// router, so a surface cannot be missing from it.
+///
+/// The counters are asserted alongside because a refusal that BILLS is the
+/// other way to get this wrong: nothing ran upstream, so nothing is owed.
+#[tokio::test]
+async fn an_enforced_surface_reports_the_refusal_it_makes() {
+    let mut wrong = Vec::new();
+
+    for (surface, posture) in POSTURE {
+        if !matches!(posture, Posture::Enforced) {
+            continue;
+        }
+        let Some(request) = fixture(surface) else {
+            // `enforced_surfaces_refuse_a_blocking_guardrail` owns the
+            // missing-fixture complaint; do not duplicate it here.
+            continue;
+        };
+        let (router, mut rx) = census_router_with_usage();
+        let response = router.oneshot(request).await.expect("router must answer");
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body must read");
+        if !refused_by_guardrail(&String::from_utf8_lossy(&bytes)) {
+            // Ditto: a surface that did not refuse is the sibling test's
+            // finding, and reporting it twice buries the new one.
+            continue;
+        }
+
+        // Drained on a short timeout rather than counted — how many events
+        // a surface emits is its own business, and pinning it here would
+        // make this file fail for reasons that are not the flag.
+        let mut events = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await
+        {
+            events.push(event);
+        }
+
+        if events.is_empty() {
+            wrong.push(format!("{surface}: refused but emitted no usage event"));
+            continue;
+        }
+        if !events.iter().any(|e| e.guardrail_blocked) {
+            wrong.push(format!(
+                "{surface}: emitted {} usage event(s), none marked guardrail_blocked",
+                events.len(),
+            ));
+            continue;
+        }
+        // `/a2a` is exempt: its counters are the gateway's own reading of
+        // the words, flagged `usage_estimated` and never charged — they are
+        // filled from the request before the chain even runs.
+        if *surface == "/a2a/:agent" {
+            continue;
+        }
+        for event in &events {
+            if event.prompt_tokens != 0 || event.completion_tokens != 0 {
+                wrong.push(format!(
+                    "{surface}: refused request billed {}+{} tokens",
+                    event.prompt_tokens, event.completion_tokens,
+                ));
+            }
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "a guardrail refusal must reach the Logs \"Guardrail blocks\" view \
+         (usage_events.guardrail_blocked = true) on every enforced surface, and cost \
+         the caller nothing:\n  {}",
+        wrong.join("\n  "),
     );
 }
 
