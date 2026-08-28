@@ -2025,7 +2025,11 @@ fn emit_submit_usage_event(
     };
     let pk = crate::usage_attr::ResolvedPk::resolve(snap, provider_key_id);
     crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
-    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
+    crate::usage_attr::apply_caller_identity(
+        &mut event,
+        client.jwt.as_ref(),
+        client.caller.user_id.as_deref(),
+    );
     let usage_model =
         crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
     crate::usage_attr::emit_usage(

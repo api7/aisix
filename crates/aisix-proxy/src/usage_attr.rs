@@ -392,18 +392,29 @@ pub(crate) fn apply_pk_telemetry(event: &mut UsageEvent, pk: &ResolvedPk<'_>) {
     event.byo_label = sanitize_tag(tags.byo_label.unwrap_or_default());
 }
 
-/// Stamp the JWT identity attribution fields onto an in-progress
-/// UsageEvent (AISIX-Cloud#564). A `None` identity (the API-key path)
-/// leaves the fields empty, which skip-serialize to wire NULL. One
-/// source of truth for the mapping so the handler family can't drift —
+/// Stamp the caller-identity attribution fields onto an in-progress
+/// UsageEvent: the JWT identity (AISIX-Cloud#564) and the org member the
+/// authenticating key belongs to (AISIX-Cloud#1389). A `None` in either
+/// argument leaves its fields empty, which skip-serialize to wire NULL.
+/// One source of truth for the mapping so the handler family can't drift —
 /// same rationale as [`apply_pk_telemetry`]. The values are sanitised
 /// like every other externally-influenced tag: the subject is a claim
 /// from a verified token, but the identity provider is still not a
 /// trusted emitter of control characters or unbounded strings.
-pub(crate) fn apply_jwt_identity(
+///
+/// `user_id` takes both halves of the auth surface: on the API-key path it
+/// is the key's own `user_id`, and on the JWT path it is the `user_id` of
+/// the key the token resolved to — a JWT request runs AS a key, so one
+/// argument covers both and the member filter sees every credential a
+/// member calls through.
+pub(crate) fn apply_caller_identity(
     event: &mut UsageEvent,
     jwt: Option<&std::sync::Arc<crate::auth::JwtIdentity>>,
+    user_id: Option<&str>,
 ) {
+    if let Some(user_id) = user_id {
+        event.user_id = sanitize_tag(user_id.to_string());
+    }
     let Some(jwt) = jwt else {
         return;
     };
@@ -516,7 +527,11 @@ pub(crate) fn build_error_usage_event(
         guardrail_enforced_hits: enforced,
         ..Default::default()
     };
-    apply_jwt_identity(&mut event, client.jwt.as_ref());
+    apply_caller_identity(
+        &mut event,
+        client.jwt.as_ref(),
+        client.caller.user_id.as_deref(),
+    );
     event
 }
 
@@ -560,6 +575,10 @@ pub(crate) fn usage_event_labels<'a>(
             labels.id()
         },
         provider_key_name: labels.name(),
+        // Overwritten by `UsageSink::try_emit` from the event's own
+        // `user_id` (AISIX-Cloud#1389) — one place, so no handler in this
+        // family can build a label set that disagrees with the row.
+        user_id: "unknown",
         // Same `PkLabels` the request families read (AISIX-Cloud#1403), so
         // `aisix_usage_events_emitted_total` joins with them on
         // `upstream_protocol` instead of dropping out of the aggregation.

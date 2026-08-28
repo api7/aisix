@@ -76,6 +76,17 @@ pub struct UsageEvent {
     #[serde(default)]
     pub api_key_id: String,
 
+    /// UUID of the org member the authenticating ApiKey is owned by
+    /// (`ApiKey.user_id`), snapshotted at request time so the Logs
+    /// member filter keeps naming who actually made the call
+    /// (AISIX-Cloud#1389). Resolving it from `api_key_id` at query time
+    /// instead would re-attribute a key's whole history the moment an
+    /// operator rebinds it, and lose the attribution entirely once the
+    /// key is deleted. Empty when the key is bound to no member, or
+    /// when auth failed before resolution; cp-api stores empty as NULL.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub user_id: String,
+
     /// The model alias exactly as the client sent it in the request
     /// body (`model` field) — a Model-Group name for routed requests,
     /// a direct model's display name otherwise. `model_id` records the
@@ -775,8 +786,25 @@ impl UsageSink {
     /// records did we lose" answerable. The event itself cannot supply
     /// them: its `requested_model` is caller-controlled text (#451) and it
     /// carries no ProviderKey id at all.
+    ///
+    /// The one attribution dimension that DOES come off the event is
+    /// `user_id` (AISIX-Cloud#1389): it is a resolved ApiKey field, not
+    /// caller text, and taking it here rather than from each handler's
+    /// label builder is what makes the counter and the row cp-api persists
+    /// structurally incapable of naming different members.
     pub fn try_emit(&self, handler: &'static str, event: UsageEvent, labels: UsageEventLabels<'_>) {
         log_provider_call(handler, &event);
+        // Owned because `event` is moved into the channel below while the
+        // drop counter still needs the label.
+        let user_id = event.user_id.clone();
+        let labels = UsageEventLabels {
+            user_id: if user_id.is_empty() {
+                "unknown"
+            } else {
+                user_id.as_str()
+            },
+            ..labels
+        };
         // Normalise inbound_protocol to a fixed `&'static str` set at
         // the boundary (audit MEDIUM-3). This both kills the heap
         // alloc per call AND pins prometheus cardinality at the type
@@ -1175,14 +1203,18 @@ mod tests {
         sink.try_emit(
             "chat",
             UsageEvent {
-                status_code: 200,
+                status_code: 429,
                 inbound_protocol: "openai".into(),
+                // Attribution the sink reads off the event itself, not off
+                // the label set the handler built.
+                user_id: "member-1".into(),
                 ..Default::default()
             },
             UsageEventLabels {
                 model: "customer-chat",
                 provider_key_id: "pk-1",
                 provider_key_name: "openai-prod",
+                user_id: "unknown",
                 upstream_protocol: "openai",
             },
         );
@@ -1196,6 +1228,11 @@ mod tests {
                 ("model", "customer-chat"),
                 ("provider_key_id", "pk-1"),
                 ("provider_key_name", "openai-prod"),
+                ("user_id", "member-1"),
+                // The raw code sits beside the family, so a query can name
+                // one failure mode without giving up the family rollup.
+                ("status_code", "4xx"),
+                ("status", "429"),
             ],
         );
         let dropped = parse_counter_value(
@@ -1206,6 +1243,7 @@ mod tests {
                 ("model", "customer-chat"),
                 ("provider_key_id", "pk-1"),
                 ("provider_key_name", "openai-prod"),
+                ("user_id", "member-1"),
             ],
         );
         assert_eq!(
