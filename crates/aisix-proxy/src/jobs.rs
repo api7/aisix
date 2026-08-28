@@ -623,7 +623,11 @@ fn emit_job_usage_event(
     };
     let pk = crate::usage_attr::ResolvedPk::resolve(snap, &target.pk_entry.id);
     crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
-    crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
+    crate::usage_attr::apply_caller_identity(
+        &mut event,
+        auth.jwt.as_ref(),
+        auth.key().user_id.as_deref(),
+    );
     let usage_model =
         crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
     crate::usage_attr::emit_usage(
@@ -1802,6 +1806,7 @@ fn maybe_attribute_batch(
 
     let state = state.clone();
     let api_key_id = auth.entry.id.clone();
+    let user_id = auth.entry.value.user_id.clone();
     let jwt = auth.jwt.clone();
     let model_id = target.model_entry.id.clone();
     let display_name = target.display_name().to_string();
@@ -1818,6 +1823,7 @@ fn maybe_attribute_batch(
             &state,
             &api_key_id,
             jwt.as_ref(),
+            user_id.as_deref(),
             &model_id,
             &display_name,
             cost.as_ref(),
@@ -1850,6 +1856,7 @@ async fn attribute_batch_usage(
     state: &ProxyState,
     api_key_id: &str,
     jwt: Option<&std::sync::Arc<crate::auth::JwtIdentity>>,
+    user_id: Option<&str>,
     model_id: &str,
     display_name: &str,
     cost: Option<&aisix_core::models::model::ModelCost>,
@@ -1962,7 +1969,7 @@ async fn attribute_batch_usage(
         crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
         // Attribution names the identity that observed completion — the
         // same caller the event's api_key_id already reflects.
-        crate::usage_attr::apply_jwt_identity(&mut event, jwt);
+        crate::usage_attr::apply_caller_identity(&mut event, jwt, user_id);
         let usage_model =
             crate::usage_attr::usage_event_model_label(&snap, &event.requested_model).into_owned();
         state.usage_sink.try_emit(

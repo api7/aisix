@@ -889,7 +889,11 @@ fn emit_a2a_usage(
         guardrail_blocked,
         ..Default::default()
     };
-    crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
+    crate::usage_attr::apply_caller_identity(
+        &mut event,
+        auth.jwt.as_ref(),
+        auth.key().user_id.as_deref(),
+    );
     // The client-perceived duration of the call. Nothing else records it for
     // `/a2a`: the handler returns the moment a stream's response head is out,
     // so `aisix_proxy_request_duration_seconds` times only how long a stream

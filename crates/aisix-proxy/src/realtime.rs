@@ -849,7 +849,11 @@ async fn run_session(
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
-    crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
+    crate::usage_attr::apply_caller_identity(
+        &mut event,
+        auth.jwt.as_ref(),
+        auth.key().user_id.as_deref(),
+    );
     let usage_model =
         crate::usage_attr::usage_event_model_label(&snap, &event.requested_model).into_owned();
     crate::usage_attr::emit_usage(

@@ -3035,7 +3035,11 @@ fn emit_usage_event(
         guardrail_enforced_hits: crate::usage_attr::terminal_enforced_hits(terminal, audit),
         ..Default::default()
     };
-    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
+    crate::usage_attr::apply_caller_identity(
+        &mut event,
+        client.jwt.as_ref(),
+        client.caller.user_id.as_deref(),
+    );
     let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
     crate::usage_attr::emit_usage(
         state,
@@ -3160,7 +3164,11 @@ fn emit_zero_token_event(
         guardrail_blocked: terminal && guardrail_blocked,
         ..Default::default()
     };
-    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
+    crate::usage_attr::apply_caller_identity(
+        &mut event,
+        client.jwt.as_ref(),
+        client.caller.user_id.as_deref(),
+    );
     let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
     crate::usage_attr::emit_usage(
         state,
