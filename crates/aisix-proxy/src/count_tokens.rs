@@ -328,7 +328,14 @@ async fn screen_input(
         ));
     }
     // Mask-action rules rewrite the body that is about to be forwarded.
-    crate::redact::redact_anthropic_request(&chain, body);
+    // Merged, not discarded: `/v1/messages` merges the same pass into the
+    // counts its event reports (#932), and the two routes screen the same
+    // body with the same chain — a mask this side under-reported would
+    // read as the sibling route masking more of the same payload.
+    crate::redact::merge_counts(
+        &mut screening.redactions,
+        crate::redact::redact_anthropic_request(&chain, body),
+    );
     Ok(())
 }
 
@@ -929,6 +936,89 @@ mod tests {
             .header("content-type", "application/json")
             .body(axum::body::Body::from(body.to_string()))
             .unwrap()
+    }
+
+    /// AISIX-Cloud#1435: the served request leaves a row, and that row
+    /// carries what the guardrail chain did to the body.
+    ///
+    /// The mask count is the part worth pinning. `/v1/messages` merges the
+    /// post-block-check masking pass into the counts its event reports
+    /// (#932), and this route screens the same body with the same chain —
+    /// so a mask counted on one and not the other reads as the sibling
+    /// route masking more of the same payload. It is also invisible from
+    /// the audit side: the enforced hit carries its own copy, so a reader
+    /// checking only that would see the mask recorded while the field
+    /// cp-api persists stayed empty. The upstream answers
+    /// `input_tokens: 42`, which must NOT become spend: it measures a
+    /// prompt, it does not consume one.
+    #[tokio::test]
+    async fn a_served_request_emits_a_zero_token_row_carrying_the_mask_it_applied() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 42})),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(anthropic_model("ct-mask"));
+        snap.apikeys.insert(apikey_entry(&["ct-mask"]));
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{
+                "name": "eda-mask",
+                "kind": "pii",
+                "hook_point": "input",
+                "detectors": [],
+                "custom_patterns": [
+                    {"name": "eda_version", "regex": "version\\s*:\\s*(\\d+(?:\\.\\d+)+)", "action": "mask", "replacement": "***"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        snap.guardrails.insert(ResourceEntry::new("g-mask", row, 1));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized(
+            "anthropic",
+            Arc::new(aisix_provider_anthropic::AnthropicBridge::new()),
+        );
+        let handle = SnapshotHandle::new(snap);
+        let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone(), None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, hub, &cfg())
+                .without_cache()
+                .with_guardrail_index(index)
+                .with_usage_sink(UsageSink::new(tx)),
+        );
+
+        let res = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "ct-mask",
+                "messages": [{ "role": "user", "content": "version: 9.9.9" }],
+            })))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("count_tokens must emit a usage event")
+            .expect("channel open");
+        assert_eq!(event.status_code, 200);
+        assert_eq!(event.inbound_protocol, "anthropic");
+        assert_eq!(event.requested_model, "ct-mask");
+        assert_eq!(event.prompt_tokens, 0);
+        assert_eq!(event.completion_tokens, 0);
+        assert_eq!(
+            event.redacted_entity_counts.get("eda_version").copied(),
+            Some(1),
+            "the mask this route applied is missing from its own row: {event:?}",
+        );
     }
 
     /// Mixed group [anthropic, openai]: the openai target is `continue`d
