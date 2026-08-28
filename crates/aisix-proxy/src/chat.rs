@@ -4409,7 +4409,11 @@ fn emit_usage_event(
         // MCP attribution does not apply to the chat path.
         ..Default::default()
     };
-    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
+    crate::usage_attr::apply_caller_identity(
+        &mut event,
+        client.jwt.as_ref(),
+        client.caller.user_id.as_deref(),
+    );
     // Guardrail outcome counters (#379). Recorded here — the one place every
     // chat path (success / error / streaming / cache-hit) funnels through —
     // from the same guardrail fields the UsageEvent carries.

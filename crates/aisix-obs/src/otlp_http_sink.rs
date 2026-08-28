@@ -822,6 +822,12 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
         // spans back to the AISIX api_key dashboard.
         attributes.push(attr_string("aisix.api_key_id", &event.api_key_id));
     }
+    // The org member behind the credential (AISIX-Cloud#1389). Exported
+    // beside the key rather than derived from it downstream: a member can
+    // hold several keys, and a key can be rebound to someone else.
+    if !event.user_id.is_empty() {
+        attributes.push(attr_string("aisix.user_id", &event.user_id));
+    }
     if !event.model_id.is_empty() {
         attributes.push(attr_string("aisix.model_id", &event.model_id));
     }

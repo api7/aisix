@@ -2996,7 +2996,11 @@ fn emit_anthropic_usage_event(
     };
     // Handler label "messages" — Anthropic /v1/messages inbound
     // path. Bucketed prometheus counter (#408).
-    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
+    crate::usage_attr::apply_caller_identity(
+        &mut event,
+        client.jwt.as_ref(),
+        client.caller.user_id.as_deref(),
+    );
     let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
     // The metric code below still reads `event`, so the chokepoint gets
     // its own copy (it stamps `trace_id` on the emitted one).

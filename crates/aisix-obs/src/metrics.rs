@@ -259,8 +259,14 @@ pub const M_GUARDRAIL_LATENCY_SECONDS: &str = "aisix_guardrail_latency_seconds";
 /// - `handler`: which OpenAI-shape handler emitted (chat /
 ///   embeddings / responses / completions / rerank / audio /
 ///   images / messages). Fixed enumeration, low cardinality.
-/// - `status_code`: bucketed as `2xx` / `4xx` / `5xx` (avoid the
-///   1000-value cardinality blowup of raw u16 codes).
+/// - `status_code`: bucketed as `2xx` / `4xx` / `5xx`.
+/// - `http_status_code`: the raw code (`429`, `502`, ...), so a query can
+///   name one failure mode instead of a whole family (AISIX-Cloud#1389).
+///   It adds no series over `status_code` alone — the raw code determines
+///   the family — and `status_code` is kept so existing dashboards and
+///   alerts written against `status_code="4xx"` keep working unchanged.
+/// - `user_id`: the org member behind the request, from
+///   [`UsageEventLabels`].
 /// - `inbound_protocol`: `openai` / `anthropic`. Matches the
 ///   wire-level field on UsageEvent.
 /// - `upstream_protocol`: the wire protocol of the ProviderKey the event
@@ -2013,8 +2019,11 @@ impl Metrics {
     /// that invariant exists only on dimensions BOTH sides carry. The
     /// protocol is a function of the ProviderKey row `provider_key_id`
     /// already names, so like `provider_key_name` it adds no series here.
-    /// (`handler` / `status_code` / `inbound_protocol` are the emit
-    /// counter's own arguments, not attribution, and stay one-sided.)
+    /// (`handler` / `status_code` / `http_status_code` / `inbound_protocol`
+    /// are the emit counter's own arguments, not attribution, and stay
+    /// one-sided — `emitted == delivered + dropped` is an invariant over
+    /// the attribution dimensions, which is why `user_id` DOES appear on
+    /// both.)
     pub fn record_usage_event_drop(&self, reason: &str, labels: UsageEventLabels<'_>) {
         self.cached_counter(
             M_USAGE_EVENT_DROPS_TOTAL,
@@ -2024,6 +2033,7 @@ impl Metrics {
                 k.label(labels.model);
                 k.label(labels.provider_key_id);
                 k.label(labels.provider_key_name);
+                k.label(labels.user_id);
                 k.label(labels.upstream_protocol);
             },
             || {
@@ -2033,6 +2043,7 @@ impl Metrics {
                     "model" => labels.model.to_string(),
                     "provider_key_id" => labels.provider_key_id.to_string(),
                     "provider_key_name" => labels.provider_key_name.to_string(),
+                    "user_id" => labels.user_id.to_string(),
                     "upstream_protocol" => labels.upstream_protocol.to_string(),
                 )
             },
@@ -2068,16 +2079,19 @@ impl Metrics {
         labels: UsageEventLabels<'_>,
     ) {
         let status_class = status_bucket(status_code);
+        let http_status_code = status_code.to_string();
         self.cached_counter(
             M_USAGE_EVENT_EMITS_TOTAL,
             1,
             |k| {
                 k.label(handler);
                 k.label(status_class);
+                k.label(&http_status_code);
                 k.label(inbound_protocol);
                 k.label(labels.model);
                 k.label(labels.provider_key_id);
                 k.label(labels.provider_key_name);
+                k.label(labels.user_id);
                 k.label(labels.upstream_protocol);
             },
             || {
@@ -2085,11 +2099,13 @@ impl Metrics {
                     M_USAGE_EVENT_EMITS_TOTAL,
                     "handler" => handler,
                     "status_code" => status_class,
+                    "http_status_code" => http_status_code.clone(),
                     "inbound_protocol" => inbound_protocol,
                     "upstream_protocol" => labels.upstream_protocol.to_string(),
                     "model" => labels.model.to_string(),
                     "provider_key_id" => labels.provider_key_id.to_string(),
                     "provider_key_name" => labels.provider_key_name.to_string(),
+                    "user_id" => labels.user_id.to_string(),
                 )
             },
         );
@@ -2683,6 +2699,19 @@ pub struct UsageEventLabels<'a> {
     pub model: &'a str,
     pub provider_key_id: &'a str,
     pub provider_key_name: &'a str,
+    /// Org member the authenticating key belongs to (AISIX-Cloud#1389) —
+    /// the same `user_id` `aisix_proxy_requests_total` carries, so a
+    /// member's request rate and their usage-event rate slice alike, and
+    /// the readable `user_name` is joinable from that family rather than
+    /// duplicated here. `unknown` when the key is bound to no member, or
+    /// when auth never resolved a key.
+    ///
+    /// This is attribution, so it sits on BOTH counters: "which member's
+    /// usage records were lost" is exactly the question the shared label
+    /// set exists to keep answerable. `UsageSink::try_emit` fills it from
+    /// the event's own `user_id`, so the counter and the row cp-api
+    /// persists can never name different people.
+    pub user_id: &'a str,
     /// The upstream wire protocol of the key named by `provider_key_id`
     /// (AISIX-Cloud#1403) — the same value, resolved the same way, that
     /// the request and usage families carry, so an operator can align
@@ -2703,6 +2732,7 @@ impl Default for UsageEventLabels<'_> {
             model: "unknown",
             provider_key_id: "unknown",
             provider_key_name: "unknown",
+            user_id: "unknown",
             upstream_protocol: "unknown",
         }
     }
@@ -4281,6 +4311,7 @@ mod tests {
         model: "gpt-4o",
         provider_key_id: "pk-1",
         provider_key_name: "openai-prod",
+        user_id: "member-1",
         upstream_protocol: "openai",
     };
 
@@ -4349,14 +4380,14 @@ mod tests {
 
         assert!(
             rendered.contains(
-                "handler=\"messages\",status_code=\"2xx\",\
+                "handler=\"messages\",status_code=\"2xx\",http_status_code=\"200\",\
                  inbound_protocol=\"anthropic\",upstream_protocol=\"openai\""
             ),
             "cross-protocol sample must report the upstream's protocol:\n{rendered}"
         );
         assert!(
             rendered.contains(
-                "handler=\"chat\",status_code=\"4xx\",\
+                "handler=\"chat\",status_code=\"4xx\",http_status_code=\"401\",\
                  inbound_protocol=\"openai\",upstream_protocol=\"unknown\""
             ),
             "an unresolved upstream must read `unknown`, never borrow the \
@@ -4414,16 +4445,23 @@ mod tests {
         };
         // The emit counter's own arguments — a surface of the emitting
         // handler, not of the event's attribution.
-        let emit_only: BTreeSet<String> = ["handler", "status_code", "inbound_protocol"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        let emit_only: BTreeSet<String> = [
+            "handler",
+            "status_code",
+            "http_status_code",
+            "inbound_protocol",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
         let attribution: BTreeSet<String> = labels_of(M_USAGE_EVENT_EMITS_TOTAL)
             .difference(&emit_only)
             .cloned()
             .collect();
         assert!(
-            attribution.contains("model") && attribution.contains("provider_key_id"),
+            attribution.contains("model")
+                && attribution.contains("provider_key_id")
+                && attribution.contains("user_id"),
             "the attribution set looks wrong: {attribution:?}"
         );
 
