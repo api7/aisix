@@ -68,6 +68,7 @@ fn snapshot() -> AisixSnapshot {
         "key_hash": CALLER_HASH,
         "allowed_models": ["*"],
         "allowed_routes": ["*"],
+        "allowed_agents": ["*"],
     }))
     .expect("valid api key");
     snap.apikeys.insert(ResourceEntry::new("ak-1", key, 1));
@@ -137,6 +138,15 @@ fn snapshot() -> AisixSnapshot {
         let model: aisix_core::Model = serde_json::from_value(value).expect("valid model");
         snap.models.insert(ResourceEntry::new(id, model, 1));
     }
+
+    let agent: aisix_core::A2aAgent = serde_json::from_value(serde_json::json!({
+        "name": "agent-under-test",
+        "url": format!("{DEAD_UPSTREAM}/a2a"),
+        "enabled": true,
+    }))
+    .expect("valid a2a agent");
+    snap.a2a_agents
+        .insert(ResourceEntry::new("agent-1", agent, 1));
 
     let route: aisix_core::PassthroughRoute = serde_json::from_value(serde_json::json!({
         "name": "byo-tunnel",
@@ -252,6 +262,30 @@ fn fixture(surface: &str, text: &str) -> Request<Body> {
             surface,
             serde_json::json!({ "model": "gpt-under-test", "prompt": text }),
         ),
+        // JSON-RPC rather than an OpenAI envelope: the screened text is
+        // `params.message`, the only caller-authored content A2A carries.
+        "/a2a" => Request::builder()
+            .method("POST")
+            .uri("/a2a/agent-under-test")
+            .header("authorization", format!("Bearer {CALLER}"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "message/send",
+                    "params": {
+                        "message": {
+                            "role": "user",
+                            "parts": [{ "kind": "text", "text": text }],
+                            "messageId": "m-1",
+                        },
+                    },
+                })
+                .to_string(),
+            ))
+            .unwrap(),
         // The passthrough tunnel forwards the body verbatim, so its
         // screened text is whatever the detected envelope carries.
         "/passthrough/byo" => json(
@@ -285,6 +319,7 @@ const SURFACES: &[&str] = &[
     "/v1/audio/speech",
     "/v1/videos",
     "/passthrough/byo",
+    "/a2a",
 ];
 
 /// Drive one fixture and collect every usage event it emitted.
@@ -336,13 +371,18 @@ async fn a_guardrail_refusal_is_marked_on_every_surface() {
             ));
             continue;
         }
-        // A refusal costs the caller nothing: no upstream ran.
-        for event in &events {
-            if event.prompt_tokens != 0 || event.completion_tokens != 0 {
-                wrong.push(format!(
-                    "{surface}: refused request billed {}+{} tokens",
-                    event.prompt_tokens, event.completion_tokens
-                ));
+        // A refusal costs the caller nothing: no upstream ran. `/a2a` is
+        // exempt because its counters are the gateway's own reading of the
+        // words, flagged `usage_estimated` and never charged — they are
+        // filled from the request before the chain even runs.
+        if *surface != "/a2a" {
+            for event in &events {
+                if event.prompt_tokens != 0 || event.completion_tokens != 0 {
+                    wrong.push(format!(
+                        "{surface}: refused request billed {}+{} tokens",
+                        event.prompt_tokens, event.completion_tokens
+                    ));
+                }
             }
         }
     }
