@@ -58,14 +58,30 @@ customer runs. Two things follow, and both belong to the release flow:
 - **The release tag is the first build to run the PGO pipeline on that
   commit**, so a training-shape regression surfaces *after* QA has passed —
   the most expensive moment to find it, since the fix moves the commit and
-  costs a fresh rc plus a re-run of QA. Pre-flight it instead: once the
-  release commit is final and before tagging, run the `docker-image`
-  workflow via `workflow_dispatch` on that commit with **pgo = true**. It
+  costs a fresh rc plus a re-run of QA. Pre-flight it instead, and do it
+  **concurrently, not as a gate before tagging**: the check needs only the
+  candidate's commit, which `vX.Y.Z-rc.N` already fixes, so fire it as soon
+  as the candidate is cut and read the verdict when you come to tag. It
   builds the exact three-phase path and asserts the proof marker, publishing
-  only a `:sha-<short>` tag that moves no pointer.
+  only a `:sha-<short>` tag that moves no pointer — and it finishes well
+  inside the QA window, so it costs no extra wall clock. Blocking on it at
+  tag time would put ~30 minutes on the critical path of every release for a
+  result that was already knowable hours earlier.
+
+`--ref` takes a **branch or tag name, never a raw commit SHA**, so dispatch on
+the release line's branch — at this point its HEAD *is* the candidate commit.
+Do NOT dispatch on the `vX.Y.Z-rc.N` tag: a tag ref makes metadata-action
+re-emit the candidate's own image tags, republishing the very artifact QA is
+testing as a PGO'd build QA never saw. A branch ref publishes one GHCR
+`:sha-<short>` and nothing else.
 
 ```bash
-gh workflow run docker-image.yml --ref <release-sha> -f pgo=true
+# when the candidate is cut — fire and carry on
+gh workflow run docker-image.yml --ref release/<X.Y> -f pgo=true
+# confirm it caught the candidate commit and not a later push to the branch
+gh run list --workflow=docker-image.yml --limit 1 --json databaseId,headSha --jq '.[0]'
+# when you come to tag — a lookup, not a wait
+gh run view <run-id> --json conclusion --jq .conclusion
 ```
 
 A PR that touches `Dockerfile`, `Cargo.toml`, `Cargo.lock`,
