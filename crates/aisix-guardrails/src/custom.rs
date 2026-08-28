@@ -1190,7 +1190,7 @@ enum ScriptOutcome {
 /// WHICH mistake their script is making — "you returned an action I do not
 /// know" and "you returned nothing at all" need different fixes, and
 /// neither is "your screening service is down".
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum ScriptFailure {
     /// The wall-clock budget elapsed, or the interrupt handler fired.
     Timeout,
