@@ -174,8 +174,10 @@ pub struct IncomingRejection {
 
 /// One partially compatible observation, aggregated per (kind, field):
 /// `count` resources of `resource_kind` are currently served with `field`
-/// ignored because this gateway version does not know it — typically a
-/// field added by a newer control plane (issue #871). Shown next to
+/// ignored because this gateway version does not know it — a field the
+/// control plane added after this build, or one this build retired after
+/// the control plane; the two are indistinguishable from here (issue
+/// #871, AISIX-Cloud#1435). Shown next to
 /// `rejected[]` on `GET /status/config` so a matching `config_hash` can
 /// never silently hide that enforcement differs from the stored
 /// documents.

@@ -392,8 +392,10 @@ pub const M_CONFIG_RELOAD_FAILURES_TOTAL: &str = "aisix_config_reload_failures_t
 pub const M_CONFIG_REJECTED_RESOURCES: &str = "aisix_config_rejected_resources";
 /// Served resources per kind carrying fields this gateway version does not
 /// know (loaded with those fields ignored — partially compatible, #871).
-/// Non-zero typically means a newer control plane is writing ahead of this
-/// data plane's rollout.
+/// Non-zero means this data plane and the control plane writing to it are
+/// not the same generation; which one is ahead is not knowable from here
+/// (AISIX-Cloud#1435), since a field this build retired is as unknown to
+/// it as one it has never seen.
 pub const M_CONFIG_PARTIALLY_COMPATIBLE_RESOURCES: &str =
     "aisix_config_partially_compatible_resources";
 /// Served resources per kind whose latest source bytes are rejected and

@@ -965,6 +965,57 @@ impl Guardrail for LiveGuardrailChain {
 ///
 /// The resulting index is pre-sorted by priority (descending) so
 /// `GuardrailIndex::resolve` can walk it linearly.
+/// INFO once per guardrail id for the process lifetime.
+///
+/// The index is rebuilt on every snapshot version change, and this arm
+/// describes a STANDING property of a row — it has no attachment records —
+/// not an event. Logging it per build re-stated the same unchanged fact on
+/// every configuration write in the environment, once per affected
+/// guardrail, which is what AISIX-Cloud#1435 saw on a busy deployment.
+///
+/// Deduped rather than demoted: the fallback means the row governs every
+/// request in the environment because nobody scoped it, which is worth
+/// saying out loud — once.
+fn log_implicit_env_scope_once(id: &str, name: &str) {
+    if !implicit_env_scope_first_seen(id) {
+        return;
+    }
+    tracing::info!(
+        guardrail_id = %id,
+        guardrail_name = %name,
+        "guardrail has no attachment rows; applying as implicit env-scope at priority 0 (backward-compat rolling-upgrade window)",
+    );
+}
+
+/// The memory behind [`log_implicit_env_scope_once`], split out so the
+/// once-per-id rule can be tested without a tracing subscriber.
+///
+/// `true` the first time an id is seen, `false` afterwards.
+fn implicit_env_scope_first_seen(id: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    // Same shape and same cap as `warn_partial_compat_deduped` in
+    // aisix-etcd: past the cap new ids keep logging rather than being
+    // silently dropped, so the memory bound never costs a signal.
+    const MAX_REMEMBERED: usize = 1024;
+    static LOGGED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+    // Poison-tolerant: this set only dedupes log lines, so a panic while
+    // the lock was held must not wedge every later index build.
+    let mut logged = LOGGED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if logged.contains(id) {
+        return false;
+    }
+    if logged.len() < MAX_REMEMBERED {
+        logged.insert(id.to_string());
+    }
+    true
+}
+
 pub fn build_index_from_snapshot(
     guardrails: &ResourceTable<DomainGuardrail>,
     attachments: &ResourceTable<GuardrailAttachment>,
@@ -1082,11 +1133,7 @@ pub fn build_index_from_snapshot(
         }
         match build_one(row, bedrock_endpoint_url, embedder) {
             Ok(Some(g)) => {
-                tracing::info!(
-                    guardrail_id = %guardrail_arc.id,
-                    guardrail_name = %row.name,
-                    "guardrail has no attachment rows; applying as implicit env-scope at priority 0 (backward-compat rolling-upgrade window)",
-                );
+                log_implicit_env_scope_once(&guardrail_arc.id, &row.name);
                 entries.push(GuardrailIndex::push_entry(
                     guardrail_arc.id.clone(),
                     row.name.clone(),
@@ -1266,6 +1313,30 @@ mod tests {
     use aisix_core::models::Guardrail as DomainGuardrail;
     use aisix_core::resource::ResourceEntry;
     use aisix_gateway::{ChatFormat, ChatMessage};
+
+    /// AISIX-Cloud#1435: the implicit env-scope notice is a standing
+    /// property of a row, and the index is rebuilt on every snapshot
+    /// version change — so logging it per build restated the same
+    /// unchanged fact once per affected guardrail on every configuration
+    /// write in the environment.
+    ///
+    /// Ids are unique to this test: the memory is process-global, so a
+    /// shared id would make the result depend on which test ran first.
+    #[test]
+    fn the_implicit_env_scope_notice_is_logged_once_per_guardrail() {
+        assert!(
+            implicit_env_scope_first_seen("g-1435-a"),
+            "the first sighting of a guardrail must be reported",
+        );
+        assert!(
+            !implicit_env_scope_first_seen("g-1435-a"),
+            "a later index rebuild must not restate an unchanged fact",
+        );
+        assert!(
+            implicit_env_scope_first_seen("g-1435-b"),
+            "the dedupe is per guardrail — a different row is its own notice",
+        );
+    }
 
     fn entry(_name: &str, id: &str, row: DomainGuardrail) -> ResourceEntry<DomainGuardrail> {
         // `name` is documentary at the call site; the row's own
