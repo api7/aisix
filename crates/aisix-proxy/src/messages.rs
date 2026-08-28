@@ -1501,7 +1501,16 @@ async fn anthropic_passthrough_dispatch(
                     // as 499, matching LiteLLM. The upstream work still
                     // happened, so the event is emitted either way — only
                     // its outcome differs.
-                    if usage.reached_end {
+                    //
+                    // A guardrail refusal is not an abandonment, whatever
+                    // `reached_end` says: the hold-back-overflow arm returns
+                    // mid-stream, so the flag is the only thing that tells
+                    // "the gateway ended this" from "the caller went away".
+                    // chat.rs reaches 200 here by `break`ing to its
+                    // end-of-upstream marker instead; same answer, and this
+                    // way `reached_end` keeps meaning what it says
+                    // (AISIX-Cloud#1428).
+                    if usage.reached_end || usage.guardrail_blocked {
                         200
                     } else {
                         crate::CLIENT_CLOSED_REQUEST
@@ -2156,8 +2165,9 @@ async fn cross_provider_dispatch(
                     user_id_for_telem.as_deref(),
                     user_name_for_telem.as_deref(),
                     // See the sibling passthrough path: an abandoned stream
-                    // is reported as 499, matching LiteLLM.
-                    if comp.reached_end {
+                    // is reported as 499, matching LiteLLM — and a guardrail
+                    // refusal is not an abandonment.
+                    if comp.reached_end || comp.guardrail_blocked {
                         200
                     } else {
                         crate::CLIENT_CLOSED_REQUEST
@@ -5939,6 +5949,98 @@ data: [DONE]\n\n";
             // customer was charged for would be the wrong repair.
             assert_eq!(event.prompt_tokens, 11, "{relay}");
             assert_eq!(event.completion_tokens, 9, "{relay}");
+            // A refusal is not an abandonment. Both relays report the 200 the
+            // caller's response head already committed, which is what
+            // `/v1/chat/completions` records for the same event.
+            assert_eq!(event.status_code, 200, "{relay}");
         }
+    }
+
+    /// AISIX-Cloud#1428: the hold-back OVERFLOW arm — a response too large to
+    /// buffer for scanning, which fails closed — is a guardrail refusal too,
+    /// and must not be filed as a client abandonment.
+    ///
+    /// This arm returns mid-stream, before the upstream-EOF marker, so
+    /// `reached_end` stays false and the row used to report `499`: "the
+    /// caller went away". Nobody went away — the gateway refused. chat.rs
+    /// gets 200 here by `break`ing out to its EOF marker; this reaches the
+    /// same answer off the flag, which leaves `reached_end` meaning what its
+    /// doc says.
+    #[tokio::test]
+    async fn streaming_holdback_overflow_is_a_block_not_an_abandonment() {
+        use aisix_obs::UsageSink;
+
+        // Past DEFAULT_STREAM_OUTPUT_BUFFER_BYTES (256 KiB) of held text,
+        // and deliberately clean: the cap, not the content, is what refuses.
+        let big = "x".repeat(300_000);
+        let upstream = MockServer::start().await;
+        let sse = format!(
+            "\
+event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_big\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null,\"usage\":{{\"input_tokens\":11,\"output_tokens\":1}}}}}}\n\n\
+event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{big}\"}}}}\n\n\
+event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":9}}}}\n\n\
+event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("my-claude"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        // A row whose streamed-output policy is the whole-response hold-back;
+        // the literal never appears, so only the cap can refuse.
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"out-block","enabled":true,"kind":"keyword","hook_point":"output","fail_open":false,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        snap.guardrails.insert(ResourceEntry::new("g-out", row, 1));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "my-claude",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100,
+                "stream": true,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let streamed =
+            String::from_utf8(to_bytes(resp.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+        assert!(
+            streamed.contains(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+            "the oversized stream must fail closed: {}",
+            &streamed[..streamed.len().min(400)]
+        );
+        assert!(
+            !streamed.contains(&big),
+            "unscannable content must not be released"
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(1000), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("usage event sender dropped");
+        assert!(event.guardrail_blocked);
+        assert_eq!(
+            event.status_code, 200,
+            "a fail-closed refusal is not a client abandonment"
+        );
     }
 }

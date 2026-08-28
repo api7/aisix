@@ -405,6 +405,16 @@ async fn an_ordinary_failure_is_not_marked_as_a_guardrail_block() {
             wrong.push(format!("{surface}: clean text was refused ({status})"));
             continue;
         }
+        // Without this the control is vacuous: a fixture that stopped
+        // before the handler ran — a stale key hash, a rejected body, a
+        // missing model row — emits nothing, and "no event is marked" is
+        // trivially satisfied by having no event.
+        if events.is_empty() {
+            wrong.push(format!(
+                "{surface}: clean run emitted no usage event, so nothing was checked"
+            ));
+            continue;
+        }
         if let Some(event) = events.iter().find(|e| e.guardrail_blocked) {
             wrong.push(format!(
                 "{surface}: {} marked guardrail_blocked on a {} that no guardrail refused",

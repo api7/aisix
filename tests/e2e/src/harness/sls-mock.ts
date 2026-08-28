@@ -155,6 +155,13 @@ function readVarint(buf: Buffer, pos: number): [number, number] {
   let result = 0;
   let shift = 0;
   for (;;) {
+    // Past the end `buf[pos]` is `undefined`, and `undefined & 0x80` is 0 —
+    // so the loop would exit with a wrong value and an advanced position,
+    // and the mis-parse would surface much later as an opaque
+    // `waitForSlsLog` timeout instead of naming the truncated payload.
+    if (pos >= buf.length) {
+      throw new Error(`truncated varint at offset ${pos} of ${buf.length} bytes`);
+    }
     const b = buf[pos]!;
     pos += 1;
     result += (b & 0x7f) * 2 ** shift;
