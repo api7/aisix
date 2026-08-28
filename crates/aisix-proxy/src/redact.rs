@@ -212,9 +212,14 @@ pub async fn moderate_body(
     let collector = SegmentCollector::default();
     walk(&collector);
     let texts = collector.take();
-    if texts.is_empty() {
-        return non_segment_verdict;
-    }
+    // The pass runs even with zero collected slots. "Nothing to scan" is
+    // not "nothing to decide": a segment-moderating member may hold a
+    // verdict that does not depend on the text (a `kind: custom` policy
+    // script), and skipping the pass turned an operator's block rule into
+    // a silent allow on any request whose scannable slots were all empty.
+    // Every member that needs a remote call short-circuits empty input
+    // itself (bedrock/lakera/presidio/aliyun all refuse empty content), so
+    // consulting the chain here costs no provider round-trip.
     let mut outcome = match dir {
         Direction::Input => chain.moderate_input_segments(&texts).await,
         Direction::Output => chain.moderate_output_segments(&texts).await,

@@ -602,50 +602,72 @@ async fn dispatch(
     *applied_out = resolved_chain.applied().to_vec();
     *audit_out = resolved_chain.audit_log();
     if !resolved_chain.is_empty() {
-        if let Ok(chat) = aisix_provider_anthropic::parse_inbound_request(body) {
-            let (verdict, hits) = aisix_guardrails::Guardrail::check_input_non_segment_observed(
-                resolved_chain.as_ref(),
-                &chat,
-            )
-            .await;
-            monitor_hits_out.extend(hits);
-            // Segment pass: one Bedrock call over the body's text slots;
-            // an ANONYMIZE disposition writes the masked text back into
-            // the Anthropic-native body (#932 bedrock follow-up).
-            let verdict = crate::redact::moderate_body(
-                resolved_chain.as_ref(),
-                crate::redact::Direction::Input,
-                verdict,
-                redactions_out,
-                monitor_hits_out,
-                |g| crate::redact::redact_anthropic_request(g, body),
-            )
-            .await;
-            if let aisix_guardrails::GuardrailVerdict::Block {
-                reason,
-                guardrail_name,
-                unavailable,
-            } = verdict
-            {
-                // AISIX-Cloud#1013: mask before returning so the failure
-                // content capture exports post-mask text (see chat.rs).
-                crate::redact::merge_counts(
-                    redactions_out,
-                    crate::redact::redact_anthropic_request(resolved_chain.as_ref(), body),
-                );
+        // Fail CLOSED when the body cannot be parsed into something
+        // scannable. This used to be `if let Ok(chat) = ...`, so a shape
+        // the gateway's Anthropic parser rejects skipped the guardrail
+        // and was forwarded upstream anyway — the check was only as
+        // complete as the parser, and the parser lags the provider by
+        // construction. `/mcp` already takes this arm on an unscannable
+        // body; this is the same rule on the LLM side.
+        let chat = match aisix_provider_anthropic::parse_inbound_request(body) {
+            Ok(chat) => chat,
+            Err(err) => {
                 tracing::warn!(
                     guardrail_hook = "input",
                     model = %model_name,
-                    reason = %reason,
-                    "guardrail blocked /v1/messages request",
+                    error = %err,
+                    "cannot scan /v1/messages body for guardrails; blocking",
                 );
                 return Err(crate::error::guardrail_block_error(
                     "request",
-                    guardrail_name.as_deref(),
-                    unavailable.as_deref(),
+                    None,
+                    Some(crate::error::TAG_UNSCANNABLE_BODY),
                 )
                 .into());
             }
+        };
+        let (verdict, hits) = aisix_guardrails::Guardrail::check_input_non_segment_observed(
+            resolved_chain.as_ref(),
+            &chat,
+        )
+        .await;
+        monitor_hits_out.extend(hits);
+        // Segment pass: one Bedrock call over the body's text slots;
+        // an ANONYMIZE disposition writes the masked text back into
+        // the Anthropic-native body (#932 bedrock follow-up).
+        let verdict = crate::redact::moderate_body(
+            resolved_chain.as_ref(),
+            crate::redact::Direction::Input,
+            verdict,
+            redactions_out,
+            monitor_hits_out,
+            |g| crate::redact::redact_anthropic_request(g, body),
+        )
+        .await;
+        if let aisix_guardrails::GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+            unavailable,
+        } = verdict
+        {
+            // AISIX-Cloud#1013: mask before returning so the failure
+            // content capture exports post-mask text (see chat.rs).
+            crate::redact::merge_counts(
+                redactions_out,
+                crate::redact::redact_anthropic_request(resolved_chain.as_ref(), body),
+            );
+            tracing::warn!(
+                guardrail_hook = "input",
+                model = %model_name,
+                reason = %reason,
+                "guardrail blocked /v1/messages request",
+            );
+            return Err(crate::error::guardrail_block_error(
+                "request",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
+            )
+            .into());
         }
         // #932: mask-action PII rules rewrite the Anthropic-native body in
         // place AFTER the block check passes — both the passthrough and the

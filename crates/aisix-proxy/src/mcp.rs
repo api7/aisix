@@ -408,10 +408,11 @@ async fn dispatch(
             .unwrap_or_default();
         let chat =
             aisix_gateway::ChatFormat::new("", vec![aisix_gateway::ChatMessage::user(args_text)]);
-        // Segment-moderating members (semantic, Bedrock ANONYMIZE) are
-        // consulted through the segment pass below instead — the same
-        // check/moderate split every LLM family uses, so a member is
-        // never consulted (or billed) twice per hook.
+        // Segment-moderating members (custom scripts, Bedrock ANONYMIZE,
+        // Presidio, Lakera, Aliyun AI) are consulted through the segment
+        // pass below instead — the same check/moderate split every LLM
+        // family uses, so a member is never consulted (or billed) twice
+        // per hook.
         let (verdict, hits) =
             aisix_guardrails::Guardrail::check_input_non_segment_observed(chain, &chat).await;
         monitor_hits.extend(hits);
@@ -527,8 +528,8 @@ async fn dispatch(
         _ => bytes,
     };
     // Async segment-moderation pass over the same `params.arguments`
-    // string leaves the sync write-back covers (#1363): semantic rows —
-    // and any other segment-moderating member — mask through here. The
+    // string leaves the sync write-back covers (#1363): every
+    // segment-moderating member decides — and masks — through here. The
     // pass reuses the byte-splice walker, so the scan slots and the
     // write-back slots are the same set by construction (no fourth text
     // shape; the aisix#1027 scan/rewrite divergence is not widened).
@@ -801,7 +802,7 @@ async fn moderate_tool_arguments(
     .await
 }
 
-/// Run the chain's segment-moderating members (semantic rows, Bedrock
+/// Run the chain's segment-moderating members (custom scripts, Bedrock
 /// ANONYMIZE) over the string leaves `pred` selects (#1363): collect
 /// the decoded slots with the same byte-splice walker the write-back
 /// uses, moderate them in ONE chain pass, and splice the positionally
@@ -829,9 +830,10 @@ async fn moderate_selected_segments(
             unavailable: Some(crate::error::TAG_UNSCANNABLE_BODY.to_owned()),
         };
     }
-    if texts.is_empty() {
-        return SegmentPassOutcome::Keep;
-    }
+    // No early return on an empty collect walk — see `redact::moderate_body`.
+    // A `tools/call` with `"arguments": {}` has no string leaves, and
+    // returning `Keep` here meant a guardrail scoped to the MCP server was
+    // never consulted: the tool executed under an unconditional block rule.
     let mut outcome = if input {
         aisix_guardrails::Guardrail::moderate_input_segments(chain, &texts).await
     } else {
@@ -1051,7 +1053,7 @@ async fn apply_output_guardrails(
     // (`tool_result_path`; `name`/`uri` stay untouched — they address a
     // resource; see the scan-loop comment). Two write-back channels
     // compose: the sync per-field redactors (kind=pii mask rules), then
-    // the async segment pass (semantic rows, Bedrock ANONYMIZE) over
+    // the async segment pass (custom scripts, Bedrock ANONYMIZE) over
     // whatever the sync pass produced.
     let mut counts = crate::redact::RedactionCounts::new();
     let mut current: Option<Vec<u8>> = None;
