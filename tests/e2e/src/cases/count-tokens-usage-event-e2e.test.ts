@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   slsLogsFor,
   spawnApp,
@@ -49,11 +50,14 @@ const FORBIDDEN_WORD = "counttokensentinel";
 const MODEL_ALIAS = "ctu-e2e";
 const UPSTREAM_MODEL_ID = "claude-haiku-4-5-20251001";
 
-// The route emits no captured content, so rows are identified by the
-// outcome rather than by a marker planted in the prompt. One probe of each
-// kind therefore has to mean one row of each status.
-const rowsWithStatus = (sls: MockSls, status: string) =>
-  slsLogsFor(sls, LOGSTORE).filter((l) => l.get("status_code") === status);
+// The route emits no captured content, so a row cannot be found by a marker
+// planted in the prompt the way the sibling specs do. `x-aisix-request-id`
+// is the anchor instead: `ensure_request_id` is the outermost layer and
+// stamps it onto every response, short-circuited 4xx included, and it IS
+// the telemetry `request_id` — so each assertion pins the row its own
+// request produced rather than any row that happens to share a status.
+const rowsForRequest = (sls: MockSls, requestId: string) =>
+  slsLogsFor(sls, LOGSTORE).filter((l) => l.get("request_id") === requestId);
 
 describe("count_tokens usage e2e: served and refused requests both leave a row (#1435)", () => {
   let upstream: OpenAiUpstream | undefined;
@@ -61,7 +65,9 @@ describe("count_tokens usage e2e: served and refused requests both leave a row (
   let app: SpawnedApp | undefined;
   let etcdReachable = false;
 
-  async function countTokens(text: string): Promise<Response> {
+  async function countTokens(
+    text: string,
+  ): Promise<{ status: number; requestId: string }> {
     const res = await fetch(`${app!.proxyUrl}/v1/messages/count_tokens`, {
       method: "POST",
       headers: {
@@ -75,7 +81,10 @@ describe("count_tokens usage e2e: served and refused requests both leave a row (
       }),
     });
     await res.text();
-    return res;
+    return {
+      status: res.status,
+      requestId: res.headers.get("x-aisix-request-id") ?? "",
+    };
   }
 
   beforeAll(async () => {
@@ -134,7 +143,13 @@ describe("count_tokens usage e2e: served and refused requests both leave a row (
       allowed_models: [MODEL_ALIAS],
     });
 
-    await waitConfigPropagation(async () => (await countTokens("readiness")).status === 200);
+    // Independent of the route under test (tests/e2e/AGENTS.md). Gating on
+    // count_tokens itself would make a regression in it surface as a
+    // propagation timeout in `beforeAll` instead of a failed assertion, and
+    // every gate attempt would plant a served row the first test could then
+    // match instead of its own.
+    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
   });
 
   afterAll(async () => {
@@ -148,17 +163,18 @@ describe("count_tokens usage e2e: served and refused requests both leave a row (
       ctx.skip();
       return;
     }
-    const before = slsLogsFor(sls, LOGSTORE).length;
     const res = await countTokens("how long is this prompt");
     expect(res.status).toBe(200);
+    expect(res.requestId).not.toBe("");
 
     const log = await waitForSlsLog(
       sls,
       LOGSTORE,
-      (l) => l.get("status_code") === "200",
+      (l) => l.get("request_id") === res.requestId,
       "served count_tokens usage row",
       15_000,
     );
+    expect(log.get("status_code")).toBe("200");
     expect(log.get("requested_model")).toBe(MODEL_ALIAS);
     expect(log.get("inbound_protocol")).toBe("anthropic");
     expect(log.get("guardrail_blocked")).not.toBe("true");
@@ -166,7 +182,8 @@ describe("count_tokens usage e2e: served and refused requests both leave a row (
     // the prompt, not consumption, so it must not become spend.
     expect(log.get("prompt_tokens") ?? "0").toBe("0");
     expect(log.get("completion_tokens") ?? "0").toBe("0");
-    expect(slsLogsFor(sls, LOGSTORE).length).toBeGreaterThan(before);
+    // One request, one row.
+    expect(rowsForRequest(sls, res.requestId)).toHaveLength(1);
   });
 
   test("a refused count_tokens reaches the Blocked view", async (ctx) => {
@@ -176,22 +193,24 @@ describe("count_tokens usage e2e: served and refused requests both leave a row (
     }
     const res = await countTokens(`please ${FORBIDDEN_WORD} now`);
     expect(res.status).toBe(422);
+    expect(res.requestId).not.toBe("");
 
     const log = await waitForSlsLog(
       sls,
       LOGSTORE,
-      (l) => l.get("status_code") === "422",
+      (l) => l.get("request_id") === res.requestId,
       "refused count_tokens usage row",
       15_000,
     );
     // The predicate the dashboard's "Guardrail blocks" view filters on.
     expect(log.get("guardrail_blocked")).toBe("true");
+    expect(log.get("status_code")).toBe("422");
     expect(log.get("requested_model")).toBe(MODEL_ALIAS);
     expect(log.get("inbound_protocol")).toBe("anthropic");
     // Refused before dispatch, so nothing was sent and nothing is owed.
     expect(log.get("prompt_tokens") ?? "0").toBe("0");
     expect(log.get("completion_tokens") ?? "0").toBe("0");
     // One refusal, one row — not one per resolved target.
-    expect(rowsWithStatus(sls, "422")).toHaveLength(1);
+    expect(rowsForRequest(sls, res.requestId)).toHaveLength(1);
   });
 });
