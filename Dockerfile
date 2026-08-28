@@ -77,9 +77,16 @@ COPY schemas ./schemas
 # above.
 COPY bench/pgo-training ./bench/pgo-training
 
-# Profile-guided optimization gate. Default ON: release artifacts are always
-# PGO-built, and a forgotten build-arg ships a PGO'd image — never a silently
-# un-optimized one. CI passes PGO=off only for pull-request smoke builds.
+# Profile-guided optimization gate. The default stays ON so a bare
+# `docker build` — a local release rehearsal, a one-off customer image —
+# produces the same shape as the published artifact rather than a silently
+# un-optimized one; opting out is explicit.
+#
+# CI inverts that default and passes PGO=on only for a STABLE release tag
+# (vX.Y.Z). PR, main/:dev and `-rc.N` builds pass PGO=off: PGO cost ~20 min
+# on every one of the ~40 main pushes per release cycle, and none of those
+# images are the artifact a customer runs. See "Decide PGO build mode" in
+# .github/workflows/docker-image.yml and the PGO section of RELEASING.md.
 ARG PGO=on
 
 # `--locked` forces the build to use the exact versions in Cargo.lock —
