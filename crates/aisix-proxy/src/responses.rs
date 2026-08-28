@@ -292,6 +292,10 @@ pub async fn responses(
                 // The winner's event carries the terminal spans.
                 /* terminal_last */
                 false,
+                // These are the attempts a WINNER superseded — the request
+                // was served, so no guardrail refused it.
+                /* guardrail_blocked */
+                false,
                 &audit,
             );
             // Issue #404: emit UsageEvent so cp-api's budget ledger
@@ -413,6 +417,11 @@ pub async fn responses(
                 },
                 elapsed,
             );
+            // AISIX-Cloud#1428: a guardrail refusal IS this failure, so the
+            // terminal event must say so — it is what the dashboard's
+            // "Guardrail blocks" view filters on. Every other 4xx/5xx class
+            // leaves the flag alone.
+            let guardrail_blocked = err.is_guardrail_block();
             // AISIX-Cloud#1013: failed requests carry the (post-mask)
             // request body so a 4xx/5xx can be triaged from the log alone.
             // Same opt-in gate and cap as the success path; 401/403 stay
@@ -459,6 +468,7 @@ pub async fn responses(
                 // emission; the pre-dispatch branch below covers empty.
                 /* terminal_last */
                 !routing.attempts.is_empty(),
+                guardrail_blocked,
                 &audit,
             );
             // Pre-dispatch failure (model-not-found, auth, budget) records no
@@ -483,6 +493,7 @@ pub async fn responses(
                         error_class: err.kind().to_string(),
                         ..Default::default()
                     },
+                    guardrail_blocked,
                     // Input masking may have fired before the failure.
                     redaction_counts.clone(),
                     monitor_hits.clone(),
@@ -3093,6 +3104,11 @@ fn emit_zero_token_event(
     elapsed: Duration,
     client: &ClientContext,
     attempt: AttemptInfo,
+    // Whether the request ended in a guardrail refusal, from
+    // [`ProxyError::is_guardrail_block`]. Request-scoped like the enforced
+    // hits below, so it lands on the terminal event only
+    // (AISIX-Cloud#1428).
+    guardrail_blocked: bool,
     // Per-detector PII mask counts (#932): input masking may have fired
     // before the failure. Empty for most failure classes.
     redacted_entity_counts: crate::redact::RedactionCounts,
@@ -3140,6 +3156,8 @@ fn emit_zero_token_event(
         // superseded attempt's event would repeat the same hit per retry.
         // Only the terminal event carries them.
         guardrail_enforced_hits: crate::usage_attr::terminal_enforced_hits(terminal, audit),
+        // Same rule, same reason as the hits above.
+        guardrail_blocked: terminal && guardrail_blocked,
         ..Default::default()
     };
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
@@ -3177,6 +3195,9 @@ fn emit_failed_attempts(
     // event is the request's terminal emission, so it carries the trace's
     // SERVER + logical spans. False on the success path.
     terminal_last: bool,
+    // Whether the request ended in a guardrail refusal (AISIX-Cloud#1428).
+    // Rides the same event as the audit handle below, for the same reason.
+    guardrail_blocked: bool,
     // The request's enforced-guardrail audit handle (AISIX-Cloud#1330);
     // stamped only on the event this call marks terminal.
     audit: &crate::usage_attr::GuardrailAudit,
@@ -3207,6 +3228,7 @@ fn emit_failed_attempts(
             Duration::from_millis(u64::from(rec.latency_ms)),
             client,
             AttemptInfo::from_record(rec),
+            guardrail_blocked,
             // Failed attempts carry no per-request redaction detail; the
             // terminal event does.
             crate::redact::RedactionCounts::new(),
@@ -3463,6 +3485,91 @@ mod tests {
         // Per #153 the matched literal must not leak into the wire message.
         let msg = v["error"]["message"].as_str().unwrap_or_default();
         assert!(!msg.contains("BLOCKME"), "blocklist literal leaked: {msg}");
+    }
+
+    /// A routing (group) parent over one member, so the same blocked
+    /// request can be addressed either directly or through the group.
+    fn routing_model(name: &str, target: &str) -> ResourceEntry<Model> {
+        let json = format!(
+            r#"{{"display_name":"{name}","routing":{{"strategy":"failover","targets":[{{"model":"{target}"}}]}}}}"#
+        );
+        let m: Model = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(format!("router-{name}"), m, 1)
+    }
+
+    /// AISIX-Cloud#1428: an input-guardrail refusal on `/v1/responses` must
+    /// emit a zero-token 422 UsageEvent marked `guardrail_blocked`, which is
+    /// the exact predicate the dashboard's Logs "Guardrail blocks" view
+    /// filters on. Before the fix the event carried the flag's `false`
+    /// default, so the request appeared in the unfiltered feed and vanished
+    /// from the Blocked one — which reads as the gateway having logged no
+    /// guardrail activity at all.
+    ///
+    /// Driven over all four combinations the report names, because they
+    /// take different code: a direct model refuses before any attempt is
+    /// recorded (the terminal event is the pre-dispatch one), a group
+    /// parent resolves its targets first, and `stream: true` changes which
+    /// response the handler builds. The input hook runs before target
+    /// selection either way, so all four must agree.
+    #[tokio::test]
+    async fn input_guardrail_block_marks_guardrail_blocked_usage_event() {
+        use aisix_obs::UsageSink;
+
+        for model in ["gpt-4o-resp", "resp-group"] {
+            for stream in [false, true] {
+                let upstream = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/v1/responses"))
+                    .respond_with(ResponseTemplate::new(200))
+                    .expect(0)
+                    .mount(&upstream)
+                    .await;
+
+                let snap = new_snap_openai(&upstream.uri());
+                snap.models.insert(openai_model("gpt-4o-resp"));
+                snap.models
+                    .insert(routing_model("resp-group", "gpt-4o-resp"));
+                snap.apikeys.insert(apikey_entry(&["*"]));
+                snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+
+                let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+                let hub = Arc::new(Hub::new());
+                hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+                let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+                    .without_cache()
+                    .with_usage_sink(UsageSink::new(tx));
+
+                let resp = crate::build_router(state)
+                    .oneshot(make_req(serde_json::json!({
+                        "model": model,
+                        "input": "please BLOCKME now",
+                        "stream": stream,
+                    })))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "model={model} stream={stream}"
+                );
+
+                let event = tokio::time::timeout(std::time::Duration::from_millis(1000), rx.recv())
+                    .await
+                    .expect("usage event must be emitted")
+                    .expect("usage_sink sender dropped");
+                assert!(
+                    event.guardrail_blocked,
+                    "model={model} stream={stream}: the refusal must be findable under \
+                     guardrail_blocked=true"
+                );
+                assert_eq!(event.status_code, 422, "model={model} stream={stream}");
+                // Nothing was sent upstream, so nothing is billed.
+                assert_eq!(event.prompt_tokens, 0, "model={model} stream={stream}");
+                assert_eq!(event.completion_tokens, 0, "model={model} stream={stream}");
+                // The caller-addressed entry, group or not (AISIX-Cloud#790).
+                assert_eq!(event.requested_model, model);
+            }
+        }
     }
 
     /// #719: the Responses `input` array form (message items with typed

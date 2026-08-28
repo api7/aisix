@@ -779,6 +779,7 @@ fn finish(
                 &auth.entry.id,
                 status,
                 err.kind(),
+                err.is_guardrail_block(),
                 client,
                 enforced_hits,
             );

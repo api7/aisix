@@ -3,11 +3,12 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
   SeedClient,
-  lz4DecompressBlock,
+  slsLogsFor,
   spawnApp,
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForSlsLog,
   type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -51,97 +52,9 @@ const EMAIL = "dana@example.com";
 const CN_ID = "11010519491231002X"; // valid ISO 7064 MOD 11-2 check digit
 const MASKED_BLOCK_SENTINEL = "masked-block-prompt-6a4e8b";
 
-// --- Minimal SLS LogGroup protobuf reader (see sink/sls.rs encoder) -----
-// LogGroup { Logs = 1 (message) { Time = 1 (varint), Contents = 2 (message)
-// { Key = 1 (string), Value = 2 (string) } } }; unknown fields skipped.
-
-function readVarint(buf: Buffer, pos: number): [number, number] {
-  let result = 0;
-  let shift = 0;
-  for (;;) {
-    const b = buf[pos]!;
-    pos += 1;
-    result += (b & 0x7f) * 2 ** shift;
-    if ((b & 0x80) === 0) return [result, pos];
-    shift += 7;
-  }
-}
-
-function skipField(buf: Buffer, pos: number, wireType: number): number {
-  if (wireType === 0) return readVarint(buf, pos)[1];
-  if (wireType === 2) {
-    const [len, p] = readVarint(buf, pos);
-    return p + len;
-  }
-  if (wireType === 5) return pos + 4;
-  if (wireType === 1) return pos + 8;
-  throw new Error(`unsupported wire type ${wireType}`);
-}
-
-function parseContentPair(buf: Buffer): [string, string] {
-  let pos = 0;
-  let key = "";
-  let value = "";
-  while (pos < buf.length) {
-    const [tag, p] = readVarint(buf, pos);
-    pos = p;
-    const field = tag >>> 3;
-    const wireType = tag & 7;
-    if (wireType === 2) {
-      const [len, q] = readVarint(buf, pos);
-      const bytes = buf.subarray(q, q + len);
-      pos = q + len;
-      if (field === 1) key = bytes.toString("utf8");
-      else if (field === 2) value = bytes.toString("utf8");
-    } else {
-      pos = skipField(buf, pos, wireType);
-    }
-  }
-  return [key, value];
-}
-
-function parseLog(buf: Buffer): Map<string, string> {
-  const out = new Map<string, string>();
-  let pos = 0;
-  while (pos < buf.length) {
-    const [tag, p] = readVarint(buf, pos);
-    pos = p;
-    const field = tag >>> 3;
-    const wireType = tag & 7;
-    if (field === 2 && wireType === 2) {
-      const [len, q] = readVarint(buf, pos);
-      const [k, v] = parseContentPair(buf.subarray(q, q + len));
-      out.set(k, v);
-      pos = q + len;
-    } else {
-      pos = skipField(buf, pos, wireType);
-    }
-  }
-  return out;
-}
-
 /** Decode every log delivered to `logstore` into flat key→value maps. */
 function logsFor(sls: MockSls, logstore: string): Map<string, string>[] {
-  const logs: Map<string, string>[] = [];
-  for (const r of sls.requests) {
-    if (r.logstore !== logstore || r.rawSize === 0 || r.body.length === 0) continue;
-    const group = lz4DecompressBlock(r.body, r.rawSize);
-    let pos = 0;
-    while (pos < group.length) {
-      const [tag, p] = readVarint(group, pos);
-      pos = p;
-      const field = tag >>> 3;
-      const wireType = tag & 7;
-      if (field === 1 && wireType === 2) {
-        const [len, q] = readVarint(group, pos);
-        logs.push(parseLog(group.subarray(q, q + len)));
-        pos = q + len;
-      } else {
-        pos = skipField(group, pos, wireType);
-      }
-    }
-  }
-  return logs;
+  return slsLogsFor(sls, logstore);
 }
 
 /** Poll until a FULL_LOGSTORE log matching `pred` arrives (or time out). */
@@ -151,13 +64,7 @@ async function waitForLog(
   what: string,
   timeoutMs = 10_000,
 ): Promise<Map<string, string>> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const hit = logsFor(sls, FULL_LOGSTORE).find(pred);
-    if (hit) return hit;
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  throw new Error(`no SLS log matching: ${what}`);
+  return waitForSlsLog(sls, FULL_LOGSTORE, pred, what, timeoutMs);
 }
 
 // -------------------------------------------------------------------------

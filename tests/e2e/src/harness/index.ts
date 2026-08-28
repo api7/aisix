@@ -29,6 +29,8 @@ export {
   waitForLogstore,
   waitForToken,
   lz4DecompressBlock,
+  slsLogsFor,
+  waitForSlsLog,
   type MockSls,
   type CapturedPutLogs,
 } from "./sls-mock.js";

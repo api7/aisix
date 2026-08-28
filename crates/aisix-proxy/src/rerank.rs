@@ -227,6 +227,7 @@ pub async fn rerank(
                 &api_key_id,
                 status,
                 err.kind(),
+                err.is_guardrail_block(),
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
             );

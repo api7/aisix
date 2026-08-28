@@ -490,6 +490,28 @@ impl ProxyError {
         }
     }
 
+    /// Whether this failure IS a guardrail refusal — the request was
+    /// stopped by the guardrail machinery rather than by an upstream, a
+    /// quota, a credential or a malformed body.
+    ///
+    /// Drives `UsageEvent::guardrail_blocked`, which is the indexed column
+    /// the dashboard's "Guardrail blocks" view and the
+    /// `guardrail_blocked=true` usage query filter on. Every failure-path
+    /// emitter reads it from here rather than re-deriving the match, so a
+    /// new handler cannot join the family with the flag silently left at
+    /// its `false` default (AISIX-Cloud#1428).
+    ///
+    /// A fail-closed refusal (`unavailable: Some(_)` — the guardrail could
+    /// not evaluate the request and its row refuses what it cannot check)
+    /// counts too: the guardrail machinery is still what stopped the
+    /// request, and hiding it from the Blocked view would leave an operator
+    /// with a 422 that nothing accounts for. Which of the two it was stays
+    /// legible on `guardrail_enforced_hits.action`
+    /// (`blocked` vs `blocked_unavailable`).
+    pub(crate) fn is_guardrail_block(&self) -> bool {
+        matches!(self, ProxyError::ContentFiltered { .. })
+    }
+
     /// Seconds the client should wait before retrying. Only present for
     /// rate-limit-style rejections so the proxy can emit a `Retry-After`
     /// header.

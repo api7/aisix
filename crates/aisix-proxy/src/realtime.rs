@@ -241,6 +241,7 @@ pub(crate) async fn realtime(
                 api_key_id.unwrap_or(""),
                 status,
                 err.kind(),
+                err.is_guardrail_block(),
                 &client,
                 // Refused before the handshake, so no chain was ever
                 // resolved and no guardrail can have enforced anything.
@@ -598,6 +599,10 @@ async fn run_session(
                 &auth.entry.id,
                 502,
                 "transport",
+                // Failing to open the upstream socket is not a guardrail
+                // decision, whatever the chain went on to allow.
+                /* guardrail_blocked */
+                false,
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
             );
@@ -832,6 +837,13 @@ async fn run_session(
         inbound_protocol: "realtime".to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        // A frame the chain refused ends the session, so the session's one
+        // terminal event is where the refusal has to be recorded — this is
+        // the only realtime row the "Guardrail blocks" view can ever see
+        // (AISIX-Cloud#1428).
+        guardrail_blocked: session_error
+            .as_ref()
+            .is_some_and(ProxyError::is_guardrail_block),
         guardrail_monitor_hits: monitor_hits,
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(&audit),
         ..Default::default()

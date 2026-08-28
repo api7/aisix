@@ -428,6 +428,12 @@ pub(crate) fn apply_jwt_identity(
 /// `"passthrough"` for `/passthrough/...`, `"realtime"` for `/v1/realtime`,
 /// `"openai"` for the OpenAI-shaped handlers) so Logs protocol filtering sees
 /// failures and successes under the same tag.
+///
+/// A guardrail refusal reaches this function like any other failure, so
+/// `guardrail_blocked` is a REQUIRED argument rather than a default: a
+/// handler that forgets it produces a 422 the "Guardrail blocks" view
+/// cannot find, which reads to an operator as "the gateway logged no
+/// guardrail activity at all" (AISIX-Cloud#1428).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_error_usage_event(
     state: &ProxyState,
@@ -439,6 +445,11 @@ pub(crate) fn emit_error_usage_event(
     api_key_id: &str,
     status_code: u16,
     error_class: &str,
+    // Whether this failure IS a guardrail refusal, from
+    // [`ProxyError::is_guardrail_block`]. Every caller but the realtime
+    // connect failure — which synthesizes its class without a `ProxyError`
+    // — reads it off the error it is reporting.
+    guardrail_blocked: bool,
     client: &ClientContext,
     // The request's enforced guardrail hits. The failure path is where a
     // `blocked` hit lands — a guardrail refusal IS the error — so the
@@ -454,6 +465,7 @@ pub(crate) fn emit_error_usage_event(
         api_key_id,
         status_code,
         error_class,
+        guardrail_blocked,
         client,
         enforced,
     );
@@ -485,6 +497,8 @@ pub(crate) fn build_error_usage_event(
     api_key_id: &str,
     status_code: u16,
     error_class: &str,
+    // See [`emit_error_usage_event`].
+    guardrail_blocked: bool,
     client: &ClientContext,
     enforced: Vec<aisix_core::GuardrailEnforcedHit>,
 ) -> UsageEvent {
@@ -498,6 +512,7 @@ pub(crate) fn build_error_usage_event(
         error_class: error_class.to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        guardrail_blocked,
         guardrail_enforced_hits: enforced,
         ..Default::default()
     };
