@@ -1282,10 +1282,9 @@ impl LiveGuardrailIndex {
         chain.with_audit_log(Some(Arc::new(crate::GuardrailAuditLog::new())))
     }
 
-    /// `true` when the resolved index has no guardrail entries — neither
-    /// from explicit attachment rows nor from the backward-compat implicit
-    /// env-scope fallback for no-attachment guardrails. Callers can use
-    /// this to skip chain allocation on the hot path.
+    /// `true` when the index has no entries — no enabled attachment names a
+    /// guardrail this build can run. Callers use it to skip chain allocation
+    /// on the hot path.
     pub fn is_empty(&self) -> bool {
         self.current().is_empty()
     }
@@ -1963,11 +1962,11 @@ mod tests {
         assert_eq!(chain.member_names(), ["y", "x", "z"]);
     }
 
-    /// The production per-request path: guardrails with no attachment
-    /// rows fall back to implicit env-scope entries that all share
-    /// priority 0, so their relative order in the resolved chain is
-    /// decided by the index build's iteration — which must be the same
-    /// created_at-ascending order as the chain-build path (#519 B.4a).
+    /// The production per-request path. Every guardrail here carries an
+    /// env attachment at the same priority, so nothing but the build's own
+    /// iteration order separates them — which must be deterministic, or the
+    /// DashMap's run-to-run order decides which Block fires first
+    /// (#519 B.4a).
     #[test]
     fn index_ties_resolve_in_attachment_id_order() {
         // The index sorts by (priority desc, scope-specificity desc) with a
@@ -2132,9 +2131,9 @@ mod tests {
 
     #[tokio::test]
     async fn one_enabled_one_disabled_attachment_fires_exactly_once() {
-        // Verifies the HashSet boundary: a guardrail with one enabled + one disabled
-        // attachment must fire exactly once (via the enabled attachment) and must NOT
-        // trigger the backward-compat env-scope fallback.
+        // A guardrail with one enabled + one disabled attachment must fire
+        // exactly once — through the enabled one, with the disabled row
+        // contributing no second entry that `resolve` would have to dedupe.
         let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
         guardrails.insert(entry(
             "g",

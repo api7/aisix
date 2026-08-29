@@ -55,10 +55,16 @@ models:
     provider: openai
     model_name: gpt-4o-mini
     provider_key: file-pk
+  # Reachable by the caller, and deliberately NOT the model the scoped
+  # guardrail names — the negative half of the scope assertion.
+  - display_name: file-unscoped
+    provider: openai
+    model_name: gpt-4o-mini
+    provider_key: file-pk
 api_keys:
   - display_name: file-caller
     key_env: ${CALLER_KEY_ENV}
-    allowed_models: ["file-allowed"]
+    allowed_models: ["file-allowed", "file-unscoped"]
 guardrails:
   - name: file-no-secrets
     kind: keyword
@@ -180,6 +186,7 @@ describe("file resource source: smoke + read-only admin surface", () => {
     expect(listed.map((e) => e.value.display_name).sort()).toEqual([
       "file-allowed",
       "file-forbidden",
+      "file-unscoped",
     ]);
 
     // The write endpoints were removed: the routes serve GET only, so
@@ -270,6 +277,17 @@ describe("file resource source: smoke + read-only admin surface", () => {
     });
     expect(blocked.status).toBe(422);
     expect(upstream.receivedRequests.length).toBe(hitsBefore);
+
+    // …and the other half: the same phrase on a model the attachment does
+    // NOT name passes. Blocking on the scoped model alone would also be
+    // satisfied by a guardrail that runs everywhere, which is exactly the
+    // behaviour this release removed.
+    const allowed = await proxy.chat({
+      model: "file-unscoped",
+      messages: [{ role: "user", content: "contains file-mode-model-scoped-phrase here" }],
+    });
+    expect(allowed.status).toBe(200);
+    expect(upstream.receivedRequests.length).toBe(hitsBefore + 1);
   });
 
   test("a guardrail with no attachment governs nothing", async () => {
