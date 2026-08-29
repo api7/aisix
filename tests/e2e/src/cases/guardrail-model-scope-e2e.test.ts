@@ -20,10 +20,11 @@ import {
 // fired on a request to glm5.1 (an unselected model). The DP's
 // `GuardrailIndex::resolve` matches model scope by the virtual-model UUID,
 // so a correctly-loaded model attachment never matches an unscoped model.
-// The failure mode is the implicit-env fallback: if the model attachments
-// are NOT present in the DP snapshot (e.g. a pre-#630 image that dropped
-// watch-applied attachments), the guardrail has zero loaded attachments and
-// falls back to env-scope at priority 0 — running GLOBALLY on every model.
+// The failure mode this guards is a model attachment that never reaches the
+// DP snapshot (e.g. a pre-#630 image that dropped watch-applied
+// attachments): the guardrail then has zero loaded attachments and, since
+// AISIX-Cloud#1450 retired the implicit-env fallback, inspects NOTHING —
+// the rule is silently absent rather than silently global.
 //
 // This test creates the attachment via the same etcd watch path cp-api
 // uses (`/<prefix>/guardrail_attachments/<uuid>`), so it exercises the
@@ -85,14 +86,14 @@ describe("guardrail e2e: model-scope attachment runs only for the scoped model (
       hook_point: "input",
       kind: "keyword",
       patterns: [{ kind: "literal", value: FORBIDDEN_WORD }],
-    });
+    }, { attach: false });
 
     // Attach the guardrail to the SCOPED model only. Wire shape mirrors
     // cp-api's `marshalGuardrailAttachmentKV` (P0c): snake_case fields,
     // `scope_id` = the virtual-model UUID returned by createModel, plus the
-    // `env_id` cp-api always includes (the DP ignores it). Having ANY
-    // attachment row suppresses the implicit-env fallback, so the only way
-    // the guardrail can apply is via a matching model scope.
+    // `env_id` cp-api always includes (the DP ignores it). This is the
+    // guardrail's only scope, so a matching model is the only way it can
+    // apply at all.
     await etcd!.put(
       `${app.etcdPrefix}/guardrail_attachments/${randomUUID()}`,
       JSON.stringify({

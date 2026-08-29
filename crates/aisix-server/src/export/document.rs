@@ -159,26 +159,13 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
 
     // guardrails — identity: name; recursive credential redaction.
     //
-    // The file has no attachment collection, so every file-defined
-    // guardrail applies gateway-wide. Only a guardrail already gateway-wide
-    // in etcd (via an env-scoped attachment) round-trips without changing
-    // its effect; an attachment-scoped or unattached guardrail would widen
-    // to ALL traffic on import (or activate a rule that was never attached).
-    // Those are omitted with a warning — the file still loads without them.
-    let gateway_wide = gateway_wide_guardrail_ids(snapshot);
-    let mut gateway_wide_names: BTreeSet<String> = BTreeSet::new();
-    for entry in snapshot.guardrails.entries() {
-        if gateway_wide.contains(&entry.id) {
-            gateway_wide_names.insert(entry.value.name.clone());
-        } else {
-            diag.warnings.push(format!(
-                "guardrail {:?} is attachment-scoped or unattached in etcd; the resources file \
-                 has no attachment collection, so exporting it would apply it to ALL traffic — \
-                 omitted. Re-declare it in the file only if a gateway-wide rule is intended.",
-                entry.value.name
-            ));
-        }
-    }
+    // Every guardrail is exported, attached or not: the file format now
+    // carries `guardrail_attachments`, and both sources agree that a
+    // guardrail's scope is its attachments and nothing else, so an
+    // unattached guardrail is inert on either side (AISIX-Cloud#1450). It
+    // used to be the opposite — the file had no attachment collection and a
+    // file-defined guardrail applied gateway-wide — so anything not already
+    // env-scoped had to be dropped or it would WIDEN on import.
     let mut guardrails = emit_entries(
         &snapshot.guardrails,
         |g| g.name.clone(),
@@ -196,12 +183,21 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             redact_by_key(doc, GUARDRAIL_SECRET_KEYS, &mut ctx);
         },
     );
-    guardrails.retain(|v| {
-        v.get("name")
+    guardrails.sort_by(|a, b| {
+        a.get("name")
             .and_then(Value::as_str)
-            .is_some_and(|n| gateway_wide_names.contains(n))
+            .cmp(&b.get("name").and_then(Value::as_str))
     });
     push_kind(&mut collections, "guardrails", guardrails);
+
+    // guardrail_attachments — the scope that makes each guardrail apply.
+    // References are emitted as the file identities the other collections
+    // use, since the loader resolves them back to derived ids.
+    push_kind(
+        &mut collections,
+        "guardrail_attachments",
+        emit_guardrail_attachments(snapshot, &model_names, &api_key_names, &mut diag),
+    );
 
     // mcp_servers — identity: name; secret: secret.
     push_kind(
@@ -348,8 +344,8 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
         ),
     );
 
-    // guardrail_attachments are consumed above to decide which guardrails
-    // are gateway-wide; they are not a file collection of their own.
+    // guardrail_attachments are emitted above as their own collection, with
+    // every id reference rewritten to the identity its collection is keyed by.
 
     // Two entries whose identities differ only in characters `sanitize`
     // folds to `_` (e.g. `openai-prod` vs `openai.prod`) derive the SAME
@@ -380,18 +376,118 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
     }
 }
 
-/// Ids of guardrails that already apply gateway-wide in etcd — i.e. that
-/// have at least one env-scoped guardrail attachment (`scope_type: env`
-/// matches every request). These are the only guardrails whose effect is
-/// unchanged when exported into the attachment-less file format.
-fn gateway_wide_guardrail_ids(snapshot: &AisixSnapshot) -> BTreeSet<String> {
-    snapshot
-        .guardrail_attachments
-        .entries()
-        .into_iter()
-        .filter(|a| matches!(a.value.scope_type, GuardrailScopeType::Env))
-        .map(|a| a.value.guardrail_id.clone())
-        .collect()
+/// Build the file's `guardrail_attachments` entries, rewriting every id
+/// reference into the identity its own collection is keyed by in the file.
+///
+/// A `team` scope carries its id through verbatim, the way
+/// `resugar_scope_ref` already does for a team-scoped rate-limit policy:
+/// there is no teams collection to name, but `api_keys[].team_id` IS a file
+/// field and the runtime compares the two ids as bare strings, so the scope
+/// really does resolve standalone. Dropping it would narrow a guardrail while
+/// the rate limit beside it survived.
+///
+/// An attachment the file genuinely cannot express is dropped with a warning
+/// rather than emitted dangling: a `passthrough_route` scope (the export
+/// carries no routes collection to point at) and a `scope_id` naming a
+/// resource missing from the snapshot. Dropping is the safe direction — the
+/// guardrail loses that scope and governs less, never more.
+fn emit_guardrail_attachments(
+    snapshot: &AisixSnapshot,
+    model_names: &BTreeMap<String, String>,
+    api_key_names: &BTreeMap<String, String>,
+    diag: &mut Diagnostics,
+) -> Vec<Value> {
+    let guardrail_names = id_to_name(&snapshot.guardrails, |g| g.name.clone());
+    let mcp_server_names = id_to_name(&snapshot.mcp_servers, |s| s.name.clone());
+
+    let mut out: Vec<Value> = Vec::new();
+    for entry in snapshot.guardrail_attachments.entries() {
+        let a = &entry.value;
+        let Some(guardrail) = guardrail_names.get(&a.guardrail_id) else {
+            diag.warnings.push(format!(
+                "guardrail attachment {:?} references a guardrail that is not in the snapshot; omitted",
+                entry.id
+            ));
+            continue;
+        };
+        let scope_name = match a.scope_type {
+            GuardrailScopeType::Env => None,
+            GuardrailScopeType::Model => Some(("model", model_names.get(scope_ref(a)))),
+            GuardrailScopeType::McpServer => {
+                Some(("MCP server", mcp_server_names.get(scope_ref(a))))
+            }
+            GuardrailScopeType::ApiKey => Some(("api key", api_key_names.get(scope_ref(a)))),
+            // The export carries no `passthrough_routes` collection, so a
+            // route-scoped attachment has nothing to point at in the file —
+            // emitting the name anyway makes the whole file fail to load.
+            GuardrailScopeType::PassthroughRoute => {
+                diag.warnings.push(format!(
+                    "guardrail {guardrail:?} has a passthrough-route-scoped attachment; the \
+                     export does not carry passthrough routes, so that scope is omitted",
+                ));
+                continue;
+            }
+            // Verbatim: `api_keys[].team_id` is a file field and
+            // `IndexEntry::applies_to` compares the two ids as bare strings.
+            GuardrailScopeType::Team => Some(("team", a.scope_id.as_ref())),
+        };
+        let resolved = match scope_name {
+            None => None,
+            Some((label, Some(name))) => {
+                let _ = label;
+                Some(name.clone())
+            }
+            Some((label, None)) => {
+                diag.warnings.push(format!(
+                    "guardrail {guardrail:?} is scoped to a {label} that is not in the snapshot; \
+                     that scope is omitted",
+                ));
+                continue;
+            }
+        };
+
+        let mut doc = serde_json::Map::new();
+        doc.insert("guardrail_id".into(), Value::String(guardrail.clone()));
+        doc.insert(
+            "scope_type".into(),
+            serde_json::to_value(&a.scope_type).unwrap_or(Value::Null),
+        );
+        if let Some(name) = resolved {
+            doc.insert("scope_id".into(), Value::String(name));
+        }
+        doc.insert("priority".into(), Value::from(a.priority));
+        if !a.enabled {
+            doc.insert("enabled".into(), Value::Bool(false));
+        }
+        // Same `$` escaping every other collection gets from `emit_entries`:
+        // the loader unescapes `$$` before interpolating, so a name carrying
+        // a `$` must be written escaped on BOTH sides of the reference or the
+        // two stop matching.
+        let mut doc = Value::Object(doc);
+        escape_dollars(&mut doc);
+        out.push(doc);
+    }
+    // Deterministic file output: same snapshot must emit the same bytes.
+    out.sort_by(|a, b| {
+        (
+            a.get("guardrail_id").and_then(Value::as_str),
+            a.get("scope_type").and_then(Value::as_str),
+            a.get("scope_id").and_then(Value::as_str),
+        )
+            .cmp(&(
+                b.get("guardrail_id").and_then(Value::as_str),
+                b.get("scope_type").and_then(Value::as_str),
+                b.get("scope_id").and_then(Value::as_str),
+            ))
+    });
+    out
+}
+
+/// An attachment's `scope_id`, or the empty string — which never matches a
+/// real resource id, so an absent scope on a narrow scope_type resolves to
+/// "not in the snapshot" and is reported as such.
+fn scope_ref(a: &aisix_core::models::GuardrailAttachment) -> &str {
+    a.scope_id.as_deref().unwrap_or("")
 }
 
 /// Deterministic file identity for a canonical api-key document, which

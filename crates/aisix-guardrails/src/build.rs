@@ -965,57 +965,21 @@ impl Guardrail for LiveGuardrailChain {
 ///
 /// The resulting index is pre-sorted by priority (descending) so
 /// `GuardrailIndex::resolve` can walk it linearly.
-/// INFO once per guardrail id for the process lifetime.
 ///
-/// The index is rebuilt on every snapshot version change, and this arm
-/// describes a STANDING property of a row — it has no attachment records —
-/// not an event. Logging it per build re-stated the same unchanged fact on
-/// every configuration write in the environment, once per affected
-/// guardrail, which is what AISIX-Cloud#1435 saw on a busy deployment.
+/// **Attachments are the whole of a guardrail's scope.** A guardrail with no
+/// enabled attachment governs nothing — it is not a no-op by oversight but by
+/// definition, because an attachment is the only thing that says which traffic
+/// the rule inspects.
 ///
-/// Deduped rather than demoted: the fallback means the row governs every
-/// request in the environment because nobody scoped it, which is worth
-/// saying out loud — once.
-fn log_implicit_env_scope_once(id: &str, name: &str) {
-    if !implicit_env_scope_first_seen(id) {
-        return;
-    }
-    tracing::info!(
-        guardrail_id = %id,
-        guardrail_name = %name,
-        "guardrail has no attachment rows; applying as implicit env-scope at priority 0 (backward-compat rolling-upgrade window)",
-    );
-}
-
-/// The memory behind [`log_implicit_env_scope_once`], split out so the
-/// once-per-id rule can be tested without a tracing subscriber.
-///
-/// `true` the first time an id is seen, `false` afterwards.
-fn implicit_env_scope_first_seen(id: &str) -> bool {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-
-    // Same shape and same cap as `warn_partial_compat_deduped` in
-    // aisix-etcd: past the cap new ids keep logging rather than being
-    // silently dropped, so the memory bound never costs a signal.
-    const MAX_REMEMBERED: usize = 1024;
-    static LOGGED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-
-    // Poison-tolerant: this set only dedupes log lines, so a panic while
-    // the lock was held must not wedge every later index build.
-    let mut logged = LOGGED
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if logged.contains(id) {
-        return false;
-    }
-    if logged.len() < MAX_REMEMBERED {
-        logged.insert(id.to_string());
-    }
-    true
-}
-
+/// This used to have a backward-compat arm that applied a guardrail carrying
+/// ZERO attachment rows to the entire environment at priority 0, for the P0c
+/// rolling-upgrade window where the data plane had attachments and the control
+/// plane had not written any yet. That window closed, and the arm was actively
+/// harmful: because it keyed on the ABSENCE of rows, removing a guardrail's
+/// last attachment WIDENED it. Deleting the one model a guardrail was scoped
+/// to promoted that guardrail to the whole environment (AISIX-Cloud#1450) —
+/// the exact opposite of what the operator asked for, silently, on a security
+/// control. Scope now comes from the attachments and from nothing else.
 pub fn build_index_from_snapshot(
     guardrails: &ResourceTable<DomainGuardrail>,
     attachments: &ResourceTable<GuardrailAttachment>,
@@ -1023,11 +987,6 @@ pub fn build_index_from_snapshot(
     embedder: &GuardrailEmbedderSlot,
 ) -> GuardrailIndex {
     let mut entries = Vec::new();
-    // Track guardrail IDs that have ANY attachment record (enabled or not).
-    // The backward-compat fallback below only fires for guardrails that have
-    // zero attachment rows — operators who explicitly disabled an attachment
-    // are expressing intent; we must not override it with the env-scope fallback.
-    let mut attached_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Deterministic attachment order: `GuardrailIndex::new` sorts by
     // (priority desc, scope-specificity desc) with a STABLE sort, so
@@ -1040,11 +999,6 @@ pub fn build_index_from_snapshot(
 
     for attachment_arc in attachment_entries.iter() {
         let attachment = &attachment_arc.value;
-        // Track ALL attachment references (enabled or not) so the backward-compat
-        // fallback below treats "has an explicit attachment" as opt-in to P0c
-        // attachment semantics — even if all attachments are currently disabled.
-        attached_ids.insert(attachment.guardrail_id.clone());
-
         if !attachment.enabled {
             continue;
         }
@@ -1100,62 +1054,92 @@ pub fn build_index_from_snapshot(
         ));
     }
 
-    // Backward compat: a guardrail definition that has no enabled attachment
-    // fires on every request in the env at priority 0 (same as the pre-P0c
-    // behavior where all guardrails in the snapshot were applied globally).
-    // This covers the rolling-upgrade window where the DP has been updated to
-    // P0c but the CP hasn't yet written attachment rows for existing guardrails.
-    //
-    // TODO(P0c-cleanup): Remove this block once the CP is fully rolled out and
-    // guaranteed to write at least one attachment row for every guardrail
-    // (tracked in https://github.com/api7/ai-gateway/issues/417).
-    // After removal, a guardrail with zero attachment rows is a silent no-op —
-    // operators must explicitly attach it to a scope.
-    //
-    // NOTE: the standalone resources-file source (aisix-core::filesource)
-    // deliberately writes NO attachment rows — its v1 format has no
-    // attachment collection, so file-defined guardrails are env-global
-    // through exactly this fallback. Do not remove this block without
-    // giving the file format a scoping surface (or synthesizing env-scope
-    // attachments in the file loader). The file-resource-source e2e pins
-    // that a file-defined guardrail fires.
-    // Same deterministic created_at-ascending order as the chain-build
-    // path: these implicit entries all share priority 0 + env scope, so
-    // without a pre-sort their relative order — and which Block fires
-    // first — would follow the DashMap's arbitrary iteration (#519 B.4a).
-    for guardrail_arc in sorted_guardrail_entries(guardrails) {
-        if attached_ids.contains(guardrail_arc.id.as_str()) {
-            continue; // explicit attachment governs this guardrail
-        }
-        let row = &guardrail_arc.value;
-        if !row.enabled {
+    warn_unattached_guardrails(guardrails, attachments);
+    GuardrailIndex::from_entries(entries)
+}
+
+/// Ids of the enabled guardrails no attachment names — the rows that are
+/// loaded, counted, and inert.
+///
+/// A DISABLED attachment still counts as naming its guardrail: switching an
+/// attachment off is the operator saying "not here, for now", and reporting
+/// that as an oversight would train them to ignore the line.
+fn unattached_ids(
+    guardrails: &ResourceTable<DomainGuardrail>,
+    attachments: &ResourceTable<GuardrailAttachment>,
+) -> Vec<(String, String)> {
+    let attached: std::collections::HashSet<String> = attachments
+        .entries()
+        .into_iter()
+        .map(|a| a.value.guardrail_id.clone())
+        .collect();
+    let mut out: Vec<(String, String)> = guardrails
+        .entries()
+        .into_iter()
+        .filter(|e| e.value.enabled && !attached.contains(e.id.as_str()))
+        .map(|e| (e.id.clone(), e.value.name.clone()))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Names of the enabled-but-unattached guardrails, for `aisix validate` —
+/// the one place an operator looks BEFORE deploying, where the runtime WARN
+/// below has not had a chance to fire yet.
+pub fn unattached_guardrail_names(
+    guardrails: &ResourceTable<DomainGuardrail>,
+    attachments: &ResourceTable<GuardrailAttachment>,
+) -> Vec<String> {
+    unattached_ids(guardrails, attachments)
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect()
+}
+
+/// WARN once per guardrail id for the process lifetime: this row is enabled
+/// but nothing attaches it, so it inspects no traffic at all.
+///
+/// The state is legitimate — a scope target can be deleted, and a rule with
+/// no scope left is correctly inert — but it is also indistinguishable from a
+/// misconfiguration, and it is INVISIBLE otherwise: the guardrail is present
+/// in the snapshot, `/status/config` counts it as loaded, and no request ever
+/// mentions it. An operator who believes a rule is in force deserves to be
+/// told it is not.
+///
+/// Deduped per id, not logged per build, for the reason AISIX-Cloud#1435
+/// documents: the index is rebuilt on every snapshot version change, and this
+/// describes a STANDING property of a row rather than an event.
+fn warn_unattached_guardrails(
+    guardrails: &ResourceTable<DomainGuardrail>,
+    attachments: &ResourceTable<GuardrailAttachment>,
+) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    const MAX_REMEMBERED: usize = 1024;
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    // Poison-tolerant: this set only dedupes log lines, so a panic while the
+    // lock was held must not wedge every later index build.
+    let mut warned = WARNED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    for (id, name) in unattached_ids(guardrails, attachments) {
+        if warned.contains(&id) {
             continue;
         }
-        match build_one(row, bedrock_endpoint_url, embedder) {
-            Ok(Some(g)) => {
-                log_implicit_env_scope_once(&guardrail_arc.id, &row.name);
-                entries.push(GuardrailIndex::push_entry(
-                    guardrail_arc.id.clone(),
-                    row.name.clone(),
-                    ScopeKind::Env,
-                    None,
-                    0,
-                    g,
-                    applied_for(row),
-                ));
-            }
-            Ok(None) => {}
-            Err(err) => {
-                tracing::warn!(
-                    guardrail_id = %guardrail_arc.id,
-                    error = %err,
-                    "skipping guardrail with invalid config (no-attachment backward-compat path)",
-                );
-            }
+        tracing::warn!(
+            guardrail_id = %id,
+            guardrail_name = %name,
+            "guardrail is enabled but has no attachment, so it inspects no traffic; \
+             attach it to an environment, model, MCP server, API key, team or \
+             passthrough route to put it in force",
+        );
+        if warned.len() < MAX_REMEMBERED {
+            warned.insert(id);
         }
     }
-
-    GuardrailIndex::from_entries(entries)
 }
 
 // ---------------------------------------------------------------------------
@@ -1298,10 +1282,9 @@ impl LiveGuardrailIndex {
         chain.with_audit_log(Some(Arc::new(crate::GuardrailAuditLog::new())))
     }
 
-    /// `true` when the resolved index has no guardrail entries — neither
-    /// from explicit attachment rows nor from the backward-compat implicit
-    /// env-scope fallback for no-attachment guardrails. Callers can use
-    /// this to skip chain allocation on the hot path.
+    /// `true` when the index has no entries — no enabled attachment names a
+    /// guardrail this build can run. Callers use it to skip chain allocation
+    /// on the hot path.
     pub fn is_empty(&self) -> bool {
         self.current().is_empty()
     }
@@ -1313,30 +1296,6 @@ mod tests {
     use aisix_core::models::Guardrail as DomainGuardrail;
     use aisix_core::resource::ResourceEntry;
     use aisix_gateway::{ChatFormat, ChatMessage};
-
-    /// AISIX-Cloud#1435: the implicit env-scope notice is a standing
-    /// property of a row, and the index is rebuilt on every snapshot
-    /// version change — so logging it per build restated the same
-    /// unchanged fact once per affected guardrail on every configuration
-    /// write in the environment.
-    ///
-    /// Ids are unique to this test: the memory is process-global, so a
-    /// shared id would make the result depend on which test ran first.
-    #[test]
-    fn the_implicit_env_scope_notice_is_logged_once_per_guardrail() {
-        assert!(
-            implicit_env_scope_first_seen("g-1435-a"),
-            "the first sighting of a guardrail must be reported",
-        );
-        assert!(
-            !implicit_env_scope_first_seen("g-1435-a"),
-            "a later index rebuild must not restate an unchanged fact",
-        );
-        assert!(
-            implicit_env_scope_first_seen("g-1435-b"),
-            "the dedupe is per guardrail — a different row is its own notice",
-        );
-    }
 
     fn entry(_name: &str, id: &str, row: DomainGuardrail) -> ResourceEntry<DomainGuardrail> {
         // `name` is documentary at the call site; the row's own
@@ -2003,14 +1962,39 @@ mod tests {
         assert_eq!(chain.member_names(), ["y", "x", "z"]);
     }
 
-    /// The production per-request path: guardrails with no attachment
-    /// rows fall back to implicit env-scope entries that all share
-    /// priority 0, so their relative order in the resolved chain is
-    /// decided by the index build's iteration — which must be the same
-    /// created_at-ascending order as the chain-build path (#519 B.4a).
+    /// The production per-request path. Every guardrail here carries an
+    /// env attachment at the same priority, so nothing but the build's own
+    /// iteration order separates them — which must be deterministic, or the
+    /// DashMap's run-to-run order decides which Block fires first
+    /// (#519 B.4a).
     #[test]
-    fn no_attachment_fallback_resolves_in_created_at_order() {
+    fn index_ties_resolve_in_attachment_id_order() {
+        // The index sorts by (priority desc, scope-specificity desc) with a
+        // STABLE sort, so insertion order decides what is left — and insertion
+        // walks attachments sorted by their own id. Every attachment here is
+        // env-scope at the same priority, so attachment id is the ONLY
+        // tiebreak; without the build-time sort the DashMap's arbitrary,
+        // run-to-run-varying order would make this flap (#519 B.4a).
+        //
+        // Guardrail `created_at` deliberately does not decide this order: that
+        // is the chain path's rule (`chain_order_is_created_at_ascending_with_id_tiebreak`),
+        // and the two are different mechanisms. This test used to exercise the
+        // index through the zero-attachment fallback, which borrowed the
+        // chain's ordering; with that fallback retired (AISIX-Cloud#1450) the
+        // index is reached only through explicit attachments.
         let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
+        for (i, (guardrail_id, _, _)) in SHUFFLED_ROWS.iter().enumerate() {
+            // Attachment ids run opposite to the row order they attach, so a
+            // pass that forgot to sort would surface as the insertion order.
+            let attachment_id = format!("a-{:02}", SHUFFLED_ROWS.len() - i);
+            attachments.insert(attachment_entry(
+                &attachment_id,
+                parse_attachment(&format!(
+                    r#"{{ "guardrail_id": "{guardrail_id}", "scope_type": "env", "priority": 100 }}"#
+                )),
+            ));
+        }
+
         let index = build_index_from_snapshot(
             &shuffled_table(),
             &attachments,
@@ -2024,7 +2008,14 @@ mod tests {
             api_key_id: "k",
             team_id: None,
         });
-        assert_eq!(chain.member_names(), EXPECTED_ORDER);
+        // a-01 attaches the LAST row, a-10 the first — so ascending attachment
+        // id walks SHUFFLED_ROWS backwards.
+        let expected: Vec<&str> = SHUFFLED_ROWS
+            .iter()
+            .rev()
+            .map(|(_, name, _)| *name)
+            .collect();
+        assert_eq!(chain.member_names(), expected);
     }
 
     // -----------------------------------------------------------------------
@@ -2140,9 +2131,9 @@ mod tests {
 
     #[tokio::test]
     async fn one_enabled_one_disabled_attachment_fires_exactly_once() {
-        // Verifies the HashSet boundary: a guardrail with one enabled + one disabled
-        // attachment must fire exactly once (via the enabled attachment) and must NOT
-        // trigger the backward-compat env-scope fallback.
+        // A guardrail with one enabled + one disabled attachment must fire
+        // exactly once — through the enabled one, with the disabled row
+        // contributing no second entry that `resolve` would have to dedupe.
         let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
         guardrails.insert(entry(
             "g",
@@ -2194,10 +2185,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_attachment_guardrail_fires_globally_backward_compat() {
-        // Core backward-compat contract: a guardrail with ZERO attachment rows
-        // must fire on every request (env-scope at priority 0), preserving
-        // the pre-P0c "apply globally" behavior during rolling upgrade.
+    async fn guardrail_without_attachment_governs_nothing() {
+        // AISIX-Cloud#1450. This used to assert the opposite: a guardrail with
+        // ZERO attachment rows fired on every request, a rolling-upgrade
+        // fallback from the window where the data plane read attachments and
+        // the control plane had not written any yet.
+        //
+        // Keying on the ABSENCE of rows made removing a guardrail's last
+        // attachment a scope WIDENING — delete the one model it was scoped to
+        // and it started inspecting the entire environment. An attachment is
+        // the only thing that says which traffic a rule sees, so no attachment
+        // now means no traffic.
         let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
         guardrails.insert(entry(
             "g",
@@ -2220,8 +2218,8 @@ mod tests {
         );
         assert_eq!(
             index.len(),
-            1,
-            "no-attachment guardrail must appear as env-scope entry",
+            0,
+            "an unattached guardrail must not enter the index",
         );
 
         let ctx = RequestContext {
@@ -2232,12 +2230,12 @@ mod tests {
             team_id: None,
         };
         assert!(
-            index
+            !index
                 .resolve(&ctx)
                 .check_input(&req("here AKIA"))
                 .await
                 .is_block(),
-            "no-attachment guardrail must block matching requests",
+            "an unattached guardrail must not block anything, however well its pattern matches",
         );
     }
 
@@ -2430,6 +2428,17 @@ mod tests {
                 }"#,
             ),
         ));
+        // Both rows need an explicit env attachment: scope comes only from
+        // attachments now, so an unattached guardrail never reaches the index
+        // (AISIX-Cloud#1450).
+        for (attachment_id, guardrail_id) in [("a-1", "g-1"), ("a-2", "g-2")] {
+            snap.guardrail_attachments.insert(attachment_entry(
+                attachment_id,
+                parse_attachment(&format!(
+                    r#"{{ "guardrail_id": "{guardrail_id}", "scope_type": "env", "priority": 100 }}"#
+                )),
+            ));
+        }
         let sink = Arc::new(RecordingSink::default());
         let live = LiveGuardrailIndex::new_with_sink(
             SnapshotHandle::new(snap),

@@ -273,6 +273,28 @@ fn run_validate(resources: &Path) -> anyhow::Result<()> {
         }
         std::process::exit(1);
     }
+    // An enabled guardrail nothing attaches is inert — a scope target can be
+    // deleted, so this is legitimate rather than malformed, and the exit code
+    // stays 0. But `validate` is the one place an operator looks BEFORE
+    // deploying, and the runtime WARN they would otherwise have to notice in
+    // a log is the only other signal: the row loads, the resource count
+    // includes it, and no request ever mentions it.
+    let unattached = aisix_guardrails::unattached_guardrail_names(
+        &snapshot.guardrails,
+        &snapshot.guardrail_attachments,
+    );
+    if !unattached.is_empty() {
+        eprintln!(
+            "resources file {}: {} enabled guardrail(s) have no attachment and inspect no traffic:",
+            resources.display(),
+            unattached.len(),
+        );
+        for name in &unattached {
+            eprintln!(
+                "  - guardrails ({name:?}): add a guardrail_attachments entry to put it in force"
+            );
+        }
+    }
     println!(
         "OK: {} loaded {} resource(s)",
         resources.display(),

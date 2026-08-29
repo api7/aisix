@@ -1035,6 +1035,34 @@ async fn readyz(
     crate::health::readyz_response(&state.livez, config_block, params.contains_key("verbose"))
 }
 
+/// Inserts a guardrail together with the env-scoped attachment that puts it
+/// in force.
+///
+/// A guardrail's scope is its attachments and nothing else — an unattached
+/// guardrail governs nothing (AISIX-Cloud#1450 retired the fallback that
+/// applied a zero-attachment guardrail to the whole environment). Tests that
+/// want a guardrail to fire on the request under test go through here rather
+/// than inserting into `snap.guardrails` alone; a test about scoping writes
+/// the attachment it means instead.
+#[cfg(test)]
+pub(crate) fn seed_env_scoped_guardrail(
+    snap: &aisix_core::AisixSnapshot,
+    guardrail: aisix_core::ResourceEntry<aisix_core::Guardrail>,
+) {
+    let attachment: aisix_core::models::GuardrailAttachment = serde_json::from_str(&format!(
+        r#"{{"guardrail_id": "{}", "scope_type": "env", "priority": 100}}"#,
+        guardrail.id
+    ))
+    .expect("env attachment must parse");
+    snap.guardrail_attachments
+        .insert(aisix_core::ResourceEntry::new(
+            format!("att-{}", guardrail.id),
+            attachment,
+            1,
+        ));
+    snap.guardrails.insert(guardrail);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

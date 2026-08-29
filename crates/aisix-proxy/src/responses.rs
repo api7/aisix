@@ -3442,8 +3442,8 @@ mod tests {
             .unwrap()
     }
 
-    /// An env-scoped keyword input guardrail (no attachment row → applies to
-    /// every request via the backward-compat fallback) that blocks on a
+    /// A keyword input guardrail, attached env-wide by
+    /// `seed_env_scoped_guardrail` so it applies to every request. Blocks on a
     /// literal substring. Keyword is local (no remote call), so it's the
     /// deterministic stand-in for any input-hook guardrail kind.
     fn keyword_input_guardrail(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {
@@ -3475,7 +3475,7 @@ mod tests {
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -3538,7 +3538,7 @@ mod tests {
                 snap.models
                     .insert(routing_model("resp-group", "gpt-4o-resp"));
                 snap.apikeys.insert(apikey_entry(&["*"]));
-                snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+                crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
                 let (tx, mut rx) = tokio::sync::mpsc::channel(8);
                 let hub = Arc::new(Hub::new());
@@ -3599,7 +3599,7 @@ mod tests {
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -3638,7 +3638,7 @@ mod tests {
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -3676,7 +3676,7 @@ mod tests {
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -3717,7 +3717,7 @@ mod tests {
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -3755,7 +3755,7 @@ mod tests {
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -3774,8 +3774,8 @@ mod tests {
         assert_eq!(v["error"]["type"], "content_filter");
     }
 
-    /// An env-scoped keyword guardrail on the OUTPUT hook (no attachment →
-    /// applies to every request). `runs_on_output()` is true, so the
+    /// A keyword guardrail on the OUTPUT hook, attached env-wide by
+    /// `seed_env_scoped_guardrail`. `runs_on_output()` is true, so the
     /// handler scans the assistant output.
     fn keyword_output_guardrail(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {
         let json = format!(
@@ -3808,7 +3808,7 @@ mod tests {
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -3849,7 +3849,7 @@ mod tests {
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -3889,7 +3889,7 @@ mod tests {
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -3931,7 +3931,7 @@ mod tests {
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -3993,7 +3993,7 @@ mod tests {
         let snap = new_snap_anthropic_at(&upstream.uri());
         snap.models.insert(anthropic_model("claude-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -4039,7 +4039,7 @@ mod tests {
         let snap = new_snap_anthropic_at(&upstream.uri());
         snap.models.insert(anthropic_model("claude-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -4080,7 +4080,7 @@ mod tests {
         let snap = new_snap_anthropic_at(&upstream.uri());
         snap.models.insert(anthropic_model("claude-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
@@ -4142,7 +4142,7 @@ mod tests {
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -4198,8 +4198,7 @@ mod tests {
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails
-            .insert(keyword_output_guardrail_monitor("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail_monitor("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -4249,8 +4248,7 @@ mod tests {
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails
-            .insert(keyword_output_guardrail_monitor("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail_monitor("BLOCKME"));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
@@ -4341,8 +4339,7 @@ mod tests {
             acs.uri()
         );
         let g: aisix_core::Guardrail = serde_json::from_str(&textmod_json).unwrap();
-        snap.guardrails
-            .insert(ResourceEntry::new("g-textmod-mon", g, 1));
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-textmod-mon", g, 1));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
@@ -4417,8 +4414,7 @@ mod tests {
         let snap = new_snap_anthropic_at(&upstream.uri());
         snap.models.insert(anthropic_model("claude-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails
-            .insert(keyword_output_guardrail_monitor("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail_monitor("BLOCKME"));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
@@ -4482,7 +4478,7 @@ mod tests {
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -4526,7 +4522,7 @@ mod tests {
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -4575,7 +4571,7 @@ mod tests {
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -4623,7 +4619,7 @@ mod tests {
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -4665,7 +4661,7 @@ mod tests {
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -4707,7 +4703,7 @@ mod tests {
         )
         .unwrap();
         snap.apikeys.insert(ResourceEntry::new("k-1", apikey, 1));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         // Blocked by the guardrail — must NOT reserve the single RPM slot.
@@ -5278,7 +5274,7 @@ data: [DONE]\n\n";
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
@@ -5910,7 +5906,7 @@ data: [DONE]\n\n";
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(masking_guardrail());
+        crate::seed_env_scoped_guardrail(&snap, masking_guardrail());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
@@ -5963,7 +5959,7 @@ data: [DONE]\n\n";
         let snap = new_snap_openai(&upstream.uri());
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(masking_guardrail());
+        crate::seed_env_scoped_guardrail(&snap, masking_guardrail());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());

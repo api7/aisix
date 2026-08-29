@@ -2676,8 +2676,10 @@ mod tests {
             r#"{"name":"test-block","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"custom_id"}]}"#,
         )
         .unwrap();
-        snap.guardrails
-            .insert(aisix_core::resource::ResourceEntry::new("g-1", g, 1));
+        crate::seed_env_scoped_guardrail(
+            &snap,
+            aisix_core::resource::ResourceEntry::new("g-1", g, 1),
+        );
         let (app, mut rx) = build_app_with_sink(snap);
 
         let boundary = "XBOUNDARYX";

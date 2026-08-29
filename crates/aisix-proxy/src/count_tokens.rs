@@ -979,7 +979,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        snap.guardrails.insert(ResourceEntry::new("g-mask", row, 1));
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-mask", row, 1));
 
         let hub = Arc::new(Hub::new());
         hub.register_specialized(

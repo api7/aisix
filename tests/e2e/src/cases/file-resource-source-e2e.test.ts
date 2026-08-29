@@ -55,16 +55,40 @@ models:
     provider: openai
     model_name: gpt-4o-mini
     provider_key: file-pk
+  # Reachable by the caller, and deliberately NOT the model the scoped
+  # guardrail names — the negative half of the scope assertion.
+  - display_name: file-unscoped
+    provider: openai
+    model_name: gpt-4o-mini
+    provider_key: file-pk
 api_keys:
   - display_name: file-caller
     key_env: ${CALLER_KEY_ENV}
-    allowed_models: ["file-allowed"]
+    allowed_models: ["file-allowed", "file-unscoped"]
 guardrails:
   - name: file-no-secrets
     kind: keyword
     patterns:
       - kind: literal
         value: file-mode-forbidden-phrase
+  - name: file-model-scoped
+    kind: keyword
+    patterns:
+      - kind: literal
+        value: file-mode-model-scoped-phrase
+  - name: file-unattached
+    kind: keyword
+    patterns:
+      - kind: literal
+        value: file-mode-unattached-phrase
+guardrail_attachments:
+  - guardrail_id: file-no-secrets
+    scope_type: env
+    priority: 100
+  - guardrail_id: file-model-scoped
+    scope_type: model
+    scope_id: file-allowed
+    priority: 100
 `;
 }
 
@@ -162,6 +186,7 @@ describe("file resource source: smoke + read-only admin surface", () => {
     expect(listed.map((e) => e.value.display_name).sort()).toEqual([
       "file-allowed",
       "file-forbidden",
+      "file-unscoped",
     ]);
 
     // The write endpoints were removed: the routes serve GET only, so
@@ -182,7 +207,7 @@ describe("file resource source: smoke + read-only admin surface", () => {
 
     // The refused write did not change the resource set.
     const relist = await fetch(`${app.adminUrl}/admin/v1/models`, { headers: auth });
-    expect(((await relist.json()) as unknown[]).length).toBe(2);
+    expect(((await relist.json()) as unknown[]).length).toBe(3);
 
     const delRes = await fetch(`${app.adminUrl}/admin/v1/models/any-id`, {
       method: "DELETE",
@@ -215,11 +240,11 @@ describe("file resource source: smoke + read-only admin surface", () => {
 
   test("file-defined guardrail fires on matching input", async () => {
     if (!app || !upstream) throw new Error("setup failed");
-    // The file format has no attachment collection, so file-defined
-    // guardrails apply env-globally. Pin that they actually fire — the
-    // runtime executes them through the zero-attachment fallback in the
-    // guardrail index, and this test is the regression trap for that
-    // dependency.
+    // A guardrail fires because an attachment says so — the file declares
+    // an env-scoped one alongside it, and the loader resolves the
+    // `guardrail_id` reference from the name to the derived id. There is no
+    // implicit scope any more (AISIX-Cloud#1450), so this pins both halves:
+    // the reference resolves, and the resolved attachment reaches the index.
     const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
     const hitsBefore = upstream.receivedRequests.length;
     const blocked = await proxy.chat({
@@ -236,6 +261,49 @@ describe("file resource source: smoke + read-only admin surface", () => {
       messages: [{ role: "user", content: "clean input" }],
     });
     expect(clean.status).toBe(200);
+  });
+
+  test("a model-scoped attachment resolves its target by name", async () => {
+    if (!app || !upstream) throw new Error("setup failed");
+    // `scope_id: file-allowed` names the model the way the models
+    // collection keys it; the loader rewrites both references to derived
+    // ids, and the request must resolve to the same id for the scope to
+    // match. Nothing else in the pipeline proves that mapping end to end.
+    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    const hitsBefore = upstream.receivedRequests.length;
+    const blocked = await proxy.chat({
+      model: "file-allowed",
+      messages: [{ role: "user", content: "contains file-mode-model-scoped-phrase here" }],
+    });
+    expect(blocked.status).toBe(422);
+    expect(upstream.receivedRequests.length).toBe(hitsBefore);
+
+    // …and the other half: the same phrase on a model the attachment does
+    // NOT name passes. Blocking on the scoped model alone would also be
+    // satisfied by a guardrail that runs everywhere, which is exactly the
+    // behaviour this release removed.
+    const allowed = await proxy.chat({
+      model: "file-unscoped",
+      messages: [{ role: "user", content: "contains file-mode-model-scoped-phrase here" }],
+    });
+    expect(allowed.status).toBe(200);
+    expect(upstream.receivedRequests.length).toBe(hitsBefore + 1);
+  });
+
+  test("a guardrail with no attachment governs nothing", async () => {
+    if (!app || !upstream) throw new Error("setup failed");
+    // AISIX-Cloud#1450: a guardrail's scope is its attachments and nothing
+    // else. `file-unattached` is declared and loads cleanly — declaring it
+    // is not an error — but nothing attaches it, so its pattern must pass
+    // straight through to the upstream.
+    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    const hitsBefore = upstream.receivedRequests.length;
+    const allowed = await proxy.chat({
+      model: "file-allowed",
+      messages: [{ role: "user", content: "contains file-mode-unattached-phrase here" }],
+    });
+    expect(allowed.status).toBe(200);
+    expect(upstream.receivedRequests.length).toBe(hitsBefore + 1);
   });
 });
 

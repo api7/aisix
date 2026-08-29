@@ -2801,7 +2801,7 @@ mod tests {
             r#"{"name":"test-block","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,
         )
         .unwrap();
-        snap.guardrails.insert(ResourceEntry::new("g-1", g, 1));
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1", g, 1));
 
         let app = build_app(snap);
         let resp = tower::ServiceExt::oneshot(
@@ -3931,7 +3931,7 @@ mod tests {
             r#"{"name":"test-block","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,
         )
         .unwrap();
-        snap.guardrails.insert(ResourceEntry::new("g-1", g, 1));
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1", g, 1));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());

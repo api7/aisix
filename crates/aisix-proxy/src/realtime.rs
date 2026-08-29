@@ -1615,8 +1615,10 @@ mod tests {
             r#"{"name":"test-block","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,
         )
         .unwrap();
-        snap.guardrails
-            .insert(aisix_core::resource::ResourceEntry::new("g-1", g, 1));
+        crate::seed_env_scoped_guardrail(
+            &snap,
+            aisix_core::resource::ResourceEntry::new("g-1", g, 1),
+        );
         let (addr, _state, mut rx) = serve(snap).await;
 
         let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
