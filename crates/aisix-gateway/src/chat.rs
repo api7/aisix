@@ -468,13 +468,24 @@ impl UsageStats {
             .saturating_add(self.cache_read_tokens)
     }
 
-    /// OpenAI `usage.total_tokens`, recomputed rather than passed
-    /// through so the identity OpenAI clients rely on —
-    /// `total == prompt + completion` — holds for every upstream. An
-    /// Anthropic-shape upstream's own total already folds the cache
-    /// counters in, which is the same number; a Bedrock Converse total
-    /// does not, and that one would otherwise under-report.
+    /// OpenAI `usage.total_tokens`.
+    ///
+    /// Recomputed only when the projection actually MOVED tokens between
+    /// fields — that is, when the upstream reported its cache counters
+    /// beside the input. There the stored total was built under the
+    /// other accounting and relaying it is what produced #1447's
+    /// `40 + 10 = 150`; and a Bedrock Converse total, which excludes the
+    /// cache entirely, would under-report.
+    ///
+    /// Otherwise the upstream's own total stands, because recomputing it
+    /// can only lose information: a provider counting overhead we cannot
+    /// see would be silently corrected downward, and one that reports a
+    /// bare `total_tokens` with no breakdown would render as `0`.
     pub fn openai_total_tokens(&self) -> u32 {
+        let converted = self.cache_creation_tokens > 0 || self.cache_read_tokens > 0;
+        if !converted && self.total_tokens > 0 {
+            return self.total_tokens;
+        }
         self.openai_prompt_tokens()
             .saturating_add(self.completion_tokens)
     }
@@ -917,6 +928,69 @@ mod tests {
         let oai = openai_shape();
         assert_eq!(oai.anthropic_input_tokens(), N + W);
         assert_eq!(oai.anthropic_cache_creation_input_tokens(), 0);
+    }
+
+    /// `total_tokens` is only recomputed when the projection moved
+    /// tokens. Recomputing unconditionally erases whatever an upstream
+    /// counted outside `prompt + completion` — including the extreme
+    /// case of one that reports a bare total and no breakdown, which
+    /// would have rendered as `0`.
+    #[test]
+    fn openai_total_defers_to_the_upstream_unless_the_shape_converted() {
+        // Converted: the stored total was built under Anthropic
+        // accounting, so it must not be relayed as-is.
+        assert_eq!(anthropic_shape().openai_total_tokens(), N + W + R + O);
+        // …and a Bedrock-style total that EXCLUDES the cache is likewise
+        // recomputed rather than under-reported.
+        let bedrock_like = UsageStats {
+            prompt_tokens: N,
+            completion_tokens: O,
+            total_tokens: N + O,
+            cache_creation_tokens: W,
+            cache_read_tokens: R,
+            ..UsageStats::default()
+        };
+        assert_eq!(bedrock_like.openai_total_tokens(), N + W + R + O);
+
+        // Not converted: the upstream's own total stands, even when it
+        // exceeds prompt + completion because the provider is counting
+        // overhead we cannot see.
+        let with_overhead = UsageStats {
+            prompt_tokens: 1000,
+            completion_tokens: 400,
+            total_tokens: 1500,
+            ..UsageStats::default()
+        };
+        assert_eq!(with_overhead.openai_total_tokens(), 1500);
+
+        // The degenerate upstream: a total and nothing else.
+        let total_only = UsageStats {
+            total_tokens: 42,
+            ..UsageStats::default()
+        };
+        assert_eq!(total_only.openai_total_tokens(), 42);
+
+        // A missing total still falls back to the parts.
+        let no_total = UsageStats {
+            prompt_tokens: 7,
+            completion_tokens: 3,
+            ..UsageStats::default()
+        };
+        assert_eq!(no_total.openai_total_tokens(), 10);
+    }
+
+    /// The first turn of a cached conversation WRITES without reading.
+    /// Those tokens are billed input, so they are inside
+    /// `openai_prompt_tokens` — and if nothing names them the caller
+    /// sees an unexplained increase it cannot price, since a write costs
+    /// more than plain input.
+    #[test]
+    fn a_cache_write_without_a_read_is_still_reportable() {
+        let write_only = UsageStats::with_cache(N, O, W, 0);
+        assert_eq!(write_only.openai_prompt_tokens(), N + W);
+        assert_eq!(write_only.openai_cached_tokens(), 0, "a write is not a hit");
+        assert_eq!(write_only.anthropic_cache_creation_input_tokens(), W);
+        assert_eq!(write_only.openai_total_tokens(), N + W + O);
     }
 
     #[test]

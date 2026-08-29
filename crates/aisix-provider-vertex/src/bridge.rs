@@ -2045,8 +2045,20 @@ impl GeminiUsageMetadata {
         let prompt_tokens = self
             .prompt_token_count
             .saturating_add(self.tool_use_prompt_token_count);
+        //
+        // `thoughts <= candidates` is part of the test, not a safety
+        // clamp: "the candidates already contain the thoughts" cannot be
+        // true of a count smaller than the thoughts it supposedly
+        // contains. A streaming frame mid-thinking hits exactly that —
+        // thoughts accrue while `candidatesTokenCount` is still 0, and a
+        // `totalTokenCount` that has not caught up satisfies the sum. On
+        // the inclusive reading that frame yields
+        // `reasoning_tokens > completion_tokens`, which cp-api rejects
+        // outright, dropping the request from Logs and billing with only
+        // a warning. Reading it as exclusive is also simply correct.
         let candidates_inclusive = self.total_token_count > 0
-            && prompt_tokens.saturating_add(self.candidates_token_count) == self.total_token_count;
+            && prompt_tokens.saturating_add(self.candidates_token_count) == self.total_token_count
+            && self.thoughts_token_count <= self.candidates_token_count;
         let completion_tokens = if candidates_inclusive {
             self.candidates_token_count
         } else {
@@ -2933,6 +2945,28 @@ mod tests {
         assert_eq!(u.prompt_tokens, 115);
         assert_eq!(u.completion_tokens, 50);
         assert_eq!(u.total_tokens, 165);
+    }
+
+    /// `reasoning_tokens` is a SUBSET of `completion_tokens` in OpenAI
+    /// accounting, and cp-api enforces that by REJECTING an event that
+    /// violates it — the request then leaves no row in Logs and is never
+    /// billed. A thinking frame that has accrued thoughts before any
+    /// visible output is the shape that produces it, so pin that it
+    /// stays consistent.
+    #[test]
+    fn gemini_thinking_frame_never_reports_more_reasoning_than_output() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":0,
+                "thoughtsTokenCount":50,"totalTokenCount":100}"#,
+        );
+        assert!(
+            u.reasoning_tokens <= u.completion_tokens,
+            "reasoning {} > completion {} would be dropped by cp-api",
+            u.reasoning_tokens,
+            u.completion_tokens
+        );
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.reasoning_tokens, 50);
     }
 
     /// Context-cache hits stay the OpenAI shape: a SUBSET of the prompt,

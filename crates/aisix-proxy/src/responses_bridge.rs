@@ -338,9 +338,17 @@ fn build_output_items(text: Option<&str>, tool_calls: Option<&Vec<Value>>) -> Ve
 /// cache while `cached_tokens` reported it, i.e. the self-contradictory
 /// `cached_tokens > input_tokens` (AISIX-Cloud#1447).
 fn responses_usage_json(u: &UsageStats) -> Value {
+    let mut input_details = json!({"cached_tokens": u.openai_cached_tokens()});
+    // A cache WRITE is billed input with no OpenAI field of its own, so
+    // name it beside the hit rather than leave it as an unexplained part
+    // of `input_tokens`. Present only when the upstream reported one.
+    let cache_creation = u.anthropic_cache_creation_input_tokens();
+    if cache_creation > 0 {
+        input_details["cache_creation_tokens"] = cache_creation.into();
+    }
     json!({
         "input_tokens": u.openai_prompt_tokens(),
-        "input_tokens_details": {"cached_tokens": u.openai_cached_tokens()},
+        "input_tokens_details": input_details,
         "output_tokens": u.completion_tokens,
         "output_tokens_details": {"reasoning_tokens": u.reasoning_tokens},
         "total_tokens": u.openai_total_tokens(),
@@ -1745,39 +1753,54 @@ mod tests {
         assert_eq!(types_of(&tail), vec!["response.completed"]);
     }
 
-    /// `total_tokens` is recomputed from the projected input + output,
-    /// never echoed from the upstream. The Responses API defines the
-    /// total as exactly that sum, and a client budgeting off the three
-    /// fields must be able to decompose it.
+    /// `total_tokens` is echoed when nothing was converted and
+    /// recomputed when something was — the two halves of one rule, so
+    /// they are pinned together.
     ///
-    /// This used to preserve a differing upstream total on the theory
-    /// that the provider was counting overhead we could not see. It is
-    /// how AISIX-Cloud#1447 reached the wire: for an Anthropic upstream
-    /// the preserved total folded in cache tokens that `input_tokens`
-    /// did not, so the client got `40 + 10 = 150`. An upstream counter
-    /// we DO understand belongs in a field of its own — see Gemini's
-    /// `thoughtsTokenCount` landing in `reasoning_tokens` rather than
-    /// inflating an unexplained total.
+    /// Echoing unconditionally is how AISIX-Cloud#1447 reached the wire:
+    /// an Anthropic upstream's total folds in cache tokens that its
+    /// `input_tokens` excludes, so a client projected into OpenAI
+    /// accounting read `40 + 10 = 150`. Recomputing unconditionally is
+    /// the opposite mistake — it silently corrects away whatever a
+    /// provider counted outside `prompt + completion`.
     #[test]
-    fn streaming_total_tokens_is_recomputed_not_echoed() {
-        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
-        let _ = enc.next_events(&content_chunk("hi"));
-        let done = enc.next_events(&ChatChunk {
-            id: "c".into(),
-            model: "m".into(),
-            delta: ChatDelta::default(),
-            finish_reason: Some(FinishReason::Stop),
-            usage: Some(UsageStats {
-                prompt_tokens: 5,
-                completion_tokens: 2,
-                total_tokens: 11,
-                ..Default::default()
-            }),
+    fn streaming_total_tokens_is_echoed_unless_the_shape_converted() {
+        fn closing_usage(usage: UsageStats) -> Value {
+            let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+            let _ = enc.next_events(&content_chunk("hi"));
+            let done = enc.next_events(&ChatChunk {
+                id: "c".into(),
+                model: "m".into(),
+                delta: ChatDelta::default(),
+                finish_reason: Some(FinishReason::Stop),
+                usage: Some(usage),
+            });
+            done.last().unwrap().data["response"]["usage"].clone()
+        }
+
+        // No conversion: the provider's own total stands even though it
+        // exceeds input + output.
+        let echoed = closing_usage(UsageStats {
+            prompt_tokens: 5,
+            completion_tokens: 2,
+            total_tokens: 11,
+            ..Default::default()
         });
-        let usage = &done.last().unwrap().data["response"]["usage"];
-        assert_eq!(usage["input_tokens"], 5);
-        assert_eq!(usage["output_tokens"], 2);
-        assert_eq!(usage["total_tokens"], 7);
+        assert_eq!(echoed["input_tokens"], 5);
+        assert_eq!(echoed["output_tokens"], 2);
+        assert_eq!(echoed["total_tokens"], 11);
+
+        // Converted: the stored total was built under the upstream's own
+        // accounting, so it is rebuilt from the projected fields.
+        let converted = closing_usage(UsageStats::with_cache(40, 10, 30, 70));
+        assert_eq!(converted["input_tokens"], 140);
+        assert_eq!(converted["output_tokens"], 10);
+        assert_eq!(converted["total_tokens"], 150);
+        assert_eq!(converted["input_tokens_details"]["cached_tokens"], 70);
+        assert_eq!(
+            converted["input_tokens_details"]["cache_creation_tokens"],
+            30
+        );
     }
 
     #[test]
