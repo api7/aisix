@@ -182,8 +182,7 @@ fn snapshot() -> AisixSnapshot {
         "patterns": [{ "kind": "literal", "value": BLOCK }],
     }))
     .expect("valid guardrail");
-    snap.guardrails
-        .insert(ResourceEntry::new("g-1", guardrail, 1));
+    crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1", guardrail, 1));
 
     snap
 }

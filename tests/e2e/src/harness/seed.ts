@@ -53,10 +53,40 @@ export class SeedClient {
     return this.put("observability_exporters", exporter);
   }
 
+  /**
+   * Seeds a guardrail and, unless `attach` is false, the env-scoped
+   * attachment that puts it in force.
+   *
+   * A guardrail's scope comes only from its attachments — an unattached
+   * one governs nothing (AISIX-Cloud#1450 retired the fallback that used
+   * to apply a zero-attachment guardrail to the whole environment, because
+   * keying on the ABSENCE of rows made removing a guardrail's last
+   * attachment WIDEN it). Attaching by default mirrors the console, which
+   * always writes an attachment alongside the guardrail; a test that
+   * manages its own scope passes `{ attach: false }` and writes the
+   * attachment it wants.
+   */
   async createGuardrail(
     guardrail: Record<string, unknown>,
+    opts: { attach?: boolean } = {},
   ): Promise<{ id: string; value: Record<string, unknown> }> {
-    return this.put("guardrails", guardrail);
+    const created = await this.put("guardrails", guardrail);
+    if (opts.attach !== false) {
+      await this.attachGuardrailToEnv(created.id);
+    }
+    return created;
+  }
+
+  /** Env-scope attachment: the guardrail applies to every request. */
+  async attachGuardrailToEnv(
+    guardrailID: string,
+    priority = 100,
+  ): Promise<{ id: string; value: Record<string, unknown> }> {
+    return this.put("guardrail_attachments", {
+      guardrail_id: guardrailID,
+      scope_type: "env",
+      priority,
+    });
   }
 
   async createCachePolicy(

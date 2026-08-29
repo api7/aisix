@@ -5699,7 +5699,7 @@ data: [DONE]\n\n";
             }"#,
         )
         .unwrap();
-        snap.guardrails.insert(ResourceEntry::new("g-mask", row, 1));
+        crate::seed_env_scoped_guardrail(snap, ResourceEntry::new("g-mask", row, 1));
     }
 
     #[track_caller]
@@ -5911,7 +5911,7 @@ data: [DONE]\n\n";
                 r#"{"name":"out-block","enabled":true,"kind":"keyword","hook_point":"output","fail_open":false,"patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,
             )
             .unwrap();
-            snap.guardrails.insert(ResourceEntry::new("g-out", row, 1));
+            crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-out", row, 1));
 
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);
             let hub = Arc::new(Hub::new());
@@ -6007,7 +6007,7 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
             r#"{"name":"out-block","enabled":true,"kind":"keyword","hook_point":"output","fail_open":false,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
         )
         .unwrap();
-        snap.guardrails.insert(ResourceEntry::new("g-out", row, 1));
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-out", row, 1));
 
         let hub = Arc::new(Hub::new());
         hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));

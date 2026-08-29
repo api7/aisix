@@ -235,7 +235,7 @@ describe("aisix export: etcd → export → file round-trip", () => {
         name: "noleak-guardrail",
         kind: "openai_moderation",
         api_key: marker.guardrailApiKey,
-      });
+      }, { attach: false });
       // Attach it env-wide so it is already gateway-wide in etcd and the
       // exporter emits it (exercising guardrail-credential redaction);
       // an attachment-scoped guardrail would be omitted by design.

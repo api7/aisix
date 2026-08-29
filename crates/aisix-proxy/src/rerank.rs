@@ -1001,7 +1001,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(cohere_model("rr"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let app = build_app(snap);
         let resp = app
@@ -1037,7 +1037,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(cohere_model("rr"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let app = build_app(snap);
         let resp = app
@@ -1083,7 +1083,7 @@ mod tests {
         snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
         snap.models.insert(cohere_model("rr"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -1535,7 +1535,7 @@ mod tests {
         snap.apikeys.insert(apikey_entry(&["*"]));
         // ALLOW guardrail: a literal the benign request below never matches, so
         // it governs the request (non-empty applied set) without blocking it.
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
@@ -1942,7 +1942,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(openai_model("rr"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(pii_mask_guardrail());
+        crate::seed_env_scoped_guardrail(&snap, pii_mask_guardrail());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
@@ -1993,7 +1993,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(openai_model("rerank-model"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
@@ -2065,7 +2065,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(openai_model("rerank-model"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(masking_input_guardrail());
+        crate::seed_env_scoped_guardrail(&snap, masking_input_guardrail());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());

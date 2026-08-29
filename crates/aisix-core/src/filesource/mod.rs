@@ -2,9 +2,10 @@
 //! config.yaml).
 //!
 //! Loads every dynamic resource — provider keys, models, API keys,
-//! guardrails, MCP servers, A2A agents, cache policies, observability
-//! exporters, rate-limit policies — from one YAML file instead of etcd,
-//! so a single container can run fully declaratively.
+//! guardrails and their attachments, MCP servers, A2A agents, cache
+//! policies, observability exporters, rate-limit policies — from one YAML
+//! file instead of etcd, so a single container can run fully
+//! declaratively.
 //!
 //! Pipeline (identical for boot, SIGHUP reload, and `aisix validate`):
 //!
@@ -22,8 +23,8 @@
 //! per-entry and across entries.)
 //!
 //! File format v1 (`_format_version: "1"`, mandatory):
-//! - nine top-level collection keys, each a sequence of maps, named by
-//!   the plural resource kind; unknown top-level keys are load errors.
+//! - fourteen top-level collection keys, each a sequence of maps, named
+//!   by the plural resource kind; unknown top-level keys are load errors.
 //! - after desugaring, every entry must be exactly a canonical resource
 //!   document (`schemas/resources/*.schema.json`) — the file source
 //!   never relaxes the canonical schemas.
@@ -31,6 +32,12 @@
 //!   (UUIDv5 of `"<kind>/<identity>"`, see
 //!   [`desugar::FILE_RESOURCE_NAMESPACE`]) and identities must be
 //!   unique per kind.
+//! - cross-collection references are written as the identity the target
+//!   collection is keyed by, and desugaring rewrites them to derived ids
+//!   — including a guardrail attachment's `guardrail_id` and `scope_id`.
+//!   A guardrail with no attachment is not an error: its scope target may
+//!   simply be gone, and a guardrail's scope is its attachments and
+//!   nothing else, so it governs nothing until something attaches it.
 
 mod desugar;
 mod status;
@@ -46,11 +53,12 @@ use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::models::{
     validate_a2a_agent, validate_apikey, validate_cache_policy, validate_claim_mapping,
-    validate_guardrail, validate_mcp_auth_settings, validate_mcp_server, validate_model,
-    validate_observability_exporter, validate_oidc_provider, validate_passthrough_route,
-    validate_provider_key, validate_rate_limit_policy, A2aAgent, ApiKey, CachePolicy, ClaimMapping,
-    Guardrail, McpAuthSettings, McpServer, Model, ObservabilityExporter, OidcProvider,
-    PassthroughRoute, ProviderKey, RateLimitPolicy, SchemaError,
+    validate_guardrail, validate_guardrail_attachment, validate_mcp_auth_settings,
+    validate_mcp_server, validate_model, validate_observability_exporter, validate_oidc_provider,
+    validate_passthrough_route, validate_provider_key, validate_rate_limit_policy, A2aAgent,
+    ApiKey, CachePolicy, ClaimMapping, Guardrail, GuardrailAttachment, McpAuthSettings, McpServer,
+    Model, ObservabilityExporter, OidcProvider, PassthroughRoute, ProviderKey, RateLimitPolicy,
+    SchemaError,
 };
 use crate::resource::ResourceEntry;
 use crate::AisixSnapshot;
@@ -131,12 +139,13 @@ pub(crate) fn url_has_credentials(url: &str) -> bool {
     false
 }
 
-/// Fixed processing order for the thirteen resource collections.
-const KINDS: [(&str, IdentityField); 13] = [
+/// Fixed processing order for the fourteen resource collections.
+const KINDS: [(&str, IdentityField); 14] = [
     ("provider_keys", IdentityField::DisplayName),
     ("models", IdentityField::DisplayName),
     ("api_keys", IdentityField::DisplayName),
     ("guardrails", IdentityField::Name),
+    ("guardrail_attachments", IdentityField::AttachmentTriple),
     ("mcp_servers", IdentityField::NameOrDisplayName),
     ("a2a_agents", IdentityField::NameOrDisplayName),
     ("cache_policies", IdentityField::Name),
@@ -349,6 +358,7 @@ pub fn load_from_str(
     let mut apikeys: Vec<(String, String, ApiKey)> = Vec::new();
     let mut provider_keys: Vec<(String, String, ProviderKey)> = Vec::new();
     let mut guardrails: Vec<(String, String, Guardrail)> = Vec::new();
+    let mut guardrail_attachments: Vec<(String, String, GuardrailAttachment)> = Vec::new();
     let mut mcp_servers: Vec<(String, String, McpServer)> = Vec::new();
     let mut a2a_agents: Vec<(String, String, A2aAgent)> = Vec::new();
     let mut cache_policies: Vec<(String, String, CachePolicy)> = Vec::new();
@@ -385,6 +395,9 @@ pub fn load_from_str(
                 desugar::desugar_rate_limit_policy(&mut entry.doc, &identity_maps)
             }
             "claim_mappings" => desugar::desugar_claim_mapping(&mut entry.doc, &identity_maps),
+            "guardrail_attachments" => {
+                desugar::desugar_guardrail_attachment(&mut entry.doc, &identity_maps)
+            }
             "passthrough_routes" => {
                 desugar::desugar_passthrough_route(&mut entry.doc, &identity_maps)
             }
@@ -414,6 +427,16 @@ pub fn load_from_str(
             "guardrails" => {
                 if let Some(t) = finish(&scope, &entry.doc, validate_guardrail, &mut errors) {
                     guardrails.push((id, scope, t));
+                }
+            }
+            "guardrail_attachments" => {
+                if let Some(t) = finish(
+                    &scope,
+                    &entry.doc,
+                    validate_guardrail_attachment,
+                    &mut errors,
+                ) {
+                    guardrail_attachments.push((id, scope, t));
                 }
             }
             "mcp_servers" => {
@@ -772,6 +795,11 @@ pub fn load_from_str(
     for (id, _, v) in guardrails {
         snapshot
             .guardrails
+            .insert(ResourceEntry::new(id, v, revision));
+    }
+    for (id, _, v) in guardrail_attachments {
+        snapshot
+            .guardrail_attachments
             .insert(ResourceEntry::new(id, v, revision));
     }
     for (id, _, v) in mcp_servers {

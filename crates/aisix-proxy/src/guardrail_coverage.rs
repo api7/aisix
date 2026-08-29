@@ -382,8 +382,7 @@ fn census_snapshot() -> AisixSnapshot {
         "timeout_ms": 5000,
     }))
     .expect("valid guardrail");
-    snap.guardrails
-        .insert(ResourceEntry::new("g-census", guardrail, 1));
+    crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-census", guardrail, 1));
 
     snap
 }
@@ -745,8 +744,7 @@ async fn surfaces_refused_with(row: Option<serde_json::Value>) -> Vec<&'static s
     if let Some(row) = row {
         let guardrail: aisix_core::Guardrail =
             serde_json::from_value(row).expect("valid guardrail");
-        snap.guardrails
-            .insert(ResourceEntry::new("g-census", guardrail, 2));
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-census", guardrail, 2));
     }
     let handle = SnapshotHandle::new(snap);
     let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone(), None);

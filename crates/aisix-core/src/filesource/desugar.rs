@@ -69,6 +69,12 @@ pub(crate) enum IdentityField {
     /// their own. Every entry shares the constant, so a second entry
     /// trips the pass-1 duplicate check.
     Fixed(&'static str),
+    /// The `(guardrail_id, scope_type, scope_id)` triple
+    /// (guardrail_attachments). An attachment has no name of its own,
+    /// and that triple is exactly what the control plane makes unique,
+    /// so it is the file's identity too — attaching the same guardrail
+    /// to the same target twice is a pass-1 duplicate.
+    AttachmentTriple,
 }
 
 impl IdentityField {
@@ -79,6 +85,7 @@ impl IdentityField {
             Self::Name => "name",
             Self::NameOrDisplayName => "name (or display_name)",
             Self::Fixed(_) => "the singleton identity",
+            Self::AttachmentTriple => "guardrail_id + scope_type (+ scope_id)",
         }
     }
 
@@ -96,6 +103,18 @@ impl IdentityField {
             Self::Name => field("name"),
             Self::NameOrDisplayName => field("name").or_else(|| field("display_name")),
             Self::Fixed(v) => Some(v.to_string()),
+            // Composed from the file-level names, before desugaring
+            // rewrites them to derived ids, so the identity a duplicate
+            // is reported against is what the operator actually wrote.
+            // `-` stands in for an absent scope_id (scope_type: env),
+            // which cannot collide with a resolved name because the
+            // triple always carries the scope_type as well.
+            Self::AttachmentTriple => {
+                let guardrail = field("guardrail_id")?;
+                let scope_type = field("scope_type")?;
+                let scope = field("scope_id").unwrap_or_else(|| "-".to_string());
+                Some(format!("{guardrail}/{scope_type}/{scope}"))
+            }
         }
     }
 }
@@ -332,6 +351,47 @@ pub(crate) fn desugar_rate_limit_policy(
     };
     let resolved = resolve_entity_name(maps, scope_kind, label, name, "`scope_ref`")?;
     obj.insert("scope_ref".into(), Value::String(resolved));
+    Ok(())
+}
+
+/// Resolve a guardrail attachment's two references from file-level names
+/// to derived ids: `guardrail_id` against the guardrails, and `scope_id`
+/// against whichever collection `scope_type` names.
+///
+/// `team` is deliberately absent from the scope table: the file source has
+/// no teams collection to resolve against, so a team-scoped attachment
+/// keeps whatever id the operator wrote. Callers running standalone have
+/// no teams either, so such an attachment simply never matches — which is
+/// the same outcome as any other scope whose target is gone.
+pub(crate) fn desugar_guardrail_attachment(
+    doc: &mut Value,
+    maps: &IdentityMaps,
+) -> Result<(), String> {
+    let obj = match doc.as_object_mut() {
+        Some(o) => o,
+        None => return Ok(()),
+    };
+    if let Some(name) = obj.get("guardrail_id").and_then(Value::as_str) {
+        let resolved =
+            resolve_entity_name(maps, "guardrails", "guardrail", name, "`guardrail_id`")?;
+        obj.insert("guardrail_id".into(), Value::String(resolved));
+    }
+
+    let scope_kind = match obj.get("scope_type").and_then(Value::as_str) {
+        Some("model") => ("models", "model"),
+        Some("mcp_server") => ("mcp_servers", "MCP server"),
+        Some("api_key") => ("api_keys", "api key"),
+        Some("passthrough_route") => ("passthrough_routes", "passthrough route"),
+        // `env` carries no scope_id; `team` has no file collection.
+        _ => return Ok(()),
+    };
+    let Some(name) = obj.get("scope_id").and_then(Value::as_str) else {
+        // Missing / non-string scope_id: canonical validation reports it.
+        return Ok(());
+    };
+    let (kind, label) = scope_kind;
+    let resolved = resolve_entity_name(maps, kind, label, name, "`scope_id`")?;
+    obj.insert("scope_id".into(), Value::String(resolved));
     Ok(())
 }
 

@@ -157,6 +157,14 @@ The five kinds are the cross-plane taxonomy (cp-admin.yaml `kind`); this repo's 
 - **`ensemble` is an experimental surface.** Its known parity gaps — member `allowed_cidrs`/guardrail/cooldown/health consumption, Prometheus token+spend attribution, response caching, parent-level generic knobs — are deliberate TODOs under a single future design pass. Do NOT piecemeal-fix one gap ahead of that pass, and do NOT re-audit them as fresh findings. (The one exception is a marshal-family or shared-chokepoint change where covering ensemble is a one-line parallel edit, e.g. projecting an entry-level field the DP already enforces.)
 - Adding a NEW kind = sweeping every existing model-keyed mechanism against it (grep the kind predicates in `models/model.rs`; every hit re-answers the questions above).
 
+## A Guardrail's Scope Is Its Attachments and Nothing Else
+
+There is no implicit scope. `build_index_from_snapshot` puts a guardrail in the index once per enabled attachment, and a guardrail with none governs nothing — on either source. Declaring one without an attachment is not an error, because its scope target may simply have been deleted.
+
+It used to be the opposite: a guardrail carrying ZERO attachment rows was applied to the entire environment at priority 0, a rolling-upgrade fallback from the window where this side read attachments and the control plane had not written any yet. Keying on the ABSENCE of rows is what made it dangerous — deleting the one model a guardrail was scoped to removed its last attachment and thereby WIDENED the guardrail to all traffic, silently, on a security control (AISIX-Cloud#1450). Do not reintroduce a default of any shape, and in particular do not give the resources file one "for convenience": the file source declares `guardrail_attachments` exactly as the control plane projects them, references written as the identity each collection is keyed by, so both sources answer the scoping question the same way. A convenience default in one of them is a divergence a standalone user cannot see.
+
+The export follows from that: `aisix export` emits every guardrail plus every attachment it can name. An attachment it cannot name — `team`, which has no file collection, or a `scope_id` missing from the snapshot — is dropped with a warning rather than emitted dangling, because losing a scope makes the guardrail govern LESS. Inventing one would make it govern more.
+
 ## Time-Boxed Compat Code Carries a `COMPAT-SINCE:` Marker
 
 **A shim meant to live for exactly one release gets a machine-readable deadline, not a sentence in a comment. Prose deadlines never come due — both of the ones this repo was carrying were found by grep, not by process.**

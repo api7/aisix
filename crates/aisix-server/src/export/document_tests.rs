@@ -318,10 +318,9 @@ fn attachment(guardrail_id: &str, scope_type: &str, scope_id: Option<&str>) -> V
 }
 
 #[test]
-fn env_scoped_guardrail_is_exported_gateway_wide() {
-    // An env-scoped attachment already applies to every request, so
-    // exporting the guardrail (which the file applies gateway-wide)
-    // is behavior-equivalent.
+fn env_scoped_guardrail_exports_with_its_attachment() {
+    // The file carries the scope now, so the guardrail and the attachment
+    // that puts it in force are exported together.
     let snap = AisixSnapshot::new();
     snap.guardrails.insert(ResourceEntry::new(
         "g-1",
@@ -337,13 +336,34 @@ fn env_scoped_guardrail_is_exported_gateway_wide() {
     let guardrails = find(&doc, "guardrails");
     assert_eq!(guardrails.len(), 1);
     assert_eq!(guardrails[0]["name"], json!("global-guard"));
+
+    let attachments = find(&doc, "guardrail_attachments");
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0]["guardrail_id"], json!("global-guard"));
+    assert_eq!(attachments[0]["scope_type"], json!("env"));
+    assert!(attachments[0].get("scope_id").is_none());
 }
 
 #[test]
-fn attachment_scoped_or_unattached_guardrail_is_omitted_with_a_warning() {
-    // A guardrail attached to one model — or attached to nothing — would
-    // widen (or activate) gateway-wide on import, so it must be omitted.
+fn narrow_scope_survives_the_export_as_a_reference_by_name() {
+    // AISIX-Cloud#1450. This used to assert the opposite: a model-scoped
+    // guardrail was DROPPED, because the file had no attachment collection
+    // and anything it did carry applied gateway-wide — exporting a narrow
+    // rule would have widened it to all traffic. The file expresses scope
+    // now, so the scope round-trips instead of being discarded, and the
+    // reference is emitted as the model's file identity.
     let snap = AisixSnapshot::new();
+    snap.models.insert(ResourceEntry::new(
+        "m-1",
+        serde_json::from_value(json!({
+            "display_name": "gpt-4o",
+            "provider": "openai",
+            "model_name": "gpt-4o-2024-11-20",
+            "provider_key_id": "pk-1"
+        }))
+        .unwrap(),
+        1,
+    ));
     snap.guardrails.insert(ResourceEntry::new(
         "g-scoped",
         keyword_guardrail("model-guard"),
@@ -354,24 +374,85 @@ fn attachment_scoped_or_unattached_guardrail_is_omitted_with_a_warning() {
         serde_json::from_value(attachment("g-scoped", "model", Some("m-1"))).unwrap(),
         1,
     ));
+
+    let doc = build_export_document(&snap, false);
+    let attachments = find(&doc, "guardrail_attachments");
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0]["guardrail_id"], json!("model-guard"));
+    assert_eq!(attachments[0]["scope_type"], json!("model"));
+    assert_eq!(
+        attachments[0]["scope_id"],
+        json!("gpt-4o"),
+        "scope must be emitted as the model's file identity, not its etcd id",
+    );
+}
+
+#[test]
+fn an_unattached_guardrail_exports_with_no_attachment() {
+    // Inert on both sides now, so exporting it is faithful rather than
+    // dangerous: it governs nothing in etcd and nothing in the file.
+    let snap = AisixSnapshot::new();
     snap.guardrails.insert(ResourceEntry::new(
         "g-inert",
         keyword_guardrail("inert-guard"),
         1,
     ));
     let doc = build_export_document(&snap, false);
-    // Neither guardrail is exported…
-    assert!(doc.collections.iter().all(|(k, _)| *k != "guardrails"));
-    // …and both are surfaced as would-widen-to-all-traffic warnings.
-    for name in ["model-guard", "inert-guard"] {
-        assert!(
-            doc.warnings
-                .iter()
-                .any(|w| w.contains(name) && w.contains("ALL traffic")),
-            "missing warning for {name}: {:?}",
-            doc.warnings
-        );
-    }
+    let guardrails = find(&doc, "guardrails");
+    assert_eq!(guardrails.len(), 1);
+    assert_eq!(guardrails[0]["name"], json!("inert-guard"));
+    assert!(
+        doc.collections
+            .iter()
+            .all(|(k, _)| *k != "guardrail_attachments"),
+        "nothing may be synthesized on the guardrail's behalf",
+    );
+}
+
+#[test]
+fn an_attachment_the_file_cannot_name_is_dropped_with_a_warning() {
+    // Dropping loses scope, which makes the guardrail govern LESS — the
+    // safe direction. Emitting a dangling reference would fail the import
+    // outright, and inventing one would widen it.
+    let snap = AisixSnapshot::new();
+    snap.guardrails.insert(ResourceEntry::new(
+        "g-1",
+        keyword_guardrail("team-guard"),
+        1,
+    ));
+    snap.guardrail_attachments.insert(ResourceEntry::new(
+        "att-team",
+        serde_json::from_value(attachment("g-1", "team", Some("t-1"))).unwrap(),
+        1,
+    ));
+    snap.guardrail_attachments.insert(ResourceEntry::new(
+        "att-missing-model",
+        serde_json::from_value(attachment("g-1", "model", Some("m-gone"))).unwrap(),
+        1,
+    ));
+
+    let doc = build_export_document(&snap, false);
+    assert!(
+        doc.collections
+            .iter()
+            .all(|(k, _)| *k != "guardrail_attachments"),
+        "neither attachment can be named in the file: {:?}",
+        doc.collections
+    );
+    assert!(
+        doc.warnings
+            .iter()
+            .any(|w| w.contains("no teams collection")),
+        "team scope must be reported: {:?}",
+        doc.warnings
+    );
+    assert!(
+        doc.warnings
+            .iter()
+            .any(|w| w.contains("not in the snapshot")),
+        "dangling model scope must be reported: {:?}",
+        doc.warnings
+    );
 }
 
 #[test]

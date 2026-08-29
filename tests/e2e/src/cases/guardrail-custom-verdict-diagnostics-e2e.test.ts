@@ -140,7 +140,7 @@ describe("custom guardrail e2e: a broken script is distinguishable from an enfor
         kind: "custom",
         script,
         timeout_ms: 5000,
-      });
+      }, { attach: false });
       await etcd.put(
         `${app.etcdPrefix}/guardrail_attachments/${randomUUID()}`,
         JSON.stringify({

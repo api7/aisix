@@ -69,6 +69,11 @@ guardrails:
       - kind: literal
         value: topsecret
 
+guardrail_attachments:
+  - guardrail_id: no-secrets
+    scope_type: env
+    priority: 100
+
 mcp_servers:
   - name: github
     url: https://mcp.example.com/mcp
@@ -156,6 +161,7 @@ fn full_valid_file_loads_every_kind() {
     assert_eq!(snap.models.len(), 3);
     assert_eq!(snap.apikeys.len(), 2);
     assert_eq!(snap.guardrails.len(), 1);
+    assert_eq!(snap.guardrail_attachments.len(), 1);
     assert_eq!(snap.mcp_servers.len(), 1);
     assert_eq!(snap.a2a_agents.len(), 1);
     assert_eq!(snap.cache_policies.len(), 1);
@@ -995,4 +1001,129 @@ claim_mappings:
     let errors = errors_of(load(&file, &env_of(&[])));
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("match"), "{errors:?}");
+}
+
+/// A guardrail's scope comes only from its attachments, so the file source
+/// needs the same collection the control plane projects (AISIX-Cloud#1450).
+/// References are written as the names the file already uses and resolved to
+/// derived ids, the way `scope_ref` and `provider_key` are.
+#[test]
+fn guardrail_attachment_resolves_its_references_by_name() {
+    const FILE: &str = r#"
+_format_version: "1"
+
+provider_keys:
+  - display_name: openai-prod
+    provider: openai
+    api_key: sk-test
+
+models:
+  - display_name: gpt-4o
+    provider: openai
+    model_name: gpt-4o-2024-11-20
+    provider_key: openai-prod
+
+guardrails:
+  - name: no-secrets
+    kind: keyword
+    patterns:
+      - kind: literal
+        value: topsecret
+
+guardrail_attachments:
+  - guardrail_id: no-secrets
+    scope_type: model
+    scope_id: gpt-4o
+    priority: 100
+"#;
+    let snap = load(FILE, &HashMap::new()).expect("file must load");
+    assert_eq!(snap.guardrail_attachments.len(), 1);
+
+    let attachment = &snap.guardrail_attachments.entries()[0].value;
+    assert_eq!(
+        attachment.guardrail_id,
+        snap.guardrails.get_by_name("no-secrets").unwrap().id,
+        "guardrail_id must resolve to the guardrail's derived id",
+    );
+    assert_eq!(
+        attachment.scope_id.as_deref(),
+        Some(snap.models.get_by_name("gpt-4o").unwrap().id.as_str()),
+        "scope_id must resolve to the model's derived id",
+    );
+}
+
+/// The reference has to be checked, not silently carried: an attachment
+/// naming a guardrail that is not in the file would load as a scope pointing
+/// at nothing, which is precisely the state that used to be indistinguishable
+/// from "unscoped".
+#[test]
+fn guardrail_attachment_referencing_an_unknown_guardrail_is_a_load_error() {
+    const FILE: &str = r#"
+_format_version: "1"
+
+guardrail_attachments:
+  - guardrail_id: does-not-exist
+    scope_type: env
+    priority: 100
+"#;
+    let errs = errors_of(load(FILE, &HashMap::new()));
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("`guardrail_id` references unknown guardrail")),
+        "unknown guardrail must be named in the error: {errs:?}",
+    );
+}
+
+/// Same triple twice is the control plane's uniqueness constraint, so it is
+/// the file's duplicate too.
+#[test]
+fn attaching_the_same_guardrail_to_the_same_scope_twice_is_a_load_error() {
+    const FILE: &str = r#"
+_format_version: "1"
+
+guardrails:
+  - name: no-secrets
+    kind: keyword
+    patterns:
+      - kind: literal
+        value: topsecret
+
+guardrail_attachments:
+  - guardrail_id: no-secrets
+    scope_type: env
+    priority: 100
+  - guardrail_id: no-secrets
+    scope_type: env
+    priority: 50
+"#;
+    let errs = errors_of(load(FILE, &HashMap::new()));
+    assert!(
+        errs.iter().any(|e| e.contains("duplicate")),
+        "duplicate attachment triple must be reported: {errs:?}",
+    );
+}
+
+/// An unattached guardrail is NOT an error. Its scope target may simply have
+/// been deleted, and refusing to load — or inventing an env attachment for it
+/// — would each be a worse answer than the honest one: it governs nothing
+/// until something attaches it.
+#[test]
+fn a_guardrail_with_no_attachment_loads_without_complaint() {
+    const FILE: &str = r#"
+_format_version: "1"
+
+guardrails:
+  - name: no-secrets
+    kind: keyword
+    patterns:
+      - kind: literal
+        value: topsecret
+"#;
+    let snap = load(FILE, &HashMap::new()).expect("an unattached guardrail must still load");
+    assert_eq!(snap.guardrails.len(), 1);
+    assert_eq!(
+        snap.guardrail_attachments.len(),
+        0,
+        "nothing may be synthesized on the guardrail's behalf",
+    );
 }

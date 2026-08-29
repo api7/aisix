@@ -299,7 +299,7 @@ describe("semantic guardrail kind e2e", () => {
     row: Record<string, unknown>,
   ): Promise<void> {
     if (!seed) throw new Error("seed not ready");
-    const guardrail = await seed.createGuardrail({ enabled: true, ...row });
+    const guardrail = await seed.createGuardrail({ enabled: true, ...row }, { attach: false });
     await seed.update("guardrail_attachments", randomUUID(), {
       guardrail_id: guardrail.id,
       scope_type: "model",

@@ -85,7 +85,7 @@ describe("guardrail e2e: model-scope attachment runs only for the scoped model (
       hook_point: "input",
       kind: "keyword",
       patterns: [{ kind: "literal", value: FORBIDDEN_WORD }],
-    });
+    }, { attach: false });
 
     // Attach the guardrail to the SCOPED model only. Wire shape mirrors
     // cp-api's `marshalGuardrailAttachmentKV` (P0c): snake_case fields,
