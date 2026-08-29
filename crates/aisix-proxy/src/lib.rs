@@ -10562,16 +10562,31 @@ event: message_stop\ndata: {}\n\n",
             usage.is_object(),
             "{client:?}/{upstream:?}/stream={streaming} produced no client usage; body: {text}"
         );
-        // The sender lives in the router this function still owns, so the
-        // channel never closes on its own: a cell that stops emitting
-        // would hang here and surface as the suite timeout rather than
-        // naming itself.
-        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .unwrap_or_else(|_| {
-                panic!("{client:?}/{upstream:?}/stream={streaming}: no UsageEvent (timed out)")
-            })
-            .unwrap_or_else(|| panic!("{client:?}/{upstream:?}/stream={streaming}: no UsageEvent"));
+        // Take the SERVED attempt's event, not simply the first one.
+        // Every attempt emits its own (#655), so a connection hiccup
+        // against the mock puts a failed attempt's zeroed event on the
+        // channel ahead of the real one — which is how this read failed
+        // intermittently under CI load while passing locally.
+        //
+        // The sender lives in the router this function still owns, so
+        // the channel never closes on its own: a cell that stops
+        // emitting would hang here and surface as the suite timeout
+        // rather than naming itself.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let event = loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let next = tokio::time::timeout(remaining, rx.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{client:?}/{upstream:?}/stream={streaming}: no served UsageEvent")
+                })
+                .unwrap_or_else(|| {
+                    panic!("{client:?}/{upstream:?}/stream={streaming}: usage sink closed")
+                });
+            if next.status_code == 200 {
+                break next;
+            }
+        };
         (usage, event)
     }
 
