@@ -104,6 +104,16 @@ pub struct Usage {
 pub struct PromptTokensDetails {
     /// Prompt tokens served from the provider's prompt cache.
     pub cached_tokens: u32,
+    /// Prompt tokens the provider WROTE into its cache this turn.
+    ///
+    /// Not an OpenAI field — OpenAI has no cache-write concept — but
+    /// without it an Anthropic/Bedrock cache write is an unexplained
+    /// increase in `prompt_tokens` that the caller cannot price, and
+    /// Anthropic bills a write above the plain input rate. Emitted only
+    /// when the upstream reported one, so an OpenAI upstream's usage is
+    /// byte-identical to before. LiteLLM surfaces the same counter here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -118,23 +128,38 @@ impl Usage {
     /// passthrough policy (#542) so the non-streaming and streaming
     /// renderers stay in lock-step:
     ///
-    /// - canonical triplet copied through
-    /// - `cached_prompt_tokens > 0` → emit OpenAI-shape
+    /// - the input/total pair is PROJECTED into OpenAI accounting
+    ///   (`UsageStats::openai_*`), never copied: an Anthropic-shape
+    ///   upstream stores its cache counters BESIDE `prompt_tokens`,
+    ///   and copying them through handed an OpenAI client a
+    ///   `prompt_tokens` short of the input it paid for, with
+    ///   `total_tokens != prompt + completion` (AISIX-Cloud#1447)
+    /// - `cached_tokens > 0` → emit OpenAI-shape
     ///   `prompt_tokens_details.cached_tokens` (works for OpenAI's
-    ///   nested field AND DeepSeek's normalized native one)
+    ///   nested field, DeepSeek's normalized native one, AND an
+    ///   Anthropic/Bedrock upstream's `cache_read_input_tokens`)
+    /// - a cache WRITE is billed input, so it lands in `prompt_tokens`
+    ///   and is named beside the hit rather than left as an unexplained
+    ///   increase the caller cannot price
     /// - `reasoning_tokens > 0` → emit
     ///   `completion_tokens_details.reasoning_tokens`
     /// - DeepSeek-native `prompt_cache_hit_tokens` /
     ///   `prompt_cache_miss_tokens` passed through verbatim when the
     ///   upstream sent them (Some), omitted otherwise
     fn from_stats(u: &aisix_gateway::UsageStats) -> Self {
+        let cached_tokens = u.openai_cached_tokens();
+        let cache_creation_tokens = u.anthropic_cache_creation_input_tokens();
         Usage {
-            prompt_tokens: u.prompt_tokens,
+            prompt_tokens: u.openai_prompt_tokens(),
             completion_tokens: u.completion_tokens,
-            total_tokens: u.total_tokens,
-            prompt_tokens_details: (u.cached_prompt_tokens > 0).then_some(PromptTokensDetails {
-                cached_tokens: u.cached_prompt_tokens,
-            }),
+            total_tokens: u.openai_total_tokens(),
+            prompt_tokens_details: (cached_tokens > 0 || cache_creation_tokens > 0).then_some(
+                PromptTokensDetails {
+                    cached_tokens,
+                    cache_creation_tokens: (cache_creation_tokens > 0)
+                        .then_some(cache_creation_tokens),
+                },
+            ),
             completion_tokens_details: (u.reasoning_tokens > 0).then_some(
                 CompletionTokensDetails {
                     reasoning_tokens: u.reasoning_tokens,

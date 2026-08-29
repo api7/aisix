@@ -1747,18 +1747,9 @@ fn gemini_chunk_into_chat_chunks(
         .as_deref()
         .map(|s| map_gemini_finish_reason(Some(s)));
 
-    let usage = raw.usage_metadata.map(|u| UsageStats {
-        prompt_tokens: u.prompt_token_count,
-        completion_tokens: u.candidates_token_count,
-        total_tokens: if u.total_token_count > 0 {
-            u.total_token_count
-        } else {
-            u.prompt_token_count
-                .saturating_add(u.candidates_token_count)
-        },
-        cached_prompt_tokens: u.cached_content_token_count,
-        ..Default::default()
-    });
+    let usage = raw
+        .usage_metadata
+        .map(GeminiUsageMetadata::into_usage_stats);
 
     let mut chunks = Vec::with_capacity(2);
 
@@ -2013,6 +2004,76 @@ struct GeminiUsageMetadata {
     /// prompt total (AISIX-Cloud#1404).
     #[serde(default, rename = "cachedContentTokenCount")]
     cached_content_token_count: u32,
+    /// Thinking tokens. Gemini bills these as output but reports them
+    /// in their own counter, and — depending on model version — either
+    /// inside `candidatesTokenCount` or beside it. OpenAI accounting has
+    /// no third bucket: reasoning is a SUBSET of `completion_tokens`.
+    /// See [`GeminiUsageMetadata::into_usage_stats`].
+    #[serde(default, rename = "thoughtsTokenCount")]
+    thoughts_token_count: u32,
+    /// Tokens fed back to the model from tool results — INPUT that
+    /// `promptTokenCount` does not include. Always 0 today because this
+    /// bridge sends no tools, and mapped anyway: it is a term in
+    /// Gemini's own `totalTokenCount` identity, which is what decides
+    /// whether `candidatesTokenCount` already contains the thoughts. A
+    /// version of this code that assumed the term away would start
+    /// double-counting thinking tokens the day tools are added here,
+    /// with nothing to catch it.
+    #[serde(default, rename = "toolUsePromptTokenCount")]
+    tool_use_prompt_token_count: u32,
+}
+
+impl GeminiUsageMetadata {
+    /// Project Gemini's counters onto [`UsageStats`]' OpenAI accounting
+    /// shape. Shared by the streaming and non-streaming decoders so the
+    /// two cannot report a different completion total for the same call.
+    ///
+    /// `thoughtsTokenCount` is the subtle one. Gemini changed its mind
+    /// about whether `candidatesTokenCount` includes it, so neither
+    /// answer can be hard-coded; `totalTokenCount` settles it, exactly
+    /// as LiteLLM's adapter decides the same question. Left unmapped
+    /// (the pre-fix behaviour) a thinking model reported
+    /// `reasoning_tokens: 0` and a `completion_tokens` short of what
+    /// Google billed, which every client-facing protocol then inherited
+    /// (AISIX-Cloud#1447).
+    fn into_usage_stats(self) -> UsageStats {
+        // Gemini's identity is
+        //   total = prompt + candidates + toolUsePrompt + thoughts
+        // so `candidates` still summing to the total means it has
+        // already absorbed the thoughts, and adding them again would
+        // bill the thinking twice.
+        let prompt_tokens = self
+            .prompt_token_count
+            .saturating_add(self.tool_use_prompt_token_count);
+        //
+        // `thoughts <= candidates` is part of the test, not a safety
+        // clamp: "the candidates already contain the thoughts" cannot be
+        // true of a count smaller than the thoughts it supposedly
+        // contains. A streaming frame mid-thinking hits exactly that —
+        // thoughts accrue while `candidatesTokenCount` is still 0, and a
+        // `totalTokenCount` that has not caught up satisfies the sum. On
+        // the inclusive reading that frame yields
+        // `reasoning_tokens > completion_tokens`, which cp-api rejects
+        // outright, dropping the request from Logs and billing with only
+        // a warning. Reading it as exclusive is also simply correct.
+        let candidates_inclusive = self.total_token_count > 0
+            && prompt_tokens.saturating_add(self.candidates_token_count) == self.total_token_count
+            && self.thoughts_token_count <= self.candidates_token_count;
+        let completion_tokens = if candidates_inclusive {
+            self.candidates_token_count
+        } else {
+            self.candidates_token_count
+                .saturating_add(self.thoughts_token_count)
+        };
+        UsageStats {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            cached_prompt_tokens: self.cached_content_token_count,
+            reasoning_tokens: self.thoughts_token_count,
+            ..Default::default()
+        }
+    }
 }
 
 /// Translate Gemini's response into the gateway's [`ChatResponse`].
@@ -2042,18 +2103,7 @@ fn gemini_response_into_chat_response(
     };
     let usage = raw
         .usage_metadata
-        .map(|u| UsageStats {
-            prompt_tokens: u.prompt_token_count,
-            completion_tokens: u.candidates_token_count,
-            total_tokens: if u.total_token_count > 0 {
-                u.total_token_count
-            } else {
-                u.prompt_token_count
-                    .saturating_add(u.candidates_token_count)
-            },
-            cached_prompt_tokens: u.cached_content_token_count,
-            ..Default::default()
-        })
+        .map(GeminiUsageMetadata::into_usage_stats)
         .unwrap_or_default();
     ChatResponse {
         id: String::new(), // Gemini doesn't return a request id in the body
@@ -2823,6 +2873,114 @@ mod tests {
         .unwrap();
         let chat = gemini_response_into_chat_response(raw, "gemini-1.5-pro");
         assert_eq!(chat.usage.total_tokens, 0);
+    }
+
+    fn gemini_usage(json: &str) -> UsageStats {
+        serde_json::from_str::<GeminiUsageMetadata>(json)
+            .unwrap()
+            .into_usage_stats()
+    }
+
+    /// A thinking model whose `candidatesTokenCount` EXCLUDES the
+    /// thoughts: `totalTokenCount` is the giveaway (100 + 20 != 150).
+    /// Google bills thoughts as output, and OpenAI accounting has no
+    /// third bucket, so they fold into `completion_tokens` with
+    /// `reasoning_tokens` naming the subset. Left unmapped they vanished
+    /// from every client-facing protocol (AISIX-Cloud#1447).
+    #[test]
+    fn gemini_thoughts_fold_into_completion_when_reported_beside_candidates() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":20,
+                "thoughtsTokenCount":30,"totalTokenCount":150}"#,
+        );
+        assert_eq!(u.prompt_tokens, 100);
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.reasoning_tokens, 30);
+        assert_eq!(u.total_tokens, 150, "matches Gemini's own totalTokenCount");
+        assert_eq!(u.openai_total_tokens(), 150);
+    }
+
+    /// Other Gemini versions already count thoughts INSIDE
+    /// `candidatesTokenCount` — here 50 covers both, and
+    /// `100 + 50 == 150` says so. Adding them again would bill the
+    /// thinking twice, so the total settles which reading applies.
+    #[test]
+    fn gemini_thoughts_are_not_double_counted_when_already_inclusive() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":50,
+                "thoughtsTokenCount":30,"totalTokenCount":150}"#,
+        );
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.reasoning_tokens, 30);
+        assert_eq!(u.total_tokens, 150);
+    }
+
+    /// Tool-result tokens are INPUT that `promptTokenCount` excludes, so
+    /// they join the prompt — and they are a term in the identity that
+    /// decides inclusiveness. Here `100 + 20 + 15 + 30 == 165`, so the
+    /// candidates are exclusive and the thoughts fold in.
+    #[test]
+    fn gemini_tool_use_prompt_tokens_join_the_input() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":20,"toolUsePromptTokenCount":15,
+                "thoughtsTokenCount":30,"totalTokenCount":165}"#,
+        );
+        assert_eq!(u.prompt_tokens, 115);
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.total_tokens, 165, "matches Gemini's own totalTokenCount");
+    }
+
+    /// The same reading with INCLUSIVE candidates: `100 + 50 + 15 == 165`
+    /// leaves nothing for the thoughts, so they are already inside the
+    /// 50. Judging inclusiveness without the tool-use term would read
+    /// this as exclusive and bill the 30 thinking tokens twice — the
+    /// reason that term is mapped at all while this bridge sends no
+    /// tools.
+    #[test]
+    fn gemini_tool_use_tokens_do_not_break_the_inclusive_reading() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":50,"toolUsePromptTokenCount":15,
+                "thoughtsTokenCount":30,"totalTokenCount":165}"#,
+        );
+        assert_eq!(u.prompt_tokens, 115);
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.total_tokens, 165);
+    }
+
+    /// `reasoning_tokens` is a SUBSET of `completion_tokens` in OpenAI
+    /// accounting, and cp-api enforces that by REJECTING an event that
+    /// violates it — the request then leaves no row in Logs and is never
+    /// billed. A thinking frame that has accrued thoughts before any
+    /// visible output is the shape that produces it, so pin that it
+    /// stays consistent.
+    #[test]
+    fn gemini_thinking_frame_never_reports_more_reasoning_than_output() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":0,
+                "thoughtsTokenCount":50,"totalTokenCount":100}"#,
+        );
+        assert!(
+            u.reasoning_tokens <= u.completion_tokens,
+            "reasoning {} > completion {} would be dropped by cp-api",
+            u.reasoning_tokens,
+            u.completion_tokens
+        );
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.reasoning_tokens, 50);
+    }
+
+    /// Context-cache hits stay the OpenAI shape: a SUBSET of the prompt,
+    /// never added on top of it.
+    #[test]
+    fn gemini_cached_content_stays_a_subset_of_the_prompt() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":20,
+                "cachedContentTokenCount":70,"totalTokenCount":120}"#,
+        );
+        assert_eq!(u.openai_prompt_tokens(), 100);
+        assert_eq!(u.openai_cached_tokens(), 70);
+        assert_eq!(u.anthropic_input_tokens(), 30);
+        assert_eq!(u.anthropic_cache_read_input_tokens(), 70);
     }
 
     // ─── Pre-dispatch validation ───────────────────────────────────────

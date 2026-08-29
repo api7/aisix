@@ -3643,6 +3643,16 @@ mod tests {
         assert_eq!(chat.usage.total_tokens, 51);
         // Bedrock reports no OpenAI-shape cached subset.
         assert_eq!(chat.usage.cached_prompt_tokens, 0);
+
+        // …and because they sit beside `inputTokens`, a client asking in
+        // OpenAI accounting must be told the full 1040 input, not the 40
+        // (AISIX-Cloud#1447). Converse's own `totalTokens` excludes the
+        // cache entirely, which is why the client-facing total is
+        // recomputed rather than echoed.
+        assert_eq!(chat.usage.openai_prompt_tokens(), 1040);
+        assert_eq!(chat.usage.openai_cached_tokens(), 800);
+        assert_eq!(chat.usage.openai_total_tokens(), 1051);
+        assert_eq!(chat.usage.anthropic_input_tokens(), 40);
     }
 
     /// Claude on Bedrock dispatches through the legacy `/invoke` path,
