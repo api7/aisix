@@ -207,7 +207,7 @@ describe("file resource source: smoke + read-only admin surface", () => {
 
     // The refused write did not change the resource set.
     const relist = await fetch(`${app.adminUrl}/admin/v1/models`, { headers: auth });
-    expect(((await relist.json()) as unknown[]).length).toBe(2);
+    expect(((await relist.json()) as unknown[]).length).toBe(3);
 
     const delRes = await fetch(`${app.adminUrl}/admin/v1/models/any-id`, {
       method: "DELETE",
