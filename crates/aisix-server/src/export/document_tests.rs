@@ -413,7 +413,8 @@ fn an_unattached_guardrail_exports_with_no_attachment() {
 fn an_attachment_the_file_cannot_name_is_dropped_with_a_warning() {
     // Dropping loses scope, which makes the guardrail govern LESS — the
     // safe direction. Emitting a dangling reference would fail the import
-    // outright, and inventing one would widen it.
+    // outright (the loader rejects the whole file), and inventing one would
+    // widen it.
     let snap = AisixSnapshot::new();
     snap.guardrails.insert(ResourceEntry::new(
         "g-1",
@@ -421,13 +422,17 @@ fn an_attachment_the_file_cannot_name_is_dropped_with_a_warning() {
         1,
     ));
     snap.guardrail_attachments.insert(ResourceEntry::new(
-        "att-team",
-        serde_json::from_value(attachment("g-1", "team", Some("t-1"))).unwrap(),
-        1,
-    ));
-    snap.guardrail_attachments.insert(ResourceEntry::new(
         "att-missing-model",
         serde_json::from_value(attachment("g-1", "model", Some("m-gone"))).unwrap(),
+        1,
+    ));
+    // The export carries no passthrough_routes collection at all, so a
+    // route-scoped attachment has nothing to point at. Emitting the name
+    // anyway produced a file the loader rejected WHOLE, with export still
+    // exiting 0.
+    snap.guardrail_attachments.insert(ResourceEntry::new(
+        "att-route",
+        serde_json::from_value(attachment("g-1", "passthrough_route", Some("r-1"))).unwrap(),
         1,
     ));
 
@@ -442,15 +447,15 @@ fn an_attachment_the_file_cannot_name_is_dropped_with_a_warning() {
     assert!(
         doc.warnings
             .iter()
-            .any(|w| w.contains("no teams collection")),
-        "team scope must be reported: {:?}",
+            .any(|w| w.contains("not in the snapshot")),
+        "dangling model scope must be reported: {:?}",
         doc.warnings
     );
     assert!(
         doc.warnings
             .iter()
-            .any(|w| w.contains("not in the snapshot")),
-        "dangling model scope must be reported: {:?}",
+            .any(|w| w.contains("does not carry passthrough routes")),
+        "route scope must be reported: {:?}",
         doc.warnings
     );
 }
@@ -629,5 +634,39 @@ fn dangling_claim_mapping_target_is_kept_and_blocking() {
             .any(|w| w.contains("dangling") && w.contains("finance-dept")),
         "{:?}",
         doc.blocking
+    );
+}
+
+/// A team scope has no collection to name, but it still round-trips: the id
+/// goes through verbatim, `api_keys[].team_id` is a file field, and the
+/// runtime compares the two as bare strings. Dropping it would narrow a
+/// guardrail while the team-scoped rate limit beside it survived.
+#[test]
+fn a_team_scope_is_carried_through_verbatim() {
+    let snap = AisixSnapshot::new();
+    snap.guardrails.insert(ResourceEntry::new(
+        "g-1",
+        keyword_guardrail("team-guard"),
+        1,
+    ));
+    snap.guardrail_attachments.insert(ResourceEntry::new(
+        "att-team",
+        serde_json::from_value(attachment("g-1", "team", Some("team-alpha"))).unwrap(),
+        1,
+    ));
+
+    let doc = build_export_document(&snap, false);
+    let attachments = find(&doc, "guardrail_attachments");
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0]["scope_type"], json!("team"));
+    assert_eq!(
+        attachments[0]["scope_id"],
+        json!("team-alpha"),
+        "a team id has no name to resolve to and must survive unchanged",
+    );
+    assert!(
+        doc.warnings.is_empty(),
+        "a team scope is expressible, so nothing should be reported: {:?}",
+        doc.warnings
     );
 }

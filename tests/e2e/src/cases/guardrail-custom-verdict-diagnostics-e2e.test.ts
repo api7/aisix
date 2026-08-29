@@ -121,8 +121,8 @@ describe("custom guardrail e2e: a broken script is distinguishable from an enfor
     });
 
     // One model per script, each with its own guardrail attached by model
-    // scope — the scripts must not shadow each other, and an attachment row
-    // suppresses the implicit env-wide fallback.
+    // scope — the scripts must not shadow each other, and a model scope is
+    // the guardrail's only scope.
     for (const [model, script] of Object.entries(CASES)) {
       const m = await seed.createModel({
         display_name: model,

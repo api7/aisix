@@ -169,8 +169,8 @@ fn snapshot() -> AisixSnapshot {
     snap.passthrough_routes
         .insert(ResourceEntry::new("route-1", route, 1));
 
-    // Env-scoped (no attachment row → the backward-compat fallback applies
-    // it to every request), input hook, fail-closed. A keyword row is the
+    // Attached env-wide by `seed_env_scoped_guardrail`, input hook,
+    // fail-closed. A keyword row is the
     // deterministic stand-in for any input-hook kind and, unlike a
     // text-independent script, keeps the clean run genuinely clean.
     let guardrail: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({

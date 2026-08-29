@@ -871,8 +871,8 @@ mod tests {
         })
     }
 
-    /// An env-scoped keyword input guardrail (no attachment row → applies
-    /// to every request via the backward-compat fallback) that blocks on a
+    /// A keyword input guardrail, attached env-wide by
+    /// `seed_env_scoped_guardrail` so it applies to every request. Blocks on a
     /// literal. `fail_open:false` is irrelevant for keyword (local, never
     /// errors) but keeps the row explicit.
     fn keyword_input_guardrail(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {

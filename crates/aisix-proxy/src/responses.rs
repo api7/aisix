@@ -3442,8 +3442,8 @@ mod tests {
             .unwrap()
     }
 
-    /// An env-scoped keyword input guardrail (no attachment row → applies to
-    /// every request via the backward-compat fallback) that blocks on a
+    /// A keyword input guardrail, attached env-wide by
+    /// `seed_env_scoped_guardrail` so it applies to every request. Blocks on a
     /// literal substring. Keyword is local (no remote call), so it's the
     /// deterministic stand-in for any input-hook guardrail kind.
     fn keyword_input_guardrail(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {
@@ -3774,8 +3774,8 @@ mod tests {
         assert_eq!(v["error"]["type"], "content_filter");
     }
 
-    /// An env-scoped keyword guardrail on the OUTPUT hook (no attachment →
-    /// applies to every request). `runs_on_output()` is true, so the
+    /// A keyword guardrail on the OUTPUT hook, attached env-wide by
+    /// `seed_env_scoped_guardrail`. `runs_on_output()` is true, so the
     /// handler scans the assistant output.
     fn keyword_output_guardrail(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {
         let json = format!(

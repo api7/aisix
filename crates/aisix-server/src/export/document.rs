@@ -344,8 +344,8 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
         ),
     );
 
-    // guardrail_attachments are consumed above to decide which guardrails
-    // are gateway-wide; they are not a file collection of their own.
+    // guardrail_attachments are emitted above as their own collection, with
+    // every id reference rewritten to the identity its collection is keyed by.
 
     // Two entries whose identities differ only in characters `sanitize`
     // folds to `_` (e.g. `openai-prod` vs `openai.prod`) derive the SAME
@@ -379,11 +379,18 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
 /// Build the file's `guardrail_attachments` entries, rewriting every id
 /// reference into the identity its own collection is keyed by in the file.
 ///
-/// An attachment the file cannot express is dropped with a warning rather
-/// than emitted with a dangling reference: `team` has no file collection to
-/// name, and a `scope_id` pointing at a resource missing from the snapshot
-/// has no name to resolve. Dropping is the safe direction — the guardrail
-/// loses that scope and governs less, never more.
+/// A `team` scope carries its id through verbatim, the way
+/// `resugar_scope_ref` already does for a team-scoped rate-limit policy:
+/// there is no teams collection to name, but `api_keys[].team_id` IS a file
+/// field and the runtime compares the two ids as bare strings, so the scope
+/// really does resolve standalone. Dropping it would narrow a guardrail while
+/// the rate limit beside it survived.
+///
+/// An attachment the file genuinely cannot express is dropped with a warning
+/// rather than emitted dangling: a `passthrough_route` scope (the export
+/// carries no routes collection to point at) and a `scope_id` naming a
+/// resource missing from the snapshot. Dropping is the safe direction — the
+/// guardrail loses that scope and governs less, never more.
 fn emit_guardrail_attachments(
     snapshot: &AisixSnapshot,
     model_names: &BTreeMap<String, String>,
@@ -392,7 +399,6 @@ fn emit_guardrail_attachments(
 ) -> Vec<Value> {
     let guardrail_names = id_to_name(&snapshot.guardrails, |g| g.name.clone());
     let mcp_server_names = id_to_name(&snapshot.mcp_servers, |s| s.name.clone());
-    let route_names = id_to_name(&snapshot.passthrough_routes, |r| r.name.clone());
 
     let mut out: Vec<Value> = Vec::new();
     for entry in snapshot.guardrail_attachments.entries() {
@@ -411,16 +417,19 @@ fn emit_guardrail_attachments(
                 Some(("MCP server", mcp_server_names.get(scope_ref(a))))
             }
             GuardrailScopeType::ApiKey => Some(("api key", api_key_names.get(scope_ref(a)))),
+            // The export carries no `passthrough_routes` collection, so a
+            // route-scoped attachment has nothing to point at in the file —
+            // emitting the name anyway makes the whole file fail to load.
             GuardrailScopeType::PassthroughRoute => {
-                Some(("passthrough route", route_names.get(scope_ref(a))))
-            }
-            GuardrailScopeType::Team => {
                 diag.warnings.push(format!(
-                    "guardrail {guardrail:?} has a team-scoped attachment; the resources file has \
-                     no teams collection to name, so that scope is omitted",
+                    "guardrail {guardrail:?} has a passthrough-route-scoped attachment; the \
+                     export does not carry passthrough routes, so that scope is omitted",
                 ));
                 continue;
             }
+            // Verbatim: `api_keys[].team_id` is a file field and
+            // `IndexEntry::applies_to` compares the two ids as bare strings.
+            GuardrailScopeType::Team => Some(("team", a.scope_id.as_ref())),
         };
         let resolved = match scope_name {
             None => None,
@@ -450,7 +459,13 @@ fn emit_guardrail_attachments(
         if !a.enabled {
             doc.insert("enabled".into(), Value::Bool(false));
         }
-        out.push(Value::Object(doc));
+        // Same `$` escaping every other collection gets from `emit_entries`:
+        // the loader unescapes `$$` before interpolating, so a name carrying
+        // a `$` must be written escaped on BOTH sides of the reference or the
+        // two stop matching.
+        let mut doc = Value::Object(doc);
+        escape_dollars(&mut doc);
+        out.push(doc);
     }
     // Deterministic file output: same snapshot must emit the same bytes.
     out.sort_by(|a, b| {

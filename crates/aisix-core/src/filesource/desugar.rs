@@ -358,11 +358,13 @@ pub(crate) fn desugar_rate_limit_policy(
 /// to derived ids: `guardrail_id` against the guardrails, and `scope_id`
 /// against whichever collection `scope_type` names.
 ///
-/// `team` is deliberately absent from the scope table: the file source has
-/// no teams collection to resolve against, so a team-scoped attachment
-/// keeps whatever id the operator wrote. Callers running standalone have
-/// no teams either, so such an attachment simply never matches — which is
-/// the same outcome as any other scope whose target is gone.
+/// `team` is absent from the scope table on purpose, and its `scope_id` is
+/// carried through verbatim rather than resolved: there is no teams
+/// collection to name, but `api_keys[].team_id` IS a file field and
+/// `IndexEntry::applies_to` compares the two ids as bare strings — so a
+/// team-scoped attachment does resolve standalone, against whatever id the
+/// operator wrote on both sides. Same treatment a team-scoped rate-limit
+/// policy's `scope_ref` already gets.
 pub(crate) fn desugar_guardrail_attachment(
     doc: &mut Value,
     maps: &IdentityMaps,

@@ -1054,7 +1054,92 @@ pub fn build_index_from_snapshot(
         ));
     }
 
+    warn_unattached_guardrails(guardrails, attachments);
     GuardrailIndex::from_entries(entries)
+}
+
+/// Ids of the enabled guardrails no attachment names — the rows that are
+/// loaded, counted, and inert.
+///
+/// A DISABLED attachment still counts as naming its guardrail: switching an
+/// attachment off is the operator saying "not here, for now", and reporting
+/// that as an oversight would train them to ignore the line.
+fn unattached_ids(
+    guardrails: &ResourceTable<DomainGuardrail>,
+    attachments: &ResourceTable<GuardrailAttachment>,
+) -> Vec<(String, String)> {
+    let attached: std::collections::HashSet<String> = attachments
+        .entries()
+        .into_iter()
+        .map(|a| a.value.guardrail_id.clone())
+        .collect();
+    let mut out: Vec<(String, String)> = guardrails
+        .entries()
+        .into_iter()
+        .filter(|e| e.value.enabled && !attached.contains(e.id.as_str()))
+        .map(|e| (e.id.clone(), e.value.name.clone()))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Names of the enabled-but-unattached guardrails, for `aisix validate` —
+/// the one place an operator looks BEFORE deploying, where the runtime WARN
+/// below has not had a chance to fire yet.
+pub fn unattached_guardrail_names(
+    guardrails: &ResourceTable<DomainGuardrail>,
+    attachments: &ResourceTable<GuardrailAttachment>,
+) -> Vec<String> {
+    unattached_ids(guardrails, attachments)
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect()
+}
+
+/// WARN once per guardrail id for the process lifetime: this row is enabled
+/// but nothing attaches it, so it inspects no traffic at all.
+///
+/// The state is legitimate — a scope target can be deleted, and a rule with
+/// no scope left is correctly inert — but it is also indistinguishable from a
+/// misconfiguration, and it is INVISIBLE otherwise: the guardrail is present
+/// in the snapshot, `/status/config` counts it as loaded, and no request ever
+/// mentions it. An operator who believes a rule is in force deserves to be
+/// told it is not.
+///
+/// Deduped per id, not logged per build, for the reason AISIX-Cloud#1435
+/// documents: the index is rebuilt on every snapshot version change, and this
+/// describes a STANDING property of a row rather than an event.
+fn warn_unattached_guardrails(
+    guardrails: &ResourceTable<DomainGuardrail>,
+    attachments: &ResourceTable<GuardrailAttachment>,
+) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    const MAX_REMEMBERED: usize = 1024;
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    // Poison-tolerant: this set only dedupes log lines, so a panic while the
+    // lock was held must not wedge every later index build.
+    let mut warned = WARNED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    for (id, name) in unattached_ids(guardrails, attachments) {
+        if warned.contains(&id) {
+            continue;
+        }
+        tracing::warn!(
+            guardrail_id = %id,
+            guardrail_name = %name,
+            "guardrail is enabled but has no attachment, so it inspects no traffic; \
+             attach it to an environment, model, MCP server, API key, team or \
+             passthrough route to put it in force",
+        );
+        if warned.len() < MAX_REMEMBERED {
+            warned.insert(id);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
