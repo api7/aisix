@@ -10562,9 +10562,15 @@ event: message_stop\ndata: {}\n\n",
             usage.is_object(),
             "{client:?}/{upstream:?}/stream={streaming} produced no client usage; body: {text}"
         );
-        let event = rx
-            .recv()
+        // The sender lives in the router this function still owns, so the
+        // channel never closes on its own: a cell that stops emitting
+        // would hang here and surface as the suite timeout rather than
+        // naming itself.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
             .await
+            .unwrap_or_else(|_| {
+                panic!("{client:?}/{upstream:?}/stream={streaming}: no UsageEvent (timed out)")
+            })
             .unwrap_or_else(|| panic!("{client:?}/{upstream:?}/stream={streaming}: no UsageEvent"));
         (usage, event)
     }

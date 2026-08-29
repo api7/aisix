@@ -2011,6 +2011,16 @@ struct GeminiUsageMetadata {
     /// See [`GeminiUsageMetadata::into_usage_stats`].
     #[serde(default, rename = "thoughtsTokenCount")]
     thoughts_token_count: u32,
+    /// Tokens fed back to the model from tool results — INPUT that
+    /// `promptTokenCount` does not include. Always 0 today because this
+    /// bridge sends no tools, and mapped anyway: it is a term in
+    /// Gemini's own `totalTokenCount` identity, which is what decides
+    /// whether `candidatesTokenCount` already contains the thoughts. A
+    /// version of this code that assumed the term away would start
+    /// double-counting thinking tokens the day tools are added here,
+    /// with nothing to catch it.
+    #[serde(default, rename = "toolUsePromptTokenCount")]
+    tool_use_prompt_token_count: u32,
 }
 
 impl GeminiUsageMetadata {
@@ -2027,11 +2037,16 @@ impl GeminiUsageMetadata {
     /// Google billed, which every client-facing protocol then inherited
     /// (AISIX-Cloud#1447).
     fn into_usage_stats(self) -> UsageStats {
+        // Gemini's identity is
+        //   total = prompt + candidates + toolUsePrompt + thoughts
+        // so `candidates` still summing to the total means it has
+        // already absorbed the thoughts, and adding them again would
+        // bill the thinking twice.
+        let prompt_tokens = self
+            .prompt_token_count
+            .saturating_add(self.tool_use_prompt_token_count);
         let candidates_inclusive = self.total_token_count > 0
-            && self
-                .prompt_token_count
-                .saturating_add(self.candidates_token_count)
-                == self.total_token_count;
+            && prompt_tokens.saturating_add(self.candidates_token_count) == self.total_token_count;
         let completion_tokens = if candidates_inclusive {
             self.candidates_token_count
         } else {
@@ -2039,9 +2054,9 @@ impl GeminiUsageMetadata {
                 .saturating_add(self.thoughts_token_count)
         };
         UsageStats {
-            prompt_tokens: self.prompt_token_count,
+            prompt_tokens,
             completion_tokens,
-            total_tokens: self.prompt_token_count.saturating_add(completion_tokens),
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
             cached_prompt_tokens: self.cached_content_token_count,
             reasoning_tokens: self.thoughts_token_count,
             ..Default::default()
@@ -2886,6 +2901,38 @@ mod tests {
         assert_eq!(u.completion_tokens, 50);
         assert_eq!(u.reasoning_tokens, 30);
         assert_eq!(u.total_tokens, 150);
+    }
+
+    /// Tool-result tokens are INPUT that `promptTokenCount` excludes, so
+    /// they join the prompt — and they are a term in the identity that
+    /// decides inclusiveness. Here `100 + 20 + 15 + 30 == 165`, so the
+    /// candidates are exclusive and the thoughts fold in.
+    #[test]
+    fn gemini_tool_use_prompt_tokens_join_the_input() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":20,"toolUsePromptTokenCount":15,
+                "thoughtsTokenCount":30,"totalTokenCount":165}"#,
+        );
+        assert_eq!(u.prompt_tokens, 115);
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.total_tokens, 165, "matches Gemini's own totalTokenCount");
+    }
+
+    /// The same reading with INCLUSIVE candidates: `100 + 50 + 15 == 165`
+    /// leaves nothing for the thoughts, so they are already inside the
+    /// 50. Judging inclusiveness without the tool-use term would read
+    /// this as exclusive and bill the 30 thinking tokens twice — the
+    /// reason that term is mapped at all while this bridge sends no
+    /// tools.
+    #[test]
+    fn gemini_tool_use_tokens_do_not_break_the_inclusive_reading() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":50,"toolUsePromptTokenCount":15,
+                "thoughtsTokenCount":30,"totalTokenCount":165}"#,
+        );
+        assert_eq!(u.prompt_tokens, 115);
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.total_tokens, 165);
     }
 
     /// Context-cache hits stay the OpenAI shape: a SUBSET of the prompt,

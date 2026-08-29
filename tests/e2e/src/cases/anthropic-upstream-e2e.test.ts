@@ -417,7 +417,12 @@ describe("anthropic upstream e2e: cache tokens fold into total_tokens (#906)", (
     expect(completion.usage?.prompt_tokens).toBe(10 + 200 + 800);
     expect(completion.usage?.completion_tokens).toBe(4);
     expect(completion.usage?.total_tokens).toBe(10 + 4 + 200 + 800);
-    expect(completion.usage?.prompt_tokens_details?.cached_tokens).toBe(800);
+    // The SDK's pinned `CompletionUsage` predates `prompt_tokens_details`;
+    // the wire carries it, so assert on the wire shape.
+    expect(
+      (completion.usage as unknown as { prompt_tokens_details?: { cached_tokens?: number } })
+        ?.prompt_tokens_details?.cached_tokens,
+    ).toBe(800);
   });
 });
 

@@ -332,6 +332,12 @@ describe("client-facing usage is the CALLER's protocol, not the upstream's (AISI
     expect(usage.prompt_tokens).toBe(TOTAL_IN);
     expect(usage.completion_tokens).toBe(OUT);
     expect(usage.total_tokens).toBe(TOTAL);
+    // The cache detail has to survive the stream too — dropping it only
+    // on the streaming exit is how #1405 shipped half-fixed.
+    expect(
+      (usage as unknown as { prompt_tokens_details: { cached_tokens: number } })
+        .prompt_tokens_details.cached_tokens,
+    ).toBe(CACHE_READ);
 
     await expectAnthropicShapedEvent(res.requestId);
   });
@@ -365,6 +371,10 @@ describe("client-facing usage is the CALLER's protocol, not the upstream's (AISI
     expect(usage.input_tokens).toBe(TOTAL_IN);
     expect(usage.output_tokens).toBe(OUT);
     expect(usage.total_tokens).toBe(TOTAL);
+    const cached = (usage as unknown as { input_tokens_details: { cached_tokens: number } })
+      .input_tokens_details.cached_tokens;
+    expect(cached).toBe(CACHE_READ);
+    expect(cached).toBeLessThanOrEqual(usage.input_tokens);
 
     await expectAnthropicShapedEvent(res.requestId);
   });
