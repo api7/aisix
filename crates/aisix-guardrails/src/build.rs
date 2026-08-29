@@ -1096,19 +1096,43 @@ pub fn unattached_guardrail_names(
         .collect()
 }
 
+/// Which enabled-but-unattached guardrails this build should report, given
+/// what the previous build saw and what has already been said.
+///
+/// Pure, so the two-sighting rule is testable without a tracing subscriber —
+/// the shape the retired `implicit_env_scope_first_seen` helper had, and for
+/// the same reason.
+///
+/// A row must have been unattached in the PREVIOUS build too. A guardrail and
+/// its attachment are separate documents in separate outbox rows, so every
+/// ordinary creation has a build where the data plane holds the guardrail and
+/// not yet its attachment; reporting on that first sighting fired on
+/// correctly-attached guardrails. Because the notice is deduplicated per id
+/// for the life of the process, that false alarm was permanent — a log line
+/// saying a security control inspects nothing, about one that does.
+fn unattached_to_report(
+    unattached: &[(String, String)],
+    seen_before: &std::collections::HashSet<String>,
+    warned: &std::collections::HashSet<String>,
+) -> Vec<(String, String)> {
+    unattached
+        .iter()
+        .filter(|(id, _)| seen_before.contains(id) && !warned.contains(id))
+        .cloned()
+        .collect()
+}
+
 /// WARN once per guardrail id for the process lifetime: this row is enabled
 /// but nothing attaches it, so it inspects no traffic at all.
 ///
-/// The state is legitimate — a scope target can be deleted, and a rule with
-/// no scope left is correctly inert — but it is also indistinguishable from a
-/// misconfiguration, and it is INVISIBLE otherwise: the guardrail is present
-/// in the snapshot, `/status/config` counts it as loaded, and no request ever
-/// mentions it. An operator who believes a rule is in force deserves to be
-/// told it is not.
+/// The state is legitimate — a scope target can be deleted, and a rule with no
+/// scope left is correctly inert — but it is invisible otherwise: the guardrail
+/// is in the snapshot, `/status/config` counts it as loaded, and no request
+/// ever mentions it.
 ///
-/// Deduped per id, not logged per build, for the reason AISIX-Cloud#1435
-/// documents: the index is rebuilt on every snapshot version change, and this
-/// describes a STANDING property of a row rather than an event.
+/// Deduped per id rather than logged per build, for the reason
+/// AISIX-Cloud#1435 documents: the index is rebuilt on every snapshot version
+/// change, and this describes a STANDING property of a row, not an event.
 fn warn_unattached_guardrails(
     guardrails: &ResourceTable<DomainGuardrail>,
     attachments: &ResourceTable<GuardrailAttachment>,
@@ -1117,18 +1141,19 @@ fn warn_unattached_guardrails(
     use std::sync::{Mutex, OnceLock};
 
     const MAX_REMEMBERED: usize = 1024;
-    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    // Poison-tolerant: this set only dedupes log lines, so a panic while the
+    // (already reported, seen unattached in the previous build)
+    static STATE: OnceLock<Mutex<(HashSet<String>, HashSet<String>)>> = OnceLock::new();
+
+    // Poison-tolerant: this state only shapes log lines, so a panic while the
     // lock was held must not wedge every later index build.
-    let mut warned = WARNED
-        .get_or_init(|| Mutex::new(HashSet::new()))
+    let mut guard = STATE
+        .get_or_init(|| Mutex::new((HashSet::new(), HashSet::new())))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (warned, seen_before) = &mut *guard;
 
-    for (id, name) in unattached_ids(guardrails, attachments) {
-        if warned.contains(&id) {
-            continue;
-        }
+    let unattached = unattached_ids(guardrails, attachments);
+    for (id, name) in unattached_to_report(&unattached, seen_before, warned) {
         tracing::warn!(
             guardrail_id = %id,
             guardrail_name = %name,
@@ -1140,6 +1165,14 @@ fn warn_unattached_guardrails(
             warned.insert(id);
         }
     }
+    // Replaced, not merged: a guardrail that GAINED an attachment has to drop
+    // out, or a later loss would report on its first build and reopen the race
+    // this closes.
+    *seen_before = unattached
+        .into_iter()
+        .map(|(id, _)| id)
+        .take(MAX_REMEMBERED)
+        .collect();
 }
 
 // ---------------------------------------------------------------------------
@@ -2181,6 +2214,38 @@ mod tests {
                 .await
                 .is_block(),
             "env-scope enabled attachment must still fire",
+        );
+    }
+
+    /// A guardrail and its attachment arrive as separate documents, so every
+    /// ordinary creation has a build where the guardrail is present and the
+    /// attachment is not. Reporting on that first sighting named a
+    /// correctly-attached guardrail as inspecting nothing — permanently, since
+    /// the notice is deduplicated per id for the process lifetime.
+    #[test]
+    fn the_unattached_notice_needs_two_consecutive_sightings() {
+        use std::collections::HashSet;
+        let rows = vec![("g-1".to_string(), "one".to_string())];
+        let mut seen_before: HashSet<String> = HashSet::new();
+        let mut warned: HashSet<String> = HashSet::new();
+
+        assert!(
+            unattached_to_report(&rows, &seen_before, &warned).is_empty(),
+            "the first build a guardrail appears in is its attachment's window",
+        );
+        seen_before.insert("g-1".to_string());
+
+        let due = unattached_to_report(&rows, &seen_before, &warned);
+        assert_eq!(
+            due.len(),
+            1,
+            "still unattached one build later is a standing property, not a race",
+        );
+        warned.insert("g-1".to_string());
+
+        assert!(
+            unattached_to_report(&rows, &seen_before, &warned).is_empty(),
+            "and it is said once, not on every rebuild",
         );
     }
 
