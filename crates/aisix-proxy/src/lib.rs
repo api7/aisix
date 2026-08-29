@@ -10657,6 +10657,74 @@ event: message_stop\ndata: {}\n\n",
         }
     }
 
+    /// A semantic-cache hit replays the stored `UsageStats`, so it must
+    /// travel the same projection as the original call. Serving the hit
+    /// from a path that copies the stored fields would report a
+    /// different `prompt_tokens` for the same answer depending on
+    /// whether it came from cache — with only the Anthropic-upstream
+    /// numbers ever wrong, which is the hardest kind of drift to notice.
+    #[tokio::test]
+    async fn usage_matrix_cache_hit_replays_the_same_client_facing_usage() {
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        let mock = MockServer::start().await;
+        um_mount_upstream(&mock, UmUpstream::AnthropicShape, false).await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(matrix_anthropic_pk(&mock.uri()));
+        snap.models.insert(anthropic_model_entry("um-model"));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["um-model"]));
+        seed_cache_policy(&snap, "usage-matrix-cache");
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        hub.register_family(
+            aisix_core::Adapter::Anthropic,
+            Arc::new(AnthropicBridge::new()),
+        );
+        let state = build_state_with_cache(snap, hub);
+
+        let mut seen = Vec::new();
+        for expect_cache in ["miss", "hit"] {
+            let resp = run(
+                build_router(state.clone()),
+                r1447_style_req(serde_json::json!({
+                    "model": "um-model",
+                    "messages": [{"role": "user", "content": "hi"}]
+                })),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()
+                    .get("x-aisix-cache")
+                    .and_then(|v| v.to_str().ok()),
+                Some(expect_cache),
+            );
+            let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            seen.push(v["usage"].clone());
+        }
+
+        assert_eq!(seen[0]["prompt_tokens"], UM_TOTAL_IN);
+        assert_eq!(seen[0]["total_tokens"], UM_TOTAL);
+        assert_eq!(
+            seen[0], seen[1],
+            "a cache hit must report the same usage as the call it replays"
+        );
+    }
+
+    fn r1447_style_req(body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
     /// An OpenAI client reads the SAME numbers whichever upstream served
     /// it — that equality is the whole contract, and pre-fix an Anthropic
     /// upstream broke every field of it.
