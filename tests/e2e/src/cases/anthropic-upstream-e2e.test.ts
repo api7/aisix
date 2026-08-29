@@ -402,12 +402,22 @@ describe("anthropic upstream e2e: cache tokens fold into total_tokens (#906)", (
       messages: [{ role: "user", content: "hi" }],
     });
 
-    // prompt_tokens stays the non-cached input (Option A: cache is NOT
-    // folded into prompt_tokens), but total_tokens is the honest sum of
-    // every input class + completion: 10 + 4 + 200 + 800 = 1014.
-    expect(completion.usage?.prompt_tokens).toBe(10);
+    // total_tokens is the honest sum of every input class + completion:
+    // 10 + 4 + 200 + 800 = 1014. That is #906's property and it still
+    // holds.
+    //
+    // What changed is the split beneath it. #906 left prompt_tokens as
+    // the upstream's non-cached `input_tokens` (10) while the total had
+    // already folded the cache in, so an OpenAI client read
+    // `10 + 4 = 1014` and could not decompose its own bill.
+    // AISIX-Cloud#1447 projects the input into OpenAI accounting, where
+    // cache reads and writes are INSIDE prompt_tokens — so the same 1014
+    // now splits as 1010 + 4, and the cache read surfaces as the subset
+    // it is. The upstream's own shape is untouched in the UsageEvent.
+    expect(completion.usage?.prompt_tokens).toBe(10 + 200 + 800);
     expect(completion.usage?.completion_tokens).toBe(4);
     expect(completion.usage?.total_tokens).toBe(10 + 4 + 200 + 800);
+    expect(completion.usage?.prompt_tokens_details?.cached_tokens).toBe(800);
   });
 });
 

@@ -118,23 +118,29 @@ impl Usage {
     /// passthrough policy (#542) so the non-streaming and streaming
     /// renderers stay in lock-step:
     ///
-    /// - canonical triplet copied through
-    /// - `cached_prompt_tokens > 0` → emit OpenAI-shape
+    /// - the input/total pair is PROJECTED into OpenAI accounting
+    ///   (`UsageStats::openai_*`), never copied: an Anthropic-shape
+    ///   upstream stores its cache counters BESIDE `prompt_tokens`,
+    ///   and copying them through handed an OpenAI client a
+    ///   `prompt_tokens` short of the input it paid for, with
+    ///   `total_tokens != prompt + completion` (AISIX-Cloud#1447)
+    /// - `cached_tokens > 0` → emit OpenAI-shape
     ///   `prompt_tokens_details.cached_tokens` (works for OpenAI's
-    ///   nested field AND DeepSeek's normalized native one)
+    ///   nested field, DeepSeek's normalized native one, AND an
+    ///   Anthropic/Bedrock upstream's `cache_read_input_tokens`)
     /// - `reasoning_tokens > 0` → emit
     ///   `completion_tokens_details.reasoning_tokens`
     /// - DeepSeek-native `prompt_cache_hit_tokens` /
     ///   `prompt_cache_miss_tokens` passed through verbatim when the
     ///   upstream sent them (Some), omitted otherwise
     fn from_stats(u: &aisix_gateway::UsageStats) -> Self {
+        let cached_tokens = u.openai_cached_tokens();
         Usage {
-            prompt_tokens: u.prompt_tokens,
+            prompt_tokens: u.openai_prompt_tokens(),
             completion_tokens: u.completion_tokens,
-            total_tokens: u.total_tokens,
-            prompt_tokens_details: (u.cached_prompt_tokens > 0).then_some(PromptTokensDetails {
-                cached_tokens: u.cached_prompt_tokens,
-            }),
+            total_tokens: u.openai_total_tokens(),
+            prompt_tokens_details: (cached_tokens > 0)
+                .then_some(PromptTokensDetails { cached_tokens }),
             completion_tokens_details: (u.reasoning_tokens > 0).then_some(
                 CompletionTokensDetails {
                     reasoning_tokens: u.reasoning_tokens,

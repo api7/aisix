@@ -10233,4 +10233,536 @@ data: [DONE]\n\n";
         assert_eq!(hit.action, "blocked");
         assert!(hit.error_type.is_empty());
     }
+
+    // ─── Usage accounting across the protocol-conversion matrix ────
+    //
+    // AISIX-Cloud#1447. `UsageStats` stores whichever accounting shape
+    // the UPSTREAM used; the client must be answered in ITS OWN
+    // protocol's shape. That makes six cells, three of which convert:
+    //
+    //   client            upstream shape   conversion?
+    //   /v1/chat/…        OpenAI           no  (identity)
+    //   /v1/chat/…        Anthropic        YES
+    //   /v1/responses     OpenAI           no  (verbatim passthrough)
+    //   /v1/responses     Anthropic        YES
+    //   /v1/messages      OpenAI           YES
+    //   /v1/messages      Anthropic        no  (verbatim passthrough)
+    //
+    // …times streaming/non-streaming. Every cell is walked below, and
+    // each is checked on BOTH exits: the bytes the client reads, and the
+    // UsageEvent that drives Logs/billing. The two answer different
+    // questions and must not be conflated — the event keeps the
+    // upstream's raw counters so a call bills identically whichever
+    // protocol addressed it, while the client sees its own protocol's
+    // accounting.
+    //
+    // One call, described by both upstreams: 40 uncached input tokens,
+    // a 30-token cache write, a 70-token cache read, 10 output. The
+    // model read 140 input tokens and 150 in total, and no client may be
+    // told otherwise.
+    const UM_UNCACHED_IN: u32 = 40;
+    const UM_CACHE_WRITE: u32 = 30;
+    const UM_CACHE_READ: u32 = 70;
+    const UM_OUT: u32 = 10;
+    const UM_TOTAL_IN: u32 = UM_UNCACHED_IN + UM_CACHE_WRITE + UM_CACHE_READ; // 140
+    const UM_TOTAL: u32 = UM_TOTAL_IN + UM_OUT; // 150
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum UmClient {
+        Chat,
+        Responses,
+        Messages,
+    }
+
+    /// Which accounting shape the upstream reports in. Not "which
+    /// vendor" — bedrock reports in the Anthropic shape, and every
+    /// OpenAI-compatible provider (deepseek, gemini, azure, …) in the
+    /// OpenAI one, so these two exhaust the axis.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum UmUpstream {
+        OpenAiShape,
+        AnthropicShape,
+    }
+
+    /// The OpenAI-shape upstream's account of the call: one `prompt_tokens`
+    /// that already contains the cache read. OpenAI has no cache-WRITE
+    /// bucket, so those 30 tokens are simply part of the prompt here.
+    fn um_openai_usage_json() -> serde_json::Value {
+        serde_json::json!({
+            "prompt_tokens": UM_TOTAL_IN,
+            "completion_tokens": UM_OUT,
+            "total_tokens": UM_TOTAL,
+            "prompt_tokens_details": {"cached_tokens": UM_CACHE_READ},
+        })
+    }
+
+    /// The same call as the Anthropic-shape upstream reports it: cache
+    /// counters BESIDE a non-cached `input_tokens`.
+    fn um_anthropic_usage_json() -> serde_json::Value {
+        serde_json::json!({
+            "input_tokens": UM_UNCACHED_IN,
+            "output_tokens": UM_OUT,
+            "cache_creation_input_tokens": UM_CACHE_WRITE,
+            "cache_read_input_tokens": UM_CACHE_READ,
+        })
+    }
+
+    async fn um_mount_upstream(mock: &MockServer, upstream: UmUpstream, streaming: bool) {
+        match (upstream, streaming) {
+            (UmUpstream::OpenAiShape, false) => {
+                let body = serde_json::json!({
+                    "id": "chatcmpl-um",
+                    "model": "gpt-4o",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": um_openai_usage_json(),
+                });
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .mount(mock)
+                    .await;
+            }
+            (UmUpstream::OpenAiShape, true) => {
+                let sse = format!(
+                    "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    serde_json::json!({
+                        "id": "chatcmpl-um",
+                        "model": "gpt-4o",
+                        "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}]
+                    }),
+                    serde_json::json!({
+                        "id": "chatcmpl-um",
+                        "model": "gpt-4o",
+                        "choices": [],
+                        "usage": um_openai_usage_json(),
+                    }),
+                );
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("content-type", "text/event-stream")
+                            .set_body_raw(sse.into_bytes(), "text/event-stream"),
+                    )
+                    .mount(mock)
+                    .await;
+            }
+            (UmUpstream::AnthropicShape, false) => {
+                let body = serde_json::json!({
+                    "id": "msg_um",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-3-5-haiku-20241022",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "stop_reason": "end_turn",
+                    "usage": um_anthropic_usage_json(),
+                });
+                Mock::given(method("POST"))
+                    .and(path("/v1/messages"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .mount(mock)
+                    .await;
+            }
+            (UmUpstream::AnthropicShape, true) => {
+                // `message_start` carries the input side (including both
+                // cache counters); `message_delta` closes with the output
+                // side. That split is Anthropic's, not ours.
+                let sse = format!(
+                    "event: message_start\ndata: {}\n\n\
+event: content_block_delta\ndata: {}\n\n\
+event: message_delta\ndata: {}\n\n\
+event: message_stop\ndata: {}\n\n",
+                    serde_json::json!({
+                        "type": "message_start",
+                        "message": {
+                            "id": "msg_um",
+                            "role": "assistant",
+                            "content": [],
+                            "model": "claude-3-5-haiku-20241022",
+                            "stop_reason": null,
+                            "usage": {
+                                "input_tokens": UM_UNCACHED_IN,
+                                "cache_creation_input_tokens": UM_CACHE_WRITE,
+                                "cache_read_input_tokens": UM_CACHE_READ,
+                                "output_tokens": 1
+                            }
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": "ok"}
+                    }),
+                    serde_json::json!({
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn"},
+                        "usage": {"output_tokens": UM_OUT}
+                    }),
+                    serde_json::json!({"type": "message_stop"}),
+                );
+                Mock::given(method("POST"))
+                    .and(path("/v1/messages"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("content-type", "text/event-stream")
+                            .set_body_raw(sse.into_bytes(), "text/event-stream"),
+                    )
+                    .mount(mock)
+                    .await;
+            }
+        }
+    }
+
+    /// The `/v1/responses` OpenAI target takes the verbatim passthrough
+    /// rather than the bridge, so that cell needs the upstream to speak
+    /// Responses too.
+    async fn um_mount_responses_upstream(mock: &MockServer, streaming: bool) {
+        let usage = serde_json::json!({
+            "input_tokens": UM_TOTAL_IN,
+            "input_tokens_details": {"cached_tokens": UM_CACHE_READ},
+            "output_tokens": UM_OUT,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": UM_TOTAL,
+        });
+        let completed = serde_json::json!({
+            "id": "resp_um",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "model": "gpt-4o",
+            "output": [{
+                "type": "message",
+                "id": "msg_um",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok", "annotations": []}]
+            }],
+            "usage": usage,
+        });
+        let template = if streaming {
+            let sse = format!(
+                "event: response.completed\ndata: {}\n\n",
+                serde_json::json!({
+                    "type": "response.completed",
+                    "sequence_number": 1,
+                    "response": completed,
+                }),
+            );
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse.into_bytes(), "text/event-stream")
+        } else {
+            ResponseTemplate::new(200).set_body_json(completed)
+        };
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(template)
+            .mount(mock)
+            .await;
+    }
+
+    /// Drive one matrix cell and return `(client-facing usage, UsageEvent)`.
+    async fn um_call(
+        client: UmClient,
+        upstream: UmUpstream,
+        streaming: bool,
+    ) -> (serde_json::Value, aisix_obs::UsageEvent) {
+        use aisix_obs::UsageSink;
+        use aisix_provider_anthropic::AnthropicBridge;
+        use aisix_provider_openai::OpenAiBridge;
+
+        let mock = MockServer::start().await;
+        let responses_verbatim =
+            client == UmClient::Responses && upstream == UmUpstream::OpenAiShape;
+        if responses_verbatim {
+            um_mount_responses_upstream(&mock, streaming).await;
+        } else {
+            um_mount_upstream(&mock, upstream, streaming).await;
+        }
+
+        let snap = AisixSnapshot::new();
+        let model_name = match upstream {
+            UmUpstream::OpenAiShape => {
+                snap.provider_keys.insert(provider_key_entry(&mock.uri()));
+                snap.models.insert(model_entry("um-model"));
+                "um-model"
+            }
+            UmUpstream::AnthropicShape => {
+                snap.provider_keys.insert(matrix_anthropic_pk(&mock.uri()));
+                snap.models.insert(anthropic_model_entry("um-model"));
+                "um-model"
+            }
+        };
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &[model_name]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        hub.register_family(
+            aisix_core::Adapter::Anthropic,
+            Arc::new(AnthropicBridge::new()),
+        );
+        hub.register_family(aisix_core::Adapter::Openai, Arc::new(OpenAiBridge::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
+
+        let (uri, body) = match client {
+            UmClient::Chat => (
+                "/v1/chat/completions",
+                serde_json::json!({
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": streaming,
+                    "stream_options": {"include_usage": true},
+                }),
+            ),
+            UmClient::Responses => (
+                "/v1/responses",
+                serde_json::json!({"model": model_name, "input": "hi", "stream": streaming}),
+            ),
+            UmClient::Messages => (
+                "/v1/messages",
+                serde_json::json!({
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                    "stream": streaming,
+                }),
+            ),
+        };
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json");
+        if !streaming {
+            builder = builder.header("accept", "application/json");
+        }
+        let req = builder.body(Body::from(body.to_string())).unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "{client:?}/{upstream:?}/stream={streaming}"
+        );
+        let raw = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let text = String::from_utf8(raw.to_vec()).unwrap();
+
+        let usage = if streaming {
+            um_usage_from_sse(client, &text)
+        } else {
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()["usage"].clone()
+        };
+        assert!(
+            usage.is_object(),
+            "{client:?}/{upstream:?}/stream={streaming} produced no client usage; body: {text}"
+        );
+        let event = rx
+            .recv()
+            .await
+            .unwrap_or_else(|| panic!("{client:?}/{upstream:?}/stream={streaming}: no UsageEvent"));
+        (usage, event)
+    }
+
+    /// Pull the client-facing usage out of a streamed body.
+    ///
+    /// Chat and Responses each put a COMPLETE usage block on one
+    /// terminal frame, so the last one wins. Anthropic deliberately
+    /// splits it: `message_start` carries the input side (and the cache
+    /// counters), `message_delta` the output side — so a `/v1/messages`
+    /// client accumulates across frames, and this reader must too.
+    /// Merging field-wise by max also covers the translated stream,
+    /// where the input side is only known once the upstream's usage
+    /// frame lands and therefore rides the closing `message_delta`.
+    fn um_usage_from_sse(client: UmClient, body: &str) -> serde_json::Value {
+        let mut merged = serde_json::Map::new();
+        let mut last = serde_json::Value::Null;
+        for line in body.lines() {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if data.trim() == "[DONE]" {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            let candidate = match client {
+                UmClient::Chat => v.get("usage").cloned(),
+                // `message_start` nests it under `message`; `message_delta`
+                // puts it at the top level. Both are Anthropic's shape.
+                UmClient::Messages => v
+                    .get("usage")
+                    .or_else(|| v.get("message").and_then(|m| m.get("usage")))
+                    .cloned(),
+                UmClient::Responses => v.get("response").and_then(|r| r.get("usage")).cloned(),
+            };
+            let Some(c) = candidate.filter(serde_json::Value::is_object) else {
+                continue;
+            };
+            last = c.clone();
+            for (k, val) in c.as_object().unwrap() {
+                let keep = match (
+                    merged.get(k).and_then(serde_json::Value::as_u64),
+                    val.as_u64(),
+                ) {
+                    (Some(prev), Some(next)) => serde_json::json!(prev.max(next)),
+                    _ => val.clone(),
+                };
+                merged.insert(k.clone(), keep);
+            }
+        }
+        match client {
+            UmClient::Messages => serde_json::Value::Object(merged),
+            _ => last,
+        }
+    }
+
+    /// Every cell, regardless of conversion: the event carries the
+    /// UPSTREAM's own counters, so the same call bills identically no
+    /// matter which client protocol addressed it.
+    fn um_assert_event_keeps_upstream_shape(
+        event: &aisix_obs::UsageEvent,
+        upstream: UmUpstream,
+        label: &str,
+    ) {
+        assert_eq!(event.completion_tokens, UM_OUT, "{label}: completion");
+        match upstream {
+            UmUpstream::AnthropicShape => {
+                assert_eq!(event.prompt_tokens, UM_UNCACHED_IN, "{label}: prompt");
+                assert_eq!(event.cached_prompt_tokens, 0, "{label}: cached_prompt");
+                assert_eq!(
+                    event.cache_creation_tokens, UM_CACHE_WRITE,
+                    "{label}: cache_creation"
+                );
+                assert_eq!(
+                    event.cache_read_tokens, UM_CACHE_READ,
+                    "{label}: cache_read"
+                );
+            }
+            UmUpstream::OpenAiShape => {
+                assert_eq!(event.prompt_tokens, UM_TOTAL_IN, "{label}: prompt");
+                assert_eq!(
+                    event.cached_prompt_tokens, UM_CACHE_READ,
+                    "{label}: cached_prompt"
+                );
+                assert_eq!(event.cache_creation_tokens, 0, "{label}: cache_creation");
+                assert_eq!(event.cache_read_tokens, 0, "{label}: cache_read");
+            }
+        }
+    }
+
+    /// An OpenAI client reads the SAME numbers whichever upstream served
+    /// it — that equality is the whole contract, and pre-fix an Anthropic
+    /// upstream broke every field of it.
+    #[tokio::test]
+    async fn usage_matrix_openai_client_is_upstream_agnostic() {
+        for streaming in [false, true] {
+            for upstream in [UmUpstream::OpenAiShape, UmUpstream::AnthropicShape] {
+                let label = format!("chat/{upstream:?}/stream={streaming}");
+                let (usage, event) = um_call(UmClient::Chat, upstream, streaming).await;
+                assert_eq!(
+                    usage["prompt_tokens"], UM_TOTAL_IN,
+                    "{label}: prompt_tokens"
+                );
+                assert_eq!(usage["completion_tokens"], UM_OUT, "{label}: completion");
+                assert_eq!(usage["total_tokens"], UM_TOTAL, "{label}: total");
+                assert_eq!(
+                    usage["prompt_tokens_details"]["cached_tokens"], UM_CACHE_READ,
+                    "{label}: cached_tokens"
+                );
+                assert_eq!(
+                    usage["prompt_tokens"].as_u64().unwrap()
+                        + usage["completion_tokens"].as_u64().unwrap(),
+                    usage["total_tokens"].as_u64().unwrap(),
+                    "{label}: total must decompose"
+                );
+                um_assert_event_keeps_upstream_shape(&event, upstream, &label);
+            }
+        }
+    }
+
+    /// Same contract on the Responses surface, where the pre-fix bug was
+    /// louder still: `cached_tokens` could exceed `input_tokens`.
+    #[tokio::test]
+    async fn usage_matrix_responses_client_is_upstream_agnostic() {
+        for streaming in [false, true] {
+            for upstream in [UmUpstream::OpenAiShape, UmUpstream::AnthropicShape] {
+                let label = format!("responses/{upstream:?}/stream={streaming}");
+                let (usage, event) = um_call(UmClient::Responses, upstream, streaming).await;
+                assert_eq!(usage["input_tokens"], UM_TOTAL_IN, "{label}: input_tokens");
+                assert_eq!(usage["output_tokens"], UM_OUT, "{label}: output_tokens");
+                assert_eq!(usage["total_tokens"], UM_TOTAL, "{label}: total");
+                assert_eq!(
+                    usage["input_tokens_details"]["cached_tokens"], UM_CACHE_READ,
+                    "{label}: cached_tokens"
+                );
+                assert!(
+                    usage["input_tokens_details"]["cached_tokens"]
+                        .as_u64()
+                        .unwrap()
+                        <= usage["input_tokens"].as_u64().unwrap(),
+                    "{label}: cached_tokens must stay a subset of input_tokens"
+                );
+                um_assert_event_keeps_upstream_shape(&event, upstream, &label);
+            }
+        }
+    }
+
+    /// The Anthropic client's three input counters must always sum to
+    /// the 140 tokens the model read. They do NOT split it identically
+    /// across upstreams, and correctly so: an OpenAI-shape upstream has
+    /// no cache-write bucket to report, so its non-hit input is all
+    /// plain `input_tokens`. Fabricating a `cache_creation_input_tokens`
+    /// to make the two look alike would invent a number no upstream sent.
+    #[tokio::test]
+    async fn usage_matrix_messages_client_conserves_total_input() {
+        for streaming in [false, true] {
+            for upstream in [UmUpstream::OpenAiShape, UmUpstream::AnthropicShape] {
+                let label = format!("messages/{upstream:?}/stream={streaming}");
+                let (usage, event) = um_call(UmClient::Messages, upstream, streaming).await;
+                let get = |k: &str| usage.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+                assert_eq!(get("output_tokens"), u64::from(UM_OUT), "{label}: output");
+                assert_eq!(
+                    get("input_tokens")
+                        + get("cache_creation_input_tokens")
+                        + get("cache_read_input_tokens"),
+                    u64::from(UM_TOTAL_IN),
+                    "{label}: the three input counters must sum to the real input"
+                );
+                assert_eq!(
+                    get("cache_read_input_tokens"),
+                    u64::from(UM_CACHE_READ),
+                    "{label}: cache read is reportable by both shapes"
+                );
+                match upstream {
+                    UmUpstream::AnthropicShape => {
+                        assert_eq!(get("input_tokens"), u64::from(UM_UNCACHED_IN), "{label}");
+                        assert_eq!(
+                            get("cache_creation_input_tokens"),
+                            u64::from(UM_CACHE_WRITE),
+                            "{label}"
+                        );
+                    }
+                    UmUpstream::OpenAiShape => {
+                        assert_eq!(
+                            get("input_tokens"),
+                            u64::from(UM_UNCACHED_IN + UM_CACHE_WRITE),
+                            "{label}: OpenAI has no cache-write bucket"
+                        );
+                        assert!(
+                            usage.get("cache_creation_input_tokens").is_none(),
+                            "{label}: never fabricate a cache write the upstream never reported"
+                        );
+                    }
+                }
+                um_assert_event_keeps_upstream_shape(&event, upstream, &label);
+            }
+        }
+    }
 }

@@ -1622,27 +1622,17 @@ fn translate_assistant_blocks(blocks: &[serde_json::Value]) -> ChatMessage {
 /// [`UsageStats`], for a response rendered back to a `/v1/messages`
 /// client (AISIX-Cloud#1405).
 ///
-/// `UsageStats` carries two *disjoint* cache representations and they
-/// fold in opposite directions:
+/// The Anthropic client-facing half of the usage projection, mirroring
+/// the OpenAI half in `render.rs` / `responses_bridge.rs`. Both read the
+/// SAME definitions on [`UsageStats`] — see the "Client-facing protocol
+/// projections" block there for why an upstream's shape must never reach
+/// a client unconverted, and why summing (rather than picking) the two
+/// cache representations is what keeps an ensemble aggregate right.
 ///
-/// - An OpenAI-shape upstream reports its cache hit as
-///   `cached_prompt_tokens`, a SUBSET already counted inside
-///   `prompt_tokens`. Anthropic's `input_tokens` means NON-cached
-///   input, so the subset is subtracted back out.
-/// - An Anthropic-shape upstream reports `cache_creation_tokens` /
-///   `cache_read_tokens` as counters ON TOP of `prompt_tokens`, which
-///   is already Anthropic's `input_tokens` — nothing to subtract.
-///
-/// Because the two never co-occur (`wire.rs` in each provider fills one
-/// family and zeroes the other), summing them is the same as picking
-/// whichever the upstream actually reported. Either way the client sees
-/// the identity Anthropic guarantees: `input_tokens + cache_creation +
-/// cache_read` is the total input the model processed.
-///
-/// LiteLLM's `/v1/messages` adapter derives the same three numbers the
-/// same way; it subtracts BOTH cache counters from `prompt_tokens`
-/// because its single `Usage` object has already folded the
-/// Anthropic-shape counters in, which ours deliberately has not.
+/// LiteLLM's `/v1/messages` adapter derives the same three numbers; it
+/// subtracts BOTH cache counters from `prompt_tokens` because its single
+/// `Usage` object has already folded the Anthropic-shape counters in,
+/// which ours deliberately has not.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct AnthropicInputUsage {
     /// `usage.input_tokens` — non-cached input.
@@ -1654,9 +1644,9 @@ struct AnthropicInputUsage {
 impl AnthropicInputUsage {
     fn from_usage(u: &UsageStats) -> Self {
         Self {
-            input_tokens: u.prompt_tokens.saturating_sub(u.cached_prompt_tokens),
-            cache_creation_input_tokens: u.cache_creation_tokens,
-            cache_read_input_tokens: u.cache_read_tokens.saturating_add(u.cached_prompt_tokens),
+            input_tokens: u.anthropic_input_tokens(),
+            cache_creation_input_tokens: u.anthropic_cache_creation_input_tokens(),
+            cache_read_input_tokens: u.anthropic_cache_read_input_tokens(),
         }
     }
 

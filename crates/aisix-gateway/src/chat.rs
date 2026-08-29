@@ -416,6 +416,86 @@ impl UsageStats {
             ),
         }
     }
+
+    // ── Client-facing protocol projections ─────────────────────────
+    //
+    // `UsageStats` stores whichever accounting shape the UPSTREAM used,
+    // because that is what UsageEvent / Prometheus / billing must keep
+    // reporting (AISIX-Cloud#1447). The client, though, must be answered
+    // in ITS OWN protocol's accounting — so every client-facing renderer
+    // projects through the methods below rather than copying fields.
+    //
+    // The two shapes disagree on one thing only: whether the cache
+    // counters live INSIDE the input count or BESIDE it.
+    //
+    //   OpenAI shape     prompt_tokens INCLUDES cached_prompt_tokens
+    //   Anthropic shape  prompt_tokens EXCLUDES cache_creation/read
+    //
+    // A single upstream fills exactly one family and zeroes the other,
+    // so each projection is a plain fold that reduces to the identity
+    // on its own shape. Summing rather than picking also keeps an
+    // ENSEMBLE aggregate right: `saturating_add` can merge an
+    // OpenAI-shape member with an Anthropic-shape one, and only the
+    // additive form reports both members' cache hits.
+    //
+    // Both directions are defined here, together, on purpose: they are
+    // two halves of one contract, and splitting them across the two
+    // renderer crates is how one gets fixed while the other silently
+    // keeps the old semantics.
+
+    /// Total input the model processed, in either accounting shape —
+    /// the quantity both protocols agree on, since it is what the
+    /// upstream actually billed for.
+    pub fn total_input_tokens(&self) -> u32 {
+        self.prompt_tokens
+            .saturating_add(self.cache_creation_tokens)
+            .saturating_add(self.cache_read_tokens)
+    }
+
+    /// OpenAI `usage.prompt_tokens` / Responses `usage.input_tokens`:
+    /// the FULL input, cache hits and cache writes included.
+    pub fn openai_prompt_tokens(&self) -> u32 {
+        self.total_input_tokens()
+    }
+
+    /// OpenAI `prompt_tokens_details.cached_tokens` /
+    /// Responses `input_tokens_details.cached_tokens`: the cache-read
+    /// portion, a SUBSET of [`Self::openai_prompt_tokens`]. A cache
+    /// WRITE is billed input but is not a hit, so it is deliberately
+    /// not counted here.
+    pub fn openai_cached_tokens(&self) -> u32 {
+        self.cached_prompt_tokens
+            .saturating_add(self.cache_read_tokens)
+    }
+
+    /// OpenAI `usage.total_tokens`, recomputed rather than passed
+    /// through so the identity OpenAI clients rely on —
+    /// `total == prompt + completion` — holds for every upstream. An
+    /// Anthropic-shape upstream's own total already folds the cache
+    /// counters in, which is the same number; a Bedrock Converse total
+    /// does not, and that one would otherwise under-report.
+    pub fn openai_total_tokens(&self) -> u32 {
+        self.openai_prompt_tokens()
+            .saturating_add(self.completion_tokens)
+    }
+
+    /// Anthropic `usage.input_tokens`: NON-cached input only.
+    pub fn anthropic_input_tokens(&self) -> u32 {
+        self.prompt_tokens.saturating_sub(self.cached_prompt_tokens)
+    }
+
+    /// Anthropic `usage.cache_read_input_tokens`, a counter BESIDE
+    /// `input_tokens`.
+    pub fn anthropic_cache_read_input_tokens(&self) -> u32 {
+        self.cache_read_tokens
+            .saturating_add(self.cached_prompt_tokens)
+    }
+
+    /// Anthropic `usage.cache_creation_input_tokens`. No OpenAI-shape
+    /// upstream reports a cache write, so there is nothing to fold in.
+    pub fn anthropic_cache_creation_input_tokens(&self) -> u32 {
+        self.cache_creation_tokens
+    }
 }
 
 /// Full (non-streaming) chat response.
@@ -753,6 +833,129 @@ mod tests {
         assert_eq!(u.total_tokens, 1014);
         // No cache present degrades to the plain prompt + completion total.
         assert_eq!(UsageStats::with_cache(10, 4, 0, 0).total_tokens, 14);
+    }
+
+    // ── Client-facing protocol projections ─────────────────────────
+    //
+    // The reporter's numbers from AISIX-Cloud#1447, used throughout so
+    // the same call is followed across every source shape: 40 uncached
+    // input + 30 cache write + 70 cache read + 10 output. Whoever
+    // reports it, the model processed 140 input tokens and 150 total.
+    const N: u32 = 40;
+    const W: u32 = 30;
+    const R: u32 = 70;
+    const O: u32 = 10;
+
+    /// What an Anthropic-shape upstream (anthropic, bedrock) stores.
+    fn anthropic_shape() -> UsageStats {
+        UsageStats::with_cache(N, O, W, R)
+    }
+
+    /// What an OpenAI-shape upstream (openai, azure, deepseek, gemini)
+    /// stores for the SAME call: no cache-write concept, and the read is
+    /// already inside `prompt_tokens`.
+    fn openai_shape() -> UsageStats {
+        UsageStats {
+            prompt_tokens: N + W + R,
+            completion_tokens: O,
+            total_tokens: N + W + R + O,
+            cached_prompt_tokens: R,
+            ..UsageStats::default()
+        }
+    }
+
+    #[test]
+    fn projections_agree_on_total_input_across_source_shapes() {
+        // The whole point of the projection layer: an OpenAI client and
+        // an Anthropic client, in front of EITHER upstream shape, must
+        // be told the model read the same 140 tokens.
+        for u in [anthropic_shape(), openai_shape()] {
+            assert_eq!(u.total_input_tokens(), N + W + R);
+            assert_eq!(u.openai_prompt_tokens(), N + W + R);
+            assert_eq!(
+                u.anthropic_input_tokens()
+                    + u.anthropic_cache_creation_input_tokens()
+                    + u.anthropic_cache_read_input_tokens(),
+                N + W + R,
+                "Anthropic's three input counters must sum to the same input"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_projection_keeps_cached_a_subset_of_prompt() {
+        for u in [anthropic_shape(), openai_shape()] {
+            assert!(
+                u.openai_cached_tokens() <= u.openai_prompt_tokens(),
+                "cached_tokens > prompt_tokens is the contradiction #1447 reported"
+            );
+            assert_eq!(u.openai_cached_tokens(), R, "cache READ is the hit");
+            assert_eq!(
+                u.openai_total_tokens(),
+                u.openai_prompt_tokens() + u.completion_tokens,
+                "OpenAI clients decompose total into prompt + completion"
+            );
+            assert_eq!(u.openai_total_tokens(), N + W + R + O);
+        }
+    }
+
+    #[test]
+    fn anthropic_projection_keeps_input_free_of_cache() {
+        // The cache READ is reportable by both shapes, so it converts
+        // exactly either way.
+        for u in [anthropic_shape(), openai_shape()] {
+            assert_eq!(u.anthropic_cache_read_input_tokens(), R);
+        }
+        // The cache WRITE does not: OpenAI accounting has no such
+        // bucket, so an OpenAI upstream's non-hit input is all plain
+        // input. Fabricating a write to make the two shapes look alike
+        // would invent a number the upstream never sent.
+        let ant = anthropic_shape();
+        assert_eq!(ant.anthropic_input_tokens(), N);
+        assert_eq!(ant.anthropic_cache_creation_input_tokens(), W);
+
+        let oai = openai_shape();
+        assert_eq!(oai.anthropic_input_tokens(), N + W);
+        assert_eq!(oai.anthropic_cache_creation_input_tokens(), 0);
+    }
+
+    #[test]
+    fn projections_are_the_identity_without_any_cache() {
+        let u = UsageStats::new(N, O);
+        assert_eq!(u.openai_prompt_tokens(), N);
+        assert_eq!(u.openai_cached_tokens(), 0);
+        assert_eq!(u.openai_total_tokens(), N + O);
+        assert_eq!(u.anthropic_input_tokens(), N);
+        assert_eq!(u.anthropic_cache_read_input_tokens(), 0);
+        assert_eq!(u.anthropic_cache_creation_input_tokens(), 0);
+    }
+
+    #[test]
+    fn projections_sum_both_cache_families_on_a_mixed_aggregate() {
+        // An ensemble fans out to members on different providers, and
+        // `saturating_add` merges their usage into ONE client-facing
+        // record — the only place both cache representations co-occur.
+        // Picking whichever is non-zero (an easy shortcut when each
+        // upstream fills exactly one family) would silently drop a whole
+        // member's cache hit here.
+        let mixed = anthropic_shape().saturating_add(&openai_shape());
+        assert_eq!(mixed.openai_prompt_tokens(), 2 * (N + W + R));
+        assert_eq!(mixed.openai_cached_tokens(), 2 * R);
+        assert_eq!(mixed.openai_total_tokens(), 2 * (N + W + R + O));
+
+        // The Anthropic side sums to the same 2 × 140 of input, but
+        // splits it differently, and correctly so: OpenAI accounting has
+        // no cache-WRITE bucket, so that member's non-hit input is all
+        // plain input. Only the Anthropic member contributes a write.
+        assert_eq!(mixed.anthropic_input_tokens(), N + (W + N));
+        assert_eq!(mixed.anthropic_cache_read_input_tokens(), 2 * R);
+        assert_eq!(mixed.anthropic_cache_creation_input_tokens(), W);
+        assert_eq!(
+            mixed.anthropic_input_tokens()
+                + mixed.anthropic_cache_creation_input_tokens()
+                + mixed.anthropic_cache_read_input_tokens(),
+            2 * (N + W + R)
+        );
     }
 
     #[test]

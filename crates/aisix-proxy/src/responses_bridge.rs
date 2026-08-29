@@ -330,21 +330,20 @@ fn build_output_items(text: Option<&str>, tool_calls: Option<&Vec<Value>>) -> Ve
     output
 }
 
-/// Render usage in the Responses-API shape. `cached_tokens` takes whichever
-/// of the OpenAI-normalized hit count or the Anthropic cache-read count is
-/// present (the other is 0).
+/// Render usage in the Responses-API shape, which is OpenAI accounting:
+/// `input_tokens` is the FULL input and `input_tokens_details.cached_tokens`
+/// is a subset of it. Both are projected from [`UsageStats`] rather than
+/// copied — an Anthropic-shape upstream keeps its cache counters beside
+/// `prompt_tokens`, so copying produced an `input_tokens` that excluded the
+/// cache while `cached_tokens` reported it, i.e. the self-contradictory
+/// `cached_tokens > input_tokens` (AISIX-Cloud#1447).
 fn responses_usage_json(u: &UsageStats) -> Value {
-    let total = if u.total_tokens > 0 {
-        u.total_tokens
-    } else {
-        u.prompt_tokens.saturating_add(u.completion_tokens)
-    };
     json!({
-        "input_tokens": u.prompt_tokens,
-        "input_tokens_details": {"cached_tokens": u.cached_prompt_tokens.max(u.cache_read_tokens)},
+        "input_tokens": u.openai_prompt_tokens(),
+        "input_tokens_details": {"cached_tokens": u.openai_cached_tokens()},
         "output_tokens": u.completion_tokens,
         "output_tokens_details": {"reasoning_tokens": u.reasoning_tokens},
-        "total_tokens": total,
+        "total_tokens": u.openai_total_tokens(),
     })
 }
 
@@ -495,8 +494,8 @@ impl ResponsesSseEncoder {
     }
 
     fn usage_value(&self) -> Value {
-        // `responses_usage_json` keeps a provider-supplied `total_tokens`
-        // when present and only falls back to prompt+completion when it's 0.
+        // Same projection as the non-streaming exit, so a stream and a
+        // buffered call over the same upstream report identical usage.
         responses_usage_json(&UsageStats {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
@@ -1746,8 +1745,21 @@ mod tests {
         assert_eq!(types_of(&tail), vec!["response.completed"]);
     }
 
+    /// `total_tokens` is recomputed from the projected input + output,
+    /// never echoed from the upstream. The Responses API defines the
+    /// total as exactly that sum, and a client budgeting off the three
+    /// fields must be able to decompose it.
+    ///
+    /// This used to preserve a differing upstream total on the theory
+    /// that the provider was counting overhead we could not see. It is
+    /// how AISIX-Cloud#1447 reached the wire: for an Anthropic upstream
+    /// the preserved total folded in cache tokens that `input_tokens`
+    /// did not, so the client got `40 + 10 = 150`. An upstream counter
+    /// we DO understand belongs in a field of its own — see Gemini's
+    /// `thoughtsTokenCount` landing in `reasoning_tokens` rather than
+    /// inflating an unexplained total.
     #[test]
-    fn streaming_preserves_provider_total_tokens() {
+    fn streaming_total_tokens_is_recomputed_not_echoed() {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
         let _ = enc.next_events(&content_chunk("hi"));
         let done = enc.next_events(&ChatChunk {
@@ -1755,8 +1767,6 @@ mod tests {
             model: "m".into(),
             delta: ChatDelta::default(),
             finish_reason: Some(FinishReason::Stop),
-            // Provider reports an authoritative total that differs from
-            // prompt+completion (e.g. it counts tool/system overhead).
             usage: Some(UsageStats {
                 prompt_tokens: 5,
                 completion_tokens: 2,
@@ -1764,8 +1774,10 @@ mod tests {
                 ..Default::default()
             }),
         });
-        let completed = done.last().unwrap();
-        assert_eq!(completed.data["response"]["usage"]["total_tokens"], 11);
+        let usage = &done.last().unwrap().data["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 5);
+        assert_eq!(usage["output_tokens"], 2);
+        assert_eq!(usage["total_tokens"], 7);
     }
 
     #[test]
