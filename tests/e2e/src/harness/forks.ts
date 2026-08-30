@@ -28,10 +28,20 @@ export function configuredEtcdEndpoints(): string[] {
  * The core cap is why adding a fifth etcd service to a 4-core runner
  * would buy nothing: the endpoint list is a ceiling on concurrency, not
  * a target.
+ *
+ * AISIX_E2E_MAX_FORKS can only LOWER the result. Letting it raise past
+ * the endpoint count would put two gateways' watch sets on one cluster
+ * — #157 exactly — while vitest.config.ts advertises the opposite as a
+ * guarantee, so the knob is clamped by the same bound everything else
+ * is.
  */
 export function forkBudget(): number {
-  const ceiling = Math.min(RANGE_SLOTS, Math.max(2, availableParallelism()));
+  const derived = Math.min(
+    Math.max(2, configuredEtcdEndpoints().length),
+    RANGE_SLOTS,
+    Math.max(2, availableParallelism()),
+  );
   const override = Number(process.env.AISIX_E2E_MAX_FORKS);
-  if (Number.isInteger(override) && override >= 1) return Math.min(override, ceiling);
-  return Math.min(Math.max(2, configuredEtcdEndpoints().length), ceiling);
+  if (Number.isInteger(override) && override >= 1) return Math.min(override, derived);
+  return derived;
 }

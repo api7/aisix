@@ -3,9 +3,17 @@ import { harnessRequest } from "./http.js";
 
 const DEFAULT_ETCD = "http://127.0.0.1:2379";
 
-/** True inside GitHub Actions (or anything else setting CI). */
+/**
+ * True inside GitHub Actions (or anything else setting CI).
+ *
+ * `CI=false` and `CI=0` mean NOT on CI — a widely used way to turn CI
+ * behaviour off — and a bare presence check reads them as true. That
+ * would flip ping() to throwing for a developer who exports either,
+ * across all 246 call sites, against the promise that a machine without
+ * etcd keeps the quiet skip. Same test std-env uses.
+ */
 export function onCI(): boolean {
-  return process.env.CI !== undefined && process.env.CI !== "";
+  return !["", "0", "false"].includes(process.env.CI ?? "");
 }
 
 /**
@@ -76,11 +84,18 @@ export class EtcdClient {
    * concurrency, and a false negative now reds the build rather than
    * quietly dropping a file. Locally the single probe keeps the skip
    * fast — retrying 226 files' worth of beforeAll hooks would not be.
+   *
+   * The SLEEP between attempts is the part that does the work. A
+   * container that is restarting REFUSES the connection in about a
+   * millisecond rather than hanging, so escalating only the abort
+   * timeout spans nothing at all: three attempts against a closed port
+   * complete in ~8ms and prove only that it was closed 8ms ago.
    */
   async ping(timeoutMs = 1000): Promise<boolean> {
     const attempts = onCI() ? 3 : 1;
     for (let attempt = 1; attempt <= attempts; attempt++) {
       if (await this.reachable(timeoutMs * attempt)) return true;
+      if (attempt < attempts) await new Promise((r) => setTimeout(r, 500 * attempt));
     }
     if (onCI()) {
       throw new Error(

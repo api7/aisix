@@ -11,11 +11,17 @@ export default defineConfig({
     globalSetup: "./src/harness/global-setup.ts",
 
     // E2E tests spin up the aisix binary, so what bounds concurrency is
-    // the shared infrastructure underneath — CPU has never been the
-    // observed limit here, though it is the one to suspect first if the
-    // wall-clock assertions in audio-timeout / ttft-first-frame /
-    // per-attempt-telemetry start flaking. Both constraints that forced
-    // maxForks=2 are removed at the source rather than by serialising:
+    // the shared infrastructure underneath. CPU is the thing to suspect
+    // first if the wall-clock assertions in audio-timeout /
+    // ttft-first-frame / per-attempt-telemetry start flaking — each
+    // fork's gateway sizes its proxy pool to the whole machine, so four
+    // forks put appreciably more threads on the same cores than two.
+    // Measured over three CI runs at four forks, those three files pass
+    // with stable timings (audio-timeout 1283/1409/1543ms against a
+    // 2800ms bound, ttft-first-frame 24.59/24.65/24.65s); if that stops
+    // holding, lower the budget rather than widening the assertions.
+    // Both constraints that forced maxForks=2 are removed at the source
+    // rather than by serialising:
     //
     //   - ports: harness/ports.ts carves a disjoint port range per fork
     //     off VITEST_POOL_ID, so no two forks can be issued the same one.
