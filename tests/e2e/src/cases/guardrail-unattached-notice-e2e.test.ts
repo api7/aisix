@@ -4,8 +4,10 @@ import {
   EtcdClient,
   ProxyClient,
   SeedClient,
+  scrapeMetrics,
   spawnApp,
   startOpenAiUpstream,
+  sumMetric,
   waitConfigPropagation,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -53,6 +55,13 @@ describe("guardrail unattached notice", () => {
     ).status;
   }
 
+  async function appliedRevision(): Promise<number> {
+    return sumMetric(
+      await scrapeMetrics(app!.metricsUrl),
+      "aisix_config_applied_revision",
+    );
+  }
+
   // rebuildIndex forces exactly one guardrail-index build.
   //
   // It takes BOTH a write and a request, and neither alone will do: the
@@ -61,13 +70,20 @@ describe("guardrail unattached notice", () => {
   // the rebuild is lazy, deferred to the first request after the version
   // moves. A loop missing either half observes no builds at all and passes
   // while asserting nothing.
+  //
+  // The write is gated on the gateway having APPLIED it rather than on a
+  // fixed delay, because that is the event a build hangs off: a request
+  // sent while the snapshot is still at the old revision reuses the cached
+  // index, so the round silently builds nothing and the loop does fewer
+  // builds than it reads as having done.
   async function rebuildIndex(): Promise<void> {
+    const before = await appliedRevision();
     await seed!.createProviderKey({
       display_name: `un-churn-pk-${churn++}`,
       secret: "sk-mock",
       api_base: `${upstream!.baseUrl}/v1`,
     });
-    await waitConfigPropagation();
+    await waitConfigPropagation(async () => (await appliedRevision()) > before);
     await chat("harmless");
   }
 
@@ -165,7 +181,7 @@ describe("guardrail unattached notice", () => {
     expect(noticesFor(app.output(), raced)).toBe(0);
   });
 
-  test("a guardrail nothing attaches is reported, once", async (ctx) => {
+  test("a guardrail nothing attaches is reported at startup, once", async (ctx) => {
     if (!etcdReachable || !seed || !app || !proxy) {
       ctx.skip();
       return;
@@ -182,23 +198,34 @@ describe("guardrail unattached notice", () => {
       { attach: false },
     );
 
-    // No positive gate is available here — a guardrail attached to nothing
-    // screens nothing, which is the point — but none is needed: the
-    // assertion is that the notice DID arrive, so a guardrail that never
-    // reached the snapshot fails it rather than passing quietly.
+    // Asserted through a fresh process on the same configuration rather
+    // than by waiting out the grace on the running one. Two reasons: it is
+    // seconds instead of half a minute, and it covers the half the grace
+    // cannot — a gateway that RESTARTS onto standing configuration. The
+    // notice fires from an index build, builds happen only when the
+    // snapshot version moves, and configuration nobody is editing moves
+    // nothing, so without the startup report a restarted gateway would say
+    // nothing about a rule that inspects no traffic until some unrelated
+    // write happened to come along.
     //
-    // Two builds have to pass before the notice is due; the first sighting
-    // is indistinguishable from an attachment still in flight. A couple of
-    // spare rounds absorb an unrelated write landing in between, and the
-    // assertion is on the count, so a late notice still fails.
-    for (let i = 0; i < 4 && noticesFor(app.output(), name) === 0; i++) {
-      await rebuildIndex();
-    }
-    expect(noticesFor(app.output(), name)).toBe(1);
+    // The grace's own arithmetic is covered by the unit tests, which can
+    // inject `now` instead of sleeping.
+    const restarted = await spawnApp({ etcdPrefix: app.etcdPrefix });
+    try {
+      await waitConfigPropagation(
+        async () => noticesFor(restarted.output(), name) > 0,
+      );
+      // Once, not once per rebuild: it is a standing property of the row.
+      const seenOnce = noticesFor(restarted.output(), name);
+      expect(seenOnce).toBe(1);
 
-    // …and it is a standing property said once, not an event repeated on
-    // every later build.
-    for (let i = 0; i < 3; i++) await rebuildIndex();
-    expect(noticesFor(app.output(), name)).toBe(1);
+      // And the guardrails that ARE attached are not swept up in it — the
+      // startup report has no grace, so if it were reading the snapshot
+      // wrongly this is where it would show.
+      expect(noticesFor(restarted.output(), "un-attached-guard")).toBe(0);
+      expect(noticesFor(restarted.output(), "un-raced-guard")).toBe(0);
+    } finally {
+      await restarted.exit();
+    }
   });
 });

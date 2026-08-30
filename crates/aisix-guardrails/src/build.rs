@@ -1096,30 +1096,130 @@ pub fn unattached_guardrail_names(
         .collect()
 }
 
+/// How long a guardrail must have been present-and-unattached before the
+/// notice is due.
+///
+/// A guardrail and its attachment are separate documents in separate outbox
+/// rows, so every ordinary creation has a build where the data plane holds
+/// the guardrail and not yet its attachment. Reporting there named
+/// correctly-attached guardrails as inspecting nothing — permanently, since
+/// the notice is deduplicated per id for the process lifetime.
+///
+/// The grace is measured in TIME, not in builds. A build is not a unit of
+/// duration: the index is rebuilt on every snapshot version change AND
+/// concurrently by every request that arrives during one rebuild, so two or
+/// more builds fit between the two writes — sometimes within a single
+/// version. Any "seen in the previous build" rule is therefore satisfied
+/// while the attachment is still in flight. Thirty seconds is two orders of
+/// magnitude above the gap the control plane leaves (it drains both rows
+/// from one outbox batch) and short enough to name a genuinely inert rule
+/// early in a deployment.
+const UNATTACHED_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Which enabled-but-unattached guardrails this build should report, given
-/// what the previous build saw and what has already been said.
+/// when each guardrail id was first SEEN — attached or not — and what has
+/// already been said.
 ///
-/// Pure, so the two-sighting rule is testable without a tracing subscriber —
-/// the shape the retired `implicit_env_scope_first_seen` helper had, and for
-/// the same reason.
+/// Timing from first sight rather than from first sight *unattached* is what
+/// separates the two states that look identical in one snapshot: a guardrail
+/// whose attachment has not arrived yet, and one whose attachment is gone.
+/// The first is new, so its clock has barely started; the second has been
+/// around, so it is due immediately. Timing from "first seen unattached"
+/// collapses them and makes a deleted attachment wait for a second build —
+/// which, since builds only happen on config changes, means waiting for an
+/// unrelated write that may never come.
 ///
-/// A row must have been unattached in the PREVIOUS build too. A guardrail and
-/// its attachment are separate documents in separate outbox rows, so every
-/// ordinary creation has a build where the data plane holds the guardrail and
-/// not yet its attachment; reporting on that first sighting fired on
-/// correctly-attached guardrails. Because the notice is deduplicated per id
-/// for the life of the process, that false alarm was permanent — a log line
-/// saying a security control inspects nothing, about one that does.
+/// Pure, and takes `now`, so the grace is testable without sleeping and
+/// without a tracing subscriber — the shape the retired
+/// `implicit_env_scope_first_seen` helper had, and for the same reason.
 fn unattached_to_report(
     unattached: &[(String, String)],
-    seen_before: &std::collections::HashSet<String>,
+    present_since: &std::collections::HashMap<String, std::time::Instant>,
     warned: &std::collections::HashSet<String>,
+    now: std::time::Instant,
 ) -> Vec<(String, String)> {
     unattached
         .iter()
-        .filter(|(id, _)| seen_before.contains(id) && !warned.contains(id))
+        .filter(|(id, _)| {
+            !warned.contains(id)
+                && present_since
+                    .get(id)
+                    .is_some_and(|t| now.saturating_duration_since(*t) >= UNATTACHED_GRACE)
+        })
         .cloned()
         .collect()
+}
+
+/// (already reported, first build each enabled guardrail id was seen in)
+type UnattachedState = (
+    std::collections::HashSet<String>,
+    std::collections::HashMap<String, std::time::Instant>,
+);
+
+/// Shared by the build-time notice and the startup report so a row named at
+/// boot is not named again by the first rebuild.
+static UNATTACHED_STATE: std::sync::OnceLock<std::sync::Mutex<UnattachedState>> =
+    std::sync::OnceLock::new();
+
+/// Cap on both halves of the state. Beyond it the notice degrades to
+/// silence rather than to repetition — the right direction for a log line.
+const MAX_REMEMBERED: usize = 4096;
+
+fn unattached_state() -> std::sync::MutexGuard<'static, UnattachedState> {
+    // Poison-tolerant: this state only shapes log lines, so a panic while the
+    // lock was held must not wedge every later index build.
+    UNATTACHED_STATE
+        .get_or_init(|| {
+            std::sync::Mutex::new((
+                std::collections::HashSet::new(),
+                std::collections::HashMap::new(),
+            ))
+        })
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn emit_unattached_notice(id: &str, name: &str) {
+    tracing::warn!(
+        guardrail_id = %id,
+        guardrail_name = %name,
+        "guardrail is enabled but has no attachment, so it inspects no traffic; \
+         attach it to an environment, model, MCP server, API key, team or \
+         passthrough route to put it in force",
+    );
+}
+
+/// Report the guardrails that are inert in the snapshot a process STARTED
+/// with, once the first full load has landed.
+///
+/// The build-time notice below cannot cover this. It fires from an index
+/// build, builds happen only when the snapshot version moves, and standing
+/// configuration moves nothing — so on a deployment nobody is editing, a
+/// restart would go quiet about rules that inspect no traffic until some
+/// unrelated write happened to trigger a rebuild.
+///
+/// No grace applies here, and none is needed: a boot snapshot is assembled
+/// in one pass (`apply_resync` builds it from every entry at once, and the
+/// file loader does the same), so nothing is in flight and there is no race
+/// to wait out. Ids named here are recorded as said, so the first rebuild
+/// does not repeat them.
+pub fn report_unattached_guardrails_at_startup(
+    guardrails: &ResourceTable<DomainGuardrail>,
+    attachments: &ResourceTable<GuardrailAttachment>,
+) {
+    let mut guard = unattached_state();
+    let (warned, present_since) = &mut *guard;
+    let now = std::time::Instant::now();
+    for (id, name) in unattached_ids(guardrails, attachments) {
+        if warned.contains(&id) {
+            continue;
+        }
+        emit_unattached_notice(&id, &name);
+        if warned.len() < MAX_REMEMBERED {
+            warned.insert(id.clone());
+        }
+        present_since.insert(id, now);
+    }
 }
 
 /// WARN once per guardrail id for the process lifetime: this row is enabled
@@ -1137,42 +1237,45 @@ fn warn_unattached_guardrails(
     guardrails: &ResourceTable<DomainGuardrail>,
     attachments: &ResourceTable<GuardrailAttachment>,
 ) {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
+    use std::collections::HashMap;
+    use std::time::Instant;
 
-    const MAX_REMEMBERED: usize = 1024;
-    // (already reported, seen unattached in the previous build)
-    static STATE: OnceLock<Mutex<(HashSet<String>, HashSet<String>)>> = OnceLock::new();
+    let mut guard = unattached_state();
+    let (warned, present_since) = &mut *guard;
 
-    // Poison-tolerant: this state only shapes log lines, so a panic while the
-    // lock was held must not wedge every later index build.
-    let mut guard = STATE
-        .get_or_init(|| Mutex::new((HashSet::new(), HashSet::new())))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (warned, seen_before) = &mut *guard;
-
+    let now = Instant::now();
     let unattached = unattached_ids(guardrails, attachments);
-    for (id, name) in unattached_to_report(&unattached, seen_before, warned) {
-        tracing::warn!(
-            guardrail_id = %id,
-            guardrail_name = %name,
-            "guardrail is enabled but has no attachment, so it inspects no traffic; \
-             attach it to an environment, model, MCP server, API key, team or \
-             passthrough route to put it in force",
-        );
+
+    // Every enabled guardrail, not just the unattached ones: the timestamp
+    // is "when this row appeared", which is what tells a new guardrail
+    // (attachment still in flight) apart from an old one that just lost its
+    // attachment. Sorted, so the cap truncates the same ids every build
+    // rather than making rows drift in and out and restart their clocks.
+    let mut enabled: Vec<String> = guardrails
+        .entries()
+        .into_iter()
+        .filter(|e| e.value.enabled)
+        .map(|e| e.id.clone())
+        .collect();
+    enabled.sort();
+    let next: HashMap<String, Instant> = enabled
+        .into_iter()
+        .take(MAX_REMEMBERED)
+        .map(|id| {
+            let since = present_since.get(&id).copied().unwrap_or(now);
+            (id, since)
+        })
+        .collect();
+
+    for (id, name) in unattached_to_report(&unattached, &next, warned, now) {
+        emit_unattached_notice(&id, &name);
         if warned.len() < MAX_REMEMBERED {
             warned.insert(id);
         }
     }
-    // Replaced, not merged: a guardrail that GAINED an attachment has to drop
-    // out, or a later loss would report on its first build and reopen the race
-    // this closes.
-    *seen_before = unattached
-        .into_iter()
-        .map(|(id, _)| id)
-        .take(MAX_REMEMBERED)
-        .collect();
+    // Rebuilt rather than merged, so a guardrail that left the snapshot
+    // drops out and one that comes back starts a fresh clock.
+    *present_since = next;
 }
 
 // ---------------------------------------------------------------------------
@@ -2217,36 +2320,104 @@ mod tests {
         );
     }
 
-    /// A guardrail and its attachment arrive as separate documents, so every
-    /// ordinary creation has a build where the guardrail is present and the
-    /// attachment is not. Reporting on that first sighting named a
+    /// A guardrail and its attachment arrive as separate documents, so a build
+    /// falling between them holds the guardrail alone. Reporting there named a
     /// correctly-attached guardrail as inspecting nothing — permanently, since
     /// the notice is deduplicated per id for the process lifetime.
     #[test]
-    fn the_unattached_notice_needs_two_consecutive_sightings() {
-        use std::collections::HashSet;
+    fn the_unattached_notice_waits_out_the_grace() {
+        use std::collections::{HashMap, HashSet};
+        use std::time::{Duration, Instant};
+
         let rows = vec![("g-1".to_string(), "one".to_string())];
-        let mut seen_before: HashSet<String> = HashSet::new();
+        let t0 = Instant::now();
+        let mut first_seen: HashMap<String, Instant> = HashMap::new();
         let mut warned: HashSet<String> = HashSet::new();
 
         assert!(
-            unattached_to_report(&rows, &seen_before, &warned).is_empty(),
-            "the first build a guardrail appears in is its attachment's window",
+            unattached_to_report(&rows, &first_seen, &warned, t0).is_empty(),
+            "an id with no recorded first sighting is inside its attachment's window",
         );
-        seen_before.insert("g-1".to_string());
+        first_seen.insert("g-1".to_string(), t0);
 
-        let due = unattached_to_report(&rows, &seen_before, &warned);
+        assert!(
+            unattached_to_report(&rows, &first_seen, &warned, t0 + UNATTACHED_GRACE / 2).is_empty(),
+            "half a grace in is still the window, however many builds have run",
+        );
+
+        let due = unattached_to_report(&rows, &first_seen, &warned, t0 + UNATTACHED_GRACE);
         assert_eq!(
             due.len(),
             1,
-            "still unattached one build later is a standing property, not a race",
+            "unattached for the whole grace is a standing property, not a race",
         );
         warned.insert("g-1".to_string());
 
         assert!(
-            unattached_to_report(&rows, &seen_before, &warned).is_empty(),
-            "and it is said once, not on every rebuild",
+            unattached_to_report(
+                &rows,
+                &first_seen,
+                &warned,
+                t0 + UNATTACHED_GRACE + Duration::from_secs(600),
+            )
+            .is_empty(),
+            "and it is said once, not on every rebuild after",
         );
+    }
+
+    /// A guardrail that has been around and just lost its attachment is due
+    /// at once. This is the one case the notice exists for — a scope target
+    /// was deleted and the rule is now inert — and timing from "first seen
+    /// UNATTACHED" instead of "first seen" would make it wait for a second
+    /// build, i.e. for an unrelated config write that may never come.
+    #[test]
+    fn losing_an_attachment_is_reported_on_the_next_build() {
+        use std::collections::{HashMap, HashSet};
+        use std::time::Instant;
+
+        let rows = vec![("g-1".to_string(), "one".to_string())];
+        let created = Instant::now();
+        let mut present_since: HashMap<String, Instant> = HashMap::new();
+        // Present, and attached, since well before the grace.
+        present_since.insert("g-1".to_string(), created);
+        let warned: HashSet<String> = HashSet::new();
+
+        let due = unattached_to_report(
+            &rows,
+            &present_since,
+            &warned,
+            created + UNATTACHED_GRACE * 2,
+        );
+        assert_eq!(
+            due.len(),
+            1,
+            "a row that has outlived the grace is due the build its attachment goes",
+        );
+    }
+
+    /// The clock has to be measured in time, not in builds. Two builds fit
+    /// between a guardrail and its attachment whenever anything else is being
+    /// written, so a consecutive-build rule reports a correctly-attached
+    /// guardrail under ordinary config churn — the very bug it was meant to
+    /// close, just harder to reproduce.
+    #[test]
+    fn many_builds_inside_the_grace_still_report_nothing() {
+        use std::collections::{HashMap, HashSet};
+        use std::time::Instant;
+
+        let rows = vec![("g-1".to_string(), "one".to_string())];
+        let t0 = Instant::now();
+        let mut first_seen: HashMap<String, Instant> = HashMap::new();
+        first_seen.insert("g-1".to_string(), t0);
+        let warned: HashSet<String> = HashSet::new();
+
+        for i in 1..=50 {
+            let now = t0 + (UNATTACHED_GRACE / 100) * i;
+            assert!(
+                unattached_to_report(&rows, &first_seen, &warned, now).is_empty(),
+                "build {i} is inside the grace and must stay quiet",
+            );
+        }
     }
 
     #[tokio::test]

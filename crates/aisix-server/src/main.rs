@@ -1017,6 +1017,37 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         heartbeat::spawn(h, cancel_rx.clone())
     });
 
+    // Say what the process STARTED with that inspects no traffic, once the
+    // first full load has landed.
+    //
+    // The runtime notice inside the guardrail index cannot cover this: it
+    // fires from an index build, builds happen only when the snapshot
+    // version moves, and standing configuration moves nothing. Without this
+    // a restart would go quiet about rules attached to nothing until some
+    // unrelated write happened to trigger a rebuild — on a deployment
+    // nobody is editing, never.
+    //
+    // Bounded rather than waiting forever: if the source never becomes
+    // ready the proxy has louder problems than this line, and `/readyz`
+    // already reports them.
+    {
+        let startup_snapshot = snapshot_handle.clone();
+        let startup_status = config_status.clone();
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            while !startup_status.is_ready() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            if startup_status.is_ready() {
+                let snap = startup_snapshot.load();
+                aisix_guardrails::report_unattached_guardrails_at_startup(
+                    &snap.guardrails,
+                    &snap.guardrail_attachments,
+                );
+            }
+        });
+    }
+
     // Clone shared trackers before consuming proxy_state in build_router.
     let health_tracker = proxy_state.health.clone();
     let livez_state = proxy_state.livez.clone();
