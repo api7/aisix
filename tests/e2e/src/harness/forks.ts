@@ -37,10 +37,15 @@ export function configuredEtcdEndpoints(): string[] {
  */
 export function forkBudget(): number {
   const endpoints = configuredEtcdEndpoints().length;
+  const cores = availableParallelism();
   const derived = Math.min(
     endpoints > 0 ? endpoints : 2,
     RANGE_SLOTS,
-    Math.max(2, availableParallelism()),
+    // The floor of 2 belongs to the UNCONFIGURED case only — it is the
+    // historical value, not a claim about the hardware. With a list
+    // present the core count is honoured literally, so a one-core host
+    // runs one fork rather than two gateways on one core.
+    endpoints > 0 ? cores : Math.max(2, cores),
   );
   const override = Number(process.env.AISIX_E2E_MAX_FORKS);
   if (Number.isInteger(override) && override >= 1) return Math.min(override, derived);

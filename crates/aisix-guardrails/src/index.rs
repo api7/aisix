@@ -246,7 +246,7 @@ mod tests {
     use super::*;
     use crate::{GuardrailVerdict, KeywordBlocklist, KeywordRule};
     use aisix_gateway::{ChatFormat, ChatMessage};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn kw(_name: &'static str, literal: &str) -> Arc<dyn Guardrail> {
         Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal(
@@ -623,7 +623,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Benchmark: 1000 attachment entries, resolve < 100ms
+    // Benchmark: 1000 attachment entries, build + 100 resolves stay linear
     // -----------------------------------------------------------------------
 
     /// Performance pin: building the index from 1000 entries and resolving
@@ -686,11 +686,13 @@ mod tests {
         }
 
         let elapsed = start.elapsed();
+        // Compare Durations, not as_millis(): the latter truncates, so
+        // 500.9ms would read as 500 and pass a `< 500` check.
         assert!(
-            elapsed.as_millis() < 500,
-            "index build + 100 resolves took {}ms, expected < 500ms — that is \
+            elapsed < Duration::from_millis(500),
+            "index build + 100 resolves took {:?}, expected < 500ms — that is \
              far past runner noise and means the cost curve changed shape",
-            elapsed.as_millis()
+            elapsed
         );
     }
 }
