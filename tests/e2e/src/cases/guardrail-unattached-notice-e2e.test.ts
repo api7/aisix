@@ -26,6 +26,7 @@ import {
 // wrong way: silence proves nothing if the notice never fires at all, and
 // firing proves nothing if it fires on everything.
 
+const MODEL = "un-model";
 const CALLER_PLAINTEXT = "sk-unattached-notice-caller";
 const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
@@ -46,6 +47,12 @@ describe("guardrail unattached notice", () => {
   let etcdReachable = false;
   let churn = 0;
 
+  async function chat(content: string): Promise<number> {
+    return (
+      await proxy!.chat({ model: MODEL, messages: [{ role: "user", content }] })
+    ).status;
+  }
+
   // rebuildIndex forces exactly one guardrail-index build.
   //
   // It takes BOTH a write and a request, and neither alone will do: the
@@ -61,10 +68,18 @@ describe("guardrail unattached notice", () => {
       api_base: `${upstream!.baseUrl}/v1`,
     });
     await waitConfigPropagation();
-    await proxy!.chat({
-      model: "un-model",
-      messages: [{ role: "user", content: "harmless" }],
-    });
+    await chat("harmless");
+  }
+
+  // awaitInForce gates on the guardrail actually screening traffic — its
+  // own pattern coming back blocked. The notice assertions are all
+  // negative, so without a positive gate they pass just as well on a
+  // guardrail that never reached the snapshot. Blocking is a different
+  // surface from the log line under test, and `chat` returns a status
+  // rather than throwing, so a real transport failure still surfaces as
+  // itself rather than as this timeout.
+  async function awaitInForce(probe: string): Promise<void> {
+    await waitConfigPropagation(async () => (await chat(probe)) === 422);
   }
 
   beforeAll(async () => {
@@ -82,16 +97,21 @@ describe("guardrail unattached notice", () => {
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
-      display_name: "un-model",
+      display_name: MODEL,
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
+    // Caller key last, then gate on it authenticating: that one condition
+    // implies every resource above it is in the snapshot.
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
-      allowed_models: ["un-model"],
+      allowed_models: [MODEL],
     });
     proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(
+      async () => (await proxy!.listModels()).status === 200,
+    );
   });
 
   afterAll(async () => {
@@ -99,8 +119,11 @@ describe("guardrail unattached notice", () => {
     await upstream?.close();
   });
 
-  test("an attached guardrail is never reported, however the two writes interleave", async () => {
-    if (!etcdReachable || !seed || !app) return;
+  test("an attached guardrail is never reported, however the two writes interleave", async (ctx) => {
+    if (!etcdReachable || !seed || !app || !proxy) {
+      ctx.skip();
+      return;
+    }
 
     // The ordinary creation shape first: guardrail and env attachment
     // written back to back, then traffic.
@@ -112,6 +135,7 @@ describe("guardrail unattached notice", () => {
       kind: "keyword",
       patterns: [{ kind: "literal", value: "un-attached-probe" }],
     });
+    await awaitInForce("un-attached-probe");
     for (let i = 0; i < 3; i++) await rebuildIndex();
     expect(noticesFor(app.output(), settled)).toBe(0);
 
@@ -132,6 +156,7 @@ describe("guardrail unattached notice", () => {
     );
     await rebuildIndex();
     await seed.attachGuardrailToEnv(g.id);
+    await awaitInForce("un-raced-probe");
     for (let i = 0; i < 3; i++) await rebuildIndex();
 
     // Nothing, and nothing later either: the notice is deduplicated per id
@@ -140,8 +165,11 @@ describe("guardrail unattached notice", () => {
     expect(noticesFor(app.output(), raced)).toBe(0);
   });
 
-  test("a guardrail nothing attaches is reported, once", async () => {
-    if (!etcdReachable || !seed || !app) return;
+  test("a guardrail nothing attaches is reported, once", async (ctx) => {
+    if (!etcdReachable || !seed || !app || !proxy) {
+      ctx.skip();
+      return;
+    }
     const name = "un-orphan-guard";
     await seed.createGuardrail(
       {
@@ -154,9 +182,14 @@ describe("guardrail unattached notice", () => {
       { attach: false },
     );
 
-    // Two builds have to pass before the notice is due — the first sighting
+    // No positive gate is available here — a guardrail attached to nothing
+    // screens nothing, which is the point — but none is needed: the
+    // assertion is that the notice DID arrive, so a guardrail that never
+    // reached the snapshot fails it rather than passing quietly.
+    //
+    // Two builds have to pass before the notice is due; the first sighting
     // is indistinguishable from an attachment still in flight. A couple of
-    // spare rounds absorb an unrelated write landing in between; the
+    // spare rounds absorb an unrelated write landing in between, and the
     // assertion is on the count, so a late notice still fails.
     for (let i = 0; i < 4 && noticesFor(app.output(), name) === 0; i++) {
       await rebuildIndex();
