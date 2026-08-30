@@ -316,15 +316,10 @@ describe("file resource source: differential vs etcd mode", () => {
   beforeAll(async () => {
     const etcd = new EtcdClient();
     etcdReachable = await etcd.ping();
-    if (!etcdReachable) {
-      // Local runs may skip quietly; on CI the differential pin is the
-      // point of this file — a silent skip would let the equivalence
-      // contract rot invisibly.
-      if (process.env.CI) {
-        throw new Error("differential case requires etcd on CI (AISIX_E2E_ETCD)");
-      }
-      return;
-    }
+    // Local runs may skip quietly. On CI they cannot: ping() throws
+    // there, for every case file, so the equivalence contract this file
+    // pins can no longer rot behind a silent skip.
+    if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
 

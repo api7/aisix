@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { stringify as yamlStringify } from "yaml";
 
 import { pickFreePorts } from "./ports.js";
-import { EtcdClient } from "./etcd.js";
+import { EtcdClient, etcdEndpoint } from "./etcd.js";
 import { harnessRequest } from "./http.js";
 
 export interface AppOverrides {
@@ -234,8 +234,9 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   // file source stays exercisable even without the shared etcd.
   if (!fileMode && !(await etcd.ping())) {
     throw new Error(
-      `etcd not reachable at ${process.env.AISIX_E2E_ETCD ?? "http://127.0.0.1:2379"} ` +
-        "(set AISIX_E2E_ETCD or run `docker run --rm -p 2379:2379 quay.io/coreos/etcd:v3.5.15`)",
+      `etcd not reachable at ${etcdEndpoint()} ` +
+        "(set AISIX_E2E_ETCD_ENDPOINTS — which takes precedence — or AISIX_E2E_ETCD, " +
+          "or run `docker run --rm -p 2379:2379 quay.io/coreos/etcd:v3.5.15`)",
     );
   }
 
@@ -268,7 +269,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
       ? { resources_file: resourcesPath }
       : {
           etcd: {
-            endpoints: [process.env.AISIX_E2E_ETCD ?? "http://127.0.0.1:2379"],
+            endpoints: [etcdEndpoint()],
             prefix: etcdPrefix,
             dial_timeout_ms: 5000,
             request_timeout_ms: 5000,

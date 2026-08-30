@@ -25,7 +25,9 @@ import { createServer } from "node:net";
 
 const RANGE_BASE = 21000;
 const RANGE_SIZE = 800;
-const RANGE_SLOTS = 14; // 21000..32199, below the ephemeral range
+// Exported so vitest.config.ts can cap fork concurrency at it: a fork
+// beyond this shares a port range with an earlier one.
+export const RANGE_SLOTS = 14; // 21000..32199, below the ephemeral range
 
 function rangeSlot(): number {
   const poolId = Number(process.env.VITEST_POOL_ID);
