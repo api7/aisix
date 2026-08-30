@@ -36,8 +36,9 @@ export function configuredEtcdEndpoints(): string[] {
  * is.
  */
 export function forkBudget(): number {
+  const endpoints = configuredEtcdEndpoints().length;
   const derived = Math.min(
-    Math.max(2, configuredEtcdEndpoints().length),
+    endpoints > 0 ? endpoints : 2,
     RANGE_SLOTS,
     Math.max(2, availableParallelism()),
   );

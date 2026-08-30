@@ -2,26 +2,6 @@ import { EtcdClient, etcdEndpoint, etcdEndpointForPool, onCI } from "./etcd.js";
 import { configuredEtcdEndpoints, forkBudget } from "./forks.js";
 
 /**
- * Fail the run when a configured etcd cluster is not answering.
- *
- * Nearly every case file opens with `if (!(await etcd.ping())) return;`
- * or `ctx.skip()`, which is right for a developer without etcd running
- * — but it means an unreachable cluster produces a GREEN run with those
- * files contributing nothing. With one shared cluster that was at least
- * all-or-nothing and impossible to miss. Splitting the suite across four
- * clusters (see etcdEndpoint) turns it into a partial, silent loss: one
- * dead endpoint takes out only the quarter of the files whose fork was
- * assigned to it, and `e2e (vitest) + coverage` still reports success.
- *
- * So the reachability check moves here, once, before any fork starts:
- *
- *   - on CI, every configured endpoint must answer. A skipped file on CI
- *     is a coverage hole, not a convenience.
- *   - locally, the same applies as soon as MORE THAN ONE endpoint is
- *     configured, because that is the partial-loss shape. A developer
- *     with no etcd at all, or one, keeps the quiet skip.
- */
-/**
  * Probe one endpoint, retrying before calling it dead.
  *
  * A generous single timeout buys nothing against the failure this
@@ -41,6 +21,26 @@ async function reachableWithRetry(endpoint: string): Promise<boolean> {
   return false;
 }
 
+/**
+ * Fail the run when a configured etcd cluster is not answering.
+ *
+ * Nearly every case file opens with `if (!(await etcd.ping())) return;`
+ * or `ctx.skip()`, which is right for a developer without etcd running
+ * — but it means an unreachable cluster produces a GREEN run with those
+ * files contributing nothing. With one shared cluster that was at least
+ * all-or-nothing and impossible to miss. Splitting the suite across four
+ * clusters (see etcdEndpoint) turns it into a partial, silent loss: one
+ * dead endpoint takes out only the quarter of the files whose fork was
+ * assigned to it, and `e2e (vitest) + coverage` still reports success.
+ *
+ * So the reachability check moves here, once, before any fork starts:
+ *
+ *   - on CI, every configured endpoint must answer. A skipped file on CI
+ *     is a coverage hole, not a convenience.
+ *   - locally, the same applies as soon as MORE THAN ONE endpoint is
+ *     configured, because that is the partial-loss shape. A developer
+ *     with no etcd at all, or one, keeps the quiet skip.
+ */
 export async function setup(): Promise<void> {
   // Only the endpoints this run will actually USE. forkBudget is capped
   // by the core count too, so a 4-entry list on a 2-core runner drives
@@ -71,7 +71,7 @@ export async function setup(): Promise<void> {
   if (dead.length === 0) return;
 
   throw new Error(
-    `etcd not reachable at ${dead.join(", ")} (of ${endpoints.length} configured). ` +
+    `etcd not reachable at ${dead.join(", ")} (of ${endpoints.length} in use). ` +
       "Every case file that landed on one of these would SKIP silently and the run " +
       "would still pass, so it fails here instead. Check the etcd services in " +
       ".github/workflows/ci.yml against AISIX_E2E_ETCD_ENDPOINTS — the two lists " +
