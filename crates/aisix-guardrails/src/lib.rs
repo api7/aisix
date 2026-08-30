@@ -302,8 +302,9 @@ pub use audit::GuardrailAuditLog;
 #[cfg(feature = "bedrock")]
 pub use bedrock::BedrockGuardrail;
 pub use build::{
-    build_chain_from_snapshot, build_index_from_snapshot, unattached_guardrail_names,
-    unbuildable_guardrail_rows, LiveGuardrailChain, LiveGuardrailIndex, UnbuildableGuardrailRow,
+    build_chain_from_snapshot, build_index_from_snapshot, sweep_unattached_guardrails,
+    unattached_guardrail_names, unbuildable_guardrail_rows, LiveGuardrailChain, LiveGuardrailIndex,
+    UnbuildableGuardrailRow, UNATTACHED_SWEEP_INTERVAL,
 };
 pub use chain::GuardrailChain;
 pub use index::{GuardrailIndex, RequestContext};

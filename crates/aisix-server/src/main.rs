@@ -429,7 +429,9 @@ fn select_managed_boot_path(bundle_on_disk: bool, bundle_provided: bool) -> Mana
     }
 }
 
-async fn run_metrics_upkeep<F>(mut cancel: watch::Receiver<bool>, period: Duration, upkeep: F)
+/// Run `job` every `period` until cancelled. Two callers: the metrics
+/// upkeep sweep and the inert-guardrail sweep.
+async fn run_periodic<F>(mut cancel: watch::Receiver<bool>, period: Duration, job: F)
 where
     F: Fn(),
 {
@@ -440,7 +442,7 @@ where
             break;
         }
         tokio::select! {
-            _ = interval.tick() => upkeep(),
+            _ = interval.tick() => job(),
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
                     break;
@@ -823,7 +825,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     ));
     let metrics_upkeep_task = {
         let metrics = metrics.clone();
-        tokio::spawn(run_metrics_upkeep(
+        tokio::spawn(run_periodic(
             cancel_rx.clone(),
             Duration::from_secs(5),
             move || metrics.run_upkeep(),
@@ -1016,6 +1018,41 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         h = h.with_exporter_health_fetcher(Arc::new(move || fan_out.exporter_stats()));
         heartbeat::spawn(h, cancel_rx.clone())
     });
+
+    // Name the guardrails that are attached to nothing, on a timer.
+    //
+    // On a timer rather than from the index build, because the thing being
+    // reported does not coincide with a configuration change. A build
+    // happens only when the snapshot version moves, so a notice emitted
+    // from one is delivered only if somebody writes something — and the two
+    // cases that matter most are the ones where nobody does: a scope target
+    // deleted out from under a rule that was screening traffic yesterday,
+    // and a gateway restarted onto standing configuration.
+    //
+    // Nor is it gated on a readiness flag. `ConfigStatus::is_ready` means
+    // "a load has been applied", which `Supervisor::restore_from_cache`
+    // satisfies before the watch task has reached etcd at all — a one-shot
+    // report behind that gate reads the CACHED generation and never looks
+    // again, so it goes quiet exactly when the cache is the stale thing
+    // (someone changed an attachment while this gateway was down). A sweep
+    // that keeps running converges either way. It may still name a row
+    // that live etcd has attached, during a long outage: that is not a
+    // false alarm, because the gateway is serving the cached generation at
+    // that moment and in it the rule really does inspect nothing.
+    {
+        let sweep_snapshot = snapshot_handle.clone();
+        tokio::spawn(run_periodic(
+            cancel_rx.clone(),
+            aisix_guardrails::UNATTACHED_SWEEP_INTERVAL,
+            move || {
+                let snap = sweep_snapshot.load();
+                aisix_guardrails::sweep_unattached_guardrails(
+                    &snap.guardrails,
+                    &snap.guardrail_attachments,
+                );
+            },
+        ));
+    }
 
     // Clone shared trackers before consuming proxy_state in build_router.
     let health_tracker = proxy_state.health.clone();
@@ -2481,19 +2518,15 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn metrics_upkeep_runs_periodically_and_stops_on_cancel() {
+    async fn a_periodic_job_runs_on_its_period_and_stops_on_cancel() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = calls.clone();
-        let task = tokio::spawn(run_metrics_upkeep(
-            cancel_rx,
-            Duration::from_secs(5),
-            move || {
-                observed.fetch_add(1, Ordering::SeqCst);
-            },
-        ));
+        let task = tokio::spawn(run_periodic(cancel_rx, Duration::from_secs(5), move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }));
 
         tokio::task::yield_now().await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);

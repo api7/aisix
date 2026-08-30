@@ -1054,7 +1054,6 @@ pub fn build_index_from_snapshot(
         ));
     }
 
-    warn_unattached_guardrails(guardrails, attachments);
     GuardrailIndex::from_entries(entries)
 }
 
@@ -1096,50 +1095,210 @@ pub fn unattached_guardrail_names(
         .collect()
 }
 
-/// WARN once per guardrail id for the process lifetime: this row is enabled
-/// but nothing attaches it, so it inspects no traffic at all.
+/// How long a guardrail must have been present-and-unattached before the
+/// notice is due.
 ///
-/// The state is legitimate — a scope target can be deleted, and a rule with
-/// no scope left is correctly inert — but it is also indistinguishable from a
-/// misconfiguration, and it is INVISIBLE otherwise: the guardrail is present
-/// in the snapshot, `/status/config` counts it as loaded, and no request ever
-/// mentions it. An operator who believes a rule is in force deserves to be
-/// told it is not.
+/// A guardrail and its attachment are separate documents in separate outbox
+/// rows, so every ordinary creation has a build where the data plane holds
+/// the guardrail and not yet its attachment. Reporting there named
+/// correctly-attached guardrails as inspecting nothing — permanently, since
+/// the notice is deduplicated per id for the process lifetime.
 ///
-/// Deduped per id, not logged per build, for the reason AISIX-Cloud#1435
-/// documents: the index is rebuilt on every snapshot version change, and this
-/// describes a STANDING property of a row rather than an event.
-fn warn_unattached_guardrails(
+/// The grace is measured in TIME, not in builds. A build is not a unit of
+/// duration: the index is rebuilt on every snapshot version change AND
+/// concurrently by every request that arrives during one rebuild, so two or
+/// more builds fit between the two writes — sometimes within a single
+/// version. Any "seen in the previous build" rule is therefore satisfied
+/// while the attachment is still in flight. Thirty seconds is far above the
+/// gap the control plane leaves — the two documents come from two separate
+/// API calls a client round trip apart, each with an outbox tick behind it,
+/// NOT from one batch — and short enough to name a genuinely inert rule
+/// early in a deployment.
+const UNATTACHED_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often `sweep_unattached_guardrails` should be called. Exported so the
+/// interval and the grace stay legible together: a row is named between one
+/// and two sweeps after the grace expires.
+pub const UNATTACHED_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Which enabled-but-unattached guardrails this build should report, given
+/// when each guardrail id was first SEEN — attached or not — and what has
+/// already been said.
+///
+/// Timing from first sight rather than from first sight *unattached* is what
+/// separates the two states that look identical in one snapshot: a guardrail
+/// whose attachment has not arrived yet, and one whose attachment is gone.
+/// The first is new, so its clock has barely started; the second has been
+/// around, so it is due immediately. Timing from "first seen unattached"
+/// collapses them and makes a deleted attachment wait for a second build —
+/// which, since builds only happen on config changes, means waiting for an
+/// unrelated write that may never come.
+///
+/// Pure, and takes `now`, so the grace is testable without sleeping and
+/// without a tracing subscriber — the shape the retired
+/// `implicit_env_scope_first_seen` helper had, and for the same reason.
+fn unattached_to_report(
+    unattached: &[(String, String)],
+    present_since: &std::collections::HashMap<String, std::time::Instant>,
+    warned: &std::collections::HashSet<String>,
+    now: std::time::Instant,
+) -> Vec<(String, String)> {
+    unattached
+        .iter()
+        .filter(|(id, _)| {
+            !warned.contains(id)
+                && present_since
+                    .get(id)
+                    .is_some_and(|t| now.saturating_duration_since(*t) >= UNATTACHED_GRACE)
+        })
+        .cloned()
+        .collect()
+}
+
+/// (already reported, first build each enabled guardrail id was seen in)
+type UnattachedState = (
+    std::collections::HashSet<String>,
+    std::collections::HashMap<String, std::time::Instant>,
+);
+
+/// Shared by the build-time notice and the startup report so a row named at
+/// boot is not named again by the first rebuild.
+static UNATTACHED_STATE: std::sync::OnceLock<std::sync::Mutex<UnattachedState>> =
+    std::sync::OnceLock::new();
+
+/// Cap on both halves of the state. Beyond it the notice degrades to
+/// silence rather than to repetition — the right direction for a log line.
+const MAX_REMEMBERED: usize = 4096;
+
+fn unattached_state() -> std::sync::MutexGuard<'static, UnattachedState> {
+    // Poison-tolerant: this state only shapes log lines, so a panic while the
+    // lock was held must not wedge every later index build.
+    UNATTACHED_STATE
+        .get_or_init(|| {
+            std::sync::Mutex::new((
+                std::collections::HashSet::new(),
+                std::collections::HashMap::new(),
+            ))
+        })
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Test-only view of the sweep's process-global state. The cap it exists to
+/// check is on the CUMULATIVE set, so nothing short of driving real sweeps
+/// across several generations of ids can see it.
+#[cfg(test)]
+fn unattached_state_for_test() -> (usize, usize) {
+    let guard = unattached_state();
+    (guard.0.len(), guard.1.len())
+}
+
+/// Test-only: backdate the presence stamps so a sweep sees rows that have
+/// already outlived the grace, instead of the test sleeping through it.
+#[cfg(test)]
+fn backdate_unattached_stamps_for_test() {
+    let mut guard = unattached_state();
+    let aged = std::time::Instant::now()
+        .checked_sub(UNATTACHED_GRACE * 2)
+        .expect("test clock is past the grace");
+    for stamp in guard.1.values_mut() {
+        *stamp = aged;
+    }
+}
+
+fn emit_unattached_notice(id: &str, name: &str) {
+    tracing::warn!(
+        guardrail_id = %id,
+        guardrail_name = %name,
+        "guardrail is enabled but has no attachment, so it inspects no traffic; \
+         attach it to an environment, model, MCP server, API key, team or \
+         passthrough route to put it in force",
+    );
+}
+
+/// The presence timestamps for the next sweep: every enabled guardrail id,
+/// keeping the timestamp an id already had.
+///
+/// Attached rows are timestamped too, and that is the whole point — the
+/// stamp says "when this row appeared", which is what tells a guardrail
+/// whose attachment has not arrived yet from one whose attachment is gone.
+/// Stamping only the unattached ones collapses the two and makes a deleted
+/// attachment serve out a fresh grace, as if the rule were new.
+///
+/// Sorted before the cap so truncation keeps the same ids each sweep,
+/// rather than letting rows drift in and out and restart their clocks.
+fn presence_timestamps(
+    guardrails: &ResourceTable<DomainGuardrail>,
+    previous: &std::collections::HashMap<String, std::time::Instant>,
+    now: std::time::Instant,
+) -> std::collections::HashMap<String, std::time::Instant> {
+    let mut enabled: Vec<String> = guardrails
+        .entries()
+        .into_iter()
+        .filter(|e| e.value.enabled)
+        .map(|e| e.id.clone())
+        .collect();
+    enabled.sort();
+    enabled
+        .into_iter()
+        .take(MAX_REMEMBERED)
+        .map(|id| {
+            let since = previous.get(&id).copied().unwrap_or(now);
+            (id, since)
+        })
+        .collect()
+}
+
+/// Name the enabled guardrails that have been attached to nothing for longer
+/// than the grace. Called on a timer; see `UNATTACHED_GRACE`.
+///
+/// A TIMER, and not the index build it used to ride on, because the thing
+/// being reported does not coincide with a configuration change. A build
+/// happens only when the snapshot version moves, so a notice emitted from
+/// one can only ever be delivered by somebody writing something — and the
+/// two cases that matter most are exactly the ones where nobody does:
+///
+///   - a scope target is deleted, its attachment goes with it, and the rule
+///     that was screening traffic yesterday is now inert. The delete itself
+///     is one version change, and if the row is younger than the grace at
+///     that moment the notice is not yet due; the next build may be days
+///     away, or never.
+///   - a gateway restarts onto standing configuration. Nothing has changed,
+///     so nothing rebuilds, so nothing is said.
+///
+/// Riding the build also put the emit on the request path, where
+/// `LiveGuardrailIndex::current()` builds outside the lock and every request
+/// arriving during one rebuild runs its own — which is how the original
+/// "seen in two consecutive builds" rule managed to see two builds inside a
+/// single snapshot version.
+pub fn sweep_unattached_guardrails(
     guardrails: &ResourceTable<DomainGuardrail>,
     attachments: &ResourceTable<GuardrailAttachment>,
 ) {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
+    let mut guard = unattached_state();
+    let (warned, present_since) = &mut *guard;
 
-    const MAX_REMEMBERED: usize = 1024;
-    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    // Poison-tolerant: this set only dedupes log lines, so a panic while the
-    // lock was held must not wedge every later index build.
-    let mut warned = WARNED
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = std::time::Instant::now();
+    let unattached = unattached_ids(guardrails, attachments);
+    let next = presence_timestamps(guardrails, present_since, now);
 
-    for (id, name) in unattached_ids(guardrails, attachments) {
-        if warned.contains(&id) {
-            continue;
+    for (id, name) in unattached_to_report(&unattached, &next, warned, now) {
+        // Stop rather than emit-without-remembering. `next` caps what ONE
+        // sweep can stamp, but `warned` is the union across every sweep, so
+        // it grows with each generation of ids and nothing bounds it —
+        // ~4096 rows reported, deleted, replaced, reported again. Skipping
+        // only the insert would keep emitting and re-emit the same row on
+        // every sweep from then on, which is a log flood rather than the
+        // silence this cap promises.
+        if warned.len() >= MAX_REMEMBERED {
+            break;
         }
-        tracing::warn!(
-            guardrail_id = %id,
-            guardrail_name = %name,
-            "guardrail is enabled but has no attachment, so it inspects no traffic; \
-             attach it to an environment, model, MCP server, API key, team or \
-             passthrough route to put it in force",
-        );
-        if warned.len() < MAX_REMEMBERED {
-            warned.insert(id);
-        }
+        emit_unattached_notice(&id, &name);
+        warned.insert(id);
     }
+    // Rebuilt rather than merged, so a guardrail that left the snapshot
+    // drops out and one that comes back starts a fresh clock.
+    *present_since = next;
 }
 
 // ---------------------------------------------------------------------------
@@ -2182,6 +2341,308 @@ mod tests {
                 .is_block(),
             "env-scope enabled attachment must still fire",
         );
+    }
+
+    /// A guardrail and its attachment arrive as separate documents, so a build
+    /// falling between them holds the guardrail alone. Reporting there named a
+    /// correctly-attached guardrail as inspecting nothing — permanently, since
+    /// the notice is deduplicated per id for the process lifetime.
+    #[test]
+    fn the_unattached_notice_waits_out_the_grace() {
+        use std::collections::{HashMap, HashSet};
+        use std::time::{Duration, Instant};
+
+        let rows = vec![("g-1".to_string(), "one".to_string())];
+        let t0 = Instant::now();
+        let mut first_seen: HashMap<String, Instant> = HashMap::new();
+        let mut warned: HashSet<String> = HashSet::new();
+
+        assert!(
+            unattached_to_report(&rows, &first_seen, &warned, t0).is_empty(),
+            "an id with no recorded first sighting is inside its attachment's window",
+        );
+        first_seen.insert("g-1".to_string(), t0);
+
+        assert!(
+            unattached_to_report(&rows, &first_seen, &warned, t0 + UNATTACHED_GRACE / 2).is_empty(),
+            "half a grace in is still the window, however many builds have run",
+        );
+
+        let due = unattached_to_report(&rows, &first_seen, &warned, t0 + UNATTACHED_GRACE);
+        assert_eq!(
+            due.len(),
+            1,
+            "unattached for the whole grace is a standing property, not a race",
+        );
+        warned.insert("g-1".to_string());
+
+        assert!(
+            unattached_to_report(
+                &rows,
+                &first_seen,
+                &warned,
+                t0 + UNATTACHED_GRACE + Duration::from_secs(600),
+            )
+            .is_empty(),
+            "and it is said once, not on every rebuild after",
+        );
+    }
+
+    /// `warned` is the union across every sweep, not a per-sweep set, so
+    /// the cap on what one sweep can stamp does not bound it. Rows get
+    /// reported, deleted, and replaced by a new generation of ids, and the
+    /// set grows with each one — this asserted otherwise in a comment
+    /// before it was measured.
+    ///
+    /// The only test in this file that touches the process-global state;
+    /// nothing else drives `sweep_unattached_guardrails`, so it owns it.
+    #[test]
+    fn the_reported_set_stops_growing_at_the_cap() {
+        let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
+        for generation in 0..3 {
+            let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
+            for i in 0..MAX_REMEMBERED {
+                guardrails.insert(entry(
+                    "secrets",
+                    &format!("g-{generation}-{i}"),
+                    parse(
+                        r#"{
+                            "name": "inert",
+                            "kind": "keyword",
+                            "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                        }"#,
+                    ),
+                ));
+            }
+            // First sweep stamps the generation, the backdate ages it past
+            // the grace, the second reports it — the shape of a fleet that
+            // churns guardrails faster than the cap.
+            sweep_unattached_guardrails(&guardrails, &attachments);
+            backdate_unattached_stamps_for_test();
+            sweep_unattached_guardrails(&guardrails, &attachments);
+        }
+
+        let (warned, present_since) = unattached_state_for_test();
+        assert!(
+            warned <= MAX_REMEMBERED,
+            "the reported set grew to {warned}, past its {MAX_REMEMBERED} cap",
+        );
+        assert!(
+            present_since <= MAX_REMEMBERED,
+            "stamps grew to {present_since}"
+        );
+
+        // …and past the cap it goes SILENT, rather than emitting rows it
+        // cannot remember. Stopping and skipping-the-insert both keep the
+        // set at the cap, so the size assertion above cannot tell them
+        // apart — and the second one re-emits the same rows on every sweep
+        // for the life of the process, which is the louder failure.
+        crate::keep_callsites_enabled();
+        let _capture_guard = crate::TRACING_CAPTURE_LOCK.blocking_lock();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(CaptureWriter(buf.clone()))
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let overflow: ResourceTable<DomainGuardrail> = ResourceTable::default();
+            overflow.insert(entry(
+                "secrets",
+                "g-past-the-cap",
+                parse(
+                    r#"{
+                        "name": "past-the-cap",
+                        "kind": "keyword",
+                        "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                    }"#,
+                ),
+            ));
+            sweep_unattached_guardrails(&overflow, &attachments);
+            backdate_unattached_stamps_for_test();
+            sweep_unattached_guardrails(&overflow, &attachments);
+        }
+        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logged.contains("past-the-cap"),
+            "reported a row it could not remember; it will say the same thing \
+             again on every sweep from now on:\n{logged}",
+        );
+    }
+
+    /// Minimal `MakeWriter` for the capture above; the crate's other
+    /// capture helper is async and this test is not.
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The grace's VALUE, not just its arithmetic. Every other test here
+    /// expresses its instants as multiples of `UNATTACHED_GRACE`, so they
+    /// hold for any positive value — including one small enough to put the
+    /// original bug back, where a guardrail is named while the second of
+    /// its two documents is still in flight.
+    ///
+    /// Two lower bounds, both load-bearing rather than arbitrary. The
+    /// sweep is the only thing that can observe a row, so a grace shorter
+    /// than two sweep periods can be satisfied by the first two sweeps
+    /// after a guardrail appears — which is where its attachment still is.
+    /// And the absolute floor is about the writer, not the reader. The
+    /// guardrail and its attachment are not one write: the console creates
+    /// the guardrail, then reconciles its attachments in a second API call,
+    /// so the gap is a client round trip plus the outbox tick behind each —
+    /// and the grace has to outlast that by a wide margin on a loaded
+    /// control plane, not merely beat its median.
+    #[test]
+    fn the_grace_outlasts_two_sweeps_and_a_slow_two_document_write() {
+        assert!(
+            UNATTACHED_GRACE >= UNATTACHED_SWEEP_INTERVAL * 2,
+            "grace {UNATTACHED_GRACE:?} must span at least two sweeps of \
+             {UNATTACHED_SWEEP_INTERVAL:?}",
+        );
+        assert!(
+            UNATTACHED_GRACE >= std::time::Duration::from_secs(20),
+            "grace {UNATTACHED_GRACE:?} is too short to outlast a slow outbox drain",
+        );
+    }
+
+    /// The clock is kept for ATTACHED guardrails too. That is the whole of
+    /// what makes a deleted attachment reportable: without it the row is
+    /// "first seen" on the build its attachment goes, serves out a fresh
+    /// grace as if it were new, and — since a sweep only reports what has
+    /// outlived the grace — the moment that mattered is gone.
+    ///
+    /// Pinned here rather than only through the sweep, because stamping the
+    /// unattached rows alone leaves every other test in this file green.
+    #[test]
+    fn presence_is_timestamped_for_attached_rows_too() {
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        guardrails.insert(entry(
+            "secrets",
+            "g-attached",
+            parse(
+                r#"{
+                    "name": "block-secrets",
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+        let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
+        attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(
+                r#"{ "guardrail_id": "g-attached", "scope_type": "env", "priority": 100 }"#,
+            ),
+        ));
+        assert!(
+            unattached_ids(&guardrails, &attachments).is_empty(),
+            "fixture must be attached, or this test proves nothing",
+        );
+
+        let t0 = Instant::now();
+        let stamped = presence_timestamps(&guardrails, &HashMap::new(), t0);
+        assert_eq!(
+            stamped.get("g-attached"),
+            Some(&t0),
+            "an attached guardrail must carry a timestamp; without it, losing its \
+             attachment later reads as a brand-new row",
+        );
+
+        // …and the stamp survives, so age accumulates while it is attached.
+        let later = t0 + UNATTACHED_GRACE * 3;
+        let carried = presence_timestamps(&guardrails, &stamped, later);
+        assert_eq!(
+            carried.get("g-attached"),
+            Some(&t0),
+            "the clock must not restart on every sweep",
+        );
+
+        // Which is what makes the attachment's removal reportable at once.
+        let orphaned = vec![("g-attached".to_string(), "block-secrets".to_string())];
+        assert_eq!(
+            unattached_to_report(
+                &orphaned,
+                &carried,
+                &std::collections::HashSet::new(),
+                later,
+            )
+            .len(),
+            1,
+        );
+    }
+
+    /// A guardrail that has been around and just lost its attachment is due
+    /// at once. This is the one case the notice exists for — a scope target
+    /// was deleted and the rule is now inert — and timing from "first seen
+    /// UNATTACHED" instead of "first seen" would make it wait for a second
+    /// build, i.e. for an unrelated config write that may never come.
+    #[test]
+    fn losing_an_attachment_is_reported_on_the_next_build() {
+        use std::collections::{HashMap, HashSet};
+        use std::time::Instant;
+
+        let rows = vec![("g-1".to_string(), "one".to_string())];
+        let created = Instant::now();
+        let mut present_since: HashMap<String, Instant> = HashMap::new();
+        // Present, and attached, since well before the grace.
+        present_since.insert("g-1".to_string(), created);
+        let warned: HashSet<String> = HashSet::new();
+
+        let due = unattached_to_report(
+            &rows,
+            &present_since,
+            &warned,
+            created + UNATTACHED_GRACE * 2,
+        );
+        assert_eq!(
+            due.len(),
+            1,
+            "a row that has outlived the grace is due the build its attachment goes",
+        );
+    }
+
+    /// The clock has to be measured in time, not in builds. Two builds fit
+    /// between a guardrail and its attachment whenever anything else is being
+    /// written, so a consecutive-build rule reports a correctly-attached
+    /// guardrail under ordinary config churn — the very bug it was meant to
+    /// close, just harder to reproduce.
+    #[test]
+    fn many_builds_inside_the_grace_still_report_nothing() {
+        use std::collections::{HashMap, HashSet};
+        use std::time::Instant;
+
+        let rows = vec![("g-1".to_string(), "one".to_string())];
+        let t0 = Instant::now();
+        let mut first_seen: HashMap<String, Instant> = HashMap::new();
+        first_seen.insert("g-1".to_string(), t0);
+        let warned: HashSet<String> = HashSet::new();
+
+        for i in 1..=50 {
+            let now = t0 + (UNATTACHED_GRACE / 100) * i;
+            assert!(
+                unattached_to_report(&rows, &first_seen, &warned, now).is_empty(),
+                "build {i} is inside the grace and must stay quiet",
+            );
+        }
     }
 
     #[tokio::test]
