@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  etcdEndpoint,
   ProxyClient,
   SeedClient,
   spawnApp,
@@ -35,7 +36,7 @@ const execFileP = promisify(execFile);
 
 const BIN_PATH =
   process.env.AISIX_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "aisix");
-const ETCD_ENDPOINT = process.env.AISIX_E2E_ETCD ?? "http://127.0.0.1:2379";
+const ETCD_ENDPOINT = etcdEndpoint();
 
 const CALLER_PLAINTEXT = "sk-export-roundtrip-caller";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");

@@ -1,14 +1,45 @@
 import { harnessRequest } from "./http.js";
 
+const DEFAULT_ETCD = "http://127.0.0.1:2379";
+
+/**
+ * The etcd endpoint THIS vitest fork uses. Every etcd reference in the
+ * suite must come from here — the spawned gateway's config, the seeder,
+ * and any case that talks to etcd directly. A case that resolves the
+ * endpoint itself will read a different cluster than the gateway it just
+ * spawned the moment more than one is in play, and the failure looks
+ * like a propagation bug rather than a wiring one.
+ * (harness/etcd-endpoint.test.ts fails if a file resolves it itself.)
+ *
+ * With `AISIX_E2E_ETCD_ENDPOINTS` set to a comma-separated list, forks
+ * are spread across the entries by `VITEST_POOL_ID`. Concurrency in this
+ * suite was capped at two forks because 20+ files' gateways sharing one
+ * etcd pushed watch-dispatch latency past `waitConfigPropagation` (#157);
+ * one cluster per fork is what lifts that cap, the same way ports.ts
+ * carves a disjoint port range per fork rather than serialising.
+ *
+ * Correctness never depends on the split — every spawned gateway already
+ * gets a fresh random etcd prefix — so more forks than endpoints only
+ * costs the contention back, and a single endpoint behaves exactly as
+ * before.
+ */
+export function etcdEndpoint(): string {
+  const list = (process.env.AISIX_E2E_ETCD_ENDPOINTS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (list.length === 0) return process.env.AISIX_E2E_ETCD ?? DEFAULT_ETCD;
+  const poolId = Number(process.env.VITEST_POOL_ID);
+  const slot = Number.isFinite(poolId) && poolId >= 0 ? poolId : process.pid;
+  return list[slot % list.length];
+}
+
 /**
  * Minimal etcd v3 helper that talks to the JSON gRPC-gateway
  * (`/v3/kv/*` endpoints). Avoids pulling a heavy etcd npm dependency.
  */
 export class EtcdClient {
-  constructor(
-    private readonly endpoint: string = process.env.AISIX_E2E_ETCD ??
-      "http://127.0.0.1:2379",
-  ) {}
+  constructor(private readonly endpoint: string = etcdEndpoint()) {}
 
   /**
    * Best-effort connectivity probe — returns false if etcd isn't reachable.

@@ -259,12 +259,36 @@ jobs:
           - serving: work-stealing
             thread_per_core: "false"
     services:
+      # One etcd per vitest fork. The suite ran at maxForks=2 because
+      # 20+ files' gateways watching a SINGLE cluster pushed watch
+      # dispatch past `waitConfigPropagation` (#157); the fork count is
+      # derived from AISIX_E2E_ETCD_ENDPOINTS below, so adding a cluster
+      # here is what raises it — and removing one lowers it rather than
+      # doubling forks onto a shared cluster.
       etcd:
         image: quay.io/coreos/etcd:v3.5.15
         env:
           ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
           ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
         ports: ["2379:2379"]
+      etcd2:
+        image: quay.io/coreos/etcd:v3.5.15
+        env:
+          ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+          ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
+        ports: ["2380:2379"]
+      etcd3:
+        image: quay.io/coreos/etcd:v3.5.15
+        env:
+          ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+          ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
+        ports: ["2381:2379"]
+      etcd4:
+        image: quay.io/coreos/etcd:v3.5.15
+        env:
+          ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+          ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
+        ports: ["2382:2379"]
       redis:
         # redis:8 = vector-capable, so the semantic-cache redis e2e
         # exercises the real path against AISIX_E2E_REDIS.
@@ -324,6 +348,10 @@ jobs:
           # Vector-less redis for the semantic-cache degradation suite;
           # the main 6379 service is redis:8 (vector-capable).
           AISIX_E2E_REDIS_PLAIN: redis://127.0.0.1:6377
+          # One entry per etcd service above. vitest derives maxForks
+          # from this list (see tests/e2e/vitest.config.ts), and
+          # harness/etcd.ts hands each fork its own entry.
+          AISIX_E2E_ETCD_ENDPOINTS: http://127.0.0.1:2379,http://127.0.0.1:2380,http://127.0.0.1:2381,http://127.0.0.1:2382
         run: pnpm test
       - name: tag coverage by leg
         # The gate downloads every leg with `merge-multiple: true`, which

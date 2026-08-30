@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { stringify as yamlStringify } from "yaml";
 import { Agent, request } from "undici";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { EtcdClient, pickFreePorts, suiteThreadPerCore } from "../harness/index.js";
+import { EtcdClient, etcdEndpoint, pickFreePorts, suiteThreadPerCore } from "../harness/index.js";
 
 // E2E: `proxy.tls` / `admin.tls` actually serve HTTPS.
 //
@@ -68,7 +68,7 @@ describe("listener TLS (#473)", () => {
     const adminKey = `admin-${randomUUID()}`;
     const cfg = {
       etcd: {
-        endpoints: [process.env.AISIX_E2E_ETCD ?? "http://127.0.0.1:2379"],
+        endpoints: [etcdEndpoint()],
         prefix: `/aisix-e2e-tls-${randomUUID()}`,
         dial_timeout_ms: 5000,
         request_timeout_ms: 5000,
