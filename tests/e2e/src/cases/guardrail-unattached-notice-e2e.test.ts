@@ -160,9 +160,15 @@ describe("guardrail unattached notice", () => {
 
       await awaitInForce("un-settled-probe");
 
-      // One sweep must observe `un-raced` unattached before it is attached,
-      // or the window this case exists to open was never opened.
-      await sleep(SWEEP + 2_000);
+      // Hold `un-raced` unattached for a grace MINUS a sweep before
+      // attaching it. Two sweeps are then guaranteed to have seen it — the
+      // first lands within one period of its creation, the second one
+      // period after that, both before the attachment — so a grace short
+      // enough to be satisfied by two sweeps names it and this case fails.
+      // Derived from the grace, not from the sweep period: a window sized
+      // in sweeps measures the sweep, and the thing under test here is the
+      // grace.
+      await sleep(GRACE - SWEEP);
       await seed.attachGuardrailToEnv(raced.id);
       await awaitInForce("un-raced-probe");
 

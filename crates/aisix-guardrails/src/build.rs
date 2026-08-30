@@ -1183,6 +1183,28 @@ fn unattached_state() -> std::sync::MutexGuard<'static, UnattachedState> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Test-only view of the sweep's process-global state. The cap it exists to
+/// check is on the CUMULATIVE set, so nothing short of driving real sweeps
+/// across several generations of ids can see it.
+#[cfg(test)]
+fn unattached_state_for_test() -> (usize, usize) {
+    let guard = unattached_state();
+    (guard.0.len(), guard.1.len())
+}
+
+/// Test-only: backdate the presence stamps so a sweep sees rows that have
+/// already outlived the grace, instead of the test sleeping through it.
+#[cfg(test)]
+fn backdate_unattached_stamps_for_test() {
+    let mut guard = unattached_state();
+    let aged = std::time::Instant::now()
+        .checked_sub(UNATTACHED_GRACE * 2)
+        .expect("test clock is past the grace");
+    for stamp in guard.1.values_mut() {
+        *stamp = aged;
+    }
+}
+
 fn emit_unattached_notice(id: &str, name: &str) {
     tracing::warn!(
         guardrail_id = %id,
@@ -1260,10 +1282,17 @@ pub fn sweep_unattached_guardrails(
     let next = presence_timestamps(guardrails, present_since, now);
 
     for (id, name) in unattached_to_report(&unattached, &next, warned, now) {
+        // Stop rather than emit-without-remembering. `next` caps what ONE
+        // sweep can stamp, but `warned` is the union across every sweep, so
+        // it grows with each generation of ids and nothing bounds it —
+        // ~4096 rows reported, deleted, replaced, reported again. Skipping
+        // only the insert would keep emitting and re-emit the same row on
+        // every sweep from then on, which is a log flood rather than the
+        // silence this cap promises.
+        if warned.len() >= MAX_REMEMBERED {
+            break;
+        }
         emit_unattached_notice(&id, &name);
-        // Unconditional: `next` is already capped, so `warned` cannot grow
-        // past it. Skipping the insert once full would make the notice
-        // repeat on every sweep instead of degrading to silence.
         warned.insert(id);
     }
     // Rebuilt rather than merged, so a guardrail that left the snapshot
@@ -2355,6 +2384,78 @@ mod tests {
             )
             .is_empty(),
             "and it is said once, not on every rebuild after",
+        );
+    }
+
+    /// `warned` is the union across every sweep, not a per-sweep set, so
+    /// the cap on what one sweep can stamp does not bound it. Rows get
+    /// reported, deleted, and replaced by a new generation of ids, and the
+    /// set grows with each one — this asserted otherwise in a comment
+    /// before it was measured.
+    ///
+    /// The only test in this file that touches the process-global state;
+    /// nothing else drives `sweep_unattached_guardrails`, so it owns it.
+    #[test]
+    fn the_reported_set_stops_growing_at_the_cap() {
+        let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
+        for generation in 0..3 {
+            let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
+            for i in 0..MAX_REMEMBERED {
+                guardrails.insert(entry(
+                    "secrets",
+                    &format!("g-{generation}-{i}"),
+                    parse(
+                        r#"{
+                            "name": "inert",
+                            "kind": "keyword",
+                            "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                        }"#,
+                    ),
+                ));
+            }
+            // First sweep stamps the generation, the backdate ages it past
+            // the grace, the second reports it — the shape of a fleet that
+            // churns guardrails faster than the cap.
+            sweep_unattached_guardrails(&guardrails, &attachments);
+            backdate_unattached_stamps_for_test();
+            sweep_unattached_guardrails(&guardrails, &attachments);
+        }
+
+        let (warned, present_since) = unattached_state_for_test();
+        assert!(
+            warned <= MAX_REMEMBERED,
+            "the reported set grew to {warned}, past its {MAX_REMEMBERED} cap",
+        );
+        assert!(
+            present_since <= MAX_REMEMBERED,
+            "stamps grew to {present_since}"
+        );
+    }
+
+    /// The grace's VALUE, not just its arithmetic. Every other test here
+    /// expresses its instants as multiples of `UNATTACHED_GRACE`, so they
+    /// hold for any positive value — including one small enough to put the
+    /// original bug back, where a guardrail is named while the second of
+    /// its two documents is still in flight.
+    ///
+    /// Two lower bounds, both load-bearing rather than arbitrary. The
+    /// sweep is the only thing that can observe a row, so a grace shorter
+    /// than two sweep periods can be satisfied by the first two sweeps
+    /// after a guardrail appears — which is where its attachment still is.
+    /// And the absolute floor is about the writer, not the reader: the
+    /// control plane drains a guardrail and its attachment from one outbox
+    /// batch, so the grace has to outlast a slow drain of that batch by a
+    /// wide margin.
+    #[test]
+    fn the_grace_outlasts_two_sweeps_and_a_slow_two_document_write() {
+        assert!(
+            UNATTACHED_GRACE >= UNATTACHED_SWEEP_INTERVAL * 2,
+            "grace {UNATTACHED_GRACE:?} must span at least two sweeps of \
+             {UNATTACHED_SWEEP_INTERVAL:?}",
+        );
+        assert!(
+            UNATTACHED_GRACE >= std::time::Duration::from_secs(20),
+            "grace {UNATTACHED_GRACE:?} is too short to outlast a slow outbox drain",
         );
     }
 
