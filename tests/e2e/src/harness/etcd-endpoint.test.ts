@@ -32,9 +32,13 @@ describe("etcdEndpoint", () => {
   // outside that range and stays allowed.)
   it("is the only place the etcd endpoint is resolved", () => {
     const offenders = sourceFiles(srcDir).filter((file) => {
+      // Exactly two files may resolve an endpoint from the
+      // environment: forks.ts parses the list (everyone else asks it),
+      // and etcd.ts owns the single-endpoint fallback and the
+      // fork-to-cluster mapping. Anything else is the bug this catches.
       if (
+        file.endsWith(join("harness", "forks.ts")) ||
         file.endsWith(join("harness", "etcd.ts")) ||
-        file.endsWith(join("harness", "global-setup.ts")) ||
         file.endsWith(join("harness", "etcd-endpoint.test.ts"))
       ) {
         return false;

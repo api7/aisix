@@ -1,3 +1,4 @@
+import { configuredEtcdEndpoints } from "./forks.js";
 import { harnessRequest } from "./http.js";
 
 const DEFAULT_ETCD = "http://127.0.0.1:2379";
@@ -29,10 +30,7 @@ export function onCI(): boolean {
  * before.
  */
 export function etcdEndpoint(): string {
-  const list = (process.env.AISIX_E2E_ETCD_ENDPOINTS ?? "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const list = configuredEtcdEndpoints();
   if (list.length === 0) return process.env.AISIX_E2E_ETCD ?? DEFAULT_ETCD;
   const poolId = Number(process.env.VITEST_POOL_ID);
   const slot = Number.isFinite(poolId) && poolId >= 0 ? poolId : process.pid;

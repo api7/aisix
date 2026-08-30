@@ -1,4 +1,5 @@
 import { EtcdClient, etcdEndpoint, onCI } from "./etcd.js";
+import { configuredEtcdEndpoints, forkBudget } from "./forks.js";
 
 /**
  * Fail the run when a configured etcd cluster is not answering.
@@ -20,11 +21,34 @@ import { EtcdClient, etcdEndpoint, onCI } from "./etcd.js";
  *     configured, because that is the partial-loss shape. A developer
  *     with no etcd at all, or one, keeps the quiet skip.
  */
+/**
+ * Probe one endpoint, retrying before calling it dead.
+ *
+ * A generous single timeout buys nothing against the failure this
+ * actually guards: a container still opening its listener REFUSES the
+ * connection in a few milliseconds rather than hanging, so a 5s budget
+ * returns false just as fast as a 50ms one. Only a retry spans a cold
+ * start — and it has to, because a false negative here fails the whole
+ * merge-blocking e2e leg before a single test runs. ping() escalates the
+ * same way on CI for the same reason.
+ */
+async function reachableWithRetry(endpoint: string): Promise<boolean> {
+  const client = new EtcdClient(endpoint);
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    if (await client.reachable(2000)) return true;
+    if (attempt < 5) await new Promise((r) => setTimeout(r, 500 * attempt));
+  }
+  return false;
+}
+
 export async function setup(): Promise<void> {
-  const configured = (process.env.AISIX_E2E_ETCD_ENDPOINTS ?? "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+  // Only the endpoints this run will actually USE. forkBudget is capped
+  // by the core count too, so a 4-entry list on a 2-core runner drives
+  // two forks — and failing there because clusters 3 and 4 are missing
+  // would be a demand the run never makes. etcdEndpoint assigns
+  // `poolId % list.length`, so with fewer forks than entries the ones in
+  // use are the leading slice.
+  const configured = configuredEtcdEndpoints().slice(0, forkBudget());
   const endpoints = configured.length > 0 ? configured : [etcdEndpoint()];
 
   if (!onCI() && endpoints.length < 2) return;
@@ -34,11 +58,7 @@ export async function setup(): Promise<void> {
       endpoint,
       // `reachable`, not `ping`: ping throws on CI, and this needs to
       // name EVERY dead endpoint rather than stop at the first.
-      //
-      // 5s, not the client's 1s default: this runs before any fork, so
-      // a cold container that is still opening its listener must not be
-      // mistaken for a dead one.
-      up: await new EtcdClient(endpoint).reachable(5000),
+      up: await reachableWithRetry(endpoint),
     })),
   );
   const dead = probes.filter((p) => !p.up).map((p) => p.endpoint);

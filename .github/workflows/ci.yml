@@ -262,9 +262,13 @@ jobs:
       # One etcd per vitest fork. The suite ran at maxForks=2 because
       # 20+ files' gateways watching a SINGLE cluster pushed watch
       # dispatch past `waitConfigPropagation` (#157); the fork count is
-      # derived from AISIX_E2E_ETCD_ENDPOINTS below, so adding a cluster
-      # here is what raises it — and removing one lowers it rather than
-      # doubling forks onto a shared cluster.
+      # derived from AISIX_E2E_ETCD_ENDPOINTS below, so removing a
+      # cluster here lowers it rather than doubling forks onto a shared
+      # one. It does NOT work in the other direction: forkBudget is also
+      # capped by the core count, and ubuntu-latest has exactly four — a
+      # fifth service would add no forks and only a fifth thing that has
+      # to be up. Raising concurrency means a bigger runner AND another
+      # cluster, in that order.
       etcd:
         image: quay.io/coreos/etcd:v3.5.15
         env:
