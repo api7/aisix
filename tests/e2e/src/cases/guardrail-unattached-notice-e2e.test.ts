@@ -160,15 +160,19 @@ describe("guardrail unattached notice", () => {
 
       await awaitInForce("un-settled-probe");
 
-      // Hold `un-raced` unattached for a grace MINUS a sweep before
-      // attaching it. Two sweeps are then guaranteed to have seen it — the
-      // first lands within one period of its creation, the second one
-      // period after that, both before the attachment — so a grace short
-      // enough to be satisfied by two sweeps names it and this case fails.
-      // Derived from the grace, not from the sweep period: a window sized
-      // in sweeps measures the sweep, and the thing under test here is the
-      // grace.
-      await sleep(GRACE - SWEEP);
+      // Just over one sweep, so at least one lands with `un-raced` present
+      // and unattached — the window every ordinary creation passes through.
+      //
+      // Deliberately NOT sized from the grace. The row's clock starts at
+      // the first sweep after it is WRITTEN, which is before this sleep
+      // begins — the `awaitInForce` above sits in between, and the harness
+      // budgets up to 30s for guardrail propagation on a loaded runner. A
+      // window of `GRACE - SWEEP` would leave a correctly-attached
+      // guardrail unattached for that plus the propagation wait, and past
+      // the grace it gets named: a false red on the assertion below. The
+      // grace's lower bound is asserted directly in the unit tests, which
+      // is where a value can be checked without racing anything.
+      await sleep(SWEEP + 2_000);
       await seed.attachGuardrailToEnv(raced.id);
       await awaitInForce("un-raced-probe");
 

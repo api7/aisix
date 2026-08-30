@@ -2430,6 +2430,65 @@ mod tests {
             present_since <= MAX_REMEMBERED,
             "stamps grew to {present_since}"
         );
+
+        // …and past the cap it goes SILENT, rather than emitting rows it
+        // cannot remember. Stopping and skipping-the-insert both keep the
+        // set at the cap, so the size assertion above cannot tell them
+        // apart — and the second one re-emits the same rows on every sweep
+        // for the life of the process, which is the louder failure.
+        crate::keep_callsites_enabled();
+        let _capture_guard = crate::TRACING_CAPTURE_LOCK.blocking_lock();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(CaptureWriter(buf.clone()))
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let overflow: ResourceTable<DomainGuardrail> = ResourceTable::default();
+            overflow.insert(entry(
+                "secrets",
+                "g-past-the-cap",
+                parse(
+                    r#"{
+                        "name": "past-the-cap",
+                        "kind": "keyword",
+                        "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                    }"#,
+                ),
+            ));
+            sweep_unattached_guardrails(&overflow, &attachments);
+            backdate_unattached_stamps_for_test();
+            sweep_unattached_guardrails(&overflow, &attachments);
+        }
+        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logged.contains("past-the-cap"),
+            "reported a row it could not remember; it will say the same thing \
+             again on every sweep from now on:\n{logged}",
+        );
+    }
+
+    /// Minimal `MakeWriter` for the capture above; the crate's other
+    /// capture helper is async and this test is not.
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 
     /// The grace's VALUE, not just its arithmetic. Every other test here
@@ -2442,10 +2501,12 @@ mod tests {
     /// sweep is the only thing that can observe a row, so a grace shorter
     /// than two sweep periods can be satisfied by the first two sweeps
     /// after a guardrail appears — which is where its attachment still is.
-    /// And the absolute floor is about the writer, not the reader: the
-    /// control plane drains a guardrail and its attachment from one outbox
-    /// batch, so the grace has to outlast a slow drain of that batch by a
-    /// wide margin.
+    /// And the absolute floor is about the writer, not the reader. The
+    /// guardrail and its attachment are not one write: the console creates
+    /// the guardrail, then reconciles its attachments in a second API call,
+    /// so the gap is a client round trip plus the outbox tick behind each —
+    /// and the grace has to outlast that by a wide margin on a loaded
+    /// control plane, not merely beat its median.
     #[test]
     fn the_grace_outlasts_two_sweeps_and_a_slow_two_document_write() {
         assert!(
