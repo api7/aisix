@@ -1,4 +1,4 @@
-import { EtcdClient, etcdEndpoint, onCI } from "./etcd.js";
+import { EtcdClient, etcdEndpoint, etcdEndpointForPool, onCI } from "./etcd.js";
 import { configuredEtcdEndpoints, forkBudget } from "./forks.js";
 
 /**
@@ -44,11 +44,17 @@ async function reachableWithRetry(endpoint: string): Promise<boolean> {
 export async function setup(): Promise<void> {
   // Only the endpoints this run will actually USE. forkBudget is capped
   // by the core count too, so a 4-entry list on a 2-core runner drives
-  // two forks — and failing there because clusters 3 and 4 are missing
-  // would be a demand the run never makes. etcdEndpoint assigns
-  // `poolId % list.length`, so with fewer forks than entries the ones in
-  // use are the leading slice.
-  const configured = configuredEtcdEndpoints().slice(0, forkBudget());
+  // two forks, and failing there over clusters the run never touches
+  // would be a demand it does not make.
+  //
+  // Asking etcdEndpointForPool per pool id rather than slicing the list:
+  // VITEST_POOL_ID is ONE-based, so two forks over four entries use
+  // entries 1 and 2 — `slice(0, 2)` would have probed 0 and 1, clearing
+  // an unused cluster while leaving fork 2's unchecked.
+  const budget = forkBudget();
+  const inUse = new Set<string>();
+  for (let poolId = 1; poolId <= budget; poolId++) inUse.add(etcdEndpointForPool(poolId));
+  const configured = configuredEtcdEndpoints().filter((e) => inUse.has(e));
   const endpoints = configured.length > 0 ? configured : [etcdEndpoint()];
 
   if (!onCI() && endpoints.length < 2) return;

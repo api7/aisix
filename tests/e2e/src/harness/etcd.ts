@@ -30,11 +30,24 @@ export function onCI(): boolean {
  * before.
  */
 export function etcdEndpoint(): string {
+  const poolId = Number(process.env.VITEST_POOL_ID);
+  return etcdEndpointForPool(Number.isFinite(poolId) && poolId >= 0 ? poolId : process.pid);
+}
+
+/**
+ * The endpoint a given VITEST_POOL_ID maps to.
+ *
+ * Exported so the global setup can probe exactly the clusters the run
+ * will reach instead of re-deriving the mapping. Re-deriving is how the
+ * two drift: `VITEST_POOL_ID` is ONE-based, so a 4-entry list running 2
+ * forks uses entries 1 and 2 — not the first two — and a setup that
+ * probed `slice(0, 2)` would clear an endpoint nobody touches while
+ * leaving the one fork 2 depends on unchecked.
+ */
+export function etcdEndpointForPool(poolId: number): string {
   const list = configuredEtcdEndpoints();
   if (list.length === 0) return process.env.AISIX_E2E_ETCD ?? DEFAULT_ETCD;
-  const poolId = Number(process.env.VITEST_POOL_ID);
-  const slot = Number.isFinite(poolId) && poolId >= 0 ? poolId : process.pid;
-  return list[slot % list.length];
+  return list[poolId % list.length];
 }
 
 /**

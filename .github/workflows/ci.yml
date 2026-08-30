@@ -242,6 +242,11 @@ jobs:
     name: e2e (vitest, ${{ matrix.serving }}) + coverage
     needs: [build-bin]
     runs-on: ubuntu-latest
+    # Explicit, so the job's token stays read-only regardless of the
+    # repository-level default (currently `read`, but that is a setting).
+    # Mirrors the mcp-conformance job below.
+    permissions:
+      contents: read
     strategy:
       # The two serving modes are separate products of the same binary:
       # thread-per-core answers a request on the thread that accepted it

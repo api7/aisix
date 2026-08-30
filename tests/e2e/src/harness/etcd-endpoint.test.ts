@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-import { etcdEndpoint } from "./etcd.js";
+import { etcdEndpoint, etcdEndpointForPool } from "./etcd.js";
 
 const srcDir = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -84,6 +84,23 @@ describe("etcdEndpoint", () => {
         expect(seen.size).toBe(3);
       },
     );
+  });
+
+  // VITEST_POOL_ID is ONE-based, so "the endpoints N forks use" is NOT
+  // the first N entries. The global setup probes exactly the clusters
+  // the run will reach, and it has to derive them the same way this
+  // does — deriving them independently is how it came to clear an
+  // unused endpoint while leaving a used one unchecked.
+  it("maps one-based pool ids, so N forks are not the first N entries", () => {
+    withEnv({ AISIX_E2E_ETCD_ENDPOINTS: "http://a:2379,http://b:2379,http://c:2379,http://d:2379" }, () => {
+      expect([1, 2].map(etcdEndpointForPool)).toEqual(["http://b:2379", "http://c:2379"]);
+      expect([1, 2, 3, 4].map(etcdEndpointForPool)).toEqual([
+        "http://b:2379",
+        "http://c:2379",
+        "http://d:2379",
+        "http://a:2379",
+      ]);
+    });
   });
 
   it("falls back to the single-endpoint form when no list is set", () => {
