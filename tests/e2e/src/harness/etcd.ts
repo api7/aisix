@@ -93,16 +93,21 @@ export class EtcdClient {
    * endpoint rather than throw on the first.
    */
   async reachable(timeoutMs = 1000): Promise<boolean> {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), timeoutMs);
       const res = await harnessRequest(`${this.endpoint}/v3/maintenance/status`, {
         method: "POST",
         body: "{}",
         headers: { "content-type": "application/json" },
         signal: ctrl.signal,
       });
-      clearTimeout(t);
+      // The timer stays armed until the BODY is consumed, not just until
+      // the headers land. The 200 this method distrusts is exactly the
+      // kind that can come from something that is not etcd, and one that
+      // then never finishes its body would hang here forever with the
+      // abort disarmed — blocking the global setup that probes every
+      // endpoint at once, or a case file's beforeAll.
       if (res.statusCode !== 200) {
         await res.body.dump();
         return false;
@@ -116,6 +121,8 @@ export class EtcdClient {
       }
     } catch {
       return false;
+    } finally {
+      clearTimeout(t);
     }
   }
 

@@ -26,8 +26,8 @@ describe("etcdEndpoint", () => {
   // _ENDPOINTS list (`\b` does NOT separate them — `_` is a word
   // character — so a case doing `AISIX_E2E_ETCD_ENDPOINTS.split(",")[0]`
   // would pin fork 1's cluster and pass a narrower guard), and writing a
-  // literal in the 2379-2382 range CI publishes its clusters on, by
-  // either host spelling. (A deliberately dead endpoint like
+  // literal in the 2379-2382 range CI publishes its clusters on, in any
+  // of its three host spellings. (A deliberately dead endpoint like
   // 127.0.0.1:1, which several cases use to prove a failure path, is
   // outside that range and stays allowed.)
   it("is the only place the etcd endpoint is resolved", () => {
@@ -42,7 +42,7 @@ describe("etcdEndpoint", () => {
       const src = readFileSync(file, "utf8");
       return (
         /process\.env\.AISIX_E2E_ETCD/.test(src) ||
-        /(?:127\.0\.0\.1|localhost):23[78][0-9]/.test(src)
+        /(?:127\.0\.0\.1|localhost|\[::1\]):(?:2379|238[0-2])\b/.test(src)
       );
     });
     expect(offenders.map((f) => f.slice(srcDir.length + 1))).toEqual([]);
