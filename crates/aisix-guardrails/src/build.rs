@@ -1109,9 +1109,10 @@ pub fn unattached_guardrail_names(
 /// concurrently by every request that arrives during one rebuild, so two or
 /// more builds fit between the two writes — sometimes within a single
 /// version. Any "seen in the previous build" rule is therefore satisfied
-/// while the attachment is still in flight. Thirty seconds is two orders of
-/// magnitude above the gap the control plane leaves (it drains both rows
-/// from one outbox batch) and short enough to name a genuinely inert rule
+/// while the attachment is still in flight. Thirty seconds is far above the
+/// gap the control plane leaves — the two documents come from two separate
+/// API calls a client round trip apart, each with an outbox tick behind it,
+/// NOT from one batch — and short enough to name a genuinely inert rule
 /// early in a deployment.
 const UNATTACHED_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 

@@ -158,7 +158,14 @@ describe("guardrail unattached notice", () => {
       );
       const orphanedAttachment = await seed.attachGuardrailToEnv(orphaned.id);
 
-      await awaitInForce("un-settled-probe");
+      // Gate on the LAST guardrail written, not the first. etcd applies in
+      // revision order, so `un-orphaned` being in force implies every row
+      // above it is in the snapshot — including `un-raced`, which the
+      // window below is measured against. Gating on `un-settled` (the
+      // first write) would leave that implication to chance, and a
+      // `un-raced` arriving late turns the assertion on it into a silent
+      // no-op rather than a failure.
+      await awaitInForce("un-orphaned-probe");
 
       // Just over one sweep, so at least one lands with `un-raced` present
       // and unattached — the window every ordinary creation passes through.
