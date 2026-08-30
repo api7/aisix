@@ -1054,7 +1054,6 @@ pub fn build_index_from_snapshot(
         ));
     }
 
-    warn_unattached_guardrails(guardrails, attachments);
     GuardrailIndex::from_entries(entries)
 }
 
@@ -1115,6 +1114,11 @@ pub fn unattached_guardrail_names(
 /// from one outbox batch) and short enough to name a genuinely inert rule
 /// early in a deployment.
 const UNATTACHED_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often `sweep_unattached_guardrails` should be called. Exported so the
+/// interval and the grace stay legible together: a row is named between one
+/// and two sweeps after the grace expires.
+pub const UNATTACHED_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Which enabled-but-unattached guardrails this build should report, given
 /// when each guardrail id was first SEEN — attached or not — and what has
@@ -1189,68 +1193,22 @@ fn emit_unattached_notice(id: &str, name: &str) {
     );
 }
 
-/// Report the guardrails that are inert in the snapshot a process STARTED
-/// with, once the first full load has landed.
+/// The presence timestamps for the next sweep: every enabled guardrail id,
+/// keeping the timestamp an id already had.
 ///
-/// The build-time notice below cannot cover this. It fires from an index
-/// build, builds happen only when the snapshot version moves, and standing
-/// configuration moves nothing — so on a deployment nobody is editing, a
-/// restart would go quiet about rules that inspect no traffic until some
-/// unrelated write happened to trigger a rebuild.
+/// Attached rows are timestamped too, and that is the whole point — the
+/// stamp says "when this row appeared", which is what tells a guardrail
+/// whose attachment has not arrived yet from one whose attachment is gone.
+/// Stamping only the unattached ones collapses the two and makes a deleted
+/// attachment serve out a fresh grace, as if the rule were new.
 ///
-/// No grace applies here, and none is needed: a boot snapshot is assembled
-/// in one pass (`apply_resync` builds it from every entry at once, and the
-/// file loader does the same), so nothing is in flight and there is no race
-/// to wait out. Ids named here are recorded as said, so the first rebuild
-/// does not repeat them.
-pub fn report_unattached_guardrails_at_startup(
+/// Sorted before the cap so truncation keeps the same ids each sweep,
+/// rather than letting rows drift in and out and restart their clocks.
+fn presence_timestamps(
     guardrails: &ResourceTable<DomainGuardrail>,
-    attachments: &ResourceTable<GuardrailAttachment>,
-) {
-    let mut guard = unattached_state();
-    let (warned, present_since) = &mut *guard;
-    let now = std::time::Instant::now();
-    for (id, name) in unattached_ids(guardrails, attachments) {
-        if warned.contains(&id) {
-            continue;
-        }
-        emit_unattached_notice(&id, &name);
-        if warned.len() < MAX_REMEMBERED {
-            warned.insert(id.clone());
-        }
-        present_since.insert(id, now);
-    }
-}
-
-/// WARN once per guardrail id for the process lifetime: this row is enabled
-/// but nothing attaches it, so it inspects no traffic at all.
-///
-/// The state is legitimate — a scope target can be deleted, and a rule with no
-/// scope left is correctly inert — but it is invisible otherwise: the guardrail
-/// is in the snapshot, `/status/config` counts it as loaded, and no request
-/// ever mentions it.
-///
-/// Deduped per id rather than logged per build, for the reason
-/// AISIX-Cloud#1435 documents: the index is rebuilt on every snapshot version
-/// change, and this describes a STANDING property of a row, not an event.
-fn warn_unattached_guardrails(
-    guardrails: &ResourceTable<DomainGuardrail>,
-    attachments: &ResourceTable<GuardrailAttachment>,
-) {
-    use std::collections::HashMap;
-    use std::time::Instant;
-
-    let mut guard = unattached_state();
-    let (warned, present_since) = &mut *guard;
-
-    let now = Instant::now();
-    let unattached = unattached_ids(guardrails, attachments);
-
-    // Every enabled guardrail, not just the unattached ones: the timestamp
-    // is "when this row appeared", which is what tells a new guardrail
-    // (attachment still in flight) apart from an old one that just lost its
-    // attachment. Sorted, so the cap truncates the same ids every build
-    // rather than making rows drift in and out and restart their clocks.
+    previous: &std::collections::HashMap<String, std::time::Instant>,
+    now: std::time::Instant,
+) -> std::collections::HashMap<String, std::time::Instant> {
     let mut enabled: Vec<String> = guardrails
         .entries()
         .into_iter()
@@ -1258,20 +1216,55 @@ fn warn_unattached_guardrails(
         .map(|e| e.id.clone())
         .collect();
     enabled.sort();
-    let next: HashMap<String, Instant> = enabled
+    enabled
         .into_iter()
         .take(MAX_REMEMBERED)
         .map(|id| {
-            let since = present_since.get(&id).copied().unwrap_or(now);
+            let since = previous.get(&id).copied().unwrap_or(now);
             (id, since)
         })
-        .collect();
+        .collect()
+}
+
+/// Name the enabled guardrails that have been attached to nothing for longer
+/// than the grace. Called on a timer; see `UNATTACHED_GRACE`.
+///
+/// A TIMER, and not the index build it used to ride on, because the thing
+/// being reported does not coincide with a configuration change. A build
+/// happens only when the snapshot version moves, so a notice emitted from
+/// one can only ever be delivered by somebody writing something — and the
+/// two cases that matter most are exactly the ones where nobody does:
+///
+///   - a scope target is deleted, its attachment goes with it, and the rule
+///     that was screening traffic yesterday is now inert. The delete itself
+///     is one version change, and if the row is younger than the grace at
+///     that moment the notice is not yet due; the next build may be days
+///     away, or never.
+///   - a gateway restarts onto standing configuration. Nothing has changed,
+///     so nothing rebuilds, so nothing is said.
+///
+/// Riding the build also put the emit on the request path, where
+/// `LiveGuardrailIndex::current()` builds outside the lock and every request
+/// arriving during one rebuild runs its own — which is how the original
+/// "seen in two consecutive builds" rule managed to see two builds inside a
+/// single snapshot version.
+pub fn sweep_unattached_guardrails(
+    guardrails: &ResourceTable<DomainGuardrail>,
+    attachments: &ResourceTable<GuardrailAttachment>,
+) {
+    let mut guard = unattached_state();
+    let (warned, present_since) = &mut *guard;
+
+    let now = std::time::Instant::now();
+    let unattached = unattached_ids(guardrails, attachments);
+    let next = presence_timestamps(guardrails, present_since, now);
 
     for (id, name) in unattached_to_report(&unattached, &next, warned, now) {
         emit_unattached_notice(&id, &name);
-        if warned.len() < MAX_REMEMBERED {
-            warned.insert(id);
-        }
+        // Unconditional: `next` is already capped, so `warned` cannot grow
+        // past it. Skipping the insert once full would make the notice
+        // repeat on every sweep instead of degrading to silence.
+        warned.insert(id);
     }
     // Rebuilt rather than merged, so a guardrail that left the snapshot
     // drops out and one that comes back starts a fresh clock.
@@ -2362,6 +2355,75 @@ mod tests {
             )
             .is_empty(),
             "and it is said once, not on every rebuild after",
+        );
+    }
+
+    /// The clock is kept for ATTACHED guardrails too. That is the whole of
+    /// what makes a deleted attachment reportable: without it the row is
+    /// "first seen" on the build its attachment goes, serves out a fresh
+    /// grace as if it were new, and — since a sweep only reports what has
+    /// outlived the grace — the moment that mattered is gone.
+    ///
+    /// Pinned here rather than only through the sweep, because stamping the
+    /// unattached rows alone leaves every other test in this file green.
+    #[test]
+    fn presence_is_timestamped_for_attached_rows_too() {
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        guardrails.insert(entry(
+            "secrets",
+            "g-attached",
+            parse(
+                r#"{
+                    "name": "block-secrets",
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+        let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
+        attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(
+                r#"{ "guardrail_id": "g-attached", "scope_type": "env", "priority": 100 }"#,
+            ),
+        ));
+        assert!(
+            unattached_ids(&guardrails, &attachments).is_empty(),
+            "fixture must be attached, or this test proves nothing",
+        );
+
+        let t0 = Instant::now();
+        let stamped = presence_timestamps(&guardrails, &HashMap::new(), t0);
+        assert_eq!(
+            stamped.get("g-attached"),
+            Some(&t0),
+            "an attached guardrail must carry a timestamp; without it, losing its \
+             attachment later reads as a brand-new row",
+        );
+
+        // …and the stamp survives, so age accumulates while it is attached.
+        let later = t0 + UNATTACHED_GRACE * 3;
+        let carried = presence_timestamps(&guardrails, &stamped, later);
+        assert_eq!(
+            carried.get("g-attached"),
+            Some(&t0),
+            "the clock must not restart on every sweep",
+        );
+
+        // Which is what makes the attachment's removal reportable at once.
+        let orphaned = vec![("g-attached".to_string(), "block-secrets".to_string())];
+        assert_eq!(
+            unattached_to_report(
+                &orphaned,
+                &carried,
+                &std::collections::HashSet::new(),
+                later,
+            )
+            .len(),
+            1,
         );
     }
 

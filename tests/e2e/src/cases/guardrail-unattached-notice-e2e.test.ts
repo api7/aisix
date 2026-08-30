@@ -4,31 +4,41 @@ import {
   EtcdClient,
   ProxyClient,
   SeedClient,
-  scrapeMetrics,
   spawnApp,
   startOpenAiUpstream,
-  sumMetric,
   waitConfigPropagation,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
 
 // E2E for the notice a gateway logs about an enabled guardrail that
-// nothing attaches. The interesting property is WHEN it must stay quiet.
+// nothing attaches.
 //
-// A guardrail and its attachment are separate documents arriving as
-// separate writes, so every ordinary creation has an index build where the
-// gateway holds the guardrail and not yet its attachment. Warning there
-// named correctly-attached guardrails as inspecting nothing, permanently —
-// the notice is deduplicated per id for the life of the process, so the
-// false alarm never ages out. Nothing in the unit tests could see it: they
-// build the index once, and the race needs two builds with a write between.
+// The gateway sweeps for these on a timer rather than reporting from an
+// index build, and this file exists because both halves of that are easy
+// to get wrong in ways nothing else catches.
 //
-// Both halves are asserted here because either alone is satisfiable the
-// wrong way: silence proves nothing if the notice never fires at all, and
-// firing proves nothing if it fires on everything.
+// It must stay QUIET on a guardrail that is correctly attached. The
+// guardrail and its attachment are separate documents arriving as separate
+// writes, so there is always a window where the gateway holds one and not
+// the other; naming a row there is a log line saying a security control
+// inspects no traffic, about one that does — and, deduplicated per id for
+// the life of the process, it never ages out.
+//
+// It must SPEAK on a guardrail that really is attached to nothing, and the
+// case that matters is not the one that is easy to test: a scope target
+// deleted out from under a rule that was screening traffic yesterday.
+// Nobody writes anything afterwards, so a notice that rides a config change
+// is never delivered.
+//
+// The timings below are the gateway's own (`UNATTACHED_GRACE`,
+// `UNATTACHED_SWEEP_INTERVAL`). They are wall time, which is why this file
+// is slow; the arithmetic of the grace itself is unit-tested with an
+// injected clock.
 
 const MODEL = "un-model";
+const GRACE = 30_000;
+const SWEEP = 10_000;
 const CALLER_PLAINTEXT = "sk-unattached-notice-caller";
 const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
@@ -36,8 +46,15 @@ const CALLER_KEY_HASH = createHash("sha256")
 
 const NOTICE = /guardrail is enabled but has no attachment/;
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Matches the `guardrail_name` field exactly, not as a substring: with
+// names like `un-inert` and `un-orphaned` in the same file, a substring
+// test silently counts one row's notice against another and the assertion
+// that a guardrail was named ONCE quietly reads two.
 function noticesFor(output: string, name: string): number {
-  return output.split("\n").filter((l) => NOTICE.test(l) && l.includes(name))
+  const named = new RegExp(`guardrail_name=${name}(\\s|$)`);
+  return output.split("\n").filter((l) => NOTICE.test(l) && named.test(l))
     .length;
 }
 
@@ -47,7 +64,6 @@ describe("guardrail unattached notice", () => {
   let seed: SeedClient | undefined;
   let proxy: ProxyClient | undefined;
   let etcdReachable = false;
-  let churn = 0;
 
   async function chat(content: string): Promise<number> {
     return (
@@ -55,45 +71,13 @@ describe("guardrail unattached notice", () => {
     ).status;
   }
 
-  async function appliedRevision(): Promise<number> {
-    return sumMetric(
-      await scrapeMetrics(app!.metricsUrl),
-      "aisix_config_applied_revision",
-    );
-  }
-
-  // rebuildIndex forces exactly one guardrail-index build.
-  //
-  // It takes BOTH a write and a request, and neither alone will do: the
-  // index is keyed on the snapshot version, so requests without a write
-  // reuse the cached index, and a write without a request builds nothing —
-  // the rebuild is lazy, deferred to the first request after the version
-  // moves. A loop missing either half observes no builds at all and passes
-  // while asserting nothing.
-  //
-  // The write is gated on the gateway having APPLIED it rather than on a
-  // fixed delay, because that is the event a build hangs off: a request
-  // sent while the snapshot is still at the old revision reuses the cached
-  // index, so the round silently builds nothing and the loop does fewer
-  // builds than it reads as having done.
-  async function rebuildIndex(): Promise<void> {
-    const before = await appliedRevision();
-    await seed!.createProviderKey({
-      display_name: `un-churn-pk-${churn++}`,
-      secret: "sk-mock",
-      api_base: `${upstream!.baseUrl}/v1`,
-    });
-    await waitConfigPropagation(async () => (await appliedRevision()) > before);
-    await chat("harmless");
-  }
-
-  // awaitInForce gates on the guardrail actually screening traffic — its
-  // own pattern coming back blocked. The notice assertions are all
+  // awaitInForce gates on a guardrail actually screening traffic — its own
+  // pattern coming back blocked. Every assertion about the notice is
   // negative, so without a positive gate they pass just as well on a
   // guardrail that never reached the snapshot. Blocking is a different
   // surface from the log line under test, and `chat` returns a status
-  // rather than throwing, so a real transport failure still surfaces as
-  // itself rather than as this timeout.
+  // rather than throwing, so a transport failure still surfaces as itself
+  // rather than as this timeout.
   async function awaitInForce(probe: string): Promise<void> {
     await waitConfigPropagation(async () => (await chat(probe)) === 422);
   }
@@ -135,97 +119,86 @@ describe("guardrail unattached notice", () => {
     await upstream?.close();
   });
 
-  test("an attached guardrail is never reported, however the two writes interleave", async (ctx) => {
-    if (!etcdReachable || !seed || !app || !proxy) {
-      ctx.skip();
-      return;
-    }
-
-    // The ordinary creation shape first: guardrail and env attachment
-    // written back to back, then traffic.
-    const settled = "un-attached-guard";
-    await seed.createGuardrail({
-      name: settled,
-      enabled: true,
-      hook_point: "input",
-      kind: "keyword",
-      patterns: [{ kind: "literal", value: "un-attached-probe" }],
-    });
-    await awaitInForce("un-attached-probe");
-    for (let i = 0; i < 3; i++) await rebuildIndex();
-    expect(noticesFor(app.output(), settled)).toBe(0);
-
-    // …then the window the notice actually fired in, opened deliberately.
-    // The two documents are separate writes, so a request landing between
-    // them builds an index holding the guardrail alone — routine under live
-    // traffic, and never reached by a test that writes both back to back.
-    const raced = "un-raced-guard";
-    const g = await seed.createGuardrail(
-      {
-        name: raced,
-        enabled: true,
-        hook_point: "input",
-        kind: "keyword",
-        patterns: [{ kind: "literal", value: "un-raced-probe" }],
-      },
-      { attach: false },
-    );
-    await rebuildIndex();
-    await seed.attachGuardrailToEnv(g.id);
-    await awaitInForce("un-raced-probe");
-    for (let i = 0; i < 3; i++) await rebuildIndex();
-
-    // Nothing, and nothing later either: the notice is deduplicated per id
-    // for the life of the process, so one report here could never be
-    // withdrawn once the attachment landed.
-    expect(noticesFor(app.output(), raced)).toBe(0);
-  });
-
-  test("a guardrail nothing attaches is reported at startup, once", async (ctx) => {
-    if (!etcdReachable || !seed || !app || !proxy) {
-      ctx.skip();
-      return;
-    }
-    const name = "un-orphan-guard";
-    await seed.createGuardrail(
-      {
+  test(
+    "named only when attached to nothing, and then exactly once",
+    async (ctx) => {
+      if (!etcdReachable || !seed || !app || !proxy) {
+        ctx.skip();
+        return;
+      }
+      const guard = (name: string, probe: string) => ({
         name,
         enabled: true,
         hook_point: "input",
         kind: "keyword",
-        patterns: [{ kind: "literal", value: "un-orphan-probe" }],
-      },
-      { attach: false },
-    );
+        patterns: [{ kind: "literal", value: probe }],
+      });
 
-    // Asserted through a fresh process on the same configuration rather
-    // than by waiting out the grace on the running one. Two reasons: it is
-    // seconds instead of half a minute, and it covers the half the grace
-    // cannot — a gateway that RESTARTS onto standing configuration. The
-    // notice fires from an index build, builds happen only when the
-    // snapshot version moves, and configuration nobody is editing moves
-    // nothing, so without the startup report a restarted gateway would say
-    // nothing about a rule that inspects no traffic until some unrelated
-    // write happened to come along.
-    //
-    // The grace's own arithmetic is covered by the unit tests, which can
-    // inject `now` instead of sleeping.
-    const restarted = await spawnApp({ etcdPrefix: app.etcdPrefix });
-    try {
-      await waitConfigPropagation(
-        async () => noticesFor(restarted.output(), name) > 0,
+      // ORDINARY: guardrail and env attachment written back to back.
+      await seed.createGuardrail(guard("un-settled", "un-settled-probe"));
+      // INERT: attached to nothing, ever. The one row that must be named.
+      await seed.createGuardrail(guard("un-inert", "un-inert-probe"), {
+        attach: false,
+      });
+      // RACED: written alone now, attached after a sweep has already seen
+      // it unattached — the window every ordinary creation passes through
+      // under live traffic, held open deliberately here.
+      const raced = await seed.createGuardrail(guard("un-raced", "un-raced-probe"), {
+        attach: false,
+      });
+      // ORPHANED-LATER: attached now, its attachment removed after the
+      // grace. A scope target deleted out from under a rule that has been
+      // screening traffic — the case the notice exists for.
+      // `attach: false` plus one explicit attachment, so there is exactly
+      // one row to remove later — the default would add a second and the
+      // guardrail would still be attached after the delete.
+      const orphaned = await seed.createGuardrail(
+        guard("un-orphaned", "un-orphaned-probe"),
+        { attach: false },
       );
-      // Once, not once per rebuild: it is a standing property of the row.
-      const seenOnce = noticesFor(restarted.output(), name);
-      expect(seenOnce).toBe(1);
+      const orphanedAttachment = await seed.attachGuardrailToEnv(orphaned.id);
 
-      // And the guardrails that ARE attached are not swept up in it — the
-      // startup report has no grace, so if it were reading the snapshot
-      // wrongly this is where it would show.
-      expect(noticesFor(restarted.output(), "un-attached-guard")).toBe(0);
-      expect(noticesFor(restarted.output(), "un-raced-guard")).toBe(0);
-    } finally {
-      await restarted.exit();
-    }
-  });
+      await awaitInForce("un-settled-probe");
+
+      // One sweep must observe `un-raced` unattached before it is attached,
+      // or the window this case exists to open was never opened.
+      await sleep(SWEEP + 2_000);
+      await seed.attachGuardrailToEnv(raced.id);
+      await awaitInForce("un-raced-probe");
+
+      // Past the grace, plus a sweep to act on it.
+      await sleep(GRACE + SWEEP);
+      const out = () => app!.output();
+      expect(noticesFor(out(), "un-inert")).toBe(1);
+      expect(noticesFor(out(), "un-settled")).toBe(0);
+      expect(noticesFor(out(), "un-raced")).toBe(0);
+      expect(noticesFor(out(), "un-orphaned")).toBe(0);
+
+      // Now take the attachment away. `un-orphaned` has been present since
+      // well before the grace, so it is due on the next sweep — it does NOT
+      // serve out a fresh one as if it were a new row.
+      await seed.delete("guardrail_attachments", orphanedAttachment.id);
+      // Gate on the rule actually going inert before waiting on the log, so
+      // a delete that never landed fails as itself rather than as a silent
+      // sweep.
+      await waitConfigPropagation(async () => (await chat("un-orphaned-probe")) === 200);
+      // Two sweeps, not more: the row is already older than the grace, so
+      // the very next one is due. A window wide enough to also cover a
+      // fresh grace would pass on an implementation that restarts the
+      // clock when the attachment goes — which is the whole bug.
+      await waitConfigPropagation(
+        async () => noticesFor(out(), "un-orphaned") > 0,
+        SWEEP * 2,
+      );
+      expect(noticesFor(out(), "un-orphaned")).toBe(1);
+
+      // Said once, not once per sweep, and the others still silent.
+      await sleep(SWEEP * 2);
+      expect(noticesFor(out(), "un-orphaned")).toBe(1);
+      expect(noticesFor(out(), "un-inert")).toBe(1);
+      expect(noticesFor(out(), "un-settled")).toBe(0);
+      expect(noticesFor(out(), "un-raced")).toBe(0);
+    },
+    3 * (GRACE + SWEEP * 3),
+  );
 });

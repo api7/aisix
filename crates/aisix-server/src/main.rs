@@ -1017,33 +1017,41 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         heartbeat::spawn(h, cancel_rx.clone())
     });
 
-    // Say what the process STARTED with that inspects no traffic, once the
-    // first full load has landed.
+    // Name the guardrails that are attached to nothing, on a timer.
     //
-    // The runtime notice inside the guardrail index cannot cover this: it
-    // fires from an index build, builds happen only when the snapshot
-    // version moves, and standing configuration moves nothing. Without this
-    // a restart would go quiet about rules attached to nothing until some
-    // unrelated write happened to trigger a rebuild — on a deployment
-    // nobody is editing, never.
+    // On a timer rather than from the index build, because the thing being
+    // reported does not coincide with a configuration change. A build
+    // happens only when the snapshot version moves, so a notice emitted
+    // from one is delivered only if somebody writes something — and the two
+    // cases that matter most are the ones where nobody does: a scope target
+    // deleted out from under a rule that was screening traffic yesterday,
+    // and a gateway restarted onto standing configuration.
     //
-    // Bounded rather than waiting forever: if the source never becomes
-    // ready the proxy has louder problems than this line, and `/readyz`
-    // already reports them.
+    // Nor is it gated on a readiness flag. `ConfigStatus::is_ready` means
+    // "a load has been applied", which `Supervisor::restore_from_cache`
+    // satisfies before the watch task has reached etcd at all — a one-shot
+    // report behind that gate reads the CACHED generation and never looks
+    // again, so it goes quiet exactly when the cache is the stale thing
+    // (someone changed an attachment while this gateway was down), and can
+    // just as easily name a guardrail that is attached in live etcd. A
+    // sweep that keeps running converges either way.
     {
-        let startup_snapshot = snapshot_handle.clone();
-        let startup_status = config_status.clone();
+        let sweep_snapshot = snapshot_handle.clone();
+        let mut sweep_cancel = cancel_rx.clone();
         tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-            while !startup_status.is_ready() && tokio::time::Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            if startup_status.is_ready() {
-                let snap = startup_snapshot.load();
-                aisix_guardrails::report_unattached_guardrails_at_startup(
-                    &snap.guardrails,
-                    &snap.guardrail_attachments,
-                );
+            let mut ticker = tokio::time::interval(aisix_guardrails::UNATTACHED_SWEEP_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let snap = sweep_snapshot.load();
+                        aisix_guardrails::sweep_unattached_guardrails(
+                            &snap.guardrails,
+                            &snap.guardrail_attachments,
+                        );
+                    }
+                    _ = sweep_cancel.changed() => break,
+                }
             }
         });
     }
