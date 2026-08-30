@@ -1,4 +1,4 @@
-import { EtcdClient, etcdEndpoint } from "./etcd.js";
+import { EtcdClient, etcdEndpoint, onCI } from "./etcd.js";
 
 /**
  * Fail the run when a configured etcd cluster is not answering.
@@ -27,16 +27,18 @@ export async function setup(): Promise<void> {
     .filter(Boolean);
   const endpoints = configured.length > 0 ? configured : [etcdEndpoint()];
 
-  const onCI = process.env.CI !== undefined && process.env.CI !== "";
-  if (!onCI && endpoints.length < 2) return;
+  if (!onCI() && endpoints.length < 2) return;
 
   const probes = await Promise.all(
     endpoints.map(async (endpoint) => ({
       endpoint,
+      // `reachable`, not `ping`: ping throws on CI, and this needs to
+      // name EVERY dead endpoint rather than stop at the first.
+      //
       // 5s, not the client's 1s default: this runs before any fork, so
       // a cold container that is still opening its listener must not be
       // mistaken for a dead one.
-      up: await new EtcdClient(endpoint).ping(5000),
+      up: await new EtcdClient(endpoint).reachable(5000),
     })),
   );
   const dead = probes.filter((p) => !p.up).map((p) => p.endpoint);

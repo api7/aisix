@@ -235,7 +235,8 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   if (!fileMode && !(await etcd.ping())) {
     throw new Error(
       `etcd not reachable at ${etcdEndpoint()} ` +
-        "(set AISIX_E2E_ETCD or run `docker run --rm -p 2379:2379 quay.io/coreos/etcd:v3.5.15`)",
+        "(set AISIX_E2E_ETCD_ENDPOINTS — which takes precedence — or AISIX_E2E_ETCD, " +
+          "or run `docker run --rm -p 2379:2379 quay.io/coreos/etcd:v3.5.15`)",
     );
   }
 

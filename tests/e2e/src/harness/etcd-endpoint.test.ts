@@ -22,20 +22,28 @@ describe("etcdEndpoint", () => {
   // spawned talks to fork N's, and the symptom is a config-propagation
   // timeout that looks like a product bug.
   //
-  // Both spellings count: reading AISIX_E2E_ETCD, and writing a literal
-  // in the 2379-2382 range CI publishes its clusters on. (A deliberately
-  // dead endpoint like 127.0.0.1:1, which several cases use to prove a
-  // failure path, is outside that range and stays allowed.)
+  // Three spellings count: reading AISIX_E2E_ETCD, reading the
+  // _ENDPOINTS list (`\b` does NOT separate them — `_` is a word
+  // character — so a case doing `AISIX_E2E_ETCD_ENDPOINTS.split(",")[0]`
+  // would pin fork 1's cluster and pass a narrower guard), and writing a
+  // literal in the 2379-2382 range CI publishes its clusters on, by
+  // either host spelling. (A deliberately dead endpoint like
+  // 127.0.0.1:1, which several cases use to prove a failure path, is
+  // outside that range and stays allowed.)
   it("is the only place the etcd endpoint is resolved", () => {
     const offenders = sourceFiles(srcDir).filter((file) => {
       if (
         file.endsWith(join("harness", "etcd.ts")) ||
+        file.endsWith(join("harness", "global-setup.ts")) ||
         file.endsWith(join("harness", "etcd-endpoint.test.ts"))
       ) {
         return false;
       }
       const src = readFileSync(file, "utf8");
-      return /process\.env\.AISIX_E2E_ETCD\b/.test(src) || /127\.0\.0\.1:23[78][0-9]/.test(src);
+      return (
+        /process\.env\.AISIX_E2E_ETCD/.test(src) ||
+        /(?:127\.0\.0\.1|localhost):23[78][0-9]/.test(src)
+      );
     });
     expect(offenders.map((f) => f.slice(srcDir.length + 1))).toEqual([]);
   });

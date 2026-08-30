@@ -2,6 +2,11 @@ import { harnessRequest } from "./http.js";
 
 const DEFAULT_ETCD = "http://127.0.0.1:2379";
 
+/** True inside GitHub Actions (or anything else setting CI). */
+export function onCI(): boolean {
+  return process.env.CI !== undefined && process.env.CI !== "";
+}
+
 /**
  * The etcd endpoint THIS vitest fork uses. Every etcd reference in the
  * suite must come from here — the spawned gateway's config, the seeder,
@@ -42,14 +47,52 @@ export class EtcdClient {
   constructor(private readonly endpoint: string = etcdEndpoint()) {}
 
   /**
-   * Best-effort connectivity probe — returns false if etcd isn't reachable.
+   * Connectivity probe. Returns false when etcd isn't reachable — but
+   * THROWS instead when running on CI.
+   *
+   * ~246 call sites read this as `if (!(await etcd.ping())) return;` or
+   * `ctx.skip()`, which is right for a developer without etcd running
+   * and wrong for CI, where a skipped file is a coverage hole that
+   * still reports green. That mattered less when one dead cluster took
+   * the whole suite down at once; with a cluster per fork it costs only
+   * the files bound to that fork, so the run stays green while a
+   * quarter of it silently evaporates. `file-resource-source-e2e`
+   * already carried this rule for itself; it belongs here, once, for
+   * everyone.
+   *
+   * Retries before concluding "down", and only on CI: a 1s one-shot
+   * against a contended container is a coin flip under fork
+   * concurrency, and a false negative now reds the build rather than
+   * quietly dropping a file. Locally the single probe keeps the skip
+   * fast — retrying 226 files' worth of beforeAll hooks would not be.
+   */
+  async ping(timeoutMs = 1000): Promise<boolean> {
+    const attempts = onCI() ? 3 : 1;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      if (await this.reachable(timeoutMs * attempt)) return true;
+    }
+    if (onCI()) {
+      throw new Error(
+        `etcd not reachable at ${this.endpoint} after ${attempts} attempts. ` +
+          "On CI this fails the run instead of skipping the test, because a " +
+          "skipped file contributes no assertions and the leg still reports green.",
+      );
+    }
+    return false;
+  }
+
+  /**
+   * The raw probe: true when the endpoint answers as etcd.
    *
    * Beyond a 200 status we also confirm the response is JSON containing the
    * expected `header.cluster_id` field. A stray Docker port-mapping or a
    * dev-tool's "service unavailable" HTML page can return 200 to anything
    * on port 2379 and we don't want to misidentify those as etcd.
+   *
+   * Used directly by the global setup, which needs to report EVERY dead
+   * endpoint rather than throw on the first.
    */
-  async ping(timeoutMs = 1000): Promise<boolean> {
+  async reachable(timeoutMs = 1000): Promise<boolean> {
     try {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), timeoutMs);

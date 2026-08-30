@@ -1,5 +1,7 @@
 import { defineConfig } from "vitest/config";
 
+import { availableParallelism } from "node:os";
+
 import { RANGE_SLOTS } from "./src/harness/ports.js";
 
 /**
@@ -14,14 +16,21 @@ import { RANGE_SLOTS } from "./src/harness/ports.js";
  * Ceiling RANGE_SLOTS — ports.ts hands fork `poolId % RANGE_SLOTS` its
  * own port range, so beyond that two forks collide on a range and the
  * AddrInUse flake that module exists to prevent comes back.
+ *
+ * Also ceilinged by the core count. Each fork drives a real `aisix`
+ * process, and several cases assert wall-clock bounds derived on a
+ * loaded runner (audio-timeout, ttft-first-frame,
+ * per-attempt-telemetry) — handing out more forks than cores would eat
+ * their margin whatever the endpoint list says.
  */
 function forkBudget(): number {
+  const ceiling = Math.min(RANGE_SLOTS, Math.max(2, availableParallelism()));
   const override = Number(process.env.AISIX_E2E_MAX_FORKS);
-  if (Number.isInteger(override) && override >= 1) return Math.min(override, RANGE_SLOTS);
+  if (Number.isInteger(override) && override >= 1) return Math.min(override, ceiling);
   const endpoints = (process.env.AISIX_E2E_ETCD_ENDPOINTS ?? "")
     .split(",")
     .filter((s) => s.trim() !== "").length;
-  return Math.min(Math.max(2, endpoints), RANGE_SLOTS);
+  return Math.min(Math.max(2, endpoints), ceiling);
 }
 
 export default defineConfig({
