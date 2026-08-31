@@ -101,6 +101,15 @@ pub struct CallerIdentity {
     pub api_key_name: Option<String>,
     pub team_id: Option<String>,
     pub user_id: Option<String>,
+    /// Display name of the member `user_id` names, for the `user_name`
+    /// metric label (AISIX-Cloud#1455). Resolved here so it always comes
+    /// off the same ApiKey row as `user_id`, from the one place a request
+    /// reads its caller.
+    ///
+    /// NOT a header-template variable: `HeaderTemplateVars` names the
+    /// four `request.api_key.*` keys it exposes explicitly, and this is
+    /// not one of them.
+    pub user_name: Option<String>,
 }
 
 impl CallerIdentity {
@@ -111,6 +120,7 @@ impl CallerIdentity {
             api_key_name: entry.value.display_name.clone(),
             team_id: entry.value.team_id.clone(),
             user_id: entry.value.user_id.clone(),
+            user_name: entry.value.user_name.clone(),
         }
     }
 }

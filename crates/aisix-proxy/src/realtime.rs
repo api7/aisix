@@ -853,6 +853,7 @@ async fn run_session(
         &mut event,
         auth.jwt.as_ref(),
         auth.key().user_id.as_deref(),
+        auth.key().user_name.as_deref(),
     );
     let usage_model =
         crate::usage_attr::usage_event_model_label(&snap, &event.requested_model).into_owned();

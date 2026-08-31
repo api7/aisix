@@ -407,13 +407,23 @@ pub(crate) fn apply_pk_telemetry(event: &mut UsageEvent, pk: &ResolvedPk<'_>) {
 /// the key the token resolved to — a JWT request runs AS a key, so one
 /// argument covers both and the member filter sees every credential a
 /// member calls through.
+///
+/// `user_name` is that member's display name for the metric label of the
+/// same name (AISIX-Cloud#1455). It is a separate argument rather than a
+/// separate call so the compiler makes every emitting path hand over both
+/// halves of one ApiKey row: a name sourced anywhere but beside its id is
+/// a name that will eventually label the wrong member.
 pub(crate) fn apply_caller_identity(
     event: &mut UsageEvent,
     jwt: Option<&std::sync::Arc<crate::auth::JwtIdentity>>,
     user_id: Option<&str>,
+    user_name: Option<&str>,
 ) {
     if let Some(user_id) = user_id {
         event.user_id = sanitize_tag(user_id.to_string());
+    }
+    if let Some(user_name) = user_name {
+        event.user_name = sanitize_tag(user_name.to_string());
     }
     let Some(jwt) = jwt else {
         return;
@@ -531,6 +541,7 @@ pub(crate) fn build_error_usage_event(
         &mut event,
         client.jwt.as_ref(),
         client.caller.user_id.as_deref(),
+        client.caller.user_name.as_deref(),
     );
     event
 }
@@ -575,10 +586,11 @@ pub(crate) fn usage_event_labels<'a>(
             labels.id()
         },
         provider_key_name: labels.name(),
-        // Overwritten by `UsageSink::try_emit` from the event's own
-        // `user_id` (AISIX-Cloud#1389) — one place, so no handler in this
-        // family can build a label set that disagrees with the row.
+        // Both overwritten by `UsageSink::try_emit` from the event's own
+        // member pair (AISIX-Cloud#1389, #1455) — one place, so no handler
+        // in this family can build a label set that disagrees with the row.
         user_id: "unknown",
+        user_name: "unknown",
         // Same `PkLabels` the request families read (AISIX-Cloud#1403), so
         // `aisix_usage_events_emitted_total` joins with them on
         // `upstream_protocol` instead of dropping out of the aggregation.

@@ -4280,6 +4280,7 @@ fn record_budget_gauges(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
         user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
+        user_name: auth.key().user_name.as_deref().unwrap_or("unknown"),
     };
     if let Some(budget) = budget {
         metrics.set_budget_gauges(
@@ -4413,6 +4414,7 @@ fn emit_usage_event(
         &mut event,
         client.jwt.as_ref(),
         client.caller.user_id.as_deref(),
+        client.caller.user_name.as_deref(),
     );
     // Guardrail outcome counters (#379). Recorded here — the one place every
     // chat path (success / error / streaming / cache-hit) funnels through —

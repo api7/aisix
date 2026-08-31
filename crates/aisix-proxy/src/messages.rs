@@ -3000,6 +3000,7 @@ fn emit_anthropic_usage_event(
         &mut event,
         client.jwt.as_ref(),
         client.caller.user_id.as_deref(),
+        client.caller.user_name.as_deref(),
     );
     let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
     // The metric code below still reads `event`, so the chokepoint gets

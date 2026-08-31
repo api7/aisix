@@ -486,6 +486,7 @@ async fn check_budget(state: &ProxyState, auth: &AuthenticatedKey) -> Result<(),
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
         user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
+        user_name: auth.key().user_name.as_deref().unwrap_or("unknown"),
     };
     if let Some(budget) = decision.budget.as_ref() {
         state.metrics.set_budget_gauges(

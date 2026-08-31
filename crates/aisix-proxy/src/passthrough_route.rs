@@ -796,6 +796,7 @@ async fn dispatch(
         request_id: client.request_id.clone(),
         api_key_id: auth.entry.id.clone(),
         user_id: auth.entry.value.user_id.clone(),
+        user_name: auth.entry.value.user_name.clone(),
         jwt: auth.jwt.clone(),
         anonymous: auth.anonymous,
         client_identity,
@@ -1968,10 +1969,13 @@ struct RouteTelemetry {
     path: String,
     request_id: String,
     api_key_id: String,
-    /// Org member the authenticating key belongs to (AISIX-Cloud#1389).
-    /// `None` for a key bound to no member — including the anonymous
-    /// route key, which belongs to the route rather than to a person.
+    /// Org member the authenticating key belongs to (AISIX-Cloud#1389),
+    /// and that member's display name for the `user_name` metric label
+    /// (AISIX-Cloud#1455). Both `None` for a key bound to no member —
+    /// including the anonymous route key, which belongs to the route
+    /// rather than to a person.
     user_id: Option<String>,
+    user_name: Option<String>,
     jwt: Option<Arc<crate::auth::JwtIdentity>>,
     /// Whether the caller reached this route through `auth_mode:
     /// anonymous` rather than a credential of its own. Stamped onto the
@@ -2142,6 +2146,7 @@ impl RouteTelemetry {
             &mut event,
             self.jwt.as_ref(),
             self.user_id.as_deref(),
+            self.user_name.as_deref(),
         );
         if self.anonymous {
             event.auth_type = "anonymous".to_string();

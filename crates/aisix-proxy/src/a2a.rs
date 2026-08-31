@@ -893,6 +893,7 @@ fn emit_a2a_usage(
         &mut event,
         auth.jwt.as_ref(),
         auth.key().user_id.as_deref(),
+        auth.key().user_name.as_deref(),
     );
     // The client-perceived duration of the call. Nothing else records it for
     // `/a2a`: the handler returns the moment a stream's response head is out,
