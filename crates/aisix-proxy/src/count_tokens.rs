@@ -543,15 +543,17 @@ async fn dispatch(
     if !any_anthropic {
         return Err(ProxyError::InvalidRequest(format!(
             "model `{model_name}` is not backed by an Anthropic-protocol upstream; \
-             /v1/messages/count_tokens requires a model whose provider key uses \
-             the anthropic adapter"
+             /v1/messages/count_tokens requires a provider key that either uses \
+             the anthropic adapter or declares `apis.messages`"
         )));
     }
     Err(last_err.unwrap_or(ProxyError::ProviderUnavailable))
 }
 
-/// Dispatch one concrete Anthropic target's count_tokens passthrough to
-/// `{api_base}/v1/messages/count_tokens`. The caller has already confirmed
+/// Dispatch one concrete target's count_tokens passthrough. The route is
+/// a sub-route of `/v1/messages` and rides the same declaration, so it
+/// resolves against that surface's own base when the Provider Key names
+/// one and against `api_base` otherwise. The caller has already confirmed
 /// the target speaks the Anthropic protocol (`dispatch::speaks_anthropic`).
 #[allow(clippy::too_many_arguments)]
 async fn count_tokens_to_target(
@@ -602,10 +604,16 @@ async fn count_tokens_to_target(
     let url = aisix_gateway::url_cache::cached_endpoint_url(
         &pk_entry.id,
         "proxy/messages/count_tokens",
-        // Every resolve_base_url input (#1017) via the shared constructor.
-        &crate::dispatch::pk_url_fingerprint(&pk_entry.value),
+        // Every resolve_base_url_for input (#1017) via the shared constructor.
+        &crate::dispatch::pk_surface_url_fingerprint(
+            &pk_entry.value,
+            aisix_core::ApiSurface::Messages,
+        ),
         || {
-            let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
+            let base = crate::dispatch::resolve_base_url_for(
+                &pk_entry.value,
+                aisix_core::ApiSurface::Messages,
+            )?;
             Ok::<_, crate::error::ProxyError>(crate::dispatch::build_anthropic_url(
                 &base,
                 "/messages/count_tokens",
@@ -730,8 +738,17 @@ async fn count_tokens_to_target(
 
     Ok(CountTokensSuccess {
         response: resp,
-        // The loop above only ever dispatches Anthropic targets.
-        provider: "anthropic".to_string(),
+        // The target model's own vendor id, as every other endpoint
+        // labels it. This used to read "anthropic" on the grounds that
+        // the loop only dispatches Anthropic targets — true of the wire,
+        // never of the vendor: a `byo` + `adapter: anthropic` key already
+        // reported `byo` on /v1/chat/completions, and a Provider Key that
+        // declares `apis.messages` brings any vendor down this path.
+        provider: model
+            .provider
+            .as_deref()
+            .unwrap_or("unknown")
+            .to_ascii_lowercase(),
         upstream_model,
         provider_key_id: pk_entry.id.to_string(),
         model_id: model_id.to_string(),

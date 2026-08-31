@@ -110,7 +110,35 @@ fn normalize_api_base(base: &str) -> String {
     trimmed.to_string()
 }
 
+/// The `apis.messages` base this key declares, or `""`. Feeds the URL
+/// cache fingerprint so editing the entry rebuilds the cached URL, the
+/// same way editing `api_base` does.
+fn declared_messages_base(ctx: &BridgeContext) -> &str {
+    ctx.provider_key
+        .apis
+        .as_ref()
+        .and_then(|apis| apis.messages.as_ref())
+        .and_then(|entry| entry.base.as_deref())
+        .unwrap_or("")
+}
+
 fn resolve_base(ctx: &BridgeContext) -> Result<String, BridgeError> {
+    // A Provider Key that declares `apis.messages` names where the
+    // Anthropic wire lives on this upstream, which is where this bridge
+    // dispatches — so the declaration has to reach here too, or the
+    // `/v1/messages` passthrough and the translated path would send the
+    // same upstream route to two different hosts.
+    if let Some(base) = ctx
+        .provider_key
+        .apis
+        .as_ref()
+        .and_then(|apis| apis.messages.as_ref())
+        .and_then(|entry| entry.base.as_deref())
+        .map(str::trim)
+        .filter(|base| !base.is_empty())
+    {
+        return Ok(normalize_api_base(base));
+    }
     match ctx.provider_key.api_base.as_deref() {
         Some(b) if !b.trim().is_empty() => Ok(normalize_api_base(b.trim())),
         _ => {
@@ -287,6 +315,7 @@ impl Bridge for AnthropicBridge {
             &ctx.provider_key_id,
             "anthropic/messages",
             &[
+                declared_messages_base(ctx),
                 ctx.provider_key.api_base.as_deref().unwrap_or(""),
                 &ctx.provider_key.provider,
             ],
@@ -339,6 +368,7 @@ impl Bridge for AnthropicBridge {
             &ctx.provider_key_id,
             "anthropic/messages",
             &[
+                declared_messages_base(ctx),
                 ctx.provider_key.api_base.as_deref().unwrap_or(""),
                 &ctx.provider_key.provider,
             ],

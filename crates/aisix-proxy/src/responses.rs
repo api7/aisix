@@ -645,10 +645,10 @@ async fn dispatch(
         Some(crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?);
 
     // Resolve the attempt list (routing-aware). A Model Group walks its
-    // targets in order; a direct model resolves to itself (#471). OpenAI
-    // targets take the verbatim Responses passthrough; every other provider
-    // is bridged through ChatFormat (#825), so a group can mix and fail over
-    // across both kinds.
+    // targets in order; a direct model resolves to itself (#471). Those
+    // targets whose Provider Key serves `/v1/responses` natively take the
+    // verbatim passthrough; every other target is bridged through ChatFormat
+    // (#825), so a group can mix and fail over across both kinds.
     let attempt_models = crate::routing::resolve_attempt_models(
         &state.routing,
         &state.runtime_status,
@@ -782,7 +782,11 @@ async fn dispatch(
                     continue 'targets;
                 }
             };
-            let result = if target.model.provider.as_deref() == Some("openai") {
+            let result = if crate::dispatch::serves_natively(
+                snapshot,
+                &target.model,
+                aisix_core::ApiSurface::Responses,
+            ) {
                 responses_to_target(
                     state,
                     snapshot,
@@ -1029,9 +1033,11 @@ fn responses_value_text(v: &Value) -> String {
     }
 }
 
-/// Dispatch one concrete OpenAI target's Responses-API passthrough to
-/// `{api_base}/v1/responses`. The caller has already confirmed
-/// `model.provider == openai`.
+/// Dispatch one concrete target's Responses-API passthrough. The caller
+/// has already confirmed the target serves `/v1/responses` natively
+/// ([`crate::dispatch::serves_natively`]) — which its vendor id implies
+/// only for OpenAI itself, and which any vendor can declare — so the
+/// URL is resolved per surface rather than from `api_base` alone.
 #[allow(clippy::too_many_arguments)]
 async fn responses_to_target(
     state: &ProxyState,
@@ -1119,10 +1125,16 @@ async fn responses_to_target(
     let url = aisix_gateway::url_cache::cached_endpoint_url(
         &pk_entry.id,
         "proxy/responses",
-        // Every resolve_base_url input (#1017) via the shared constructor.
-        &crate::dispatch::pk_url_fingerprint(&pk_entry.value),
+        // Every resolve_base_url_for input (#1017) via the shared constructor.
+        &crate::dispatch::pk_surface_url_fingerprint(
+            &pk_entry.value,
+            aisix_core::ApiSurface::Responses,
+        ),
         || {
-            let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
+            let base = crate::dispatch::resolve_base_url_for(
+                &pk_entry.value,
+                aisix_core::ApiSurface::Responses,
+            )?;
             Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
                 &base,
                 "/responses",
@@ -1224,7 +1236,19 @@ async fn responses_to_target(
     state.health.record_success(&model.display_name);
     state.runtime_status.mark_healthy(model_id);
 
-    let provider_label = "openai".to_string();
+    // The target model's own vendor id, exactly as the bridged path and
+    // every other endpoint label it. A literal was correct while this
+    // path was reachable only from `provider == "openai"`; now that a key
+    // declares which surfaces it serves, a `deepseek` (or `byo`) model
+    // can take the verbatim passthrough too, and hard-coding "openai"
+    // would split its metric series across two provider labels. The
+    // billed amount is unaffected — that comes from the cost inlined on
+    // the model document, not from this label.
+    let provider_label = model
+        .provider
+        .as_deref()
+        .unwrap_or("unknown")
+        .to_ascii_lowercase();
 
     if is_stream {
         let headers = upstream_resp.headers().clone();

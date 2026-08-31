@@ -57,6 +57,27 @@ pub struct ProviderKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<Adapter>,
 
+    /// API surfaces this upstream serves natively, beyond the one its
+    /// `adapter` already implies, and the base URL each one lives at.
+    ///
+    /// One upstream account often exposes more than one protocol, on
+    /// different paths of the same host — an OpenAI-compatible
+    /// `/v1/chat/completions` under `…/v1` and an Anthropic-compatible
+    /// `/v1/messages` under `…/anthropic`, both authenticated by the same
+    /// credential. `api_base` can only name one of them, so without this
+    /// field every request the declared path cannot serve gets translated
+    /// instead — losing whatever the target protocol carries that the
+    /// canonical chat shape does not (prompt-cache breakpoints, thinking
+    /// blocks). Declaring the second entry here lets each inbound protocol
+    /// reach its own native path under the one credential.
+    ///
+    /// Each surface resolves on its own terms; see [`ProviderApis`].
+    /// Surfaces this map has no key for — embeddings, audio, images,
+    /// videos, files/batches/fine-tuning, rerank — always use `api_base`,
+    /// exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apis: Option<ProviderApis>,
+
     /// Telemetry tags carried alongside the key for metric and log emission.
     #[serde(default)]
     pub telemetry_tags: TelemetryTags,
@@ -84,6 +105,86 @@ pub struct ProviderKey {
     /// Filled in by the snapshot loader from the etcd key path.
     #[serde(skip)]
     pub(crate) runtime_id: String,
+}
+
+/// The API surfaces a Provider Key can declare in [`ProviderKey::apis`].
+///
+/// Only surfaces whose native path the gateway can choose *instead of*
+/// translating belong here — declaring one is a statement about which of
+/// the two it takes. `/v1/chat/completions` is deliberately absent: every
+/// path reaches it through a provider bridge at `api_base`, so there is
+/// no choice to declare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ApiSurface {
+    /// OpenAI-wire `/v1/responses`.
+    Responses,
+    /// Anthropic-wire `/v1/messages`, and its `/count_tokens` sub-route.
+    Messages,
+}
+
+/// Per-surface native entry points on one upstream.
+///
+/// The two surfaces resolve differently, because the evidence for them
+/// differs:
+///
+/// - `messages` is **additive**. An `adapter: anthropic` key (or the
+///   `anthropic` vendor) speaks that wire by declaration and keeps serving
+///   `/v1/messages` natively whatever this map says; listing it here adds
+///   the route to a key whose adapter is something else. That is the
+///   DeepSeek/Zhipu shape — an OpenAI-compatible key whose vendor also
+///   fronts an Anthropic-compatible path. An entry's own `base` always
+///   decides WHERE the Anthropic wire lives, for the verbatim
+///   passthrough and for the bridge that translates into it alike;
+///   without one it is `api_base`.
+/// - `responses` is **authoritative**. Once this map exists, `/v1/responses`
+///   is served natively only if it is listed. The Responses API is a strict
+///   superset of chat completions rather than a rename, so an
+///   OpenAI-compatible endpoint serving one does not necessarily serve the
+///   other, and `adapter: openai` is not evidence either way. Leaving it
+///   out is how an operator says "this endpoint has no `/v1/responses`" and
+///   gets the request translated to chat completions instead of 404'd
+///   upstream.
+///
+/// With no map at all, each falls back to what the gateway inferred
+/// before this field existed: `/v1/messages` from the vendor id or the
+/// `anthropic` adapter, `/v1/responses` from the vendor id alone.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+pub struct ProviderApis {
+    /// OpenAI-wire `/v1/responses`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses: Option<ApiEndpoint>,
+
+    /// Anthropic-wire `/v1/messages` (and `/v1/messages/count_tokens`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages: Option<ApiEndpoint>,
+}
+
+impl ProviderApis {
+    /// The declared entry for `surface`, if any.
+    pub fn get(&self, surface: ApiSurface) -> Option<&ApiEndpoint> {
+        match surface {
+            ApiSurface::Responses => self.responses.as_ref(),
+            ApiSurface::Messages => self.messages.as_ref(),
+        }
+    }
+}
+
+/// One declared entry point.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+pub struct ApiEndpoint {
+    /// Base URL this surface is served at. Omit when it is the same one
+    /// `api_base` names — an entry with no `base` still carries the
+    /// declaration that the surface exists.
+    ///
+    /// Deliberately NOT length-constrained, matching `api_base`. The
+    /// lenient read schema keeps every constraint but the open-object
+    /// one, so a `minLength` here would make an empty string skip the
+    /// whole Provider Key row — and with it every model that references
+    /// the key — where the same empty string on `api_base` is the
+    /// control plane's documented way to clear an override. An empty
+    /// value is treated as "no override" at resolution time instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 /// TLS settings for connections to one Provider Key's `api_base`.
@@ -543,6 +644,7 @@ mod tests {
             api_base: None,
             provider: String::new(),
             adapter: None,
+            apis: None,
             telemetry_tags: TelemetryTags::default(),
             request: None,
             response: None,
