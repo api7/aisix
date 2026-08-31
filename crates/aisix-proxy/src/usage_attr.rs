@@ -423,7 +423,17 @@ pub(crate) fn apply_caller_identity(
         event.user_id = sanitize_tag(user_id.to_string());
     }
     if let Some(user_name) = user_name {
-        event.user_name = sanitize_tag(user_name.to_string());
+        // NOT `sanitize_tag`, unlike the id above. That call exists to keep
+        // operator-typed text safe on the cp-api wire and in the log line;
+        // `user_name` reaches neither (`#[serde(skip)]`, and
+        // `log_provider_call` does not render it). Its only destination is
+        // the `user_name` metric label, which the four #890 families
+        // already stamp raw off the same ApiKey row — sanitising this one
+        // copy would make a long or odd name read differently on
+        // `aisix_usage_event*` than on `aisix_llm_*`, and break the
+        // cross-family join on the pair for exactly that member. The
+        // prometheus exporter escapes exposition characters itself.
+        event.user_name = user_name.to_string();
     }
     let Some(jwt) = jwt else {
         return;

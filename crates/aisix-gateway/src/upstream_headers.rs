@@ -106,9 +106,9 @@ pub struct CallerIdentity {
     /// off the same ApiKey row as `user_id`, from the one place a request
     /// reads its caller.
     ///
-    /// NOT a header-template variable: `HeaderTemplateVars` names the
-    /// four `request.api_key.*` keys it exposes explicitly, and this is
-    /// not one of them.
+    /// NOT a header-template variable: `HEADER_TEMPLATE_VARS` lists the
+    /// four `request.api_key.*` keys, and `HeaderVars::resolve` matches
+    /// them one by one — this is not among them.
     pub user_name: Option<String>,
 }
 

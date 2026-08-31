@@ -2727,10 +2727,12 @@ pub struct UsageEventLabels<'a> {
     /// Readable display name of the member `user_id` names
     /// (AISIX-Cloud#1455). One series per (id, name) pair rather than per
     /// name: the two are read off one ApiKey row, so at any instant the
-    /// name is determined by the id and the label costs nothing. A rename
-    /// that reaches the row splits the counter into a before and an after
-    /// series, exactly as a ProviderKey rename already does to
-    /// `provider_key_name`.
+    /// name is determined by the id and the label costs nothing. The name
+    /// is a SNAPSHOT of the row, not a live read: cp-api stamps it when it
+    /// projects the ApiKey, and nothing reprojects a key just because its
+    /// member was renamed — so a rename shows up here only once that key is
+    /// next written for some other reason, and splits the counter into a
+    /// before and an after series when it does.
     ///
     /// Filled from the event beside `user_id` in `UsageSink::try_emit`
     /// rather than by each handler's label builder, so the two cannot
@@ -2825,8 +2827,9 @@ pub struct BudgetLabels<'a> {
     /// alone. `unknown` whenever `user_id` is.
     ///
     /// These are GAUGES, and this recorder registers no idle timeout, so
-    /// a label set that stops being written stays at its last value: a
-    /// rename that reaches the ApiKey row leaves the pre-rename sample
+    /// a label set that stops being written stays at its last value: if a
+    /// rename ever does reach the ApiKey row (see [`UsageEventLabels`] —
+    /// it takes a later write of that key), the pre-rename sample stays
     /// behind, and a `sum` that does not group by the member counts both.
     /// That is true of every label on this family that can change under a
     /// fixed `api_key_id`: rebinding a key's team or owner strands its
