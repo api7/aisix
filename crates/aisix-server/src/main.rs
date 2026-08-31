@@ -310,21 +310,28 @@ fn run_validate(resources: &Path) -> anyhow::Result<()> {
 /// no longer current (see `Metrics::retire_stale_gauges`). Two rules keep
 /// it from retiring live data:
 ///
-/// - A placeholder is never retired. `"unknown"` is what these label
-///   builders emit when a resource could not be resolved, so it names
-///   nothing to look up — and retiring it would fight the emitter, which
-///   goes on writing that same placeholder every health tick.
-/// - Absence has to be POSITIVE. Only a resolvable label whose resource is
-///   gone counts as dead; anything this cannot decide stays live, because a
-///   wrongly retired series hides real state.
+/// Absence has to be POSITIVE: only a label this can resolve, and whose
+/// resource is genuinely gone, counts as dead. Anything undecidable stays
+/// live, because a wrongly retired gauge hides real state — a worse outcome
+/// than the stale sample retirement exists to clean up.
 ///
-/// The budget family additionally compares the whole member triple rather
-/// than just the key's existence: rebinding a key to another team or member
-/// starts a NEW series and strands the old one under the same
-/// `api_key_id`, which is the case a bare existence check misses.
+/// Both families are therefore judged on `api_key_id` alone, which is the
+/// one label here that is an id the snapshot can be asked about:
+///
+/// - The budget family additionally compares the whole member triple. A
+///   bare existence check would call BOTH label sets live after a rebind or
+///   a rename and leave the pre-change sample frozen under the same
+///   `api_key_id`, which is the case it exists to catch. The triple is read
+///   off the same api-key row the emitter reads, so the comparison is exact.
+/// - The rate-limit family's `model` label is deliberately NOT checked. It
+///   is the model string the CALLER sent (`chat.rs` passes `req.model`
+///   through), not a resolved name, so a wildcard-served deployment emits a
+///   concrete name that `models.get_by_name` cannot find. Retiring on that
+///   would blank a live series every sweep and let the next request write it
+///   again — a gauge flapping between its real value and `NaN`. Losing the
+///   key is the trigger that matters and the one that is decidable.
 fn gauge_series_is_live(snap: &AisixSnapshot, series: aisix_obs::LiveGaugeSeries<'_>) -> bool {
     const UNKNOWN: &str = "unknown";
-    let model_alive = |name: &str| name == UNKNOWN || snap.models.get_by_name(name).is_some();
     match series {
         aisix_obs::LiveGaugeSeries::Budget {
             api_key_id,
@@ -340,17 +347,8 @@ fn gauge_series_is_live(snap: &AisixSnapshot, series: aisix_obs::LiveGaugeSeries
                 && key.user_id.as_deref().unwrap_or(UNKNOWN) == user_id
                 && key.user_name.as_deref().unwrap_or(UNKNOWN) == user_name
         }
-        aisix_obs::LiveGaugeSeries::RatelimitRemaining { api_key_id, model } => {
-            snap.apikeys.get_by_id(api_key_id).is_some() && model_alive(model)
-        }
-        aisix_obs::LiveGaugeSeries::DeploymentState {
-            model,
-            provider_key_id,
-            ..
-        } => {
-            model_alive(model)
-                && (provider_key_id == UNKNOWN
-                    || snap.provider_keys.get_by_id(provider_key_id).is_some())
+        aisix_obs::LiveGaugeSeries::RatelimitRemaining { api_key_id, .. } => {
+            snap.apikeys.get_by_id(api_key_id).is_some()
         }
     }
 }
@@ -2656,51 +2654,29 @@ mod tests {
         ));
     }
 
-    /// `unknown` names nothing to look up. Retiring it would fight the
-    /// emitter — the health checker re-writes that exact placeholder on
-    /// every tick — and flap the series between a value and NaN.
+    /// The rate-limit family is judged on its api key alone. Its `model`
+    /// label is the string the CALLER sent, so a wildcard-served
+    /// deployment emits a concrete name the snapshot cannot resolve —
+    /// checking it would retire a live series every sweep and let the next
+    /// request rewrite it, flapping the gauge between its value and NaN.
     #[test]
-    fn placeholder_labels_are_never_retired() {
-        let snap = AisixSnapshot::new();
+    fn rate_limit_remaining_is_judged_on_its_key_not_its_model() {
+        let snap = snapshot_with_key("ak-1", None, None, None);
+        let at = |key, model| aisix_obs::LiveGaugeSeries::RatelimitRemaining {
+            api_key_id: key,
+            model,
+        };
+        // A model name the snapshot has never heard of — what a wildcard
+        // row serves — must NOT be read as a dead series.
         assert!(gauge_series_is_live(
             &snap,
-            aisix_obs::LiveGaugeSeries::DeploymentState {
-                provider: "unknown",
-                model: "unknown",
-                upstream_model: "unknown",
-                provider_key_id: "unknown",
-            }
+            at("ak-1", "openai/gpt-4o-2024-11-20")
         ));
-        // A resolvable name that is genuinely absent is a different thing.
+        assert!(gauge_series_is_live(&snap, at("ak-1", "anything at all")));
+        // Losing the key is the trigger that is decidable, and it retires.
         assert!(!gauge_series_is_live(
             &snap,
-            aisix_obs::LiveGaugeSeries::DeploymentState {
-                provider: "openai",
-                model: "gpt-4o",
-                upstream_model: "gpt-4o",
-                provider_key_id: "unknown",
-            }
-        ));
-    }
-
-    /// The rate-limit gauges are keyed by a key AND a model; losing either
-    /// leaves the pair describing nothing.
-    #[test]
-    fn rate_limit_remaining_needs_both_halves_of_its_key() {
-        let snap = snapshot_with_key("ak-1", None, None, None);
-        assert!(!gauge_series_is_live(
-            &snap,
-            aisix_obs::LiveGaugeSeries::RatelimitRemaining {
-                api_key_id: "ak-1",
-                model: "gpt-4o",
-            }
-        ));
-        assert!(!gauge_series_is_live(
-            &snap,
-            aisix_obs::LiveGaugeSeries::RatelimitRemaining {
-                api_key_id: "ak-gone",
-                model: "unknown",
-            }
+            at("ak-gone", "openai/gpt-4o-2024-11-20")
         ));
     }
 

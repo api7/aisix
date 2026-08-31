@@ -609,9 +609,23 @@ pub enum GaugeFamily {
     /// `aisix_ratelimit_remaining_{requests,tokens}` — keyed by an api
     /// key and a model.
     RatelimitRemaining,
-    /// `aisix_deployment_state` — keyed by a model and the provider key
-    /// serving it.
-    DeploymentState,
+}
+
+// `aisix_deployment_state` is NOT here, though its label set can strand
+// the same way. It is edge-triggered: `health.rs`'s `sync_deployment_state`
+// returns early unless the state CHANGED, so a live model is written only
+// when its health flips. Retiring it on a label change — repointing a
+// model at another provider key, or renaming the model — would blank the
+// series with nothing to rewrite it until the next health transition, and
+// "is this deployment up?" going dark is worse than the stale label it
+// would replace. Making it sweepable means having the health tracker
+// re-publish on a snapshot change, which is a different change.
+
+fn family_key(family: GaugeFamily) -> &'static str {
+    match family {
+        GaugeFamily::Budget => "budget",
+        GaugeFamily::RatelimitRemaining => "ratelimit_remaining",
+    }
 }
 
 struct RetirableSeries {
@@ -635,13 +649,10 @@ pub enum LiveGaugeSeries<'a> {
     },
     RatelimitRemaining {
         api_key_id: &'a str,
+        /// Reported for context only. It is the model string the CALLER
+        /// sent, not a resolved name, so a liveness check must not try to
+        /// look it up — see the emit site's note.
         model: &'a str,
-    },
-    DeploymentState {
-        provider: &'a str,
-        model: &'a str,
-        upstream_model: &'a str,
-        provider_key_id: &'a str,
     },
 }
 
@@ -936,11 +947,7 @@ impl Metrics {
     /// second worker, or a cache eviction) is an idempotent no-op.
     fn track_retirable(&self, family: GaugeFamily, labels: &[&str]) {
         let mut key = String::with_capacity(64);
-        key.push_str(match family {
-            GaugeFamily::Budget => "budget",
-            GaugeFamily::RatelimitRemaining => "ratelimit_remaining",
-            GaugeFamily::DeploymentState => "deployment_state",
-        });
+        key.push_str(family_key(family));
         for value in labels {
             key.push(WORKER_KEY_SEP);
             key.push_str(value);
@@ -989,10 +996,19 @@ impl Metrics {
     /// gauge write), and one that comes back is written by the request
     /// path and reported live on the next pass.
     pub fn retire_stale_gauges(&self, is_live: impl Fn(LiveGaugeSeries<'_>) -> bool) -> usize {
-        let map = self.inner.retirable.lock().expect("retirable registry");
+        // Take the entries out under the lock and release it before doing
+        // any work: `is_live` reads the caller's snapshot and the retire
+        // path registers handles on the recorder, and holding this mutex
+        // across either puts the sweeper in the request path's way — the
+        // registration side takes the same lock on a worker-cache miss.
+        let taken: Vec<RetirableSeries> = {
+            let mut map = self.inner.retirable.lock().expect("retirable registry");
+            map.drain().map(|(_, v)| v).collect()
+        };
         let mut retired = 0usize;
+        let mut keep: Vec<RetirableSeries> = Vec::with_capacity(taken.len());
         metrics::with_local_recorder(&self.inner.recorder, || {
-            for series in map.values() {
+            for series in taken {
                 let l: Vec<&str> = series.labels.iter().map(|v| &**v).collect();
                 let view = match (series.family, l.as_slice()) {
                     (GaugeFamily::Budget, [api_key_id, team_id, user_id, user_name]) => {
@@ -1006,21 +1022,16 @@ impl Metrics {
                     (GaugeFamily::RatelimitRemaining, [api_key_id, model]) => {
                         LiveGaugeSeries::RatelimitRemaining { api_key_id, model }
                     }
-                    (
-                        GaugeFamily::DeploymentState,
-                        [provider, model, upstream_model, provider_key_id],
-                    ) => LiveGaugeSeries::DeploymentState {
-                        provider,
-                        model,
-                        upstream_model,
-                        provider_key_id,
-                    },
                     // Arity is fixed per family at the registration sites;
                     // a mismatch means a family gained a label without its
-                    // view. Skip rather than retire on a guess.
-                    _ => continue,
+                    // view. Keep rather than retire on a guess.
+                    _ => {
+                        keep.push(series);
+                        continue;
+                    }
                 };
                 if is_live(view) {
+                    keep.push(series);
                     continue;
                 }
                 retired += 1;
@@ -1066,24 +1077,24 @@ impl Metrics {
                             .set(f64::NAN);
                         }
                     }
-                    LiveGaugeSeries::DeploymentState {
-                        provider,
-                        model,
-                        upstream_model,
-                        provider_key_id,
-                    } => {
-                        metrics::gauge!(
-                            M_DEPLOYMENT_STATE,
-                            "provider" => provider.to_string(),
-                            "model" => model.to_string(),
-                            "upstream_model" => upstream_model.to_string(),
-                            "provider_key_id" => provider_key_id.to_string(),
-                        )
-                        .set(f64::NAN);
-                    }
                 }
             }
         });
+        // A retired label set is dropped: nothing writes it any more, so
+        // re-marking it every tick is pure waste, and keeping it would let
+        // dead entries fill `RETIRABLE_CAPACITY` and silently stop NEW
+        // series from ever being tracked — which is the bug this exists to
+        // fix. A key that comes back re-registers on its next request.
+        let mut map = self.inner.retirable.lock().expect("retirable registry");
+        for series in keep {
+            let mut key = String::with_capacity(64);
+            key.push_str(family_key(series.family));
+            for value in &series.labels {
+                key.push(WORKER_KEY_SEP);
+                key.push_str(value);
+            }
+            map.entry(Box::from(key.as_str())).or_insert(series);
+        }
         retired
     }
 
@@ -2116,15 +2127,6 @@ impl Metrics {
                 k.label(labels.provider_key_id);
             },
             || {
-                self.track_retirable(
-                    GaugeFamily::DeploymentState,
-                    &[
-                        labels.provider,
-                        labels.model,
-                        labels.upstream_model,
-                        labels.provider_key_id,
-                    ],
-                );
                 metrics::gauge!(
                     M_DEPLOYMENT_STATE,
                     "provider" => labels.provider.to_string(),
@@ -2256,26 +2258,22 @@ impl Metrics {
         }
     }
 
-    /// The key still exists but carries no budget: drop the claim rather
-    /// than leaving the amounts from when it did.
+    /// The key carries no budget: clear the presence flag and nothing
+    /// else.
     ///
-    /// `details_present` goes to 0 — the documented guard reads `== 1` —
-    /// and the four quantities go to NaN for the same reason retirement
-    /// uses it: a `remaining_usd 0` would read as "exhausted", which is a
-    /// worse answer than "no budget here". Zeroing only the flag was the
-    /// original behaviour and left `limit_usd` / `spent_usd` frozen at
-    /// their last budgeted values, so an unguarded ratio kept reporting a
-    /// budget the key no longer has.
+    /// Deliberately does NOT retract the four amounts, even though a key
+    /// whose budget was removed leaves them frozen at their last budgeted
+    /// values. This runs on EVERY request whose decision carries no
+    /// budget, which includes every request on a deployment with budgets
+    /// switched off (`budget::Mode::Disabled` answers `allow_all()`, and
+    /// that is the default) — writing the amounts here would mint four
+    /// `NaN` series per api key for a feature nobody enabled, five-ing
+    /// the cardinality of this family to fix a case that only arises
+    /// after a budget is deleted. The documented guard
+    /// `aisix_budget_details_present == 1` is what covers that case, and
+    /// [`Metrics::retire_stale_gauges`] covers the key going away.
     pub fn clear_budget_gauges(&self, labels: BudgetLabels<'_>) {
         self.cached_budget_gauge(M_BUDGET_DETAILS_PRESENT, labels, 0.0);
-        for metric in [
-            M_BUDGET_LIMIT_USD,
-            M_BUDGET_SPENT_USD,
-            M_BUDGET_REMAINING_USD,
-            M_BUDGET_RESET_SECONDS,
-        ] {
-            self.cached_budget_gauge(metric, labels, f64::NAN);
-        }
     }
 
     pub fn record_redis_failure(&self, operation: &str) {
@@ -4392,38 +4390,26 @@ mod tests {
         );
     }
 
-    /// Removing a key's budget must retract the amounts too. Zeroing only
-    /// the presence flag left `limit_usd` / `spent_usd` frozen at their
-    /// last budgeted values, so an unguarded ratio went on reporting a
-    /// budget that had been deleted.
+    /// `clear_budget_gauges` runs on EVERY request whose decision carries
+    /// no budget — which is every request on a deployment with budgets
+    /// switched off, the default. Retracting the amounts here would mint
+    /// four series per api key for a feature nobody enabled, so it must
+    /// touch the presence flag and nothing else.
     #[test]
-    fn clearing_a_budget_retracts_the_amounts_not_just_the_flag() {
+    fn a_budgetless_key_mints_only_the_presence_flag() {
         let m = Metrics::new(false);
-        let labels = BudgetLabels {
+        m.clear_budget_gauges(BudgetLabels {
             api_key_id: "ak-1",
             team_id: "t",
             user_id: "u",
             user_name: "alice",
-        };
-        m.set_budget_gauges(
-            labels,
-            BudgetGauges {
-                limit_usd: Some(100.0),
-                spent_usd: Some(95.0),
-                remaining_usd: Some(5.0),
-                reset_seconds: Some(60),
-            },
-        );
-        m.clear_budget_gauges(labels);
-
+        });
         let rendered = m.render();
-        let line = |metric: &str| -> String {
-            series_lines(&rendered, metric)
-                .pop()
-                .unwrap_or_else(|| panic!("{metric} must render\n{rendered}"))
-                .to_string()
-        };
-        assert!(line(M_BUDGET_DETAILS_PRESENT).ends_with(" 0"));
+        assert_eq!(
+            series_lines(&rendered, M_BUDGET_DETAILS_PRESENT).len(),
+            1,
+            "{rendered}"
+        );
         for metric in [
             M_BUDGET_LIMIT_USD,
             M_BUDGET_SPENT_USD,
@@ -4431,9 +4417,8 @@ mod tests {
             M_BUDGET_RESET_SECONDS,
         ] {
             assert!(
-                line(metric).ends_with(" NaN"),
-                "{metric} kept a stale amount: {}",
-                line(metric)
+                series_lines(&rendered, metric).is_empty(),
+                "{metric} must not exist for a key that never had a budget:\n{rendered}"
             );
         }
     }
@@ -4490,14 +4475,34 @@ mod tests {
         }
     }
 
-    /// `aisix_ratelimit_remaining_requests 0` means "quota exhausted" and
-    /// `aisix_deployment_state 0` means "healthy". Retiring either to zero
-    /// would replace a stale claim with a false one, so this pins the
-    /// marker rather than trusting the constant.
+    /// `aisix_ratelimit_remaining_requests 0` means "quota exhausted".
+    /// Retiring to zero would replace a stale claim with a false one, so
+    /// this pins the marker rather than trusting the constant.
     #[test]
     fn retirement_never_asserts_a_meaningful_zero() {
         let m = Metrics::new(false);
         m.set_rate_limit_remaining("ak-gone", "gpt-4o", Some(7), Some(900));
+        assert_eq!(m.retire_stale_gauges(|_| false), 1);
+
+        let rendered = m.render();
+        for metric in [M_RATELIMIT_REMAINING_REQUESTS, M_RATELIMIT_REMAINING_TOKENS] {
+            let line = series_lines(&rendered, metric)
+                .pop()
+                .unwrap_or_else(|| panic!("{metric} must render\n{rendered}"));
+            assert!(
+                line.ends_with(" NaN"),
+                "{metric} must retire to NaN, never to a value that means \
+                 something: {line}"
+            );
+        }
+    }
+
+    /// `aisix_deployment_state` is deliberately NOT swept: it is written
+    /// only on a health TRANSITION, so retiring it would blank a live
+    /// model's state with nothing to rewrite it until the next flip.
+    #[test]
+    fn deployment_state_is_not_retirable() {
+        let m = Metrics::new(false);
         m.set_deployment_state(
             DeploymentLabels {
                 provider: "openai",
@@ -4507,23 +4512,15 @@ mod tests {
             },
             DeploymentState::Down,
         );
-        assert_eq!(m.retire_stale_gauges(|_| false), 2);
-
-        let rendered = m.render();
-        for metric in [
-            M_RATELIMIT_REMAINING_REQUESTS,
-            M_RATELIMIT_REMAINING_TOKENS,
-            M_DEPLOYMENT_STATE,
-        ] {
-            let line = series_lines(&rendered, metric)
+        // Nothing is live, and it still must not be touched.
+        assert_eq!(m.retire_stale_gauges(|_| false), 0);
+        assert!(
+            series_lines(&m.render(), M_DEPLOYMENT_STATE)
                 .pop()
-                .unwrap_or_else(|| panic!("{metric} must render\n{rendered}"));
-            assert!(
-                line.ends_with(" NaN"),
-                "{metric} must retire to NaN, never a value that means \
-                 something: {line}"
-            );
-        }
+                .expect("renders")
+                .ends_with(" 2"),
+            "a health-transition gauge must keep its last reported state"
+        );
     }
 
     /// Retirement is per label SET, not per key: rebinding a key to another
@@ -4597,10 +4594,13 @@ mod tests {
         );
     }
 
-    /// A key that comes back is written by the request path again, and the
-    /// next sweep reports it live — so retirement is not one-shot.
+    /// A retired label set is DROPPED from the registry, not kept and
+    /// re-marked forever. Keeping it would let dead entries fill
+    /// `RETIRABLE_CAPACITY` over a long-running process and silently stop
+    /// new series from being tracked at all — the very bug this exists to
+    /// fix — and would re-emit the same NaN on every tick.
     #[test]
-    fn a_revived_key_stops_being_retired() {
+    fn a_retired_series_is_dropped_from_the_registry() {
         let m = Metrics::new(false);
         let labels = BudgetLabels {
             api_key_id: "ak-1",
@@ -4608,25 +4608,48 @@ mod tests {
             user_id: "u",
             user_name: "alice",
         };
+        m.set_budget_gauges(
+            labels,
+            BudgetGauges {
+                spent_usd: Some(40.0),
+                ..BudgetGauges::default()
+            },
+        );
+        assert_eq!(m.retire_stale_gauges(|_| false), 1);
+        // Nothing left to retire: the entry is gone, so the sweep does no
+        // work on it again.
+        assert_eq!(m.retire_stale_gauges(|_| false), 0);
+    }
+
+    /// Rebinding produces a NEW label set, which registers and is
+    /// retirable in its own right — so dropping the old entry does not
+    /// leave the key untracked. (An identical label set coming back would
+    /// need a deleted id to be reissued, which uuids do not do.)
+    #[test]
+    fn the_label_set_a_rebind_creates_is_tracked_too() {
+        let m = Metrics::new(false);
         let spend = |v| BudgetGauges {
             spent_usd: Some(v),
             ..BudgetGauges::default()
         };
-        m.set_budget_gauges(labels, spend(40.0));
+        let before = BudgetLabels {
+            api_key_id: "ak-1",
+            team_id: "team-old",
+            user_id: "u",
+            user_name: "alice",
+        };
+        m.set_budget_gauges(before, spend(40.0));
         assert_eq!(m.retire_stale_gauges(|_| false), 1);
-        assert!(series_lines(&m.render(), M_BUDGET_SPENT_USD)
-            .pop()
-            .expect("renders")
-            .ends_with(" NaN"));
 
-        m.set_budget_gauges(labels, spend(41.0));
-        assert_eq!(m.retire_stale_gauges(|_| true), 0);
-        assert!(
-            series_lines(&m.render(), M_BUDGET_SPENT_USD)
-                .pop()
-                .expect("renders")
-                .ends_with(" 41"),
-            "a live key must read its real value again"
+        let after = BudgetLabels {
+            team_id: "team-new",
+            ..before
+        };
+        m.set_budget_gauges(after, spend(45.0));
+        assert_eq!(
+            m.retire_stale_gauges(|_| false),
+            1,
+            "the post-rebind label set must be tracked on its own registration"
         );
     }
 
