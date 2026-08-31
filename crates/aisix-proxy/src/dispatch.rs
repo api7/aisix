@@ -206,14 +206,17 @@ pub(crate) fn serves_natively(
     // in front of an `adapter: azure-openai` key, and the vendor-id
     // fallback below would then send that credential down the verbatim
     // path with no declaration in sight.
-    if pk.is_some_and(|p| {
-        matches!(
-            p.adapter,
-            Some(aisix_core::Adapter::Bedrock)
-                | Some(aisix_core::Adapter::Vertex)
-                | Some(aisix_core::Adapter::AzureOpenai)
-        )
-    }) {
+    // Exhaustive on purpose: a new `Adapter` variant must be a compile
+    // error here rather than silently inheriting the verbatim path,
+    // which is how a platform credential would end up on a route that
+    // does not exist.
+    let platform = pk.is_some_and(|p| match p.adapter {
+        Some(aisix_core::Adapter::Bedrock)
+        | Some(aisix_core::Adapter::Vertex)
+        | Some(aisix_core::Adapter::AzureOpenai) => true,
+        Some(aisix_core::Adapter::Openai) | Some(aisix_core::Adapter::Anthropic) | None => false,
+    });
+    if platform {
         return false;
     }
     let declared = pk.and_then(|p| p.apis.as_ref());

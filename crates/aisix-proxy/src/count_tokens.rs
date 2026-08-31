@@ -543,8 +543,8 @@ async fn dispatch(
     if !any_anthropic {
         return Err(ProxyError::InvalidRequest(format!(
             "model `{model_name}` is not backed by an Anthropic-protocol upstream; \
-             /v1/messages/count_tokens requires a model whose provider key uses \
-             the anthropic adapter"
+             /v1/messages/count_tokens requires a provider key that either uses \
+             the anthropic adapter or declares `apis.messages`"
         )));
     }
     Err(last_err.unwrap_or(ProxyError::ProviderUnavailable))

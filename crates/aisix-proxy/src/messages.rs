@@ -162,6 +162,7 @@ pub async fn messages(
         Ok(DispatchOutcome {
             response,
             provider_label,
+            upstream_protocol,
             provider_key_id,
             upstream_model,
             metrics,
@@ -283,6 +284,7 @@ pub async fn messages(
                     &state,
                     &snapshot,
                     &pk,
+                    upstream_protocol,
                     &request_id,
                     event_model_id,
                     &api_key_id,
@@ -425,6 +427,8 @@ pub async fn messages(
                     &state,
                     &snapshot,
                     &crate::usage_attr::ResolvedPk::unresolved(),
+                    // No attempt won, so no wire was spoken.
+                    aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN,
                     &request_id,
                     &model_id,
                     &api_key_id,
@@ -517,6 +521,9 @@ fn emit_failed_attempts_anthropic(
             state,
             snap,
             &pk,
+            // A failed attempt may not have got as far as choosing a
+            // route, so the key's own wire is the best available answer.
+            pk.labels().protocol(),
             request_id,
             // Each failed attempt records the TARGET it actually hit
             // (AISIX-Cloud#790), not the group it was resolved from.
@@ -1498,6 +1505,7 @@ async fn anthropic_passthrough_dispatch(
                     &state_c,
                     &snap_c,
                     &pk_c,
+                    aisix_core::Adapter::Anthropic.wire_protocol(),
                     &request_id_c,
                     &model_id_c,
                     &api_key_id_c,
@@ -1596,6 +1604,7 @@ async fn anthropic_passthrough_dispatch(
         Ok(DispatchOutcome {
             response,
             provider_label,
+            upstream_protocol: aisix_core::Adapter::Anthropic.wire_protocol(),
             provider_key_id: pk_id.to_string(),
             upstream_model: upstream_model.clone(),
             metrics: AnthropicUsageMetrics::default(),
@@ -1738,6 +1747,7 @@ async fn anthropic_passthrough_dispatch(
         Ok(DispatchOutcome {
             response: Json(json_body).into_response(),
             provider_label,
+            upstream_protocol: aisix_core::Adapter::Anthropic.wire_protocol(),
             provider_key_id: pk_id.to_string(),
             upstream_model,
             metrics,
@@ -2165,6 +2175,8 @@ async fn cross_provider_dispatch(
                     &state_for_telem,
                     &snap_telem,
                     &pk_telem,
+                    // The bridge dispatched through this key's own wire.
+                    pk_telem.labels().protocol(),
                     &request_id_for_telem,
                     &model_id_for_telem,
                     &api_key_id_for_telem,
@@ -2237,6 +2249,7 @@ async fn cross_provider_dispatch(
         return Ok(DispatchOutcome {
             response,
             provider_label,
+            upstream_protocol: aisix_gateway::upstream_protocol(provider_key),
             provider_key_id: provider_key_id.to_string(),
             upstream_model,
             metrics: AnthropicUsageMetrics::default(),
@@ -2349,6 +2362,7 @@ async fn cross_provider_dispatch(
     Ok(DispatchOutcome {
         response: Json(json).into_response(),
         provider_label,
+        upstream_protocol: aisix_gateway::upstream_protocol(provider_key),
         provider_key_id: provider_key_id.to_string(),
         upstream_model,
         metrics,
@@ -2812,6 +2826,14 @@ impl<F: FnOnce(AnthropicStreamCompletion)> Drop for CompleteAnthropicStreamOnDro
 struct DispatchOutcome {
     response: Response,
     provider_label: String,
+    /// The wire the winning attempt actually spoke, which is not always
+    /// the one the Provider Key defaults to: a key whose adapter is
+    /// `openai` still speaks Anthropic when it declares `apis.messages`
+    /// and this request took that route verbatim. Deriving the label
+    /// from the key would report `openai` for a request that went out on
+    /// the Anthropic wire, which is the one thing this label exists to
+    /// say (AISIX-Cloud#1403).
+    upstream_protocol: &'static str,
     provider_key_id: String,
     upstream_model: String,
     metrics: AnthropicUsageMetrics,
@@ -2911,6 +2933,12 @@ fn emit_anthropic_usage_event(
     // both this event and the handler's `record` (#941 audit L2). The
     // failed-attempt and stream-end callers resolve their own.
     pk: &crate::usage_attr::ResolvedPk<'_>,
+    // The wire this request actually went out on. Not derivable from the
+    // key: one whose adapter is `openai` still speaks Anthropic when it
+    // declares `apis.messages` and the request took that route verbatim,
+    // and reporting the key's default would name a protocol the request
+    // never used (AISIX-Cloud#1403).
+    upstream_protocol: &'static str,
     request_id: &str,
     model_id: &str,
     api_key_id: &str,
@@ -3083,7 +3111,7 @@ fn emit_anthropic_usage_event(
             UsageLabels {
                 endpoint: "/v1/messages",
                 inbound_protocol: "anthropic",
-                upstream_protocol: pk.labels().protocol(),
+                upstream_protocol,
                 provider,
                 model: bounded_model.as_ref(),
                 upstream_model: bounded_upstream.as_ref(),
