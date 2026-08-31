@@ -75,6 +75,7 @@ pub struct ProviderKey {
     /// Surfaces this map has no key for — embeddings, audio, images,
     /// videos, files/batches/fine-tuning, rerank — always use `api_base`,
     /// exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apis: Option<ProviderApis>,
 
     /// Telemetry tags carried alongside the key for metric and log emission.
@@ -128,10 +129,13 @@ pub enum ApiSurface {
 ///
 /// - `messages` is **additive**. An `adapter: anthropic` key (or the
 ///   `anthropic` vendor) speaks that wire by declaration and keeps serving
-///   `/v1/messages` at `api_base` whatever this map says; listing it here
-///   adds the route to a key whose adapter is something else, at its own
-///   `base`. That is the DeepSeek/Zhipu shape — an OpenAI-compatible key
-///   whose vendor also fronts an Anthropic-compatible path.
+///   `/v1/messages` natively whatever this map says; listing it here adds
+///   the route to a key whose adapter is something else. That is the
+///   DeepSeek/Zhipu shape — an OpenAI-compatible key whose vendor also
+///   fronts an Anthropic-compatible path. An entry's own `base` always
+///   decides WHERE the Anthropic wire lives, for the verbatim
+///   passthrough and for the bridge that translates into it alike;
+///   without one it is `api_base`.
 /// - `responses` is **authoritative**. Once this map exists, `/v1/responses`
 ///   is served natively only if it is listed. The Responses API is a strict
 ///   superset of chat completions rather than a rename, so an

@@ -1234,7 +1234,17 @@ async fn responses_to_target(
     state.health.record_success(&model.display_name);
     state.runtime_status.mark_healthy(model_id);
 
-    let provider_label = "openai".to_string();
+    // The target model's own vendor id, exactly as the bridged path and
+    // every other endpoint label it. A literal was correct while this
+    // path was reachable only from `provider == "openai"`; now that a key
+    // declares which surfaces it serves, a `deepseek` (or `byo`) model
+    // can take the verbatim passthrough too, and hard-coding "openai"
+    // would split its metric series and misattribute the priced row.
+    let provider_label = model
+        .provider
+        .as_deref()
+        .unwrap_or("unknown")
+        .to_ascii_lowercase();
 
     if is_stream {
         let headers = upstream_resp.headers().clone();

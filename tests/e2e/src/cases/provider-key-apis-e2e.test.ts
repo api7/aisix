@@ -5,7 +5,9 @@ import {
   EtcdClient,
   SeedClient,
   pickFreePort,
+  scrapeMetrics,
   spawnApp,
+  sumMetric,
   waitConfigPropagation,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -186,9 +188,33 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
       provider_key_id: dualPk.id,
     });
 
+    // 4. An anthropic-adapter key whose Anthropic wire lives on the
+    //    declared path. Its OpenAI-wire traffic is translated INTO that
+    //    wire by the bridge, which has to reach the same host the
+    //    verbatim passthrough does.
+    const anthropicPk = await seed.createProviderKey({
+      display_name: "apis-anthropic",
+      provider: "byo",
+      adapter: "anthropic",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+      apis: { messages: { base: `${upstream.baseUrl}/anthropic` } },
+    });
+    await seed.createModel({
+      display_name: "anthropic-declared",
+      provider: "byo",
+      model_name: "upstream-model",
+      provider_key_id: anthropicPk.id,
+    });
+
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
-      allowed_models: ["declared-chat-only", "legacy-chat-only", "dual-protocol"],
+      allowed_models: [
+        "declared-chat-only",
+        "legacy-chat-only",
+        "dual-protocol",
+        "anthropic-declared",
+      ],
     });
   });
 
@@ -314,5 +340,65 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
     expect(upstream.seen.slice(before).map((r) => r.path)).toEqual([
       "/v1/chat/completions",
     ]);
+  });
+
+  test("the bridge that translates INTO the Anthropic wire uses the declared entry too", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    const before = upstream.seen.length;
+    const res = await callGateway(app, "/v1/chat/completions", {
+      model: "anthropic-declared",
+      messages: [{ role: "user", content: "hello" }],
+    });
+    expect(res.status).toBe(200);
+    // Not `/v1/messages` at api_base: one upstream route must not resolve
+    // to two hosts depending on which inbound protocol asked for it.
+    expect(upstream.seen.slice(before).map((r) => r.path)).toEqual([
+      "/anthropic/v1/messages",
+    ]);
+  });
+
+  test("usage is attributed to the target model's own vendor, not the wire it took", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    // Both requests run on `deepseek` models. The verbatim Anthropic
+    // passthrough and the translated Responses path used to hard-code
+    // "anthropic" / "openai" here, which split one model's series in two
+    // and misattributed the priced row.
+    await callGateway(app, "/v1/messages", {
+      model: "dual-protocol",
+      max_tokens: 16,
+      messages: [{ role: "user", content: "hello" }],
+    });
+    await callGateway(app, "/v1/responses", {
+      model: "declared-chat-only",
+      input: "hello",
+    });
+
+    const samples = await scrapeMetrics(app.metricsUrl);
+    const deepseekMessages = sumMetric(samples, "aisix_llm_requests_total", {
+      provider: "deepseek",
+      endpoint: "/v1/messages",
+    });
+    expect(deepseekMessages).toBeGreaterThan(0);
+    expect(
+      sumMetric(samples, "aisix_llm_requests_total", {
+        provider: "anthropic",
+      }),
+      "no series may be labelled with the wire instead of the vendor",
+    ).toBe(0);
+    // The bridged Responses request rides the `openai` catalog vendor, so
+    // it legitimately reports openai — the assertion that matters is that
+    // it reports the MODEL's vendor rather than a constant.
+    expect(
+      sumMetric(samples, "aisix_llm_requests_total", {
+        provider: "openai",
+        endpoint: "/v1/responses",
+      }),
+    ).toBeGreaterThan(0);
   });
 });

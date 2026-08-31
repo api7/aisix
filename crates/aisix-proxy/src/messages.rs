@@ -1286,7 +1286,16 @@ async fn anthropic_passthrough_dispatch(
     state.health.record_success(&model.display_name);
     state.runtime_status.mark_healthy(model_id);
 
-    let provider_label = "anthropic".to_string();
+    // The target model's own vendor id — same rule as the bridged path
+    // and every other endpoint. The literal predates `apis`: it was
+    // already wrong for `provider: "byo"` + `adapter: anthropic`, which
+    // reports `byo` on /v1/chat/completions and reported `anthropic`
+    // here, and a declared `messages` entry widens that to any vendor.
+    let provider_label = model
+        .provider
+        .as_deref()
+        .unwrap_or("unknown")
+        .to_ascii_lowercase();
 
     if is_stream {
         // For SSE streaming: pass through the response body as a streaming

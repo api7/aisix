@@ -736,8 +736,17 @@ async fn count_tokens_to_target(
 
     Ok(CountTokensSuccess {
         response: resp,
-        // The loop above only ever dispatches Anthropic targets.
-        provider: "anthropic".to_string(),
+        // The target model's own vendor id, as every other endpoint
+        // labels it. This used to read "anthropic" on the grounds that
+        // the loop only dispatches Anthropic targets — true of the wire,
+        // never of the vendor: a `byo` + `adapter: anthropic` key already
+        // reported `byo` on /v1/chat/completions, and a Provider Key that
+        // declares `apis.messages` brings any vendor down this path.
+        provider: model
+            .provider
+            .as_deref()
+            .unwrap_or("unknown")
+            .to_ascii_lowercase(),
         upstream_model,
         provider_key_id: pk_entry.id.to_string(),
         model_id: model_id.to_string(),
