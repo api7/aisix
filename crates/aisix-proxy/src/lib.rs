@@ -7161,6 +7161,99 @@ data: [DONE]\n\n";
         );
     }
 
+    /// The 429 the customer's client actually receives, through the
+    /// whole router rather than the renderer alone: the quota gate's
+    /// rejection has to reach `IntoResponse` with its dimension intact.
+    /// A unit test on the renderer would still pass if the gate lost
+    /// the detail on the way out.
+    #[tokio::test]
+    async fn ratelimit_429_carries_the_standard_headers_end_to_end() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot_with_limits(
+            "my-gpt4",
+            &["my-gpt4"],
+            &upstream.uri(),
+            serde_json::json!({"rpm": 1}),
+        );
+        let app = build_router(build_state(snap, hub));
+
+        let call = || {
+            let app = app.clone();
+            async move {
+                let body = serde_json::json!({
+                    "model": "my-gpt4",
+                    "messages": [{"role": "user", "content": "hi"}]
+                });
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer sk-caller")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap();
+                run(app, req).await
+            }
+        };
+
+        assert_eq!(call().await.status(), StatusCode::OK);
+
+        let resp = call().await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let headers = resp.headers();
+        assert_eq!(
+            headers
+                .get("x-ratelimit-limit")
+                .and_then(|v| v.to_str().ok()),
+            Some("1"),
+        );
+        assert_eq!(
+            headers
+                .get("x-ratelimit-remaining")
+                .and_then(|v| v.to_str().ok()),
+            Some("0"),
+        );
+        assert_eq!(
+            headers
+                .get("x-ratelimit-scope")
+                .and_then(|v| v.to_str().ok()),
+            Some("rpm"),
+        );
+        // Reset and Retry-After are the same delta-seconds count down to
+        // the minute boundary, so a client may read either one.
+        let reset = headers
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .expect("x-ratelimit-reset present and numeric");
+        let retry_after = headers
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .expect("retry-after present and numeric");
+        assert_eq!(reset, retry_after);
+        assert!(
+            (1..=60).contains(&reset),
+            "an rpm window resets within the minute, got {reset}",
+        );
+    }
+
     #[tokio::test]
     async fn input_guardrail_block_returns_422_and_skips_upstream() {
         // wiremock that fails the test if it's hit at all.

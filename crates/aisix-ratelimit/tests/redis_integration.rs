@@ -104,6 +104,88 @@ async fn rpm_counter_is_shared_across_replicas() {
     );
 }
 
+/// The shared backend must describe a refusal exactly as the local one
+/// does: the 429's `x-ratelimit-*` headers are the same contract on a
+/// clustered deployment as on a single node.
+///
+/// The Lua script reports the refused dimension as an INDEX into the
+/// same `request_dims` / `token_dims` list the caller pushed into ARGV,
+/// so the name is reconstructed on the Rust side. A key carrying several
+/// windows is what makes that mapping observable — with a single window
+/// any index would decode to the same name.
+#[tokio::test]
+async fn refusal_detail_survives_the_shared_backend() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let a = store(&url).await;
+    let b = store(&url).await;
+    let key = unique_key("detail");
+    // rps is looser than rpm here, so the SECOND dimension in the
+    // request list is the one that refuses — an off-by-one in the index
+    // mapping would report `rps`.
+    let limits = RateLimit {
+        rps: Some(10),
+        rpm: Some(1),
+        ..rl()
+    };
+
+    a.acquire(&key, &limits, "a-1")
+        .await
+        .expect("first allowed");
+    let err = b
+        .acquire(&key, &limits, "b-1")
+        .await
+        .expect_err("shared counter must refuse the second replica");
+
+    let detail = err.detail();
+    assert_eq!(detail.dimension, "rpm", "got {err:?}");
+    assert_eq!(detail.limit, 1);
+    assert_eq!(detail.remaining, 0);
+    assert!(
+        (1..=60).contains(&detail.reset_secs),
+        "a minute window resets within the minute, got {}",
+        detail.reset_secs
+    );
+}
+
+/// A concurrency refusal from the shared backend carries the gauge's
+/// own state plus the fixed hint — the same shape the local store
+/// produces, so a client cannot tell the backends apart.
+#[tokio::test]
+async fn concurrency_refusal_detail_survives_the_shared_backend() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let a = store(&url).await;
+    let b = store(&url).await;
+    let key = unique_key("conc-detail");
+    let limits = RateLimit {
+        concurrency: Some(1),
+        ..rl()
+    };
+
+    a.acquire(&key, &limits, "a-1")
+        .await
+        .expect("first allowed");
+    let err = b
+        .acquire(&key, &limits, "b-1")
+        .await
+        .expect_err("shared concurrency gauge must refuse");
+
+    let detail = err.detail();
+    assert_eq!(detail.dimension, "concurrency", "got {err:?}");
+    assert_eq!(detail.limit, 1);
+    assert_eq!(detail.remaining, 0);
+    assert_eq!(
+        detail.reset_secs,
+        aisix_ratelimit::CONCURRENCY_RETRY_AFTER_SECS
+    );
+    assert_eq!(detail.reset_secs, 60);
+}
+
 /// Sleep until the next whole second starts.
 ///
 /// The rps counter buckets server-side: the Lua script reads `now` from
@@ -218,7 +300,7 @@ async fn concurrency_slot_is_shared_and_released_across_replicas() {
     assert!(
         matches!(
             b.acquire(&key, &limits, "b-1").await,
-            Err(aisix_ratelimit::RateLimitError::Concurrency)
+            Err(aisix_ratelimit::RateLimitError::Concurrency { .. })
         ),
         "concurrency slot must be shared across replicas"
     );
