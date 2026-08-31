@@ -602,10 +602,16 @@ async fn count_tokens_to_target(
     let url = aisix_gateway::url_cache::cached_endpoint_url(
         &pk_entry.id,
         "proxy/messages/count_tokens",
-        // Every resolve_base_url input (#1017) via the shared constructor.
-        &crate::dispatch::pk_url_fingerprint(&pk_entry.value),
+        // Every resolve_base_url_for input (#1017) via the shared constructor.
+        &crate::dispatch::pk_surface_url_fingerprint(
+            &pk_entry.value,
+            aisix_core::ApiSurface::Messages,
+        ),
         || {
-            let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
+            let base = crate::dispatch::resolve_base_url_for(
+                &pk_entry.value,
+                aisix_core::ApiSurface::Messages,
+            )?;
             Ok::<_, crate::error::ProxyError>(crate::dispatch::build_anthropic_url(
                 &base,
                 "/messages/count_tokens",

@@ -72,8 +72,8 @@ pub use policy_conditions::{
     PolicyCondition, PolicyDimension,
 };
 pub use provider_key::{
-    ParamConstraints, ProviderKey, RequestOverrides, ResponseOverrides, StreamDoneMarker,
-    TelemetryKind, TelemetryTags,
+    ApiEndpoint, ApiSurface, ParamConstraints, ProviderApis, ProviderKey, RequestOverrides,
+    ResponseOverrides, StreamDoneMarker, TelemetryKind, TelemetryTags,
 };
 pub use rate_limit::{McpRateLimit, RateLimit};
 pub use rate_limit_policy::{PolicyScope, PolicyWindow, RateLimitPolicy};

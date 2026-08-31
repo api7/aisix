@@ -3681,6 +3681,63 @@ mod tests {
         validate_provider_key(&v).unwrap();
     }
 
+    /// AISIX-Cloud#1388 / the two-protocol upstream: one credential, an
+    /// OpenAI-compatible path and an Anthropic-compatible one on the same
+    /// host. Both entry shapes have to validate — with a `base` override
+    /// and without one (the bare declaration that a surface exists).
+    #[test]
+    fn provider_key_with_apis_entries_passes() {
+        let v = json!({
+            "display_name": "deepseek-prod",
+            "secret": "sk-x",
+            "api_base": "https://api.deepseek.com/v1",
+            "provider": "deepseek",
+            "adapter": "openai",
+            "apis": {
+                "responses": {},
+                "messages": {"base": "https://api.deepseek.com/anthropic"}
+            }
+        });
+        validate_provider_key(&v).unwrap();
+
+        // An empty map is meaningful on its own: it says the key serves
+        // nothing beyond what its adapter implies.
+        let v = json!({
+            "display_name": "vllm",
+            "secret": "sk-x",
+            "api_base": "https://vllm.internal/v1",
+            "provider": "openai",
+            "apis": {}
+        });
+        validate_provider_key(&v).unwrap();
+    }
+
+    /// The surface key set is closed on the write path, so a typo (or a
+    /// surface this release does not serve) fails loudly rather than
+    /// sitting in the document doing nothing.
+    #[test]
+    fn provider_key_rejects_an_unknown_api_surface() {
+        let v = json!({
+            "display_name": "x",
+            "secret": "sk-x",
+            "apis": {"embeddings": {"base": "https://up/v1"}}
+        });
+        validate_provider_key(&v).unwrap_err();
+    }
+
+    /// …but the read path tolerates one, so a surface added by a newer
+    /// control plane is ignored instead of taking the whole Provider Key
+    /// row — and with it every model that references the key — offline.
+    #[test]
+    fn lenient_provider_key_tolerates_an_unknown_api_surface() {
+        let v = json!({
+            "display_name": "x",
+            "secret": "sk-x",
+            "apis": {"embeddings": {"base": "https://up/v1"}}
+        });
+        validate_provider_key_lenient(&v).unwrap();
+    }
+
     #[test]
     fn provider_key_with_byo_telemetry_shape_passes() {
         let v = json!({

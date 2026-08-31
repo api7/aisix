@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aisix_core::resource::ResourceEntry;
-use aisix_core::{AisixSnapshot, Model, ProviderKey};
+use aisix_core::{AisixSnapshot, ApiSurface, Model, ProviderKey};
 use aisix_gateway::{Bridge, BridgeError, Hub};
 
 /// Map a `reqwest` transport error from a raw-passthrough dispatch
@@ -164,11 +164,47 @@ pub(crate) fn check_ip_access(model: &Model, source_ip: &str) -> Result<(), Prox
 /// as before. A dangling `provider_key_id` likewise falls back to the vendor
 /// id, leaving the dispatch path (not this gate) to report it.
 pub(crate) fn speaks_anthropic(snapshot: &AisixSnapshot, model: &Model) -> bool {
-    if model.provider.as_deref() == Some("anthropic") {
-        return true;
+    serves_natively(snapshot, model, ApiSurface::Messages)
+}
+
+/// Whether this Model's upstream serves `surface` natively — i.e. whether
+/// the caller's body may be forwarded verbatim instead of being translated
+/// through a provider bridge.
+///
+/// The two surfaces answer differently, because the evidence for them
+/// differs. `/v1/messages` is served by any key that speaks the Anthropic
+/// wire by declaration — the `anthropic` vendor id, or `provider: "byo"` +
+/// `adapter: anthropic`, which is the documented way to front a
+/// self-hosted or proxied Anthropic endpoint — and additionally by any key
+/// that names the route in [`ProviderKey::apis`], which is how one
+/// credential reaches a vendor's OpenAI path and its Anthropic path both.
+///
+/// `/v1/responses` has no such declaration to lean on: the Responses API
+/// is a strict superset of chat completions rather than a rename, so
+/// `adapter: openai` says nothing about whether the route exists. Absent
+/// an `apis` map the gateway falls back to the vendor id — only OpenAI
+/// itself is assumed to serve it — and once the map exists it is the
+/// answer, so an operator whose OpenAI-compatible endpoint has no
+/// `/v1/responses` gets the request translated rather than 404'd upstream.
+pub(crate) fn serves_natively(
+    snapshot: &AisixSnapshot,
+    model: &Model,
+    surface: ApiSurface,
+) -> bool {
+    let pk = resolve_provider_key(snapshot, model).ok();
+    let pk = pk.as_ref().map(|e| &e.value);
+    let declared = pk.and_then(|p| p.apis.as_ref());
+    match surface {
+        ApiSurface::Messages => {
+            model.provider.as_deref() == Some("anthropic")
+                || pk.is_some_and(|p| p.adapter == Some(aisix_core::Adapter::Anthropic))
+                || declared.is_some_and(|apis| apis.messages.is_some())
+        }
+        ApiSurface::Responses => match declared {
+            Some(apis) => apis.responses.is_some(),
+            None => model.provider.as_deref() == Some("openai"),
+        },
     }
-    resolve_provider_key(snapshot, model)
-        .is_ok_and(|pk| pk.value.adapter == Some(aisix_core::Adapter::Anthropic))
 }
 
 /// Required upstream model id (`model_name`) for a non-routing Model.
@@ -368,6 +404,51 @@ pub(crate) fn pk_url_fingerprint(provider_key: &ProviderKey) -> [&str; 2] {
     ]
 }
 
+/// The base URL for one API surface: the `apis` entry's own `base` when
+/// the Provider Key declares one, else [`resolve_base_url`].
+///
+/// This is what lets a single upstream account serve two protocols from
+/// two paths — `…/v1` for the OpenAI wire and `…/anthropic` for the
+/// Anthropic one — under one credential. Surfaces the `apis` map does not
+/// cover keep resolving through `api_base` alone.
+pub(crate) fn resolve_base_url_for(
+    provider_key: &ProviderKey,
+    surface: ApiSurface,
+) -> Result<String, ProxyError> {
+    match surface_base(provider_key, surface) {
+        Some(base) => Ok(strip_endpoint_suffix(base.trim()).to_string()),
+        None => resolve_base_url(provider_key),
+    }
+}
+
+/// The raw per-surface `base` override, if this key declares a non-empty
+/// one. Shared by [`resolve_base_url_for`] and the cache fingerprint so
+/// the two can never read different inputs.
+fn surface_base(provider_key: &ProviderKey, surface: ApiSurface) -> Option<&str> {
+    provider_key
+        .apis
+        .as_ref()
+        .and_then(|apis| apis.get(surface))
+        .and_then(|entry| entry.base.as_deref())
+        .map(str::trim)
+        .filter(|base| !base.is_empty())
+}
+
+/// [`pk_url_fingerprint`] plus the per-surface override, for the callers
+/// that build their URL through [`resolve_base_url_for`]. Editing an
+/// `apis` entry has to invalidate the cached URL just like editing
+/// `api_base` does.
+pub(crate) fn pk_surface_url_fingerprint(
+    provider_key: &ProviderKey,
+    surface: ApiSurface,
+) -> [&str; 3] {
+    [
+        surface_base(provider_key, surface).unwrap_or(""),
+        provider_key.api_base.as_deref().unwrap_or(""),
+        provider_key.provider.as_str(),
+    ]
+}
+
 /// Join an Anthropic upstream base with a version-independent endpoint
 /// path (`/messages`, `/messages/count_tokens`).
 ///
@@ -560,6 +641,161 @@ mod tests {
             }}"#
         );
         serde_json::from_str(&cfg).unwrap()
+    }
+
+    /// Build a snapshot holding one Provider Key from raw JSON, so a test
+    /// can express the exact stored document (including an `apis` map) the
+    /// resolver will see.
+    fn snapshot_with_pk_json(provider_key_id: &str, json: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        let pk: ProviderKey = serde_json::from_str(json).unwrap();
+        snap.provider_keys
+            .insert(ResourceEntry::new(provider_key_id, pk, 1));
+        snap
+    }
+
+    fn model_on(provider: &str, provider_key_id: &str) -> Model {
+        serde_json::from_str(&format!(
+            r#"{{"display_name":"m","provider":"{provider}","model_name":"x","provider_key_id":"{provider_key_id}"}}"#
+        ))
+        .unwrap()
+    }
+
+    /// No `apis` map — every surface resolves exactly as it did before the
+    /// field existed. This is the guard that stored configuration keeps its
+    /// behavior: the vendor id decides `/v1/responses`, the vendor id or
+    /// the anthropic adapter decides `/v1/messages`.
+    #[test]
+    fn without_apis_the_vendor_inference_is_unchanged() {
+        let snap = snapshot_with_pk_json(
+            "pk-1",
+            r#"{"display_name":"o","secret":"k","api_base":"https://up/v1","provider":"openai","adapter":"openai"}"#,
+        );
+        let m = model_on("openai", "pk-1");
+        assert!(serves_natively(&snap, &m, ApiSurface::Responses));
+        assert!(!serves_natively(&snap, &m, ApiSurface::Messages));
+
+        let snap = snapshot_with_pk_json(
+            "pk-2",
+            r#"{"display_name":"a","secret":"k","api_base":"https://up","provider":"byo","adapter":"anthropic"}"#,
+        );
+        let m = model_on("byo", "pk-2");
+        assert!(serves_natively(&snap, &m, ApiSurface::Messages));
+        assert!(!serves_natively(&snap, &m, ApiSurface::Responses));
+    }
+
+    /// AISIX-Cloud#1388: an OpenAI-compatible endpoint reached through the
+    /// `openai` catalog vendor + a custom `api_base` has no `/v1/responses`
+    /// route. Declaring `apis` without it makes the gateway translate
+    /// instead of forwarding a request the upstream 404s.
+    #[test]
+    fn apis_without_responses_stops_the_verbatim_passthrough() {
+        let snap = snapshot_with_pk_json(
+            "pk-1",
+            r#"{"display_name":"o","secret":"k","api_base":"https://vllm.internal/v1","provider":"openai","adapter":"openai","apis":{}}"#,
+        );
+        let m = model_on("openai", "pk-1");
+        assert!(
+            !serves_natively(&snap, &m, ApiSurface::Responses),
+            "an apis map that omits responses is the operator saying the route is absent",
+        );
+    }
+
+    /// The same key declaring the route keeps the verbatim passthrough —
+    /// an OpenAI-compatible endpoint that does implement `/v1/responses`
+    /// must not be downgraded just because it declared its surfaces.
+    #[test]
+    fn apis_listing_responses_keeps_the_verbatim_passthrough() {
+        let snap = snapshot_with_pk_json(
+            "pk-1",
+            r#"{"display_name":"o","secret":"k","api_base":"https://vllm.internal/v1","provider":"byo","adapter":"openai","apis":{"responses":{}}}"#,
+        );
+        let m = model_on("byo", "pk-1");
+        assert!(serves_natively(&snap, &m, ApiSurface::Responses));
+    }
+
+    /// The DeepSeek/Zhipu shape: one credential, an OpenAI-compatible path
+    /// and an Anthropic-compatible one. Declaring `messages` adds the
+    /// native Anthropic route to a key whose adapter is `openai`, so
+    /// `/v1/messages` stops being translated (which is what drops
+    /// `cache_control` and thinking blocks).
+    #[test]
+    fn apis_adds_a_native_anthropic_route_to_an_openai_key() {
+        let snap = snapshot_with_pk_json(
+            "pk-1",
+            r#"{"display_name":"ds","secret":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","adapter":"openai",
+                "apis":{"messages":{"base":"https://api.deepseek.com/anthropic"}}}"#,
+        );
+        let m = model_on("deepseek", "pk-1");
+        assert!(serves_natively(&snap, &m, ApiSurface::Messages));
+        // …and it does not accidentally imply the Responses route.
+        assert!(!serves_natively(&snap, &m, ApiSurface::Responses));
+    }
+
+    /// An anthropic-adapter key keeps serving `/v1/messages` at `api_base`
+    /// whatever else `apis` lists — that is what the adapter declares, and
+    /// an unrelated entry must not turn it off.
+    #[test]
+    fn an_anthropic_adapter_keeps_its_own_surface_when_apis_lists_others() {
+        let snap = snapshot_with_pk_json(
+            "pk-1",
+            r#"{"display_name":"a","secret":"k","api_base":"https://up","provider":"byo","adapter":"anthropic","apis":{"responses":{}}}"#,
+        );
+        let m = model_on("byo", "pk-1");
+        assert!(serves_natively(&snap, &m, ApiSurface::Messages));
+    }
+
+    /// A surface entry's own `base` is what the URL is built from, and it
+    /// gets the same endpoint-suffix tolerance `api_base` has. Anything the
+    /// entry does not override falls back to `api_base`.
+    #[test]
+    fn surface_base_overrides_api_base_only_for_the_declared_surface() {
+        let pk: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"ds","secret":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","adapter":"openai",
+                "apis":{"messages":{"base":"https://api.deepseek.com/anthropic/v1/messages"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_base_url_for(&pk, ApiSurface::Messages).unwrap(),
+            "https://api.deepseek.com/anthropic/v1",
+            "a pasted full endpoint URL loses the endpoint, keeping the version segment \
+             exactly as api_base does",
+        );
+        assert_eq!(
+            build_anthropic_url(
+                &resolve_base_url_for(&pk, ApiSurface::Messages).unwrap(),
+                "/messages"
+            ),
+            "https://api.deepseek.com/anthropic/v1/messages",
+        );
+        assert_eq!(
+            resolve_base_url_for(&pk, ApiSurface::Responses).unwrap(),
+            "https://api.deepseek.com/v1",
+        );
+    }
+
+    /// The cached-URL fingerprint has to carry the per-surface override, or
+    /// editing an `apis` entry would keep serving the URL built from the
+    /// previous one.
+    #[test]
+    fn surface_fingerprint_changes_when_the_entry_changes() {
+        let base: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"ds","secret":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","apis":{"messages":{"base":"https://a.example/anthropic"}}}"#,
+        )
+        .unwrap();
+        let edited: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"ds","secret":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","apis":{"messages":{"base":"https://b.example/anthropic"}}}"#,
+        )
+        .unwrap();
+        assert_ne!(
+            pk_surface_url_fingerprint(&base, ApiSurface::Messages),
+            pk_surface_url_fingerprint(&edited, ApiSurface::Messages),
+        );
+        // A surface the map does not cover still fingerprints on api_base.
+        assert_eq!(
+            pk_surface_url_fingerprint(&base, ApiSurface::Responses)[1..],
+            pk_url_fingerprint(&base)[..],
+        );
     }
 
     fn routing_model() -> Model {

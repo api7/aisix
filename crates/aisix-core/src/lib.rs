@@ -46,15 +46,15 @@ pub use models::{
     validate_a2a_agent, validate_apikey, validate_cache_policy, validate_guardrail,
     validate_mcp_server, validate_model, validate_observability_exporter, validate_provider_key,
     validate_rate_limit_policy, A2aAgent, A2aAuthType, A2aProtocolVersion, Adapter, AisixSnapshot,
-    ApiKey, AppliedGuardrail, CachePolicy, CooldownConfig, ExporterKind, Guardrail,
-    GuardrailEnforcedHit, GuardrailExecution, GuardrailHookPoint, GuardrailKind,
+    ApiEndpoint, ApiKey, ApiSurface, AppliedGuardrail, CachePolicy, CooldownConfig, ExporterKind,
+    Guardrail, GuardrailEnforcedHit, GuardrailExecution, GuardrailHookPoint, GuardrailKind,
     GuardrailMetricsSink, GuardrailMonitorHit, HashOnSource, HashOnType, KeywordConfig,
     KeywordPattern, McpAuthType, McpProtocolVersion, McpRateLimit, McpServer, McpServerType,
     McpTransport, Model, ObservabilityExporter, ParamConstraints, PassthroughAuthMode,
-    PassthroughCredentialMode, PassthroughRoute, PolicyScope, PolicyWindow, ProviderKey, RateLimit,
-    RateLimitPolicy, RequestOverrides, ResponseOverrides, Routing, RoutingStrategy, RoutingTarget,
-    SchemaError, StreamDoneMarker, TelemetryKind, TelemetryTags, WhenAllUnavailablePolicy,
-    DEFAULT_COOLDOWN_TRIGGER_STATUSES,
+    PassthroughCredentialMode, PassthroughRoute, PolicyScope, PolicyWindow, ProviderApis,
+    ProviderKey, RateLimit, RateLimitPolicy, RequestOverrides, ResponseOverrides, Routing,
+    RoutingStrategy, RoutingTarget, SchemaError, StreamDoneMarker, TelemetryKind, TelemetryTags,
+    WhenAllUnavailablePolicy, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use resource::{Resource, ResourceEntry};
 pub use similarity::{best_similarity, cosine_similarity};

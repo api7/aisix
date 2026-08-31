@@ -27,6 +27,21 @@
       ],
       "type": "string"
     },
+    "ApiEndpoint": {
+      "additionalProperties": false,
+      "description": "One declared entry point.",
+      "properties": {
+        "base": {
+          "description": "Base URL this surface is served at. Omit when it is the same one `api_base` names — an entry with no `base` still carries the declaration that the surface exists.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "ParamConstraints": {
       "additionalProperties": false,
       "description": "Numeric range clamps applied to chat-completion request bodies.",
@@ -46,6 +61,35 @@
             "number",
             "null"
           ]
+        }
+      },
+      "type": "object"
+    },
+    "ProviderApis": {
+      "additionalProperties": false,
+      "description": "Per-surface native entry points on one upstream.\n\nThe two surfaces resolve differently, because the evidence for them differs:\n\n- `messages` is **additive**. An `adapter: anthropic` key (or the `anthropic` vendor) speaks that wire by declaration and keeps serving `/v1/messages` at `api_base` whatever this map says; listing it here adds the route to a key whose adapter is something else, at its own `base`. That is the DeepSeek/Zhipu shape — an OpenAI-compatible key whose vendor also fronts an Anthropic-compatible path. - `responses` is **authoritative**. Once this map exists, `/v1/responses` is served natively only if it is listed. The Responses API is a strict superset of chat completions rather than a rename, so an OpenAI-compatible endpoint serving one does not necessarily serve the other, and `adapter: openai` is not evidence either way. Leaving it out is how an operator says \"this endpoint has no `/v1/responses`\" and gets the request translated to chat completions instead of 404'd upstream.\n\nWith no map at all, both fall back to the vendor-id inference the gateway used before this field existed.",
+      "properties": {
+        "messages": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ApiEndpoint"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Anthropic-wire `/v1/messages` (and `/v1/messages/count_tokens`)."
+        },
+        "responses": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ApiEndpoint"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "OpenAI-wire `/v1/responses`."
         }
       },
       "type": "object"
@@ -252,6 +296,17 @@
       "description": "Upstream provider's API key. The gateway receives plaintext so it can authenticate to the upstream provider. Protect the configuration store and transport accordingly.",
       "minLength": 1,
       "type": "string"
+    },
+    "apis": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ProviderApis"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "API surfaces this upstream serves natively, beyond the one its `adapter` already implies, and the base URL each one lives at.\n\nOne upstream account often exposes more than one protocol, on different paths of the same host — an OpenAI-compatible `/v1/chat/completions` under `…/v1` and an Anthropic-compatible `/v1/messages` under `…/anthropic`, both authenticated by the same credential. `api_base` can only name one of them, so without this field every request the declared path cannot serve gets translated instead — losing whatever the target protocol carries that the canonical chat shape does not (prompt-cache breakpoints, thinking blocks). Declaring the second entry here lets each inbound protocol reach its own native path under the one credential.\n\nEach surface resolves on its own terms; see [`ProviderApis`]. Surfaces this map has no key for — embeddings, audio, images, videos, files/batches/fine-tuning, rerank — always use `api_base`, exactly as before."
     },
     "display_name": {
       "description": "Operator-facing label, unique within the gateway. Surfaces in the Admin API list view and in dashboard UIs that wrap this resource.",
