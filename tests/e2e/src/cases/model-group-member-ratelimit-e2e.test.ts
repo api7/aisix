@@ -272,9 +272,13 @@ describe("model group member rate limit e2e (AISIX-Cloud#1087)", () => {
     expect(servedContent(await callGroup("mgrl-both-limited"))).toBe("served-by-c2");
 
     // Both members exhausted → the request fails with 429, not a 5xx, and
-    // carries the limiter's `Retry-After` so SDK back-off still works. The
-    // hint is the load-bearing half: a bare 429 makes clients retry
-    // immediately against a window that has not reopened.
+    // describes the limit that refused it. The refusal is reported as the
+    // gateway's own — it used to be flattened into an upstream-shaped
+    // error, which carries neither the taxonomy nor the `x-ratelimit-*`
+    // headers, so a caller could not tell it from the provider throttling
+    // them. `Retry-After` is the load-bearing half of that: a bare 429
+    // makes clients retry immediately against a window that has not
+    // reopened.
     const third = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
       method: "POST",
       headers: {
@@ -287,11 +291,23 @@ describe("model group member rate limit e2e (AISIX-Cloud#1087)", () => {
       }),
     });
     expect(third.status).toBe(429);
-    const body = (await third.json()) as { error?: { message?: string } };
-    expect(body.error?.message ?? "").toContain("rate limit");
+    const body = (await third.json()) as {
+      error?: { message?: string; type?: string };
+    };
+    // The stable taxonomy rather than a substring of the prose: the
+    // message is the limiter's own now (`request limit exceeded
+    // (requests)`), matching what /v1/messages and /v1/responses have
+    // always returned for the same exhaustion.
+    expect(body.error?.type).toBe("rate_limit_exceeded");
+    expect(third.headers.get("x-ratelimit-scope")).toBe("rpm");
+    expect(third.headers.get("x-ratelimit-limit")).toBe("1");
+    expect(third.headers.get("x-ratelimit-remaining")).toBe("0");
     const retryAfter = Number.parseInt(third.headers.get("retry-after") ?? "", 10);
     expect(retryAfter).toBeGreaterThan(0);
     expect(retryAfter).toBeLessThanOrEqual(60);
+    expect(Number.parseInt(third.headers.get("x-ratelimit-reset") ?? "", 10)).toBe(
+      retryAfter,
+    );
   });
 
   test("winning member's TPM bucket is committed, throttling the next call", async (ctx) => {
