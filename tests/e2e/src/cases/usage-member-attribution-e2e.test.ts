@@ -11,7 +11,6 @@ import {
   startMockIdp,
   startMockSls,
   startOpenAiUpstream,
-  sumMetric,
   waitConfigPropagation,
   waitForSlsLog,
   type MetricSample,
@@ -261,6 +260,7 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
       return;
     }
     const marker = "uma-unowned-1d93";
+    const before: MetricSample[] = await scrapeMetrics(app.metricsUrl);
     expect((await chat(UNOWNED_PLAINTEXT, marker)).status).toBe(200);
 
     const log = await waitForSlsLog(
@@ -275,13 +275,23 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
 
     // On the counter the same absence reads as the placeholder both halves
     // share — a metric label set has to be uniform across the family, and
-    // an unowned key must not borrow a name from anywhere.
+    // an unowned key must not borrow a name from anywhere. A delta, per
+    // this suite's rule: the whole file shares one app, so an absolute
+    // sum would be answering for every other case's traffic too.
     const after: MetricSample[] = await scrapeMetrics(app.metricsUrl);
     expect(
-      sumMetric(after, "aisix_usage_events_emitted_total", (l) =>
+      metricDelta(before, after, "aisix_usage_events_emitted_total", (l) =>
         l.user_id === "unknown" && l.user_name !== "unknown",
       ),
     ).toBe(0);
+    // …and the request DID land on the paired placeholder, so the zero
+    // above is an absence of mismatches rather than an absence of traffic.
+    expect(
+      metricDelta(before, after, "aisix_usage_events_emitted_total", {
+        user_id: "unknown",
+        user_name: "unknown",
+      }),
+    ).toBeGreaterThanOrEqual(1);
   });
 
   test("a gateway rate-limit 429 reaches the feed with the member on it", async (ctx) => {

@@ -270,8 +270,9 @@ pub const M_GUARDRAIL_LATENCY_SECONDS: &str = "aisix_guardrail_latency_seconds";
 ///   and `status_code` is kept so dashboards and alerts written against
 ///   `status_code="4xx"` keep working unchanged.
 /// - `user_id` / `user_name`: the org member behind the request and
-///   their display name, from [`UsageEventLabels`]. The name is a
-///   function of the id off one ApiKey row, so it adds no series.
+///   their display name, from [`UsageEventLabels`]. Both come off one
+///   ApiKey row, so the name is determined by the id and the pair is one
+///   series, not one per name.
 /// - `inbound_protocol`: `openai` / `anthropic`. Matches the
 ///   wire-level field on UsageEvent.
 /// - `upstream_protocol`: the wire protocol of the ProviderKey the event
@@ -2724,11 +2725,16 @@ pub struct UsageEventLabels<'a> {
     /// persists can never name different people.
     pub user_id: &'a str,
     /// Readable display name of the member `user_id` names
-    /// (AISIX-Cloud#1455). A function of `user_id` off the same ApiKey
-    /// row, so it adds no series — and it is filled from the event
-    /// beside `user_id` in `UsageSink::try_emit` rather than by each
-    /// handler's label builder, so the two cannot name different people.
-    /// `unknown` whenever `user_id` is.
+    /// (AISIX-Cloud#1455). One series per (id, name) pair rather than per
+    /// name: the two are read off one ApiKey row, so at any instant the
+    /// name is determined by the id and the label costs nothing. A rename
+    /// that reaches the row splits the counter into a before and an after
+    /// series, exactly as a ProviderKey rename already does to
+    /// `provider_key_name`.
+    ///
+    /// Filled from the event beside `user_id` in `UsageSink::try_emit`
+    /// rather than by each handler's label builder, so the two cannot
+    /// name different people. `unknown` whenever `user_id` is.
     pub user_name: &'a str,
     /// The upstream wire protocol of the key named by `provider_key_id`
     /// (AISIX-Cloud#1403) — the same value, resolved the same way, that
@@ -2814,8 +2820,19 @@ pub struct BudgetLabels<'a> {
     pub team_id: &'a str,
     pub user_id: &'a str,
     /// Readable display name of the member `user_id` names
-    /// (AISIX-Cloud#1455), read off the same ApiKey row so the pair adds
-    /// no series over `user_id` alone. `unknown` whenever `user_id` is.
+    /// (AISIX-Cloud#1455), read off the same ApiKey row so the name is
+    /// determined by the id and the pair costs no series over `user_id`
+    /// alone. `unknown` whenever `user_id` is.
+    ///
+    /// These are GAUGES, and this recorder registers no idle timeout, so
+    /// a label set that stops being written stays at its last value: a
+    /// rename that reaches the ApiKey row leaves the pre-rename sample
+    /// behind, and a `sum` that does not group by the member counts both.
+    /// That is true of every label on this family that can change under a
+    /// fixed `api_key_id`: rebinding a key's team or owner strands its
+    /// samples the same way. `clear_budget_gauges` does not help — it
+    /// zeroes `details_present` for the label set it is handed, which is
+    /// the new one.
     pub user_name: &'a str,
 }
 
@@ -5133,7 +5150,17 @@ mod tests {
         assert!(out.contains("status_class=\"2xx\""));
         assert!(out.contains("streaming=\"false\""));
         assert!(out.contains("streaming=\"true\""));
-        for high_card in ["api_key_id", "user_id", "team_id", "provider_key_id"] {
+        // Substring matches, so each NAME label has to be listed beside its
+        // id: `contains("user_id")` does not see `user_name`, and these
+        // histograms are the one family the id/name pair must NOT reach.
+        for high_card in [
+            "api_key_id",
+            "user_id",
+            "user_name",
+            "team_id",
+            "provider_key_id",
+            "provider_key_name",
+        ] {
             for line in out.lines().filter(|l| l.contains("aisix_request_")) {
                 assert!(
                     !line.contains(high_card),
