@@ -261,6 +261,23 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
         "responses-declared",
       ],
     });
+
+    // Gate the whole suite on the seeded configuration being live, not
+    // just the first test — every case here asserts which upstream path
+    // was hit, and a run filtered to one of them would otherwise start
+    // before the caller key resolves. `/v1/models` authenticates with
+    // the caller key and lists what it may reach, so it proves both
+    // halves at once.
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      const body = (await res.json()) as { data?: { id: string }[] };
+      return (
+        res.ok &&
+        (body.data ?? []).some((m) => m.id === "responses-declared")
+      );
+    });
   });
 
   afterAll(async () => {
@@ -273,18 +290,6 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
       ctx.skip();
       return;
     }
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await callGateway(app!, "/v1/chat/completions", {
-          model: "declared-chat-only",
-          messages: [{ role: "user", content: "ready" }],
-        });
-        return r.status === 200;
-      } catch {
-        return false;
-      }
-    });
-
     const before = upstream.seen.length;
     const res = await callGateway(app, "/v1/responses", {
       model: "declared-chat-only",
@@ -437,21 +442,36 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
     // passthrough and the translated Responses path used to hard-code
     // "anthropic" / "openai" here, which split one model's series in two
     // and misattributed the priced row.
-    await callGateway(app, "/v1/messages", {
-      model: "dual-protocol",
-      max_tokens: 16,
-      messages: [{ role: "user", content: "hello" }],
-    });
-    await callGateway(app, "/v1/responses", {
-      model: "declared-chat-only",
-      input: "hello",
-    });
+    // Asserted, not discarded: a failed request still increments
+    // `aisix_llm_requests_total` with the provider label, so the metric
+    // checks below would pass without any successful dispatch.
+    expect(
+      (
+        await callGateway(app, "/v1/messages", {
+          model: "dual-protocol",
+          max_tokens: 16,
+          messages: [{ role: "user", content: "hello" }],
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await callGateway(app, "/v1/responses", {
+          model: "declared-chat-only",
+          input: "hello",
+        })
+      ).status,
+    ).toBe(200);
     // The verbatim Responses path on a non-OpenAI vendor — the case that
     // used to report a hard-coded "openai".
-    await callGateway(app, "/v1/responses", {
-      model: "responses-declared",
-      input: "hello",
-    });
+    expect(
+      (
+        await callGateway(app, "/v1/responses", {
+          model: "responses-declared",
+          input: "hello",
+        })
+      ).status,
+    ).toBe(200);
 
     const samples = await scrapeMetrics(app.metricsUrl);
     const deepseekMessages = sumMetric(samples, "aisix_llm_requests_total", {

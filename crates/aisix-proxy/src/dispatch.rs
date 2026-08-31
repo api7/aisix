@@ -253,6 +253,10 @@ const API_BASE_ENDPOINT_SUFFIXES: &[&str] = &[
     "/completions",
     "/embeddings",
     "/responses",
+    // Longest first: `/messages` would otherwise never match a pasted
+    // count_tokens URL, and stripping it from the middle is not what a
+    // suffix scan does.
+    "/messages/count_tokens",
     "/messages",
     "/rerank",
 ];

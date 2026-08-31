@@ -145,8 +145,9 @@ pub enum ApiSurface {
 ///   gets the request translated to chat completions instead of 404'd
 ///   upstream.
 ///
-/// With no map at all, both fall back to the vendor-id inference the
-/// gateway used before this field existed.
+/// With no map at all, each falls back to what the gateway inferred
+/// before this field existed: `/v1/messages` from the vendor id or the
+/// `anthropic` adapter, `/v1/responses` from the vendor id alone.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 pub struct ProviderApis {
     /// OpenAI-wire `/v1/responses`.
