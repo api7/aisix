@@ -5493,6 +5493,23 @@ data: [DONE]\n\n";
     /// can mount multiple Models in one snapshot. `pk_id` lets each
     /// model point at its own ProviderKey row — useful for routing
     /// tests that use multiple upstream MockServers.
+    fn model_entry_with_limits(
+        id: &str,
+        name: &str,
+        pk_id: &str,
+        rate_limit: serde_json::Value,
+    ) -> ResourceEntry<Model> {
+        let cfg = serde_json::json!({
+            "display_name": name,
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": pk_id,
+            "rate_limit": rate_limit,
+        });
+        let model: Model = serde_json::from_value(cfg).unwrap();
+        ResourceEntry::new(id, model, 1)
+    }
+
     fn model_entry_with_id(id: &str, name: &str, pk_id: &str) -> ResourceEntry<Model> {
         let cfg = format!(
             r#"{{
@@ -5516,6 +5533,105 @@ data: [DONE]\n\n";
 
     /// Build a virtual routing Model that points at `targets` (other
     /// Model.display_name values) using the given strategy.
+    /// A routing group whose every target is over its own model limit
+    /// is still THIS gateway refusing the request, so its 429 must carry
+    /// the same headers a direct model's refusal does.
+    ///
+    /// The dispatch loop turns a per-target quota rejection into a
+    /// failed attempt and keeps going; when nothing is left, whatever
+    /// the loop kept is what the caller sees. Wrapping that in a
+    /// `Bridge` error — the shape an UPSTREAM 429 takes — would strip
+    /// the headers and tell the caller the provider refused them.
+    #[tokio::test]
+    async fn exhausted_routing_group_429_still_carries_the_rate_limit_headers() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-1", &upstream.uri()));
+        // The group's only target carries an INLINE model limit — the
+        // layer that used to be flattened away. A policy-layer rejection
+        // was already surfaced un-flattened.
+        snap.models.insert(model_entry_with_limits(
+            "m-1",
+            "primary",
+            "pk-1",
+            serde_json::json!({"rpm": 1}),
+        ));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary"],
+            None,
+            None,
+            None,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+
+        let app = build_router(build_state(snap, hub));
+        let call = || {
+            let app = app.clone();
+            async move {
+                let body = serde_json::json!({
+                    "model": "smart",
+                    "messages": [{"role": "user", "content": "hi"}]
+                });
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer sk-caller")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap();
+                run(app, req).await
+            }
+        };
+
+        assert_eq!(call().await.status(), StatusCode::OK);
+
+        let resp = call().await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let headers = resp.headers();
+        assert_eq!(
+            headers
+                .get("x-ratelimit-scope")
+                .and_then(|v| v.to_str().ok()),
+            Some("rpm"),
+            "an exhausted group must report the target limit that refused it",
+        );
+        assert_eq!(
+            headers
+                .get("x-ratelimit-limit")
+                .and_then(|v| v.to_str().ok()),
+            Some("1"),
+        );
+        assert_eq!(
+            headers
+                .get("x-ratelimit-remaining")
+                .and_then(|v| v.to_str().ok()),
+            Some("0"),
+        );
+        assert!(headers.contains_key("x-ratelimit-reset"));
+        assert!(headers.contains_key("retry-after"));
+    }
+
     fn routing_entry(
         name: &str,
         strategy: &str,

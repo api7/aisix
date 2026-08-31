@@ -39,8 +39,11 @@ pub struct LimitDetail {
     /// tokens for `tp*`, in-flight slots for `concurrency` — the unit
     /// follows the dimension, which is why the wire reports both.
     pub limit: u64,
-    /// Headroom left under `limit`. Zero on every rejection except a
-    /// concurrency one racing a slot release.
+    /// Headroom left under `limit`, saturating at zero. Every rejection
+    /// reports zero — a windowed dimension refuses at or past its cap,
+    /// and the concurrency gauge refuses at or past its slot count — so
+    /// the subtraction exists to keep the value derived from the two
+    /// numbers beside it rather than hardcoded per call site.
     pub remaining: u64,
     /// Seconds until the caller may retry: to the window boundary for a
     /// windowed dimension, [`CONCURRENCY_RETRY_AFTER_SECS`] otherwise.
