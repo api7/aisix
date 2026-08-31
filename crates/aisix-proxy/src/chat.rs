@@ -1659,9 +1659,11 @@ async fn dispatch(
                                 dispatched: false,
                             },
                         );
-                        // Keep the limiter's own Retry-After hint on the wire:
-                        // when every target is exhausted this error becomes the
-                        // client's 429, and SDKs back off on that header.
+                        // Fallback only: `last_reserve_reject` below carries
+                        // the same refusal un-flattened and takes precedence
+                        // at exhaustion. This stays so the loop still has a
+                        // 429-shaped `last_err` if a later target clears the
+                        // reject without recording one of its own.
                         last_err = Some(BridgeError::upstream_status_with_retry_after(
                             429,
                             format!(
@@ -2782,9 +2784,11 @@ async fn dispatch(
                             dispatched: false,
                         },
                     );
-                    // Keep the limiter's own Retry-After hint on the wire:
-                    // when every target is exhausted this error becomes the
-                    // client's 429, and SDKs back off on that header.
+                    // Fallback only: `last_reserve_reject` below carries the
+                    // same refusal un-flattened and takes precedence at
+                    // exhaustion. This stays so the loop still has a
+                    // 429-shaped `last_err` if a later target clears the
+                    // reject without recording one of its own.
                     last_err = Some(BridgeError::upstream_status_with_retry_after(
                         429,
                         format!(
