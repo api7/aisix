@@ -1033,9 +1033,11 @@ fn responses_value_text(v: &Value) -> String {
     }
 }
 
-/// Dispatch one concrete OpenAI target's Responses-API passthrough to
-/// `{api_base}/v1/responses`. The caller has already confirmed
-/// `model.provider == openai`.
+/// Dispatch one concrete target's Responses-API passthrough. The caller
+/// has already confirmed the target serves `/v1/responses` natively
+/// ([`crate::dispatch::serves_natively`]) — which its vendor id implies
+/// only for OpenAI itself, and which any vendor can declare — so the
+/// URL is resolved per surface rather than from `api_base` alone.
 #[allow(clippy::too_many_arguments)]
 async fn responses_to_target(
     state: &ProxyState,
@@ -1239,7 +1241,9 @@ async fn responses_to_target(
     // path was reachable only from `provider == "openai"`; now that a key
     // declares which surfaces it serves, a `deepseek` (or `byo`) model
     // can take the verbatim passthrough too, and hard-coding "openai"
-    // would split its metric series and misattribute the priced row.
+    // would split its metric series across two provider labels. The
+    // billed amount is unaffected — that comes from the cost inlined on
+    // the model document, not from this label.
     let provider_label = model
         .provider
         .as_deref()

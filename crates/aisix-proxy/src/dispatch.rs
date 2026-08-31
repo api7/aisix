@@ -193,7 +193,24 @@ pub(crate) fn serves_natively(
 ) -> bool {
     let pk = resolve_provider_key(snapshot, model).ok();
     let pk = pk.as_ref().map(|e| &e.value);
-    let declared = pk.and_then(|p| p.apis.as_ref());
+    // A platform adapter reaches every surface translated — its own
+    // routes are Bedrock's `/model/{id}/converse`, Vertex's
+    // `:generateContent` and Azure's deployment-scoped paths, none of
+    // which these entries can name — and its credential is a JSON tuple
+    // the verbatim paths would send as a bearer token to a URL that does
+    // not exist. cp-api refuses the declaration outright; a document
+    // that reaches the gateway anyway (a hand-written resources file, a
+    // direct etcd write) must not be acted on either.
+    let declared = pk
+        .filter(|p| {
+            !matches!(
+                p.adapter,
+                Some(aisix_core::Adapter::Bedrock)
+                    | Some(aisix_core::Adapter::Vertex)
+                    | Some(aisix_core::Adapter::AzureOpenai)
+            )
+        })
+        .and_then(|p| p.apis.as_ref());
     match surface {
         ApiSurface::Messages => {
             model.provider.as_deref() == Some("anthropic")
@@ -743,6 +760,46 @@ mod tests {
         );
         let m = model_on("byo", "pk-1");
         assert!(serves_natively(&snap, &m, ApiSurface::Messages));
+    }
+
+    /// A platform adapter never takes a native path, declaration or not:
+    /// its own routes are not these paths, and its credential is a JSON
+    /// tuple the verbatim dispatch would send as a bearer token.
+    #[test]
+    fn a_platform_adapter_never_serves_a_declared_surface() {
+        for adapter in ["bedrock", "vertex", "azure-openai"] {
+            let snap = snapshot_with_pk_json(
+                "pk-1",
+                &format!(
+                    r#"{{"display_name":"p","secret":"{{}}","api_base":"https://up","provider":"byo","adapter":"{adapter}","apis":{{"responses":{{}},"messages":{{}}}}}}"#
+                ),
+            );
+            let m = model_on("byo", "pk-1");
+            assert!(
+                !serves_natively(&snap, &m, ApiSurface::Responses),
+                "{adapter} must not take the verbatim responses path",
+            );
+            assert!(
+                !serves_natively(&snap, &m, ApiSurface::Messages),
+                "{adapter} must not take the verbatim messages path",
+            );
+        }
+    }
+
+    /// An empty `base` resolves as "no override" rather than building a
+    /// URL from an empty string. The read schema deliberately allows it
+    /// through (see `ApiEndpoint::base`), so this is the only thing
+    /// standing between a cleared field and a malformed upstream URL.
+    #[test]
+    fn an_empty_surface_base_falls_back_to_api_base() {
+        let pk: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"ds","secret":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","apis":{"messages":{"base":"   "}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_base_url_for(&pk, ApiSurface::Messages).unwrap(),
+            "https://api.deepseek.com/v1",
+        );
     }
 
     /// A surface entry's own `base` is what the URL is built from, and it

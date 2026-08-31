@@ -53,6 +53,27 @@ const MESSAGES_REPLY = {
 
 const COUNT_TOKENS_REPLY = { input_tokens: 42 };
 
+// An OpenAI Responses-API reply, for the upstream that does implement
+// the route — on a path of its own, so the test can tell the declared
+// entry's base from `api_base`.
+const RESPONSES_REPLY = {
+  id: "resp_apis_1",
+  object: "response",
+  created_at: 1730000000,
+  model: "upstream-model",
+  status: "completed",
+  output: [
+    {
+      type: "message",
+      id: "msg_apis_1",
+      role: "assistant",
+      status: "completed",
+      content: [{ type: "output_text", text: "from the responses route", annotations: [] }],
+    },
+  ],
+  usage: { input_tokens: 9, output_tokens: 4, total_tokens: 13 },
+};
+
 interface DualProtocolUpstream {
   baseUrl: string;
   /** Every request the mock saw, in order. */
@@ -91,6 +112,8 @@ async function startDualProtocolUpstream(): Promise<DualProtocolUpstream> {
           return json(200, MESSAGES_REPLY);
         case "/anthropic/v1/messages/count_tokens":
           return json(200, COUNT_TOKENS_REPLY);
+        case "/responses-host/v1/responses":
+          return json(200, RESPONSES_REPLY);
         default:
           // Everything else — `/v1/responses` and `/v1/messages` included
           // — is absent, the way a chat-completions-only deployment and a
@@ -207,6 +230,27 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
       provider_key_id: anthropicPk.id,
     });
 
+    // 5. A non-OpenAI vendor whose endpoint DOES serve `/v1/responses`,
+    //    on a path of its own. Nothing but the declaration can reach
+    //    this: the vendor id says "not OpenAI", so without `apis` the
+    //    request would be translated.
+    const responsesPk = await seed.createProviderKey({
+      display_name: "apis-responses",
+      provider: "deepseek",
+      adapter: "openai",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+      // A version-bearing root, the shape an OpenAI-compatible endpoint
+      // is configured with: the endpoint path is appended to it as-is.
+      apis: { responses: { base: `${upstream.baseUrl}/responses-host/v1` } },
+    });
+    await seed.createModel({
+      display_name: "responses-declared",
+      provider: "deepseek",
+      model_name: "upstream-model",
+      provider_key_id: responsesPk.id,
+    });
+
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: [
@@ -214,6 +258,7 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
         "legacy-chat-only",
         "dual-protocol",
         "anthropic-declared",
+        "responses-declared",
       ],
     });
   });
@@ -360,6 +405,29 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
     ]);
   });
 
+  test("a declared `responses` entry forwards verbatim, to its own base", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    const before = upstream.seen.length;
+    const res = await callGateway(app, "/v1/responses", {
+      model: "responses-declared",
+      input: "hello",
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.object).toBe("response");
+    expect(JSON.stringify(body.output)).toContain("from the responses route");
+
+    const dispatched = upstream.seen.slice(before);
+    // The declared base, not `api_base`, and not the chat-completions
+    // route a translated request would have taken.
+    expect(dispatched.map((r) => r.path)).toEqual(["/responses-host/v1/responses"]);
+    // Verbatim: `input` reaches the upstream unconverted.
+    expect(JSON.parse(dispatched[0].body)).toMatchObject({ input: "hello" });
+  });
+
   test("usage is attributed to the target model's own vendor, not the wire it took", async (ctx) => {
     if (!etcdReachable || !app || !upstream) {
       ctx.skip();
@@ -378,6 +446,12 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
       model: "declared-chat-only",
       input: "hello",
     });
+    // The verbatim Responses path on a non-OpenAI vendor — the case that
+    // used to report a hard-coded "openai".
+    await callGateway(app, "/v1/responses", {
+      model: "responses-declared",
+      input: "hello",
+    });
 
     const samples = await scrapeMetrics(app.metricsUrl);
     const deepseekMessages = sumMetric(samples, "aisix_llm_requests_total", {
@@ -385,12 +459,25 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
       endpoint: "/v1/messages",
     });
     expect(deepseekMessages).toBeGreaterThan(0);
+    // Scoped to the two endpoints this file drives through a verbatim
+    // path, so adding an actually-Anthropic model here later does not
+    // make the assertion fire for the wrong reason.
+    for (const endpoint of ["/v1/messages", "/v1/messages/count_tokens"]) {
+      expect(
+        sumMetric(samples, "aisix_llm_requests_total", {
+          provider: "anthropic",
+          endpoint,
+        }),
+        `${endpoint} must be labelled with the vendor, not the wire`,
+      ).toBe(0);
+    }
     expect(
       sumMetric(samples, "aisix_llm_requests_total", {
-        provider: "anthropic",
+        provider: "deepseek",
+        endpoint: "/v1/responses",
       }),
-      "no series may be labelled with the wire instead of the vendor",
-    ).toBe(0);
+      "the verbatim Responses path must report the vendor too",
+    ).toBeGreaterThan(0);
     // The bridged Responses request rides the `openai` catalog vendor, so
     // it legitimately reports openai — the assertion that matters is that
     // it reports the MODEL's vendor rather than a constant.

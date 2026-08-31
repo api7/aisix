@@ -32,8 +32,7 @@
       "description": "One declared entry point.",
       "properties": {
         "base": {
-          "description": "Base URL this surface is served at. Omit when it is the same one `api_base` names — an entry with no `base` still carries the declaration that the surface exists.",
-          "minLength": 1,
+          "description": "Base URL this surface is served at. Omit when it is the same one `api_base` names — an entry with no `base` still carries the declaration that the surface exists.\n\nDeliberately NOT length-constrained, matching `api_base`. The lenient read schema keeps every constraint but the open-object one, so a `minLength` here would make an empty string skip the whole Provider Key row — and with it every model that references the key — where the same empty string on `api_base` is the control plane's documented way to clear an override. An empty value is treated as \"no override\" at resolution time instead.",
           "type": [
             "string",
             "null"

@@ -550,8 +550,10 @@ async fn dispatch(
     Err(last_err.unwrap_or(ProxyError::ProviderUnavailable))
 }
 
-/// Dispatch one concrete Anthropic target's count_tokens passthrough to
-/// `{api_base}/v1/messages/count_tokens`. The caller has already confirmed
+/// Dispatch one concrete target's count_tokens passthrough. The route is
+/// a sub-route of `/v1/messages` and rides the same declaration, so it
+/// resolves against that surface's own base when the Provider Key names
+/// one and against `api_base` otherwise. The caller has already confirmed
 /// the target speaks the Anthropic protocol (`dispatch::speaks_anthropic`).
 #[allow(clippy::too_many_arguments)]
 async fn count_tokens_to_target(
