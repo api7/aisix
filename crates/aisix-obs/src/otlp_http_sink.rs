@@ -757,6 +757,9 @@ fn structural_attributes(event: &UsageEvent, exporter_name: &str) -> Vec<Value> 
         attr_string("aisix.request_id", &event.request_id),
         attr_int("http.response.status_code", event.status_code as i64),
     ];
+    if !event.operation.is_empty() {
+        attributes.push(attr_string("aisix.operation", &event.operation));
+    }
     if !event.requested_model.is_empty() {
         attributes.push(attr_string("gen_ai.request.model", &event.requested_model));
     }
@@ -781,6 +784,16 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
         attr_string("gen_ai.system", "aisix"),
         attr_string("gen_ai.operation.name", operation_name(event)),
     ];
+    // The gateway's own, finer reading of the same thing. The semconv value
+    // above is constrained to OpenTelemetry's vocabulary, so every
+    // OpenAI-shaped route lands on `chat` there — which cannot separate a
+    // conversation from an image or a video (AISIX-Cloud#1461). Carried on
+    // the structural spans too, so a trace can be filtered by kind at its
+    // root rather than only on the attempt span. Absent, like every other
+    // optional attribute here, when the event carries no value.
+    if !event.operation.is_empty() {
+        attributes.push(attr_string("aisix.operation", &event.operation));
+    }
     // The model alias the client sent (`model` field) — a Model-Group
     // name for routed requests (AISIX-Cloud#790). Semconv key for the
     // requested (vs response) model.
@@ -1243,6 +1256,7 @@ mod tests {
             provider_model_version: "gpt-4o-2024-08-06".into(),
             finish_reason: "stop".into(),
             cost_usd: 0.001,
+            operation: "image_generation".into(),
             ..Default::default()
         }
     }
@@ -1340,6 +1354,24 @@ mod tests {
         assert!(keys(attempt).contains(&"gen_ai.response.id".to_string()));
         assert!(!keys(server).contains(&"gen_ai.response.id".to_string()));
         assert!(keys(server).contains(&"aisix.request_id".to_string()));
+        // The request's kind is one of the joining keys, on every level:
+        // a trace backend filters a whole trace by it at the SERVER root,
+        // which reading it off the attempt span alone would not allow
+        // (AISIX-Cloud#1461).
+        let operation_of = |span: &Value| -> String {
+            span["attributes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["key"] == "aisix.operation")
+                .expect("aisix.operation must be present")["value"]["stringValue"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        for span in [server, logical, attempt] {
+            assert_eq!(operation_of(span), "image_generation");
+        }
 
         // Timestamps bracket: server ⊇ logical ⊇ attempt.
         let nanos =
@@ -1767,6 +1799,15 @@ mod tests {
         let keys: Vec<&str> = attrs.iter().map(|a| a["key"].as_str().unwrap()).collect();
         assert!(keys.contains(&"gen_ai.system"));
         assert!(keys.contains(&"gen_ai.operation.name"));
+        // The semconv value collapses every OpenAI-shaped route onto `chat`;
+        // this is the one that says which endpoint (AISIX-Cloud#1461), so the
+        // VALUE is what has to be checked — the key alone would be satisfied
+        // by an empty attribute.
+        let operation = attrs
+            .iter()
+            .find(|a| a["key"] == "aisix.operation")
+            .expect("aisix.operation must be present");
+        assert_eq!(operation["value"]["stringValue"], "image_generation");
         assert!(keys.contains(&"gen_ai.response.model"));
         assert!(keys.contains(&"gen_ai.response.id"));
         assert!(keys.contains(&"gen_ai.usage.input_tokens"));

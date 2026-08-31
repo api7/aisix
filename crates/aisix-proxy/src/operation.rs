@@ -249,7 +249,7 @@ mod tests {
     /// must keep the handler label their dashboards already query.
     #[test]
     fn operations_are_distinct_and_handlers_are_stable() {
-        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut owner: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
         for (route, emits) in ROUTE_OPERATIONS {
             let surface = match emits {
                 Emits::Usage(surface) => surface,
@@ -267,14 +267,18 @@ mod tests {
             );
             // Routes of one family legitimately repeat an operation
             // (`/v1/files/:id` is still `files`); what must not happen is two
-            // DIFFERENT families landing on one word.
-            if let Some(prev) = seen.get(surface.operation) {
+            // DIFFERENT handler families landing on one word, which would
+            // merge two kinds of traffic under one index key. So the map is
+            // keyed operation -> owning handler: a repeat is only allowed
+            // from the family that already owns it.
+            if let Some(prev_handler) = owner.get(surface.operation) {
                 assert_eq!(
-                    *prev, surface.operation,
-                    "{route} reuses an operation another family already owns",
+                    *prev_handler, surface.handler,
+                    "{route} takes operation {:?}, which handler {:?} already owns",
+                    surface.operation, prev_handler,
                 );
             }
-            seen.insert(surface.operation);
+            owner.insert(surface.operation, surface.handler);
         }
 
         // The handler label is a shipped Prometheus dimension: renaming one
@@ -323,7 +327,8 @@ mod tests {
             };
             let Some(Emits::Usage(expected)) = declared.get(surface).copied() else {
                 wrong.push(format!(
-                    "{surface} is driveable and reaches an upstream, but this file says it                      emits no usage event"
+                    "{surface} is driveable and reaches an upstream, but this file says it \
+                     emits no usage event"
                 ));
                 continue;
             };
@@ -354,6 +359,11 @@ mod tests {
             }
         }
 
+        assert!(
+            wrong.is_empty(),
+            "the operation on a usage event must be the one its route declares:\n  {}",
+            wrong.join("\n  "),
+        );
         // Derived, not a hand-picked floor: every driveable enforced surface
         // must have contributed an event, or this check silently covers
         // fewer routes than it appears to. WHICH surface stopped emitting is
@@ -369,11 +379,6 @@ mod tests {
             checked, driveable,
             "{checked} of {driveable} driveable surfaces produced a usage event — the \
              operation census is covering fewer routes than it appears to",
-        );
-        assert!(
-            wrong.is_empty(),
-            "the operation on a usage event must be the one its route declares:\n  {}",
-            wrong.join("\n  "),
         );
     }
 
