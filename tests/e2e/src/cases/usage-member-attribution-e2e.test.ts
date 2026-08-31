@@ -71,6 +71,10 @@ const GATEWAY_LIMITED_PLAINTEXT = "sk-usage-member-gateway-limited";
 // The member every owned credential in this case belongs to. A uuid-shaped
 // value because that is what cp-api projects (`api_keys.user_id`).
 const ALICE = "3f1b7c62-9d4e-4a51-8f0b-2c6d5e4a1b90";
+// The display name cp-api projects beside that id (AISIX-Cloud#1455). The
+// counter carries the pair so "show me Alice's 429s" can be asked with the
+// name an operator already knows instead of a uuid they have to go look up.
+const ALICE_NAME = "Alice Example";
 
 describe("usage member attribution e2e: a usage row names the org member (#1389)", () => {
   let upstream: OpenAiUpstream | undefined;
@@ -169,6 +173,7 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
       key_hash: hash("sk-usage-member-jwt-bound"),
       allowed_models: [MODEL, THROTTLED_MODEL],
       user_id: ALICE,
+      user_name: ALICE_NAME,
       jwt_subject: "alice",
       jwt_provider: "uma-idp",
     });
@@ -186,6 +191,7 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
       key_hash: hash(GATEWAY_LIMITED_PLAINTEXT),
       allowed_models: [MODEL],
       user_id: ALICE,
+      user_name: ALICE_NAME,
       rate_limit: { rpm: 1 },
     });
 
@@ -195,6 +201,7 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
       key_hash: hash(OWNED_PLAINTEXT),
       allowed_models: [MODEL, THROTTLED_MODEL],
       user_id: ALICE,
+      user_name: ALICE_NAME,
     });
 
     const proxy = new ProxyClient(app.proxyUrl, OWNED_PLAINTEXT);
@@ -253,6 +260,7 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
       return;
     }
     const marker = "uma-unowned-1d93";
+    const before: MetricSample[] = await scrapeMetrics(app.metricsUrl);
     expect((await chat(UNOWNED_PLAINTEXT, marker)).status).toBe(200);
 
     const log = await waitForSlsLog(
@@ -264,6 +272,26 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
     // Absent, not a placeholder: a member filter must not sweep up traffic
     // that belongs to no member.
     expect(log.get("user_id")).toBeUndefined();
+
+    // On the counter the same absence reads as the placeholder both halves
+    // share — a metric label set has to be uniform across the family, and
+    // an unowned key must not borrow a name from anywhere. A delta, per
+    // this suite's rule: the whole file shares one app, so an absolute
+    // sum would be answering for every other case's traffic too.
+    const after: MetricSample[] = await scrapeMetrics(app.metricsUrl);
+    expect(
+      metricDelta(before, after, "aisix_usage_events_emitted_total", (l) =>
+        l.user_id === "unknown" && l.user_name !== "unknown",
+      ),
+    ).toBe(0);
+    // …and the request DID land on the paired placeholder, so the zero
+    // above is an absence of mismatches rather than an absence of traffic.
+    expect(
+      metricDelta(before, after, "aisix_usage_events_emitted_total", {
+        user_id: "unknown",
+        user_name: "unknown",
+      }),
+    ).toBeGreaterThanOrEqual(1);
   });
 
   test("a gateway rate-limit 429 reaches the feed with the member on it", async (ctx) => {
@@ -297,6 +325,7 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
     expect(
       metricDelta(before, after, "aisix_usage_events_emitted_total", {
         user_id: ALICE,
+        user_name: ALICE_NAME,
         status: "429",
       }),
     ).toBeGreaterThanOrEqual(1);
@@ -330,6 +359,21 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
         status: "429",
       }),
     ).toBeGreaterThanOrEqual(1);
+    // AISIX-Cloud#1455: the readable name rides on the same sample. It is
+    // filled from the event beside the id, so a sample carrying one and
+    // not the other would mean the two came from different places.
+    expect(
+      metricDelta(before, after, "aisix_usage_events_emitted_total", {
+        user_id: ALICE,
+        user_name: ALICE_NAME,
+        status: "429",
+      }),
+    ).toBeGreaterThanOrEqual(1);
+    expect(
+      metricDelta(before, after, "aisix_usage_events_emitted_total", (l) =>
+        l.user_id === ALICE && l.user_name !== ALICE_NAME,
+      ),
+    ).toBe(0);
     // The status family survives beside the raw code, so a dashboard
     // written against `status_code="4xx"` keeps working unchanged.
     expect(

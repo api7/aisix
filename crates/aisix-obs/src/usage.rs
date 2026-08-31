@@ -87,6 +87,20 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub user_id: String,
 
+    /// Display name of the member `user_id` names, for the `user_name`
+    /// metric label the usage-event counters carry beside `user_id`
+    /// (AISIX-Cloud#1455). Read off the same ApiKey row as `user_id` by
+    /// `apply_caller_identity`, which is what keeps the pair from ever
+    /// naming a member and someone else's name.
+    ///
+    /// NOT part of the DP -> cp-api wire contract: cp-api resolves member
+    /// names from its own tables, so shipping a second copy would only
+    /// give that name a way to disagree with itself. It rides the event
+    /// purely so `UsageSink::try_emit` — the one place `user_id` becomes a
+    /// label — can stamp both halves together.
+    #[serde(skip)]
+    pub user_name: String,
+
     /// The model alias exactly as the client sent it in the request
     /// body (`model` field) — a Model-Group name for routed requests,
     /// a direct model's display name otherwise. `model_id` records the
@@ -787,21 +801,31 @@ impl UsageSink {
     /// them: its `requested_model` is caller-controlled text (#451) and it
     /// carries no ProviderKey id at all.
     ///
-    /// The one attribution dimension that DOES come off the event is
-    /// `user_id` (AISIX-Cloud#1389): it is a resolved ApiKey field, not
-    /// caller text, and taking it here rather than from each handler's
-    /// label builder is what makes the counter and the row cp-api persists
-    /// structurally incapable of naming different members.
+    /// The attribution dimensions that DO come off the event are the
+    /// member pair `user_id` / `user_name` (AISIX-Cloud#1389, #1455): both
+    /// are resolved ApiKey fields, not caller text, and taking them here
+    /// rather than from each handler's label builder is what makes the
+    /// counter and the row cp-api persists structurally incapable of
+    /// naming different members. They are stamped together for the same
+    /// reason `PkLabels` keeps a key's id and name together — a name that
+    /// can be sourced separately from its id is a name that will
+    /// eventually be wrong.
     pub fn try_emit(&self, handler: &'static str, event: UsageEvent, labels: UsageEventLabels<'_>) {
         log_provider_call(handler, &event);
         // Owned because `event` is moved into the channel below while the
-        // drop counter still needs the label.
+        // drop counter still needs the labels.
         let user_id = event.user_id.clone();
+        let user_name = event.user_name.clone();
         let labels = UsageEventLabels {
             user_id: if user_id.is_empty() {
                 "unknown"
             } else {
                 user_id.as_str()
+            },
+            user_name: if user_name.is_empty() {
+                "unknown"
+            } else {
+                user_name.as_str()
             },
             ..labels
         };
@@ -1208,13 +1232,17 @@ mod tests {
                 // Attribution the sink reads off the event itself, not off
                 // the label set the handler built.
                 user_id: "member-1".into(),
+                user_name: "Alice Example".into(),
                 ..Default::default()
             },
             UsageEventLabels {
                 model: "customer-chat",
                 provider_key_id: "pk-1",
                 provider_key_name: "openai-prod",
+                // Both halves of the member pair are the sink's to fill:
+                // whatever a handler puts here has to lose to the event.
                 user_id: "unknown",
+                user_name: "unknown",
                 upstream_protocol: "openai",
             },
         );
@@ -1229,6 +1257,7 @@ mod tests {
                 ("provider_key_id", "pk-1"),
                 ("provider_key_name", "openai-prod"),
                 ("user_id", "member-1"),
+                ("user_name", "Alice Example"),
                 // The raw code sits beside the family, so a query can name
                 // one failure mode without giving up the family rollup.
                 ("status_code", "4xx"),
@@ -1244,6 +1273,7 @@ mod tests {
                 ("provider_key_id", "pk-1"),
                 ("provider_key_name", "openai-prod"),
                 ("user_id", "member-1"),
+                ("user_name", "Alice Example"),
             ],
         );
         assert_eq!(

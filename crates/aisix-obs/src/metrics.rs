@@ -269,8 +269,10 @@ pub const M_GUARDRAIL_LATENCY_SECONDS: &str = "aisix_guardrail_latency_seconds";
 ///   series over `status_code` alone (the raw code determines the family),
 ///   and `status_code` is kept so dashboards and alerts written against
 ///   `status_code="4xx"` keep working unchanged.
-/// - `user_id`: the org member behind the request, from
-///   [`UsageEventLabels`].
+/// - `user_id` / `user_name`: the org member behind the request and
+///   their display name, from [`UsageEventLabels`]. Both come off one
+///   ApiKey row, so the name is determined by the id and the pair is one
+///   series, not one per name.
 /// - `inbound_protocol`: `openai` / `anthropic`. Matches the
 ///   wire-level field on UsageEvent.
 /// - `upstream_protocol`: the wire protocol of the ProviderKey the event
@@ -1973,6 +1975,7 @@ impl Metrics {
                 k.label(labels.api_key_id);
                 k.label(labels.team_id);
                 k.label(labels.user_id);
+                k.label(labels.user_name);
             },
             || {
                 metrics::gauge!(
@@ -1980,6 +1983,7 @@ impl Metrics {
                     "api_key_id" => labels.api_key_id.to_string(),
                     "team_id" => labels.team_id.to_string(),
                     "user_id" => labels.user_id.to_string(),
+                    "user_name" => labels.user_name.to_string(),
                 )
             },
         );
@@ -2028,8 +2032,8 @@ impl Metrics {
     /// (`handler` / `status_code` / `status` / `inbound_protocol`
     /// are the emit counter's own arguments, not attribution, and stay
     /// one-sided — `emitted == delivered + dropped` is an invariant over
-    /// the attribution dimensions, which is why `user_id` DOES appear on
-    /// both.)
+    /// the attribution dimensions, which is why the member pair `user_id`
+    /// / `user_name` DOES appear on both.)
     pub fn record_usage_event_drop(&self, reason: &str, labels: UsageEventLabels<'_>) {
         self.cached_counter(
             M_USAGE_EVENT_DROPS_TOTAL,
@@ -2040,6 +2044,7 @@ impl Metrics {
                 k.label(labels.provider_key_id);
                 k.label(labels.provider_key_name);
                 k.label(labels.user_id);
+                k.label(labels.user_name);
                 k.label(labels.upstream_protocol);
             },
             || {
@@ -2050,6 +2055,7 @@ impl Metrics {
                     "provider_key_id" => labels.provider_key_id.to_string(),
                     "provider_key_name" => labels.provider_key_name.to_string(),
                     "user_id" => labels.user_id.to_string(),
+                    "user_name" => labels.user_name.to_string(),
                     "upstream_protocol" => labels.upstream_protocol.to_string(),
                 )
             },
@@ -2071,8 +2077,8 @@ impl Metrics {
     ///   `&'static str` here prevents user-controlled cardinality)
     ///
     /// [`UsageEventLabels`] adds the model, the ProviderKey the event was
-    /// attributed to (AISIX-Cloud#1317) and that key's `upstream_protocol`
-    /// (AISIX-Cloud#1403). Those cannot be `&'static str`, so they are
+    /// attributed to (AISIX-Cloud#1317), that key's `upstream_protocol`
+    /// (AISIX-Cloud#1403) and the member pair `user_id` / `user_name`. Those cannot be `&'static str`, so they are
     /// bounded at the proxy's emit chokepoint instead — see that type. The
     /// dimensions they add are ones `aisix_llm_requests_total` already
     /// carries, so this counter stays well inside the request families'
@@ -2097,6 +2103,7 @@ impl Metrics {
                 k.label(labels.provider_key_id);
                 k.label(labels.provider_key_name);
                 k.label(labels.user_id);
+                k.label(labels.user_name);
                 k.label(labels.upstream_protocol);
             },
             || {
@@ -2111,6 +2118,7 @@ impl Metrics {
                     "provider_key_id" => labels.provider_key_id.to_string(),
                     "provider_key_name" => labels.provider_key_name.to_string(),
                     "user_id" => labels.user_id.to_string(),
+                    "user_name" => labels.user_name.to_string(),
                 )
             },
         );
@@ -2706,10 +2714,9 @@ pub struct UsageEventLabels<'a> {
     pub provider_key_name: &'a str,
     /// Org member the authenticating key belongs to (AISIX-Cloud#1389) —
     /// the same `user_id` `aisix_proxy_requests_total` carries, so a
-    /// member's request rate and their usage-event rate slice alike, and
-    /// the readable `user_name` is joinable from that family rather than
-    /// duplicated here. `unknown` when the key is bound to no member, or
-    /// when auth never resolved a key.
+    /// member's request rate and their usage-event rate slice alike.
+    /// `unknown` when the key is bound to no member, or when auth never
+    /// resolved a key.
     ///
     /// This is attribution, so it sits on BOTH counters: "which member's
     /// usage records were lost" is exactly the question the shared label
@@ -2717,6 +2724,20 @@ pub struct UsageEventLabels<'a> {
     /// the event's own `user_id`, so the counter and the row cp-api
     /// persists can never name different people.
     pub user_id: &'a str,
+    /// Readable display name of the member `user_id` names
+    /// (AISIX-Cloud#1455). One series per (id, name) pair rather than per
+    /// name: the two are read off one ApiKey row, so at any instant the
+    /// name is determined by the id and the label costs nothing. The name
+    /// is a SNAPSHOT of the row, not a live read: cp-api stamps it when it
+    /// projects the ApiKey, and nothing reprojects a key just because its
+    /// member was renamed — so a rename shows up here only once that key is
+    /// next written for some other reason, and splits the counter into a
+    /// before and an after series when it does.
+    ///
+    /// Filled from the event beside `user_id` in `UsageSink::try_emit`
+    /// rather than by each handler's label builder, so the two cannot
+    /// name different people. `unknown` whenever `user_id` is.
+    pub user_name: &'a str,
     /// The upstream wire protocol of the key named by `provider_key_id`
     /// (AISIX-Cloud#1403) — the same value, resolved the same way, that
     /// the request and usage families carry, so an operator can align
@@ -2738,6 +2759,7 @@ impl Default for UsageEventLabels<'_> {
             provider_key_id: "unknown",
             provider_key_name: "unknown",
             user_id: "unknown",
+            user_name: "unknown",
             upstream_protocol: "unknown",
         }
     }
@@ -2799,6 +2821,22 @@ pub struct BudgetLabels<'a> {
     pub api_key_id: &'a str,
     pub team_id: &'a str,
     pub user_id: &'a str,
+    /// Readable display name of the member `user_id` names
+    /// (AISIX-Cloud#1455), read off the same ApiKey row so the name is
+    /// determined by the id and the pair costs no series over `user_id`
+    /// alone. `unknown` whenever `user_id` is.
+    ///
+    /// These are GAUGES, and this recorder registers no idle timeout, so
+    /// a label set that stops being written stays at its last value: if a
+    /// rename ever does reach the ApiKey row (see [`UsageEventLabels`] —
+    /// it takes a later write of that key), the pre-rename sample stays
+    /// behind, and a `sum` that does not group by the member counts both.
+    /// That is true of every label on this family that can change under a
+    /// fixed `api_key_id`: rebinding a key's team or owner strands its
+    /// samples the same way. `clear_budget_gauges` does not help — it
+    /// zeroes `details_present` for the label set it is handed, which is
+    /// the new one.
+    pub user_name: &'a str,
 }
 
 impl Default for BudgetLabels<'_> {
@@ -2807,6 +2845,7 @@ impl Default for BudgetLabels<'_> {
             api_key_id: "unknown",
             team_id: "unknown",
             user_id: "unknown",
+            user_name: "unknown",
         }
     }
 }
@@ -3728,11 +3767,13 @@ mod tests {
             api_key_id: "ak-a",
             team_id: "team-a",
             user_id: "user-a",
+            user_name: "alice",
         };
         let key_b = BudgetLabels {
             api_key_id: "ak-b",
             team_id: "team-b",
             user_id: "user-b",
+            user_name: "bob",
         };
         metrics.set_budget_gauges(
             key_a,
@@ -3768,7 +3809,15 @@ mod tests {
             let line = series(metric, "team-a")
                 .unwrap_or_else(|| panic!("{metric} missing for team-a:\n{rendered}"));
             assert!(line.ends_with(&format!(" {value}")), "got: {line}");
-            assert!(line.contains("api_key_id=\"ak-a\"") && line.contains("user_id=\"user-a\""));
+            assert!(
+                line.contains("api_key_id=\"ak-a\"")
+                    && line.contains("user_id=\"user-a\"")
+                    // AISIX-Cloud#1455: the member's readable name rides
+                    // beside their id here for the same reason it does on
+                    // the request families — a budget alert that can only
+                    // name a UUID is one an operator has to go look up.
+                    && line.contains("user_name=\"alice\"")
+            );
         }
         // Key B must have its OWN spent series, not overwrite A's.
         assert!(series(M_BUDGET_SPENT_USD, "team-b").is_some_and(|l| l.ends_with(" 7")));
@@ -4081,6 +4130,7 @@ mod tests {
             api_key_id: "ak",
             team_id: "t",
             user_id: "u",
+            user_name: "n",
         };
         let variants = [
             BudgetLabels {
@@ -4093,6 +4143,13 @@ mod tests {
             },
             BudgetLabels {
                 user_id: "u2",
+                ..base
+            },
+            // A rename keeps the id and changes only the name. Off the
+            // worker key, the gauge would keep reporting this member
+            // under their old name for as long as the worker lives.
+            BudgetLabels {
+                user_name: "n2",
                 ..base
             },
         ];
@@ -4317,6 +4374,7 @@ mod tests {
         provider_key_id: "pk-1",
         provider_key_name: "openai-prod",
         user_id: "member-1",
+        user_name: "alice",
         upstream_protocol: "openai",
     };
 
@@ -4363,7 +4421,19 @@ mod tests {
                 ..PK_A
             },
         );
-        assert_one_series_per_label_set(&m.render(), M_USAGE_EVENT_EMITS_TOTAL, 7);
+        // AISIX-Cloud#1455: a renamed member keeps their id, so the name
+        // has to be part of the key or this counter reports them under
+        // the old name for the worker's lifetime.
+        m.record_usage_event_emit(
+            "chat",
+            200,
+            "openai",
+            UsageEventLabels {
+                user_name: "alice-renamed",
+                ..PK_A
+            },
+        );
+        assert_one_series_per_label_set(&m.render(), M_USAGE_EVENT_EMITS_TOTAL, 8);
     }
 
     /// AISIX-Cloud#1403: the label survives onto the exposition, with the
@@ -4414,7 +4484,14 @@ mod tests {
                 ..PK_A
             },
         );
-        assert_one_series_per_label_set(&m.render(), M_USAGE_EVENT_DROPS_TOTAL, 3);
+        m.record_usage_event_drop(
+            "sink_full",
+            UsageEventLabels {
+                user_name: "alice-renamed",
+                ..PK_A
+            },
+        );
+        assert_one_series_per_label_set(&m.render(), M_USAGE_EVENT_DROPS_TOTAL, 4);
     }
 
     /// AISIX-Cloud#1317: the two counters are read as one pair —
@@ -5076,7 +5153,17 @@ mod tests {
         assert!(out.contains("status_class=\"2xx\""));
         assert!(out.contains("streaming=\"false\""));
         assert!(out.contains("streaming=\"true\""));
-        for high_card in ["api_key_id", "user_id", "team_id", "provider_key_id"] {
+        // Substring matches, so each NAME label has to be listed beside its
+        // id: `contains("user_id")` does not see `user_name`, and these
+        // histograms are the one family the id/name pair must NOT reach.
+        for high_card in [
+            "api_key_id",
+            "user_id",
+            "user_name",
+            "team_id",
+            "provider_key_id",
+            "provider_key_name",
+        ] {
             for line in out.lines().filter(|l| l.contains("aisix_request_")) {
                 assert!(
                     !line.contains(high_card),

@@ -1192,6 +1192,7 @@ fn emit_tool_call_usage(
         &mut event,
         auth.jwt.as_ref(),
         auth.key().user_id.as_deref(),
+        auth.key().user_name.as_deref(),
     );
     crate::usage_attr::apply_auth_type(&mut event, auth);
     // A tool call resolves neither a model nor a ProviderKey, so the
