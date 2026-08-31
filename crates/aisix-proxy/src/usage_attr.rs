@@ -310,7 +310,7 @@ pub(crate) fn total_tokens_with_cache(
 /// The `model` metric label for a request whose client-supplied `model`
 /// field never resolved to a configured model (e.g. model-not-found). See
 /// [`metric_model_label`].
-pub(crate) const UNRESOLVED_MODEL_LABEL: &str = "unresolved";
+pub const UNRESOLVED_MODEL_LABEL: &str = "unresolved";
 
 /// Bound the `model` metric label to the configured set. A request's `model`
 /// field is arbitrary caller-controlled text until it resolves against the

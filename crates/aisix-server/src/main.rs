@@ -335,7 +335,9 @@ fn gauge_series_is_live(snap: &AisixSnapshot, series: aisix_obs::LiveGaugeSeries
     const UNKNOWN: &str = "unknown";
     // What `metric_model_label` emits when nothing resolved. It names no
     // row, so it is a placeholder like `unknown` and must never be retired.
-    const UNRESOLVED: &str = "unresolved";
+    // Taken from the emitter's own constant rather than spelled again here:
+    // the two drifting apart would silently start retiring live series.
+    const UNRESOLVED: &str = aisix_proxy::UNRESOLVED_MODEL_LABEL;
     match series {
         aisix_obs::LiveGaugeSeries::Budget {
             api_key_id,
