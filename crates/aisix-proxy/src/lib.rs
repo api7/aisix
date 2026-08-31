@@ -5586,12 +5586,16 @@ data: [DONE]\n\n";
         snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
 
         let app = build_router(build_state(snap, hub));
-        let call = || {
+        // The streaming and non-streaming dispatch loops are separate
+        // copies of the same logic and drifted apart once already, so
+        // both are exercised here against the one shared bucket.
+        let call = |stream: bool| {
             let app = app.clone();
             async move {
                 let body = serde_json::json!({
                     "model": "smart",
-                    "messages": [{"role": "user", "content": "hi"}]
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": stream,
                 });
                 let req = Request::builder()
                     .method("POST")
@@ -5604,32 +5608,41 @@ data: [DONE]\n\n";
             }
         };
 
-        assert_eq!(call().await.status(), StatusCode::OK);
+        fn assert_headers(resp: axum::http::Response<Body>, which: &str) {
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "{which}");
+            let headers = resp.headers();
+            assert_eq!(
+                headers
+                    .get("x-ratelimit-scope")
+                    .and_then(|v| v.to_str().ok()),
+                Some("rpm"),
+                "{which}: an exhausted group must report the target limit that refused it",
+            );
+            assert_eq!(
+                headers
+                    .get("x-ratelimit-limit")
+                    .and_then(|v| v.to_str().ok()),
+                Some("1"),
+                "{which}",
+            );
+            assert_eq!(
+                headers
+                    .get("x-ratelimit-remaining")
+                    .and_then(|v| v.to_str().ok()),
+                Some("0"),
+                "{which}",
+            );
+            assert!(headers.contains_key("x-ratelimit-reset"), "{which}");
+            assert!(headers.contains_key("retry-after"), "{which}");
+        }
 
-        let resp = call().await;
-        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-        let headers = resp.headers();
-        assert_eq!(
-            headers
-                .get("x-ratelimit-scope")
-                .and_then(|v| v.to_str().ok()),
-            Some("rpm"),
-            "an exhausted group must report the target limit that refused it",
-        );
-        assert_eq!(
-            headers
-                .get("x-ratelimit-limit")
-                .and_then(|v| v.to_str().ok()),
-            Some("1"),
-        );
-        assert_eq!(
-            headers
-                .get("x-ratelimit-remaining")
-                .and_then(|v| v.to_str().ok()),
-            Some("0"),
-        );
-        assert!(headers.contains_key("x-ratelimit-reset"));
-        assert!(headers.contains_key("retry-after"));
+        // Non-streaming: the first call burns the target's only slot.
+        assert_eq!(call(false).await.status(), StatusCode::OK);
+        assert_headers(call(false).await, "non-streaming");
+
+        // Streaming runs the second copy of the loop against the same,
+        // now-exhausted bucket.
+        assert_headers(call(true).await, "streaming");
     }
 
     fn routing_entry(
