@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   slsLogsFor,
   spawnApp,
@@ -221,17 +222,15 @@ describe("usage operation e2e (AISIX-Cloud#1461)", () => {
       );
       await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
 
-      await waitConfigPropagation(async () => {
-        try {
-          const r = await postJson(app, "/v1/chat/completions", {
-            model: CHAT_MODEL,
-            messages: [{ role: "user", content: "warmup" }],
-          });
-          return r.status === 200;
-        } catch {
-          return false;
-        }
-      });
+      // The caller key is seeded last, so it authenticating implies every
+      // model and the exporter above are already in the snapshot. Per
+      // tests/e2e/AGENTS.md the gate must not drive the behavior under test
+      // (a broken operation would then surface as a 30s propagation timeout
+      // instead of an assertion) and must not swallow errors — `listModels`
+      // returns a status rather than throwing, so a transport failure cannot
+      // be mistaken for "not ready yet".
+      const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+      await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
 
       // --- the three routes that used to be one `openai` stream ----------
       expect(
