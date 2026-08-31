@@ -303,6 +303,58 @@ fn run_validate(resources: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Is this gauge label set still describing something the configuration
+/// contains?
+///
+/// The retirement sweep asks this per series; `false` marks the series as
+/// no longer current (see `Metrics::retire_stale_gauges`). Two rules keep
+/// it from retiring live data:
+///
+/// - A placeholder is never retired. `"unknown"` is what these label
+///   builders emit when a resource could not be resolved, so it names
+///   nothing to look up — and retiring it would fight the emitter, which
+///   goes on writing that same placeholder every health tick.
+/// - Absence has to be POSITIVE. Only a resolvable label whose resource is
+///   gone counts as dead; anything this cannot decide stays live, because a
+///   wrongly retired series hides real state.
+///
+/// The budget family additionally compares the whole member triple rather
+/// than just the key's existence: rebinding a key to another team or member
+/// starts a NEW series and strands the old one under the same
+/// `api_key_id`, which is the case a bare existence check misses.
+fn gauge_series_is_live(snap: &AisixSnapshot, series: aisix_obs::LiveGaugeSeries<'_>) -> bool {
+    const UNKNOWN: &str = "unknown";
+    let model_alive = |name: &str| name == UNKNOWN || snap.models.get_by_name(name).is_some();
+    match series {
+        aisix_obs::LiveGaugeSeries::Budget {
+            api_key_id,
+            team_id,
+            user_id,
+            user_name,
+        } => {
+            let Some(entry) = snap.apikeys.get_by_id(api_key_id) else {
+                return false;
+            };
+            let key = &entry.value;
+            key.team_id.as_deref().unwrap_or(UNKNOWN) == team_id
+                && key.user_id.as_deref().unwrap_or(UNKNOWN) == user_id
+                && key.user_name.as_deref().unwrap_or(UNKNOWN) == user_name
+        }
+        aisix_obs::LiveGaugeSeries::RatelimitRemaining { api_key_id, model } => {
+            snap.apikeys.get_by_id(api_key_id).is_some() && model_alive(model)
+        }
+        aisix_obs::LiveGaugeSeries::DeploymentState {
+            model,
+            provider_key_id,
+            ..
+        } => {
+            model_alive(model)
+                && (provider_key_id == UNKNOWN
+                    || snap.provider_keys.get_by_id(provider_key_id).is_some())
+        }
+    }
+}
+
 /// SIGHUP → re-run the whole file-source pipeline against the same
 /// resources file. Success swaps the snapshot atomically (the same
 /// [`SnapshotHandle::store`] the etcd watch supervisor uses), stamping
@@ -825,10 +877,20 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     ));
     let metrics_upkeep_task = {
         let metrics = metrics.clone();
+        let snapshot = snapshot_handle.clone();
         tokio::spawn(run_periodic(
             cancel_rx.clone(),
             Duration::from_secs(5),
-            move || metrics.run_upkeep(),
+            move || {
+                metrics.run_upkeep();
+                // Retire the gauge series whose key is gone. These families
+                // are written only from the request (or health-check) path,
+                // and the recorder registers no idle timeout, so a deleted
+                // or rebound api key leaves a sample frozen at its last
+                // value while still claiming to describe the present.
+                let snap = snapshot.load();
+                metrics.retire_stale_gauges(|series| gauge_series_is_live(&snap, series));
+            },
         ))
     };
     // Cache backends (#519 B.8). The memory cache is always built
@@ -2515,6 +2577,131 @@ mod tests {
             matches!(enable_jemalloc_background_thread(), Ok(true)),
             "background_thread did not enable on a linux-gnu target"
         );
+    }
+
+    fn snapshot_with_key(
+        id: &str,
+        team: Option<&str>,
+        user: Option<&str>,
+        name: Option<&str>,
+    ) -> AisixSnapshot {
+        let key: aisix_core::ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": "h",
+            "allowed_models": [],
+            "team_id": team,
+            "user_id": user,
+            "user_name": name,
+        }))
+        .unwrap();
+        let snap = AisixSnapshot::new();
+        snap.apikeys
+            .insert(aisix_core::resource::ResourceEntry::new(id, key, 1));
+        snap
+    }
+
+    /// The case the sweep exists for: the api key is gone, so its budget
+    /// label set describes nothing and must be reported dead.
+    #[test]
+    fn a_deleted_key_is_not_live() {
+        let snap = AisixSnapshot::new();
+        assert!(!gauge_series_is_live(
+            &snap,
+            aisix_obs::LiveGaugeSeries::Budget {
+                api_key_id: "ak-gone",
+                team_id: "t",
+                user_id: "u",
+                user_name: "alice",
+            }
+        ));
+    }
+
+    /// A bare "does the key exist" check would call BOTH label sets live
+    /// after a rebind and leave the pre-rebind sample frozen forever. The
+    /// whole member triple has to match.
+    #[test]
+    fn a_rebound_key_leaves_only_its_current_label_set_live() {
+        let snap = snapshot_with_key("ak-1", Some("team-new"), Some("u"), Some("alice"));
+        let at = |team, user, name| aisix_obs::LiveGaugeSeries::Budget {
+            api_key_id: "ak-1",
+            team_id: team,
+            user_id: user,
+            user_name: name,
+        };
+        assert!(gauge_series_is_live(&snap, at("team-new", "u", "alice")));
+        assert!(!gauge_series_is_live(&snap, at("team-old", "u", "alice")));
+        assert!(!gauge_series_is_live(
+            &snap,
+            at("team-new", "u-old", "alice")
+        ));
+        // A rename strands the old name under the same id, same as a rebind.
+        assert!(!gauge_series_is_live(
+            &snap,
+            at("team-new", "u", "Alice Before")
+        ));
+    }
+
+    /// An unbound key projects `unknown` for the member triple; that IS its
+    /// current label set, so it must stay live.
+    #[test]
+    fn an_unbound_key_is_live_under_its_placeholders() {
+        let snap = snapshot_with_key("ak-1", None, None, None);
+        assert!(gauge_series_is_live(
+            &snap,
+            aisix_obs::LiveGaugeSeries::Budget {
+                api_key_id: "ak-1",
+                team_id: "unknown",
+                user_id: "unknown",
+                user_name: "unknown",
+            }
+        ));
+    }
+
+    /// `unknown` names nothing to look up. Retiring it would fight the
+    /// emitter — the health checker re-writes that exact placeholder on
+    /// every tick — and flap the series between a value and NaN.
+    #[test]
+    fn placeholder_labels_are_never_retired() {
+        let snap = AisixSnapshot::new();
+        assert!(gauge_series_is_live(
+            &snap,
+            aisix_obs::LiveGaugeSeries::DeploymentState {
+                provider: "unknown",
+                model: "unknown",
+                upstream_model: "unknown",
+                provider_key_id: "unknown",
+            }
+        ));
+        // A resolvable name that is genuinely absent is a different thing.
+        assert!(!gauge_series_is_live(
+            &snap,
+            aisix_obs::LiveGaugeSeries::DeploymentState {
+                provider: "openai",
+                model: "gpt-4o",
+                upstream_model: "gpt-4o",
+                provider_key_id: "unknown",
+            }
+        ));
+    }
+
+    /// The rate-limit gauges are keyed by a key AND a model; losing either
+    /// leaves the pair describing nothing.
+    #[test]
+    fn rate_limit_remaining_needs_both_halves_of_its_key() {
+        let snap = snapshot_with_key("ak-1", None, None, None);
+        assert!(!gauge_series_is_live(
+            &snap,
+            aisix_obs::LiveGaugeSeries::RatelimitRemaining {
+                api_key_id: "ak-1",
+                model: "gpt-4o",
+            }
+        ));
+        assert!(!gauge_series_is_live(
+            &snap,
+            aisix_obs::LiveGaugeSeries::RatelimitRemaining {
+                api_key_id: "ak-gone",
+                model: "unknown",
+            }
+        ));
     }
 
     #[tokio::test(start_paused = true)]
