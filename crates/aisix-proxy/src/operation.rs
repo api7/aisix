@@ -282,13 +282,104 @@ mod tests {
         }
 
         // The handler label is a shipped Prometheus dimension: renaming one
-        // silently empties every query built on it.
-        assert_eq!(IMAGE_GENERATION.handler, IMAGE_EDIT.handler);
-        assert_eq!(TRANSCRIPTION.handler, SPEECH.handler);
-        assert_eq!(VIDEO_GENERATION.handler, "videos");
-        assert_eq!(PASSTHROUGH.handler, "passthrough_route");
-        assert_eq!(CHAT.handler, "chat");
-        assert_eq!(EMBEDDINGS.handler, "embeddings");
+        // silently empties every query built on it. Pinned absolutely and in
+        // full — a relative equality (`IMAGE_GENERATION.handler ==
+        // IMAGE_EDIT.handler`) survives renaming both, and an unlisted
+        // constant survives renaming outright. `BATCH_COMPLETION` is the one
+        // most likely to be "tidied" to match its operation; its handler is
+        // `batch`, and a customer's dashboard queries that word.
+        for (surface, handler) in [
+            (CHAT, "chat"),
+            (COMPLETIONS, "completions"),
+            (MESSAGES, "messages"),
+            (COUNT_TOKENS, "count_tokens"),
+            (RESPONSES, "responses"),
+            (EMBEDDINGS, "embeddings"),
+            (RERANK, "rerank"),
+            (REALTIME, "realtime"),
+            (FILES, "files"),
+            (BATCHES, "batches"),
+            (FINE_TUNING, "fine_tuning"),
+            (MCP, "mcp"),
+            (A2A, "a2a"),
+            (IMAGE_GENERATION, "images"),
+            (IMAGE_EDIT, "images"),
+            (TRANSCRIPTION, "audio"),
+            (TRANSLATION, "audio"),
+            (SPEECH, "audio"),
+            (VIDEO_GENERATION, "videos"),
+            (PASSTHROUGH, "passthrough_route"),
+            (BATCH_COMPLETION, "batch"),
+        ] {
+            assert_eq!(
+                surface.handler, handler,
+                "the {:?} surface renamed a shipped Prometheus handler label",
+                surface.operation,
+            );
+        }
+    }
+
+    /// Surfaces with no route of their own, which the route census above
+    /// therefore cannot see. A new one must be listed here or the doc census
+    /// below will report its operation as undocumented.
+    const NON_ROUTE: &[Surface] = &[BATCH_COMPLETION];
+
+    /// Every operation this crate can emit, from the two places they come
+    /// from: the route table (itself pinned to `build_router`) and the
+    /// routeless surfaces above.
+    fn emitted_operations() -> BTreeSet<&'static str> {
+        ROUTE_OPERATIONS
+            .iter()
+            .filter_map(|(_, emits)| match emits {
+                Emits::Usage(surface) => Some(surface.operation),
+                Emits::Nothing(_) => None,
+            })
+            .chain(NON_ROUTE.iter().map(|s| s.operation))
+            .collect()
+    }
+
+    /// `UsageEvent::operation`'s doc comment restates the value set, and says
+    /// a consumer should take it verbatim — the control plane builds its Logs
+    /// filter as a picker over exactly such a fixed set. So it is a second
+    /// definition of this module's vocabulary, in another crate, and it has
+    /// already drifted once: it listed two values nothing emits and omitted
+    /// one that is emitted.
+    ///
+    /// Parsed rather than re-copied, the same move `ROUTE_OPERATIONS` makes
+    /// against `build_router`.
+    #[test]
+    fn the_wire_field_documents_exactly_what_this_crate_emits() {
+        const USAGE_SRC: &str = include_str!("../../aisix-obs/src/usage.rs");
+        const OPENER: &str = "What the caller asked the gateway to DO, from a fixed set:";
+
+        let start = USAGE_SRC
+            .find(OPENER)
+            .expect("UsageEvent::operation must still introduce its value set with that sentence");
+        let rest = &USAGE_SRC[start + OPENER.len()..];
+        // The list runs to the end of that doc paragraph — the first line
+        // carrying no value, i.e. the bare `///` separator.
+        let end = rest
+            .find("\n    ///\n")
+            .expect("the value list must be its own doc paragraph");
+        let listed = &rest[..end];
+
+        let mut documented = BTreeSet::new();
+        let mut chars = listed.split('`');
+        // Odd-indexed pieces are the backtick-delimited values.
+        chars.next();
+        while let Some(value) = chars.next() {
+            documented.insert(value);
+            chars.next();
+        }
+
+        let emitted = emitted_operations();
+        assert_eq!(
+            documented,
+            emitted,
+            "UsageEvent::operation's doc comment and this module disagree.\n               documented but never emitted: {:?}\n               emitted but undocumented: {:?}",
+            documented.difference(&emitted).collect::<Vec<_>>(),
+            emitted.difference(&documented).collect::<Vec<_>>(),
+        );
     }
 
     /// The declared operation is what a driven request actually reports.

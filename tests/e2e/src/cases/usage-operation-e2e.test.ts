@@ -4,7 +4,6 @@ import {
   EtcdClient,
   ProxyClient,
   SeedClient,
-  slsLogsFor,
   spawnApp,
   startMockSls,
   startOpenAiUpstream,
@@ -50,6 +49,8 @@ const CHAT_MODEL = "op1461-chat";
 const RESPONSES_MODEL = "op1461-responses";
 const IMAGES_MODEL = "op1461-images";
 const SPEECH_MODEL = "op1461-speech";
+/** Serves BOTH audio-upload routes, so their rows differ only by the field under test. */
+const AUDIO_IN_MODEL = "op1461-audio-in";
 const VIDEO_MODEL = "op1461-video";
 
 function chatBody(text: string) {
@@ -113,12 +114,55 @@ async function rowFor(sls: MockSls, model: string): Promise<Map<string, string>>
   );
 }
 
+/**
+ * The row one specific call produced, found by the id the gateway echoed in
+ * `x-aisix-request-id`.
+ *
+ * The paired routes below — the two image routes, the two audio-upload
+ * routes — are driven against ONE model each, so `requested_model` cannot
+ * separate them and a set assertion over both rows cannot either: swapping
+ * the two constants at their emit sites leaves the same set. Reading each
+ * call's own row is what makes the pair meaningful, and the shared model
+ * still guarantees that nothing but the field under test distinguishes them.
+ */
+async function rowForRequest(sls: MockSls, requestId: string): Promise<Map<string, string>> {
+  expect(requestId).not.toBe("");
+  return waitForSlsLog(
+    sls,
+    META_LOGSTORE,
+    (log) => log.get("request_id") === requestId,
+    `a row for request_id=${requestId}`,
+  );
+}
+
+/** POST a multipart form and hand back the gateway's request id for the call. */
+async function postForm(
+  app: SpawnedApp,
+  path: string,
+  parts: Record<string, string | Blob>,
+): Promise<string> {
+  const form = new FormData();
+  for (const [name, value] of Object.entries(parts)) {
+    if (value instanceof Blob) form.set(name, value, "a.bin");
+    else form.set(name, value);
+  }
+  const res = await fetch(`${app.proxyUrl}${path}`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+    body: form,
+  });
+  await res.arrayBuffer();
+  expect(res.status).toBe(200);
+  return res.headers.get("x-aisix-request-id") ?? "";
+}
+
 describe("usage operation e2e (AISIX-Cloud#1461)", () => {
   let etcdReachable = false;
   let chatUpstream: OpenAiUpstream | undefined;
   let responsesUpstream: OpenAiUpstream | undefined;
   let imagesUpstream: OpenAiUpstream | undefined;
   let speechUpstream: OpenAiUpstream | undefined;
+  let audioInUpstream: OpenAiUpstream | undefined;
   let videoUpstream: OpenAiUpstream | undefined;
   let sls: MockSls | undefined;
   const apps: SpawnedApp[] = [];
@@ -133,6 +177,9 @@ describe("usage operation e2e (AISIX-Cloud#1461)", () => {
     });
     speechUpstream = await startOpenAiUpstream({
       nonStreamBody: { fake: "binary-audio-placeholder" },
+    });
+    audioInUpstream = await startOpenAiUpstream({
+      nonStreamBody: { text: "the speaker said something" },
     });
     videoUpstream = await startOpenAiUpstream({
       nonStreamBody: {
@@ -149,6 +196,7 @@ describe("usage operation e2e (AISIX-Cloud#1461)", () => {
     await responsesUpstream?.close();
     await imagesUpstream?.close();
     await speechUpstream?.close();
+    await audioInUpstream?.close();
     await videoUpstream?.close();
     await sls?.close();
   });
@@ -162,6 +210,7 @@ describe("usage operation e2e (AISIX-Cloud#1461)", () => {
         !responsesUpstream ||
         !imagesUpstream ||
         !speechUpstream ||
+        !audioInUpstream ||
         !videoUpstream ||
         !sls
       ) {
@@ -211,6 +260,7 @@ describe("usage operation e2e (AISIX-Cloud#1461)", () => {
       await seedModel(RESPONSES_MODEL, "gpt-4o-mini", responsesUpstream);
       await seedModel(IMAGES_MODEL, "dall-e-3", imagesUpstream);
       await seedModel(SPEECH_MODEL, "tts-1", speechUpstream);
+      await seedModel(AUDIO_IN_MODEL, "whisper-1", audioInUpstream);
       // Video submission speaks the Alibaba task API, whose base URL carries
       // no `/v1` suffix (see videos-e2e).
       await seedModel(
@@ -247,26 +297,18 @@ describe("usage operation e2e (AISIX-Cloud#1461)", () => {
       ).toBe(200);
 
       // --- one handler label, two operations ------------------------------
-      expect(
-        (
-          await postJson(app, "/v1/images/generations", {
-            model: IMAGES_MODEL,
-            prompt: "a cat",
-          })
-        ).status,
-      ).toBe(200);
-
-      const edits = new FormData();
-      edits.set("model", IMAGES_MODEL);
-      edits.set("prompt", "make it blue");
-      edits.set("image", new Blob(["fake-png-bytes"], { type: "image/png" }), "a.png");
-      const editsRes = await fetch(`${app.proxyUrl}/v1/images/edits`, {
-        method: "POST",
-        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
-        body: edits,
+      const generationsRes = await postJson(app, "/v1/images/generations", {
+        model: IMAGES_MODEL,
+        prompt: "a cat",
       });
-      await editsRes.arrayBuffer();
-      expect(editsRes.status).toBe(200);
+      expect(generationsRes.status).toBe(200);
+      const generationsId = generationsRes.headers.get("x-aisix-request-id") ?? "";
+
+      const editsId = await postForm(app, "/v1/images/edits", {
+        model: IMAGES_MODEL,
+        prompt: "make it blue",
+        image: new Blob(["fake-png-bytes"], { type: "image/png" }),
+      });
 
       // --- audio out, and the zero-token video submission -----------------
       expect(
@@ -282,6 +324,21 @@ describe("usage operation e2e (AISIX-Cloud#1461)", () => {
       expect(
         (await postJson(app, "/v1/videos", { model: VIDEO_MODEL, prompt: "a river" })).status,
       ).toBe(200);
+
+      // Transcription and translation share a handler, an emitter and — here —
+      // a model. Both are driven because the in-crate census only reaches
+      // their REFUSED path, which is a different call site from the success
+      // one: swapping the two constants where they succeed is invisible to
+      // every other test.
+      const audioFile = () => new Blob(["ID3fake-audio"], { type: "audio/mpeg" });
+      const transcriptionId = await postForm(app, "/v1/audio/transcriptions", {
+        model: AUDIO_IN_MODEL,
+        file: audioFile(),
+      });
+      const translationId = await postForm(app, "/v1/audio/translations", {
+        model: AUDIO_IN_MODEL,
+        file: audioFile(),
+      });
 
       const chatRow = await rowFor(sls, CHAT_MODEL);
       const responsesRow = await rowFor(sls, RESPONSES_MODEL);
@@ -299,9 +356,15 @@ describe("usage operation e2e (AISIX-Cloud#1461)", () => {
       expect(videoRow.get("prompt_tokens") ?? "0").toBe("0");
       expect(videoRow.has("prompt")).toBe(false);
 
-      // Both image surfaces share one model alias, so read them as a set.
-      const imageOps = await waitForImageOperations(sls);
-      expect(imageOps).toEqual(new Set(["image_generation", "image_edit"]));
+      // The paired routes, each read by its own call's id — see rowForRequest.
+      for (const [requestId, expected] of [
+        [generationsId, "image_generation"],
+        [editsId, "image_edit"],
+        [transcriptionId, "transcription"],
+        [translationId, "translation"],
+      ] as const) {
+        expect((await rowForRequest(sls, requestId)).get("operation")).toBe(expected);
+      }
 
       // `inbound_protocol` cannot make any of these distinctions: it is the
       // same value on all of them, which is the reason the field exists.
@@ -335,27 +398,3 @@ describe("usage operation e2e (AISIX-Cloud#1461)", () => {
   );
 
 });
-
-/**
- * Wait until both image rows have landed and return their operations.
- *
- * `/v1/images/generations` and `/v1/images/edits` are driven against one
- * model, so the two rows are only distinguishable by the field under test —
- * which means the wait has to be for the SET to be complete, not for any one
- * row: polling for "a row with image_edit" would pass on a build that
- * reported it for both.
- */
-async function waitForImageOperations(sls: MockSls): Promise<Set<string>> {
-  const deadline = Date.now() + 15_000;
-  let seen = new Set<string>();
-  while (Date.now() < deadline) {
-    seen = new Set(
-      slsLogsFor(sls, META_LOGSTORE)
-        .filter((log) => log.get("requested_model") === IMAGES_MODEL)
-        .map((log) => log.get("operation") ?? ""),
-    );
-    if (seen.size >= 2) return seen;
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  return seen;
-}
