@@ -113,7 +113,7 @@ fn normalize_api_base(base: &str) -> String {
 /// The `apis.messages` base this key declares, or `""`. Feeds the URL
 /// cache fingerprint so editing the entry rebuilds the cached URL, the
 /// same way editing `api_base` does.
-fn declared_messages_base<'a>(ctx: &'a BridgeContext) -> &'a str {
+fn declared_messages_base(ctx: &BridgeContext) -> &str {
     ctx.provider_key
         .apis
         .as_ref()
