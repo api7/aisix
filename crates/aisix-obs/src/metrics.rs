@@ -633,6 +633,16 @@ struct RetirableSeries {
     /// Label VALUES in the family's fixed order — the same order
     /// [`LiveGaugeSeries`] destructures them in.
     labels: Vec<Box<str>>,
+    /// The metrics actually registered under this label set, and the only
+    /// ones retirement writes.
+    ///
+    /// A family's members are not all present for every label set: a key
+    /// with no budget reaches `clear_budget_gauges`, which writes the
+    /// presence flag alone. Retiring the family's full list would then
+    /// CREATE the four amount series — `metrics::gauge!` registers on
+    /// first use — minting exactly the per-key cardinality that
+    /// `clear_budget_gauges` is careful not to.
+    metrics: Vec<&'static str>,
 }
 
 /// One live label set, handed to the liveness predicate of
@@ -951,7 +961,7 @@ impl Metrics {
     /// Called from the REGISTRATION path only — a worker-cache miss — so
     /// the steady-state emit never takes this lock. Re-registration (a
     /// second worker, or a cache eviction) is an idempotent no-op.
-    fn track_retirable(&self, family: GaugeFamily, labels: &[&str]) {
+    fn track_retirable(&self, family: GaugeFamily, metric: &'static str, labels: &[&str]) {
         let mut key = String::with_capacity(64);
         key.push_str(family_key(family));
         for value in labels {
@@ -959,7 +969,15 @@ impl Metrics {
             key.push_str(value);
         }
         let mut map = self.inner.retirable.lock().expect("retirable registry");
-        if map.contains_key(key.as_str()) {
+        if let Some(entry) = map.get_mut(key.as_str()) {
+            // A label set is registered once per metric per worker, and the
+            // members appear at different times — a key gets its presence
+            // flag on the request that finds no budget and its amounts only
+            // once one exists. So an existing entry still has to learn about
+            // a metric it has not seen.
+            if !entry.metrics.contains(&metric) {
+                entry.metrics.push(metric);
+            }
             return;
         }
         // Safety valve, same reasoning as `WORKER_CACHE_CAPACITY`: these
@@ -975,6 +993,7 @@ impl Metrics {
             RetirableSeries {
                 family,
                 labels: labels.iter().map(|v| Box::from(*v)).collect(),
+                metrics: vec![metric],
             },
         );
     }
@@ -1048,46 +1067,41 @@ impl Metrics {
                     continue;
                 }
                 retired += 1;
-                match view {
-                    LiveGaugeSeries::Budget {
-                        api_key_id,
-                        team_id,
-                        user_id,
-                        user_name,
-                    } => {
-                        for metric in [
-                            M_BUDGET_LIMIT_USD,
-                            M_BUDGET_SPENT_USD,
-                            M_BUDGET_REMAINING_USD,
-                            M_BUDGET_RESET_SECONDS,
-                        ] {
-                            metrics::gauge!(
-                                metric,
-                                "api_key_id" => api_key_id.to_string(),
-                                "team_id" => team_id.to_string(),
-                                "user_id" => user_id.to_string(),
-                                "user_name" => user_name.to_string(),
-                            )
-                            .set(f64::NAN);
-                        }
-                        metrics::gauge!(
-                            M_BUDGET_DETAILS_PRESENT,
+                // Only what this label set actually registered. Writing a
+                // family's full list would CREATE the members it never had:
+                // `metrics::gauge!` registers on first use, so retiring a
+                // budgetless key would mint the four amount series that
+                // `clear_budget_gauges` deliberately does not.
+                for metric in &series.metrics {
+                    // The presence flag is boolean and its documented
+                    // cleared value is 0; everything else carries a
+                    // quantity and retires to NaN.
+                    let value = if *metric == M_BUDGET_DETAILS_PRESENT {
+                        0.0
+                    } else {
+                        f64::NAN
+                    };
+                    match view {
+                        LiveGaugeSeries::Budget {
+                            api_key_id,
+                            team_id,
+                            user_id,
+                            user_name,
+                        } => metrics::gauge!(
+                            *metric,
                             "api_key_id" => api_key_id.to_string(),
                             "team_id" => team_id.to_string(),
                             "user_id" => user_id.to_string(),
                             "user_name" => user_name.to_string(),
                         )
-                        .set(0.0);
-                    }
-                    LiveGaugeSeries::RatelimitRemaining { api_key_id, model } => {
-                        for metric in [M_RATELIMIT_REMAINING_REQUESTS, M_RATELIMIT_REMAINING_TOKENS]
-                        {
+                        .set(value),
+                        LiveGaugeSeries::RatelimitRemaining { api_key_id, model } => {
                             metrics::gauge!(
-                                metric,
+                                *metric,
                                 "api_key_id" => api_key_id.to_string(),
                                 "model" => model.to_string(),
                             )
-                            .set(f64::NAN);
+                            .set(value)
                         }
                     }
                 }
@@ -2195,7 +2209,11 @@ impl Metrics {
                     k.label(model);
                 },
                 || {
-                    self.track_retirable(GaugeFamily::RatelimitRemaining, &[api_key_id, model]);
+                    self.track_retirable(
+                        GaugeFamily::RatelimitRemaining,
+                        M_RATELIMIT_REMAINING_REQUESTS,
+                        &[api_key_id, model],
+                    );
                     metrics::gauge!(
                         M_RATELIMIT_REMAINING_REQUESTS,
                         "api_key_id" => api_key_id.to_string(),
@@ -2213,7 +2231,11 @@ impl Metrics {
                     k.label(model);
                 },
                 || {
-                    self.track_retirable(GaugeFamily::RatelimitRemaining, &[api_key_id, model]);
+                    self.track_retirable(
+                        GaugeFamily::RatelimitRemaining,
+                        M_RATELIMIT_REMAINING_TOKENS,
+                        &[api_key_id, model],
+                    );
                     metrics::gauge!(
                         M_RATELIMIT_REMAINING_TOKENS,
                         "api_key_id" => api_key_id.to_string(),
@@ -2238,6 +2260,7 @@ impl Metrics {
             || {
                 self.track_retirable(
                     GaugeFamily::Budget,
+                    metric,
                     &[
                         labels.api_key_id,
                         labels.team_id,
@@ -4435,6 +4458,87 @@ mod tests {
                 "{metric} must not exist for a key that never had a budget:\n{rendered}"
             );
         }
+    }
+
+    /// Retiring a budgetless key must not mint the amounts it never had.
+    ///
+    /// `metrics::gauge!` REGISTERS on first use, so retiring a family's
+    /// full list creates the members that label set never carried. Budgets
+    /// are off by default, which puts every api key on the
+    /// `clear_budget_gauges` path — so retiring blind would mint four
+    /// series per deleted key for a feature nobody enabled, the exact
+    /// cardinality `clear_budget_gauges` avoids on the write side.
+    #[test]
+    fn retiring_a_budgetless_key_mints_no_amount_series() {
+        let m = Metrics::new(false);
+        let labels = BudgetLabels {
+            api_key_id: "ak-1",
+            team_id: "t",
+            user_id: "u",
+            user_name: "alice",
+        };
+        // The shape of a deployment with budgets switched off: the flag
+        // and nothing else, on every request.
+        m.clear_budget_gauges(labels);
+        assert_eq!(m.retire_stale_gauges(|_| false), 1);
+
+        let rendered = m.render();
+        assert!(
+            series_lines(&rendered, M_BUDGET_DETAILS_PRESENT)
+                .pop()
+                .expect("the flag was registered, so it retires")
+                .ends_with(" 0"),
+            "{rendered}"
+        );
+        for metric in [
+            M_BUDGET_LIMIT_USD,
+            M_BUDGET_SPENT_USD,
+            M_BUDGET_REMAINING_USD,
+            M_BUDGET_RESET_SECONDS,
+        ] {
+            assert!(
+                series_lines(&rendered, metric).is_empty(),
+                "retirement created {metric}, which this key never had:\n{rendered}"
+            );
+        }
+    }
+
+    /// The amounts appear later than the flag — a key gets its presence
+    /// flag on the request that finds no budget, and its amounts only once
+    /// one exists — so an already-tracked label set has to learn about a
+    /// metric it has not seen, or retirement would leave the amounts frozen.
+    #[test]
+    fn an_amount_registered_after_the_flag_still_retires() {
+        let m = Metrics::new(false);
+        let labels = BudgetLabels {
+            api_key_id: "ak-1",
+            team_id: "t",
+            user_id: "u",
+            user_name: "alice",
+        };
+        m.clear_budget_gauges(labels);
+        m.set_budget_gauges(
+            labels,
+            BudgetGauges {
+                spent_usd: Some(40.0),
+                ..BudgetGauges::default()
+            },
+        );
+        assert_eq!(m.retire_stale_gauges(|_| false), 1);
+
+        let rendered = m.render();
+        assert!(
+            series_lines(&rendered, M_BUDGET_SPENT_USD)
+                .pop()
+                .expect("renders")
+                .ends_with(" NaN"),
+            "{rendered}"
+        );
+        // Still nothing for the amounts that were never written.
+        assert!(
+            series_lines(&rendered, M_BUDGET_LIMIT_USD).is_empty(),
+            "{rendered}"
+        );
     }
 
     /// A gauge whose key is gone must stop claiming to describe the

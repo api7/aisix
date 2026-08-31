@@ -101,11 +101,14 @@ describe("gauge retirement e2e: a deleted key stops reporting", () => {
     });
     keyId = key.id;
 
+    // The key is written LAST, so it authenticating implies every resource
+    // above it is in the snapshot (one watch, applied in revision order).
+    // `listModels` rather than a chat: the gauge under test is registered by
+    // a chat's post-dispatch peek, so gating on one would turn a dispatch
+    // regression into a 30s propagation timeout here instead of a named
+    // assertion failure.
     const proxy = new ProxyClient(app.proxyUrl, PLAINTEXT);
-    await waitConfigPropagation(async () => {
-      const res = await proxy.chat({ model: MODEL, messages: [{ role: "user", content: "hi" }] });
-      return res.status === 200;
-    });
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
   }, 60_000);
 
   afterAll(async () => {
@@ -118,6 +121,12 @@ describe("gauge retirement e2e: a deleted key stops reporting", () => {
       ctx.skip();
       return;
     }
+    // The gauge is registered by the post-dispatch peek, so this spec makes
+    // the request it asserts on rather than relying on the readiness gate.
+    const proxy = new ProxyClient(app.proxyUrl, PLAINTEXT);
+    const res = await proxy.chat({ model: MODEL, messages: [{ role: "user", content: "hi" }] });
+    expect(res.status).toBe(200);
+
     const line = remainingLine(await scrapeText());
     expect(line, "the request must have registered the gauge").toBeTruthy();
     expect(line).toContain(`model="${MODEL}"`);
