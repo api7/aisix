@@ -442,9 +442,18 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
     // passthrough and the translated Responses path used to hard-code
     // "anthropic" / "openai" here, which split one model's series in two
     // and misattributed the priced row.
-    // Asserted, not discarded: a failed request still increments
-    // `aisix_llm_requests_total` with the provider label, so the metric
-    // checks below would pass without any successful dispatch.
+    // Deltas, not totals. Earlier tests in this file already drove
+    // `/v1/responses` on `responses-declared`, so a cumulative assertion
+    // could be satisfied by their samples even if THIS request were
+    // mislabelled. Asserted, not discarded, for the same reason: a
+    // failed request still increments the counter.
+    const before = await scrapeMetrics(app.metricsUrl);
+    const delta = (
+      samples: Awaited<ReturnType<typeof scrapeMetrics>>,
+      labels: Record<string, string>,
+    ) =>
+      sumMetric(samples, "aisix_llm_requests_total", labels) -
+      sumMetric(before, "aisix_llm_requests_total", labels);
     expect(
       (
         await callGateway(app, "/v1/messages", {
@@ -474,11 +483,9 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
     ).toBe(200);
 
     const samples = await scrapeMetrics(app.metricsUrl);
-    const deepseekMessages = sumMetric(samples, "aisix_llm_requests_total", {
-      provider: "deepseek",
-      endpoint: "/v1/messages",
-    });
-    expect(deepseekMessages).toBeGreaterThan(0);
+    expect(
+      delta(samples, { provider: "deepseek", endpoint: "/v1/messages" }),
+    ).toBeGreaterThan(0);
     // Scoped to the two endpoints this file drives through a verbatim
     // path, so adding an actually-Anthropic model here later does not
     // make the assertion fire for the wrong reason.
@@ -492,20 +499,14 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
       ).toBe(0);
     }
     expect(
-      sumMetric(samples, "aisix_llm_requests_total", {
-        provider: "deepseek",
-        endpoint: "/v1/responses",
-      }),
+      delta(samples, { provider: "deepseek", endpoint: "/v1/responses" }),
       "the verbatim Responses path must report the vendor too",
     ).toBeGreaterThan(0);
     // The bridged Responses request rides the `openai` catalog vendor, so
     // it legitimately reports openai — the assertion that matters is that
     // it reports the MODEL's vendor rather than a constant.
     expect(
-      sumMetric(samples, "aisix_llm_requests_total", {
-        provider: "openai",
-        endpoint: "/v1/responses",
-      }),
+      delta(samples, { provider: "openai", endpoint: "/v1/responses" }),
     ).toBeGreaterThan(0);
   });
 });

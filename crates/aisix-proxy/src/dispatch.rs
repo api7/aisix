@@ -198,19 +198,25 @@ pub(crate) fn serves_natively(
     // `:generateContent` and Azure's deployment-scoped paths, none of
     // which these entries can name — and its credential is a JSON tuple
     // the verbatim paths would send as a bearer token to a URL that does
-    // not exist. cp-api refuses the declaration outright; a document
-    // that reaches the gateway anyway (a hand-written resources file, a
-    // direct etcd write) must not be acted on either.
-    let declared = pk
-        .filter(|p| {
-            !matches!(
-                p.adapter,
-                Some(aisix_core::Adapter::Bedrock)
-                    | Some(aisix_core::Adapter::Vertex)
-                    | Some(aisix_core::Adapter::AzureOpenai)
-            )
-        })
-        .and_then(|p| p.apis.as_ref());
+    // not exist.
+    //
+    // This gates the whole answer rather than just the declaration.
+    // cp-api pairs an adapter with a vendor id from its own catalog, but
+    // a hand-written resources file can put `model.provider: "openai"`
+    // in front of an `adapter: azure-openai` key, and the vendor-id
+    // fallback below would then send that credential down the verbatim
+    // path with no declaration in sight.
+    if pk.is_some_and(|p| {
+        matches!(
+            p.adapter,
+            Some(aisix_core::Adapter::Bedrock)
+                | Some(aisix_core::Adapter::Vertex)
+                | Some(aisix_core::Adapter::AzureOpenai)
+        )
+    }) {
+        return false;
+    }
+    let declared = pk.and_then(|p| p.apis.as_ref());
     match surface {
         ApiSurface::Messages => {
             model.provider.as_deref() == Some("anthropic")
@@ -786,6 +792,33 @@ mod tests {
             assert!(
                 !serves_natively(&snap, &m, ApiSurface::Messages),
                 "{adapter} must not take the verbatim messages path",
+            );
+        }
+    }
+
+    /// The platform guard has to cover the fallback too. cp-api pairs an
+    /// adapter with a vendor id from its own catalog, but a hand-written
+    /// resources file can name a vendor the vendor-id inference treats as
+    /// native in front of a platform key — and that path would send a
+    /// JSON credential tuple as a bearer token to a route that does not
+    /// exist.
+    #[test]
+    fn a_platform_adapter_is_not_rescued_by_the_vendor_fallback() {
+        for (adapter, vendor, surface) in [
+            ("azure-openai", "openai", ApiSurface::Responses),
+            ("bedrock", "openai", ApiSurface::Responses),
+            ("vertex", "anthropic", ApiSurface::Messages),
+        ] {
+            let snap = snapshot_with_pk_json(
+                "pk-1",
+                &format!(
+                    r#"{{"display_name":"p","secret":"{{}}","api_base":"https://up","provider":"{vendor}","adapter":"{adapter}"}}"#
+                ),
+            );
+            let m = model_on(vendor, "pk-1");
+            assert!(
+                !serves_natively(&snap, &m, surface),
+                "{adapter} + vendor {vendor} must not reach a verbatim path",
             );
         }
     }
