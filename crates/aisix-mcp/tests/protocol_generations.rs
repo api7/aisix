@@ -172,6 +172,32 @@ async fn non_loopback_host_is_served() {
     );
 }
 
+/// The sessionless serving posture means only `POST` carries MCP
+/// protocol messages: `GET` (the SSE stream a stateful server would
+/// offer) and `DELETE` (session teardown) are not served. The gateway
+/// gets this from its `legacy_session_mode = false` + no-event-store
+/// configuration rather than from its own code, so pin it here — an SDK
+/// upgrade that starts serving either verb by default would otherwise
+/// change the endpoint's wire surface with nothing failing.
+#[tokio::test]
+async fn get_and_delete_are_not_served() {
+    let addr = spawn_gateway().await;
+    let client = reqwest::Client::new();
+    for method in [reqwest::Method::GET, reqwest::Method::DELETE] {
+        let response = client
+            .request(method.clone(), format!("http://{addr}/mcp"))
+            .header("accept", "application/json, text/event-stream")
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(
+            response.status(),
+            405,
+            "{method} /mcp must not be served on a sessionless endpoint"
+        );
+    }
+}
+
 /// `server/discover` advertises exactly the supported list — the same list
 /// `initialize` negotiates against and the proxy header gate enforces.
 #[tokio::test]

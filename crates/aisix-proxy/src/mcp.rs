@@ -3258,6 +3258,51 @@ mod tests {
         }
     }
 
+    /// Method handling sits BEHIND authentication: an unauthenticated
+    /// `GET`/`DELETE` on `/mcp` is rejected as unauthorized, and only an
+    /// authenticated one reaches the sessionless endpoint's `405`. The
+    /// order matters — answering `405` first would tell an anonymous
+    /// caller which paths exist.
+    #[tokio::test]
+    async fn get_and_delete_are_authenticated_before_method_handling() {
+        for method in ["GET", "DELETE"] {
+            let anonymous = HttpRequest::builder()
+                .method(method)
+                .uri("/mcp")
+                .header("host", "mcp.aisix.example.com")
+                .header("accept", "application/json, text/event-stream")
+                .body(Body::empty())
+                .unwrap();
+            let response = router_with(snapshot_with_key())
+                .oneshot(anonymous)
+                .await
+                .expect("router responds");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} /mcp must authenticate before it decides on the method"
+            );
+
+            let authenticated = HttpRequest::builder()
+                .method(method)
+                .uri("/mcp")
+                .header("host", "mcp.aisix.example.com")
+                .header("accept", "application/json, text/event-stream")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap();
+            let response = router_with(snapshot_with_key())
+                .oneshot(authenticated)
+                .await
+                .expect("router responds");
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "an authenticated {method} /mcp is not served on a sessionless endpoint"
+            );
+        }
+    }
+
     /// Hostile header values cannot abuse the rejection envelope: an
     /// overlong value is truncated to 64 echoed characters, a non-ASCII
     /// (obs-text) value gets the static message (never echoed), and an
