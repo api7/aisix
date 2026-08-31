@@ -1659,9 +1659,11 @@ async fn dispatch(
                                 dispatched: false,
                             },
                         );
-                        // Keep the limiter's own Retry-After hint on the wire:
-                        // when every target is exhausted this error becomes the
-                        // client's 429, and SDKs back off on that header.
+                        // Fallback only: `last_reserve_reject` below carries
+                        // the same refusal un-flattened and takes precedence
+                        // at exhaustion. This stays so the loop still has a
+                        // 429-shaped `last_err` if a later target clears the
+                        // reject without recording one of its own.
                         last_err = Some(BridgeError::upstream_status_with_retry_after(
                             429,
                             format!(
@@ -1670,12 +1672,15 @@ async fn dispatch(
                             ),
                             crate::quota::retry_after_of(&e).map(Duration::from_secs),
                         ));
-                        // Only the policy-layer rejection is worth
-                        // surfacing un-flattened (it carries the
-                        // `error.policy` attribution); the inline model
-                        // layer keeps the established flattened shape.
-                        last_reserve_reject =
-                            matches!(e, ProxyError::PolicyRateLimit { .. }).then_some(e);
+                        // Surface the quota rejection un-flattened. A
+                        // `Bridge` error reads as the PROVIDER's 429 — it
+                        // carries no `error.policy` attribution and no
+                        // `x-ratelimit-*` headers, so a caller refused by this
+                        // gateway's own limiter would see the wire shape of
+                        // somebody else's refusal. `/v1/messages` and
+                        // `/v1/responses` keep theirs too; this arm used to keep
+                        // only the policy layer's.
+                        last_reserve_reject = Some(e);
                         continue 'targets;
                     }
                 };
@@ -2779,9 +2784,11 @@ async fn dispatch(
                             dispatched: false,
                         },
                     );
-                    // Keep the limiter's own Retry-After hint on the wire:
-                    // when every target is exhausted this error becomes the
-                    // client's 429, and SDKs back off on that header.
+                    // Fallback only: `last_reserve_reject` below carries the
+                    // same refusal un-flattened and takes precedence at
+                    // exhaustion. This stays so the loop still has a
+                    // 429-shaped `last_err` if a later target clears the
+                    // reject without recording one of its own.
                     last_err = Some(BridgeError::upstream_status_with_retry_after(
                         429,
                         format!(
@@ -2790,12 +2797,15 @@ async fn dispatch(
                         ),
                         crate::quota::retry_after_of(&e).map(Duration::from_secs),
                     ));
-                    // Only the policy-layer rejection is worth surfacing
-                    // un-flattened (it carries the `error.policy`
-                    // attribution); the inline model layer keeps the
-                    // established flattened shape.
-                    last_reserve_reject =
-                        matches!(e, ProxyError::PolicyRateLimit { .. }).then_some(e);
+                    // Surface the quota rejection un-flattened. A
+                    // `Bridge` error reads as the PROVIDER's 429 — it
+                    // carries no `error.policy` attribution and no
+                    // `x-ratelimit-*` headers, so a caller refused by this
+                    // gateway's own limiter would see the wire shape of
+                    // somebody else's refusal. `/v1/messages` and
+                    // `/v1/responses` keep theirs too; this arm used to keep
+                    // only the policy layer's.
+                    last_reserve_reject = Some(e);
                     continue 'targets;
                 }
             };

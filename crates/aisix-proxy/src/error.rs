@@ -727,19 +727,72 @@ impl ProxyError {
     }
 }
 
+impl ProxyError {
+    /// The gateway limit that refused this request, when the gateway's
+    /// OWN limiter is what refused it.
+    ///
+    /// `None` for every other 429: a budget rejection caps spend in
+    /// dollars, not requests or tokens, and an upstream 429 reports the
+    /// provider's quota, which the gateway does not know. Both would
+    /// have to invent the numbers. That makes the presence of the
+    /// `x-ratelimit-*` trio on a 429 the caller's signal that AISIX
+    /// itself rejected the request rather than relaying somebody else's
+    /// rejection.
+    fn rate_limit_detail(&self) -> Option<aisix_ratelimit::LimitDetail> {
+        match self {
+            ProxyError::RateLimit(e) => Some(e.detail()),
+            ProxyError::PolicyRateLimit { source, .. } => Some(source.detail()),
+            _ => None,
+        }
+    }
+}
+
+/// Write the retry / rate-limit headers both envelopes owe a rejection.
+///
+/// Shared so the OpenAI-shape and Anthropic-shape renderers cannot
+/// drift: `/v1/messages` answering a 429 without the headers
+/// `/v1/chat/completions` carries would be the same class of bug #336
+/// fixed for the body.
+///
+/// `X-RateLimit-Reset` is delta-seconds, deliberately the same number
+/// as `Retry-After` for a windowed dimension — a caller may read either
+/// one and back off identically, with no clock sync against the
+/// gateway. `X-RateLimit-Scope` is an AISIX extension naming which
+/// dimension fired; without it `x-ratelimit-limit: 100` cannot be told
+/// apart between an rpm, a tpm and a concurrency cap, whose units all
+/// differ.
+fn apply_retry_headers(
+    response: &mut Response,
+    retry_after_secs: Option<u64>,
+    detail: Option<aisix_ratelimit::LimitDetail>,
+) {
+    let headers = response.headers_mut();
+    let mut set = |name: &'static str, value: String| {
+        if let Ok(v) = HeaderValue::from_str(&value) {
+            headers.insert(name, v);
+        }
+    };
+    if let Some(secs) = retry_after_secs {
+        set("retry-after", secs.to_string());
+    }
+    if let Some(d) = detail {
+        set("x-ratelimit-limit", d.limit.to_string());
+        set("x-ratelimit-remaining", d.remaining.to_string());
+        set("x-ratelimit-reset", d.reset_secs.to_string());
+        set("x-ratelimit-scope", d.dimension.to_string());
+    }
+}
+
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let challenge = self.auth_challenge();
         let status = self.status();
         let retry_after = self.retry_after_secs();
+        let rate_limit_detail = self.rate_limit_detail();
         let upgrade_reject = matches!(self, ProxyError::WebSocketUpgradeRequired { .. });
         let body = self.envelope();
         let mut response = (status, Json(body)).into_response();
-        if let Some(secs) = retry_after {
-            if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
-                response.headers_mut().insert("retry-after", value);
-            }
-        }
+        apply_retry_headers(&mut response, retry_after, rate_limit_detail);
         if let Some(challenge) = challenge {
             response.extensions_mut().insert(challenge);
         }
@@ -849,6 +902,7 @@ impl ProxyError {
     pub fn into_anthropic_response(self) -> Response {
         let status = self.status();
         let retry_after = self.retry_after_secs();
+        let rate_limit_detail = self.rate_limit_detail();
         let kind = anthropic_kind_from_status(status).to_string();
         // Reuse OpenAI envelope only for the SAFE-MESSAGE logic
         // (5xx body redaction, 4xx upstream-message pass-through).
@@ -863,11 +917,7 @@ impl ProxyError {
             },
         };
         let mut response = (status, Json(anth_body)).into_response();
-        if let Some(secs) = retry_after {
-            if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
-                response.headers_mut().insert("retry-after", value);
-            }
-        }
+        apply_retry_headers(&mut response, retry_after, rate_limit_detail);
         response
     }
 }
@@ -1455,6 +1505,146 @@ mod tests {
             msg.contains("503"),
             "redacted message must still surface the upstream status, got: {msg}",
         );
+    }
+
+    /// The four headers a gateway-produced 429 owes the caller, on the
+    /// OpenAI-shape envelope. `x-ratelimit-reset` is delta-seconds and
+    /// equals `retry-after` for a windowed dimension, so a client may
+    /// back off on either without a clock shared with the gateway.
+    #[tokio::test]
+    async fn gateway_429_carries_the_standard_rate_limit_headers() {
+        let err = ProxyError::RateLimit(aisix_ratelimit::RateLimitError::Requests {
+            scope: aisix_core::RateLimitScope::Requests,
+            detail: aisix_ratelimit::LimitDetail {
+                dimension: "rpm",
+                limit: 100,
+                remaining: 0,
+                reset_secs: 43,
+            },
+        });
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let h = resp.headers();
+        assert_eq!(h.get("retry-after").unwrap(), "43");
+        assert_eq!(h.get("x-ratelimit-limit").unwrap(), "100");
+        assert_eq!(h.get("x-ratelimit-remaining").unwrap(), "0");
+        assert_eq!(h.get("x-ratelimit-reset").unwrap(), "43");
+        assert_eq!(h.get("x-ratelimit-scope").unwrap(), "rpm");
+    }
+
+    /// `/v1/messages` answers in the Anthropic envelope but owes the
+    /// same headers — the renderers share one writer precisely so this
+    /// cannot drift per endpoint.
+    #[tokio::test]
+    async fn anthropic_envelope_429_carries_the_same_rate_limit_headers() {
+        let err = ProxyError::RateLimit(aisix_ratelimit::RateLimitError::Tokens {
+            scope: aisix_core::RateLimitScope::Tokens,
+            detail: aisix_ratelimit::LimitDetail {
+                dimension: "tpm",
+                limit: 50_000,
+                remaining: 0,
+                reset_secs: 12,
+            },
+        });
+        let resp = err.into_anthropic_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let h = resp.headers();
+        assert_eq!(h.get("retry-after").unwrap(), "12");
+        assert_eq!(h.get("x-ratelimit-limit").unwrap(), "50000");
+        assert_eq!(h.get("x-ratelimit-remaining").unwrap(), "0");
+        assert_eq!(h.get("x-ratelimit-reset").unwrap(), "12");
+        assert_eq!(h.get("x-ratelimit-scope").unwrap(), "tpm");
+    }
+
+    /// A policy-layer rejection is the same rejection with an attributed
+    /// policy — it reports the policy's own limit, not a blank.
+    #[tokio::test]
+    async fn policy_429_reports_the_policy_layer_limit() {
+        let err = ProxyError::PolicyRateLimit {
+            source: aisix_ratelimit::RateLimitError::Requests {
+                scope: aisix_core::RateLimitScope::Requests,
+                detail: aisix_ratelimit::LimitDetail {
+                    dimension: "rpd",
+                    limit: 5_000,
+                    remaining: 0,
+                    reset_secs: 3_600,
+                },
+            },
+            policy_id: "pol-1".into(),
+            policy_name: "team-daily".into(),
+        };
+        let resp = err.into_response();
+        let h = resp.headers();
+        assert_eq!(h.get("x-ratelimit-limit").unwrap(), "5000");
+        assert_eq!(h.get("x-ratelimit-scope").unwrap(), "rpd");
+        assert_eq!(h.get("x-ratelimit-reset").unwrap(), "3600");
+    }
+
+    /// A concurrency cap has no window, so it reports a fixed hint —
+    /// but it DOES report all four headers. Before this contract a
+    /// concurrency 429 carried no retry hint at all, leaving a client
+    /// with nothing to back off on.
+    #[tokio::test]
+    async fn concurrency_429_carries_all_four_headers() {
+        let err = ProxyError::RateLimit(aisix_ratelimit::RateLimitError::Concurrency {
+            detail: aisix_ratelimit::LimitDetail {
+                dimension: aisix_ratelimit::CONCURRENCY_DIMENSION,
+                limit: 8,
+                remaining: 0,
+                reset_secs: aisix_ratelimit::CONCURRENCY_RETRY_AFTER_SECS,
+            },
+        });
+        let resp = err.into_response();
+        let h = resp.headers();
+        assert_eq!(h.get("retry-after").unwrap(), "60");
+        assert_eq!(h.get("x-ratelimit-limit").unwrap(), "8");
+        assert_eq!(h.get("x-ratelimit-remaining").unwrap(), "0");
+        assert_eq!(h.get("x-ratelimit-reset").unwrap(), "60");
+        assert_eq!(h.get("x-ratelimit-scope").unwrap(), "concurrency");
+    }
+
+    /// An upstream 429 is the provider's rejection, not the gateway's.
+    /// Its `Retry-After` is forwarded, but the gateway must NOT invent
+    /// `x-ratelimit-*` values for a quota it does not know — their
+    /// absence is how a caller tells the two 429s apart.
+    #[tokio::test]
+    async fn upstream_429_forwards_retry_after_but_no_gateway_ratelimit_headers() {
+        let err = ProxyError::Bridge(BridgeError::upstream_status_with_retry_after(
+            429,
+            "rate limited by provider",
+            Some(std::time::Duration::from_secs(30)),
+        ));
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let h = resp.headers();
+        assert_eq!(h.get("retry-after").unwrap(), "30");
+        assert!(h.get("x-ratelimit-limit").is_none());
+        assert!(h.get("x-ratelimit-remaining").is_none());
+        assert!(h.get("x-ratelimit-reset").is_none());
+        assert!(h.get("x-ratelimit-scope").is_none());
+    }
+
+    /// A budget rejection caps spend in dollars. It shares the 429
+    /// status but has no request/token dimension, so the trio must stay
+    /// absent rather than carry a number in the wrong unit.
+    #[tokio::test]
+    async fn budget_429_keeps_retry_after_without_rate_limit_headers() {
+        let err = ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
+            message: "budget exceeded".into(),
+            scope: None,
+            scope_ref: None,
+            limit_usd: Some("1.00".into()),
+            spent_usd: Some("2.00".into()),
+            period: None,
+            period_resets_at: None,
+            retry_after_seconds: Some(600),
+        }));
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let h = resp.headers();
+        assert_eq!(h.get("retry-after").unwrap(), "600");
+        assert!(h.get("x-ratelimit-limit").is_none());
+        assert!(h.get("x-ratelimit-scope").is_none());
     }
 
     #[tokio::test]

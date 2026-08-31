@@ -20,7 +20,7 @@ pub mod store;
 mod window;
 
 pub use clock::{Clock, SystemClock, TestClock};
-pub use error::RateLimitError;
+pub use error::{LimitDetail, RateLimitError, CONCURRENCY_DIMENSION, CONCURRENCY_RETRY_AFTER_SECS};
 pub use limiter::{
     Limiter, MultiReservation, RateLimitStatus, Reservation, StreamConcurrencyGuard,
 };

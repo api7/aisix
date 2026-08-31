@@ -45,7 +45,7 @@ use async_trait::async_trait;
 use redis::Script;
 
 use super::{local::LocalStore, token_dims, Dim, RateStore};
-use crate::error::RateLimitError;
+use crate::error::{LimitDetail, RateLimitError};
 use crate::limiter::RateLimitStatus;
 
 /// Default key namespace, kept distinct from `aisix:cache` so the same
@@ -60,6 +60,12 @@ pub const DEFAULT_CONC_TTL_SECS: u64 = 300;
 pub const DEFAULT_GRACE_SECS: u64 = 5;
 
 // Result codes returned by the acquire script's first element.
+/// Dimension name reported when the script names an index this build
+/// no longer knows — only reachable if the script and the caller ever
+/// disagree on the dimension list, which they cannot today (both come
+/// from the same `request_dims` / `token_dims` call).
+const UNKNOWN_DIMENSION: &str = "unknown";
+
 const CODE_OK: i64 = 0;
 const CODE_CONCURRENCY: i64 = 1;
 const CODE_TOKENS: i64 = 2;
@@ -80,8 +86,9 @@ local now = tonumber(t[1])
 local conc_key = prefix .. ':conc'
 if conc_max >= 0 then
   redis.call('ZREMRANGEBYSCORE', conc_key, 0, now - conc_ttl)
-  if redis.call('ZCARD', conc_key) >= conc_max then
-    return {1, 0}
+  local in_flight = redis.call('ZCARD', conc_key)
+  if in_flight >= conc_max then
+    return {1, 0, 0, conc_max, in_flight}
   end
 end
 
@@ -105,7 +112,7 @@ for i = 1, ntok do
   local cur = tonumber(redis.call('GET', prefix .. ':' .. name .. ':' .. ws) or '0')
   if cur > limit then
     local retry = window - (now - ws); if retry < 1 then retry = 1 end
-    return {2, retry}
+    return {2, retry, i, limit, cur}
   end
 end
 
@@ -115,7 +122,7 @@ for i = 1, nreq do
   local cur = tonumber(redis.call('GET', prefix .. ':' .. name .. ':' .. ws) or '0')
   if cur + 1 > limit then
     local retry = window - (now - ws); if retry < 1 then retry = 1 end
-    return {3, retry}
+    return {3, retry, i, limit, cur}
   end
 end
 
@@ -131,7 +138,7 @@ if conc_max >= 0 then
   redis.call('ZADD', conc_key, now, member)
   redis.call('EXPIRE', conc_key, conc_ttl)
 end
-return {0, 0}
+return {0, 0, 0, 0, 0}
 "#;
 
 /// Post-deduct: add `tokens` to the tpm/tpd windows AND release the
@@ -325,16 +332,38 @@ impl RateStore for RedisStore {
                 self.mark_ok();
                 let code = reply.first().copied().unwrap_or(CODE_OK);
                 let retry = reply.get(1).copied().unwrap_or(0).max(0) as u64;
+                // The script reports which dimension refused as its
+                // 1-based index into the same `request_dims` /
+                // `token_dims` vectors this call pushed into ARGV, so
+                // the name never has to cross the wire.
+                let refused = |dims: &[super::Dim]| {
+                    let idx = reply.get(2).copied().unwrap_or(0);
+                    let name = usize::try_from(idx)
+                        .ok()
+                        .and_then(|i| i.checked_sub(1))
+                        .and_then(|i| dims.get(i))
+                        .map(|d| d.name)
+                        .unwrap_or(UNKNOWN_DIMENSION);
+                    let limit = reply.get(3).copied().unwrap_or(0).max(0) as u64;
+                    let used = reply.get(4).copied().unwrap_or(0).max(0) as u64;
+                    LimitDetail::window(name, limit, used, retry)
+                };
                 match code {
                     CODE_OK => Ok(()),
-                    CODE_CONCURRENCY => Err(RateLimitError::Concurrency),
+                    CODE_CONCURRENCY => {
+                        let limit = reply.get(3).copied().unwrap_or(0).max(0) as u64;
+                        let in_flight = reply.get(4).copied().unwrap_or(0).max(0) as u64;
+                        Err(RateLimitError::Concurrency {
+                            detail: LimitDetail::concurrency(limit, in_flight),
+                        })
+                    }
                     CODE_TOKENS => Err(RateLimitError::Tokens {
                         scope: aisix_core::RateLimitScope::Tokens,
-                        retry_after_secs: retry,
+                        detail: refused(&token_dims(limits)),
                     }),
                     CODE_REQUESTS => Err(RateLimitError::Requests {
                         scope: aisix_core::RateLimitScope::Requests,
-                        retry_after_secs: retry,
+                        detail: refused(&super::request_dims(limits)),
                     }),
                     _ => Ok(()),
                 }
