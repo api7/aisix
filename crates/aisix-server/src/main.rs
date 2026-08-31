@@ -323,15 +323,19 @@ fn run_validate(resources: &Path) -> anyhow::Result<()> {
 ///   a rename and leave the pre-change sample frozen under the same
 ///   `api_key_id`, which is the case it exists to catch. The triple is read
 ///   off the same api-key row the emitter reads, so the comparison is exact.
-/// - The rate-limit family's `model` label is deliberately NOT checked. It
-///   is the model string the CALLER sent (`chat.rs` passes `req.model`
-///   through), not a resolved name, so a wildcard-served deployment emits a
-///   concrete name that `models.get_by_name` cannot find. Retiring on that
-///   would blank a live series every sweep and let the next request write it
-///   again — a gauge flapping between its real value and `NaN`. Losing the
-///   key is the trigger that matters and the one that is decidable.
+/// - The rate-limit family's `model` is checked because the emit site
+///   collapses it to the configured set first (`usage_attr::
+///   metric_model_label`): an exact model name, a wildcard ROW name like
+///   `openai/*`, or the `unresolved` placeholder. All three are decidable
+///   — the first two resolve by name, the third is a placeholder. Were the
+///   raw caller string still reaching the label, this check would retire
+///   live series every sweep, because a wildcard alias serves concrete
+///   names that are in no `models` row.
 fn gauge_series_is_live(snap: &AisixSnapshot, series: aisix_obs::LiveGaugeSeries<'_>) -> bool {
     const UNKNOWN: &str = "unknown";
+    // What `metric_model_label` emits when nothing resolved. It names no
+    // row, so it is a placeholder like `unknown` and must never be retired.
+    const UNRESOLVED: &str = "unresolved";
     match series {
         aisix_obs::LiveGaugeSeries::Budget {
             api_key_id,
@@ -347,8 +351,11 @@ fn gauge_series_is_live(snap: &AisixSnapshot, series: aisix_obs::LiveGaugeSeries
                 && key.user_id.as_deref().unwrap_or(UNKNOWN) == user_id
                 && key.user_name.as_deref().unwrap_or(UNKNOWN) == user_name
         }
-        aisix_obs::LiveGaugeSeries::RatelimitRemaining { api_key_id, .. } => {
+        aisix_obs::LiveGaugeSeries::RatelimitRemaining { api_key_id, model } => {
             snap.apikeys.get_by_id(api_key_id).is_some()
+                && (model == UNKNOWN
+                    || model == UNRESOLVED
+                    || snap.models.get_by_name(model).is_some())
         }
     }
 }
@@ -2654,30 +2661,35 @@ mod tests {
         ));
     }
 
-    /// The rate-limit family is judged on its api key alone. Its `model`
-    /// label is the string the CALLER sent, so a wildcard-served
-    /// deployment emits a concrete name the snapshot cannot resolve —
-    /// checking it would retire a live series every sweep and let the next
-    /// request rewrite it, flapping the gauge between its value and NaN.
+    /// The rate-limit family is judged on BOTH halves of its key, which is
+    /// only safe because the emit site collapses the caller's model string
+    /// to the configured set first. A wildcard alias serves concrete names
+    /// that are in no `models` row, so if the raw string still reached the
+    /// label this check would retire live series on every sweep.
     #[test]
-    fn rate_limit_remaining_is_judged_on_its_key_not_its_model() {
+    fn rate_limit_remaining_is_judged_on_both_halves_of_its_key() {
         let snap = snapshot_with_key("ak-1", None, None, None);
+        let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "openai/*",
+            "provider": "openai",
+            "model_name": "gpt-4o-mini",
+        }))
+        .unwrap();
+        snap.models
+            .insert(aisix_core::resource::ResourceEntry::new("m-1", model, 1));
         let at = |key, model| aisix_obs::LiveGaugeSeries::RatelimitRemaining {
             api_key_id: key,
             model,
         };
-        // A model name the snapshot has never heard of — what a wildcard
-        // row serves — must NOT be read as a dead series.
-        assert!(gauge_series_is_live(
-            &snap,
-            at("ak-1", "openai/gpt-4o-2024-11-20")
-        ));
-        assert!(gauge_series_is_live(&snap, at("ak-1", "anything at all")));
-        // Losing the key is the trigger that is decidable, and it retires.
-        assert!(!gauge_series_is_live(
-            &snap,
-            at("ak-gone", "openai/gpt-4o-2024-11-20")
-        ));
+        // The wildcard ROW name is what the emit site stamps for every
+        // concrete name that row serves, and it resolves.
+        assert!(gauge_series_is_live(&snap, at("ak-1", "openai/*")));
+        // Placeholders name no row, so they are never retired.
+        assert!(gauge_series_is_live(&snap, at("ak-1", "unresolved")));
+        assert!(gauge_series_is_live(&snap, at("ak-1", "unknown")));
+        // Either half going away retires the series.
+        assert!(!gauge_series_is_live(&snap, at("ak-gone", "openai/*")));
+        assert!(!gauge_series_is_live(&snap, at("ak-1", "deleted-model")));
     }
 
     #[tokio::test(start_paused = true)]

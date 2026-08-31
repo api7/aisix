@@ -306,9 +306,17 @@ pub async fn chat_completions(
             let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
             if let Some(rl_status) = state.limiter.peek(&api_key_id, &rl_limits).await {
                 crate::render::inject_ratelimit_headers(&mut success.response, &rl_status);
+                // `model_name` is the caller's raw string; it must be
+                // collapsed to the configured set before it becomes a
+                // Prometheus label, exactly as the failure path below
+                // does (#451, and the `Upstream::model` contract in
+                // `request_metrics`). This family was the one that got
+                // it wrong: a wildcard alias serves unboundedly many
+                // concrete names off one row, so the raw value let a
+                // caller mint a series per request.
                 state.metrics.set_rate_limit_remaining(
                     &api_key_id,
-                    &model_name,
+                    &crate::usage_attr::metric_model_label(&snapshot, &model_name),
                     rl_status.rpm_remaining(),
                     rl_status.tpm_remaining(),
                 );

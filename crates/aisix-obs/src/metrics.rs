@@ -671,10 +671,16 @@ struct ConfigLabelState {
 const WORKER_CACHE_CAPACITY: usize = 1024;
 
 /// Cap on the retirable-series registry — the process-wide count of
-/// distinct label sets across the three gauge families that can outlive
-/// what they name. Generous relative to any real configuration (it is
-/// api keys × models, not traffic), and a safety valve rather than an
-/// expected limit.
+/// distinct label sets across the gauge families that can outlive what
+/// they name.
+///
+/// The bound that makes one number safe for all of them is that every
+/// dimension is CONFIGURED: api keys, and models collapsed to the
+/// configured set by `usage_attr::metric_model_label`. A caller-shaped
+/// dimension would break it — the registry is shared, so one family able
+/// to mint entries per request would fill the cap and silently stop every
+/// other family from being tracked, which is exactly the failure this
+/// whole mechanism exists to prevent.
 const RETIRABLE_CAPACITY: usize = 16_384;
 
 /// Separator joining label values into a worker-cache key — a control
@@ -982,19 +988,26 @@ impl Metrics {
     ///
     /// Retirement writes a value, because the exporter has no API to drop
     /// a series. The value is deliberately NOT zero for anything that
-    /// carries a quantity: `aisix_ratelimit_remaining_requests 0` reads
-    /// as "quota exhausted" and `aisix_deployment_state 0` reads as
-    /// "healthy", so zeroing would replace a stale claim with a false
-    /// one. `NaN` is the honest marker — it renders in the text format
-    /// and every comparison against it is false, so an alert on a retired
-    /// series stops firing instead of inverting.
+    /// carries a quantity: `aisix_ratelimit_remaining_requests 0` reads as
+    /// "quota exhausted" and `aisix_budget_remaining_usd 0` as "spent it
+    /// all", so zeroing would replace a stale claim with a false one.
+    /// `NaN` is the honest marker — it renders in the text format and
+    /// every comparison against it is false, so an alert on a retired
+    /// series stops firing instead of inverting. It does mean an
+    /// aggregation over a family with a retired member reads `NaN`; the
+    /// metric reference says so.
     /// `aisix_budget_details_present` is the exception: it is a boolean
     /// presence flag whose documented cleared value is `0`, and that is
     /// what the guard `details_present == 1` is written against.
     ///
-    /// Idempotent: a still-dead series is re-marked each pass (a single
-    /// gauge write), and one that comes back is written by the request
-    /// path and reported live on the next pass.
+    /// A retired label set is DROPPED from the registry, so it is marked
+    /// exactly once rather than re-marked every pass. It is not re-tracked
+    /// by a later write either — `with_worker_handle` returns straight out
+    /// of the thread-local cache on a hit and never reaches the
+    /// registration path. That costs nothing in practice: these ids are
+    /// uuids, so an identical label set coming back would need a deleted id
+    /// to be reissued, and the shapes that DO recur (a rebind, a rename)
+    /// produce a different label set, which registers on its own.
     pub fn retire_stale_gauges(&self, is_live: impl Fn(LiveGaugeSeries<'_>) -> bool) -> usize {
         // Take the entries out under the lock and release it before doing
         // any work: `is_live` reads the caller's snapshot and the retire
@@ -1084,7 +1097,8 @@ impl Metrics {
         // re-marking it every tick is pure waste, and keeping it would let
         // dead entries fill `RETIRABLE_CAPACITY` and silently stop NEW
         // series from ever being tracked — which is the bug this exists to
-        // fix. A key that comes back re-registers on its next request.
+        // fix. See `retire_stale_gauges` for why not re-tracking a revived
+        // label set costs nothing.
         let mut map = self.inner.retirable.lock().expect("retirable registry");
         for series in keep {
             let mut key = String::with_capacity(64);

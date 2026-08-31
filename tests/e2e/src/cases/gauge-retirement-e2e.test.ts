@@ -38,6 +38,9 @@ import {
 const PLAINTEXT = "sk-gauge-retirement";
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 const MODEL = "gr-model";
+// A wildcard row: one configured model serving unboundedly many concrete
+// names. It is what makes the `model` label's boundedness observable.
+const WILDCARD_ROW = "gr-wild/*";
 
 describe("gauge retirement e2e: a deleted key stops reporting", () => {
   let upstream: OpenAiUpstream | undefined;
@@ -83,9 +86,15 @@ describe("gauge retirement e2e: a deleted key stops reporting", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
+    await seed.createModel({
+      display_name: WILDCARD_ROW,
+      provider: "openai",
+      model_name: "*",
+      provider_key_id: pk.id,
+    });
     const key = await seed.createApiKey({
       key_hash: hash(PLAINTEXT),
-      allowed_models: [MODEL],
+      allowed_models: [MODEL, WILDCARD_ROW],
       // Any limit will do: the gauge is emitted from the post-dispatch
       // peek, which only runs for a key that has one.
       rate_limit: { rpm: 100 },
@@ -115,6 +124,41 @@ describe("gauge retirement e2e: a deleted key stops reporting", () => {
     // A number, not NaN: nothing has been retired yet.
     const value = line!.slice(line!.lastIndexOf(" ") + 1);
     expect(Number.isFinite(Number(value))).toBe(true);
+  });
+
+  // The `model` label has to be the CONFIGURED name, not the string the
+  // caller sent. A wildcard row serves unboundedly many concrete names, so
+  // stamping the raw value lets any caller mint a series per request — the
+  // #451 cardinality rule, which this family used to be the one exception
+  // to. It is also what makes the retirement sweep safe to reason about:
+  // an unbounded, caller-shaped dimension would fill the shared registry
+  // and silently stop every family from being tracked.
+  test("the model label is the configured row, not the name the caller sent", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const concrete = "gr-wild/some-model-nobody-configured";
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: concrete, messages: [{ role: "user", content: "hi" }] }),
+    });
+    await res.text();
+    expect(res.status).toBe(200);
+
+    const scrape = await scrapeText();
+    const lines = scrape
+      .split("\n")
+      .filter((l) => l.startsWith("aisix_ratelimit_remaining_requests{"));
+    expect(lines.some((l) => l.includes(`model="${WILDCARD_ROW}"`))).toBe(true);
+    expect(
+      lines.some((l) => l.includes(`model="${concrete}"`)),
+      "the caller's raw model string must never reach the label",
+    ).toBe(false);
   });
 
   test("deleting the key retires the series to NaN, not to zero", async (ctx) => {
