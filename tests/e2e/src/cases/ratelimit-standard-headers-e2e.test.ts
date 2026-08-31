@@ -222,7 +222,9 @@ describe("rate limit e2e: standard 429 headers", () => {
     const probe = new ProxyClient(app.proxyUrl, TPM_PLAINTEXT);
     await waitConfigPropagation(async () => {
       const res = await probe.listModels();
-      return res.status === 200;
+      if (res.status !== 200) return false;
+      const data = (res.body as { data?: Array<{ id?: string }> }).data ?? [];
+      return data.some((m) => m.id === FAST_MODEL);
     });
     await awaitWindowHeadroom();
 
