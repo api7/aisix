@@ -320,8 +320,14 @@ mod tests {
     }
 
     /// Surfaces with no route of their own, which the route census above
-    /// therefore cannot see. A new one must be listed here or the doc census
-    /// below will report its operation as undocumented.
+    /// therefore cannot see.
+    ///
+    /// This is an input to `emitted_operations`, so forgetting an entry
+    /// REMOVES an operation from what this file believes it emits — the doc
+    /// census would then agree with a `usage.rs` that is also missing it, and
+    /// both would be wrong together. `every_surface_is_accounted_for` is what
+    /// closes that: it reads the constants out of this file's own source and
+    /// requires each to appear here or in the route table.
     const NON_ROUTE: &[Surface] = &[BATCH_COMPLETION];
 
     /// Every operation this crate can emit, from the two places they come
@@ -336,6 +342,100 @@ mod tests {
             })
             .chain(NON_ROUTE.iter().map(|s| s.operation))
             .collect()
+    }
+
+    /// This module's own source, for the two censuses that read the constant
+    /// list out of it. A hand-maintained list of the constants would be one
+    /// more thing to forget — which is the failure both of them exist to
+    /// catch.
+    const SELF_SRC: &str = include_str!("operation.rs");
+
+    /// The names of every `Surface` constant this module defines.
+    fn declared_surfaces() -> BTreeSet<&'static str> {
+        const DECL: &str = "pub(crate) const ";
+        let mut names = BTreeSet::new();
+        for (idx, _) in SELF_SRC.match_indices(DECL) {
+            let rest = &SELF_SRC[idx + DECL.len()..];
+            let Some(colon) = rest.find(':') else {
+                continue;
+            };
+            let name = rest[..colon].trim();
+            if rest[colon..]
+                .trim_start_matches([':', ' '])
+                .starts_with("Surface")
+            {
+                names.insert(name);
+            }
+        }
+        names
+    }
+
+    /// The text between `open` and the next line that closes at `close`.
+    fn block_after(open: &str, close: &str) -> &'static str {
+        let start = SELF_SRC
+            .find(open)
+            .unwrap_or_else(|| panic!("this file must still contain {open:?}"));
+        let rest = &SELF_SRC[start + open.len()..];
+        let end = rest
+            .find(close)
+            .unwrap_or_else(|| panic!("{open:?} must be closed by {close:?}"));
+        &rest[..end]
+    }
+
+    /// Every constant must reach BOTH censuses, and neither can say so on its
+    /// own.
+    ///
+    /// `every_mounted_route_declares_what_it_reports` forces a new ROUTED
+    /// surface into the route table, and the doc census then forces it into
+    /// `usage.rs`. Neither notices a surface with no route of its own — the
+    /// `BATCH_COMPLETION` shape — and neither notices a constant missing from
+    /// the handler-label table, which is the one thing that table exists for.
+    /// So the constant list comes out of the source and both memberships are
+    /// checked against it.
+    #[test]
+    fn every_surface_is_accounted_for() {
+        let declared = declared_surfaces();
+        assert!(
+            declared.len() > 15,
+            "the constant parse found only {} surfaces — it has stopped \
+             tracking this module",
+            declared.len(),
+        );
+
+        let routed = block_after("const ROUTE_OPERATIONS: &[(&str, Emits)] = &[", "\n    ];");
+        let routeless = block_after("const NON_ROUTE: &[Surface] = &[", "];");
+        let handlers = block_after("for (surface, handler) in [", "\n        ] {");
+
+        let mut unemitted = Vec::new();
+        let mut unpinned = Vec::new();
+        for name in &declared {
+            // `Emits::Usage(CHAT)` / `&[BATCH_COMPLETION]`.
+            let emitted = routed.contains(&format!("({name})"))
+                || routeless.split([',', ' ', ']']).any(|t| t == *name);
+            if !emitted {
+                unemitted.push(*name);
+            }
+            // `(CHAT, "chat"),`
+            if !handlers.contains(&format!("({name},")) {
+                unpinned.push(*name);
+            }
+        }
+
+        assert!(
+            unemitted.is_empty(),
+            "these surfaces are defined but reach no emission census, so \
+             `emitted_operations` does not know they exist and the doc census \
+             will happily agree with a `usage.rs` that also omits them: \
+             {unemitted:?}\n\
+             Put each on a route in ROUTE_OPERATIONS, or in NON_ROUTE if it \
+             has no route of its own.",
+        );
+        assert!(
+            unpinned.is_empty(),
+            "these surfaces are missing from the handler-label table, so their \
+             shipped Prometheus label can be renamed with every test still \
+             green — which is the only thing that table is for: {unpinned:?}",
+        );
     }
 
     /// `UsageEvent::operation`'s doc comment restates the value set, and says
