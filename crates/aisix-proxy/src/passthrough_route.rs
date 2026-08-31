@@ -366,7 +366,7 @@ pub async fn entry(
             crate::usage_attr::emit_prepared_usage_event(
                 &state,
                 &snapshot,
-                "passthrough_route",
+                crate::operation::PASSTHROUGH,
                 event.clone(),
                 crate::usage_attr::usage_event_labels(
                     &usage_model,
@@ -2172,7 +2172,7 @@ impl RouteTelemetry {
         crate::usage_attr::emit_usage(
             &self.state,
             &snapshot,
-            "passthrough_route",
+            crate::operation::PASSTHROUGH,
             event,
             crate::usage_attr::usage_event_labels(&usage_model, &pk),
             content.as_ref(),

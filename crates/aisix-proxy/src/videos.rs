@@ -1589,7 +1589,7 @@ pub async fn create_video(
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 &snapshot,
-                "videos",
+                crate::operation::VIDEO_GENERATION,
                 "openai",
                 &client.request_id,
                 &model_name,
@@ -2033,10 +2033,13 @@ fn emit_submit_usage_event(
     );
     let usage_model =
         crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
+    // Only the submission meters: the two GET routes poll and download a job
+    // this event already accounted for, so `video_generation` counts video
+    // work rather than polling traffic (AISIX-Cloud#1461).
     crate::usage_attr::emit_usage(
         state,
         snap,
-        "videos",
+        crate::operation::VIDEO_GENERATION,
         event,
         crate::usage_attr::usage_event_labels(&usage_model, &pk),
         None,

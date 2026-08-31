@@ -158,6 +158,7 @@ pub async fn image_edits(
                 &snapshot,
                 &pk,
                 ENDPOINT,
+                crate::operation::IMAGE_EDIT,
                 &request_id,
                 &success.model_id,
                 &success.model_name,
@@ -216,7 +217,7 @@ pub async fn image_edits(
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 &snapshot,
-                "images",
+                crate::operation::IMAGE_EDIT,
                 "openai",
                 &request_id,
                 &attributed.requested_model,

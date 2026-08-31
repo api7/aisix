@@ -3008,7 +3008,7 @@ fn emit_anthropic_usage_event(
     crate::usage_attr::emit_usage(
         state,
         snap,
-        "messages",
+        crate::operation::MESSAGES,
         event.clone(),
         crate::usage_attr::usage_event_labels(&usage_model, pk),
         content.as_ref(),

@@ -242,7 +242,7 @@ pub async fn embeddings(
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 &snapshot,
-                "embeddings",
+                crate::operation::EMBEDDINGS,
                 "openai",
                 &request_id,
                 &model_name,
@@ -726,7 +726,7 @@ fn emit_usage_event(
     crate::usage_attr::emit_usage(
         state,
         snap,
-        "embeddings",
+        crate::operation::EMBEDDINGS,
         event,
         crate::usage_attr::usage_event_labels(&usage_model, pk),
         content,

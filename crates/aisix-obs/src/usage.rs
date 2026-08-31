@@ -414,6 +414,38 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub inbound_protocol: String,
 
+    /// What the caller asked the gateway to DO, from a fixed set:
+    /// `chat`, `messages`, `count_tokens`, `responses`, `completions`,
+    /// `embeddings`, `rerank`, `image_generation`, `image_edit`,
+    /// `transcription`, `translation`, `speech`, `video_generation`,
+    /// `video_retrieve`, `video_content`, `realtime`, `files`, `batches`,
+    /// `fine_tuning`, `mcp`, `a2a`, `passthrough`.
+    ///
+    /// The dimension nothing else on this event carries. `inbound_protocol`
+    /// collapses every OpenAI-shaped route onto one value, so a text chat, an
+    /// image generation and a video submission are indistinguishable without
+    /// this field — an exporter consumer could only tell them apart by
+    /// regex-ing a captured prompt, which `content_mode = metadata_only`
+    /// never has (AISIX-Cloud#1461).
+    ///
+    /// Bounded and derived from the route the request matched, never from
+    /// caller-supplied text, so it is safe as a metric label or an index key.
+    /// Finer than the `handler` metric label wherever one handler family
+    /// serves several kinds of work: `/v1/images/generations` and
+    /// `/v1/images/edits` share `handler="images"` but not an operation, and
+    /// the three `/v1/videos` routes share `handler="videos"` while only the
+    /// POST generates a video.
+    ///
+    /// Request-scoped: every attempt of one `request_id` — retry, fallback,
+    /// ensemble member, judge — carries the same value, and a request that
+    /// failed or was refused by a guardrail carries it too, because it says
+    /// what was ASKED for rather than what came back.
+    ///
+    /// Empty only on the wire of a gateway older than the field; cp-api
+    /// stores empty as NULL.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operation: String,
+
     // ─── Per-attempt telemetry (#655) ───
     //
     // Each UsageEvent now represents ONE upstream attempt. A request

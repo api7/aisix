@@ -183,6 +183,7 @@ pub async fn transcriptions(
                     &pk,
                     &request_id,
                     "/v1/audio/transcriptions",
+                    crate::operation::TRANSCRIPTION,
                     &success,
                     &api_key_id,
                     status,
@@ -234,7 +235,7 @@ pub async fn transcriptions(
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 &snapshot,
-                "audio",
+                crate::operation::TRANSCRIPTION,
                 "openai",
                 &request_id,
                 "",
@@ -344,6 +345,7 @@ pub async fn translations(
                     &pk,
                     &request_id,
                     "/v1/audio/translations",
+                    crate::operation::TRANSLATION,
                     &success,
                     &api_key_id,
                     status,
@@ -394,7 +396,7 @@ pub async fn translations(
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 &snapshot,
-                "audio",
+                crate::operation::TRANSLATION,
                 "openai",
                 &request_id,
                 "",
@@ -510,6 +512,7 @@ pub async fn speech(
                 &model_name,
                 &api_key_id,
                 "/v1/audio/speech",
+                crate::operation::SPEECH,
                 &success.provider,
                 &success.upstream_model,
                 &success.applied_guardrails,
@@ -563,7 +566,7 @@ pub async fn speech(
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 &snapshot,
-                "audio",
+                crate::operation::SPEECH,
                 "openai",
                 &request_id,
                 &model_name,
@@ -1057,14 +1060,18 @@ async fn multipart_dispatch(
         },
     )?;
     let provider_label = provider.to_ascii_lowercase();
-    // Static label for retry tracing — this dispatch serves both audio
-    // sub-routes, and logging translations under the transcription label
-    // would mislead an operator reading retry output.
-    let retry_endpoint_label: &'static str = if upstream_path == "/audio/translations" {
-        "/v1/audio/translations"
-    } else {
-        "/v1/audio/transcriptions"
-    };
+    // Static labels for retry tracing and telemetry — this dispatch serves
+    // both audio sub-routes, and logging translations under the
+    // transcription label would mislead an operator reading retry output.
+    // Chosen in ONE branch so the endpoint series and the usage event's
+    // operation cannot name different routes on the streaming path, which
+    // is the only emit inside this function.
+    let (retry_endpoint_label, retry_surface): (&'static str, crate::operation::Surface) =
+        if upstream_path == "/audio/translations" {
+            ("/v1/audio/translations", crate::operation::TRANSLATION)
+        } else {
+            ("/v1/audio/transcriptions", crate::operation::TRANSCRIPTION)
+        };
 
     // Rebuild the multipart form with `model` rewritten. A `multipart::Form`
     // is single-use (sending consumes it), so this is a closure rather than a
@@ -1332,6 +1339,7 @@ async fn multipart_dispatch(
                         &model_name_c,
                         &api_key_id_c,
                         retry_endpoint_label,
+                        retry_surface,
                         &provider_c,
                         &upstream_model_c,
                         &applied_c,
@@ -1994,6 +2002,7 @@ fn emit_audio_usage(
     pk: &crate::usage_attr::ResolvedPk<'_>,
     request_id: &str,
     endpoint: &'static str,
+    surface: crate::operation::Surface,
     success: &AudioDispatchSuccess,
     api_key_id: &str,
     status: u16,
@@ -2011,6 +2020,7 @@ fn emit_audio_usage(
         &success.model_name,
         api_key_id,
         endpoint,
+        surface,
         &success.provider,
         &success.upstream_model,
         &success.applied_guardrails,
@@ -2048,8 +2058,10 @@ fn emit_usage_event(
     api_key_id: &str,
     // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
     // follow-up). `endpoint` too: the three audio routes share this emitter
-    // but are three distinct series.
+    // but are three distinct series — and, since they consume and produce
+    // different things, three distinct operations (AISIX-Cloud#1461).
     endpoint: &'static str,
+    surface: crate::operation::Surface,
     provider: &str,
     upstream_model: &str,
     applied_guardrails: &[AppliedGuardrail],
@@ -2115,7 +2127,7 @@ fn emit_usage_event(
     crate::usage_attr::emit_usage(
         state,
         snap,
-        "audio",
+        surface,
         event,
         crate::usage_attr::usage_event_labels(&usage_model, pk),
         content,

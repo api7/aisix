@@ -234,7 +234,7 @@ pub(crate) async fn realtime(
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 &snapshot,
-                "realtime",
+                crate::operation::REALTIME,
                 "realtime",
                 &request_id,
                 params.get("model").map(String::as_str).unwrap_or(""),
@@ -592,7 +592,7 @@ async fn run_session(
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 &state.snapshot.load(),
-                "realtime",
+                crate::operation::REALTIME,
                 "realtime",
                 &request_id,
                 &requested_model,
@@ -860,7 +860,7 @@ async fn run_session(
     crate::usage_attr::emit_usage(
         &state,
         &snap,
-        "realtime",
+        crate::operation::REALTIME,
         event.clone(),
         crate::usage_attr::usage_event_labels(&usage_model, &pk),
         None,

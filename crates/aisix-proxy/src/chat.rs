@@ -4432,7 +4432,7 @@ fn emit_usage_event(
     crate::usage_attr::emit_usage(
         state,
         snap,
-        "chat",
+        crate::operation::CHAT,
         event,
         crate::usage_attr::usage_event_labels(&usage_model, pk),
         content.as_ref(),

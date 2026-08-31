@@ -212,7 +212,7 @@ pub async fn count_tokens(
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 &snapshot,
-                "count_tokens",
+                crate::operation::COUNT_TOKENS,
                 "anthropic",
                 &request_id,
                 &model_name,
@@ -800,7 +800,7 @@ fn emit_usage_event(
     crate::usage_attr::emit_usage(
         state,
         snap,
-        "count_tokens",
+        crate::operation::COUNT_TOKENS,
         event,
         crate::usage_attr::usage_event_labels(&usage_model, pk),
         // Content capture (#700) is not wired on this route — it is a

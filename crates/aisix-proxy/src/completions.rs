@@ -250,7 +250,7 @@ pub async fn completions(
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 &snapshot,
-                "completions",
+                crate::operation::COMPLETIONS,
                 "openai",
                 &request_id,
                 &model_name,
@@ -777,7 +777,7 @@ fn emit_usage_event(
     crate::usage_attr::emit_usage(
         state,
         snap,
-        "completions",
+        crate::operation::COMPLETIONS,
         event,
         crate::usage_attr::usage_event_labels(&usage_model, pk),
         content,

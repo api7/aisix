@@ -11,6 +11,13 @@ Behavioral guidelines to reduce common LLM coding mistakes. Bias toward caution 
 - If a simpler approach exists, say so. Push back when warranted.
 - If something is unclear, stop, name what's confusing, and ask.
 
+**Scope a customer-driven issue from the requester's quoted words, not from the rest of the body.** These issues are filed in `api7/AISIX-Cloud` (a gateway change is routinely one half of a cross-repo issue) and are drafted with AI help, and the expansion only ever runs one way — it never states the ask smaller. One customer question ("how do I tell text / image / video requests apart in api7 or SLS, and how do I query it?") arrived as AISIX-Cloud#1461: five proposed wire fields, a modality taxonomy and nine acceptance checkboxes. Building the body as written is the default outcome, not an accident.
+
+- **Find the quoted words by content, not by heading.** That repo's `feature_request.yml` collects them under 「原始需求（逐字）」, but blank issues are enabled and `gh issue create` bypasses the form, so most issues never went through it and one that imitates the template titles the section however its author chose. Read for the part that quotes the requester; only when the issue genuinely carries none, ask — never reconstruct it from the body.
+- Everything else in the issue — the user story, the proposed solution, the acceptance checkboxes, the pasted industry comparison — is analysis by whoever filed it, and loses to the quoted words on conflict. Leads, not a contract. The comparison against mainstream gateways that section 7 mandates is your own, run now against upstream HEAD, never the one pasted in the issue.
+- **Before writing code, state three things and get them confirmed: the quoted ask, what you will build, and what you are dropping as expansion.** Dropping silently is as wrong as building it. "How much of the acceptance criteria should I do?" is the wrong question — it takes the expansion as the baseline and negotiates only its volume.
+- None of this weakens delivery once scope IS agreed: the agreed scope still ships whole, across every surface it touches.
+
 ## 2. Simplicity First
 
 **Minimum code that solves the problem. Nothing speculative.**

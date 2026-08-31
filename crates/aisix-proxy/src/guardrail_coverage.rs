@@ -39,7 +39,7 @@ const ROUTER_SRC: &str = include_str!("lib.rs");
 
 /// What a mounted surface owes an operator's INPUT guardrail chain.
 #[derive(Debug, Clone, Copy)]
-enum Posture {
+pub(crate) enum Posture {
     /// Caller-authored content reaches an upstream here, so the chain runs
     /// and can refuse the request before the upstream is contacted. Every
     /// such surface is driven for real below.
@@ -55,7 +55,7 @@ enum Posture {
 /// Every surface `build_router` mounts, and its posture. The set of keys is
 /// checked against the parsed routing table, so this cannot silently fall
 /// behind the router.
-const POSTURE: &[(&str, Posture)] = &[
+pub(crate) const POSTURE: &[(&str, Posture)] = &[
     // --- liveness / discovery: no caller content leaves the gateway -----
     ("/livez", Posture::NoUpstreamContent("liveness probe")),
     ("/readyz", Posture::NoUpstreamContent("readiness probe")),
@@ -418,7 +418,8 @@ fn census_router() -> axum::Router {
 /// channel, so surfaces driven through the same router would interleave
 /// their events and "which surface emitted nothing" would stop being
 /// answerable — which is the whole question below.
-fn census_router_with_usage() -> (axum::Router, tokio::sync::mpsc::Receiver<UsageEvent>) {
+pub(crate) fn census_router_with_usage() -> (axum::Router, tokio::sync::mpsc::Receiver<UsageEvent>)
+{
     let handle = SnapshotHandle::new(census_snapshot());
     let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone(), None);
     let (tx, rx) = tokio::sync::mpsc::channel(32);
@@ -460,7 +461,7 @@ fn multipart(parts: &[(&str, &str)]) -> String {
 /// no prompt, empty `arguments`, empty message text. That is the shape every
 /// bug in this class hid behind, so it is the shape the census drives. A
 /// guardrail with a text-independent verdict must refuse them all.
-fn fixture(surface: &str) -> Option<Request<Body>> {
+pub(crate) fn fixture(surface: &str) -> Option<Request<Body>> {
     let json = |uri: &str, body: serde_json::Value| {
         Request::builder()
             .method("POST")

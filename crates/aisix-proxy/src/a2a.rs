@@ -939,7 +939,7 @@ fn emit_a2a_usage(
     crate::usage_attr::emit_usage(
         state,
         snap,
-        "a2a",
+        crate::operation::A2A,
         event,
         aisix_obs::UsageEventLabels::default(),
         captured.as_ref(),

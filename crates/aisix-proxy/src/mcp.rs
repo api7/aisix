@@ -1205,7 +1205,7 @@ fn emit_tool_call_usage(
     crate::usage_attr::emit_usage(
         state,
         snap,
-        "mcp",
+        crate::operation::MCP,
         event,
         aisix_obs::UsageEventLabels::default(),
         content,

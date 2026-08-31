@@ -60,6 +60,7 @@ mod mcp_auth;
 mod messages;
 mod model_resolve;
 mod models;
+mod operation;
 mod passthrough_route;
 mod quota;
 mod realtime;
