@@ -23,6 +23,7 @@ use aisix_obs::{UsageEvent, UsageEventLabels};
 
 use crate::chat::sanitize_tag;
 use crate::client_ip::ClientContext;
+use crate::operation::Surface;
 use crate::state::ProxyState;
 
 /// The request's ENFORCE-mode guardrail audit handle (AISIX-Cloud#1330),
@@ -469,7 +470,7 @@ pub(crate) fn apply_caller_identity(
 pub(crate) fn emit_error_usage_event(
     state: &ProxyState,
     snap: &AisixSnapshot,
-    label: &'static str,
+    surface: Surface,
     inbound_protocol: &'static str,
     request_id: &str,
     requested_model: &str,
@@ -510,7 +511,7 @@ pub(crate) fn emit_error_usage_event(
     emit_prepared_usage_event(
         state,
         snap,
-        label,
+        surface,
         event,
         usage_event_labels(&model, &pk),
         client.trace.as_ref(),
@@ -611,7 +612,7 @@ pub(crate) fn usage_event_labels<'a>(
 pub(crate) fn emit_prepared_usage_event(
     state: &ProxyState,
     snap: &AisixSnapshot,
-    label: &'static str,
+    surface: Surface,
     event: UsageEvent,
     labels: UsageEventLabels<'_>,
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
@@ -620,7 +621,9 @@ pub(crate) fn emit_prepared_usage_event(
     // builder leaves `upstream_latency_ms` at 0, so no upstream span is
     // derivable either way — `dispatched: false` states the common case
     // (most error events never reached a provider).
-    emit_usage(state, snap, label, event, labels, None, trace, true, false);
+    emit_usage(
+        state, snap, surface, event, labels, None, trace, true, false,
+    );
 }
 
 /// THE emission chokepoint (AISIX-Cloud#1279): every usage event leaves
@@ -641,7 +644,7 @@ pub(crate) fn emit_prepared_usage_event(
 pub(crate) fn emit_usage(
     state: &ProxyState,
     snap: &AisixSnapshot,
-    label: &'static str,
+    surface: Surface,
     mut event: UsageEvent,
     labels: UsageEventLabels<'_>,
     content: Option<&aisix_obs::CapturedContent>,
@@ -649,6 +652,11 @@ pub(crate) fn emit_usage(
     terminal: bool,
     dispatched: bool,
 ) {
+    // Stamped here rather than at each construction site: this is the one
+    // point every usage event passes through, so the operation cannot be
+    // present on a family's success path and missing from its error or
+    // streaming one (AISIX-Cloud#1461).
+    event.operation = surface.operation.to_string();
     let emission = trace.map(|bundle| {
         event.trace_id = bundle.trace_id_hex();
         bundle.emission(
@@ -658,7 +666,9 @@ pub(crate) fn emit_usage(
             dispatched,
         )
     });
-    state.usage_sink.try_emit(label, event.clone(), labels);
+    state
+        .usage_sink
+        .try_emit(surface.handler, event.clone(), labels);
     let exporters = live_exporters(state, snap);
     state.otlp_fan_out.fan_out(
         &event,

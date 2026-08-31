@@ -479,6 +479,7 @@ mod tests {
             upstream_latency_ms: 123,
             provider_model_version: "gpt-4o-2024-08-06".into(),
             finish_reason: "stop".into(),
+            operation: "image_generation".into(),
             ..UsageEvent::default()
         };
         let ack = sink
@@ -526,6 +527,11 @@ mod tests {
         assert_eq!(log["aisix.request_id"], "req-42");
         assert_eq!(log["aisix.model_id"], "gpt-4o");
         assert_eq!(log["aisix.upstream_latency_ms"], 123);
+        // The request's kind, under the `aisix.` prefix every field without a
+        // semconv key takes (AISIX-Cloud#1461). Datadog is the sink where a
+        // consumer would otherwise have only `gen_ai.operation.name`, which
+        // this encoder does not emit at all.
+        assert_eq!(log["aisix.operation"], "image_generation");
 
         // The API key must NEVER appear in the body anywhere.
         let body_text = serde_json::to_string(&logs).unwrap();

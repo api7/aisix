@@ -490,6 +490,7 @@ mod tests {
             prompt_tokens: 5,
             completion_tokens: 7,
             upstream_latency_ms: 123,
+            operation: "image_generation".into(),
             ..UsageEvent::default()
         };
         let ack = sink
@@ -572,6 +573,15 @@ mod tests {
         assert!(!contents.contains_key("finish_reason"));
         // Metadata-only path never carries a prompt.
         assert!(!contents.contains_key("prompt"));
+        // …which is precisely why the request classification has to ride the
+        // metadata (AISIX-Cloud#1461): with no prompt to inspect, `operation`
+        // is the only thing on this record that says what kind of call it
+        // was, and it must arrive as its own indexable column rather than
+        // buried in some composite value.
+        assert_eq!(
+            contents.get("operation").map(String::as_str),
+            Some("image_generation")
+        );
     }
 
     #[tokio::test]

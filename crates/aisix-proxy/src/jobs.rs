@@ -591,7 +591,7 @@ fn emit_job_usage_event(
     state: &ProxyState,
     // The request's snapshot, loaded once by the handler (#941).
     snap: &aisix_core::AisixSnapshot,
-    label: &'static str,
+    surface: crate::operation::Surface,
     request_id: &str,
     auth: &AuthenticatedKey,
     target: &JobTarget,
@@ -634,7 +634,7 @@ fn emit_job_usage_event(
     crate::usage_attr::emit_usage(
         state,
         snap,
-        label,
+        surface,
         event,
         crate::usage_attr::usage_event_labels(&usage_model, &pk),
         None,
@@ -693,7 +693,7 @@ fn emit_access_log(
 fn finish(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
-    label: &'static str,
+    surface: crate::operation::Surface,
     method: Method,
     path: String,
     auth: &AuthenticatedKey,
@@ -735,7 +735,7 @@ fn finish(
             emit_job_usage_event(
                 state,
                 snapshot,
-                label,
+                surface,
                 &request_id,
                 auth,
                 &target,
@@ -768,7 +768,7 @@ fn finish(
                 crate::request_metrics::Caller::new(auth),
                 crate::request_metrics::Upstream {
                     provider: "",
-                    model: label,
+                    model: surface.handler,
                     ..Default::default()
                 },
                 status,
@@ -777,7 +777,7 @@ fn finish(
             crate::usage_attr::emit_error_usage_event(
                 state,
                 snapshot,
-                label,
+                surface,
                 "openai",
                 &request_id,
                 "",
@@ -992,7 +992,7 @@ pub(crate) async fn create_file(
         // A form that failed before the model field was read never loaded
         // one.
         &snapshot.unwrap_or_else(|| state.snapshot.load()),
-        "files",
+        crate::operation::FILES,
         Method::POST,
         "/v1/files".into(),
         &auth,
@@ -1020,7 +1020,7 @@ pub(crate) async fn list_files(
         params,
         headers,
         FwdSpec {
-            label: "files",
+            surface: crate::operation::FILES,
             method: Method::GET,
             log_path: "/v1/files".into(),
             upstream_path: "/files".into(),
@@ -1050,7 +1050,7 @@ pub(crate) async fn get_file(
         params,
         headers,
         FwdSpec {
-            label: "files",
+            surface: crate::operation::FILES,
             method: Method::GET,
             log_path: format!("/v1/files/{id}"),
             upstream_path: format!("/files/{raw}"),
@@ -1080,7 +1080,7 @@ pub(crate) async fn delete_file(
         params,
         headers,
         FwdSpec {
-            label: "files",
+            surface: crate::operation::FILES,
             method: Method::DELETE,
             log_path: format!("/v1/files/{id}"),
             upstream_path: format!("/files/{raw}"),
@@ -1110,7 +1110,7 @@ pub(crate) async fn file_content(
         params,
         headers,
         FwdSpec {
-            label: "files",
+            surface: crate::operation::FILES,
             method: Method::GET,
             log_path: format!("/v1/files/{id}/content"),
             upstream_path: format!("/files/{raw}/content"),
@@ -1251,7 +1251,7 @@ pub(crate) async fn create_batch(
     finish(
         &state,
         &snapshot,
-        "batches",
+        crate::operation::BATCHES,
         Method::POST,
         "/v1/batches".into(),
         &auth,
@@ -1336,7 +1336,7 @@ pub(crate) async fn get_batch(
     finish(
         &state,
         &snapshot,
-        "batches",
+        crate::operation::BATCHES,
         Method::GET,
         format!("/v1/batches/{id}"),
         &auth,
@@ -1365,7 +1365,7 @@ pub(crate) async fn cancel_batch(
         params,
         headers,
         FwdSpec {
-            label: "batches",
+            surface: crate::operation::BATCHES,
             method: Method::POST,
             log_path: format!("/v1/batches/{id}/cancel"),
             upstream_path: format!("/batches/{raw}/cancel"),
@@ -1394,7 +1394,7 @@ pub(crate) async fn list_batches(
         params,
         headers,
         FwdSpec {
-            label: "batches",
+            surface: crate::operation::BATCHES,
             method: Method::GET,
             log_path: "/v1/batches".into(),
             upstream_path: "/batches".into(),
@@ -1532,7 +1532,7 @@ pub(crate) async fn create_ft_job(
     finish(
         &state,
         &snapshot,
-        "fine_tuning",
+        crate::operation::FINE_TUNING,
         Method::POST,
         "/v1/fine_tuning/jobs".into(),
         &auth,
@@ -1561,7 +1561,7 @@ pub(crate) async fn get_ft_job(
         params,
         headers,
         FwdSpec {
-            label: "fine_tuning",
+            surface: crate::operation::FINE_TUNING,
             method: Method::GET,
             log_path: format!("/v1/fine_tuning/jobs/{id}"),
             upstream_path: format!("/fine_tuning/jobs/{raw}"),
@@ -1591,7 +1591,7 @@ pub(crate) async fn cancel_ft_job(
         params,
         headers,
         FwdSpec {
-            label: "fine_tuning",
+            surface: crate::operation::FINE_TUNING,
             method: Method::POST,
             log_path: format!("/v1/fine_tuning/jobs/{id}/cancel"),
             upstream_path: format!("/fine_tuning/jobs/{raw}/cancel"),
@@ -1620,7 +1620,7 @@ pub(crate) async fn list_ft_jobs(
         params,
         headers,
         FwdSpec {
-            label: "fine_tuning",
+            surface: crate::operation::FINE_TUNING,
             method: Method::GET,
             log_path: "/v1/fine_tuning/jobs".into(),
             upstream_path: "/fine_tuning/jobs".into(),
@@ -1637,7 +1637,7 @@ pub(crate) async fn list_ft_jobs(
 // ─────────────────────── shared simple forward ───────────────────────
 
 struct FwdSpec {
-    label: &'static str,
+    surface: crate::operation::Surface,
     method: Method,
     log_path: String,
     upstream_path: String,
@@ -1664,7 +1664,7 @@ async fn forward_simple(
     let request_id = client.request_id.clone();
     let method = spec.method.clone();
     let log_path = spec.log_path.clone();
-    let label = spec.label;
+    let surface = spec.surface;
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
 
@@ -1743,7 +1743,7 @@ async fn forward_simple(
     finish(
         &state,
         &snapshot,
-        label,
+        surface,
         method,
         log_path,
         &auth,
@@ -1968,6 +1968,10 @@ async fn attribute_batch_usage(
                 .map(|c| c.calculate(agg.prompt, agg.completion))
                 .unwrap_or(0.0),
             inbound_protocol: "batch".to_string(),
+            // Set here rather than by the emit chokepoint: this path
+            // deliberately bypasses it (no live request, so no trace
+            // bundle), and both labels still come from one constant.
+            operation: crate::operation::BATCH_COMPLETION.operation.to_string(),
             ..Default::default()
         };
         crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
@@ -1977,7 +1981,7 @@ async fn attribute_batch_usage(
         let usage_model =
             crate::usage_attr::usage_event_model_label(&snap, &event.requested_model).into_owned();
         state.usage_sink.try_emit(
-            "batch",
+            crate::operation::BATCH_COMPLETION.handler,
             event.clone(),
             crate::usage_attr::usage_event_labels(&usage_model, &pk),
         );

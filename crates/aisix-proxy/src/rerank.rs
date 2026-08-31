@@ -220,7 +220,7 @@ pub async fn rerank(
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 &snapshot,
-                "rerank",
+                crate::operation::RERANK,
                 "openai",
                 &request_id,
                 &model_name,
@@ -736,7 +736,7 @@ fn emit_usage_event(
     crate::usage_attr::emit_usage(
         state,
         snap,
-        "rerank",
+        crate::operation::RERANK,
         event,
         crate::usage_attr::usage_event_labels(&usage_model, pk),
         content,

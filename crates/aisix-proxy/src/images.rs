@@ -167,6 +167,7 @@ pub async fn image_generations(
                     &snapshot,
                     &pk,
                     "/v1/images/generations",
+                    crate::operation::IMAGE_GENERATION,
                     &request_id,
                     &success.model_id,
                     &model_name,
@@ -220,7 +221,7 @@ pub async fn image_generations(
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 &snapshot,
-                "images",
+                crate::operation::IMAGE_GENERATION,
                 "openai",
                 &request_id,
                 &model_name,
@@ -499,8 +500,11 @@ pub(crate) fn emit_usage_event(
     snap: &aisix_core::AisixSnapshot,
     pk: &crate::usage_attr::ResolvedPk<'_>,
     // `/v1/images/generations` or `/v1/images/edits` — the two image
-    // surfaces share this emit (AISIX-Cloud#1360).
+    // surfaces share this emit (AISIX-Cloud#1360), so which one this is
+    // has to come from the caller: they share a handler label and must
+    // NOT share an operation (AISIX-Cloud#1461).
     endpoint: &'static str,
+    surface: crate::operation::Surface,
     request_id: &str,
     model_id: &str,
     requested_model: &str,
@@ -550,7 +554,6 @@ pub(crate) fn emit_usage_event(
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);
-    // Handler label "images" — bucketed prometheus counter (#408).
     crate::usage_attr::apply_caller_identity(
         &mut event,
         client.jwt.as_ref(),
@@ -562,7 +565,7 @@ pub(crate) fn emit_usage_event(
     crate::usage_attr::emit_usage(
         state,
         snap,
-        "images",
+        surface,
         event,
         crate::usage_attr::usage_event_labels(&usage_model, pk),
         content,

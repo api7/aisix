@@ -414,6 +414,57 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub inbound_protocol: String,
 
+    /// What the caller asked the gateway to DO, from a fixed set:
+    /// `chat`, `messages`, `count_tokens`, `responses`, `completions`,
+    /// `embeddings`, `rerank`, `image_generation`, `image_edit`,
+    /// `transcription`, `translation`, `speech`, `video_generation`,
+    /// `realtime`, `files`, `batches`, `fine_tuning`, `batch_completion`,
+    /// `mcp`, `a2a`, `passthrough`.
+    ///
+    /// That list is the whole of it, and a consumer building a filter or a
+    /// facet should take it verbatim. `aisix_proxy::operation` is where the
+    /// values are defined, and its route census fails the build if a mounted
+    /// route reports one that is not there. Two entries are easy to get wrong
+    /// from the outside: polling or downloading a video job emits NO event at
+    /// all (only `POST /v1/videos` does, as `video_generation`), and
+    /// `batch_completion` is not a caller request — it is the gateway's own
+    /// accounting of a finished batch job, recorded long after the
+    /// `/v1/batches` call that submitted it, and it is the row carrying that
+    /// batch's real tokens and spend.
+    ///
+    /// The dimension nothing else on this event carries. `inbound_protocol`
+    /// collapses every OpenAI-shaped route onto one value, so a text chat, an
+    /// image generation and a video submission are indistinguishable without
+    /// this field — an exporter consumer could only tell them apart by
+    /// regex-ing a captured prompt, which `content_mode = metadata_only`
+    /// never has (AISIX-Cloud#1461).
+    ///
+    /// Bounded and derived from the route the request matched, never from
+    /// caller-supplied text, so it is safe as a metric label or an index key.
+    /// Finer than the `handler` metric label wherever one handler family
+    /// serves several kinds of work: `/v1/images/generations` and
+    /// `/v1/images/edits` share `handler="images"` but not an operation, and
+    /// the three `/v1/videos` routes share `handler="videos"` while only the
+    /// POST generates a video.
+    ///
+    /// Request-scoped: every attempt of one `request_id` — retry, fallback,
+    /// ensemble member, judge — carries the same value, and a request that
+    /// failed or was refused by a guardrail carries it too, because it says
+    /// what was ASKED for rather than what came back.
+    ///
+    /// Empty only on the wire of a gateway older than the field.
+    ///
+    /// Consumed today by the exporter sinks — SLS and object storage keep the
+    /// name verbatim, Datadog maps it to `aisix.operation`, OTLP carries it
+    /// as the `aisix.operation` span attribute beside the semconv
+    /// `gen_ai.operation.name`, whose vocabulary is OpenTelemetry's and
+    /// collapses every OpenAI-shaped route onto `chat`. cp-api binds
+    /// `/dp/telemetry` leniently and currently drops the field; persisting it
+    /// and surfacing it in Logs is the control-plane half of
+    /// AISIX-Cloud#1461.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operation: String,
+
     // ─── Per-attempt telemetry (#655) ───
     //
     // Each UsageEvent now represents ONE upstream attempt. A request
