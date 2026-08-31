@@ -303,6 +303,65 @@ fn run_validate(resources: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Is this gauge label set still describing something the configuration
+/// contains?
+///
+/// The retirement sweep asks this per series; `false` marks the series as
+/// no longer current (see `Metrics::retire_stale_gauges`). Two rules keep
+/// it from retiring live data:
+///
+/// Absence has to be POSITIVE: only a label this can resolve, and whose
+/// resource is genuinely gone, counts as dead. Anything undecidable stays
+/// live, because a wrongly retired gauge hides real state — a worse outcome
+/// than the stale sample retirement exists to clean up.
+///
+/// Both families are therefore judged on `api_key_id` alone, which is the
+/// one label here that is an id the snapshot can be asked about:
+///
+/// - The budget family additionally compares the whole member triple. A
+///   bare existence check would call BOTH label sets live after a rebind or
+///   a rename and leave the pre-change sample frozen under the same
+///   `api_key_id`, which is the case it exists to catch. The triple is read
+///   off the same api-key row the emitter reads, so the comparison is exact.
+/// - The rate-limit family's `model` is checked because the emit site
+///   collapses it to the configured set first (`usage_attr::
+///   metric_model_label`): an exact model name, a wildcard ROW name like
+///   `openai/*`, or the `unresolved` placeholder. All three are decidable
+///   — the first two resolve by name, the third is a placeholder. Were the
+///   raw caller string still reaching the label, this check would retire
+///   live series every sweep, because a wildcard alias serves concrete
+///   names that are in no `models` row.
+fn gauge_series_is_live(snap: &AisixSnapshot, series: aisix_obs::LiveGaugeSeries<'_>) -> bool {
+    const UNKNOWN: &str = "unknown";
+    // What `metric_model_label` emits when nothing resolved. It names no
+    // row, so it is a placeholder like `unknown` and must never be retired.
+    // Taken from the emitter's own constant rather than spelled again here:
+    // the two drifting apart would silently start retiring live series.
+    const UNRESOLVED: &str = aisix_proxy::UNRESOLVED_MODEL_LABEL;
+    match series {
+        aisix_obs::LiveGaugeSeries::Budget {
+            api_key_id,
+            team_id,
+            user_id,
+            user_name,
+        } => {
+            let Some(entry) = snap.apikeys.get_by_id(api_key_id) else {
+                return false;
+            };
+            let key = &entry.value;
+            key.team_id.as_deref().unwrap_or(UNKNOWN) == team_id
+                && key.user_id.as_deref().unwrap_or(UNKNOWN) == user_id
+                && key.user_name.as_deref().unwrap_or(UNKNOWN) == user_name
+        }
+        aisix_obs::LiveGaugeSeries::RatelimitRemaining { api_key_id, model } => {
+            snap.apikeys.get_by_id(api_key_id).is_some()
+                && (model == UNKNOWN
+                    || model == UNRESOLVED
+                    || snap.models.get_by_name(model).is_some())
+        }
+    }
+}
+
 /// SIGHUP → re-run the whole file-source pipeline against the same
 /// resources file. Success swaps the snapshot atomically (the same
 /// [`SnapshotHandle::store`] the etcd watch supervisor uses), stamping
@@ -825,10 +884,20 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     ));
     let metrics_upkeep_task = {
         let metrics = metrics.clone();
+        let snapshot = snapshot_handle.clone();
         tokio::spawn(run_periodic(
             cancel_rx.clone(),
             Duration::from_secs(5),
-            move || metrics.run_upkeep(),
+            move || {
+                metrics.run_upkeep();
+                // Retire the gauge series whose key is gone. These families
+                // are written only from the request (or health-check) path,
+                // and the recorder registers no idle timeout, so a deleted
+                // or rebound api key leaves a sample frozen at its last
+                // value while still claiming to describe the present.
+                let snap = snapshot.load();
+                metrics.retire_stale_gauges(|series| gauge_series_is_live(&snap, series));
+            },
         ))
     };
     // Cache backends (#519 B.8). The memory cache is always built
@@ -2515,6 +2584,114 @@ mod tests {
             matches!(enable_jemalloc_background_thread(), Ok(true)),
             "background_thread did not enable on a linux-gnu target"
         );
+    }
+
+    fn snapshot_with_key(
+        id: &str,
+        team: Option<&str>,
+        user: Option<&str>,
+        name: Option<&str>,
+    ) -> AisixSnapshot {
+        let key: aisix_core::ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": "h",
+            "allowed_models": [],
+            "team_id": team,
+            "user_id": user,
+            "user_name": name,
+        }))
+        .unwrap();
+        let snap = AisixSnapshot::new();
+        snap.apikeys
+            .insert(aisix_core::resource::ResourceEntry::new(id, key, 1));
+        snap
+    }
+
+    /// The case the sweep exists for: the api key is gone, so its budget
+    /// label set describes nothing and must be reported dead.
+    #[test]
+    fn a_deleted_key_is_not_live() {
+        let snap = AisixSnapshot::new();
+        assert!(!gauge_series_is_live(
+            &snap,
+            aisix_obs::LiveGaugeSeries::Budget {
+                api_key_id: "ak-gone",
+                team_id: "t",
+                user_id: "u",
+                user_name: "alice",
+            }
+        ));
+    }
+
+    /// A bare "does the key exist" check would call BOTH label sets live
+    /// after a rebind and leave the pre-rebind sample frozen forever. The
+    /// whole member triple has to match.
+    #[test]
+    fn a_rebound_key_leaves_only_its_current_label_set_live() {
+        let snap = snapshot_with_key("ak-1", Some("team-new"), Some("u"), Some("alice"));
+        let at = |team, user, name| aisix_obs::LiveGaugeSeries::Budget {
+            api_key_id: "ak-1",
+            team_id: team,
+            user_id: user,
+            user_name: name,
+        };
+        assert!(gauge_series_is_live(&snap, at("team-new", "u", "alice")));
+        assert!(!gauge_series_is_live(&snap, at("team-old", "u", "alice")));
+        assert!(!gauge_series_is_live(
+            &snap,
+            at("team-new", "u-old", "alice")
+        ));
+        // A rename strands the old name under the same id, same as a rebind.
+        assert!(!gauge_series_is_live(
+            &snap,
+            at("team-new", "u", "Alice Before")
+        ));
+    }
+
+    /// An unbound key projects `unknown` for the member triple; that IS its
+    /// current label set, so it must stay live.
+    #[test]
+    fn an_unbound_key_is_live_under_its_placeholders() {
+        let snap = snapshot_with_key("ak-1", None, None, None);
+        assert!(gauge_series_is_live(
+            &snap,
+            aisix_obs::LiveGaugeSeries::Budget {
+                api_key_id: "ak-1",
+                team_id: "unknown",
+                user_id: "unknown",
+                user_name: "unknown",
+            }
+        ));
+    }
+
+    /// The rate-limit family is judged on BOTH halves of its key, which is
+    /// only safe because the emit site collapses the caller's model string
+    /// to the configured set first. A wildcard alias serves concrete names
+    /// that are in no `models` row, so if the raw string still reached the
+    /// label this check would retire live series on every sweep.
+    #[test]
+    fn rate_limit_remaining_is_judged_on_both_halves_of_its_key() {
+        let snap = snapshot_with_key("ak-1", None, None, None);
+        let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "openai/*",
+            "provider": "openai",
+            "model_name": "gpt-4o-mini",
+        }))
+        .unwrap();
+        snap.models
+            .insert(aisix_core::resource::ResourceEntry::new("m-1", model, 1));
+        let at = |key, model| aisix_obs::LiveGaugeSeries::RatelimitRemaining {
+            api_key_id: key,
+            model,
+        };
+        // The wildcard ROW name is what the emit site stamps for every
+        // concrete name that row serves, and it resolves.
+        assert!(gauge_series_is_live(&snap, at("ak-1", "openai/*")));
+        // Placeholders name no row, so they are never retired.
+        assert!(gauge_series_is_live(&snap, at("ak-1", "unresolved")));
+        assert!(gauge_series_is_live(&snap, at("ak-1", "unknown")));
+        // Either half going away retires the series.
+        assert!(!gauge_series_is_live(&snap, at("ak-gone", "openai/*")));
+        assert!(!gauge_series_is_live(&snap, at("ak-1", "deleted-model")));
     }
 
     #[tokio::test(start_paused = true)]

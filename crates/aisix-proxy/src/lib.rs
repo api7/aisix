@@ -80,6 +80,12 @@ mod state;
 mod stream_timeout;
 mod token_estimate;
 mod usage_attr;
+/// The `model` metric label for a request that resolved no model. Exported
+/// because the retirement sweep's liveness predicate lives in the server
+/// crate and must recognise it as a placeholder — spelling it there as a
+/// literal would let this constant change underneath it and start retiring
+/// live series.
+pub use usage_attr::UNRESOLVED_MODEL_LABEL;
 mod util;
 mod videos;
 
