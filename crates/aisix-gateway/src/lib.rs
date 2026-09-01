@@ -47,8 +47,8 @@ pub use credential::credential_fingerprint;
 pub use hub::{upstream_protocol, Hub, UPSTREAM_PROTOCOL_UNKNOWN};
 pub use sse::{SseDecoder, SseEvent};
 pub use upstream_headers::{
-    apply_request_headers, resolve_extra_headers, CallerIdentity, UpstreamHeaderContext,
-    RESERVED_UPSTREAM_HEADERS,
+    apply_request_headers, forwarded_jwt_header, resolve_extra_headers, CallerIdentity,
+    ForwardedJwtSlot, UpstreamHeaderContext, RESERVED_UPSTREAM_HEADERS,
 };
 pub use upstream_http::{
     client_builder, error_with_causes, send_error, transport_error_message, UpstreamHttpConfig,

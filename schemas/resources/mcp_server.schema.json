@@ -12,20 +12,31 @@
         "properties": {
           "forward_jwt_header": {
             "not": {
-              "enum": [
-                "accept",
-                "accept-encoding",
-                "connection",
-                "content-encoding",
-                "content-length",
-                "content-type",
-                "expect",
-                "host",
-                "keep-alive",
-                "te",
-                "trailer",
-                "transfer-encoding",
-                "upgrade"
+              "anyOf": [
+                {
+                  "enum": [
+                    "accept",
+                    "accept-encoding",
+                    "connection",
+                    "content-encoding",
+                    "content-length",
+                    "content-type",
+                    "expect",
+                    "host",
+                    "keep-alive",
+                    "te",
+                    "trailer",
+                    "transfer-encoding",
+                    "upgrade",
+                    "anthropic-version",
+                    "last-event-id",
+                    "mcp-protocol-version",
+                    "mcp-session-id"
+                  ]
+                },
+                {
+                  "pattern": "^x-aisix-"
+                }
               ]
             },
             "type": "string"

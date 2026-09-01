@@ -149,6 +149,13 @@ pub(crate) struct JobTarget {
     /// target is resolved so every round-trip on this surface (upload, poll,
     /// download) sends the same set (AISIX-Cloud#1112 / #1167).
     pub extra_headers: Vec<(axum::http::HeaderName, axum::http::HeaderValue)>,
+    /// The caller's verified JWT and the header it goes in, kept beside
+    /// `extra_headers` because it must OVERWRITE that slot while
+    /// `extra_headers` merges with skip-if-present. `slot` is present
+    /// whenever the upstream configures one, so the slot is cleared even
+    /// when there is no token — an inbound copy must never be mistaken
+    /// upstream for a verified identity.
+    forwarded_jwt: Option<(axum::http::HeaderName, axum::http::HeaderValue)>,
 }
 
 impl JobTarget {
@@ -250,20 +257,22 @@ pub(crate) fn resolve_target(
     })?;
     let secret = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
 
-    let extra_headers =
-        aisix_gateway::resolve_extra_headers(&crate::dispatch::upstream_header_ctx(
-            &pk_entry.value,
-            &pk_entry.id,
-            model,
-            &model_entry.id,
-            client_ctx,
-        ));
+    let header_ctx = crate::dispatch::upstream_header_ctx(
+        &pk_entry.value,
+        &pk_entry.id,
+        model,
+        &model_entry.id,
+        client_ctx,
+    );
+    let extra_headers = aisix_gateway::resolve_extra_headers(&header_ctx);
+    let forwarded_jwt = aisix_gateway::forwarded_jwt_header(&header_ctx);
     Ok(JobTarget {
         model_entry,
         pk_entry,
         secret,
         adapter,
         extra_headers,
+        forwarded_jwt,
     })
 }
 
@@ -381,6 +390,9 @@ async fn send_upstream(
         if !headers.contains_key(name) {
             headers.insert(name.clone(), value.clone());
         }
+    }
+    if let Some((name, value)) = &target.forwarded_jwt {
+        headers.insert(name.clone(), value.clone());
     }
     builder = builder.headers(headers);
 

@@ -25,7 +25,7 @@
 /// The fields' schemars pattern forces lowercase, so this lowercase list
 /// is exhaustive on every configuration path (header matching is
 /// case-insensitive on the wire regardless).
-pub const TRANSPORT_HEADER_SLOTS: [&str; 13] = [
+pub const TRANSPORT_HEADER_SLOTS: [&str; 17] = [
     "accept",
     "accept-encoding",
     "connection",
@@ -39,7 +39,31 @@ pub const TRANSPORT_HEADER_SLOTS: [&str; 13] = [
     "trailer",
     "transfer-encoding",
     "upgrade",
+    // Protocol slots the gateway owns on a specific surface. A token here
+    // does not merely fail to identify anyone — it breaks the exchange:
+    // rmcp REJECTS a custom `mcp-session-id` / `last-event-id` /
+    // `mcp-protocol-version` outright, so an MCP upstream would stop
+    // connecting at all rather than degrade, and `anthropic-version`
+    // selects the wire format an Anthropic-shaped upstream answers in.
+    "anthropic-version",
+    "last-event-id",
+    "mcp-protocol-version",
+    "mcp-session-id",
 ];
+
+/// Prefix of the gateway's own header namespace, which a caller-JWT slot
+/// may not claim: `x-aisix-request-id` and its siblings are gateway
+/// assertions, and overwriting one with a token both loses the assertion
+/// and lets a resource's config forge that namespace.
+const GATEWAY_HEADER_PREFIX: &str = "x-aisix-";
+
+/// Whether `name` (already lowercase) is a slot a caller JWT may never be
+/// delivered in. The schema rejects these at write time; this is the
+/// runtime half of that pair, so a document written by an older or
+/// mis-validating control plane cannot corrupt a request.
+pub fn forwarded_jwt_slot_rejected(name: &str) -> bool {
+    TRANSPORT_HEADER_SLOTS.contains(&name) || name.starts_with(GATEWAY_HEADER_PREFIX)
+}
 
 /// Headers defined to carry `<scheme> <credentials>` (RFC 9110 §11.6.2),
 /// where a bare token is malformed.
@@ -62,7 +86,7 @@ const SCHEME_BEARING_SLOTS: [&str; 2] = ["authorization", "proxy-authorization"]
 pub fn forwarded_jwt(configured: Option<&str>, token: Option<&str>) -> Option<(String, String)> {
     let name = configured?.to_ascii_lowercase();
     let token = token?;
-    if token.is_empty() || TRANSPORT_HEADER_SLOTS.contains(&name.as_str()) {
+    if token.is_empty() || forwarded_jwt_slot_rejected(&name) {
         return None;
     }
     let value = if SCHEME_BEARING_SLOTS.contains(&name.as_str()) {
@@ -122,6 +146,26 @@ mod tests {
         for name in TRANSPORT_HEADER_SLOTS {
             assert_eq!(forwarded_jwt(Some(name), Some("t")), None, "{name}");
         }
+    }
+
+    #[test]
+    fn the_gateways_own_namespace_is_not_a_deliverable_slot() {
+        // Overwriting `x-aisix-request-id` with a token would lose the
+        // correlation id the response header and usage event share.
+        assert_eq!(forwarded_jwt(Some("x-aisix-request-id"), Some("t")), None);
+        assert_eq!(forwarded_jwt(Some("x-aisix-anything"), Some("t")), None);
+        assert!(forwarded_jwt_slot_rejected("x-aisix-routing-tags"));
+        assert!(!forwarded_jwt_slot_rejected("x-user-jwt"));
+    }
+
+    #[test]
+    fn protocol_slots_that_would_break_the_exchange_are_rejected() {
+        // rmcp refuses a custom value for these, so an MCP upstream would
+        // stop connecting rather than merely miss the identity.
+        for name in ["mcp-session-id", "last-event-id", "mcp-protocol-version"] {
+            assert_eq!(forwarded_jwt(Some(name), Some("t")), None, "{name}");
+        }
+        assert_eq!(forwarded_jwt(Some("anthropic-version"), Some("t")), None);
     }
 
     #[test]

@@ -580,6 +580,7 @@ pub(crate) fn upstream_header_ctx<'a>(
             provider_key_name: Some(&pk.display_name),
         })
         .with_client_headers(&client.headers)
+        .with_caller_jwt(client.jwt.as_ref().map(|j| j.token()))
 }
 
 #[cfg(test)]

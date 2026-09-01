@@ -46,6 +46,7 @@ import {
 const JWT_HEADER = "x-user-jwt";
 const FORWARDING_MODEL = "jwt-fwd-model";
 const PLAIN_MODEL = "jwt-plain-model";
+const ANTHROPIC_MODEL = "jwt-anthropic-model";
 const ROUTE_PREFIX = "/passthrough/claims";
 const AGENT_KEY = "sk-jwt-propagation-agent";
 
@@ -191,6 +192,24 @@ describe("jwt propagation e2e: forward_jwt_header across all three upstream surf
       provider_key_id: plainPk.id,
     });
 
+    // An Anthropic-shaped upstream: `/v1/messages` reaches it through the
+    // native dispatch path (which builds its own header context) and
+    // `/v1/chat/completions` through the Anthropic bridge (which builds
+    // its request by hand). Two different code paths, one upstream.
+    const anthropicPk = await seed.createProviderKey({
+      display_name: "jwt-anthropic-pk",
+      api_key: "sk-mock-anthropic",
+      api_base: `${upstream.baseUrl}/v1`,
+      provider: "anthropic",
+      request: { forward_jwt_header: JWT_HEADER },
+    });
+    await seed.createModel({
+      display_name: ANTHROPIC_MODEL,
+      provider: "anthropic",
+      model_name: "claude-sonnet-4",
+      provider_key_id: anthropicPk.id,
+    });
+
     await seed.createPassthroughRoute({
       name: "claims-route",
       path_prefix: ROUTE_PREFIX,
@@ -330,5 +349,74 @@ describe("jwt propagation e2e: forward_jwt_header across all three upstream surf
     const toolCall = since(mark).find((r) => r.path.endsWith("/models"));
     expect(toolCall, "the generated tool must reach the REST upstream").toBeDefined();
     expect(toolCall!.headers[JWT_HEADER]).toBe(token);
+  });
+
+  test("the native /v1/messages path relays the token too", async () => {
+    if (!etcdReachable) return;
+    const token = idp!.sign(claims());
+    const mark = upstream!.receivedRequests.length;
+
+    // This endpoint does NOT go through the bridge context the chat path
+    // uses — it builds its own outbound headers, which is exactly how a
+    // sibling endpoint silently misses a per-request mechanism here.
+    await fetch(`${app!.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: ANTHROPIC_MODEL,
+        max_tokens: 16,
+        messages: [{ role: "user", content: "probe" }],
+      }),
+    }).then((r) => r.text());
+
+    const seen = since(mark).find((r) => r.path.endsWith("/messages"));
+    expect(seen, "the request must reach the upstream").toBeDefined();
+    expect(seen!.headers[JWT_HEADER]).toBe(token);
+  });
+
+  test("the Anthropic bridge relays the token on /v1/chat/completions", async () => {
+    if (!etcdReachable) return;
+    const token = idp!.sign(claims());
+    const mark = upstream!.receivedRequests.length;
+
+    // A different construction path again: this bridge assembles its
+    // upstream request by hand rather than through the header pipeline.
+    await chat(token, ANTHROPIC_MODEL).then((r) => r.text());
+
+    const seen = since(mark).at(-1);
+    expect(seen, "the request must reach the upstream").toBeDefined();
+    expect(seen!.headers[JWT_HEADER]).toBe(token);
+    // The gateway's own key still authenticates it, in its own slot.
+    expect(seen!.headers["x-api-key"]).toBe("sk-mock-anthropic");
+  });
+
+  test("an API-key caller cannot occupy the verified-identity slot", async () => {
+    if (!etcdReachable) return;
+    const mark = upstream!.receivedRequests.length;
+
+    // The upstream is told this header carries a gateway-VERIFIED
+    // identity. A caller with no JWT must not be able to fill it itself.
+    const res = await fetch(
+      `${app!.proxyUrl}${ROUTE_PREFIX}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${AGENT_KEY}`,
+          "content-type": "application/json",
+          [JWT_HEADER]: "forged.by.the.caller",
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [{ role: "user", content: "probe" }],
+        }),
+      },
+    );
+    expect(res.status).toBe(200);
+    await res.text();
+
+    expect(forwardedOn(mark)).toBeUndefined();
   });
 });

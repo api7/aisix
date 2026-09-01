@@ -267,13 +267,14 @@ pub fn resolve_extra_headers(ctx: &UpstreamHeaderContext<'_>) -> Vec<(HeaderName
 /// `x-aisix-request-id`) before calling this — that ordering is what makes
 /// gateway-owned headers un-overridable.
 pub fn apply_request_headers(headers: &mut HeaderMap, ctx: &UpstreamHeaderContext<'_>) {
+    let slot = ForwardedJwtSlot::capture(headers, ctx);
     for (name, value) in resolve_extra_headers(ctx) {
         if headers.contains_key(&name) {
             continue;
         }
         headers.insert(name, value);
     }
-    apply_forwarded_jwt(headers, ctx);
+    slot.apply(headers, ctx);
 }
 
 /// Deliver the caller's verified JWT under the ProviderKey's
@@ -288,22 +289,84 @@ pub fn apply_request_headers(headers: &mut HeaderMap, ctx: &UpstreamHeaderContex
 /// is the case the field exists for, so the caller's token REPLACES it:
 /// `insert` rather than `append`, since `append` would put two
 /// credentials on the wire and let the upstream pick (the #411 shape).
-fn apply_forwarded_jwt(headers: &mut HeaderMap, ctx: &UpstreamHeaderContext<'_>) {
+/// The caller-JWT slot for one upstream call, captured BEFORE any
+/// operator or client header is merged in.
+///
+/// Two things have to be true at once, and only the ordering tells them
+/// apart. A token must land in the slot, replacing whatever is there —
+/// including the gateway's own credential, which is the point of allowing
+/// `authorization`. But when there is NO token, a copy that arrived from
+/// the caller must not survive into a slot the upstream was told carries a
+/// gateway-VERIFIED identity, while the gateway's own credential must
+/// survive, or an API-key caller on that upstream loses its authentication
+/// entirely.
+///
+/// `gateway_owned` records which case the slot was in before the merge, so
+/// [`ForwardedJwtSlot::apply`] can clear a caller's copy without clearing
+/// a credential the dispatch path itself put there.
+pub struct ForwardedJwtSlot {
+    name: Option<HeaderName>,
+    gateway_owned: bool,
+}
+
+impl ForwardedJwtSlot {
+    /// Read the configured slot and whether `headers` already owns it.
+    /// Call this before merging operator or client headers.
+    pub fn capture(headers: &HeaderMap, ctx: &UpstreamHeaderContext<'_>) -> Self {
+        let name = configured_jwt_slot(ctx);
+        let gateway_owned = name.as_ref().is_some_and(|n| headers.contains_key(n));
+        Self {
+            name,
+            gateway_owned,
+        }
+    }
+
+    /// Deliver the token, or clear a caller's copy of the slot.
+    pub fn apply(self, headers: &mut HeaderMap, ctx: &UpstreamHeaderContext<'_>) {
+        let Some(name) = self.name else { return };
+        match forwarded_jwt_header(ctx) {
+            Some((name, value)) => {
+                headers.insert(name, value);
+            }
+            None if !self.gateway_owned => {
+                headers.remove(&name);
+            }
+            None => {}
+        }
+    }
+}
+
+/// The header name this call's `forward_jwt_header` names, if it is one a
+/// token may be delivered in at all.
+fn configured_jwt_slot(ctx: &UpstreamHeaderContext<'_>) -> Option<HeaderName> {
+    let configured = ctx
+        .overrides
+        .and_then(|o| o.forward_jwt_header.as_deref())?;
+    let name = configured.to_ascii_lowercase();
+    if aisix_core::forwarded_jwt_slot_rejected(&name) {
+        return None;
+    }
+    HeaderName::try_from(name.as_str()).ok()
+}
+
+/// The caller-JWT header and value for this call, for a dispatch path that
+/// builds its own outbound header map instead of going through
+/// [`apply_request_headers`] (the files/batches/fine-tuning and video
+/// surfaces, which merge their headers with skip-if-present semantics).
+///
+/// A caller of this function is also responsible for CLEARING the slot when
+/// there is no token — see [`configured_jwt_slot`] — since a header the
+/// caller sent must never be mistaken upstream for a verified identity.
+pub fn forwarded_jwt_header(ctx: &UpstreamHeaderContext<'_>) -> Option<(HeaderName, HeaderValue)> {
     let configured = ctx.overrides.and_then(|o| o.forward_jwt_header.as_deref());
-    let Some((name, value)) = aisix_core::forwarded_jwt(configured, ctx.caller_jwt) else {
-        return;
-    };
-    let (Ok(name), Ok(mut value)) = (
-        HeaderName::try_from(name.as_str()),
-        HeaderValue::from_str(&value),
-    ) else {
-        // A token that cannot be a header value is a broken credential,
-        // not a reason to fail the request: the upstream then answers the
-        // way it answers any unauthenticated call.
-        return;
-    };
+    let (name, value) = aisix_core::forwarded_jwt(configured, ctx.caller_jwt)?;
+    // A token that cannot be a header value is a broken credential, not a
+    // reason to fail the request: the upstream then answers the way it
+    // answers any unauthenticated call.
+    let name = HeaderName::try_from(name.as_str()).ok()?;
+    let mut value = HeaderValue::from_str(&value).ok()?;
     value.set_sensitive(true);
-    headers.insert(name, value);
+    Some((name, value))
 }
 
 #[cfg(test)]

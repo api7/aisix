@@ -325,11 +325,25 @@ impl Bridge for AnthropicBridge {
         let api_version = self.api_version;
         let started = Instant::now();
         let request_id = ctx.request_id.clone();
+        // This bridge builds its upstream request by hand rather than
+        // through the shared header pipeline, so the caller-JWT delivery
+        // is resolved here explicitly. Taking the `x-api-key` slot means
+        // the end user's token replaces the gateway's key rather than
+        // joining it — `RequestBuilder::header` appends.
+        let forwarded_jwt = aisix_gateway::forwarded_jwt_header(&ctx.header_ctx());
+        let jwt_took_api_key_slot = forwarded_jwt
+            .as_ref()
+            .is_some_and(|(n, _)| n == "x-api-key");
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = url
-                .post_on(&client)
-                .header("x-api-key", key)
+            let mut request = url.post_on(&client);
+            if !jwt_took_api_key_slot {
+                request = request.header("x-api-key", key);
+            }
+            if let Some((name, value)) = forwarded_jwt {
+                request = request.header(name, value);
+            }
+            let resp = request
                 .header("anthropic-version", api_version)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("x-aisix-request-id", &request_id)
@@ -378,10 +392,21 @@ impl Bridge for AnthropicBridge {
         let api_version = self.api_version;
         let started = Instant::now();
         let request_id = ctx.request_id.clone();
+        // Same explicit delivery as the non-streaming path above.
+        let forwarded_jwt = aisix_gateway::forwarded_jwt_header(&ctx.header_ctx());
+        let jwt_took_api_key_slot = forwarded_jwt
+            .as_ref()
+            .is_some_and(|(n, _)| n == "x-api-key");
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            url.post_on(&client)
-                .header("x-api-key", key)
+            let mut request = url.post_on(&client);
+            if !jwt_took_api_key_slot {
+                request = request.header("x-api-key", key);
+            }
+            if let Some((name, value)) = forwarded_jwt {
+                request = request.header(name, value);
+            }
+            request
                 .header("anthropic-version", api_version)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ACCEPT, "text/event-stream")

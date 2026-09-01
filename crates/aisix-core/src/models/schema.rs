@@ -935,6 +935,19 @@ pub fn provider_key_root_schema() -> Value {
 /// is injected into that definition instead. All three end up enforcing
 /// one list — [`crate::forwarded_jwt::TRANSPORT_HEADER_SLOTS`] — on both
 /// the strict and the lenient path.
+/// The `not` subschema rejecting every header slot a caller JWT may never
+/// be delivered in, shared by all three resources that carry
+/// `forward_jwt_header` so the write path and
+/// [`crate::forwarded_jwt::forwarded_jwt_slot_rejected`] cannot drift.
+pub fn forwarded_jwt_slot_rejection() -> Value {
+    json!({
+        "anyOf": [
+            { "enum": crate::forwarded_jwt::TRANSPORT_HEADER_SLOTS },
+            { "pattern": "^x-aisix-" }
+        ]
+    })
+}
+
 fn reject_transport_slots_for_forwarded_jwt(schema: &mut Value, definition: &str) {
     let field = schema
         .get_mut("definitions")
@@ -943,10 +956,7 @@ fn reject_transport_slots_for_forwarded_jwt(schema: &mut Value, definition: &str
         .and_then(|p| p.get_mut("forward_jwt_header"))
         .and_then(Value::as_object_mut)
         .unwrap_or_else(|| panic!("definition `{definition}` has a `forward_jwt_header` property"));
-    field.insert(
-        "not".to_string(),
-        json!({ "enum": crate::forwarded_jwt::TRANSPORT_HEADER_SLOTS }),
-    );
+    field.insert("not".to_string(), forwarded_jwt_slot_rejection());
 }
 
 /// Mirror a struct field's `#[serde(alias = "…")]` in the generated schema.

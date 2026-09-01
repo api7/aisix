@@ -421,8 +421,13 @@ fn build_client(
 /// is case-insensitive (HTTP header names are).
 fn filtered_extra_headers(hdr: &UpstreamHeaderContext<'_>) -> Vec<(String, String)> {
     let reserved = wire::reserved_sigv4_headers();
+    // The caller's JWT rides the same filter: an internal Bedrock-shaped
+    // upstream can be handed the end user's token, but never in a slot
+    // SigV4 signs over — `authorization` there would invalidate the
+    // signature rather than authenticate anyone.
     aisix_gateway::resolve_extra_headers(hdr)
         .into_iter()
+        .chain(aisix_gateway::forwarded_jwt_header(hdr))
         .filter(|(name, _)| !reserved.contains(&name.as_str()))
         .map(|(name, value)| {
             (

@@ -392,7 +392,7 @@ pub fn passthrough_route_coupling() -> Value {
             "if": { "required": ["forward_jwt_header"] },
             "then": { "properties": { "forward_jwt_header": {
                 "type": "string",
-                "not": { "enum": crate::forwarded_jwt::TRANSPORT_HEADER_SLOTS }
+                "not": super::schema::forwarded_jwt_slot_rejection()
             } } }
         },
         // auth_mode couplings. The mode-required companions are pinned to

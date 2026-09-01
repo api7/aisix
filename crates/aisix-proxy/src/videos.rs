@@ -1038,6 +1038,13 @@ struct VideoTarget {
     /// target is resolved so every round-trip on this surface (submit, poll,
     /// content fetch) sends the same set (AISIX-Cloud#1112 / #1167).
     extra_headers: Vec<(axum::http::HeaderName, axum::http::HeaderValue)>,
+    /// The caller's verified JWT and the header it goes in, kept beside
+    /// `extra_headers` because it must OVERWRITE that slot while
+    /// `extra_headers` merges with skip-if-present. `slot` is present
+    /// whenever the upstream configures one, so the slot is cleared even
+    /// when there is no token — an inbound copy must never be mistaken
+    /// upstream for a verified identity.
+    forwarded_jwt: Option<(axum::http::HeaderName, axum::http::HeaderValue)>,
 }
 
 impl VideoTarget {
@@ -1090,14 +1097,15 @@ fn resolve_video_target(
     };
     let secret = crate::dispatch::require_api_key(&pk_entry.value, &model_entry.value)?.to_string();
 
-    let extra_headers =
-        aisix_gateway::resolve_extra_headers(&crate::dispatch::upstream_header_ctx(
-            &pk_entry.value,
-            &pk_entry.id,
-            &model_entry.value,
-            &model_entry.id,
-            client_ctx,
-        ));
+    let header_ctx = crate::dispatch::upstream_header_ctx(
+        &pk_entry.value,
+        &pk_entry.id,
+        &model_entry.value,
+        &model_entry.id,
+        client_ctx,
+    );
+    let extra_headers = aisix_gateway::resolve_extra_headers(&header_ctx);
+    let forwarded_jwt = aisix_gateway::forwarded_jwt_header(&header_ctx);
     Ok(Ok(VideoTarget {
         pk_id: pk_entry.id.to_string(),
         tls: pk_entry.value.tls.clone(),
@@ -1107,6 +1115,7 @@ fn resolve_video_target(
         secret,
         model_entry,
         extra_headers,
+        forwarded_jwt,
     }))
 }
 
@@ -1194,6 +1203,9 @@ async fn provider_call(
                 if !headers.contains_key(name) {
                     headers.insert(name.clone(), value.clone());
                 }
+            }
+            if let Some((name, value)) = &target.forwarded_jwt {
+                headers.insert(name.clone(), value.clone());
             }
             let mut builder = client.request(method.clone(), url).headers(headers);
             if let Some(b) = body {
@@ -1306,6 +1318,9 @@ async fn proxy_content(
         if !headers.contains_key(name) {
             headers.insert(name.clone(), value.clone());
         }
+    }
+    if let Some((name, value)) = &target.forwarded_jwt {
+        headers.insert(name.clone(), value.clone());
     }
     let builder = client.get(url).headers(headers);
 
