@@ -933,7 +933,7 @@ pub fn provider_key_root_schema() -> Value {
 pub fn forwarded_jwt_slot_rejection() -> Value {
     json!({
         "anyOf": [
-            { "enum": crate::forwarded_jwt::TRANSPORT_HEADER_SLOTS },
+            { "enum": crate::forwarded_jwt::NON_SENDER_HEADER_SLOTS },
             // `type` is load-bearing: a bare `pattern` matches any
             // non-string vacuously, so the enclosing `not` would reject an
             // explicit `null` — and this schema is also the LENIENT read

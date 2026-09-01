@@ -42,7 +42,7 @@ pub use config_status::{
 pub use error::{
     AdminError, AdminErrorEnvelope, BootstrapError, ProxyError, ProxyErrorEnvelope, RateLimitScope,
 };
-pub use forwarded_jwt::{forwarded_jwt, forwarded_jwt_slot_rejected, TRANSPORT_HEADER_SLOTS};
+pub use forwarded_jwt::{forwarded_jwt, forwarded_jwt_slot_rejected, NON_SENDER_HEADER_SLOTS};
 pub use header_template::{render_header_template, HeaderVars, HEADER_TEMPLATE_VARS};
 pub use models::{
     validate_a2a_agent, validate_apikey, validate_cache_policy, validate_guardrail,

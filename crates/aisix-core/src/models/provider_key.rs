@@ -393,9 +393,10 @@ pub struct RequestOverrides {
     /// there — so the upstream receives the end user's token in place of
     /// the gateway's, never both. Any other header carries the bare token.
     ///
-    /// Transport headers (`host`, `content-length`, `connection`, and the
-    /// rest of the hop-by-hop family) are rejected: they describe the
-    /// message rather than its sender. Lowercase-only, so that rejection
+    /// Headers that describe the message rather than its sender — its
+    /// framing (`host`, `content-length`), the connection carrying it
+    /// (`connection`, `keep-alive`), and what it negotiates (`accept`,
+    /// `content-type`) — are rejected. Lowercase-only, so that rejection
     /// list is exhaustive on every configuration path (header matching is
     /// case-insensitive on the wire regardless).
     #[serde(default, skip_serializing_if = "Option::is_none")]

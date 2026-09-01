@@ -91,6 +91,13 @@ describe("jwt propagation e2e: forward_jwt_header across all three upstream surf
     return seen[seen.length - 1]!.headers[JWT_HEADER];
   };
 
+  /** Read a response body, failing with it when the status is not 2xx. */
+  const bodyOf = async (res: Response, what: string): Promise<string> => {
+    const text = await res.text();
+    expect(res.ok, `${what} failed with ${res.status}: ${text.slice(0, 400)}`).toBe(true);
+    return text;
+  };
+
   const chat = async (
     token: string,
     model: string,
@@ -122,10 +129,17 @@ describe("jwt propagation e2e: forward_jwt_header across all three upstream surf
       body: JSON.stringify(body),
     });
     const text = await res.text();
+    // A handshake that fails here surfaces as the header assertion finding
+    // nothing at the upstream, which says nothing about why. Fail on the
+    // spot instead, carrying the status and body that explain it.
+    if (!res.ok) {
+      throw new Error(`MCP POST ${res.status}: ${text.slice(0, 400)}`);
+    }
+    if (!text) return undefined;
     try {
-      return text ? JSON.parse(text) : undefined;
+      return JSON.parse(text);
     } catch {
-      return undefined;
+      throw new Error(`MCP POST returned unparseable JSON: ${text.slice(0, 400)}`);
     }
   };
 
@@ -370,7 +384,7 @@ describe("jwt propagation e2e: forward_jwt_header across all three upstream surf
         max_tokens: 16,
         messages: [{ role: "user", content: "probe" }],
       }),
-    }).then((r) => r.text());
+    }).then((r) => bodyOf(r, "native /v1/messages"));
 
     const seen = since(mark).find((r) => r.path.endsWith("/messages"));
     expect(seen, "the request must reach the upstream").toBeDefined();
@@ -384,7 +398,9 @@ describe("jwt propagation e2e: forward_jwt_header across all three upstream surf
 
     // A different construction path again: this bridge assembles its
     // upstream request by hand rather than through the header pipeline.
-    await chat(token, ANTHROPIC_MODEL).then((r) => r.text());
+    await chat(token, ANTHROPIC_MODEL).then((r) =>
+      bodyOf(r, "the Anthropic bridge on /v1/chat/completions"),
+    );
 
     const seen = since(mark).at(-1);
     expect(seen, "the request must reach the upstream").toBeDefined();

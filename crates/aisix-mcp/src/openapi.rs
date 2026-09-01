@@ -164,7 +164,19 @@ impl OpenApiBridge {
         // The caller's JWT wins the slot it names: `RequestBuilder::header`
         // appends, so filling a slot twice would put two credentials on the
         // wire and let the REST API pick between them.
-        let jwt_slot = self.forwarded_jwt.as_ref().map(|(name, _)| name.as_str());
+        //
+        // Built here, before anything reads the slot, so suppressing the
+        // server credential and delivering the token cannot disagree: a
+        // value that will not become a header does not claim the slot, and
+        // the request keeps the credential it would otherwise have had.
+        // Built as a HeaderValue so `set_sensitive` survives — a `&str`
+        // would have reqwest construct a fresh, unmarked value.
+        let forwarded = self.forwarded_jwt.as_ref().and_then(|(name, value)| {
+            let mut v = reqwest::header::HeaderValue::from_str(value).ok()?;
+            v.set_sensitive(true);
+            Some((name.as_str(), v))
+        });
+        let jwt_slot = forwarded.as_ref().map(|(name, _)| *name);
         let api_key_header = server
             .api_key_header
             .as_deref()
@@ -188,16 +200,8 @@ impl OpenApiBridge {
                 request.bearer_auth(token)
             }
         };
-        Ok(match &self.forwarded_jwt {
-            // Built as a HeaderValue so `set_sensitive` survives: a `&str`
-            // would have reqwest construct a fresh, unmarked value.
-            Some((name, value)) => match reqwest::header::HeaderValue::from_str(value) {
-                Ok(mut v) => {
-                    v.set_sensitive(true);
-                    request.header(name.as_str(), v)
-                }
-                Err(_) => request,
-            },
+        Ok(match forwarded {
+            Some((name, value)) => request.header(name, value),
             None => request,
         })
     }

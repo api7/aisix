@@ -478,3 +478,30 @@ async fn a_server_without_the_field_forwards_no_caller_token() {
     assert_eq!(seen["user_jwt"], "");
     assert_eq!(seen["authorizations"], json!([]));
 }
+
+#[tokio::test]
+async fn a_token_that_cannot_be_a_header_leaves_the_gateway_credential_alone() {
+    let api = spawn_claims_api().await;
+    // Verified tokens are base64url and so always header-safe; the point of
+    // the assertion is that the two halves of the slot decision are taken
+    // together, so no future token source can suppress the gateway's
+    // credential without replacing it.
+    let seen = whoami_via_gateway(
+        json!({
+            "name": "claims",
+            "type": "openapi",
+            "url": format!("http://{api}/v1"),
+            "spec": whoami_spec(),
+            "auth_type": "bearer",
+            "secret": "gateway-held-secret",
+            "forward_jwt_header": "authorization",
+        }),
+        Some("eyJhbGciOi\ncaller"),
+    )
+    .await;
+    assert_eq!(
+        seen["authorizations"],
+        json!(["Bearer gateway-held-secret"]),
+        "an undeliverable token must not cost the request its only credential"
+    );
+}

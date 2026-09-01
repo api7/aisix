@@ -586,3 +586,28 @@ fn forwarded_jwt_is_redacted_in_debug() {
         "token must not print: {rendered}"
     );
 }
+
+/// The slot is claimed only by a token that can actually be delivered.
+/// Verified tokens are base64url and so always header-safe; the assertion
+/// is that the suppression and the delivery are one decision, so no future
+/// token source can leave the session with neither credential.
+#[tokio::test]
+async fn a_token_that_cannot_be_a_header_leaves_the_gateway_bearer_alone() {
+    let addr =
+        spawn_echo_server_requiring_sole_authorization("Bearer gateway-held-secret".to_string())
+            .await;
+
+    let upstream = McpUpstream::new(format!("http://{addr}/mcp"))
+        .with_bearer("gateway-held-secret")
+        .with_forwarded_jwt(Some((
+            "authorization".to_string(),
+            "Bearer caller\ntoken".to_string(),
+        )));
+
+    let bridge = EphemeralBridge::new(upstream);
+    let tools = bridge
+        .list_tools()
+        .await
+        .expect("an undeliverable token must not cost the session its only credential");
+    assert_eq!(tools.len(), 1);
+}

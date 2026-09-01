@@ -148,9 +148,10 @@ pub struct PassthroughRoute {
     /// slot — the upstream receives the end user's token in place of the
     /// gateway's, never both. Any other header carries the bare token.
     ///
-    /// Transport headers (`host`, `content-length`, `connection`, and the
-    /// rest of the hop-by-hop family) are rejected: they describe the
-    /// message rather than its sender. Lowercase-only, so that rejection
+    /// Headers that describe the message rather than its sender — its
+    /// framing (`host`, `content-length`), the connection carrying it
+    /// (`connection`, `keep-alive`), and what it negotiates (`accept`,
+    /// `content-type`) — are rejected. Lowercase-only, so that rejection
     /// list is exhaustive on every configuration path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(regex(pattern = "^[!#$%&'*+.^_`|~0-9a-z-]+$"), length(min = 1))]
@@ -389,9 +390,12 @@ pub fn passthrough_route_coupling() -> Value {
         // end user's token in the `Authorization` an internal service
         // already reads is what lets that service stay unchanged.
         {
+            // Presence, not value: an explicit `null` clears the field, so
+            // the `then` must not pin a type the property itself declares
+            // nullable — under the lenient contract a rejected document
+            // costs the whole row.
             "if": { "required": ["forward_jwt_header"] },
             "then": { "properties": { "forward_jwt_header": {
-                "type": "string",
                 "not": super::schema::forwarded_jwt_slot_rejection()
             } } }
         },
@@ -477,6 +481,59 @@ mod tests {
             }"#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn the_caller_jwt_slot_takes_credential_headers_and_refuses_framing_ones() {
+        use crate::models::schema::{
+            validate_passthrough_route, validate_passthrough_route_lenient,
+        };
+
+        let with = |slot: serde_json::Value| {
+            let mut v = json!({
+                "name": "system-server",
+                "path_prefix": "/passthrough/system",
+                "target_url": "https://erp.internal",
+                "provider_key_id": "11111111-1111-1111-1111-111111111111"
+            });
+            v["forward_jwt_header"] = slot;
+            v
+        };
+
+        // A credential slot is the point of the field, not an oversight: in
+        // `auth_mode: gateway_key` the gateway consumes `Authorization` to
+        // identify the caller, and this is what puts a token back there.
+        for good in ["authorization", "proxy-authorization", "x-user-jwt"] {
+            validate_passthrough_route(&with(json!(good)))
+                .unwrap_or_else(|e| panic!("`{good}` must be accepted: {e}"));
+        }
+
+        // A header that frames the message, or asserts something the gateway
+        // owns, cannot carry a sender's identity.
+        for bad in [
+            "host",
+            "content-length",
+            "mcp-session-id",
+            "x-aisix-request-id",
+        ] {
+            validate_passthrough_route(&with(json!(bad)))
+                .expect_err(&format!("`{bad}` must be rejected"));
+        }
+
+        // An explicit null clears the field. It has to survive BOTH gates:
+        // the lenient one is the read contract, where a rejected document
+        // takes the whole route offline rather than the one field.
+        validate_passthrough_route(&with(json!(null))).expect("an explicit null clears the slot");
+        validate_passthrough_route_lenient(&with(json!(null)))
+            .expect("an explicit null must not cost the row on the read path");
+
+        // The name is a lowercase token; the shape is pinned independently.
+        for malformed in [json!(""), json!("Authorization"), json!("x y")] {
+            assert!(
+                validate_passthrough_route(&with(malformed.clone())).is_err(),
+                "{malformed} is not a header name"
+            );
+        }
     }
 
     #[test]

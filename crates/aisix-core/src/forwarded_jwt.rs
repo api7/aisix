@@ -25,7 +25,7 @@
 /// The fields' schemars pattern forces lowercase, so this lowercase list
 /// is exhaustive on every configuration path (header matching is
 /// case-insensitive on the wire regardless).
-pub const TRANSPORT_HEADER_SLOTS: [&str; 17] = [
+pub const NON_SENDER_HEADER_SLOTS: [&str; 17] = [
     "accept",
     "accept-encoding",
     "connection",
@@ -61,7 +61,7 @@ const GATEWAY_HEADER_PREFIX: &str = "x-aisix-";
 /// delivered in. Shared by the runtime and by the generated schemas, so
 /// the write path, the read path and dispatch all answer alike.
 pub fn forwarded_jwt_slot_rejected(name: &str) -> bool {
-    TRANSPORT_HEADER_SLOTS.contains(&name) || name.starts_with(GATEWAY_HEADER_PREFIX)
+    NON_SENDER_HEADER_SLOTS.contains(&name) || name.starts_with(GATEWAY_HEADER_PREFIX)
 }
 
 /// Headers defined to carry `<scheme> <credentials>` (RFC 9110 §11.6.2),
@@ -146,7 +146,7 @@ mod tests {
 
     #[test]
     fn transport_slots_send_nothing() {
-        for name in TRANSPORT_HEADER_SLOTS {
+        for name in NON_SENDER_HEADER_SLOTS {
             assert_eq!(forwarded_jwt(Some(name), Some("t")), None, "{name}");
         }
     }

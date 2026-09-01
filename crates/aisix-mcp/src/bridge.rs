@@ -407,10 +407,20 @@ impl RmcpBridge {
             // the same slot: an operator who points `forward_jwt_header`
             // at `authorization` is choosing the end user's token over the
             // gateway's, and the upstream must receive exactly one of them.
-            let jwt_slot = upstream
-                .forwarded_jwt
-                .as_ref()
-                .map(|(name, _)| name.as_str());
+            //
+            // Resolved before anything reads the slot, so suppressing the
+            // gateway credential and delivering the token cannot disagree:
+            // a token that cannot become a header does not claim the slot,
+            // and the server keeps the credential it would otherwise have
+            // had. `set_sensitive` marks the value opaque to `Debug`
+            // formatting of the header map.
+            let forwarded = upstream.forwarded_jwt.as_ref().and_then(|(name, value)| {
+                let name = HeaderName::try_from(name.as_str()).ok()?;
+                let mut value = HeaderValue::from_str(value).ok()?;
+                value.set_sensitive(true);
+                Some((name, value))
+            });
+            let jwt_slot = forwarded.as_ref().map(|(name, _)| name.as_str());
             let mut custom: HashMap<HeaderName, HeaderValue> = HashMap::new();
             let mut auth_header: Option<String> = None;
             match &upstream.auth {
@@ -445,17 +455,8 @@ impl RmcpBridge {
                     }
                 }
             }
-            if let Some((name, value)) = &upstream.forwarded_jwt {
-                // A token that cannot be a header value is a broken
-                // credential, not a reason to fail the connect: the server
-                // then answers the way it answers any unauthenticated call.
-                if let (Ok(name), Ok(mut value)) = (
-                    HeaderName::try_from(name.as_str()),
-                    HeaderValue::from_str(value),
-                ) {
-                    value.set_sensitive(true);
-                    custom.insert(name, value);
-                }
+            if let Some((name, value)) = forwarded {
+                custom.insert(name, value);
             }
             let mut config = transport_config(&upstream.url);
             if let Some(token) = auth_header {
