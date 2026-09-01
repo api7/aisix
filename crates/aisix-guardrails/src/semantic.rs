@@ -50,13 +50,12 @@
 //! outer `Guardrail::fail_open` on the INPUT hook and the independent
 //! `SemanticConfig::output_fail_open` on the OUTPUT hook.
 //!
-//! Those two defaults point in OPPOSITE directions, and the asymmetry is
-//! inherited rather than chosen here: the row-level `fail_open` defaults
-//! to `true` for every kind that can be unavailable, while
-//! `output_fail_open` defaults to `false`. So an unscreenable REQUEST is
-//! admitted by default and an unscreenable RESPONSE is refused. An
-//! operator who wants unscreenable requests refused sets
-//! `fail_open: false` on the row:
+//! Both default to fail-CLOSED, so an embedding outage refuses the
+//! request and the response alike rather than releasing text nothing
+//! screened. An operator who would rather serve traffic than screen it
+//! opts out per hook and per row — `fail_open: true` on the row for
+//! requests, `output_fail_open: true` in the kind's config for
+//! responses:
 //!
 //! | embedding dispatch      | `fail_open` | Verdict                              |
 //! |-------------------------|-------------|--------------------------------------|

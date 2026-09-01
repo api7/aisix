@@ -772,39 +772,34 @@ pub struct SemanticConfig {
     pub allow_examples: Vec<String>,
     /// Cosine-similarity threshold for `deny_examples`, in `[-1, 1]`.
     /// Lower it to block more. Required whenever `deny_examples` is
-    /// non-empty: there is no value that is right for every embedding
-    /// model, so it has to be measured against the one this row uses.
+    /// non-empty.
     ///
-    /// Cosine scales differ enough between models that the SAME pair of
-    /// texts lands on opposite sides of a fixed threshold. Measured
-    /// against one deny list, unrelated benign traffic — a recipe, a git
-    /// question — peaks at 0.23 on one widely used model and 0.59 on
-    /// another; the noise floors are ~0.39 apart. A shipped default
-    /// therefore cannot be right, and a wrong one under-protects
-    /// silently, which is exactly how a policy comes to look like it is
-    /// running while catching almost nothing.
-    ///
-    /// Defaulted at the TYPE level and required by the strict write
-    /// schema instead, for the reason `embedding_model` gives: rows
-    /// written before the field was required carry no key at all, and a
-    /// row the loader cannot deserialize is skipped whole — a screening
-    /// row that vanishes is a guardrail that stopped screening, which is
-    /// fail-OPEN on a security control.
-    ///
-    /// The default stays at the historical 0.75 rather than a lowered
-    /// value: those un-migrated rows enforce 0.75 today, and changing
-    /// what they enforce without the operator asking would be a worse
-    /// surprise than leaving them. The control plane backfills the key
-    /// explicitly and reprojects, after which nothing reaches this
-    /// default and it can be retired.
+    /// There is no portable value. Cosine scores are not comparable
+    /// across embedding models — the same pair of texts can fall on
+    /// opposite sides of a fixed threshold depending on which model
+    /// produced the vectors, and a threshold carried over from another
+    /// model under-screens without any sign that it is doing so. Measure
+    /// one against the model named in `embedding_model`, on your own
+    /// traffic: every request reports what it scored in
+    /// `guardrail_scores` on its usage event, including the requests
+    /// this guardrail allowed.
+    // Defaulted at the TYPE level and required by the strict write schema
+    // instead, for the reason `embedding_model` gives: rows written before
+    // the field was required carry no key at all, and a row the loader
+    // cannot deserialize is skipped whole — a screening row that vanishes
+    // is a guardrail that stopped screening, which is fail-OPEN on a
+    // security control. The default keeps the historical value rather than
+    // a lowered one, because those rows enforce it today and changing what
+    // they enforce without the operator asking would be a worse surprise;
+    // see `default_semantic_threshold`.
     #[serde(default = "default_semantic_threshold")]
     #[schemars(range(min = -1.0, max = 1.0))]
     pub deny_threshold: f32,
     /// Cosine-similarity threshold for `allow_examples`, in `[-1, 1]`.
     /// RAISE it to block more — a text must reach it to be admitted.
-    /// Required whenever `allow_examples` is non-empty, and only then:
-    /// see `deny_threshold` for why there is no default worth shipping,
-    /// and why the type-level one nevertheless stays.
+    /// Required whenever `allow_examples` is non-empty, and only then: a
+    /// row with no allow-list has nothing for this number to decide. See
+    /// `deny_threshold` for why there is no portable value.
     #[serde(default = "default_semantic_threshold")]
     #[schemars(range(min = -1.0, max = 1.0))]
     pub allow_threshold: f32,
@@ -1185,11 +1180,10 @@ fn is_zero_u32(value: &u32) -> bool {
 /// and `allow` the LOWEST best-allow similarity, each being the text that
 /// came nearest to changing the verdict.
 ///
-/// `embedding_model` is not decoration: cosine scales differ between
-/// embedding models, so the same pair of texts can score 0.83 on one model
-/// and 0.77 on another. A score without the model that produced it cannot
-/// be compared against a threshold, against another deployment, or against
-/// a value recorded before the model was switched.
+/// `embedding_model` is not decoration: cosine scores are not comparable
+/// across embedding models, so a score without the model that produced it
+/// cannot be read against a threshold, against another deployment, or
+/// against a value recorded before the model was switched.
 ///
 /// **Indices only, never text.** `top_example_index` names the example the
 /// candidate scored highest against; neither the example text nor the
