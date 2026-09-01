@@ -491,10 +491,17 @@ fn translate_reasoning_effort_to_anthropic(
     let Some(effort) = effort.as_str() else {
         return;
     };
+    let has_native_effort = extras
+        .get("output_config")
+        .and_then(|config| config.as_object())
+        .is_some_and(|config| config.contains_key("effort"));
     // `none` has no Anthropic tier — it asks for no reasoning at all,
-    // which is the `disabled` thinking mode.
+    // which is the `disabled` thinking mode. An effort the caller set
+    // natively is their statement about depth, and disabling thinking
+    // beside it would contradict it; Anthropic also rejects `disabled`
+    // above the `high` tier, so the pair can 400 outright.
     if effort == "none" {
-        if !extras.contains_key("thinking") {
+        if !has_native_effort && !extras.contains_key("thinking") {
             extras.insert(
                 "thinking".to_string(),
                 serde_json::json!({"type": "disabled"}),
@@ -4123,6 +4130,63 @@ mod tests {
             Some(&serde_json::json!("nonsense"))
         );
         assert!(!built.extra.contains_key("reasoning_effort"));
+    }
+
+    #[test]
+    fn build_request_none_yields_to_a_native_effort_tier() {
+        // `reasoning_effort: none` beside a caller-set tier is a
+        // contradiction the caller wrote. The native field wins, so no
+        // `thinking: disabled` is injected next to it — Anthropic
+        // rejects `disabled` above `high` anyway.
+        let req = ChatFormat {
+            extra: {
+                let mut m = serde_json::Map::new();
+                m.insert("reasoning_effort".to_string(), "none".into());
+                m.insert(
+                    "output_config".to_string(),
+                    serde_json::json!({"effort": "max"}),
+                );
+                m
+            },
+            ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+        };
+        let (_system, messages) = split_system(&req).unwrap();
+        let built = build_request(&req, "c-name", None, messages, false);
+        assert_eq!(
+            built.extra.get("output_config"),
+            Some(&serde_json::json!({"effort": "max"}))
+        );
+        assert!(!built.extra.contains_key("thinking"));
+        assert!(!built.extra.contains_key("reasoning_effort"));
+    }
+
+    #[test]
+    fn build_request_tier_joins_a_caller_supplied_thinking_mode() {
+        // `thinking` is the mode and `output_config.effort` the depth:
+        // Anthropic treats them as complementary, so a caller who set a
+        // mode natively still gets the tier they asked for.
+        let req = ChatFormat {
+            extra: {
+                let mut m = serde_json::Map::new();
+                m.insert("reasoning_effort".to_string(), "high".into());
+                m.insert(
+                    "thinking".to_string(),
+                    serde_json::json!({"type": "adaptive", "display": "summarized"}),
+                );
+                m
+            },
+            ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+        };
+        let (_system, messages) = split_system(&req).unwrap();
+        let built = build_request(&req, "c-name", None, messages, false);
+        assert_eq!(
+            built.extra.get("thinking"),
+            Some(&serde_json::json!({"type": "adaptive", "display": "summarized"}))
+        );
+        assert_eq!(
+            built.extra.get("output_config"),
+            Some(&serde_json::json!({"effort": "high"}))
+        );
     }
 
     #[test]
