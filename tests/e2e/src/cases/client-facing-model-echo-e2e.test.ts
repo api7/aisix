@@ -274,6 +274,44 @@ describe("client-facing model echo e2e: the response names what the caller asked
     expect(text.trimEnd().endsWith("data: [DONE]")).toBe(true);
   });
 
+  test("/v1/responses streamed: a final frame the upstream never terminated still echoes the alias", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return void ctx.skip();
+
+    // Mid-stream a fragment is a frame still arriving and must be held. At
+    // EOF it is a frame the upstream never closed — and on this surface that
+    // is `response.completed`, the event an SDK builds its final Response
+    // object from. No guardrail here: this is the ordinary configuration, so
+    // it is the likelier way to meet the bug, not the exotic one.
+    const upstream = await startOpenAiUpstream({
+      rawStreamFrames: [
+        `event: response.created\ndata: {"type":"response.created","response":{"id":"resp_eof","object":"response","status":"in_progress","model":"${UPSTREAM_REPORTED_MODEL}"}}\n\n`,
+        `event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n`,
+        // Deliberately no trailing blank line on the last frame.
+        `event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_eof","object":"response","status":"completed","model":"${UPSTREAM_REPORTED_MODEL}","usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}`,
+      ],
+    });
+    upstreams.push(upstream);
+    await seedAlias("echo-eof-tail", upstream);
+
+    const res = await fetch(`${app.proxyUrl}/v1/responses`, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify({
+        model: "echo-eof-tail",
+        input: "say ok",
+        stream: true,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expectAliasNotUpstreamId(text, "echo-eof-tail");
+    // Both snapshot frames, the unterminated one included.
+    expect(text.split('"model":"echo-eof-tail"').length - 1).toBe(2);
+    // The tail is delivered, not withheld: there is no scan to bypass here.
+    expect(text).toContain('"total_tokens":6');
+    expect(text).toContain('"delta":"ok"');
+  });
+
   test("/v1/completions echoes the alias", async (ctx) => {
     if (!etcdReachable || !app || !seed) return void ctx.skip();
 

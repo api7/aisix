@@ -2848,14 +2848,28 @@ where
         // A non-conformant upstream can end without terminating its last
         // frame. Those bytes were never forwarded (they are still the partial
         // tail), so release them now rather than truncating the response.
+        //
+        // Restamp it on the way out. Mid-stream a fragment is a frame still
+        // arriving and must be held, but the upstream has now ended: this is
+        // a final frame it never terminated, and on this surface that is
+        // `response.completed` — the event an SDK builds its final Response
+        // object from. Same reasoning as `model_echo::restamp_sse_buffer`,
+        // and this path reaches it without any guardrail attached.
         if !buf.is_empty() {
+            let tail = std::mem::take(&mut buf);
+            let tail = crate::model_echo::restamp_sse_frame(
+                &tail,
+                &client_facing_model,
+                crate::model_echo::responses_snapshot_model,
+            )
+            .unwrap_or(tail);
             let (usage_acc, _) = guard.parts();
             let acc = usage_acc.get_or_insert_with(Default::default);
             if acc.downstream_latency_ms == 0 {
                 acc.downstream_latency_ms =
                     started.elapsed().as_millis().min(u32::MAX as u128) as u32;
             }
-            yield Ok(bytes::Bytes::from(std::mem::take(&mut buf)));
+            yield Ok(bytes::Bytes::from(tail));
         }
         // Upstream EOF — the response was delivered in full. Record that
         // before the scan below, which awaits a remote provider and is a

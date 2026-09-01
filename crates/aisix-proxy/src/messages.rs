@@ -3749,6 +3749,17 @@ where
                     return;
                 }
             } else {
+                // Restamp on the way out, for the same reason the `/v1/responses`
+                // relay does: the upstream has ended, so this is a final frame it
+                // never terminated rather than one still arriving. Anthropic's last
+                // frame is `message_stop`, which carries no model, so this is inert
+                // today — it is here so the two relays cannot answer differently.
+                let tail = crate::model_echo::restamp_sse_frame(
+                    &tail,
+                    &model_label,
+                    crate::model_echo::anthropic_message_model,
+                )
+                .unwrap_or(tail);
                 if guard.usage().downstream_latency_ms == 0 {
                     guard.usage().downstream_latency_ms =
                         started.elapsed().as_millis().min(u32::MAX as u128) as u32;
@@ -3756,9 +3767,10 @@ where
                 yield Ok(Bytes::from(tail));
             }
         }
-        // Upstream stream over — the response was forwarded in full. Record
-        // it before the scan below, which awaits a remote provider and is a
-        // routine drop point for clients that close on the terminal event.
+        // Upstream stream over. Record it before the scan below, which awaits
+        // a remote provider and is a routine drop point for clients that close
+        // on the terminal event. NOT the same as "all of it was forwarded":
+        // under a hold-back policy an unscannable frame may have been withheld.
         guard.usage().reached_end = true;
         // End-of-stream output guardrail (#448): scan the accumulated
         // assistant text. On a block, emit a terminal Anthropic `error`
@@ -6334,12 +6346,14 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
         );
     }
 
-    /// The two other ways an unscanned byte could reach a client under a
-    /// hold-back policy, both deterministic here rather than only in e2e.
+    /// Drive one streamed `/v1/messages` request through a block-capable
+    /// output guardrail (so the hold-back path is in force) and return the
+    /// body the CALLER received. `sse` is the upstream's raw SSE response.
     ///
-    /// `case` is the upstream's SSE body; `expect_released` is text that must
-    /// reach the caller, `expect_withheld` text that must not.
-    async fn holdback_case(sse: String) -> String {
+    /// The guardrail's literal never appears in any case below, so a refusal
+    /// can only come from bytes the scan could not see — which is what these
+    /// tests are about.
+    async fn holdback_case(sse: String) -> (String, aisix_obs::UsageEvent) {
         use aisix_obs::UsageSink;
 
         let upstream = MockServer::start().await;
@@ -6353,7 +6367,7 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
             .mount(&upstream)
             .await;
 
-        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let snap = new_snap_anthropic(&upstream.uri());
         snap.models.insert(anthropic_model("my-claude"));
         snap.apikeys.insert(apikey_entry(&["*"]));
@@ -6381,7 +6395,26 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        String::from_utf8(to_bytes(resp.into_body(), 1 << 21).await.unwrap().to_vec()).unwrap()
+        let body =
+            String::from_utf8(to_bytes(resp.into_body(), 1 << 21).await.unwrap().to_vec()).unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_millis(1000), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("usage event sender dropped");
+        (body, event)
+    }
+
+    /// Every fail-closed arm reports the same way: the gateway ended this, so
+    /// it is a 200 carrying `guardrail_blocked`, not the 499 a client
+    /// abandonment would produce (AISIX-Cloud#1428). Asserted per arm because
+    /// each sets the flag itself — drop `guardrail_blocked = true` from any one
+    /// of them and only its own test can notice.
+    fn assert_refused_not_abandoned(event: &aisix_obs::UsageEvent) {
+        assert!(event.guardrail_blocked, "a refusal is a guardrail block");
+        assert_eq!(
+            event.status_code, 200,
+            "a fail-closed refusal is not a client abandonment"
+        );
     }
 
     /// A stream that ends mid-frame: the scanned frames are delivered, the
@@ -6398,7 +6431,13 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 
 event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"UNSCANNEDTAIL""#;
-        let streamed = holdback_case(sse.to_string()).await;
+        let (streamed, event) = holdback_case(sse.to_string()).await;
+        // Frames WERE delivered, so this is not a refusal — the tail is simply
+        // withheld and the stream reports normally.
+        assert!(
+            !event.guardrail_blocked,
+            "withholding a tail is not a block"
+        );
         assert!(
             streamed.contains("SCANNEDTEXT"),
             "frames that were scanned still reach the caller: {streamed}"
@@ -6426,7 +6465,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
             ),
             huge = huge
         );
-        let streamed = holdback_case(sse).await;
+        let (streamed, event) = holdback_case(sse).await;
         assert!(
             streamed.contains(crate::error::TAG_UNSCANNABLE_BODY),
             "an unterminated oversized frame is refused, not released: {}",
@@ -6436,5 +6475,27 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
             !streamed.contains(&huge),
             "unscannable content must not be released"
         );
+        assert_refused_not_abandoned(&event);
+    }
+
+    /// The third arm: the unterminated frame is the WHOLE response, and small
+    /// enough that the frame cap never fires. Nothing was ever drained, so
+    /// nothing was scanned and there is nothing to deliver — dropping it
+    /// silently would hand the caller an empty 200 with no signal at all, so
+    /// it is refused explicitly instead.
+    #[tokio::test]
+    async fn holdback_refuses_when_the_unterminated_frame_is_the_whole_response() {
+        let sse = r#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ONLYEVERFRAGMENT""#;
+        let (streamed, event) = holdback_case(sse.to_string()).await;
+        assert!(
+            streamed.contains(crate::error::TAG_UNSCANNABLE_BODY),
+            "an all-fragment response is refused, not silently emptied: {streamed}"
+        );
+        assert!(
+            !streamed.contains("ONLYEVERFRAGMENT"),
+            "unscanned content must not be released: {streamed}"
+        );
+        assert_refused_not_abandoned(&event);
     }
 }
