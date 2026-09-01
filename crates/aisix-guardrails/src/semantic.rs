@@ -1019,8 +1019,11 @@ mod tests {
             false,
             Arc::new(StubEmbedder::default()),
         );
+        // Newest-first: the on-topic message is screened first and PASSES
+        // the allow gate, then the off-topic one fails it. Two allow
+        // observations, so the fold has something to choose between.
         assert!(g
-            .check_input(&req(&[("user", "refund"), ("user", "the weather")]))
+            .check_input(&req(&[("user", "the weather"), ("user", "refund")]))
             .await
             .is_block());
 
