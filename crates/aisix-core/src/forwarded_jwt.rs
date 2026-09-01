@@ -58,9 +58,8 @@ pub const TRANSPORT_HEADER_SLOTS: [&str; 17] = [
 const GATEWAY_HEADER_PREFIX: &str = "x-aisix-";
 
 /// Whether `name` (already lowercase) is a slot a caller JWT may never be
-/// delivered in. The schema rejects these at write time; this is the
-/// runtime half of that pair, so a document written by an older or
-/// mis-validating control plane cannot corrupt a request.
+/// delivered in. Shared by the runtime and by the generated schemas, so
+/// the write path, the read path and dispatch all answer alike.
 pub fn forwarded_jwt_slot_rejected(name: &str) -> bool {
     TRANSPORT_HEADER_SLOTS.contains(&name) || name.starts_with(GATEWAY_HEADER_PREFIX)
 }
@@ -75,10 +74,14 @@ const SCHEME_BEARING_SLOTS: [&str; 2] = ["authorization", "proxy-authorization"]
 /// `None` covers the three ordinary ways this does not apply, none of them
 /// an error: the upstream has no `forward_jwt_header` configured, the
 /// caller authenticated with an API key so there is no token to relay, or
-/// the configured name describes the message rather than its sender (the
-/// schema rejects those at write time; this is the runtime half of that
-/// pair, so a document written by an older control plane cannot corrupt a
-/// request).
+/// the configured name is one no token may be delivered in.
+///
+/// That last case is belt-and-braces rather than a live path — the same
+/// rejection sits in the LENIENT read schema, so a stored document naming
+/// a forbidden slot never reaches this function; the loader skips the
+/// whole row first. Worth knowing when reading a bug report: getting this
+/// field wrong takes the entire resource offline, it does not silently
+/// stop forwarding.
 ///
 /// The value is the token exactly as verified — no claim added, removed,
 /// or rewritten — prefixed with `Bearer ` only for the headers whose own

@@ -926,15 +926,6 @@ pub fn provider_key_root_schema() -> Value {
     schema
 }
 
-/// Constrain the `forward_jwt_header` of a nested definition to headers
-/// that name a sender rather than frame the message.
-///
-/// The flat resources carrying the same field express this as an
-/// `if`/`then` in their own coupling; `provider_key` holds it inside
-/// `request`, which schemars emits as a `$ref`'d definition, so the rule
-/// is injected into that definition instead. All three end up enforcing
-/// one list — [`crate::forwarded_jwt::TRANSPORT_HEADER_SLOTS`] — on both
-/// the strict and the lenient path.
 /// The `not` subschema rejecting every header slot a caller JWT may never
 /// be delivered in, shared by all three resources that carry
 /// `forward_jwt_header` so the write path and
@@ -943,11 +934,23 @@ pub fn forwarded_jwt_slot_rejection() -> Value {
     json!({
         "anyOf": [
             { "enum": crate::forwarded_jwt::TRANSPORT_HEADER_SLOTS },
-            { "pattern": "^x-aisix-" }
+            // `type` is load-bearing: a bare `pattern` matches any
+            // non-string vacuously, so the enclosing `not` would reject an
+            // explicit `null` — and this schema is also the LENIENT read
+            // contract, where a rejected document costs the whole row.
+            { "type": "string", "pattern": "^x-aisix-" }
         ]
     })
 }
 
+/// Constrain the `forward_jwt_header` of a nested definition to headers
+/// that name a sender rather than frame the message.
+///
+/// The flat resources carrying the same field express this as an
+/// `if`/`then` in their own coupling; `provider_key` holds it inside
+/// `request`, which schemars emits as a `$ref`'d definition, so the rule
+/// is injected into that definition instead. All three end up enforcing
+/// one list on both the strict and the lenient path.
 fn reject_transport_slots_for_forwarded_jwt(schema: &mut Value, definition: &str) {
     let field = schema
         .get_mut("definitions")

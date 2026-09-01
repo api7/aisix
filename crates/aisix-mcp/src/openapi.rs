@@ -189,7 +189,15 @@ impl OpenApiBridge {
             }
         };
         Ok(match &self.forwarded_jwt {
-            Some((name, value)) => request.header(name.as_str(), value.as_str()),
+            // Built as a HeaderValue so `set_sensitive` survives: a `&str`
+            // would have reqwest construct a fresh, unmarked value.
+            Some((name, value)) => match reqwest::header::HeaderValue::from_str(value) {
+                Ok(mut v) => {
+                    v.set_sensitive(true);
+                    request.header(name.as_str(), v)
+                }
+                Err(_) => request,
+            },
             None => request,
         })
     }

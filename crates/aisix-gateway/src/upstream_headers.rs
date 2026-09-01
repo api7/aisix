@@ -267,14 +267,14 @@ pub fn resolve_extra_headers(ctx: &UpstreamHeaderContext<'_>) -> Vec<(HeaderName
 /// `x-aisix-request-id`) before calling this — that ordering is what makes
 /// gateway-owned headers un-overridable.
 pub fn apply_request_headers(headers: &mut HeaderMap, ctx: &UpstreamHeaderContext<'_>) {
-    let slot = ForwardedJwtSlot::capture(headers, ctx);
+    let slot = ForwardedJwt::resolve(ctx).capture(headers);
     for (name, value) in resolve_extra_headers(ctx) {
         if headers.contains_key(&name) {
             continue;
         }
         headers.insert(name, value);
     }
-    slot.apply(headers, ctx);
+    slot.apply(headers);
 }
 
 /// Deliver the caller's verified JWT under the ProviderKey's
@@ -289,43 +289,60 @@ pub fn apply_request_headers(headers: &mut HeaderMap, ctx: &UpstreamHeaderContex
 /// is the case the field exists for, so the caller's token REPLACES it:
 /// `insert` rather than `append`, since `append` would put two
 /// credentials on the wire and let the upstream pick (the #411 shape).
-/// The caller-JWT slot for one upstream call, captured BEFORE any
-/// operator or client header is merged in.
+/// The caller-JWT delivery for one upstream call: which header, and the
+/// value if there is a token to put in it.
 ///
-/// Two things have to be true at once, and only the ordering tells them
-/// apart. A token must land in the slot, replacing whatever is there —
-/// including the gateway's own credential, which is the point of allowing
-/// `authorization`. But when there is NO token, a copy that arrived from
-/// the caller must not survive into a slot the upstream was told carries a
+/// Resolved from the request context, then CAPTURED against the outbound
+/// header map before any operator or client header is merged in — the
+/// order is what makes the two required behaviours distinguishable. A
+/// token must land in the slot, replacing whatever is there, including
+/// the gateway's own credential (which is the point of allowing
+/// `authorization`). But with NO token, a copy that arrived from the
+/// caller must not survive into a slot the upstream was told carries a
 /// gateway-VERIFIED identity, while the gateway's own credential must
-/// survive, or an API-key caller on that upstream loses its authentication
-/// entirely.
-///
-/// `gateway_owned` records which case the slot was in before the merge, so
-/// [`ForwardedJwtSlot::apply`] can clear a caller's copy without clearing
-/// a credential the dispatch path itself put there.
-pub struct ForwardedJwtSlot {
+/// survive — otherwise an API-key caller on that upstream loses its
+/// authentication entirely. Only "was this already here before the merge"
+/// tells those two apart.
+#[derive(Debug, Clone, Default)]
+pub struct ForwardedJwt {
     name: Option<HeaderName>,
+    value: Option<HeaderValue>,
+}
+
+impl ForwardedJwt {
+    /// Resolve the configured slot and the token, if any, for this call.
+    pub fn resolve(ctx: &UpstreamHeaderContext<'_>) -> Self {
+        let name = configured_jwt_slot(ctx);
+        let value = forwarded_jwt_header(ctx).map(|(_, value)| value);
+        Self { name, value }
+    }
+
+    /// Record whether `headers` already owns the slot. Call before merging
+    /// operator or client headers.
+    pub fn capture(&self, headers: &HeaderMap) -> ForwardedJwtSlot {
+        let gateway_owned = self.name.as_ref().is_some_and(|n| headers.contains_key(n));
+        ForwardedJwtSlot {
+            forwarded: self.clone(),
+            gateway_owned,
+        }
+    }
+}
+
+/// A [`ForwardedJwt`] plus the one fact only the pre-merge map could tell.
+#[derive(Debug, Clone, Default)]
+pub struct ForwardedJwtSlot {
+    forwarded: ForwardedJwt,
     gateway_owned: bool,
 }
 
 impl ForwardedJwtSlot {
-    /// Read the configured slot and whether `headers` already owns it.
-    /// Call this before merging operator or client headers.
-    pub fn capture(headers: &HeaderMap, ctx: &UpstreamHeaderContext<'_>) -> Self {
-        let name = configured_jwt_slot(ctx);
-        let gateway_owned = name.as_ref().is_some_and(|n| headers.contains_key(n));
-        Self {
-            name,
-            gateway_owned,
-        }
-    }
-
     /// Deliver the token, or clear a caller's copy of the slot.
-    pub fn apply(self, headers: &mut HeaderMap, ctx: &UpstreamHeaderContext<'_>) {
-        let Some(name) = self.name else { return };
-        match forwarded_jwt_header(ctx) {
-            Some((name, value)) => {
+    pub fn apply(self, headers: &mut HeaderMap) {
+        let Some(name) = self.forwarded.name else {
+            return;
+        };
+        match self.forwarded.value {
+            Some(value) => {
                 headers.insert(name, value);
             }
             None if !self.gateway_owned => {
@@ -338,6 +355,14 @@ impl ForwardedJwtSlot {
 
 /// The header name this call's `forward_jwt_header` names, if it is one a
 /// token may be delivered in at all.
+///
+/// Public because a dispatch path that has no `HeaderMap` to capture from
+/// still has to know which name is the caller-JWT slot — the Bedrock
+/// bridge hands its headers to a SigV4 interceptor as name/value strings.
+pub fn forwarded_jwt_slot(ctx: &UpstreamHeaderContext<'_>) -> Option<HeaderName> {
+    configured_jwt_slot(ctx)
+}
+
 fn configured_jwt_slot(ctx: &UpstreamHeaderContext<'_>) -> Option<HeaderName> {
     let configured = ctx
         .overrides
@@ -444,6 +469,63 @@ mod tests {
         apply_request_headers(&mut headers, &ctx);
         // The gateway's own credential is untouched, not replaced by a blank.
         assert_eq!(headers["authorization"], "Bearer gateway-held-key");
+    }
+
+    #[test]
+    fn a_caller_cannot_fill_the_verified_identity_slot() {
+        // The upstream is told this header carries a gateway-VERIFIED
+        // identity. A caller with no JWT must not be able to put its own
+        // value there, even when the operator's allowlist would otherwise
+        // forward that header.
+        let r = RequestOverrides {
+            forward_jwt_header: Some("x-user-jwt".into()),
+            forward_client_headers: vec!["x-user-jwt".into()],
+            ..Default::default()
+        };
+        let mut headers = HeaderMap::new();
+        let inbound = client(&[("x-user-jwt", "forged.by.the.caller")]);
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r))
+            .with_client_headers(&inbound)
+            .with_caller_jwt(None);
+        apply_request_headers(&mut headers, &ctx);
+        assert!(!headers.contains_key("x-user-jwt"), "got: {headers:?}");
+    }
+
+    #[test]
+    fn a_caller_copy_is_replaced_rather_than_joined() {
+        // Same allowlist, but this caller DID authenticate with a JWT: the
+        // verified token wins the slot, and rides alone.
+        let r = RequestOverrides {
+            forward_jwt_header: Some("x-user-jwt".into()),
+            forward_client_headers: vec!["x-user-jwt".into()],
+            ..Default::default()
+        };
+        let mut headers = HeaderMap::new();
+        let inbound = client(&[("x-user-jwt", "forged.by.the.caller")]);
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r))
+            .with_client_headers(&inbound)
+            .with_caller_jwt(Some("verified"));
+        apply_request_headers(&mut headers, &ctx);
+        assert_eq!(headers["x-user-jwt"], "verified");
+        assert_eq!(headers.get_all("x-user-jwt").iter().count(), 1);
+    }
+
+    #[test]
+    fn an_operator_header_does_not_win_the_slot() {
+        // `default_headers` outranks a client header, but not the token:
+        // the slot means "verified identity", so a static operator value
+        // there would be a lie the upstream cannot detect.
+        let r = RequestOverrides {
+            forward_jwt_header: Some("x-user-jwt".into()),
+            default_headers: [("x-user-jwt".to_string(), "static".to_string())]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ..Default::default()
+        };
+        let mut headers = HeaderMap::new();
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_caller_jwt(Some("verified"));
+        apply_request_headers(&mut headers, &ctx);
+        assert_eq!(headers["x-user-jwt"], "verified");
     }
 
     #[test]

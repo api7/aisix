@@ -149,13 +149,14 @@ pub(crate) struct JobTarget {
     /// target is resolved so every round-trip on this surface (upload, poll,
     /// download) sends the same set (AISIX-Cloud#1112 / #1167).
     pub extra_headers: Vec<(axum::http::HeaderName, axum::http::HeaderValue)>,
-    /// The caller's verified JWT and the header it goes in, kept beside
-    /// `extra_headers` because it must OVERWRITE that slot while
-    /// `extra_headers` merges with skip-if-present. `slot` is present
-    /// whenever the upstream configures one, so the slot is cleared even
-    /// when there is no token — an inbound copy must never be mistaken
-    /// upstream for a verified identity.
-    forwarded_jwt: Option<(axum::http::HeaderName, axum::http::HeaderValue)>,
+    /// The caller-JWT slot for this call, captured before the outbound
+    /// header map is merged. Kept beside `extra_headers` because it must
+    /// OVERWRITE its slot while `extra_headers` merges with
+    /// skip-if-present — and because with no token to deliver it still has
+    /// to CLEAR a copy that arrived from the caller, which an inbound
+    /// header allowlist can otherwise walk into a slot the upstream was
+    /// told carries a verified identity.
+    forwarded_jwt: aisix_gateway::ForwardedJwt,
 }
 
 impl JobTarget {
@@ -265,7 +266,7 @@ pub(crate) fn resolve_target(
         client_ctx,
     );
     let extra_headers = aisix_gateway::resolve_extra_headers(&header_ctx);
-    let forwarded_jwt = aisix_gateway::forwarded_jwt_header(&header_ctx);
+    let forwarded_jwt = aisix_gateway::ForwardedJwt::resolve(&header_ctx);
     Ok(JobTarget {
         model_entry,
         pk_entry,
@@ -386,14 +387,17 @@ async fn send_upstream(
     if let Ok(v) = axum::http::HeaderValue::from_str(request_id) {
         headers.insert(axum::http::HeaderName::from_static("x-aisix-request-id"), v);
     }
+    // Captured BEFORE the merge: the gateway's own credential went in
+    // above and must survive when there is no token, while a caller's copy
+    // could only arrive through the merge and must not.
+    let jwt_slot = target.forwarded_jwt.capture(&headers);
     for (name, value) in &target.extra_headers {
         if !headers.contains_key(name) {
             headers.insert(name.clone(), value.clone());
         }
     }
-    if let Some((name, value)) = &target.forwarded_jwt {
-        headers.insert(name.clone(), value.clone());
-    }
+    jwt_slot.apply(&mut headers);
+
     builder = builder.headers(headers);
 
     builder = match body {

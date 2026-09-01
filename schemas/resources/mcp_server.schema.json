@@ -35,7 +35,8 @@
                   ]
                 },
                 {
-                  "pattern": "^x-aisix-"
+                  "pattern": "^x-aisix-",
+                  "type": "string"
                 }
               ]
             },

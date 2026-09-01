@@ -425,8 +425,17 @@ fn filtered_extra_headers(hdr: &UpstreamHeaderContext<'_>) -> Vec<(String, Strin
     // upstream can be handed the end user's token, but never in a slot
     // SigV4 signs over — `authorization` there would invalidate the
     // signature rather than authenticate anyone.
+    //
+    // The interceptor that consumes this is FIRST-WINS (see `intercept`
+    // below), the opposite of every other delivery site, so the slot is
+    // cleared out of the operator/client headers rather than the token
+    // being appended after them. Clearing is unconditional: with a slot
+    // configured and no token to relay, a caller's own copy must not reach
+    // an upstream that was told this header carries a verified identity.
+    let jwt_slot = aisix_gateway::forwarded_jwt_slot(hdr);
     aisix_gateway::resolve_extra_headers(hdr)
         .into_iter()
+        .filter(|(name, _)| jwt_slot.as_ref() != Some(name))
         .chain(aisix_gateway::forwarded_jwt_header(hdr))
         .filter(|(name, _)| !reserved.contains(&name.as_str()))
         .map(|(name, value)| {
@@ -4696,5 +4705,84 @@ mod tests {
             }
             other => panic!("expected Config error, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod forwarded_jwt_tests {
+    use super::*;
+    use aisix_core::RequestOverrides;
+    use std::collections::HashMap;
+
+    fn overrides(slot: &str, defaults: &[(&str, &str)], forward: &[&str]) -> RequestOverrides {
+        RequestOverrides {
+            forward_jwt_header: Some(slot.to_string()),
+            default_headers: defaults
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<HashMap<_, _>>(),
+            forward_client_headers: forward.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn header_map(pairs: &[(&str, &str)]) -> http::HeaderMap {
+        let mut map = http::HeaderMap::new();
+        for (k, v) in pairs {
+            map.insert(
+                k.parse::<http::HeaderName>().unwrap(),
+                http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        map
+    }
+
+    /// The interceptor that consumes this list is FIRST-WINS, unlike every
+    /// other delivery site, so an operator's static header of the same name
+    /// would otherwise shadow the verified token.
+    #[test]
+    fn the_token_outranks_an_operator_header_of_the_same_name() {
+        let r = overrides("x-user-jwt", &[("x-user-jwt", "static")], &[]);
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_caller_jwt(Some("verified"));
+        let headers = filtered_extra_headers(&ctx);
+        assert_eq!(
+            headers,
+            vec![("x-user-jwt".to_string(), "verified".to_string())]
+        );
+    }
+
+    #[test]
+    fn the_token_outranks_a_caller_header_of_the_same_name() {
+        let r = overrides("x-user-jwt", &[], &["x-user-jwt"]);
+        let inbound = header_map(&[("x-user-jwt", "forged.by.the.caller")]);
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r))
+            .with_client_headers(&inbound)
+            .with_caller_jwt(Some("verified"));
+        let headers = filtered_extra_headers(&ctx);
+        assert_eq!(
+            headers,
+            vec![("x-user-jwt".to_string(), "verified".to_string())]
+        );
+    }
+
+    /// With no token to relay, the caller's own copy must not reach an
+    /// upstream that was told this slot carries a verified identity.
+    #[test]
+    fn an_api_key_caller_cannot_fill_the_slot() {
+        let r = overrides("x-user-jwt", &[], &["x-user-jwt"]);
+        let inbound = header_map(&[("x-user-jwt", "forged.by.the.caller")]);
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r))
+            .with_client_headers(&inbound)
+            .with_caller_jwt(None);
+        assert!(filtered_extra_headers(&ctx).is_empty());
+    }
+
+    /// The SigV4 filter still applies: a token can never land in a signed
+    /// slot, whatever the operator names.
+    #[test]
+    fn a_signed_slot_is_still_refused() {
+        let r = overrides("authorization", &[], &[]);
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_caller_jwt(Some("verified"));
+        assert!(filtered_extra_headers(&ctx).is_empty());
     }
 }
