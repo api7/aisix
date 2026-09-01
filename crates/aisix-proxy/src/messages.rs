@@ -6390,16 +6390,14 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
     /// scan cleared would be a way around the check.
     #[tokio::test]
     async fn holdback_withholds_an_unterminated_tail_but_delivers_what_was_scanned() {
-        let sse = concat!(
-            r#"event: message_start
+        let sse = r#"event: message_start
 data: {"type":"message_start","message":{"id":"msg_t","role":"assistant","content":[],"model":"claude-3-5-haiku-20241022","stop_reason":null,"usage":{"input_tokens":4,"output_tokens":1}}}
 
 event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"SCANNEDTEXT"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"UNSCANNEDTAIL""#,
-        );
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"UNSCANNEDTAIL""#;
         let streamed = holdback_case(sse.to_string()).await;
         assert!(
             streamed.contains("SCANNEDTEXT"),
