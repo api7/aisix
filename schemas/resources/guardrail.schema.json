@@ -1630,8 +1630,7 @@
           "type": "boolean"
         },
         "script": {
-          "default": "",
-          "description": "The script source, as an ES module exporting `checkInput` and/or `checkOutput`. A hook whose function the module does not export is skipped, so a script may cover one direction only.\n\nDefaulted at the TYPE level and required by the strict write schema instead (AGENTS.md: never make a projected field required at the type level). A row the loader cannot deserialize is skipped whole, and a screening row that vanishes is a guardrail that stopped screening. An empty script is refused at chain-build time, so the row screens nothing rather than silently admitting everything it was meant to screen. That refusal is a warn line, not a config-status rejection — `aisix validate` is what turns it into a report (api7/aisix#1084).",
+          "description": "The script source, as an ES module exporting `checkInput` and/or `checkOutput`. A hook whose function the module does not export is skipped, so a script may cover one direction only.\n\nDefaulted at the TYPE level and required by the strict write schema instead (AGENTS.md: never make a projected field required at the type level). A row the loader cannot deserialize is skipped whole, and a screening row that vanishes is a guardrail that stopped screening. An empty script is refused at chain-build time, so the row screens nothing rather than silently admitting everything it was meant to screen. That refusal is a warn line, not a config-status rejection: `/status/config` stays `synced` with an empty `rejected` list, so a stored row in this shape is visible only in the gateway's log (api7/aisix#1084). A resources file never reaches that path — this field is required on the strict write schema, so the row is refused outright there.",
           "minLength": 1,
           "type": "string"
         },

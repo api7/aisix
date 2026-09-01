@@ -401,23 +401,20 @@ describe("semantic guardrail similarity scores on usage events", () => {
     // would let anyone with log access enumerate the operator's deny list
     // by reading it; an echoed candidate would make the telemetry a copy of
     // user prompts (#153).
-    // Its own traffic, so the case stands alone in any order — then it
-    // asserts over EVERY row the exporter has accumulated, not the two it
-    // just produced. `waitForSlsLog` returns the FIRST match, so a
-    // predicate written against these requests would have read the rows an
-    // earlier case left behind and the assertion would have been about
-    // whichever row happened to come first. Sweeping all of them removes
-    // the question and is the stronger claim anyway: no exported row may
-    // carry this text, whatever produced it.
+    // It issues its own traffic so it stands alone in any order, then
+    // sweeps EVERY row the exporter has accumulated — the stronger claim,
+    // since no exported row may carry this text whatever produced it.
+    //
+    // The wait counts rows rather than matching a predicate. A predicate on
+    // model + guardrail_blocked would not discriminate: `waitForSlsLog`
+    // returns the FIRST match and the cases above already produced rows
+    // satisfying both, so it would return instantly and the sweep could run
+    // before either of these two requests had been exported.
+    const before = slsLogsFor(sls, META_LOGSTORE).length;
     expect(await chat(ENFORCE_MODEL, BLOCKING_PROMPT)).toBe(422);
     expect(await chat(ENFORCE_MODEL, NEAR_MISS_PROMPT)).toBe(200);
-    await row(
-      (l) => forModel(ENFORCE_MODEL)(l) && l.get("guardrail_blocked") === "true",
-      "a blocked row to sweep",
-    );
-    await row(
-      (l) => forModel(ENFORCE_MODEL)(l) && l.get("guardrail_blocked") === "false",
-      "an allowed row to sweep",
+    await waitConfigPropagation(
+      async () => slsLogsFor(sls!, META_LOGSTORE).length >= before + 2,
     );
 
     const rows = slsLogsFor(sls, META_LOGSTORE);

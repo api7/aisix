@@ -900,8 +900,11 @@ pub struct CustomConfig {
     /// screening. An empty script is refused at chain-build time, so the
     /// row screens nothing rather than silently admitting everything it was
     /// meant to screen. That refusal is a warn line, not a config-status
-    /// rejection — `aisix validate` is what turns it into a report
-    /// (api7/aisix#1084).
+    /// rejection: `/status/config` stays `synced` with an empty `rejected`
+    /// list, so a stored row in this shape is visible only in the gateway's
+    /// log (api7/aisix#1084). A resources file never reaches that path —
+    /// this field is required on the strict write schema, so the row is
+    /// refused outright there.
     #[serde(default)]
     #[schemars(length(min = 1))]
     pub script: String,

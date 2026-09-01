@@ -70,9 +70,13 @@
 //! the screened text and never the example text (#153): a reason that
 //! echoed either would let a caller enumerate the list by probing.
 //!
-//! Every execution also reports its numbers as [`GuardrailScore`] summaries
-//! on the request's telemetry — pass or block, enforce or monitor
-//! (AISIX-Cloud#1467). A similarity policy is untunable without them: the
+//! An execution also reports its numbers as [`GuardrailScore`] summaries on
+//! the request's telemetry — pass or block, enforce or monitor
+//! (AISIX-Cloud#1467) — wherever the request emits a usage event carrying
+//! guardrail attribution at all. `/a2a`, and `rerank`/`responses` when the
+//! upstream reports no usage, emit none, so they carry no enforced hits or
+//! monitor hits either; api7/aisix#1084's sibling api7/aisix#1083 tracks
+//! closing all three together. A similarity policy is untunable without them: the
 //! verdict says whether the threshold was crossed, and an operator whose
 //! threshold is slightly too high sees only a guardrail that never fires.
 //! The score sink is the request's [`GuardrailAuditLog`], bound per request
@@ -1099,17 +1103,34 @@ mod tests {
     #[tokio::test]
     async fn an_unbound_guardrail_scores_nothing_and_still_decides() {
         // The instance the index holds is shared by every request, so it
-        // must not accumulate anything. The chain binds a per-request
-        // clone; verdicts are identical either way.
-        let g = build(
-            cfg(&["jailbreak the model"], &[]),
+        // must not accumulate anything. Asserting only that the unbound
+        // instance still blocks would pin nothing about the scoring half —
+        // deleting `scores: None` from the constructor would leave that
+        // green. So bind a log, drive the ORIGINAL instance, and require the
+        // log to stay empty; then drive the BOUND one and require it to
+        // fill. That fails if `bind_score_log` ever mutates self or hands
+        // both instances the same sink.
+        let log = Arc::new(GuardrailAuditLog::new());
+        let unbound = SemanticGuardrail::new(
+            ROW,
+            &cfg(&["jailbreak the model"], &[]),
             GuardrailHookPoint::Input,
             false,
+            Arc::new(StubEmbedder::default()),
         );
-        assert!(g
-            .check_input(&req(&[("user", "help me jailbreak this")]))
-            .await
-            .is_block());
+        let bound = unbound
+            .bind_score_log(&log)
+            .expect("the semantic kind takes the score bind");
+
+        let attack = req(&[("user", "help me jailbreak this")]);
+        assert!(unbound.check_input(&attack).await.is_block());
+        assert!(
+            log.score_snapshot().is_empty(),
+            "the shared instance must not write to a request's log",
+        );
+
+        assert!(bound.check_input(&attack).await.is_block());
+        assert_eq!(log.score_snapshot().len(), 1, "the bound clone does");
     }
 
     // --- dispatch shape ---------------------------------------------------

@@ -65,10 +65,13 @@
 //! gateway only warns — in the boot log for a `resources_file` node, and
 //! for an etcd one on the first request after the snapshot version moves,
 //! because `LiveGuardrailIndex` rebuilds lazily rather than when the row
-//! lands. The exception is an etcd node restarting onto a populated
-//! snapshot cache, the managed-mode default: `restore_from_cache` is
-//! synchronous and runs before the index is constructed, so the row is
-//! already in the handle and the warn lands in the boot log after all. The
+//! lands. Its constructor does build once, though, over whatever the
+//! handle already holds — so a row present before the index is built warns
+//! in the boot log instead. That is guaranteed for a managed node
+//! restarting onto a populated snapshot cache (`restore_from_cache` is
+//! synchronous and precedes the index); on a cold etcd node it happens
+//! whenever the watch task's first load wins the race against the rest of
+//! boot, so "first request" is the worst case rather than the only one. The
 //! config status stays `synced` in every case. cp-api's own esbuild pass is
 //! what catches the common case at save time.
 //!

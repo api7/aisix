@@ -1515,12 +1515,14 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                     // is refused at chain build.
                     //
                     // Be precise about what that buys, because it is less
-                    // than it sounds: `unbuildable_guardrail_rows` has ONE
-                    // caller, inside `run_validate`, so the report is an
-                    // `aisix validate` fact. On a SERVING gateway — either
-                    // source — a build refusal is a warn line and nothing
-                    // more: `/status/config`'s `rejected` is written only by
-                    // the loader, which never sees a build failure. Both
+                    // than it sounds — for THIS field it buys nothing at
+                    // all. `run_validate` only reads a resources FILE, and
+                    // the file source validates strictly, where `script` is
+                    // still required with `minLength: 1`. So a row missing
+                    // it never survives to chain build there; the refusal is
+                    // reachable only from etcd, where nothing reports it —
+                    // `/status/config`'s `rejected` is written only by the
+                    // loader, which never sees a build failure. Both
                     // outcomes leave the row screening nothing, so this move
                     // trades a load error for a warn rather than winning
                     // enforcement; it is here for consistency with the two
@@ -1530,6 +1532,16 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                     // stored default).
                     if strict {
                         require_branch_property(b, "script");
+                        // Same reasoning as the thresholds above: `script`
+                        // advertised `default: ""` while carrying
+                        // `minLength: 1` and sitting in `required`, so a
+                        // generator honouring the contract pre-filled a value
+                        // the same contract rejects.
+                        if let Some(Value::Object(properties)) = b.get_mut("properties") {
+                            if let Some(Value::Object(field)) = properties.get_mut("script") {
+                                field.remove("default");
+                            }
+                        }
                     }
                     set_property_enum(
                         b,
@@ -4971,8 +4983,11 @@ mod tests {
         // pins the split — and the lenient half is the one that matters,
         // because a row the loader rejects is skipped whole and stops
         // screening, where a row that loads with an empty script is
-        // refused at chain build. Both stop screening; `aisix validate`
-        // is the only thing that turns the second into a report.
+        // refused at chain build. Both stop screening, and nothing
+        // reports the second: `aisix validate` reads a FILE, which is
+        // validated strictly, so a scriptless row is refused by the schema
+        // there rather than reaching the build. The build refusal is an
+        // etcd-only outcome, and it is a warn line.
         let scriptless = json!({"name": "g", "kind": "custom"});
         assert!(
             validate_guardrail(&scriptless).is_err(),
