@@ -1581,6 +1581,7 @@ async fn responses_to_target(
             attempt_started,
             content_cap,
             eos_scan,
+            requested_model.to_string(),
             move |mut usage, out_text, output_hits| {
                 // Streams that reach here are committed 200s — the
                 // `!status.is_success()` guard above returned early on errors.
@@ -1830,6 +1831,12 @@ async fn responses_to_target(
                 });
             }
         }
+
+        // Echo the model name the caller addressed, not the id the upstream
+        // answered with — the same contract the bridged half of this endpoint
+        // already honours, so `/v1/responses` stops answering differently
+        // depending on which provider happens to be behind the alias.
+        crate::model_echo::restamp_body(&mut json_body, requested_model);
 
         // #932: mask-action PII rules rewrite the response body AFTER the
         // block check passes.
@@ -2513,16 +2520,36 @@ fn responses_sse_provider_request_id(bytes: &[u8]) -> String {
 /// content capture (AISIX-Cloud#947). A frame ends at the first blank line;
 /// an incomplete trailing frame is left in `buf` for the next chunk. Reuses
 /// the shared SSE framing helpers from the `/v1/messages` passthrough so the
-/// two surfaces parse identically.
+/// two surfaces parse identically. Each frame is also appended to `out` with
+/// the client-facing `model` restamped onto the snapshot frames that carry
+/// one.
+///
+/// `out` is what the client receives, so the relay forwards whole frames
+/// rather than raw chunks — a value can only be spliced once the frame
+/// carrying it has arrived in full, and the Responses snapshot events are
+/// spread across the whole stream (`response.created` first,
+/// `response.completed` last). A frame is the SSE protocol's atomic unit, so
+/// holding a partial one back is not observable to a conforming client;
+/// `buf` retains only that partial tail.
 fn drain_responses_sse_frames(
     buf: &mut Vec<u8>,
     acc: &mut Option<ResponseUsage>,
     mut capture: Option<&mut SseTextCapture>,
     attempt_started: Instant,
     first_frame_seen: &mut bool,
+    client_facing_model: &str,
+    out: &mut Vec<u8>,
 ) {
     while let Some(end) = crate::messages::find_frame_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
+        match crate::model_echo::restamp_sse_frame(
+            &frame,
+            client_facing_model,
+            crate::model_echo::responses_snapshot_model,
+        ) {
+            Some(rewritten) => out.extend_from_slice(&rewritten),
+            None => out.extend_from_slice(&frame),
+        }
         if let Some(data) = crate::messages::extract_sse_data_line(&frame) {
             if data == b"[DONE]" {
                 continue;
@@ -2706,6 +2733,9 @@ fn build_responses_passthrough_stream<S, F>(
     attempt_started: Instant,
     content_cap: Option<u32>,
     eos_scan: Option<EosOutputScan>,
+    // The model name the caller addressed, restamped onto the snapshot
+    // frames so a streamed response echoes the alias like a buffered one.
+    client_facing_model: String,
     on_complete: F,
 ) -> impl futures::Stream<Item = reqwest::Result<bytes::Bytes>>
 where
@@ -2750,9 +2780,12 @@ where
         let mut first_frame_seen = false;
         while let Some(item) = upstream.next().await {
             if let Ok(bytes) = &item {
-                // Side-channel parse: copy into the frame buffer (the original
-                // `bytes` is yielded unchanged below) and drain complete frames.
+                // Accumulate, then drain every COMPLETE frame — restamped with
+                // the caller's model name — into `forward`. The client receives
+                // whole frames, never a partial one; `buf` keeps the trailing
+                // remainder until its terminator arrives.
                 buf.extend_from_slice(bytes);
+                let mut forward: Vec<u8> = Vec::new();
                 let (usage_acc, capture) = guard.parts();
                 drain_responses_sse_frames(
                     &mut buf,
@@ -2760,33 +2793,54 @@ where
                     capture,
                     attempt_started,
                     &mut first_frame_seen,
+                    &client_facing_model,
+                    &mut forward,
                 );
                 // Bound the frame buffer: the happy path drains complete frames
                 // above so `buf` only holds a partial trailing frame. A
                 // non-conformant upstream streaming bytes without a blank-line
-                // terminator would otherwise grow `buf` unboundedly; drop it
-                // (losing usage parsing for that pathological case) rather than
-                // OOM. Bytes still forward verbatim — only telemetry is affected.
+                // terminator would otherwise grow `buf` unboundedly; release the
+                // un-terminated remainder downstream rather than OOM. Delivery is
+                // preserved — only this frame's usage parse and model restamp
+                // are lost.
                 if buf.len() > crate::messages::MAX_SSE_FRAME_BUF_BYTES {
                     tracing::warn!(
                         buffered = buf.len(),
                         "responses stream: SSE frame buffer exceeded cap without a \
-                         terminator; dropping buffer (usage parsing skipped)"
+                         terminator; releasing it unparsed (usage parsing and model \
+                         restamp skipped)"
                     );
-                    buf.clear();
+                    forward.append(&mut buf);
                 }
-            }
-            // Forward the original item verbatim (Ok bytes OR a mid-stream Err).
-            // The first successful forward is what the caller waited for.
-            if item.is_ok() {
+                // Nothing completed yet — keep reading rather than yielding an
+                // empty chunk.
+                if forward.is_empty() {
+                    continue;
+                }
+                // The first forward is what the caller waited for.
                 let (usage_acc, _) = guard.parts();
                 let acc = usage_acc.get_or_insert_with(Default::default);
                 if acc.downstream_latency_ms == 0 {
                     acc.downstream_latency_ms =
                         started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                 }
+                yield Ok(bytes::Bytes::from(forward));
+                continue;
             }
+            // A mid-stream Err is forwarded as-is.
             yield item;
+        }
+        // A non-conformant upstream can end without terminating its last
+        // frame. Those bytes were never forwarded (they are still the partial
+        // tail), so release them now rather than truncating the response.
+        if !buf.is_empty() {
+            let (usage_acc, _) = guard.parts();
+            let acc = usage_acc.get_or_insert_with(Default::default);
+            if acc.downstream_latency_ms == 0 {
+                acc.downstream_latency_ms =
+                    started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+            }
+            yield Ok(bytes::Bytes::from(std::mem::take(&mut buf)));
         }
         // Upstream EOF — the response was delivered in full. Record that
         // before the scan below, which awaits a remote provider and is a

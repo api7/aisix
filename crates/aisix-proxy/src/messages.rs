@@ -1709,13 +1709,11 @@ async fn anthropic_passthrough_dispatch(
             }
         }
 
-        // Restore the gateway-facing model name so callers see what they asked for.
-        if let Some(m) = json_body.get_mut("model") {
-            // If the upstream echoes the model name, rewrite to the gateway name.
-            if m.as_str().map(|s| s == upstream_model).unwrap_or(false) {
-                *m = Value::String(model_name.to_string());
-            }
-        }
+        // Restore the gateway-facing model name so callers see what they asked
+        // for. Unconditional: the upstream is free to answer with an id other
+        // than the one it was asked for (a dated snapshot, a server-side
+        // remap), and the caller still addressed the alias.
+        crate::model_echo::restamp_body(&mut json_body, model_name);
 
         // #932: mask-action PII rules rewrite the passthrough response body
         // (text blocks + tool_use input) AFTER the block check passes.
@@ -3358,15 +3356,26 @@ fn update_anthropic_usage(
     }
 }
 
-/// Drain every complete SSE frame from `buf`, updating `acc`. A frame
-/// ends at the first blank line (`\n\n`). Incomplete trailing bytes are
-/// left in `buf` for the next chunk. The `data:` payload is parsed as
-/// JSON; non-JSON or non-`data` frames are skipped.
+/// Drain every complete SSE frame from `buf`, updating `acc` and
+/// appending the frame to `out` with the client-facing `model` restamped
+/// onto `message_start`. A frame ends at the first blank line (`\n\n`);
+/// incomplete trailing bytes are left in `buf` for the next chunk. The
+/// `data:` payload is parsed as JSON for the usage side; non-JSON or
+/// non-`data` frames are skipped there and forwarded untouched.
+///
+/// `out` is what the client receives, so the relay forwards whole frames
+/// rather than raw chunks: a value can only be spliced once the frame
+/// carrying it has arrived in full. A frame is the SSE protocol's atomic
+/// unit — every conforming parser buffers to the blank-line terminator
+/// anyway — so holding a partial one back is not observable to a client,
+/// and `buf` retains only that partial tail.
 fn drain_anthropic_sse_frames(
     buf: &mut Vec<u8>,
     acc: &mut AnthropicStreamUsage,
     attempt_started: Instant,
     first_token_seen: &mut bool,
+    client_facing_model: &str,
+    out: &mut Vec<u8>,
 ) {
     // SSE event delimiter is a blank line. Anthropic emits `\n\n`;
     // tolerate `\r\n\r\n` defensively by normalising the search.
@@ -3376,6 +3385,14 @@ fn drain_anthropic_sse_frames(
             if let Ok(json) = serde_json::from_slice::<Value>(data) {
                 update_anthropic_usage(acc, &json, attempt_started, first_token_seen);
             }
+        }
+        match crate::model_echo::restamp_sse_frame(
+            &frame,
+            client_facing_model,
+            crate::model_echo::anthropic_message_model,
+        ) {
+            Some(rewritten) => out.extend_from_slice(&rewritten),
+            None => out.extend_from_slice(&frame),
         }
     }
 }
@@ -3409,11 +3426,25 @@ pub(crate) fn find_frame_end(buf: &[u8]) -> Option<usize> {
 /// Anthropic emits single-line data for the frames we care about.
 /// Shared with the `/v1/responses` streaming usage parser (#808).
 pub(crate) fn extract_sse_data_line(frame: &[u8]) -> Option<&[u8]> {
+    extract_sse_data_range(frame).map(|r| &frame[r])
+}
+
+/// The same payload as [`extract_sse_data_line`], as a range into
+/// `frame`. The restamp path needs the offsets so it can splice a value
+/// back into the frame without rebuilding the bytes around it
+/// (`model_echo::restamp_sse_frame`).
+pub(crate) fn extract_sse_data_range(frame: &[u8]) -> Option<std::ops::Range<usize>> {
+    let mut offset = 0usize;
     for line in frame.split(|&b| b == b'\n') {
+        let start = offset;
+        offset += line.len() + 1; // the split consumed one `\n`
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if let Some(rest) = line.strip_prefix(b"data:") {
-            let rest = rest.strip_prefix(b" ").unwrap_or(rest);
-            return Some(rest);
+        if line.starts_with(b"data:") {
+            let mut from = start + b"data:".len();
+            if frame.get(from) == Some(&b' ') {
+                from += 1;
+            }
+            return Some(from..start + line.len());
         }
     }
     None
@@ -3566,15 +3597,19 @@ where
         let mut held: Vec<u8> = Vec::new();
         while let Some(item) = upstream.next().await {
             if let Ok(bytes) = &item {
-                // Side-channel parse: copy into the frame buffer (the
-                // original `bytes` is yielded unchanged below) and drain
-                // any complete SSE frames into the accumulator.
+                // Accumulate, then drain every COMPLETE frame — restamped
+                // with the caller's model name — into `forward`. The client
+                // receives whole frames, never a partial one; `buf` keeps the
+                // trailing remainder until its terminator arrives.
                 buf.extend_from_slice(bytes);
+                let mut forward: Vec<u8> = Vec::new();
                 drain_anthropic_sse_frames(
                     &mut buf,
                     guard.usage(),
                     attempt_started,
                     &mut first_token_seen,
+                    &model_label,
+                    &mut forward,
                 );
                 // Bound the frame buffer (PR #436 audit MEDIUM-2). The
                 // happy path drains complete frames above, so `buf`
@@ -3584,26 +3619,25 @@ where
                 // would otherwise grow `buf` unboundedly (per-request
                 // memory exhaustion). Real Anthropic SSE frames are
                 // well under a few KB, so a 1 MiB ceiling can only be
-                // hit by a non-conformant stream; drop the buffer
-                // (losing usage parsing for that pathological case)
-                // rather than OOM. The bytes themselves still forward
-                // to the client verbatim — only telemetry parsing is
-                // affected.
+                // hit by a non-conformant stream; release the
+                // un-terminated remainder downstream rather than OOM.
+                // Delivery is preserved — only this frame's usage parse
+                // and model restamp are lost.
                 if buf.len() > MAX_SSE_FRAME_BUF_BYTES {
                     tracing::warn!(
                         buffered = buf.len(),
                         "anthropic stream: SSE frame buffer exceeded cap without a \
-                         terminator; dropping buffer (usage parsing skipped for the \
-                         oversized frame)"
+                         terminator; releasing it unparsed (usage parsing and model \
+                         restamp skipped for the oversized frame)"
                     );
-                    buf.clear();
+                    forward.append(&mut buf);
                 }
                 if let Some(max_hold) = hold_policy {
                     // Hold-back: withhold the bytes until the end-of-stream
                     // scan clears (and masks) them. Overflow fails closed —
                     // content that can't be fully buffered to scan must not
                     // be released (mirrors /v1/responses).
-                    if held.len() + bytes.len() > max_hold {
+                    if held.len() + forward.len() > max_hold {
                         tracing::warn!(
                             guardrail_hook = "output",
                             max_buffer_bytes = max_hold,
@@ -3613,23 +3647,44 @@ where
                         yield Ok(Bytes::from(guardrail_block_frame(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED))));
                         return;
                     }
-                    held.extend_from_slice(bytes);
+                    held.extend_from_slice(&forward);
                     continue;
                 }
+                // Nothing completed yet — keep reading rather than yielding
+                // an empty chunk.
+                if forward.is_empty() {
+                    continue;
+                }
+                if guard.usage().downstream_latency_ms == 0 {
+                    guard.usage().downstream_latency_ms =
+                        started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                }
+                yield Ok(Bytes::from(forward));
+                continue;
             }
-            // Forward the original item verbatim (Ok bytes OR Err — an
-            // upstream error mid-stream is passed through; the
-            // accumulator keeps whatever was captured before it). In
+            // An upstream error mid-stream is passed through; the
+            // accumulator keeps whatever was captured before it. In
             // hold-back mode an Err lands here too: it is forwarded and
             // the held (unscanned) content is dropped — fail closed.
-            let errored = item.is_err();
-            if !errored && guard.usage().downstream_latency_ms == 0 {
-                guard.usage().downstream_latency_ms =
-                    started.elapsed().as_millis().min(u32::MAX as u128) as u32;
-            }
             yield item;
-            if errored && hold_policy.is_some() {
+            if hold_policy.is_some() {
                 return;
+            }
+        }
+        // A non-conformant upstream can end without terminating its last
+        // frame. Those bytes were never forwarded (they are still the
+        // partial tail), so release them now rather than truncating the
+        // response.
+        if !buf.is_empty() {
+            let tail = std::mem::take(&mut buf);
+            if hold_policy.is_some() {
+                held.extend_from_slice(&tail);
+            } else {
+                if guard.usage().downstream_latency_ms == 0 {
+                    guard.usage().downstream_latency_ms =
+                        started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                }
+                yield Ok(Bytes::from(tail));
             }
         }
         // Upstream stream over — the response was forwarded in full. Record
@@ -5352,7 +5407,15 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude-x\",\"usage\":{\"input_tokens\":11}}}\n\n\
 event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2",
         );
-        drain_anthropic_sse_frames(&mut buf, &mut acc, started, &mut first_token_seen);
+        let mut out: Vec<u8> = Vec::new();
+        drain_anthropic_sse_frames(
+            &mut buf,
+            &mut acc,
+            started,
+            &mut first_token_seen,
+            "gw-alias",
+            &mut out,
+        );
         // Only the complete first frame is consumed.
         assert_eq!(acc.prompt_tokens, 11, "input_tokens parsed from frame 1");
         assert_eq!(acc.provider_request_id, "m1");
@@ -5360,15 +5423,40 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             acc.completion_tokens, 0,
             "partial frame 2 must NOT be parsed until its terminator arrives",
         );
+        // The completed frame is forwarded with the caller's model name
+        // restamped; the partial one is withheld, so no half-frame reaches
+        // the client and no upstream id leaks on the way past.
+        let emitted = String::from_utf8(std::mem::take(&mut out)).unwrap();
+        assert!(
+            emitted.contains("\"model\":\"gw-alias\"") && !emitted.contains("claude-x"),
+            "message_start forwards with the caller's name: {emitted}",
+        );
+        assert!(
+            emitted.ends_with("}}}\n\n") && !emitted.contains("message_delta"),
+            "the partial second frame is withheld: {emitted}",
+        );
 
         // Second "chunk": the remainder of the message_delta frame.
         buf.extend_from_slice(b"3}}\n\n");
-        drain_anthropic_sse_frames(&mut buf, &mut acc, started, &mut first_token_seen);
+        drain_anthropic_sse_frames(
+            &mut buf,
+            &mut acc,
+            started,
+            &mut first_token_seen,
+            "gw-alias",
+            &mut out,
+        );
         assert_eq!(
             acc.completion_tokens, 23,
             "output_tokens parsed once the split frame is reassembled",
         );
         assert!(buf.is_empty(), "buffer fully drained after both frames");
+        let emitted = String::from_utf8(out).unwrap();
+        assert!(
+            emitted.starts_with("event: message_delta\n")
+                && emitted.contains("\"output_tokens\":23"),
+            "the reassembled frame forwards whole and unaltered: {emitted}",
+        );
     }
 
     /// Issue #245 (audit angle 8c): a stream that carries NO usage
@@ -5391,7 +5479,20 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             b"event: ping\ndata: {\"type\":\"ping\"}\n\n\
 event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded\"}}\n\n",
         );
-        drain_anthropic_sse_frames(&mut buf, &mut acc, started, &mut first_token_seen);
+        let mut out: Vec<u8> = Vec::new();
+        let expected = buf.clone();
+        drain_anthropic_sse_frames(
+            &mut buf,
+            &mut acc,
+            started,
+            &mut first_token_seen,
+            "gw-alias",
+            &mut out,
+        );
+        assert_eq!(
+            out, expected,
+            "frames with no model reach the client byte-for-byte",
+        );
 
         assert_eq!(acc.prompt_tokens, 0, "no usage → prompt_tokens stays zero");
         assert_eq!(acc.completion_tokens, 0, "no usage → completion stays zero");
