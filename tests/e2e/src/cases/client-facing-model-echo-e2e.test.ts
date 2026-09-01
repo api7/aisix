@@ -430,6 +430,19 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
     if (!etcdReachable) return;
     app = await spawnApp();
     seed = new SeedClient(etcd, app.etcdPrefix);
+    // BOTH tests here need the hold-back policy in force, so it is seeded
+    // once for the app rather than by whichever test happens to run first.
+    // `keyword` on the output hook is block-capable, which is what makes the
+    // gateway buffer a streamed response instead of forwarding it live. The
+    // pattern deliberately never matches: the point is the buffered delivery
+    // path, not a block.
+    await seed.createGuardrail({
+      name: "gr-model-echo-holdback",
+      enabled: true,
+      hook_point: "output",
+      kind: "keyword",
+      patterns: [{ kind: "literal", value: "ABSOLUTELYFORBIDDENWORD" }],
+    });
   });
 
   afterAll(async () => {
@@ -451,17 +464,6 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
       ],
     });
     upstreams.push(upstream);
-
-    // `keyword` on the output hook is block-capable, so it holds the whole
-    // stream back. The reply deliberately does not match, so the response is
-    // delivered — the point is the buffered delivery path, not a block.
-    await seed.createGuardrail({
-      name: "gr-model-echo-holdback",
-      enabled: true,
-      hook_point: "output",
-      kind: "keyword",
-      patterns: [{ kind: "literal", value: "ABSOLUTELYFORBIDDENWORD" }],
-    });
 
     const pk = await seed.createProviderKey({
       display_name: "pk-echo-guarded",
