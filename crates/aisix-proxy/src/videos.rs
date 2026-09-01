@@ -1599,6 +1599,7 @@ pub async fn create_video(
                 err.is_guardrail_block(),
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
+                crate::usage_attr::guardrail_scores(&audit),
             );
             err.into_response()
         }
@@ -2019,6 +2020,7 @@ fn emit_submit_usage_event(
         applied_guardrails: applied_guardrails.to_vec(),
         guardrail_monitor_hits,
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(audit),
+        guardrail_scores: crate::usage_attr::guardrail_scores(audit),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         ..Default::default()

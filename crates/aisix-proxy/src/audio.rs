@@ -245,6 +245,7 @@ pub async fn transcriptions(
                 err.is_guardrail_block(),
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
+                crate::usage_attr::guardrail_scores(&audit),
             );
             err.into_response()
         }
@@ -406,6 +407,7 @@ pub async fn translations(
                 err.is_guardrail_block(),
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
+                crate::usage_attr::guardrail_scores(&audit),
             );
             err.into_response()
         }
@@ -576,6 +578,7 @@ pub async fn speech(
                 err.is_guardrail_block(),
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
+                crate::usage_attr::guardrail_scores(&audit),
             );
             err.into_response()
         }
@@ -2110,6 +2113,7 @@ fn emit_usage_event(
         guardrail_monitor_hits,
         guardrail_blocked,
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(audit),
+        guardrail_scores: crate::usage_attr::guardrail_scores(audit),
         ..Default::default()
     };
     // Per-PK telemetry attribution, same lookup as chat / messages /

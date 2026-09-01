@@ -70,24 +70,42 @@
 //! Block reasons carry the matched EXAMPLE'S INDEX and the score, never
 //! the screened text and never the example text (#153): a reason that
 //! echoed either would let a caller enumerate the list by probing.
+//!
+//! Every execution also reports its numbers as [`GuardrailScore`] summaries
+//! on the request's telemetry — pass or block, enforce or monitor
+//! (AISIX-Cloud#1467). A similarity policy is untunable without them: the
+//! verdict says whether the threshold was crossed, and an operator whose
+//! threshold is slightly too high sees only a guardrail that never fires.
+//! The score sink is the request's [`GuardrailAuditLog`], bound per request
+//! by the chain — see [`Guardrail::bind_score_log`].
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use aisix_core::models::{GuardrailHookPoint, SemanticConfig};
-use aisix_core::{best_similarity, cosine_similarity};
+use aisix_core::cosine_similarity;
+use aisix_core::models::{GuardrailHookPoint, GuardrailScore, SemanticConfig};
 use aisix_gateway::{ChatFormat, ChatResponse, Role};
 use async_trait::async_trait;
 
-use crate::{EmbedFailure, Guardrail, GuardrailEmbedder, GuardrailVerdict, StreamOutputPolicy};
+use crate::{
+    EmbedFailure, Guardrail, GuardrailAuditLog, GuardrailEmbedder, GuardrailVerdict,
+    StreamOutputPolicy,
+};
 
 /// Input-hook text selection: screen every message rather than only the
 /// user's. Mirrors the `concatenate_all_content` option the remote kinds
 /// expose, minus the concatenation this kind cannot use.
 const TEXT_SOURCE_ALL: &str = "all_messages";
 
-pub struct SemanticGuardrail {
+/// Everything the row configures, shared by every request. Split out so
+/// binding the per-request score log costs two atomic bumps instead of
+/// copying the example lists onto each request.
+struct SemanticParams {
     embedder: Arc<dyn GuardrailEmbedder>,
+    /// The configured (row) name — the identity the score entries carry.
+    /// The kind's static `name()` is `"semantic"` for every row, which
+    /// would make two rows' scores indistinguishable.
+    row_name: String,
     embedding_model: String,
     deny_examples: Vec<String>,
     allow_examples: Vec<String>,
@@ -105,47 +123,67 @@ pub struct SemanticGuardrail {
     on_buffer_exceeded_fail_open: bool,
 }
 
+pub struct SemanticGuardrail {
+    cfg: Arc<SemanticParams>,
+    /// Where this execution's [`GuardrailScore`] summaries go. `None` on the
+    /// instance the index holds — that one is shared by every request and so
+    /// can own no per-request state; the chain binds a clone carrying the
+    /// request's log (see [`Guardrail::bind_score_log`]). A chain built
+    /// without a log scores nothing, exactly as it audits nothing.
+    scores: Option<Arc<GuardrailAuditLog>>,
+}
+
 impl SemanticGuardrail {
-    /// Caller owns `hook_point` and `fail_open` (they live on the
-    /// `Guardrail` row, not in the kind's config block).
+    /// Caller owns `row_name`, `hook_point` and `fail_open` (they live on
+    /// the `Guardrail` row, not in the kind's config block).
     pub fn new(
+        row_name: impl Into<String>,
         cfg: &SemanticConfig,
         hook_point: GuardrailHookPoint,
         fail_open: bool,
         embedder: Arc<dyn GuardrailEmbedder>,
     ) -> Self {
         Self {
-            embedder,
-            embedding_model: cfg.embedding_model.clone(),
-            deny_examples: cfg.deny_examples.clone(),
-            allow_examples: cfg.allow_examples.clone(),
-            deny_threshold: cfg.deny_threshold,
-            allow_threshold: cfg.allow_threshold,
-            timeout: Duration::from_millis(cfg.timeout_ms),
-            max_screened_texts: cfg.max_screened_texts as usize,
-            scan_all_messages: cfg.text_source == TEXT_SOURCE_ALL,
-            hook_point,
-            fail_open,
-            output_fail_open: cfg.output_fail_open,
-            max_buffer_bytes: cfg.max_buffer_bytes,
-            // Compare against the OPEN value, not the closed one: an
-            // unrecognised string must land fail-closed.
-            on_buffer_exceeded_fail_open: cfg.on_buffer_exceeded == "fail_open",
+            cfg: Arc::new(SemanticParams {
+                embedder,
+                row_name: row_name.into(),
+                embedding_model: cfg.embedding_model.clone(),
+                deny_examples: cfg.deny_examples.clone(),
+                allow_examples: cfg.allow_examples.clone(),
+                deny_threshold: cfg.deny_threshold,
+                allow_threshold: cfg.allow_threshold,
+                timeout: Duration::from_millis(cfg.timeout_ms),
+                max_screened_texts: cfg.max_screened_texts as usize,
+                scan_all_messages: cfg.text_source == TEXT_SOURCE_ALL,
+                hook_point,
+                fail_open,
+                output_fail_open: cfg.output_fail_open,
+                max_buffer_bytes: cfg.max_buffer_bytes,
+                // Compare against the OPEN value, not the closed one: an
+                // unrecognised string must land fail-closed.
+                on_buffer_exceeded_fail_open: cfg.on_buffer_exceeded == "fail_open",
+            }),
+            scores: None,
         }
     }
 
     fn hook_enabled(&self, hook: GuardrailHookPoint) -> bool {
-        self.hook_point == GuardrailHookPoint::Both || self.hook_point == hook
+        self.cfg.hook_point == GuardrailHookPoint::Both || self.cfg.hook_point == hook
     }
 
     /// `true` when no example is configured at all. Such a row cannot
     /// reach a verdict, so it must not spend an embedding call finding
     /// that out on every request.
     fn screens_nothing(&self) -> bool {
-        self.deny_examples.is_empty() && self.allow_examples.is_empty()
+        self.cfg.deny_examples.is_empty() && self.cfg.allow_examples.is_empty()
     }
 
-    async fn screen(&self, texts: Vec<String>, fail_open: bool) -> GuardrailVerdict {
+    async fn screen(
+        &self,
+        texts: Vec<String>,
+        fail_open: bool,
+        hook: &'static str,
+    ) -> GuardrailVerdict {
         if texts.is_empty() || self.screens_nothing() {
             return GuardrailVerdict::Allow;
         }
@@ -153,11 +191,17 @@ impl SemanticGuardrail {
         // One prototype call (cacheable: the example set is config, fixed
         // for the row) and one candidate call. Deny examples come first
         // so the split below needs no second lookup.
-        let mut prototypes = self.deny_examples.clone();
-        prototypes.extend(self.allow_examples.iter().cloned());
+        let mut prototypes = self.cfg.deny_examples.clone();
+        prototypes.extend(self.cfg.allow_examples.iter().cloned());
         let prototype_vecs = match self
+            .cfg
             .embedder
-            .embed(&self.embedding_model, &prototypes, true, self.timeout)
+            .embed(
+                &self.cfg.embedding_model,
+                &prototypes,
+                true,
+                self.cfg.timeout,
+            )
             .await
         {
             Ok(v) if v.len() == prototypes.len() => v,
@@ -166,8 +210,9 @@ impl SemanticGuardrail {
         };
 
         let candidate_vecs = match self
+            .cfg
             .embedder
-            .embed(&self.embedding_model, &texts, false, self.timeout)
+            .embed(&self.cfg.embedding_model, &texts, false, self.cfg.timeout)
             .await
         {
             Ok(v) if v.len() == texts.len() => v,
@@ -175,74 +220,110 @@ impl SemanticGuardrail {
             Err(failure) => return self.on_failure(failure, fail_open),
         };
 
-        let (deny_vecs, allow_vecs) = prototype_vecs.split_at(self.deny_examples.len());
+        let (deny_vecs, allow_vecs) = prototype_vecs.split_at(self.cfg.deny_examples.len());
+
+        // The closest call in each direction, across the texts actually
+        // judged. The verdict loop still stops at the first refusal — the
+        // candidate batch is embedded up front, so scoring the rest would
+        // cost no upstream call, but reporting a text the guardrail never
+        // consulted would misstate what it did.
+        let mut deny_peak: Option<(usize, f32)> = None;
+        let mut allow_trough: Option<(usize, f32)> = None;
+        let mut verdict = GuardrailVerdict::Allow;
 
         for candidate in &candidate_vecs {
-            if let Some(verdict) = self.judge(candidate, deny_vecs, allow_vecs) {
-                return verdict;
+            let scored = self.judge(candidate, deny_vecs, allow_vecs);
+            if let Some((i, score)) = scored.deny {
+                if deny_peak.is_none_or(|(_, peak)| score > peak) {
+                    deny_peak = Some((i, score));
+                }
+            }
+            if let Some((i, score)) = scored.allow {
+                if allow_trough.is_none_or(|(_, trough)| score < trough) {
+                    allow_trough = Some((i, score));
+                }
+            }
+            if let Some(refusal) = scored.verdict {
+                verdict = refusal;
+                break;
             }
         }
-        GuardrailVerdict::Allow
+
+        self.report(hook, "deny", self.cfg.deny_threshold, deny_peak);
+        self.report(hook, "allow", self.cfg.allow_threshold, allow_trough);
+        verdict
     }
 
-    /// Score ONE candidate. `Some(Block)` when it is refused, `None`
-    /// when it passes both gates.
+    /// Hand one direction's summary to the request's score log. A `None`
+    /// extreme means the direction was never scored — an empty example
+    /// list, or a deny refusal that short-circuited before the allow gate —
+    /// and reports nothing rather than a fabricated zero.
+    fn report(
+        &self,
+        hook: &'static str,
+        direction: &'static str,
+        threshold: f32,
+        extreme: Option<(usize, f32)>,
+    ) {
+        let (Some(log), Some((index, score))) = (self.scores.as_ref(), extreme) else {
+            return;
+        };
+        log.record_score(GuardrailScore {
+            guardrail_name: self.cfg.row_name.clone(),
+            hook: hook.to_owned(),
+            direction: direction.to_owned(),
+            score,
+            threshold,
+            matched: score >= threshold,
+            top_example_index: index as u32,
+            embedding_model: self.cfg.embedding_model.clone(),
+        });
+    }
+
+    /// Score ONE candidate against both lists.
     fn judge(
         &self,
         candidate: &[f32],
         deny_vecs: &[Vec<f32>],
         allow_vecs: &[Vec<f32>],
-    ) -> Option<GuardrailVerdict> {
+    ) -> JudgedCandidate {
+        let mut judged = JudgedCandidate::default();
+
         // Deny first, unconditionally: a text matching both lists is
         // refused, never laundered by its allow score.
-        if let Some((index, score)) = self.closest(candidate, deny_vecs) {
-            if score >= self.deny_threshold {
-                return Some(GuardrailVerdict::block(format!(
+        judged.deny = closest(candidate, deny_vecs);
+        if let Some((index, score)) = judged.deny {
+            if score >= self.cfg.deny_threshold {
+                judged.verdict = Some(GuardrailVerdict::block(format!(
                     "semantic deny example #{index} matched (similarity {score:.3} \
                      >= threshold {:.3})",
-                    self.deny_threshold
+                    self.cfg.deny_threshold
                 )));
+                return judged;
             }
         }
 
         if !allow_vecs.is_empty() {
+            judged.allow = closest(candidate, allow_vecs);
             // An empty prototype set is impossible here, so the
             // `unwrap_or` is only a total-function guard.
-            let best = best_similarity(candidate, allow_vecs.iter().map(Vec::as_slice))
-                .unwrap_or(f32::NEG_INFINITY);
-            if best < self.allow_threshold {
-                return Some(GuardrailVerdict::block(format!(
+            let best = judged.allow.map_or(f32::NEG_INFINITY, |(_, score)| score);
+            if best < self.cfg.allow_threshold {
+                judged.verdict = Some(GuardrailVerdict::block(format!(
                     "no semantic allow example matched (best similarity {best:.3} \
                      < threshold {:.3})",
-                    self.allow_threshold
+                    self.cfg.allow_threshold
                 )));
             }
         }
-        None
-    }
-
-    /// The closest prototype and its score, for the deny side — the
-    /// INDEX is what makes a block actionable in an ops log without
-    /// echoing either the example or the screened text (#153).
-    fn closest(&self, candidate: &[f32], prototypes: &[Vec<f32>]) -> Option<(usize, f32)> {
-        let mut best: Option<(usize, f32)> = None;
-        for (i, prototype) in prototypes.iter().enumerate() {
-            let score = cosine_similarity(candidate, prototype);
-            if !score.is_finite() {
-                continue;
-            }
-            if best.is_none_or(|(_, current)| score > current) {
-                best = Some((i, score));
-            }
-        }
-        best
+        judged
     }
 
     fn on_failure(&self, failure: EmbedFailure, fail_open: bool) -> GuardrailVerdict {
         let tag = failure.as_str();
         tracing::warn!(
             guardrail = "semantic",
-            embedding_model = %self.embedding_model,
+            embedding_model = %self.cfg.embedding_model,
             failure = tag,
             fail_open,
             "semantic guardrail could not embed"
@@ -256,6 +337,34 @@ impl SemanticGuardrail {
             )
         }
     }
+}
+
+/// One candidate's scores plus the refusal they produced, if any. The two
+/// scores are what the telemetry summary folds; the verdict is what the
+/// caller enforces. `allow` stays `None` when the deny gate refused first —
+/// the allow list was never consulted for that text.
+#[derive(Default)]
+struct JudgedCandidate {
+    deny: Option<(usize, f32)>,
+    allow: Option<(usize, f32)>,
+    verdict: Option<GuardrailVerdict>,
+}
+
+/// The closest prototype and its score. The INDEX is what makes both a
+/// block reason and a score entry actionable without echoing either the
+/// example or the screened text (#153).
+fn closest(candidate: &[f32], prototypes: &[Vec<f32>]) -> Option<(usize, f32)> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, prototype) in prototypes.iter().enumerate() {
+        let score = cosine_similarity(candidate, prototype);
+        if !score.is_finite() {
+            continue;
+        }
+        if best.is_none_or(|(_, current)| score > current) {
+            best = Some((i, score));
+        }
+    }
+    best
 }
 
 /// The texts the INPUT hook screens: one per message, NEWEST FIRST,
@@ -283,9 +392,17 @@ impl Guardrail for SemanticGuardrail {
     /// response for a check it never runs.
     fn runs_on_output(&self) -> bool {
         matches!(
-            self.hook_point,
+            self.cfg.hook_point,
             GuardrailHookPoint::Output | GuardrailHookPoint::Both
         )
+    }
+
+    /// This kind reports similarity scores, so it takes a per-request bind.
+    fn bind_score_log(&self, log: &Arc<GuardrailAuditLog>) -> Option<Arc<dyn Guardrail>> {
+        Some(Arc::new(Self {
+            cfg: Arc::clone(&self.cfg),
+            scores: Some(Arc::clone(log)),
+        }))
     }
 
     /// Always whole-response hold-back, like kind=pii and kind=presidio.
@@ -295,8 +412,8 @@ impl Guardrail for SemanticGuardrail {
     /// window carrying the violation is judged.
     fn stream_output_policy(&self) -> StreamOutputPolicy {
         StreamOutputPolicy::BufferFull {
-            max_buffer_bytes: self.max_buffer_bytes as usize,
-            on_exceeded_fail_open: self.on_buffer_exceeded_fail_open,
+            max_buffer_bytes: self.cfg.max_buffer_bytes as usize,
+            on_exceeded_fail_open: self.cfg.on_buffer_exceeded_fail_open,
         }
     }
 
@@ -304,8 +421,9 @@ impl Guardrail for SemanticGuardrail {
         if !self.hook_enabled(GuardrailHookPoint::Input) {
             return GuardrailVerdict::Allow;
         }
-        let texts = collect_input_texts(req, self.scan_all_messages, self.max_screened_texts);
-        self.screen(texts, self.fail_open).await
+        let texts =
+            collect_input_texts(req, self.cfg.scan_all_messages, self.cfg.max_screened_texts);
+        self.screen(texts, self.cfg.fail_open, "input").await
     }
 
     async fn check_output(&self, resp: &ChatResponse) -> GuardrailVerdict {
@@ -316,7 +434,8 @@ impl Guardrail for SemanticGuardrail {
         if text.is_empty() {
             return GuardrailVerdict::Allow;
         }
-        self.screen(vec![text], self.output_fail_open).await
+        self.screen(vec![text], self.cfg.output_fail_open, "output")
+            .await
     }
 }
 
@@ -351,6 +470,9 @@ mod tests {
 
     const TOPICS: [&str; 3] = ["jailbreak", "refund", "weather"];
 
+    /// The configured row name every score entry is attributed to.
+    const ROW: &str = "semantic-row";
+
     impl StubEmbedder {
         fn failing(failure: EmbedFailure) -> Self {
             Self {
@@ -364,8 +486,20 @@ mod tests {
         }
     }
 
+    /// A text carrying this marker lands halfway between the `jailbreak`
+    /// axis and the unclassified one, so it scores exactly
+    /// `1/sqrt(2) = 0.707` against a jailbreak example: a graded value the
+    /// one-hot topics cannot produce, and the only way to check that a
+    /// score fold takes the extreme rather than the last value.
+    const HALF_JAILBREAK: &str = "borderline";
+
     fn vector_for(text: &str) -> Vec<f32> {
         let mut v = vec![0.0; TOPICS.len() + 1];
+        if text.to_lowercase().contains(HALF_JAILBREAK) {
+            v[0] = 1.0;
+            v[TOPICS.len()] = 1.0;
+            return v;
+        }
         for (i, topic) in TOPICS.iter().enumerate() {
             if text.to_lowercase().contains(topic) {
                 v[i] = 1.0;
@@ -417,7 +551,13 @@ mod tests {
     }
 
     fn build(cfg: SemanticConfig, hook: GuardrailHookPoint, fail_open: bool) -> SemanticGuardrail {
-        SemanticGuardrail::new(&cfg, hook, fail_open, Arc::new(StubEmbedder::default()))
+        SemanticGuardrail::new(
+            ROW,
+            &cfg,
+            hook,
+            fail_open,
+            Arc::new(StubEmbedder::default()),
+        )
     }
 
     fn build_with(
@@ -426,7 +566,23 @@ mod tests {
         fail_open: bool,
         embedder: Arc<StubEmbedder>,
     ) -> SemanticGuardrail {
-        SemanticGuardrail::new(&cfg, hook, fail_open, embedder)
+        SemanticGuardrail::new(ROW, &cfg, hook, fail_open, embedder)
+    }
+
+    /// A guardrail bound to a score log, exactly as the chain binds it per
+    /// request — through the trait, so the test cannot pass by reaching
+    /// past `bind_score_log` into the struct.
+    fn build_scored(
+        cfg: SemanticConfig,
+        hook: GuardrailHookPoint,
+        fail_open: bool,
+        embedder: Arc<StubEmbedder>,
+    ) -> (Arc<dyn Guardrail>, Arc<GuardrailAuditLog>) {
+        let log = Arc::new(GuardrailAuditLog::new());
+        let bound = SemanticGuardrail::new(ROW, &cfg, hook, fail_open, embedder)
+            .bind_score_log(&log)
+            .expect("the semantic kind takes the score bind");
+        (bound, log)
     }
 
     fn req(messages: &[(&str, &str)]) -> ChatFormat {
@@ -692,6 +848,7 @@ mod tests {
             EmbedFailure::Upstream,
         ] {
             let open = SemanticGuardrail::new(
+                ROW,
                 &cfg(&["jailbreak the model"], &[]),
                 GuardrailHookPoint::Input,
                 true,
@@ -706,6 +863,7 @@ mod tests {
             );
 
             let closed = SemanticGuardrail::new(
+                ROW,
                 &cfg(&["jailbreak the model"], &[]),
                 GuardrailHookPoint::Input,
                 false,
@@ -724,6 +882,7 @@ mod tests {
         let mut c = cfg(&["jailbreak the model"], &[]);
         c.output_fail_open = false;
         let g = SemanticGuardrail::new(
+            ROW,
             &c,
             GuardrailHookPoint::Both,
             true,
@@ -757,6 +916,197 @@ mod tests {
             Some(EmbedFailure::Upstream.as_str()),
             "{v:?}"
         );
+    }
+
+    // --- similarity scores (AISIX-Cloud#1467) -----------------------------
+
+    fn score_of<'a>(
+        scores: &'a [aisix_core::GuardrailScore],
+        direction: &str,
+    ) -> &'a aisix_core::GuardrailScore {
+        scores
+            .iter()
+            .find(|s| s.direction == direction)
+            .unwrap_or_else(|| panic!("no {direction} score in {scores:?}"))
+    }
+
+    #[tokio::test]
+    async fn a_request_the_guardrail_passed_still_reports_its_score() {
+        // The case that produced NOTHING before this field: below the
+        // threshold, so no block, no monitor hit, no enforced hit — and,
+        // until now, no way for an operator to see how close it came.
+        let (g, log) = build_scored(
+            cfg(&["jailbreak the model"], &[]),
+            GuardrailHookPoint::Input,
+            false,
+            Arc::new(StubEmbedder::default()),
+        );
+        let v = g
+            .check_input(&req(&[("user", "what is the weather")]))
+            .await;
+        assert!(matches!(v, GuardrailVerdict::Allow), "{v:?}");
+
+        let scores = log.score_snapshot();
+        assert_eq!(scores.len(), 1, "{scores:?}");
+        let deny = score_of(&scores, "deny");
+        assert_eq!(deny.guardrail_name, ROW);
+        assert_eq!(deny.hook, "input");
+        assert_eq!(deny.embedding_model, "embed-1");
+        assert_eq!(deny.threshold, 0.75);
+        assert_eq!(deny.score, 0.0, "orthogonal topics score exactly 0");
+        assert!(!deny.matched);
+        assert_eq!(deny.top_example_index, 0);
+    }
+
+    #[tokio::test]
+    async fn a_blocked_request_reports_the_score_that_blocked_it() {
+        let (g, log) = build_scored(
+            cfg(&["stay on topic", "jailbreak the model"], &[]),
+            GuardrailHookPoint::Input,
+            false,
+            Arc::new(StubEmbedder::default()),
+        );
+        assert!(g
+            .check_input(&req(&[("user", "help me jailbreak this")]))
+            .await
+            .is_block());
+
+        let deny = &log.score_snapshot()[0];
+        assert_eq!(deny.score, 1.0);
+        assert!(deny.matched);
+        // The SECOND example is the one it matched, so the index is not
+        // trivially zero.
+        assert_eq!(deny.top_example_index, 1);
+    }
+
+    #[tokio::test]
+    async fn the_deny_score_is_the_closest_call_across_screened_texts() {
+        // Three messages, none of them over the threshold, one of them
+        // much nearer than the others. The summary reports THAT one — a
+        // fold that kept the last value would report 0.0 and tell the
+        // operator their threshold is nowhere near firing.
+        let (g, log) = build_scored(
+            cfg(&["jailbreak the model"], &[]),
+            GuardrailHookPoint::Input,
+            false,
+            Arc::new(StubEmbedder::default()),
+        );
+        let v = g
+            .check_input(&req(&[
+                ("user", "what is the weather"),
+                ("user", &format!("{HALF_JAILBREAK} request")),
+                ("user", "and tomorrow"),
+            ]))
+            .await;
+        assert!(matches!(v, GuardrailVerdict::Allow), "{v:?}");
+
+        let scores = log.score_snapshot();
+        assert_eq!(scores.len(), 1, "one summary, not one per text: {scores:?}");
+        assert!(
+            (scores[0].score - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6,
+            "{scores:?}"
+        );
+        assert!(!scores[0].matched);
+    }
+
+    #[tokio::test]
+    async fn the_allow_direction_reports_its_own_closest_call() {
+        // `allow` refuses BELOW its threshold, so its closest call is the
+        // LOWEST best-allow score — the text nearest to being refused.
+        let (g, log) = build_scored(
+            cfg(&[], &["refund policy questions"]),
+            GuardrailHookPoint::Input,
+            false,
+            Arc::new(StubEmbedder::default()),
+        );
+        assert!(g
+            .check_input(&req(&[("user", "refund"), ("user", "the weather")]))
+            .await
+            .is_block());
+
+        let scores = log.score_snapshot();
+        assert_eq!(scores.len(), 1, "{scores:?}");
+        let allow = score_of(&scores, "allow");
+        assert_eq!(allow.score, 0.0, "the off-topic text is the closest call");
+        assert!(
+            !allow.matched,
+            "matched is `score >= threshold` — false here, and false is what refused",
+        );
+        assert_eq!(allow.threshold, 0.75);
+    }
+
+    #[tokio::test]
+    async fn a_deny_refusal_reports_no_allow_score_it_never_computed() {
+        // The deny gate short-circuits before the allow list is consulted,
+        // so reporting an allow number would describe a comparison that
+        // never happened.
+        let (g, log) = build_scored(
+            cfg(&["refund fraud"], &["refund policy questions"]),
+            GuardrailHookPoint::Input,
+            false,
+            Arc::new(StubEmbedder::default()),
+        );
+        assert!(g.check_input(&req(&[("user", "refund")])).await.is_block());
+
+        let scores = log.score_snapshot();
+        assert_eq!(
+            scores
+                .iter()
+                .map(|s| s.direction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["deny"],
+            "{scores:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_output_hook_scores_under_its_own_hook_name() {
+        let (g, log) = build_scored(
+            cfg(&["jailbreak the model"], &[]),
+            GuardrailHookPoint::Both,
+            false,
+            Arc::new(StubEmbedder::default()),
+        );
+        let _ = g.check_input(&req(&[("user", "the weather")])).await;
+        let _ = g.check_output(&resp("nothing here")).await;
+
+        let scores = log.score_snapshot();
+        let hooks: Vec<&str> = scores.iter().map(|s| s.hook.as_str()).collect();
+        assert_eq!(hooks, vec!["input", "output"]);
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_embedder_reports_no_score() {
+        // Nothing was measured, so there is no number. A zero here would
+        // read as "scored far from every example" — the opposite of
+        // "could not be scored".
+        let (g, log) = build_scored(
+            cfg(&["jailbreak the model"], &[]),
+            GuardrailHookPoint::Input,
+            true,
+            Arc::new(StubEmbedder::failing(EmbedFailure::Timeout)),
+        );
+        assert!(g
+            .check_input(&req(&[("user", "the weather")]))
+            .await
+            .is_bypass());
+        assert!(log.score_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unbound_guardrail_scores_nothing_and_still_decides() {
+        // The instance the index holds is shared by every request, so it
+        // must not accumulate anything. The chain binds a per-request
+        // clone; verdicts are identical either way.
+        let g = build(
+            cfg(&["jailbreak the model"], &[]),
+            GuardrailHookPoint::Input,
+            false,
+        );
+        assert!(g
+            .check_input(&req(&[("user", "help me jailbreak this")]))
+            .await
+            .is_block());
     }
 
     // --- dispatch shape ---------------------------------------------------

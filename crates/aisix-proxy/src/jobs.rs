@@ -446,6 +446,7 @@ async fn scan_input_blob(
     // output scans resolve their own chain, so a request can produce two
     // audit logs (AISIX-Cloud#1330 / #1024).
     enforced_hits: &mut Vec<aisix_core::GuardrailEnforcedHit>,
+    scores: &mut Vec<aisix_core::GuardrailScore>,
 ) -> Result<(), ProxyError> {
     let ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
@@ -469,6 +470,7 @@ async fn scan_input_blob(
     // Drained BEFORE the block branch: a `blocked` hit is exactly the one
     // that leaves through `Err`, and the caller's `?` would drop it.
     enforced_hits.extend(chain.enforced_hits());
+    scores.extend(chain.scores());
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
@@ -501,6 +503,7 @@ async fn scan_output_blob(
     // output scans resolve their own chain, so a request can produce two
     // audit logs (AISIX-Cloud#1330 / #1024).
     enforced_hits: &mut Vec<aisix_core::GuardrailEnforcedHit>,
+    scores: &mut Vec<aisix_core::GuardrailScore>,
 ) -> Result<(), ProxyError> {
     let ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
@@ -524,6 +527,7 @@ async fn scan_output_blob(
     monitor_hits.extend(hits);
     // See `scan_input_blob`.
     enforced_hits.extend(chain.enforced_hits());
+    scores.extend(chain.scores());
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
@@ -602,6 +606,7 @@ fn emit_job_usage_event(
     // What an ENFORCING guardrail actually did to this request
     // (AISIX-Cloud#1330).
     guardrail_enforced_hits: Vec<aisix_core::GuardrailEnforcedHit>,
+    guardrail_scores: Vec<aisix_core::GuardrailScore>,
 ) {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -619,6 +624,7 @@ fn emit_job_usage_event(
         client_user_agent: client.user_agent.clone(),
         guardrail_monitor_hits,
         guardrail_enforced_hits,
+        guardrail_scores,
         ..Default::default()
     };
     let pk = crate::usage_attr::ResolvedPk::resolve(snap, &target.pk_entry.id);
@@ -703,6 +709,7 @@ fn finish(
     result: Result<(Response, JobTarget), ProxyError>,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     enforced_hits: Vec<aisix_core::GuardrailEnforcedHit>,
+    scores: Vec<aisix_core::GuardrailScore>,
 ) -> Response {
     let elapsed = started.elapsed();
     // `path` carries the real job/file id — bounded route template only.
@@ -744,6 +751,7 @@ fn finish(
                 client,
                 monitor_hits,
                 enforced_hits,
+                scores,
             );
             if let Ok(hv) = HeaderValue::from_str(&request_id) {
                 resp.headers_mut().insert("x-aisix-request-id", hv);
@@ -787,6 +795,7 @@ fn finish(
                 err.is_guardrail_block(),
                 client,
                 enforced_hits,
+                scores,
             );
             err.into_response()
         }
@@ -866,6 +875,7 @@ pub(crate) async fn create_file(
     };
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
+    let mut scores: Vec<aisix_core::GuardrailScore> = Vec::new();
     // Loaded below, after the upload is drained — see the note in
     // `audio::multipart_dispatch` (#941 audit M2).
     let mut snapshot = None;
@@ -946,6 +956,7 @@ pub(crate) async fn create_file(
             &file_bytes,
             &mut monitor_hits,
             &mut enforced_hits,
+            &mut scores,
         )
         .await?;
         let _reservation = crate::quota::enforce(
@@ -977,6 +988,7 @@ pub(crate) async fn create_file(
             &bytes,
             &mut monitor_hits,
             &mut enforced_hits,
+            &mut scores,
         )
         .await?;
         let model = target.display_name().to_string();
@@ -1002,6 +1014,7 @@ pub(crate) async fn create_file(
         result,
         monitor_hits,
         enforced_hits,
+        scores,
     )
 }
 
@@ -1157,6 +1170,7 @@ pub(crate) async fn create_batch(
     let request_id = client.request_id.clone();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
+    let mut scores: Vec<aisix_core::GuardrailScore> = Vec::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1207,6 +1221,7 @@ pub(crate) async fn create_batch(
             &out_body,
             &mut monitor_hits,
             &mut enforced_hits,
+            &mut scores,
         )
         .await?;
         let _reservation = crate::quota::enforce(
@@ -1238,6 +1253,7 @@ pub(crate) async fn create_batch(
             &bytes,
             &mut monitor_hits,
             &mut enforced_hits,
+            &mut scores,
         )
         .await?;
         let model = target.display_name().to_string();
@@ -1261,6 +1277,7 @@ pub(crate) async fn create_batch(
         result,
         monitor_hits,
         enforced_hits,
+        scores,
     )
 }
 
@@ -1277,6 +1294,7 @@ pub(crate) async fn get_batch(
     let (raw, embedded) = routed_model_hint(&id, &params, &headers);
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
+    let mut scores: Vec<aisix_core::GuardrailScore> = Vec::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1314,6 +1332,7 @@ pub(crate) async fn get_batch(
             &bytes,
             &mut monitor_hits,
             &mut enforced_hits,
+            &mut scores,
         )
         .await?;
 
@@ -1346,6 +1365,7 @@ pub(crate) async fn get_batch(
         result,
         monitor_hits,
         enforced_hits,
+        scores,
     )
 }
 
@@ -1441,6 +1461,7 @@ pub(crate) async fn create_ft_job(
     let request_id = client.request_id.clone();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
+    let mut scores: Vec<aisix_core::GuardrailScore> = Vec::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1488,6 +1509,7 @@ pub(crate) async fn create_ft_job(
             &out_body,
             &mut monitor_hits,
             &mut enforced_hits,
+            &mut scores,
         )
         .await?;
         let _reservation = crate::quota::enforce(
@@ -1519,6 +1541,7 @@ pub(crate) async fn create_ft_job(
             &bytes,
             &mut monitor_hits,
             &mut enforced_hits,
+            &mut scores,
         )
         .await?;
         let model = target.display_name().to_string();
@@ -1542,6 +1565,7 @@ pub(crate) async fn create_ft_job(
         result,
         monitor_hits,
         enforced_hits,
+        scores,
     )
 }
 
@@ -1667,6 +1691,7 @@ async fn forward_simple(
     let surface = spec.surface;
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
+    let mut scores: Vec<aisix_core::GuardrailScore> = Vec::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1690,6 +1715,7 @@ async fn forward_simple(
                 body,
                 &mut monitor_hits,
                 &mut enforced_hits,
+                &mut scores,
             )
             .await?;
         }
@@ -1720,6 +1746,7 @@ async fn forward_simple(
             &bytes,
             &mut monitor_hits,
             &mut enforced_hits,
+            &mut scores,
         )
         .await?;
 
@@ -1753,6 +1780,7 @@ async fn forward_simple(
         result,
         monitor_hits,
         enforced_hits,
+        scores,
     )
 }
 

@@ -227,6 +227,7 @@ pub async fn image_edits(
                 err.is_guardrail_block(),
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
+                crate::usage_attr::guardrail_scores(&audit),
             );
             err.into_response()
         }

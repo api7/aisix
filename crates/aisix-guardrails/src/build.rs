@@ -505,6 +505,7 @@ fn build_one_inner(
                 return Err(BuildError::EmbedderUnavailable);
             };
             let g = crate::semantic::SemanticGuardrail::new(
+                &row.name,
                 cfg,
                 row.hook_point,
                 row.fail_open,
@@ -804,6 +805,18 @@ impl Guardrail for MonitorGuardrail {
 
     fn runs_on_output(&self) -> bool {
         self.inner.runs_on_output()
+    }
+
+    /// Forward the bind and re-wrap. A monitor-mode row is the one an
+    /// operator is actively tuning, so it is the LAST place scores may go
+    /// missing.
+    fn bind_score_log(&self, log: &Arc<crate::GuardrailAuditLog>) -> Option<Arc<dyn Guardrail>> {
+        self.inner.bind_score_log(log).map(|inner| {
+            Arc::new(MonitorGuardrail {
+                row_name: self.row_name.clone(),
+                inner,
+            }) as Arc<dyn Guardrail>
+        })
     }
 
     // Monitor mode observes without modifying: redaction is suppressed the
@@ -2761,6 +2774,136 @@ mod tests {
             &GuardrailEmbedderSlot::none(),
         );
         assert_eq!(index.len(), 0);
+    }
+
+    // --- similarity scores reach the request's log (AISIX-Cloud#1467) -----
+
+    /// Every text embeds to the same unit vector, so a candidate scores
+    /// exactly 1.0 against any example — a deterministic "over threshold"
+    /// with no bearing on which real model is configured.
+    struct IdenticalEmbedder;
+
+    #[async_trait]
+    impl crate::GuardrailEmbedder for IdenticalEmbedder {
+        async fn embed(
+            &self,
+            _model_alias: &str,
+            texts: &[String],
+            _cacheable: bool,
+            _timeout: std::time::Duration,
+        ) -> Result<Vec<Vec<f32>>, crate::EmbedFailure> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+    }
+
+    fn semantic_row(enforcement_mode: &str) -> DomainGuardrail {
+        parse(&format!(
+            r#"{{
+                "name": "semantic-row",
+                "enabled": true,
+                "hook_point": "input",
+                "enforcement_mode": "{enforcement_mode}",
+                "kind": "semantic",
+                "embedding_model": "embed-1",
+                "deny_examples": ["forbidden topic"],
+                "deny_threshold": 0.75
+            }}"#
+        ))
+    }
+
+    fn semantic_index(enforcement_mode: &str) -> Arc<LiveGuardrailIndex> {
+        let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        guardrails.insert(entry("semantic", "g-1", semantic_row(enforcement_mode)));
+        let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
+        attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(
+                r#"{
+                    "guardrail_id": "g-1",
+                    "scope_type": "env",
+                    "priority": 50
+                }"#,
+            ),
+        ));
+        let mut snap = AisixSnapshot::new();
+        snap.guardrails = guardrails;
+        snap.guardrail_attachments = attachments;
+        LiveGuardrailIndex::new_with_sink(
+            SnapshotHandle::new(snap),
+            None,
+            None,
+            GuardrailEmbedderSlot::new(Arc::new(IdenticalEmbedder)),
+        )
+    }
+
+    fn any_ctx() -> RequestContext<'static> {
+        RequestContext {
+            passthrough_route_id: "",
+            model_id: "m1",
+            mcp_server_id: "",
+            api_key_id: "k1",
+            team_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resolved_chain_carries_the_semantic_score() {
+        // The bind happens at resolve time, where the per-request log is
+        // minted — the index's own member is shared and cannot hold one.
+        let chain = semantic_index("block").resolve(&any_ctx());
+        assert!(chain.check_input(&req("anything")).await.is_block());
+
+        let scores = chain.scores();
+        assert_eq!(scores.len(), 1, "{scores:?}");
+        assert_eq!(scores[0].guardrail_name, "semantic-row");
+        assert_eq!(scores[0].hook, "input");
+        assert_eq!(scores[0].direction, "deny");
+        assert_eq!(scores[0].embedding_model, "embed-1");
+        assert!(scores[0].matched);
+    }
+
+    #[tokio::test]
+    async fn a_monitor_mode_row_scores_through_the_decorator() {
+        // Monitor mode is where an operator tunes a threshold, so it is the
+        // last place the score may go missing. The decorator wraps the
+        // semantic guardrail, so it has to forward the bind — without that
+        // forward the chain resolves, the row runs, and the array is empty.
+        let chain = semantic_index("monitor").resolve(&any_ctx());
+        let (verdict, hits) = chain.check_input_observed(&req("anything")).await;
+        assert!(
+            matches!(verdict, GuardrailVerdict::Allow),
+            "monitor never blocks: {verdict:?}"
+        );
+        assert_eq!(hits.len(), 1, "the suppressed block is still observed");
+
+        let scores = chain.scores();
+        assert_eq!(scores.len(), 1, "{scores:?}");
+        assert_eq!(scores[0].guardrail_name, "semantic-row");
+        assert!(scores[0].matched);
+    }
+
+    #[tokio::test]
+    async fn a_chain_with_no_scoring_member_reports_nothing() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "secrets",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "block-secrets",
+                    "enabled": true,
+                    "hook_point": "input",
+                    "kind": "keyword",
+                    "patterns": [
+                        { "kind": "literal", "value": "AKIA" }
+                    ]
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none())
+            .with_audit_log(Some(Arc::new(crate::GuardrailAuditLog::new())));
+        assert!(chain.check_input(&req("AKIA-EXAMPLE")).await.is_block());
+        assert!(chain.scores().is_empty());
     }
 
     #[tokio::test]

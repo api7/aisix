@@ -3057,6 +3057,7 @@ fn emit_usage_event(
         guardrail_monitor_hits,
         // See `emit_zero_token_event`: request-scoped, so terminal only.
         guardrail_enforced_hits: crate::usage_attr::terminal_enforced_hits(terminal, audit),
+        guardrail_scores: crate::usage_attr::terminal_guardrail_scores(terminal, audit),
         ..Default::default()
     };
     crate::usage_attr::apply_caller_identity(
@@ -3185,6 +3186,7 @@ fn emit_zero_token_event(
         // superseded attempt's event would repeat the same hit per retry.
         // Only the terminal event carries them.
         guardrail_enforced_hits: crate::usage_attr::terminal_enforced_hits(terminal, audit),
+        guardrail_scores: crate::usage_attr::terminal_guardrail_scores(terminal, audit),
         // Same rule, same reason as the hits above.
         guardrail_blocked: terminal && guardrail_blocked,
         ..Default::default()

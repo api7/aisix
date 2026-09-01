@@ -4392,6 +4392,7 @@ fn emit_usage_event(
         // terminal event carries them — a superseded attempt (or an ensemble
         // panel member) would otherwise repeat the same hit.
         guardrail_enforced_hits: crate::usage_attr::terminal_enforced_hits(terminal, audit),
+        guardrail_scores: crate::usage_attr::terminal_guardrail_scores(terminal, audit),
         cache_status: extras.cache_status,
         cache_hit_layer: extras.cache_hit_layer,
         cache_similarity: extras.cache_similarity,

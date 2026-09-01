@@ -28,7 +28,7 @@
 //! (aisix-server), not here.
 
 use crate::metrics::UsageEventLabels;
-use aisix_core::{AppliedGuardrail, GuardrailEnforcedHit, GuardrailMonitorHit};
+use aisix_core::{AppliedGuardrail, GuardrailEnforcedHit, GuardrailMonitorHit, GuardrailScore};
 use serde::Serialize;
 
 /// One usage event. Emitted at end-of-request (success / upstream error /
@@ -347,6 +347,26 @@ pub struct UsageEvent {
     /// so older CP images ignore the unknown field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guardrail_enforced_hits: Vec<GuardrailEnforcedHit>,
+
+    /// What a `kind: "semantic"` guardrail actually SCORED on this request
+    /// (AISIX-Cloud#1467) — on requests it passed as well as ones it
+    /// refused, in enforce mode as well as monitor mode.
+    ///
+    /// This is the only field that reports a guardrail execution which
+    /// decided nothing. The three fields above answer "did a policy act";
+    /// a similarity policy also has to answer "how close was it", because
+    /// its threshold is a number an operator has to tune and a
+    /// below-threshold pass is otherwise indistinguishable from a guardrail
+    /// that is not running at all.
+    ///
+    /// One entry per `(guardrail_name, hook, direction)` — a summary of the
+    /// closest call, never one entry per screened text. Indices only, never
+    /// the example text and never the screened text (#153); see
+    /// [`GuardrailScore`]. Empty (no scoring guardrail ran — the dominant
+    /// case) is omitted from the wire; cp-api's `/dp/telemetry` binds JSON
+    /// leniently, so older CP images ignore the unknown field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guardrail_scores: Vec<GuardrailScore>,
 
     /// Cache outcome on this request. One of:
     ///
@@ -1550,6 +1570,84 @@ mod tests {
 
         let empty = serde_json::to_string(&UsageEvent::default()).unwrap();
         assert!(!empty.contains("guardrail_enforced_hits"));
+    }
+
+    /// AISIX-Cloud#1467: the similarity summary reaches the wire under the
+    /// key the control plane binds, carries an example INDEX and never the
+    /// texts, and is omitted when nothing scored.
+    #[test]
+    fn guardrail_scores_serialise_when_set_and_are_absent_when_empty() {
+        let ev = UsageEvent {
+            request_id: "req-scored".into(),
+            guardrail_scores: vec![
+                GuardrailScore {
+                    guardrail_name: "topic-guard".into(),
+                    hook: "input".into(),
+                    direction: "deny".into(),
+                    score: 0.812,
+                    threshold: 0.75,
+                    matched: true,
+                    top_example_index: 2,
+                    embedding_model: "text-embedding-3-small".into(),
+                },
+                GuardrailScore {
+                    guardrail_name: "topic-guard".into(),
+                    hook: "input".into(),
+                    direction: "allow".into(),
+                    score: 0.41,
+                    threshold: 0.6,
+                    matched: false,
+                    top_example_index: 0,
+                    embedding_model: "text-embedding-3-small".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""guardrail_scores""#));
+        assert!(json.contains(r#""guardrail_name":"topic-guard""#));
+        assert!(json.contains(r#""direction":"deny""#));
+        assert!(json.contains(r#""direction":"allow""#));
+        assert!(json.contains(r#""embedding_model":"text-embedding-3-small""#));
+        assert!(json.contains(r#""top_example_index":2"#));
+        // The float reaches the wire as the operator would read it, not as
+        // an f64 widening of an f32 ("0.8119999766349792").
+        assert!(json.contains(r#""score":0.812"#), "{json}");
+        assert!(json.contains(r#""threshold":0.75"#), "{json}");
+        // `matched` is `score >= threshold` in BOTH directions — the allow
+        // entry below its threshold is the one that refused, and it reads
+        // `false`.
+        assert!(json.contains(r#""matched":true"#));
+        assert!(json.contains(r#""matched":false"#));
+
+        // A score is emitted on a request nothing acted on, so it must be
+        // structurally impossible for it to carry content (#153).
+        let ev_json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let keys: Vec<&str> = ev_json["guardrail_scores"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            // Alphabetical: the JSON object is read back through a sorted
+            // map, so this pins the field SET, which is the point.
+            vec![
+                "direction",
+                "embedding_model",
+                "guardrail_name",
+                "hook",
+                "matched",
+                "score",
+                "threshold",
+                "top_example_index",
+            ],
+            "the entry has no field that could hold a text",
+        );
+
+        let empty = serde_json::to_string(&UsageEvent::default()).unwrap();
+        assert!(!empty.contains("guardrail_scores"));
     }
 
     #[test]

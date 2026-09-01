@@ -3028,6 +3028,7 @@ fn emit_anthropic_usage_event(
         // the terminal event carries them — a superseded attempt would
         // otherwise repeat the same hit once per retry.
         guardrail_enforced_hits: crate::usage_attr::terminal_enforced_hits(terminal, audit),
+        guardrail_scores: crate::usage_attr::terminal_guardrail_scores(terminal, audit),
         // Same rule, same reason.
         guardrail_blocked: terminal && guardrail_blocked,
         ..Default::default()

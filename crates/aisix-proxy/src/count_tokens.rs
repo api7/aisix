@@ -222,6 +222,7 @@ pub async fn count_tokens(
                 err.is_guardrail_block(),
                 &client,
                 crate::usage_attr::enforced_hits(&screening.audit),
+                crate::usage_attr::guardrail_scores(&screening.audit),
             );
             // Anthropic-shape envelope (#336) — count_tokens callers are
             // the Anthropic SDK, not OpenAI-compatible clients.
@@ -803,6 +804,7 @@ fn emit_usage_event(
         redacted_entity_counts: screening.redactions.clone(),
         guardrail_monitor_hits: screening.monitor_hits.clone(),
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(&screening.audit),
+        guardrail_scores: crate::usage_attr::guardrail_scores(&screening.audit),
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);

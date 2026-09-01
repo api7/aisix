@@ -55,6 +55,31 @@ pub(crate) fn enforced_hits(audit: &GuardrailAudit) -> Vec<aisix_core::Guardrail
     audit.as_ref().map(|a| a.snapshot()).unwrap_or_default()
 }
 
+/// Snapshot `audit` into a terminal `UsageEvent`'s `guardrail_scores`
+/// (AISIX-Cloud#1467). Same handle, same terminal-only rule and same
+/// non-destructive read as [`enforced_hits`] — a scoring guardrail runs
+/// once per request, so a per-attempt event would repeat its numbers once
+/// per retry and make a single screening look like several.
+pub(crate) fn guardrail_scores(audit: &GuardrailAudit) -> Vec<aisix_core::GuardrailScore> {
+    audit
+        .as_ref()
+        .map(|a| a.score_snapshot())
+        .unwrap_or_default()
+}
+
+/// [`guardrail_scores`] for the retrying families — see
+/// [`terminal_enforced_hits`].
+pub(crate) fn terminal_guardrail_scores(
+    terminal: bool,
+    audit: &GuardrailAudit,
+) -> Vec<aisix_core::GuardrailScore> {
+    if terminal {
+        guardrail_scores(audit)
+    } else {
+        Vec::new()
+    }
+}
+
 /// [`enforced_hits`] for the retrying families (chat / messages /
 /// responses), whose emitters serve both the terminal event and the
 /// superseded per-attempt ones and are told which they are building.
@@ -489,6 +514,12 @@ pub(crate) fn emit_error_usage_event(
     // (`enforced_hits(&audit)`) rather than taken as a handle: the jobs
     // surface accumulates across two separately resolved chains.
     enforced: Vec<aisix_core::GuardrailEnforcedHit>,
+    // The request's similarity scores (AISIX-Cloud#1467), drained the same
+    // way. A refusal by a `kind: semantic` row lands HERE, so an error
+    // event without them would leave the block — the one outcome an
+    // operator is certain to look at — as the only execution with no
+    // number attached.
+    scores: Vec<aisix_core::GuardrailScore>,
 ) {
     let event = build_error_usage_event(
         inbound_protocol,
@@ -500,6 +531,7 @@ pub(crate) fn emit_error_usage_event(
         guardrail_blocked,
         client,
         enforced,
+        scores,
     );
     // The failed request's own attribution, off the same cell
     // `request_metrics::LastTarget` reads — so the usage-event counters and
@@ -533,6 +565,7 @@ pub(crate) fn build_error_usage_event(
     guardrail_blocked: bool,
     client: &ClientContext,
     enforced: Vec<aisix_core::GuardrailEnforcedHit>,
+    scores: Vec<aisix_core::GuardrailScore>,
 ) -> UsageEvent {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -546,6 +579,7 @@ pub(crate) fn build_error_usage_event(
         client_user_agent: client.user_agent.clone(),
         guardrail_blocked,
         guardrail_enforced_hits: enforced,
+        guardrail_scores: scores,
         ..Default::default()
     };
     apply_caller_identity(

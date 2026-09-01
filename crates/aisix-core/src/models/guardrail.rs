@@ -1133,6 +1133,77 @@ fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 
+/// One similarity-screening summary from a `kind: "semantic"` guardrail
+/// execution (AISIX-Cloud#1467): what the embedding comparison actually
+/// scored, on a request it PASSED as well as on one it refused.
+///
+/// It exists because a similarity policy is untunable without its numbers.
+/// The verdict fields answer "did it fire"; nothing answered "how close was
+/// it", so an operator whose threshold was slightly too high saw a guardrail
+/// that simply never fired and had to bisect the threshold blindly. Monitor
+/// mode did not help: [`GuardrailMonitorHit`] records only a SUPPRESSED
+/// BLOCK, so a below-threshold pass produced no record at all.
+///
+/// One entry per `(guardrail_name, hook, direction)` — a SUMMARY, not one
+/// entry per screened text. A request screens up to `max_screened_texts`
+/// messages, and reporting each would make the array grow with conversation
+/// length while burying the only number that matters: the closest call.
+/// So `deny` carries the HIGHEST similarity seen across the screened texts
+/// and `allow` the LOWEST best-allow similarity, each being the text that
+/// came nearest to changing the verdict.
+///
+/// `embedding_model` is not decoration: cosine scales differ between
+/// embedding models, so the same pair of texts can score 0.83 on one model
+/// and 0.77 on another. A score without the model that produced it cannot
+/// be compared against a threshold, against another deployment, or against
+/// a value recorded before the model was switched.
+///
+/// **Indices only, never text.** `top_example_index` names the example the
+/// candidate scored highest against; neither the example text nor the
+/// screened text is ever captured here (#153 no-leak criterion). That is
+/// deliberate and not an oversight to be corrected later: this event is
+/// durable and widely readable, so an echoed example would let anyone with
+/// log access enumerate the operator's deny list, and an echoed candidate
+/// would make the telemetry a copy of user prompts. An interactive
+/// operator-facing dry-run answers with the example text; this does not.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GuardrailScore {
+    /// The configured (row) name of the guardrail that scored.
+    pub guardrail_name: String,
+    /// Which side ran: `input` or `output`. Never `both` — that is a
+    /// configuration value, not an execution.
+    pub hook: String,
+    /// Which example list was scored against:
+    ///
+    /// - `deny` — similarity to the closest `deny_examples` entry. The
+    ///   guardrail refuses at or above `threshold`.
+    /// - `allow` — similarity to the closest `allow_examples` entry,
+    ///   reported only when that list is non-empty. The guardrail refuses
+    ///   BELOW `threshold`.
+    pub direction: String,
+    /// Cosine similarity, in `[-1, 1]`. For `deny` the highest seen across
+    /// the screened texts; for `allow` the lowest best-allow value.
+    pub score: f32,
+    /// The configured threshold this direction compares against
+    /// (`deny_threshold` / `allow_threshold`), recorded alongside the score
+    /// so a stored event stays readable after the row is retuned.
+    pub threshold: f32,
+    /// `score >= threshold`, in BOTH directions — a statement about
+    /// similarity only, never about the verdict. Whether crossing the
+    /// threshold is good or bad is the direction's business: `deny` refuses
+    /// when it is `true`, `allow` refuses when it is `false`. Defining it as
+    /// "this caused the block" would invert its meaning between the two.
+    pub matched: bool,
+    /// Zero-based index, into this direction's example list, of the
+    /// HIGHEST-SCORING example — whether or not it crossed the threshold.
+    /// On `matched: false` this is the number an operator needs: it names
+    /// which example came closest.
+    pub top_example_index: u32,
+    /// The `embedding_model` the row screened with. See the type doc: a
+    /// score is not interpretable without it.
+    pub embedding_model: String,
+}
+
 /// One guardrail member execution as observed by the chain fold
 /// (AISIX-Cloud#1076): identity, phase, enforced outcome, and wall-clock
 /// duration. All fields are bounded values safe for metric labels — never
