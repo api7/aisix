@@ -58,6 +58,7 @@ mod jwt;
 mod mcp;
 mod mcp_auth;
 mod messages;
+mod model_echo;
 mod model_resolve;
 mod models;
 mod operation;
