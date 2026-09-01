@@ -400,6 +400,10 @@ describe("semantic guardrail similarity scores on usage events", () => {
     // would let anyone with log access enumerate the operator's deny list
     // by reading it; an echoed candidate would make the telemetry a copy of
     // user prompts (#153).
+    // Its own traffic, so the case does not inherit rows from the tests
+    // above and does not become order-dependent.
+    expect(await chat(ENFORCE_MODEL, BLOCKING_PROMPT)).toBe(422);
+    expect(await chat(ENFORCE_MODEL, NEAR_MISS_PROMPT)).toBe(200);
     const rows = [
       await row(
         (l) => forModel(ENFORCE_MODEL)(l) && l.get("guardrail_blocked") === "true",
