@@ -184,8 +184,7 @@
                 "set-cookie",
                 "x-api-key"
               ]
-            },
-            "type": "string"
+            }
           }
         }
       }

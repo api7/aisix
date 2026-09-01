@@ -380,8 +380,14 @@ pub fn passthrough_route_coupling() -> Value {
         },
         {
             "if": { "required": ["identity_header"] },
+            // Presence, not value, for the same reason as the caller-JWT
+            // slot below: the property declares itself nullable and no
+            // mode requires it, so an explicit null means "not
+            // configured" rather than a document worth dropping the
+            // route over. The coupled fields above are the opposite
+            // case and keep their type pin.
             "then": { "properties": { "identity_header": {
-                "type": "string", "not": { "enum": FORBIDDEN_HEADER_SLOTS }
+                "not": { "enum": FORBIDDEN_HEADER_SLOTS }
             } } }
         },
         // The caller-JWT slot takes the opposite list: it must name a
@@ -631,6 +637,32 @@ mod coupling_tests {
             "source_cidrs": ["10.0.0.0/8"]
         });
         assert!(validate_passthrough_route(&doc).is_err());
+    }
+
+    #[test]
+    fn explicit_null_on_an_optional_header_slot_clears_it() {
+        // The opposite of the coupled fields above: no mode requires
+        // these, they declare themselves nullable, and `null` is how a
+        // resources.yaml author writes "not set" — a bare key parses to
+        // it. Rejecting that costs the whole route on the lenient read
+        // path, over a value the author meant to leave empty.
+        for field in ["identity_header", "forward_jwt_header"] {
+            let mut doc = base();
+            doc[field] = json!(null);
+            validate_passthrough_route(&doc)
+                .unwrap_or_else(|e| panic!("strict must accept null {field}: {e}"));
+            validate_passthrough_route_lenient(&doc)
+                .unwrap_or_else(|e| panic!("lenient must accept null {field}: {e}"));
+
+            // Relaxing the type did not relax the rule the branch exists for.
+            let mut doc = base();
+            doc[field] = json!("authorization");
+            assert_eq!(
+                validate_passthrough_route(&doc).is_err(),
+                field == "identity_header",
+                "{field} keeps its own verdict on a credential slot"
+            );
+        }
     }
 
     #[test]
