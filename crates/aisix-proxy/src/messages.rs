@@ -3155,8 +3155,10 @@ pub(crate) const MAX_SSE_FRAME_BUF_BYTES: usize = 1 << 20; // 1 MiB
 /// corresponding frame.
 #[derive(Default)]
 struct AnthropicStreamUsage {
-    /// `true` once the upstream stream reached its end, i.e. the response
-    /// was forwarded in full. Stays `false` when the consumer went away
+    /// `true` once the UPSTREAM stream reached its end. Not the same as
+    /// "the response was forwarded in full": under a hold-back policy the
+    /// relay may have withheld an unterminated frame it could not scan.
+    /// Stays `false` when the consumer went away
     /// first — the generator is dropped at a suspension point and the tail
     /// never runs — which the telemetry closure reports as `499`.
     reached_end: bool,
