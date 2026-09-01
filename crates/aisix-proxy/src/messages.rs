@@ -3625,11 +3625,32 @@ where
                 // would otherwise grow `buf` unboundedly (per-request
                 // memory exhaustion). Real Anthropic SSE frames are
                 // well under a few KB, so a 1 MiB ceiling can only be
-                // hit by a non-conformant stream; release the
-                // un-terminated remainder downstream rather than OOM.
-                // Delivery is preserved — only this frame's usage parse
-                // and model restamp are lost.
+                // hit by a non-conformant stream.
+                //
+                // Under a hold-back policy those bytes fail closed, for the
+                // same reason the EOF tail below does: an unterminated frame
+                // never reached `drain_anthropic_sse_frames`, so it never fed
+                // `response_text` and the output guardrail never saw it.
+                // Releasing it with `held` after the scan would be a bypass,
+                // and its size is not what makes it one.
+                //
+                // On the live-forward path there is no scan to bypass, so the
+                // remainder goes downstream rather than being dropped or held
+                // until OOM. Delivery is preserved — only that frame's usage
+                // parse and model restamp are lost.
                 if buf.len() > MAX_SSE_FRAME_BUF_BYTES {
+                    if hold_policy.is_some() {
+                        tracing::warn!(
+                            guardrail_hook = "output",
+                            buffered = buf.len(),
+                            "streaming /v1/messages passthrough buffered an unterminated \
+                             SSE frame past the cap; failing closed rather than releasing \
+                             it unscanned",
+                        );
+                        guard.usage().guardrail_blocked = true;
+                        yield Ok(Bytes::from(guardrail_block_frame(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED))));
+                        return;
+                    }
                     tracing::warn!(
                         buffered = buf.len(),
                         "anthropic stream: SSE frame buffer exceeded cap without a \
