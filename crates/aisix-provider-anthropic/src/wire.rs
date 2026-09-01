@@ -491,6 +491,19 @@ fn translate_reasoning_effort_to_anthropic(
     let Some(effort) = effort.as_str() else {
         return;
     };
+    // A caller who natively turned thinking off has already stated the
+    // depth, so the alias adds nothing — and pairing a tier with it
+    // would build a request Anthropic rejects above `high`, naming an
+    // `output_config` the caller never sent. `reasoning_effort_for`
+    // resolves the same pair the same way in the other direction.
+    if extras
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(|t| t.as_str())
+        == Some("disabled")
+    {
+        return;
+    }
     let has_native_effort = extras
         .get("output_config")
         .and_then(|config| config.as_object())
@@ -4187,6 +4200,40 @@ mod tests {
             built.extra.get("output_config"),
             Some(&serde_json::json!({"effort": "high"}))
         );
+    }
+
+    #[test]
+    fn build_request_native_disabled_thinking_suppresses_the_tier() {
+        // Anthropic accepts `disabled` only at `high` or below, so
+        // attaching a tier here would make the gateway construct a
+        // request the upstream rejects — over a field the caller never
+        // sent. Mirrors `disabled` outranking a tier inbound.
+        for effort in ["max", "high"] {
+            let req = ChatFormat {
+                extra: {
+                    let mut m = serde_json::Map::new();
+                    m.insert("reasoning_effort".to_string(), effort.into());
+                    m.insert(
+                        "thinking".to_string(),
+                        serde_json::json!({"type": "disabled"}),
+                    );
+                    m
+                },
+                ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+            };
+            let (_system, messages) = split_system(&req).unwrap();
+            let built = build_request(&req, "c-name", None, messages, false);
+            assert_eq!(
+                built.extra.get("thinking"),
+                Some(&serde_json::json!({"type": "disabled"})),
+                "reasoning_effort = {effort}"
+            );
+            assert!(
+                !built.extra.contains_key("output_config"),
+                "tier attached to disabled thinking for reasoning_effort = {effort}"
+            );
+            assert!(!built.extra.contains_key("reasoning_effort"));
+        }
     }
 
     #[test]
