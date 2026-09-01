@@ -4,6 +4,48 @@
   "allOf": [
     {
       "if": {
+        "required": [
+          "forward_jwt_header"
+        ]
+      },
+      "then": {
+        "properties": {
+          "forward_jwt_header": {
+            "not": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "accept",
+                    "accept-encoding",
+                    "connection",
+                    "content-encoding",
+                    "content-length",
+                    "content-type",
+                    "expect",
+                    "host",
+                    "keep-alive",
+                    "te",
+                    "trailer",
+                    "transfer-encoding",
+                    "upgrade",
+                    "anthropic-version",
+                    "last-event-id",
+                    "mcp-protocol-version",
+                    "mcp-session-id"
+                  ]
+                },
+                {
+                  "pattern": "^x-aisix-",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
         "properties": {
           "auth_type": {
             "const": "bearer"
@@ -305,6 +347,15 @@
       "default": true,
       "description": "Whether this server is active. When `false`, its tools are not listed and cannot be called.",
       "type": "boolean"
+    },
+    "forward_jwt_header": {
+      "description": "Header the calling agent's own JWT is delivered to this server in, for an internal server that authorizes on the end user's claims rather than on the gateway's credential. Omit — the default — to send no caller token upstream. Applies to both `type: mcp` and `type: openapi`, so a REST API exposed here as tools receives the end user's token on every tool call.\n\nThis is independent of `auth_type`, which stays the gateway's own credential for the server: a server can require both, one in each header. The token is the one the gateway verified for this request (signature, expiry, and claim mapping all applied), relayed with no claim added, removed, or rewritten. An agent that authenticated with an API key has no token to relay, and the header is then absent rather than empty.\n\nNaming `authorization` or `proxy-authorization` sends `Bearer <token>`, the form those headers are defined to carry. Any other header carries the bare token. Naming the slot `auth_type` would otherwise fill — `authorization` for `bearer` and `oauth2`, `api_key_header` for `api_key` — takes precedence over it, so the server receives the end user's token in place of the gateway's, never both.\n\nA server that validates the `aud` claim will reject a token minted for the gateway; this field is for internal servers that read the claims of a token their own identity provider issued.\n\nHeaders that describe the message rather than its sender — its framing (`host`, `content-length`), the connection carrying it (`connection`, `keep-alive`), and what it negotiates (`accept`, `content-type`) — are rejected. Lowercase-only, so that rejection list is exhaustive on every configuration path.",
+      "minLength": 1,
+      "pattern": "^[!#$%&'*+.^_`|~0-9a-z-]+$",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "name": {
       "description": "Operator-facing label, unique within the gateway. It is used as the namespace prefix for this server's tools, which are exposed to clients as `<name>__<tool>`, so it must not contain the reserved separator `__`.",

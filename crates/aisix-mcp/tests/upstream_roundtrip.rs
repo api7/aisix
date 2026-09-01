@@ -452,3 +452,162 @@ async fn upstream_call_times_out_instead_of_hanging() {
         "call should give up at the ~200ms deadline, not wait out the 2s server sleep"
     );
 }
+
+/// Reject any request that does not carry `authorization` EXACTLY once,
+/// with the given value.
+///
+/// The single-value part is what the gateway-credential-replacement test
+/// needs: a server reading only the first value would pass just as happily
+/// with two credentials on the wire, which is the bug (`RequestBuilder`
+/// appends), not the contract.
+async fn require_sole_authorization(
+    axum::extract::State(expected): axum::extract::State<String>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let values: Vec<_> = request
+        .headers()
+        .get_all(axum::http::header::AUTHORIZATION)
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(str::to_string))
+        .collect();
+    if values.len() != 1 || values[0] != expected {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            format!("expected exactly [{expected}], got {values:?}"),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+async fn spawn_echo_server_requiring_sole_authorization(expected: String) -> SocketAddr {
+    let service = StreamableHttpService::new(
+        || Ok(EchoServer),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let app = axum::Router::new().nest_service("/mcp", service).layer(
+        axum::middleware::from_fn_with_state(expected, require_sole_authorization),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    addr
+}
+
+/// An internal MCP server that authorizes on the end user's claims receives
+/// the caller's own token, in the header the operator named — on the
+/// session handshake and on every subsequent operation, since the bridge
+/// reconnects per operation.
+#[tokio::test]
+async fn forwarded_caller_jwt_reaches_the_upstream_server() {
+    let addr = spawn_echo_server_requiring_header(RequiredHeader {
+        name: "x-user-jwt",
+        expected: "eyJhbGciOi.caller".to_string(),
+        www_authenticate: false,
+    })
+    .await;
+
+    let upstream = McpUpstream::new(format!("http://{addr}/mcp")).with_forwarded_jwt(Some((
+        "x-user-jwt".to_string(),
+        "eyJhbGciOi.caller".to_string(),
+    )));
+
+    let bridge = EphemeralBridge::new(upstream);
+    let tools = bridge.list_tools().await.expect("list with caller jwt");
+    assert_eq!(tools.len(), 1);
+    let result = bridge
+        .call_tool("echo", serde_json::json!({ "text": "hi" }))
+        .await
+        .expect("call with caller jwt");
+    assert_eq!(result.content[0]["text"], "hi");
+}
+
+/// Pointing `forward_jwt_header` at `authorization` hands the upstream the
+/// end user's token INSTEAD of the gateway's own bearer — exactly one
+/// credential on the wire, not both.
+#[tokio::test]
+async fn forwarded_caller_jwt_replaces_the_gateway_bearer() {
+    let addr =
+        spawn_echo_server_requiring_sole_authorization("Bearer caller-token".to_string()).await;
+
+    let upstream = McpUpstream::new(format!("http://{addr}/mcp"))
+        .with_bearer("gateway-held-secret")
+        .with_forwarded_jwt(Some((
+            "authorization".to_string(),
+            "Bearer caller-token".to_string(),
+        )));
+
+    let bridge = EphemeralBridge::new(upstream);
+    let tools = bridge
+        .list_tools()
+        .await
+        .expect("caller token must win the authorization slot, alone");
+    assert_eq!(tools.len(), 1);
+}
+
+/// A server with no `forward_jwt_header` still gets the gateway's own
+/// credential and nothing else — the default every registered server keeps.
+#[tokio::test]
+async fn without_the_field_the_gateway_bearer_is_still_the_only_credential() {
+    let addr =
+        spawn_echo_server_requiring_sole_authorization("Bearer gateway-held-secret".to_string())
+            .await;
+
+    let upstream =
+        McpUpstream::new(format!("http://{addr}/mcp")).with_bearer("gateway-held-secret");
+
+    let bridge = EphemeralBridge::new(upstream);
+    let tools = bridge.list_tools().await.expect("gateway bearer unchanged");
+    assert_eq!(tools.len(), 1);
+}
+
+/// The token never reaches a log through `Debug`, which the connect path
+/// formats on error.
+#[test]
+fn forwarded_jwt_is_redacted_in_debug() {
+    let upstream = McpUpstream::new("http://x/mcp").with_forwarded_jwt(Some((
+        "x-user-jwt".to_string(),
+        "eyJhbGciOi.caller".to_string(),
+    )));
+    let rendered = format!("{upstream:?}");
+    assert!(
+        rendered.contains("x-user-jwt"),
+        "the slot stays diagnosable: {rendered}"
+    );
+    assert!(
+        !rendered.contains("eyJhbGciOi.caller"),
+        "token must not print: {rendered}"
+    );
+}
+
+/// The slot is claimed only by a token that can actually be delivered.
+/// Verified tokens are base64url and so always header-safe; the assertion
+/// is that the suppression and the delivery are one decision, so no future
+/// token source can leave the session with neither credential.
+#[tokio::test]
+async fn a_token_that_cannot_be_a_header_leaves_the_gateway_bearer_alone() {
+    let addr =
+        spawn_echo_server_requiring_sole_authorization("Bearer gateway-held-secret".to_string())
+            .await;
+
+    let upstream = McpUpstream::new(format!("http://{addr}/mcp"))
+        .with_bearer("gateway-held-secret")
+        .with_forwarded_jwt(Some((
+            "authorization".to_string(),
+            "Bearer caller\ntoken".to_string(),
+        )));
+
+    let bridge = EphemeralBridge::new(upstream);
+    let tools = bridge
+        .list_tools()
+        .await
+        .expect("an undeliverable token must not cost the session its only credential");
+    assert_eq!(tools.len(), 1);
+}

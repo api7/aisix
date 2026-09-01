@@ -118,6 +118,42 @@ pub struct McpServer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<McpProtocolVersion>,
 
+    /// Header the calling agent's own JWT is delivered to this server in,
+    /// for an internal server that authorizes on the end user's claims
+    /// rather than on the gateway's credential. Omit — the default — to
+    /// send no caller token upstream. Applies to both `type: mcp` and
+    /// `type: openapi`, so a REST API exposed here as tools receives the
+    /// end user's token on every tool call.
+    ///
+    /// This is independent of `auth_type`, which stays the gateway's own
+    /// credential for the server: a server can require both, one in each
+    /// header. The token is the one the gateway verified for this request
+    /// (signature, expiry, and claim mapping all applied), relayed with no
+    /// claim added, removed, or rewritten. An agent that authenticated with
+    /// an API key has no token to relay, and the header is then absent
+    /// rather than empty.
+    ///
+    /// Naming `authorization` or `proxy-authorization` sends
+    /// `Bearer <token>`, the form those headers are defined to carry. Any
+    /// other header carries the bare token. Naming the slot `auth_type`
+    /// would otherwise fill — `authorization` for `bearer` and `oauth2`,
+    /// `api_key_header` for `api_key` — takes precedence over it, so the
+    /// server receives the end user's token in place of the gateway's,
+    /// never both.
+    ///
+    /// A server that validates the `aud` claim will reject a token minted
+    /// for the gateway; this field is for internal servers that read the
+    /// claims of a token their own identity provider issued.
+    ///
+    /// Headers that describe the message rather than its sender — its
+    /// framing (`host`, `content-length`), the connection carrying it
+    /// (`connection`, `keep-alive`), and what it negotiates (`accept`,
+    /// `content-type`) — are rejected. Lowercase-only, so that rejection
+    /// list is exhaustive on every configuration path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = "^[!#$%&'*+.^_`|~0-9a-z-]+$"), length(min = 1))]
+    pub forward_jwt_header: Option<String>,
+
     /// Maximum time, in milliseconds, to wait for a single upstream operation
     /// (establishing the session, listing tools, or calling a tool). Must be at
     /// least `1` when set. When omitted, the gateway applies a built-in default.
@@ -227,6 +263,20 @@ pub fn mcp_server_credential_coupling() -> Value {
         "properties": { "secret": { "type": "string", "minLength": 1 } }
     });
     json!([
+        // The caller-JWT slot must be a header that names a sender, not one
+        // that frames the message (`crate::forwarded_jwt`). Credential
+        // slots stay allowed: delivering the end user's token into the
+        // header an internal server already reads is the field's purpose.
+        {
+            // Presence, not value: an explicit `null` clears the field, so
+            // the `then` must not pin a type the property itself declares
+            // nullable — under the lenient contract a rejected document
+            // costs the whole row.
+            "if": { "required": ["forward_jwt_header"] },
+            "then": { "properties": { "forward_jwt_header": {
+                "not": super::schema::forwarded_jwt_slot_rejection()
+            } } }
+        },
         {
             "if": { "properties": { "auth_type": { "const": "bearer" } }, "required": ["auth_type"] },
             "then": secret_required
@@ -318,6 +368,49 @@ pub fn mcp_server_credential_coupling() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_caller_jwt_slot_takes_credential_headers_and_refuses_framing_ones() {
+        use crate::models::schema::{validate_mcp_server, validate_mcp_server_lenient};
+
+        let with = |slot: Value| {
+            let mut v = json!({"name": "erp", "url": "https://erp.internal/mcp"});
+            v["forward_jwt_header"] = slot;
+            v
+        };
+
+        // A credential slot is the point of the field, not an oversight.
+        for good in ["authorization", "proxy-authorization", "x-user-jwt"] {
+            validate_mcp_server(&with(json!(good)))
+                .unwrap_or_else(|e| panic!("`{good}` must be accepted: {e}"));
+        }
+
+        // A header that frames the message, or asserts something the gateway
+        // owns, cannot carry a sender's identity.
+        for bad in [
+            "host",
+            "content-length",
+            "mcp-session-id",
+            "x-aisix-request-id",
+        ] {
+            validate_mcp_server(&with(json!(bad))).expect_err(&format!("`{bad}` must be rejected"));
+        }
+
+        // An explicit null clears the field. It has to survive BOTH gates:
+        // the lenient one is the read contract, where a rejected document
+        // costs every tool on the row rather than the one field.
+        validate_mcp_server(&with(json!(null))).expect("an explicit null clears the slot");
+        validate_mcp_server_lenient(&with(json!(null)))
+            .expect("an explicit null must not cost the row on the read path");
+
+        // The name is a lowercase token; the shape is pinned independently.
+        for malformed in [json!(""), json!("Authorization"), json!("x y")] {
+            assert!(
+                validate_mcp_server(&with(malformed.clone())).is_err(),
+                "{malformed} is not a header name"
+            );
+        }
+    }
 
     #[test]
     fn schema_pins_each_mcp_obligation_individually() {
@@ -646,6 +739,7 @@ mod tests {
             token_url: None,
             scopes: None,
             protocol_version: None,
+            forward_jwt_header: None,
             timeout_ms: None,
             enabled: true,
             runtime_id: String::new(),

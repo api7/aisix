@@ -542,7 +542,11 @@ pub(crate) fn bridge_ctx(
     let ctx = aisix_gateway::BridgeContext::new(request_id, model, provider_key)
         .with_resource_ids(model_id, provider_key_id);
     match client {
-        Some(c) => ctx.with_client(c.caller.clone(), Some(c.headers.clone())),
+        Some(c) => ctx.with_client(
+            c.caller.clone(),
+            Some(c.headers.clone()),
+            c.jwt.as_ref().map(|j| Arc::from(j.token())),
+        ),
         None => ctx,
     }
 }
@@ -576,6 +580,7 @@ pub(crate) fn upstream_header_ctx<'a>(
             provider_key_name: Some(&pk.display_name),
         })
         .with_client_headers(&client.headers)
+        .with_caller_jwt(client.jwt.as_ref().map(|j| j.token()))
 }
 
 #[cfg(test)]

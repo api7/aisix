@@ -1038,6 +1038,14 @@ struct VideoTarget {
     /// target is resolved so every round-trip on this surface (submit, poll,
     /// content fetch) sends the same set (AISIX-Cloud#1112 / #1167).
     extra_headers: Vec<(axum::http::HeaderName, axum::http::HeaderValue)>,
+    /// The caller-JWT slot for this call, captured before the outbound
+    /// header map is merged. Kept beside `extra_headers` because it must
+    /// OVERWRITE its slot while `extra_headers` merges with
+    /// skip-if-present — and because with no token to deliver it still has
+    /// to CLEAR a copy that arrived from the caller, which an inbound
+    /// header allowlist can otherwise walk into a slot the upstream was
+    /// told carries a verified identity.
+    forwarded_jwt: aisix_gateway::ForwardedJwt,
 }
 
 impl VideoTarget {
@@ -1090,14 +1098,15 @@ fn resolve_video_target(
     };
     let secret = crate::dispatch::require_api_key(&pk_entry.value, &model_entry.value)?.to_string();
 
-    let extra_headers =
-        aisix_gateway::resolve_extra_headers(&crate::dispatch::upstream_header_ctx(
-            &pk_entry.value,
-            &pk_entry.id,
-            &model_entry.value,
-            &model_entry.id,
-            client_ctx,
-        ));
+    let header_ctx = crate::dispatch::upstream_header_ctx(
+        &pk_entry.value,
+        &pk_entry.id,
+        &model_entry.value,
+        &model_entry.id,
+        client_ctx,
+    );
+    let extra_headers = aisix_gateway::resolve_extra_headers(&header_ctx);
+    let forwarded_jwt = aisix_gateway::ForwardedJwt::resolve(&header_ctx);
     Ok(Ok(VideoTarget {
         pk_id: pk_entry.id.to_string(),
         tls: pk_entry.value.tls.clone(),
@@ -1107,6 +1116,7 @@ fn resolve_video_target(
         secret,
         model_entry,
         extra_headers,
+        forwarded_jwt,
     }))
 }
 
@@ -1190,11 +1200,15 @@ async fn provider_call(
                     header::HeaderValue::from_static("enable"),
                 );
             }
+            // Captured before the merge — see the field's doc comment.
+            let jwt_slot = target.forwarded_jwt.capture(&headers);
             for (name, value) in &target.extra_headers {
                 if !headers.contains_key(name) {
                     headers.insert(name.clone(), value.clone());
                 }
             }
+            jwt_slot.apply(&mut headers);
+
             let mut builder = client.request(method.clone(), url).headers(headers);
             if let Some(b) = body {
                 builder = builder
@@ -1302,11 +1316,15 @@ async fn proxy_content(
             headers.insert(n, v);
         }
     }
+    // Captured before the merge — see the field's doc comment.
+    let jwt_slot = target.forwarded_jwt.capture(&headers);
     for (name, value) in &target.extra_headers {
         if !headers.contains_key(name) {
             headers.insert(name.clone(), value.clone());
         }
     }
+    jwt_slot.apply(&mut headers);
+
     let builder = client.get(url).headers(headers);
 
     let stream_budget =

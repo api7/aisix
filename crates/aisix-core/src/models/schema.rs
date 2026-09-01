@@ -922,7 +922,44 @@ pub fn provider_key_root_schema() -> Value {
         "Accepted as an alternative spelling of `api_key`. \
          Provide the credential under exactly one of the two names.",
     );
+    reject_transport_slots_for_forwarded_jwt(&mut schema, "RequestOverrides");
     schema
+}
+
+/// The `not` subschema rejecting every header slot a caller JWT may never
+/// be delivered in, shared by all three resources that carry
+/// `forward_jwt_header` so the write path and
+/// [`crate::forwarded_jwt::forwarded_jwt_slot_rejected`] cannot drift.
+pub fn forwarded_jwt_slot_rejection() -> Value {
+    json!({
+        "anyOf": [
+            { "enum": crate::forwarded_jwt::NON_SENDER_HEADER_SLOTS },
+            // `type` is load-bearing: a bare `pattern` matches any
+            // non-string vacuously, so the enclosing `not` would reject an
+            // explicit `null` — and this schema is also the LENIENT read
+            // contract, where a rejected document costs the whole row.
+            { "type": "string", "pattern": "^x-aisix-" }
+        ]
+    })
+}
+
+/// Constrain the `forward_jwt_header` of a nested definition to headers
+/// that name a sender rather than frame the message.
+///
+/// The flat resources carrying the same field express this as an
+/// `if`/`then` in their own coupling; `provider_key` holds it inside
+/// `request`, which schemars emits as a `$ref`'d definition, so the rule
+/// is injected into that definition instead. All three end up enforcing
+/// one list on both the strict and the lenient path.
+fn reject_transport_slots_for_forwarded_jwt(schema: &mut Value, definition: &str) {
+    let field = schema
+        .get_mut("definitions")
+        .and_then(|d| d.get_mut(definition))
+        .and_then(|d| d.get_mut("properties"))
+        .and_then(|p| p.get_mut("forward_jwt_header"))
+        .and_then(Value::as_object_mut)
+        .unwrap_or_else(|| panic!("definition `{definition}` has a `forward_jwt_header` property"));
+    field.insert("not".to_string(), forwarded_jwt_slot_rejection());
 }
 
 /// Mirror a struct field's `#[serde(alias = "…")]` in the generated schema.
