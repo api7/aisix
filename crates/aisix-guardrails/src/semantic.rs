@@ -287,11 +287,12 @@ impl SemanticGuardrail {
         deny_vecs: &[Vec<f32>],
         allow_vecs: &[Vec<f32>],
     ) -> JudgedCandidate {
-        let mut judged = JudgedCandidate::default();
-
         // Deny first, unconditionally: a text matching both lists is
         // refused, never laundered by its allow score.
-        judged.deny = closest(candidate, deny_vecs);
+        let mut judged = JudgedCandidate {
+            deny: closest(candidate, deny_vecs),
+            ..Default::default()
+        };
         if let Some((index, score)) = judged.deny {
             if score >= self.cfg.deny_threshold {
                 judged.verdict = Some(GuardrailVerdict::block(format!(
