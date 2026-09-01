@@ -5009,6 +5009,12 @@ mod tests {
         // rejects. Without this the strip is guarded only by the schema
         // drift job, which pins code against artefact and would go green on
         // a regenerated artefact carrying the default back.
+        // Pin a property that must be PRESENT first. `Value::Index` yields
+        // `Null` for a missing key and `Null.get("default")` is `None`, so
+        // the absence assertion below passes vacuously if the whole
+        // `script` property is dropped — which would also silently ship a
+        // strict branch with no `minLength`, making `""` savable.
+        assert_eq!(branch["properties"]["script"]["minLength"], json!(1));
         assert!(
             branch["properties"]["script"].get("default").is_none(),
             "script still advertises a default: {}",

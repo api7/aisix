@@ -514,9 +514,10 @@ fn build_one_inner(
             Ok(Some(Arc::new(g)))
         }
         GuardrailKind::Custom(cfg) => {
-            // `script` carries a serde default so an older or malformed row
-            // still deserializes (AGENTS.md), which means an empty one can
-            // reach here. It must not build: an empty module parses, exports
+            // A whitespace-only script clears the schema's `minLength: 1`
+            // and reaches here; an omitted or empty one is refused by BOTH
+            // schemas, so it never gets this far. It must not build: an
+            // empty module parses, exports
             // no hook, and every hook would return Allow — a row that looks
             // configured and screens nothing.
             if cfg.script.trim().is_empty() {

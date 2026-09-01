@@ -72,11 +72,14 @@
 //!
 //! An execution also reports its numbers as [`GuardrailScore`] summaries on
 //! the request's telemetry — pass or block, enforce or monitor
-//! (AISIX-Cloud#1467) — wherever the request emits a usage event carrying
-//! guardrail attribution at all. `/a2a`, and `rerank`/`responses` when the
-//! upstream reports no usage, emit none, so they carry no enforced hits or
-//! monitor hits either; api7/aisix#1084's sibling api7/aisix#1083 tracks
-//! closing all three together. A similarity policy is untunable without them: the
+//! (AISIX-Cloud#1467) — wherever the request's usage event carries
+//! guardrail attribution at all. Two surfaces do not, for DIFFERENT
+//! reasons, and conflating them is how this comment was wrong once
+//! already: `/a2a` emits a usage event and attaches no attribution to it
+//! (only `guardrail_blocked` survives), while `rerank` and `responses`
+//! emit no usage event at all when the upstream reports no usage. Neither
+//! carries enforced hits or monitor hits either; api7/aisix#1083 tracks
+//! closing all three fields together. A similarity policy is untunable without them: the
 //! verdict says whether the threshold was crossed, and an operator whose
 //! threshold is slightly too high sees only a guardrail that never fires.
 //! The score sink is the request's [`GuardrailAuditLog`], bound per request
