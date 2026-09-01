@@ -230,6 +230,7 @@ pub async fn rerank(
                 err.is_guardrail_block(),
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
+                crate::usage_attr::guardrail_scores(&audit),
             );
             err.into_response()
         }
@@ -719,6 +720,7 @@ fn emit_usage_event(
         redacted_entity_counts,
         guardrail_monitor_hits,
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(audit),
+        guardrail_scores: crate::usage_attr::guardrail_scores(audit),
         ..Default::default()
     };
     // Per-PK attribution tags (provider_kind / provider_featured /

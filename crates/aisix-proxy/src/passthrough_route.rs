@@ -356,6 +356,7 @@ pub async fn entry(
                 error.is_guardrail_block(),
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
+                crate::usage_attr::guardrail_scores(&audit),
             );
             // The route matched before the pipeline failed, so a rejected
             // request still attributes to it — an operator triaging 401s
@@ -2139,6 +2140,7 @@ impl RouteTelemetry {
             guardrail_blocked: self.guardrail_blocked,
             guardrail_monitor_hits: std::mem::take(&mut self.monitor_hits),
             guardrail_enforced_hits: crate::usage_attr::enforced_hits(&self.audit),
+            guardrail_scores: crate::usage_attr::guardrail_scores(&self.audit),
             ..Default::default()
         };
         crate::usage_attr::apply_pk_telemetry(&mut event, &pk);

@@ -236,6 +236,39 @@ mod tests {
         assert!(bare.get("guardrail_enforced_hits").is_none());
     }
 
+    /// AISIX-Cloud#1467: the similarity summaries ride the same flattened
+    /// wire. An operator tuning a threshold reads them wherever their logs
+    /// land — a self-hosted SIEM has no control plane to ask.
+    #[test]
+    fn guardrail_scores_ride_the_flattened_exporter_wire() {
+        let rec = SinkRecord::metadata_only(UsageEvent {
+            guardrail_scores: vec![aisix_core::GuardrailScore {
+                guardrail_name: "topic-guard".into(),
+                hook: "input".into(),
+                direction: "deny".into(),
+                score: 0.62,
+                threshold: 0.75,
+                matched: false,
+                top_example_index: 1,
+                embedding_model: "text-embedding-3-small".into(),
+            }],
+            ..UsageEvent::default()
+        });
+        let json = serde_json::to_value(&rec).unwrap();
+        let scores = json["guardrail_scores"]
+            .as_array()
+            .expect("flattened onto the record, not nested under `usage`");
+        assert_eq!(scores.len(), 1);
+        assert_eq!(scores[0]["guardrail_name"], "topic-guard");
+        assert_eq!(scores[0]["direction"], "deny");
+        assert_eq!(scores[0]["matched"], false);
+        assert_eq!(scores[0]["top_example_index"], 1);
+        assert_eq!(scores[0]["embedding_model"], "text-embedding-3-small");
+
+        let bare = serde_json::to_value(SinkRecord::metadata_only(UsageEvent::default())).unwrap();
+        assert!(bare.get("guardrail_scores").is_none());
+    }
+
     #[test]
     fn full_content_record_carries_prompt_and_response() {
         let rec = SinkRecord::metadata_only(UsageEvent::default()).with_content(SinkContent {

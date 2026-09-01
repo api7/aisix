@@ -1376,6 +1376,42 @@
     },
     {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "deny_examples": {
+                "minItems": 1
+              }
+            },
+            "required": [
+              "deny_examples"
+            ]
+          },
+          "then": {
+            "required": [
+              "deny_threshold"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "allow_examples": {
+                "minItems": 1
+              }
+            },
+            "required": [
+              "allow_examples"
+            ]
+          },
+          "then": {
+            "required": [
+              "allow_threshold"
+            ]
+          }
+        }
+      ],
       "description": "Embedding-similarity screening against operator-supplied example texts. Deny examples block on a close match; an allow-list, when present, blocks everything that matches none of it. Calls an `embedding`-kind Model through the gateway's provider bridges. Detection-only — never rewrites content. Applies on input, output, or both, including buffered streaming output.",
       "properties": {
         "allow_examples": {
@@ -1388,8 +1424,7 @@
           "type": "array"
         },
         "allow_threshold": {
-          "default": 0.75,
-          "description": "Cosine-similarity threshold for `allow_examples`, in `[-1, 1]`. RAISE it to block more — a text must reach it to be admitted.",
+          "description": "Cosine-similarity threshold for `allow_examples`, in `[-1, 1]`. RAISE it to block more — a text must reach it to be admitted. Required whenever `allow_examples` is non-empty, and only then: a row with no allow-list has nothing for this number to decide. See `deny_threshold` for why there is no portable value.",
           "format": "float",
           "maximum": 1.0,
           "minimum": -1.0,
@@ -1410,8 +1445,7 @@
           "type": "array"
         },
         "deny_threshold": {
-          "default": 0.75,
-          "description": "Cosine-similarity threshold for `deny_examples`, in `[-1, 1]`. Lower it to block more.",
+          "description": "Cosine-similarity threshold for `deny_examples`, in `[-1, 1]`. Lower it to block more. Required whenever `deny_examples` is non-empty.\n\nThere is no portable value. Cosine scores are not comparable across embedding models — the same pair of texts can fall on opposite sides of a fixed threshold depending on which model produced the vectors, and a threshold carried over from another model under-screens without any sign that it is doing so. Measure one against the model named in `embedding_model`, on your own traffic: a request that emits a usage event reports what it scored in `guardrail_scores`, including the requests this guardrail allowed. Some surfaces carry no scores, among them `/a2a`, which emits a usage event but attaches no guardrail attribution to it, and `rerank`, which emits no usage event at all when the upstream reports no usage it can parse (api7/aisix#1083).",
           "format": "float",
           "maximum": 1.0,
           "minimum": -1.0,
@@ -1596,8 +1630,7 @@
           "type": "boolean"
         },
         "script": {
-          "default": "",
-          "description": "The script source, as an ES module exporting `checkInput` and/or `checkOutput`. A hook whose function the module does not export is skipped, so a script may cover one direction only.\n\nDefaulted at the TYPE level and required by the strict write schema instead (AGENTS.md: never make a projected field required at the type level). A row the loader cannot deserialize is skipped whole, and a screening row that vanishes is a guardrail that stopped screening. An empty script is rejected at chain-build time, so such a row is reported rather than silently admitting everything it was meant to screen.",
+          "description": "The script source, as an ES module exporting `checkInput` and/or `checkOutput`. A hook whose function the module does not export is skipped, so a script may cover one direction only.\n\nRequired on both the write schema and the read one, so a row that omits it is refused rather than loaded: unlike the fields that are write-path-only, a `custom` row with no script screens nothing either way, and rejecting it is what puts it in `/status/config`'s `rejected` list where an operator can see it.\n\nA script that is present but blank or does not compile passes the schema — `minLength` counts characters, and a whitespace-only value is one — and is refused when the chain is built instead. `aisix validate` reports that and exits non-zero; on a serving gateway it is a warn line and the config status stays `synced` (api7/aisix#1084).",
           "minLength": 1,
           "type": "string"
         },

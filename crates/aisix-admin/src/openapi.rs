@@ -3107,7 +3107,7 @@ mod tests {
 
         // The kind descriptions have exactly one source, beside the type in
         // `aisix_core`. Assembly here must not become a second one.
-        let source = aisix_core::models::schema::guardrail_root_schema();
+        let source = aisix_core::models::schema::guardrail_root_schema(true);
         let source_branches = source["oneOf"]
             .as_array()
             .expect("the guardrail root schema is a `oneOf` over the kinds");

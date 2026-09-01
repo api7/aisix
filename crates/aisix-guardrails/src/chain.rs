@@ -120,12 +120,37 @@ impl GuardrailChain {
         self
     }
 
-    /// Attach the request's enforced-hit log (AISIX-Cloud#1330). Called by
-    /// `LiveGuardrailIndex::resolve` with a freshly minted log; `None`
-    /// (the default for test-built chains) records nothing.
+    /// Attach the request's enforced-hit and score log
+    /// (AISIX-Cloud#1330, #1467). Called by `LiveGuardrailIndex::resolve`
+    /// with a freshly minted log; `None` (the default for test-built
+    /// chains) records nothing.
+    ///
+    /// Members that report similarity scores are rebound to the log here.
+    /// This is the only point that has both — the index's members are
+    /// shared by every request and the log is minted per request — so a
+    /// chain that skips it scores nothing, which is why the two are one
+    /// call rather than two.
     pub fn with_audit_log(mut self, audit: Option<Arc<GuardrailAuditLog>>) -> Self {
+        if let Some(log) = audit.as_ref() {
+            for m in &mut self.members {
+                if let Some(bound) = m.guardrail.bind_score_log(log) {
+                    m.guardrail = bound;
+                }
+            }
+        }
         self.audit = audit;
         self
+    }
+
+    /// The similarity scores recorded on this request so far
+    /// (AISIX-Cloud#1467). Empty when no scoring guardrail ran or when the
+    /// chain carries no log. Non-destructive — see
+    /// [`GuardrailAuditLog::score_snapshot`].
+    pub fn scores(&self) -> Vec<aisix_core::GuardrailScore> {
+        self.audit
+            .as_ref()
+            .map(|a| a.score_snapshot())
+            .unwrap_or_default()
     }
 
     /// The ENFORCE-mode hits recorded on this request so far: which
@@ -371,6 +396,21 @@ impl Guardrail for GuardrailChain {
 
     fn runs_on_output(&self) -> bool {
         self.members.iter().any(|m| m.guardrail.runs_on_output())
+    }
+
+    /// A nested chain binds its own members and answers `Some` only when
+    /// one of them took the bind — so an outer chain replaces this member
+    /// exactly when doing so changes anything.
+    fn bind_score_log(&self, log: &Arc<GuardrailAuditLog>) -> Option<Arc<dyn Guardrail>> {
+        let mut bound = self.clone();
+        let mut any = false;
+        for m in &mut bound.members {
+            if let Some(g) = m.guardrail.bind_score_log(log) {
+                m.guardrail = g;
+                any = true;
+            }
+        }
+        any.then(|| Arc::new(bound) as Arc<dyn Guardrail>)
     }
 
     async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {

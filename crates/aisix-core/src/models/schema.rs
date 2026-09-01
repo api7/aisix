@@ -125,7 +125,7 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "model" => model_root_schema(strict),
         "api_key" => apikey_root_schema(strict),
         "provider_key" => provider_key_root_schema(),
-        "guardrail" => guardrail_root_schema(),
+        "guardrail" => guardrail_root_schema(strict),
         "guardrail_attachment" => guardrail_attachment_root_schema(),
         "cache_policy" => cache_policy_root_schema(),
         "observability_exporter" => observability_exporter_root_schema(),
@@ -525,8 +525,75 @@ pub fn validate_guardrail(value: &Value) -> Result<(), SchemaError> {
             "guardrail",
             &SCHEMAS.guardrail,
             value,
-            err,
+            name_missing_semantic_threshold(value, err),
         )),
+    }
+}
+
+/// Name the similarity threshold a `kind: semantic` row left out.
+///
+/// A guardrail document is a `oneOf`, so the conditional requirement in the
+/// semantic branch collapses to the same root-level "not valid under any of
+/// the schemas" every branch failure does — true, and useless to the
+/// operator who simply has not chosen a number yet. This is the most
+/// ordinary write-path error for this kind, because there is no default to
+/// fall back on.
+///
+/// Same discipline as [`name_unknown_fields`]: the message is replaced only
+/// when the missing threshold is the WHOLE story. The document is
+/// re-validated with the absent keys filled in, and one that also violates
+/// something else keeps the original error, which points at the other
+/// problem.
+///
+/// It deliberately does not suggest a value. Cosine scales differ enough
+/// between embedding models that any number printed here would be wrong for
+/// most rows, and a suggested number is one an operator will take.
+fn name_missing_semantic_threshold(value: &Value, err: SchemaError) -> SchemaError {
+    let Some(fields) = value.as_object() else {
+        return err;
+    };
+    if fields.get("kind").and_then(Value::as_str) != Some("semantic") {
+        return err;
+    }
+    let listed = |examples: &str| {
+        fields
+            .get(examples)
+            .and_then(Value::as_array)
+            .is_some_and(|list| !list.is_empty())
+    };
+    let missing: Vec<&str> = [
+        ("deny_examples", "deny_threshold"),
+        ("allow_examples", "allow_threshold"),
+    ]
+    .into_iter()
+    .filter(|(examples, threshold)| listed(examples) && !fields.contains_key(*threshold))
+    .map(|(_, threshold)| threshold)
+    .collect();
+    if missing.is_empty() {
+        return err;
+    }
+    let mut probe = value.clone();
+    if let Some(fields) = probe.as_object_mut() {
+        for threshold in &missing {
+            fields.insert((*threshold).to_string(), json!(0.5));
+        }
+    }
+    if validate(&SCHEMAS.guardrail, &probe).is_err() {
+        return err;
+    }
+    SchemaError {
+        path: err.path,
+        message: format!(
+            "{} required: a similarity threshold has no portable default, \
+             because cosine scores are not comparable across embedding \
+             models. Measure one against `embedding_model` on your own \
+             traffic and set it explicitly.",
+            missing
+                .iter()
+                .map(|threshold| format!("`{threshold}`"))
+                .collect::<Vec<_>>()
+                .join(" and "),
+        ),
     }
 }
 
@@ -820,6 +887,21 @@ fn require_property(schema: &mut Value, name: &str) {
         }
         None => {
             obj.insert("required".to_string(), json!([name]));
+        }
+    }
+}
+
+/// [`require_property`] for a `oneOf` branch already borrowed as its object
+/// map.
+fn require_branch_property(branch: &mut serde_json::Map<String, Value>, name: &str) {
+    match branch.get_mut("required").and_then(Value::as_array_mut) {
+        Some(list) => {
+            if !list.iter().any(|v| v.as_str() == Some(name)) {
+                list.push(json!(name));
+            }
+        }
+        None => {
+            branch.insert("required".to_string(), json!([name]));
         }
     }
 }
@@ -1195,7 +1277,7 @@ pub fn mcp_policy_root_schema(strict: bool) -> Value {
 /// 4. `schemars` leaves discriminator tag fields and collection item schemas
 ///    without descriptions, so the public schema fills those gaps.
 /// 5. `created_at` republishes its `date-time` format (annotation-only).
-pub fn guardrail_root_schema() -> Value {
+pub fn guardrail_root_schema(strict: bool) -> Value {
     let mut schema = struct_root_schema::<crate::models::Guardrail>(false);
     let obj = schema
         .as_object_mut()
@@ -1372,34 +1454,90 @@ pub fn guardrail_root_schema() -> Value {
                 "semantic" => {
                     set_property_enum(b, "text_source", json!(["user_messages", "all_messages"]));
                     set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
-                    // Required on the write path, defaulted in the type:
-                    // see the field's doc comment. A row saved without it
-                    // would screen every request against a model that
-                    // resolves to nothing.
-                    match b.get_mut("required").and_then(Value::as_array_mut) {
-                        Some(list) => {
-                            if !list.iter().any(|v| v.as_str() == Some("embedding_model")) {
-                                list.push(json!("embedding_model"));
+                    // WRITE PATH ONLY, all of it. Each of these fields is
+                    // defaulted at the type level so that a STORED row
+                    // lacking it still deserializes: the loader's failure
+                    // unit is the row, and a screening guardrail that
+                    // vanishes is fail-OPEN — strictly worse than the
+                    // field defaulting. What an operator may save is the
+                    // stricter question, and it is asked here.
+                    if strict {
+                        // A row saved without an embedding model would
+                        // screen every request against a model that
+                        // resolves to nothing.
+                        require_branch_property(b, "embedding_model");
+                        // …and the type-level default goes with them. It
+                        // exists so a STORED row without the key still
+                        // loads; advertised on the write contract it reads
+                        // as a suggested value, which is the one thing this
+                        // change is trying to stop — a schema-driven form
+                        // or generator would pre-fill 0.75 and put the
+                        // operator back where they started.
+                        for threshold in ["deny_threshold", "allow_threshold"] {
+                            if let Some(Value::Object(properties)) = b.get_mut("properties") {
+                                if let Some(Value::Object(field)) = properties.get_mut(threshold) {
+                                    field.remove("default");
+                                }
                             }
                         }
-                        None => {
-                            b.insert("required".to_string(), json!(["embedding_model"]));
-                        }
+                        // Each threshold is required alongside ITS OWN
+                        // example list and only then — demanding an allow
+                        // threshold on a deny-only row would be asking for
+                        // a number that decides nothing. There is no value
+                        // that is right for every embedding model, so
+                        // there is nothing to default to; see the fields'
+                        // doc comments.
+                        b.insert(
+                            "allOf".to_string(),
+                            json!([
+                                {
+                                    "if": {
+                                        "required": ["deny_examples"],
+                                        "properties": { "deny_examples": { "minItems": 1 } }
+                                    },
+                                    "then": { "required": ["deny_threshold"] }
+                                },
+                                {
+                                    "if": {
+                                        "required": ["allow_examples"],
+                                        "properties": { "allow_examples": { "minItems": 1 } }
+                                    },
+                                    "then": { "required": ["allow_threshold"] }
+                                }
+                            ]),
+                        );
                     }
                 }
                 "custom" => {
-                    // Required on the write path, defaulted in the type:
-                    // see the field's doc comment. A row saved without it
-                    // would be accepted here and then rejected by the
-                    // gateway, i.e. a configuration that screens nothing.
-                    match b.get_mut("required").and_then(Value::as_array_mut) {
-                        Some(list) => {
-                            if !list.iter().any(|v| v.as_str() == Some("script")) {
-                                list.push(json!("script"));
+                    // Required on BOTH schemas, unlike the semantic fields
+                    // above, and the asymmetry is the point rather than an
+                    // oversight. Those two relax on the read path because a
+                    // row that loads behaves BETTER than one that vanishes:
+                    // an absent threshold keeps screening at its stored
+                    // default, and an empty `embedding_model` REFUSES every
+                    // request in scope rather than admitting it, since
+                    // `fail_open` defaults to false — fail-closed beats the
+                    // row vanishing and letting the traffic through
+                    // unscreened. It costs the `rejected[]` signal, which
+                    // api7/aisix#1084 tracks. A scriptless `custom` row screens nothing
+                    // either way, so relaxing it changes no enforcement and
+                    // costs the only structured signal there is — the loader
+                    // rejects it into `/status/config`'s `rejected[]`,
+                    // whereas a chain-build refusal is a warn line the
+                    // config status never learns about. Only a MISSING key
+                    // is caught here; a blank or uncompilable script clears
+                    // `minLength: 1` and is refused at build instead.
+                    require_branch_property(b, "script");
+                    if strict {
+                        // The published contract must not advertise a value
+                        // it rejects: `script` carried `default: ""` beside
+                        // `minLength: 1`, so a generator honouring it
+                        // pre-filled something the same schema refuses. Same
+                        // reasoning as the thresholds above.
+                        if let Some(Value::Object(properties)) = b.get_mut("properties") {
+                            if let Some(Value::Object(field)) = properties.get_mut("script") {
+                                field.remove("default");
                             }
-                        }
-                        None => {
-                            b.insert("required".to_string(), json!(["script"]));
                         }
                     }
                     set_property_enum(
@@ -2905,6 +3043,144 @@ mod tests {
             "risk_level_threshold": "none"
         });
         assert!(validate_guardrail(&v).is_err());
+    }
+
+    // ---- kind=semantic: a threshold has no portable default -------------
+
+    fn semantic_row(extra: Value) -> Value {
+        let mut v = json!({
+            "name": "g",
+            "kind": "semantic",
+            "embedding_model": "embed-1"
+        });
+        let fields = v.as_object_mut().unwrap();
+        for (k, val) in extra.as_object().unwrap() {
+            fields.insert(k.clone(), val.clone());
+        }
+        v
+    }
+
+    #[test]
+    fn guardrail_semantic_deny_list_without_its_threshold_is_rejected() {
+        // The write path refuses to guess. Cosine scales differ between
+        // embedding models, so a defaulted threshold is not a convenience
+        // — it is a number that silently under-protects on whichever
+        // model it was not measured against.
+        let v = semantic_row(json!({ "deny_examples": ["forbidden"] }));
+        let err = validate_guardrail(&v).expect_err("a deny list needs its threshold");
+        assert!(err.message.contains("`deny_threshold`"), "{}", err.message);
+        // The message must not hand the operator a number to adopt.
+        assert!(!err.message.contains("0.75"), "{}", err.message);
+    }
+
+    #[test]
+    fn guardrail_semantic_allow_list_without_its_threshold_is_rejected() {
+        let v = semantic_row(json!({ "allow_examples": ["permitted"] }));
+        let err = validate_guardrail(&v).expect_err("an allow list needs its threshold");
+        assert!(err.message.contains("`allow_threshold`"), "{}", err.message);
+    }
+
+    #[test]
+    fn guardrail_semantic_needs_only_the_threshold_its_list_uses() {
+        // Each threshold is required alongside ITS OWN list. Demanding an
+        // allow threshold on a deny-only row would be asking for a number
+        // that decides nothing.
+        let deny_only = semantic_row(json!({
+            "deny_examples": ["forbidden"],
+            "deny_threshold": 0.5
+        }));
+        validate_guardrail(&deny_only).unwrap();
+
+        let allow_only = semantic_row(json!({
+            "allow_examples": ["permitted"],
+            "allow_threshold": 0.5
+        }));
+        validate_guardrail(&allow_only).unwrap();
+
+        let both_missing_one = semantic_row(json!({
+            "deny_examples": ["forbidden"],
+            "allow_examples": ["permitted"],
+            "deny_threshold": 0.5
+        }));
+        let err = validate_guardrail(&both_missing_one).expect_err("allow list unthresholded");
+        assert!(err.message.contains("`allow_threshold`"), "{}", err.message);
+        assert!(!err.message.contains("`deny_threshold`"), "{}", err.message);
+    }
+
+    #[test]
+    fn guardrail_semantic_with_no_examples_needs_no_threshold() {
+        // A row with neither list screens nothing and is skipped at chain
+        // build; requiring a number from it would reject a shape the
+        // gateway already treats as inert.
+        validate_guardrail(&semantic_row(json!({}))).unwrap();
+    }
+
+    #[test]
+    fn guardrail_semantic_missing_threshold_does_not_mask_a_second_error() {
+        // Same discipline as the unknown-field explainer: the message is
+        // replaced only when the missing threshold is the whole story.
+        let v = semantic_row(json!({
+            "deny_examples": ["forbidden"],
+            "text_source": "not_a_mode"
+        }));
+        let err = validate_guardrail(&v).expect_err("the enum is still wrong");
+        assert!(!err.message.contains("`deny_threshold`"), "{}", err.message);
+    }
+
+    #[test]
+    fn the_semantic_write_requirements_never_reach_the_read_path() {
+        // The loader's failure unit is the ROW, so a requirement that
+        // leaks into the lenient schema does not make a stored guardrail
+        // stricter — it deletes it. A screening row that vanishes stops
+        // screening entirely, which is fail-OPEN on a security control and
+        // strictly worse than the field defaulting.
+        //
+        // Both fields below are the shape a control plane wrote before the
+        // write path demanded them, so both must still load.
+        let unthresholded = json!({
+            "name": "g",
+            "kind": "semantic",
+            "embedding_model": "embed-1",
+            "deny_examples": ["forbidden"]
+        });
+        validate_guardrail_lenient(&unthresholded)
+            .expect("a stored row written before the threshold was required keeps screening");
+        assert!(
+            validate_guardrail(&unthresholded).is_err(),
+            "but it cannot be SAVED"
+        );
+
+        let modelless = json!({
+            "name": "g",
+            "kind": "semantic",
+            "deny_examples": ["forbidden"],
+            "deny_threshold": 0.5
+        });
+        validate_guardrail_lenient(&modelless)
+            .expect("an unresolvable embedding model refuses per fail_open, it does not vanish");
+        assert!(
+            validate_guardrail(&modelless).is_err(),
+            "but it cannot be SAVED"
+        );
+    }
+
+    #[test]
+    fn guardrail_semantic_row_without_a_threshold_still_loads() {
+        // The READ path keeps the default, and that asymmetry is the
+        // point: rows written before the requirement carry no key, and a
+        // row the loader cannot deserialize is skipped whole — a
+        // screening guardrail that disappears is fail-OPEN. They go on
+        // enforcing the 0.75 they enforce today until the control plane
+        // backfills them.
+        let row: crate::models::Guardrail = serde_json::from_value(semantic_row(json!({
+            "deny_examples": ["forbidden"]
+        })))
+        .expect("an unmigrated row must still deserialize");
+        let crate::models::GuardrailKind::Semantic(cfg) = &row.config else {
+            panic!("not a semantic row");
+        };
+        assert_eq!(cfg.deny_threshold, 0.75);
+        assert_eq!(cfg.allow_threshold, 0.75);
     }
 
     #[test]
@@ -4692,22 +4968,36 @@ mod tests {
         assert!(err.message.contains("`retries`"), "{err:?}");
     }
 
-    /// Every guardrail kind describes itself, from one source, and no two
-    /// kinds share a sentence.
-    ///
-    /// The generated Admin API reference has no other source for these
-    /// descriptions. A kind left undescribed here once inherited its
-    /// neighbour's text from a positional backfill list in the OpenAPI
-    /// assembly, documenting one provider as an unrelated one (#1037), so the
-    /// binding is pinned rather than merely the presence: comparing against
-    /// [`guardrail_kind_description`] fails if a second source ever starts
-    /// writing these, however plausible the sentence it writes.
     #[test]
-    fn the_custom_branch_requires_a_script_on_the_write_path() {
-        // `script` defaults at the TYPE level so a projected row still
-        // loads, which means only the strict schema stands between a
-        // scriptless config and a guardrail the gateway will reject.
-        let schema = guardrail_root_schema();
+    fn the_custom_branch_requires_a_script_on_both_schemas() {
+        // Deliberately NOT split, unlike the semantic fields. The rule the
+        // split serves is "a row that loads behaves better than one that
+        // vanishes", and it does not hold here: a scriptless `custom` row
+        // screens nothing whether the loader skips it or the chain builder
+        // refuses it. Relaxing the read path would therefore change no
+        // enforcement and lose the only structured signal — the loader
+        // rejects it into `/status/config`'s `rejected[]`, while a
+        // chain-build refusal is a warn line the config status never sees.
+        //
+        // Asserted against BOTH sets, because reading one says a field is
+        // required somewhere and can never say where it is NOT.
+        //
+        // This covers a MISSING key only. A blank or uncompilable script
+        // passes both schemas — `minLength: 1` admits a single space, while
+        // the builder refuses on `trim().is_empty()` — and is refused when
+        // the chain is built, which `aisix validate` reports and a serving
+        // gateway logs.
+        let scriptless = json!({"name": "g", "kind": "custom"});
+        assert!(
+            validate_guardrail(&scriptless).is_err(),
+            "a scriptless row must not be savable"
+        );
+        assert!(
+            validate_guardrail_lenient(&scriptless).is_err(),
+            "and a stored one is rejected into the config status, not loaded",
+        );
+
+        let schema = guardrail_root_schema(true);
         let branch = schema["oneOf"]
             .as_array()
             .expect("the guardrail schema is a `oneOf` over the kinds")
@@ -4719,8 +5009,78 @@ mod tests {
             .map(|l| l.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
         assert!(required.contains(&"script"), "required = {required:?}");
+        // …and the published contract must not advertise a value it
+        // rejects. Without this the strip is guarded only by the schema
+        // drift job, which pins code against artefact and would go green on
+        // a regenerated artefact carrying the default back.
+        // Pin a property that must be PRESENT first. `Value::Index` yields
+        // `Null` for a missing key and `Null.get("default")` is `None`, so
+        // the absence assertion below passes vacuously if the whole
+        // `script` property is dropped — which would also silently ship a
+        // strict branch with no `minLength`, making `""` savable.
+        assert_eq!(branch["properties"]["script"]["minLength"], json!(1));
+
+        // …and pin the BEHAVIOUR that keyword produces, not just its
+        // presence. The builder's `trim().is_empty()` guard is reachable
+        // only because a whitespace-only script clears `minLength: 1` while
+        // an empty one does not — neither half was asserted anywhere.
+        let blank = json!({"name": "g", "kind": "custom", "script": ""});
+        assert!(
+            validate_guardrail(&blank).is_err(),
+            "an empty script is not savable"
+        );
+        assert!(
+            validate_guardrail_lenient(&blank).is_err(),
+            "nor loadable — so it never reaches the builder",
+        );
+        let whitespace = json!({"name": "g", "kind": "custom", "script": " "});
+        validate_guardrail(&whitespace).expect("a whitespace-only script clears minLength");
+        validate_guardrail_lenient(&whitespace)
+            .expect("on both sets — which is what makes the builder's trim() guard reachable");
+        assert!(
+            branch["properties"]["script"].get("default").is_none(),
+            "script still advertises a default: {}",
+            branch["properties"]["script"]
+        );
     }
 
+    #[test]
+    fn the_write_contract_advertises_no_threshold_default() {
+        // The type-level default exists for the read path. Published on
+        // the write contract it reads as a recommendation, and a
+        // schema-driven form or code generator would pre-fill it —
+        // handing the operator back the number this change exists to stop
+        // them inheriting.
+        let schema = guardrail_root_schema(true);
+        let branch = schema["oneOf"]
+            .as_array()
+            .expect("the guardrail schema is a `oneOf` over the kinds")
+            .iter()
+            .find(|b| b["properties"]["kind"]["enum"][0] == "semantic")
+            .expect("the semantic branch exists")
+            .clone();
+        for threshold in ["deny_threshold", "allow_threshold"] {
+            assert!(
+                branch["properties"][threshold].get("default").is_none(),
+                "{threshold} still advertises a default: {}",
+                branch["properties"][threshold]
+            );
+            // The bounds stay: a threshold outside [-1, 1] is still refused.
+            assert_eq!(branch["properties"][threshold]["minimum"], -1.0);
+            assert_eq!(branch["properties"][threshold]["maximum"], 1.0);
+        }
+    }
+
+    /// Every guardrail kind describes itself, from one source, and no two
+    /// kinds share a sentence.
+    ///
+    /// The generated Admin API reference has no other source for these
+    /// descriptions. A kind left undescribed here once inherited its
+    /// neighbour's text from a positional backfill list in the OpenAPI
+    /// assembly, documenting one provider as an unrelated one (#1037), so the
+    /// binding is pinned rather than merely the presence: comparing against
+    /// [`guardrail_kind_description`] fails if a second source ever starts
+    /// writing these, however plausible the sentence it writes.
     #[test]
     fn every_guardrail_kind_carries_its_own_description() {
         // Independent of the enum's declaration order, which is what a
@@ -4740,7 +5100,7 @@ mod tests {
             "semantic",
         ];
 
-        let schema = guardrail_root_schema();
+        let schema = guardrail_root_schema(true);
         let branches = schema["oneOf"]
             .as_array()
             .expect("the guardrail schema is a `oneOf` over the kinds");

@@ -163,6 +163,7 @@ guardrails:
     embedding_model: embed-small
     deny_examples:
       - "how do I make a bomb"
+    deny_threshold: 0.55
 "#;
     let (ok, stdout, stderr) = validate(semantic);
 

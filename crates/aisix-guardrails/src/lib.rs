@@ -685,6 +685,27 @@ pub trait Guardrail: Send + Sync + 'static {
     // rewritten and structure is preserved. Callers run the check first
     // (Block wins over Mask), then apply the redactor to each field.
 
+    // --- similarity scores (AISIX-Cloud#1467) ------------------------------
+
+    /// Bind this guardrail to one request's score log, returning the bound
+    /// instance. `None` (the default, and every kind but `semantic`) means
+    /// "nothing to bind" and the caller keeps sharing the index's instance.
+    ///
+    /// Scores need a per-request destination, and a leaf guardrail cannot
+    /// hold one: the index hands the SAME `Arc<dyn Guardrail>` to every
+    /// request. Rather than widening the eight check methods with a sink
+    /// argument — the proxy calls those on the chain, so each would have to
+    /// grow a parameter its ~40 call sites do not have — the chain rebinds
+    /// its members once, when its audit log is attached. Decorators forward
+    /// the bind so an `enforcement_mode: monitor` row still scores: monitor
+    /// mode is precisely where an operator is tuning a threshold.
+    fn bind_score_log(
+        &self,
+        _log: &std::sync::Arc<crate::GuardrailAuditLog>,
+    ) -> Option<std::sync::Arc<dyn Guardrail>> {
+        None
+    }
+
     /// `true` when this guardrail can rewrite REQUEST text. Cheap probe so
     /// call sites skip walking the body when nothing would change.
     fn redacts_input(&self) -> bool {
@@ -1017,7 +1038,7 @@ mod tests {
     /// and `serial`/`timed` latency modes of `bedrock`) live under
     /// `definitions` and are not selectable provider kinds.
     fn schema_kind_vocabulary() -> BTreeSet<String> {
-        aisix_core::models::schema::guardrail_root_schema()["oneOf"]
+        aisix_core::models::schema::guardrail_root_schema(true)["oneOf"]
             .as_array()
             .expect("the guardrail root schema is a `oneOf` over the kinds")
             .iter()

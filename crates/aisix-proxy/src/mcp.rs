@@ -1186,6 +1186,7 @@ fn emit_tool_call_usage(
         guardrail_enforced_hits: guardrail_chain
             .map(|c| c.enforced_hits())
             .unwrap_or_default(),
+        guardrail_scores: guardrail_chain.map(|c| c.scores()).unwrap_or_default(),
         ..Default::default()
     };
     crate::usage_attr::apply_caller_identity(
