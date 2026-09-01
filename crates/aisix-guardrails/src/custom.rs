@@ -55,9 +55,15 @@
 //! tight loop that never yields. `timeout_ms` arms both.
 //!
 //! The script is parsed once at chain-build time, WITHOUT being evaluated
-//! ([`validate`]) — so a syntax error is reported through
-//! `rejected_resources` when the row lands, not on the first request that
-//! hits it, and no operator code runs on the config-apply path.
+//! ([`validate`]) — so a syntax error surfaces when the row lands rather
+//! than on the first request that hits it, and no operator code runs on
+//! the config-apply path.
+//!
+//! Where it surfaces depends on the source, and it is NOT
+//! `rejected_resources`: that list is written by the loader, which never
+//! sees a build failure. `aisix validate` reports the row through
+//! `unbuildable_guardrail_rows`; on the etcd path the row is dropped with
+//! a warn and the config status stays `synced`.
 //!
 //! Each invocation gets a brand-new runtime and context (~215µs), so no
 //! state survives between requests and the memory ceiling applies per call.

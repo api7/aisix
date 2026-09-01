@@ -1511,10 +1511,22 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                 "custom" => {
                     // Write path only, for the reason the semantic branch
                     // above gives: on the READ path this would skip the row
-                    // whole instead of loading it with an empty script and
-                    // reporting it as unbuildable, which is the outcome the
-                    // field's doc comment describes. A row saved without a
-                    // script screens nothing, so the write path refuses it.
+                    // whole, where instead it loads with an empty script and
+                    // is refused at chain build.
+                    //
+                    // Be precise about what that buys, because it is less
+                    // than it sounds: `unbuildable_guardrail_rows` has ONE
+                    // caller, inside `run_validate`, so the report is an
+                    // `aisix validate` fact. On the etcd path a build refusal
+                    // is a warn line and nothing more — `/status/config`'s
+                    // `rejected` is written only by the loader, which never
+                    // sees a build failure. Both outcomes leave the row
+                    // screening nothing, so this move trades a load error for
+                    // a warn rather than winning enforcement; it is here for
+                    // consistency with the two fields above, whose read-path
+                    // behaviour genuinely is better (an empty
+                    // `embedding_model` degrades per `fail_open`, an absent
+                    // threshold keeps screening at its stored default).
                     if strict {
                         require_branch_property(b, "script");
                     }
@@ -4946,16 +4958,6 @@ mod tests {
         assert!(err.message.contains("`retries`"), "{err:?}");
     }
 
-    /// Every guardrail kind describes itself, from one source, and no two
-    /// kinds share a sentence.
-    ///
-    /// The generated Admin API reference has no other source for these
-    /// descriptions. A kind left undescribed here once inherited its
-    /// neighbour's text from a positional backfill list in the OpenAPI
-    /// assembly, documenting one provider as an unrelated one (#1037), so the
-    /// binding is pinned rather than merely the presence: comparing against
-    /// [`guardrail_kind_description`] fails if a second source ever starts
-    /// writing these, however plausible the sentence it writes.
     #[test]
     fn the_custom_branch_requires_a_script_on_the_write_path() {
         // `script` defaults at the TYPE level so a projected row still
@@ -4975,7 +4977,7 @@ mod tests {
             "a scriptless row must not be savable"
         );
         validate_guardrail_lenient(&scriptless)
-            .expect("a stored scriptless row still loads, then reports as unbuildable");
+            .expect("a stored scriptless row still loads, then fails at chain build");
 
         let schema = guardrail_root_schema(true);
         let branch = schema["oneOf"]
@@ -5018,6 +5020,16 @@ mod tests {
         }
     }
 
+    /// Every guardrail kind describes itself, from one source, and no two
+    /// kinds share a sentence.
+    ///
+    /// The generated Admin API reference has no other source for these
+    /// descriptions. A kind left undescribed here once inherited its
+    /// neighbour's text from a positional backfill list in the OpenAPI
+    /// assembly, documenting one provider as an unrelated one (#1037), so the
+    /// binding is pinned rather than merely the presence: comparing against
+    /// [`guardrail_kind_description`] fails if a second source ever starts
+    /// writing these, however plausible the sentence it writes.
     #[test]
     fn every_guardrail_kind_carries_its_own_description() {
         // Independent of the enum's declaration order, which is what a
