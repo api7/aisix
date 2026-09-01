@@ -1466,6 +1466,20 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                         // screen every request against a model that
                         // resolves to nothing.
                         require_branch_property(b, "embedding_model");
+                        // …and the type-level default goes with them. It
+                        // exists so a STORED row without the key still
+                        // loads; advertised on the write contract it reads
+                        // as a suggested value, which is the one thing this
+                        // change is trying to stop — a schema-driven form
+                        // or generator would pre-fill 0.75 and put the
+                        // operator back where they started.
+                        for threshold in ["deny_threshold", "allow_threshold"] {
+                            if let Some(Value::Object(properties)) = b.get_mut("properties") {
+                                if let Some(Value::Object(field)) = properties.get_mut(threshold) {
+                                    field.remove("default");
+                                }
+                            }
+                        }
                         // Each threshold is required alongside ITS OWN
                         // example list and only then — demanding an allow
                         // threshold on a deny-only row would be asking for
@@ -1495,19 +1509,14 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                     }
                 }
                 "custom" => {
-                    // Required on the write path, defaulted in the type:
-                    // see the field's doc comment. A row saved without it
-                    // would be accepted here and then rejected by the
-                    // gateway, i.e. a configuration that screens nothing.
-                    match b.get_mut("required").and_then(Value::as_array_mut) {
-                        Some(list) => {
-                            if !list.iter().any(|v| v.as_str() == Some("script")) {
-                                list.push(json!("script"));
-                            }
-                        }
-                        None => {
-                            b.insert("required".to_string(), json!(["script"]));
-                        }
+                    // Write path only, for the reason the semantic branch
+                    // above gives: on the READ path this would skip the row
+                    // whole instead of loading it with an empty script and
+                    // reporting it as unbuildable, which is the outcome the
+                    // field's doc comment describes. A row saved without a
+                    // script screens nothing, so the write path refuses it.
+                    if strict {
+                        require_branch_property(b, "script");
                     }
                     set_property_enum(
                         b,
@@ -4952,6 +4961,22 @@ mod tests {
         // `script` defaults at the TYPE level so a projected row still
         // loads, which means only the strict schema stands between a
         // scriptless config and a guardrail the gateway will reject.
+        //
+        // Reading the strict schema alone cannot show that: it says
+        // `script` is required somewhere, not that it is required ONLY
+        // there. Validating a scriptless row against both sets is what
+        // pins the split — and the lenient half is the one that matters,
+        // because a row the loader rejects is skipped whole and stops
+        // screening, where a row that loads with an empty script is
+        // refused at chain build and reported as unbuildable.
+        let scriptless = json!({"name": "g", "kind": "custom"});
+        assert!(
+            validate_guardrail(&scriptless).is_err(),
+            "a scriptless row must not be savable"
+        );
+        validate_guardrail_lenient(&scriptless)
+            .expect("a stored scriptless row still loads, then reports as unbuildable");
+
         let schema = guardrail_root_schema(true);
         let branch = schema["oneOf"]
             .as_array()
@@ -4964,6 +4989,33 @@ mod tests {
             .map(|l| l.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
         assert!(required.contains(&"script"), "required = {required:?}");
+    }
+
+    #[test]
+    fn the_write_contract_advertises_no_threshold_default() {
+        // The type-level default exists for the read path. Published on
+        // the write contract it reads as a recommendation, and a
+        // schema-driven form or code generator would pre-fill it —
+        // handing the operator back the number this change exists to stop
+        // them inheriting.
+        let schema = guardrail_root_schema(true);
+        let branch = schema["oneOf"]
+            .as_array()
+            .expect("the guardrail schema is a `oneOf` over the kinds")
+            .iter()
+            .find(|b| b["properties"]["kind"]["enum"][0] == "semantic")
+            .expect("the semantic branch exists")
+            .clone();
+        for threshold in ["deny_threshold", "allow_threshold"] {
+            assert!(
+                branch["properties"][threshold].get("default").is_none(),
+                "{threshold} still advertises a default: {}",
+                branch["properties"][threshold]
+            );
+            // The bounds stay: a threshold outside [-1, 1] is still refused.
+            assert_eq!(branch["properties"][threshold]["minimum"], -1.0);
+            assert_eq!(branch["properties"][threshold]["maximum"], 1.0);
+        }
     }
 
     #[test]

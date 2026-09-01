@@ -1424,7 +1424,6 @@
           "type": "array"
         },
         "allow_threshold": {
-          "default": 0.75,
           "description": "Cosine-similarity threshold for `allow_examples`, in `[-1, 1]`. RAISE it to block more — a text must reach it to be admitted. Required whenever `allow_examples` is non-empty, and only then: a row with no allow-list has nothing for this number to decide. See `deny_threshold` for why there is no portable value.",
           "format": "float",
           "maximum": 1.0,
@@ -1446,7 +1445,6 @@
           "type": "array"
         },
         "deny_threshold": {
-          "default": 0.75,
           "description": "Cosine-similarity threshold for `deny_examples`, in `[-1, 1]`. Lower it to block more. Required whenever `deny_examples` is non-empty.\n\nThere is no portable value. Cosine scores are not comparable across embedding models — the same pair of texts can fall on opposite sides of a fixed threshold depending on which model produced the vectors, and a threshold carried over from another model under-screens without any sign that it is doing so. Measure one against the model named in `embedding_model`, on your own traffic: every request reports what it scored in `guardrail_scores` on its usage event, including the requests this guardrail allowed.",
           "format": "float",
           "maximum": 1.0,
