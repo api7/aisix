@@ -112,7 +112,10 @@ describe("responses streaming with monitor-mode output guardrail (AISIX-Cloud#10
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
-    upstream = await startOpenAiUpstream({ streamEvents: STREAM_EVENTS });
+    upstream = await startOpenAiUpstream({
+      streamEvents: STREAM_EVENTS,
+      firstEventDelayMs: 25,
+    });
     app = await spawnApp();
     seed = new SeedClient(etcd, app.etcdPrefix);
 

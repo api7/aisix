@@ -269,6 +269,22 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
         min_responses: 2,
       },
     });
+    for (const [caller, model] of [
+      [NONSTREAM_FAILURE_CALLER, NONSTREAM_FAILED_ESTIMATED_MODEL],
+      [STREAM_FAILURE_CALLER, STREAM_FAILED_ESTIMATED_MODEL],
+    ] as const) {
+      await seed.createApiKey({
+        key_hash: createHash("sha256").update(caller).digest("hex"),
+        allowed_models: [
+          model,
+          "prom-ensemble-panel-est-a",
+          "prom-ensemble-panel-est-b",
+          "prom-ensemble-panel-fail",
+          "prom-ensemble-judge-fail",
+        ],
+        rate_limit: { tpd: 1 },
+      });
+    }
     await seed.createApiKey({
       key_hash: CALLER_HASH,
       allowed_models: [
@@ -291,22 +307,6 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
         "prom-ensemble-judge-quota",
       ],
     });
-    for (const [caller, model] of [
-      [NONSTREAM_FAILURE_CALLER, NONSTREAM_FAILED_ESTIMATED_MODEL],
-      [STREAM_FAILURE_CALLER, STREAM_FAILED_ESTIMATED_MODEL],
-    ] as const) {
-      await seed.createApiKey({
-        key_hash: createHash("sha256").update(caller).digest("hex"),
-        allowed_models: [
-          model,
-          "prom-ensemble-panel-est-a",
-          "prom-ensemble-panel-est-b",
-          "prom-ensemble-panel-fail",
-          "prom-ensemble-judge-fail",
-        ],
-        rate_limit: { tpd: 1 },
-      });
-    }
 
     const proxy = new ProxyClient(app.proxyUrl, CALLER);
     await waitConfigPropagation(async () => {
