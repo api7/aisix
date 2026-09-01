@@ -447,6 +447,7 @@ pub fn build_request<'a>(
     let tool_choice = extras
         .remove("tool_choice")
         .and_then(translate_openai_tool_choice_to_anthropic);
+    translate_reasoning_effort_to_anthropic(&mut extras);
     AnthropicRequest {
         model: upstream_model,
         messages,
@@ -458,6 +459,101 @@ pub fn build_request<'a>(
         tools,
         tool_choice,
         extra: extras,
+    }
+}
+
+/// Rewrite an OpenAI-shape `reasoning_effort` into Anthropic's effort
+/// control, the mirror of [`reasoning_effort_for`]. The field is always
+/// consumed: forwarding it verbatim reaches `/v1/messages` as an unknown
+/// top-level parameter (AISIX-Cloud#1474).
+///
+/// `output_config.effort` is the target rather than a
+/// `thinking.budget_tokens` block, because a budget is rejected outright
+/// from Opus 4.7 onwards while effort is accepted across the whole
+/// current family. LiteLLM picks between the two using its model
+/// capability map; the gateway has no equivalent — it holds only the
+/// operator-supplied upstream model name — so it emits the shape current
+/// models take. `thinking` is left alone: a caller asking for a depth
+/// tier has said nothing about which thinking mode it wants, and on
+/// Opus 4.6 and later the model applies its own.
+///
+/// An effort the caller expressed natively always wins, being the more
+/// specific statement of the same setting. That means `output_config.effort`
+/// specifically, not the presence of an `output_config`: the object also
+/// carries `format` and `task_budget`, and treating it as an effort
+/// declaration would drop the tier of any request that sent one of those.
+fn translate_reasoning_effort_to_anthropic(
+    extras: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let Some(effort) = extras.remove("reasoning_effort") else {
+        return;
+    };
+    let Some(effort) = effort.as_str() else {
+        return;
+    };
+    // A caller who natively turned thinking off has already stated the
+    // depth, so the alias adds nothing — and pairing a tier with it
+    // would build a request Anthropic rejects above `high`, naming an
+    // `output_config` the caller never sent. `reasoning_effort_for`
+    // resolves the same pair the same way in the other direction.
+    if extras
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(|t| t.as_str())
+        == Some("disabled")
+    {
+        return;
+    }
+    let has_native_effort = extras
+        .get("output_config")
+        .and_then(|config| config.as_object())
+        .is_some_and(|config| config.contains_key("effort"));
+    // `none` has no Anthropic tier — it asks for no reasoning at all,
+    // which is the `disabled` thinking mode. An effort the caller set
+    // natively is their statement about depth, and disabling thinking
+    // beside it would contradict it; Anthropic also rejects `disabled`
+    // above the `high` tier, so the pair can 400 outright.
+    if effort == "none" {
+        if !has_native_effort && !extras.contains_key("thinking") {
+            extras.insert(
+                "thinking".to_string(),
+                serde_json::json!({"type": "disabled"}),
+            );
+        }
+        return;
+    }
+    // Anthropic's vocabulary has no `minimal`; `low` is its floor.
+    let tier = match effort {
+        "minimal" | "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        "xhigh" => "xhigh",
+        "max" => "max",
+        other => {
+            tracing::debug!(
+                reasoning_effort = %other,
+                "dropping unrecognised reasoning_effort on Anthropic dispatch"
+            );
+            return;
+        }
+    };
+    match extras.get_mut("output_config") {
+        // `output_config` is a carrier: a caller who sent one for
+        // `format` or `task_budget` has said nothing about effort, so
+        // the tier merges in beside them. Only an `effort` they set
+        // themselves outranks it.
+        Some(serde_json::Value::Object(config)) => {
+            config.entry("effort").or_insert_with(|| tier.into());
+        }
+        // Not an object: whatever the caller meant, replacing it would
+        // lose it. Anthropic rejects the shape either way.
+        Some(_) => {}
+        None => {
+            extras.insert(
+                "output_config".to_string(),
+                serde_json::json!({"effort": tier}),
+            );
+        }
     }
 }
 
@@ -721,12 +817,20 @@ pub fn translate_anthropic_tool_choice_to_openai(
 /// whitelist-and-drop policy (#825) in the opposite direction.
 ///
 /// Translations (matching LiteLLM's Anthropic→OpenAI adapter):
-///   tools / tool_choice   → OpenAI shapes (existing helpers)
-///   stop_sequences        → stop
-///   metadata.user_id      → user
-///   thinking              → reasoning_effort
+///   tools / tool_choice                → OpenAI shapes (existing helpers)
+///   stop_sequences                     → stop
+///   metadata.user_id                   → user
+///   thinking / output_config.effort    → reasoning_effort
+///   output_format / output_config.format → response_format
+///
+/// `thinking` and `output_config` are resolved together after the loop:
+/// both encode the same OpenAI knob, so neither can be translated by
+/// looking at one key in isolation (AISIX-Cloud#1474).
 pub fn translate_extras_to_openai_shape(extra: &mut serde_json::Map<String, serde_json::Value>) {
     let anthropic = std::mem::take(extra);
+    let mut thinking = None;
+    let mut output_config = None;
+    let mut output_format = None;
     for (key, value) in anthropic {
         match key.as_str() {
             "tools" => {
@@ -747,11 +851,9 @@ pub fn translate_extras_to_openai_shape(extra: &mut serde_json::Map<String, serd
                     extra.insert("user".to_string(), user_id.into());
                 }
             }
-            "thinking" => {
-                if let Some(effort) = reasoning_effort_from_thinking(&value) {
-                    extra.insert("reasoning_effort".to_string(), effort.into());
-                }
-            }
+            "thinking" => thinking = Some(value),
+            "output_config" => output_config = Some(value),
+            "output_format" => output_format = Some(value),
             _ => {
                 tracing::debug!(
                     field = %key,
@@ -760,12 +862,68 @@ pub fn translate_extras_to_openai_shape(extra: &mut serde_json::Map<String, serd
             }
         }
     }
+
+    if let Some(effort) = reasoning_effort_for(thinking.as_ref(), output_config.as_ref()) {
+        extra.insert("reasoning_effort".to_string(), effort);
+    }
+
+    // Anthropic carries a structured-output schema either at the legacy
+    // top-level `output_format` or, since Structured Outputs, at
+    // `output_config.format`. The legacy field wins when both are set,
+    // matching LiteLLM.
+    let format = output_format
+        .or_else(|| output_config.and_then(|c| c.get("format").cloned()))
+        .and_then(anthropic_output_format_to_response_format);
+    if let Some(response_format) = format {
+        extra.insert("response_format".to_string(), response_format);
+    }
 }
 
-/// Bucket Anthropic `thinking` into an OpenAI `reasoning_effort` label.
-/// Thresholds match LiteLLM's `reasoning_effort_from_thinking_budget`
-/// (budget_tokens ≥ 4096 → high, ≥ 2048 → medium, ≥ 1024 → low, below →
-/// minimal; `adaptive` → medium; `disabled`/unrecognised → None).
+/// Resolve the OpenAI `reasoning_effort` a request's Anthropic thinking
+/// controls ask for. Precedence, highest first:
+///
+/// 1. `thinking.type = "disabled"` → `none`. An explicit opt-out is a
+///    stronger instruction than a depth tier, so a stray
+///    `output_config.effort` does not override it (LiteLLM resolves
+///    this pair the same way).
+/// 2. `output_config.effort` → forwarded verbatim. This is Anthropic's
+///    current effort control and the only one Opus 4.7 and later accept.
+/// 3. `thinking.type = "enabled"` → bucketed from `budget_tokens`.
+///    Deprecated on Opus 4.6 and rejected outright from 4.7, kept for
+///    clients still sending it.
+/// 4. `thinking.type = "adaptive"` with no effort → `high`, which is
+///    what Anthropic itself applies when `output_config.effort` is
+///    omitted.
+///
+/// Tiers are forwarded as written: `max` and `xhigh` reach an upstream
+/// that may not accept them and are rejected there, which is the
+/// intended outcome — silently degrading a tier the caller chose is the
+/// failure this resolution order exists to prevent.
+fn reasoning_effort_for(
+    thinking: Option<&serde_json::Value>,
+    output_config: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let thinking_type = thinking
+        .and_then(|t| t.get("type"))
+        .and_then(|t| t.as_str());
+    if thinking_type == Some("disabled") {
+        return Some("none".into());
+    }
+    let declared = output_config
+        .and_then(|c| c.get("effort"))
+        .and_then(|e| e.as_str());
+    if let Some(effort) = declared {
+        return Some(effort.into());
+    }
+    reasoning_effort_from_thinking(thinking?).map(Into::into)
+}
+
+/// Bucket an Anthropic `thinking` block into an OpenAI `reasoning_effort`
+/// label. `budget_tokens` thresholds match LiteLLM's
+/// `reasoning_effort_from_thinking_budget` (≥ 4096 → high, ≥ 2048 →
+/// medium, ≥ 1024 → low, below → minimal). `adaptive` carries no budget;
+/// it resolves to Anthropic's own default tier, and callers who want a
+/// different one send `output_config.effort` (see [`reasoning_effort_for`]).
 fn reasoning_effort_from_thinking(thinking: &serde_json::Value) -> Option<&'static str> {
     match thinking.get("type").and_then(|t| t.as_str())? {
         "enabled" => {
@@ -780,8 +938,79 @@ fn reasoning_effort_from_thinking(thinking: &serde_json::Value) -> Option<&'stat
                 _ => "minimal",
             })
         }
-        "adaptive" => Some("medium"),
+        "adaptive" => Some(ANTHROPIC_DEFAULT_EFFORT),
         _ => None,
+    }
+}
+
+/// The tier Anthropic applies when a request omits `output_config.effort`.
+const ANTHROPIC_DEFAULT_EFFORT: &str = "high";
+
+/// Translate an Anthropic structured-output block —
+/// `{"type": "json_schema", "schema": {…}}` — into the OpenAI
+/// `response_format` shape. Anthropic's structured outputs are
+/// constrained-decoded, so the OpenAI side is emitted with
+/// `strict: true` to keep that guarantee rather than degrading it to a
+/// best-effort hint; strict mode in turn requires every object schema to
+/// close over its properties (LiteLLM normalises the schema the same
+/// way). Returns `None` for any other shape, which is then dropped.
+fn anthropic_output_format_to_response_format(
+    output_format: serde_json::Value,
+) -> Option<serde_json::Value> {
+    if output_format.get("type").and_then(|t| t.as_str())? != "json_schema" {
+        return None;
+    }
+    let mut schema = output_format.get("schema")?.clone();
+    if schema.is_null() {
+        return None;
+    }
+    close_object_schemas(&mut schema);
+    Some(serde_json::json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "structured_output",
+            "schema": schema,
+            "strict": true,
+        }
+    }))
+}
+
+/// Recursively make every object schema satisfy OpenAI strict mode:
+/// `additionalProperties: false`, and every declared property listed in
+/// `required`.
+fn close_object_schemas(schema: &mut serde_json::Value) {
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+    if obj.get("type").and_then(|t| t.as_str()) == Some("object") {
+        if let Some(properties) = obj.get("properties").and_then(|p| p.as_object()) {
+            let required: Vec<serde_json::Value> =
+                properties.keys().map(|k| k.as_str().into()).collect();
+            obj.insert("additionalProperties".to_string(), false.into());
+            obj.insert("required".to_string(), required.into());
+        }
+        if let Some(properties) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
+            for property in properties.values_mut() {
+                close_object_schemas(property);
+            }
+        }
+    }
+    if let Some(items) = obj.get_mut("items") {
+        close_object_schemas(items);
+    }
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(branches) = obj.get_mut(key).and_then(|b| b.as_array_mut()) {
+            for branch in branches {
+                close_object_schemas(branch);
+            }
+        }
+    }
+    for key in ["$defs", "definitions"] {
+        if let Some(defs) = obj.get_mut(key).and_then(|d| d.as_object_mut()) {
+            for def in defs.values_mut() {
+                close_object_schemas(def);
+            }
+        }
     }
 }
 
@@ -3573,8 +3802,12 @@ mod tests {
                 serde_json::json!({"type": "enabled", "budget_tokens": 100}),
                 Some("minimal"),
             ),
-            (serde_json::json!({"type": "adaptive"}), Some("medium")),
-            (serde_json::json!({"type": "disabled"}), None),
+            // `adaptive` carries no budget: it resolves to the tier
+            // Anthropic itself applies when effort is omitted.
+            (serde_json::json!({"type": "adaptive"}), Some("high")),
+            // An explicit opt-out survives as OpenAI's own `none`
+            // rather than being dropped into "upstream decides".
+            (serde_json::json!({"type": "disabled"}), Some("none")),
         ] {
             let mut extra = serde_json::Map::new();
             extra.insert("thinking".to_string(), thinking.clone());
@@ -3585,6 +3818,443 @@ mod tests {
                 "thinking = {thinking}"
             );
             assert!(!extra.contains_key("thinking"));
+        }
+    }
+
+    // ─── output_config.effort / format (AISIX-Cloud#1474) ─────────
+
+    #[test]
+    fn extras_shape_effort_outranks_thinking() {
+        // The pairing Opus 4.6+ clients actually send: adaptive thinking
+        // for the mode, output_config.effort for the depth. Resolving
+        // `thinking` alone pinned every such request to one tier.
+        for (thinking, expected) in [
+            (serde_json::json!({"type": "adaptive"}), "max"),
+            // Even against the legacy budget shape the newer field wins;
+            // a client sending both means the budget as boilerplate.
+            (
+                serde_json::json!({"type": "enabled", "budget_tokens": 8000}),
+                "max",
+            ),
+        ] {
+            let mut extra = serde_json::json!({
+                "thinking": thinking,
+                "output_config": {"effort": "max"},
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            translate_extras_to_openai_shape(&mut extra);
+            assert_eq!(
+                extra.get("reasoning_effort").and_then(|v| v.as_str()),
+                Some(expected),
+                "thinking = {thinking}"
+            );
+            assert!(!extra.contains_key("output_config"));
+            assert!(!extra.contains_key("thinking"));
+        }
+    }
+
+    #[test]
+    fn extras_shape_effort_without_thinking_still_maps() {
+        // Thinking is on by default from Opus 5, so omitting `thinking`
+        // and sending only the tier is the current idiomatic request.
+        let mut extra = serde_json::json!({"output_config": {"effort": "xhigh"}})
+            .as_object()
+            .unwrap()
+            .clone();
+        translate_extras_to_openai_shape(&mut extra);
+        assert_eq!(
+            extra.get("reasoning_effort"),
+            Some(&serde_json::json!("xhigh"))
+        );
+    }
+
+    #[test]
+    fn extras_shape_forwards_effort_tiers_verbatim() {
+        // No tier is remapped down to one an arbitrary upstream is more
+        // likely to accept: an upstream rejection is visible, a silent
+        // downgrade is not.
+        for tier in ["low", "medium", "high", "xhigh", "max"] {
+            let mut extra = serde_json::json!({"output_config": {"effort": tier}})
+                .as_object()
+                .unwrap()
+                .clone();
+            translate_extras_to_openai_shape(&mut extra);
+            assert_eq!(
+                extra.get("reasoning_effort").and_then(|v| v.as_str()),
+                Some(tier)
+            );
+        }
+    }
+
+    #[test]
+    fn extras_shape_disabled_thinking_outranks_effort() {
+        // "Do not reason" is a stronger instruction than a depth tier.
+        let mut extra = serde_json::json!({
+            "thinking": {"type": "disabled"},
+            "output_config": {"effort": "max"},
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        translate_extras_to_openai_shape(&mut extra);
+        assert_eq!(
+            extra.get("reasoning_effort"),
+            Some(&serde_json::json!("none"))
+        );
+    }
+
+    #[test]
+    fn extras_shape_non_string_effort_falls_back_to_thinking() {
+        let mut extra = serde_json::json!({
+            "thinking": {"type": "enabled", "budget_tokens": 8000},
+            "output_config": {"effort": 3},
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        translate_extras_to_openai_shape(&mut extra);
+        assert_eq!(
+            extra.get("reasoning_effort"),
+            Some(&serde_json::json!("high"))
+        );
+    }
+
+    #[test]
+    fn extras_shape_output_config_without_effort_or_format_is_dropped() {
+        // `output_config` is consumed whatever it holds — the OpenAI
+        // wire has no equivalent for its other sub-keys and the whole
+        // object 400s if forwarded.
+        let mut extra = serde_json::json!({
+            "output_config": {"task_budget": {"type": "tokens", "total": 64000}},
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        translate_extras_to_openai_shape(&mut extra);
+        assert!(extra.is_empty(), "expected all dropped, got: {extra:?}");
+    }
+
+    #[test]
+    fn extras_shape_output_config_format_becomes_response_format() {
+        let mut extra = serde_json::json!({
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {"high": {"type": "number"}},
+                                },
+                            },
+                        },
+                    },
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        translate_extras_to_openai_shape(&mut extra);
+
+        let rf = extra.get("response_format").expect("response_format set");
+        assert_eq!(rf["type"], serde_json::json!("json_schema"));
+        assert_eq!(rf["json_schema"]["strict"], serde_json::json!(true));
+        let schema = &rf["json_schema"]["schema"];
+        // Strict mode closes every object level, not just the root.
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+        assert_eq!(schema["required"], serde_json::json!(["city", "days"]));
+        let item = &schema["properties"]["days"]["items"];
+        assert_eq!(item["additionalProperties"], serde_json::json!(false));
+        assert_eq!(item["required"], serde_json::json!(["high"]));
+        assert!(!extra.contains_key("output_config"));
+    }
+
+    #[test]
+    fn extras_shape_legacy_output_format_outranks_output_config_format() {
+        let mut extra = serde_json::json!({
+            "output_format": {
+                "type": "json_schema",
+                "schema": {"type": "object", "properties": {"legacy": {"type": "string"}}},
+            },
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {"type": "object", "properties": {"newer": {"type": "string"}}},
+                }
+            },
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        translate_extras_to_openai_shape(&mut extra);
+        assert_eq!(
+            extra["response_format"]["json_schema"]["schema"]["required"],
+            serde_json::json!(["legacy"])
+        );
+        assert!(!extra.contains_key("output_format"));
+    }
+
+    #[test]
+    fn extras_shape_unrecognised_output_format_is_dropped() {
+        // Neither shape reaches the upstream as an unknown parameter.
+        for output_format in [
+            serde_json::json!({"type": "json_object"}),
+            serde_json::json!({"type": "json_schema"}),
+            serde_json::json!("json"),
+        ] {
+            let mut extra = serde_json::Map::new();
+            extra.insert("output_format".to_string(), output_format.clone());
+            translate_extras_to_openai_shape(&mut extra);
+            assert!(extra.is_empty(), "output_format = {output_format}");
+        }
+    }
+
+    // ─── reasoning_effort → Anthropic (AISIX-Cloud#1474) ──────────
+
+    #[test]
+    fn build_request_maps_reasoning_effort_to_output_config() {
+        for (effort, tier) in [
+            ("minimal", "low"),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("xhigh", "xhigh"),
+            ("max", "max"),
+        ] {
+            let req = ChatFormat {
+                extra: {
+                    let mut m = serde_json::Map::new();
+                    m.insert("reasoning_effort".to_string(), effort.into());
+                    m
+                },
+                ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+            };
+            let (_system, messages) = split_system(&req).unwrap();
+            let built = build_request(&req, "c-name", None, messages, false);
+            assert_eq!(
+                built.extra.get("output_config"),
+                Some(&serde_json::json!({"effort": tier})),
+                "reasoning_effort = {effort}"
+            );
+            // Never forwarded verbatim: `/v1/messages` 400s on it.
+            assert!(!built.extra.contains_key("reasoning_effort"));
+            // No thinking mode is invented on the caller's behalf.
+            assert!(!built.extra.contains_key("thinking"));
+        }
+    }
+
+    #[test]
+    fn build_request_maps_reasoning_effort_none_to_disabled_thinking() {
+        // Anthropic has no `none` tier; the equivalent is not thinking.
+        let req = ChatFormat {
+            extra: {
+                let mut m = serde_json::Map::new();
+                m.insert("reasoning_effort".to_string(), "none".into());
+                m
+            },
+            ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+        };
+        let (_system, messages) = split_system(&req).unwrap();
+        let built = build_request(&req, "c-name", None, messages, false);
+        assert_eq!(
+            built.extra.get("thinking"),
+            Some(&serde_json::json!({"type": "disabled"}))
+        );
+        assert!(!built.extra.contains_key("output_config"));
+        assert!(!built.extra.contains_key("reasoning_effort"));
+    }
+
+    #[test]
+    fn build_request_reasoning_effort_yields_to_caller_supplied_native_fields() {
+        let req = ChatFormat {
+            extra: {
+                let mut m = serde_json::Map::new();
+                m.insert("reasoning_effort".to_string(), "low".into());
+                m.insert(
+                    "output_config".to_string(),
+                    serde_json::json!({"effort": "max"}),
+                );
+                m
+            },
+            ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+        };
+        let (_system, messages) = split_system(&req).unwrap();
+        let built = build_request(&req, "c-name", None, messages, false);
+        assert_eq!(
+            built.extra.get("output_config"),
+            Some(&serde_json::json!({"effort": "max"}))
+        );
+        assert!(!built.extra.contains_key("reasoning_effort"));
+    }
+
+    #[test]
+    fn build_request_merges_the_tier_into_a_carrier_output_config() {
+        // `output_config` also carries `format` and `task_budget`. A
+        // request that sent one of those has said nothing about effort,
+        // so treating the object's presence as a native override drops
+        // the caller's tier — the same silent loss this change fixes on
+        // the other side.
+        let req = ChatFormat {
+            extra: {
+                let mut m = serde_json::Map::new();
+                m.insert("reasoning_effort".to_string(), "high".into());
+                m.insert(
+                    "output_config".to_string(),
+                    serde_json::json!({"task_budget": {"type": "tokens", "total": 64000}}),
+                );
+                m
+            },
+            ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+        };
+        let (_system, messages) = split_system(&req).unwrap();
+        let built = build_request(&req, "c-name", None, messages, false);
+        assert_eq!(
+            built.extra.get("output_config"),
+            Some(&serde_json::json!({
+                "task_budget": {"type": "tokens", "total": 64000},
+                "effort": "high",
+            }))
+        );
+        assert!(!built.extra.contains_key("reasoning_effort"));
+    }
+
+    #[test]
+    fn build_request_leaves_a_non_object_output_config_alone() {
+        let req = ChatFormat {
+            extra: {
+                let mut m = serde_json::Map::new();
+                m.insert("reasoning_effort".to_string(), "high".into());
+                m.insert("output_config".to_string(), serde_json::json!("nonsense"));
+                m
+            },
+            ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+        };
+        let (_system, messages) = split_system(&req).unwrap();
+        let built = build_request(&req, "c-name", None, messages, false);
+        assert_eq!(
+            built.extra.get("output_config"),
+            Some(&serde_json::json!("nonsense"))
+        );
+        assert!(!built.extra.contains_key("reasoning_effort"));
+    }
+
+    #[test]
+    fn build_request_none_yields_to_a_native_effort_tier() {
+        // `reasoning_effort: none` beside a caller-set tier is a
+        // contradiction the caller wrote. The native field wins, so no
+        // `thinking: disabled` is injected next to it — Anthropic
+        // rejects `disabled` above `high` anyway.
+        let req = ChatFormat {
+            extra: {
+                let mut m = serde_json::Map::new();
+                m.insert("reasoning_effort".to_string(), "none".into());
+                m.insert(
+                    "output_config".to_string(),
+                    serde_json::json!({"effort": "max"}),
+                );
+                m
+            },
+            ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+        };
+        let (_system, messages) = split_system(&req).unwrap();
+        let built = build_request(&req, "c-name", None, messages, false);
+        assert_eq!(
+            built.extra.get("output_config"),
+            Some(&serde_json::json!({"effort": "max"}))
+        );
+        assert!(!built.extra.contains_key("thinking"));
+        assert!(!built.extra.contains_key("reasoning_effort"));
+    }
+
+    #[test]
+    fn build_request_tier_joins_a_caller_supplied_thinking_mode() {
+        // `thinking` is the mode and `output_config.effort` the depth:
+        // Anthropic treats them as complementary, so a caller who set a
+        // mode natively still gets the tier they asked for.
+        let req = ChatFormat {
+            extra: {
+                let mut m = serde_json::Map::new();
+                m.insert("reasoning_effort".to_string(), "high".into());
+                m.insert(
+                    "thinking".to_string(),
+                    serde_json::json!({"type": "adaptive", "display": "summarized"}),
+                );
+                m
+            },
+            ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+        };
+        let (_system, messages) = split_system(&req).unwrap();
+        let built = build_request(&req, "c-name", None, messages, false);
+        assert_eq!(
+            built.extra.get("thinking"),
+            Some(&serde_json::json!({"type": "adaptive", "display": "summarized"}))
+        );
+        assert_eq!(
+            built.extra.get("output_config"),
+            Some(&serde_json::json!({"effort": "high"}))
+        );
+    }
+
+    #[test]
+    fn build_request_native_disabled_thinking_suppresses_the_tier() {
+        // Anthropic accepts `disabled` only at `high` or below, so
+        // attaching a tier here would make the gateway construct a
+        // request the upstream rejects — over a field the caller never
+        // sent. Mirrors `disabled` outranking a tier inbound.
+        for effort in ["max", "high"] {
+            let req = ChatFormat {
+                extra: {
+                    let mut m = serde_json::Map::new();
+                    m.insert("reasoning_effort".to_string(), effort.into());
+                    m.insert(
+                        "thinking".to_string(),
+                        serde_json::json!({"type": "disabled"}),
+                    );
+                    m
+                },
+                ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+            };
+            let (_system, messages) = split_system(&req).unwrap();
+            let built = build_request(&req, "c-name", None, messages, false);
+            assert_eq!(
+                built.extra.get("thinking"),
+                Some(&serde_json::json!({"type": "disabled"})),
+                "reasoning_effort = {effort}"
+            );
+            assert!(
+                !built.extra.contains_key("output_config"),
+                "tier attached to disabled thinking for reasoning_effort = {effort}"
+            );
+            assert!(!built.extra.contains_key("reasoning_effort"));
+        }
+    }
+
+    #[test]
+    fn build_request_drops_unrecognised_reasoning_effort() {
+        for value in [serde_json::json!("turbo"), serde_json::json!(5)] {
+            let req = ChatFormat {
+                extra: {
+                    let mut m = serde_json::Map::new();
+                    m.insert("reasoning_effort".to_string(), value.clone());
+                    m
+                },
+                ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+            };
+            let (_system, messages) = split_system(&req).unwrap();
+            let built = build_request(&req, "c-name", None, messages, false);
+            assert!(
+                !built.extra.contains_key("reasoning_effort"),
+                "reasoning_effort = {value} leaked upstream"
+            );
+            assert!(!built.extra.contains_key("output_config"));
+            assert!(!built.extra.contains_key("thinking"));
         }
     }
 
