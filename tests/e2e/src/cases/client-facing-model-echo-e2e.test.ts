@@ -332,21 +332,18 @@ describe("client-facing model echo e2e: the response names what the caller asked
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
-    // A wildcard row is deliberately absent from `/v1/models`, so gate on
-    // the caller key authenticating there instead (see this directory's
-    // AGENTS.md) and then on the submit route accepting the minted name.
+    // A wildcard row is deliberately absent from `/v1/models`, so the gate
+    // is the caller key authenticating there — seeded last, so that single
+    // condition implies the model and provider key landed too (see this
+    // directory's AGENTS.md). It must NOT be a submit, which is behavior
+    // this test asserts: a broken submit would then surface as a 30s
+    // propagation timeout instead of the assertion that names the defect.
     await waitConfigPropagation(async () => {
-      const r = await fetch(`${app!.proxyUrl}/v1/videos`, {
-        method: "POST",
-        headers: HEADERS,
-        body: JSON.stringify({ model: "wan-echo/turbo", prompt: "ready-probe" }),
+      const r = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: HEADERS.authorization },
       });
-      if (r.status !== 200) {
-        await r.text();
-        return false;
-      }
-      const j = (await r.json()) as { object?: unknown };
-      return j.object === "video";
+      await r.text();
+      return r.status === 200;
     });
 
     const created = await fetch(`${app.proxyUrl}/v1/videos`, {
@@ -369,6 +366,25 @@ describe("client-facing model echo e2e: the response names what the caller asked
     // The failure this pins: the poll used to answer with the row's
     // `display_name`, renaming the caller's job to `wan-echo/*`.
     expect(job.model).toBe("wan-echo/turbo");
+
+    // The alias is decoded from the id the CLIENT holds, so a forged one
+    // must not be echoed back as though the gateway had attested it. Mint an
+    // id for the same row carrying a name the row does not serve: the poll
+    // falls back to the row's own name instead of parroting the forgery.
+    const [entryId] = Buffer.from(video.id!, "base64url")
+      .toString("utf8")
+      .split(":");
+    const forged = Buffer.from(
+      `${entryId}:${Buffer.from("not-a-name-this-row-serves").toString("base64url")}:task-echo-01`,
+    ).toString("base64url");
+    const forgedPoll = await fetch(`${app.proxyUrl}/v1/videos/${forged}`, {
+      method: "GET",
+      headers: { authorization: HEADERS.authorization },
+      redirect: "manual",
+    });
+    expect(forgedPoll.status).toBe(200);
+    const forgedJob = (await forgedPoll.json()) as { model?: unknown };
+    expect(forgedJob.model).toBe("wan-echo/*");
   });
 
   test("/v1/embeddings echoes the alias", async (ctx) => {
@@ -392,5 +408,161 @@ describe("client-facing model echo e2e: the response names what the caller asked
     });
     expect(res.status).toBe(200);
     expectAliasNotUpstreamId(await res.text(), "echo-embeddings");
+  });
+});
+
+// A block-capable output guardrail must see the whole response before any of
+// it reaches the caller, so a streamed `/v1/responses` request with one
+// attached is BUFFERED and returned as a single body — never touching the
+// live relay that splices frame-by-frame. That branch needs the same restamp,
+// or attaching a guardrail silently changes which model name the caller is
+// told. Its own app: an env-scoped attachment applies to every request, so it
+// cannot share the suite above.
+describe("client-facing model echo e2e: a buffering output guardrail keeps the alias", () => {
+  let app: SpawnedApp | undefined;
+  let seed: SeedClient | undefined;
+  let etcdReachable = false;
+  const upstreams: OpenAiUpstream[] = [];
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+    app = await spawnApp();
+    seed = new SeedClient(etcd, app.etcdPrefix);
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await Promise.all(upstreams.map((u) => u.close()));
+  });
+
+  test("/v1/responses streamed behind a block-capable output guardrail still echoes the alias", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return void ctx.skip();
+
+    const snapshot = (status: string) =>
+      `"id":"resp_guarded","object":"response","status":"${status}","model":"${UPSTREAM_REPORTED_MODEL}"`;
+    const upstream = await startOpenAiUpstream({
+      rawStreamFrames: [
+        `event: response.created\ndata: {"type":"response.created","response":{${snapshot("in_progress")}}}\n\n`,
+        `event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"perfectly fine text"}\n\n`,
+        `event: response.completed\ndata: {"type":"response.completed","response":{${snapshot("completed")},"usage":{"input_tokens":4,"output_tokens":3,"total_tokens":7}}}\n\n`,
+        `data: [DONE]\n\n`,
+      ],
+    });
+    upstreams.push(upstream);
+
+    // `keyword` on the output hook is block-capable, so it holds the whole
+    // stream back. The reply deliberately does not match, so the response is
+    // delivered — the point is the buffered delivery path, not a block.
+    await seed.createGuardrail({
+      name: "gr-model-echo-holdback",
+      enabled: true,
+      hook_point: "output",
+      kind: "keyword",
+      patterns: [{ kind: "literal", value: "ABSOLUTELYFORBIDDENWORD" }],
+    });
+
+    const pk = await seed.createProviderKey({
+      display_name: "pk-echo-guarded",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "echo-guarded",
+      provider: "openai",
+      model_name: CONFIGURED_MODEL_NAME,
+      provider_key_id: pk.id,
+    });
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["*"],
+    });
+    await waitConfigPropagation(async () => {
+      const r = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: HEADERS.authorization },
+      });
+      await r.text();
+      return r.status === 200;
+    });
+
+    const res = await fetch(`${app.proxyUrl}/v1/responses`, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify({
+        model: "echo-guarded",
+        input: "say something fine",
+        stream: true,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expectAliasNotUpstreamId(text, "echo-guarded");
+    // Both snapshot frames, and the held stream released intact.
+    expect(text.split('"model":"echo-guarded"').length - 1).toBe(2);
+    expect(text).toContain('"delta":"perfectly fine text"');
+    expect(text.trimEnd().endsWith("data: [DONE]")).toBe(true);
+  });
+
+  // The same hold-back policy on `/v1/messages`. Only COMPLETE frames feed
+  // the text the output guardrail scans, so an upstream that dies mid-frame
+  // leaves a tail nothing ever inspected. Releasing it after the scan would
+  // be a way around the very check hold-back exists to apply, so it is
+  // dropped — the client could not have parsed an unterminated frame anyway.
+  test("/v1/messages hold-back drops an unterminated tail instead of releasing it unscanned", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return void ctx.skip();
+
+    const upstream = await startOpenAiUpstream({
+      rawStreamFrames: [
+        `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_tail","type":"message","role":"assistant","model":"${UPSTREAM_REPORTED_MODEL}","content":[],"usage":{"input_tokens":4,"output_tokens":0}}}\n\n`,
+        `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"delivered text"}}\n\n`,
+        // No terminator: the stream ends mid-frame.
+        `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"NEVERSCANNEDTAIL"`,
+      ],
+    });
+    upstreams.push(upstream);
+
+    const pk = await seed.createProviderKey({
+      display_name: "pk-echo-tail",
+      secret: "sk-mock",
+      api_base: upstream.baseUrl,
+      provider: "anthropic",
+      adapter: "anthropic",
+    });
+    await seed.createModel({
+      display_name: "echo-tail",
+      provider: "anthropic",
+      model_name: CONFIGURED_MODEL_NAME,
+      provider_key_id: pk.id,
+    });
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["*"],
+    });
+    await waitConfigPropagation(async () => {
+      const r = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: HEADERS.authorization },
+      });
+      await r.text();
+      return r.status === 200;
+    });
+
+    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify({
+        model: "echo-tail",
+        max_tokens: 16,
+        stream: true,
+        messages: [{ role: "user", content: "say ok" }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    // The scanned frames are delivered, with the alias restamped...
+    expect(text).toContain('"model":"echo-tail"');
+    expect(text).toContain('"text":"delivered text"');
+    // ...and the unterminated, never-scanned tail is not.
+    expect(text).not.toContain("NEVERSCANNEDTAIL");
   });
 });

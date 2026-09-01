@@ -1844,8 +1844,18 @@ pub async fn get_video(
         let poll = result?;
         // Echo the name the caller submitted under, not the row's own — the
         // two differ for a wildcard row, and the submit response already
-        // echoed the caller's (`model_echo`).
-        let video = video_object_from_poll(&video_id, &requested_alias, &poll);
+        // echoed the caller's (`model_echo`). But that name is decoded from a
+        // CLIENT-SUPPLIED id, so echo it only when this row would actually
+        // serve it: a forged id, or one left behind by a row renamed since
+        // submit, falls back to the row's own name rather than being handed
+        // back as though the gateway had attested it.
+        let echoed =
+            if crate::model_resolve::row_serves_name(&target.model_entry.value, &requested_alias) {
+                requested_alias.as_str()
+            } else {
+                target.display_name()
+            };
+        let video = video_object_from_poll(&video_id, echoed, &poll);
         Ok((
             Json(video).into_response(),
             target.provider_label.clone(),

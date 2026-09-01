@@ -76,6 +76,17 @@ fn best_wildcard_row(
     best.map(|(_, entry, upstream)| (entry, upstream))
 }
 
+/// Whether `model` is a row that would actually serve the caller-facing
+/// name `requested` — an exact `display_name`, or a wildcard glob covering
+/// it. Used where a name arrives from somewhere other than a live request
+/// body (a client-supplied video id) and must not be echoed back as though
+/// the gateway had attested it.
+pub(crate) fn row_serves_name(model: &Model, requested: &str) -> bool {
+    model.display_name == requested
+        || (model.display_name.contains('*')
+            && wildcard_capture(&model.display_name, requested).is_some())
+}
+
 /// The `display_name` of the wildcard row that would serve `requested`,
 /// for metric-label bounding: successful wildcard traffic must label as
 /// the configured row (`openai/*`), never as the caller-minted concrete
@@ -130,6 +141,29 @@ mod tests {
             "provider_key_id": "pk-1",
         }))
         .unwrap()
+    }
+
+    /// `row_serves_name` gates a name that did NOT arrive on a live request
+    /// body — it decides whether the gateway will echo a caller-supplied
+    /// string back as its own `model`. A row must accept every name it
+    /// really serves and refuse everything else.
+    #[test]
+    fn row_serves_name_accepts_only_names_the_row_would_serve() {
+        let exact = direct_model("wan-turbo", Some("wan-upstream"));
+        assert!(row_serves_name(&exact, "wan-turbo"));
+        assert!(!row_serves_name(&exact, "wan-turbo-forged"));
+        assert!(!row_serves_name(&exact, "anything-at-all"));
+
+        let wildcard = direct_model("wan/*", Some("wan-*"));
+        // Every name the glob covers — the whole reason the poll echoes the
+        // caller's string rather than the row's own.
+        assert!(row_serves_name(&wildcard, "wan/turbo"));
+        assert!(row_serves_name(&wildcard, "wan/plus"));
+        // The row's own pattern is not a name a caller addressed.
+        assert!(!row_serves_name(&wildcard, "wan"));
+        // Outside the glob: a forged id must not get its string echoed.
+        assert!(!row_serves_name(&wildcard, "other/turbo"));
+        assert!(!row_serves_name(&wildcard, "anything-at-all"));
     }
 
     fn snapshot_with(models: Vec<(&str, Model)>) -> AisixSnapshot {

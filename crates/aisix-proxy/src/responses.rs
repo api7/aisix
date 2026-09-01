@@ -7,7 +7,9 @@
 //! 1. Authenticate and authorise the API key + model.
 //! 2. Validate the model is an OpenAI provider.
 //! 3. Rewrite the `model` field to the upstream model name.
-//! 4. Forward verbatim — streaming SSE and non-streaming JSON both work.
+//! 4. Relay the reply — streaming SSE and non-streaming JSON both work.
+//!    The body is the upstream's own, byte for byte, except the
+//!    caller-facing `model` name (see [`crate::model_echo`]).
 //!
 //! Only OpenAI models support this endpoint. Non-OpenAI models receive a
 //! 400 with an explanatory message.
@@ -1410,6 +1412,17 @@ async fn responses_to_target(
                 }
                 None => buf,
             };
+            // A block-capable output guardrail buffers the whole response and
+            // returns it here, never reaching the live relay that splices
+            // frame-by-frame — so the same pass runs once over the buffer.
+            // Without it, attaching such a guardrail would silently change
+            // which model name the caller is told (after masking, so a mask
+            // cannot reintroduce the upstream id).
+            let buf = crate::model_echo::restamp_sse_buffer(
+                &buf,
+                requested_model,
+                crate::model_echo::responses_snapshot_model,
+            );
             // #808: the whole SSE response is buffered here, so parse its
             // terminal event for usage and let the handler emit (the body is
             // a single complete chunk now, not a live stream).
@@ -2723,7 +2736,8 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)> Dro
 /// client-disconnect) with the accumulated counts (#808) plus the captured
 /// output text (AISIX-Cloud#947, empty when `content_cap` is `None`) and the
 /// end-of-stream scan's monitor hits (AISIX-Cloud#1010, empty without
-/// `eos_scan`). Bytes forward verbatim — the client sees the exact upstream
+/// `eos_scan`). Bytes forward unchanged apart from the caller-facing
+/// `model` on the snapshot frames — the client sees the exact upstream
 /// SSE wire shape.
 fn build_responses_passthrough_stream<S, F>(
     upstream: S,

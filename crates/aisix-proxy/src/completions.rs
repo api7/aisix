@@ -562,9 +562,8 @@ async fn dispatch(
 
             // Echo the model name the caller addressed. The request half
             // already translates the alias to the upstream id
-            // (`aisix-provider-openai::bridge::completions`); without this the
-            // response half was the only endpoint-shaped answer that handed
-            // the upstream's own id back.
+            // (`aisix-provider-openai::bridge::completions`), so without this
+            // the response half handed the upstream's own id straight back.
             crate::model_echo::restamp_body(&mut resp_json, model_name);
 
             // #932: mask-action PII rules rewrite the reply text AFTER the

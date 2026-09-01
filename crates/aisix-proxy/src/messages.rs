@@ -7,7 +7,9 @@
 //!   gateway-internal `ChatFormat` can't lossily round-trip (cache_control,
 //!   thinking blocks, tool_use, image blocks). Adds `x-api-key` +
 //!   `anthropic-version` headers, rewrites the `model` field to the
-//!   upstream id, and streams the SSE response verbatim.
+//!   upstream id, and relays the SSE response frame-by-frame — every byte
+//!   as the provider wrote it except the caller-facing `model` name, which
+//!   is restamped on `message_start` (see [`crate::model_echo`]).
 //!
 //! - **Non-Anthropic upstream** (`Model.provider == openai|gemini|deepseek`)
 //!   — translates the Anthropic-shape body to the gateway's internal
@@ -1101,8 +1103,9 @@ async fn dispatch_to_target(
 
 /// Anthropic-protocol input -> Anthropic upstream: byte-for-byte
 /// passthrough to `{api_base}/v1/messages`. Adds the `x-api-key` +
-/// `anthropic-version` headers, rewrites the `model` field to the
-/// upstream id, and streams the SSE response verbatim.
+/// `anthropic-version` headers, rewrites the request `model` to the
+/// upstream id, and relays the SSE response frame-by-frame, restamping the
+/// caller-facing `model` on `message_start` (see [`crate::model_echo`]).
 #[allow(clippy::too_many_arguments)]
 async fn anthropic_passthrough_dispatch(
     state: &ProxyState,
@@ -3128,7 +3131,8 @@ fn emit_anthropic_usage_event(
 // ─── Anthropic streaming usage parser (#245) ───────────────────────
 //
 // The Anthropic `/v1/messages` passthrough forwards the upstream SSE
-// byte stream verbatim. To recover token counts for telemetry without
+// byte stream unchanged apart from the caller-facing `model` name. To
+// recover token counts for telemetry without
 // altering the bytes the client sees, `build_anthropic_passthrough_stream`
 // wraps the byte stream: it appends each chunk to a frame buffer,
 // extracts complete SSE events (delimited by a blank line), and parses
@@ -3543,7 +3547,9 @@ impl<T> Stream for AnthropicDeliveryCounter<T> {
 /// Wrap an Anthropic upstream byte stream so token usage is parsed
 /// in-flight and `on_complete` fires once at end-of-stream (or
 /// client-disconnect) with the accumulated counts. Bytes are forwarded
-/// verbatim — the client sees the exact upstream SSE wire shape.
+/// unchanged apart from the caller-facing `model` on `message_start`: the
+/// client sees the upstream's own SSE wire shape, byte for byte, with that
+/// one value spliced (see [`crate::model_echo`]).
 #[allow(clippy::too_many_arguments)]
 fn build_anthropic_passthrough_stream<S, F>(
     upstream: S,
@@ -3673,12 +3679,28 @@ where
         }
         // A non-conformant upstream can end without terminating its last
         // frame. Those bytes were never forwarded (they are still the
-        // partial tail), so release them now rather than truncating the
-        // response.
+        // partial tail).
+        //
+        // On the live-forward path, release them: the client is no worse off
+        // than it was before this relay became frame-aligned, and truncating
+        // a response over a missing terminator would be a regression.
+        //
+        // Under a hold-back policy, DROP them. Only complete frames reach
+        // `drain_anthropic_sse_frames`, so an unterminated tail never fed
+        // `response_text` and was therefore never scanned — releasing it
+        // after the output check is exactly the bypass hold-back exists to
+        // prevent, and a client cannot parse a frame with no terminator
+        // anyway. Fail closed.
         if !buf.is_empty() {
             let tail = std::mem::take(&mut buf);
             if hold_policy.is_some() {
-                held.extend_from_slice(&tail);
+                tracing::warn!(
+                    guardrail_hook = "output",
+                    dropped = tail.len(),
+                    "streaming /v1/messages passthrough ended on an unterminated SSE \
+                     frame; dropping it unscanned rather than releasing it past the \
+                     output guardrail",
+                );
             } else {
                 if guard.usage().downstream_latency_ms == 0 {
                     guard.usage().downstream_latency_ms =
@@ -5228,7 +5250,8 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     /// realistic Anthropic SSE response (input_tokens in
     /// `message_start`, running output_tokens in `message_delta`) and
     /// asserts the emitted UsageEvent carries the real counts, plus
-    /// the response bytes still pass through verbatim.
+    /// the response bytes still pass through unchanged apart from the
+    /// caller-facing `model` name.
     #[tokio::test]
     async fn anthropic_passthrough_streaming_records_usage_from_sse_frames() {
         use aisix_obs::UsageSink;
@@ -5280,7 +5303,8 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         let resp = app.oneshot(make_req(body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Bytes pass through verbatim — the client still sees the exact
+        // Bytes pass through unchanged apart from the caller-facing
+        // `model` name — the client still sees the exact
         // Anthropic SSE wire shape.
         let streamed =
             String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
@@ -5384,6 +5408,81 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(event.cache_read_tokens, 9);
         assert_eq!(event.provider_request_id, "gen_01REPRO952");
         assert_eq!(event.provider_model_version, "mco-5");
+    }
+
+    /// `extract_sse_data_range` is what the model restamp splices into, so
+    /// an off-by-one in its arithmetic would rewrite the wrong bytes. The
+    /// range is checked against the payload it must select on every framing
+    /// variant a provider is allowed to emit. The `extract_sse_data_line`
+    /// assertion beside it is a cheap guard for the day someone gives that
+    /// accessor its own implementation again — today it delegates here, so
+    /// only the `want` table can actually catch a regression.
+    #[test]
+    fn extract_sse_data_range_selects_exactly_the_payload() {
+        use super::{extract_sse_data_line, extract_sse_data_range};
+
+        for (frame, want) in [
+            // Canonical: labelled event, LF terminators, one space after the colon.
+            (
+                &b"event: message_start\ndata: {\"a\":1}\n\n"[..],
+                Some(&b"{\"a\":1}"[..]),
+            ),
+            // CRLF: the `\r` belongs to the framing, not the payload.
+            (
+                &b"event: x\r\ndata: {\"a\":1}\r\n\r\n"[..],
+                Some(&b"{\"a\":1}"[..]),
+            ),
+            // No space after the colon — the spec makes it optional.
+            (&b"data:{\"a\":1}\n\n"[..], Some(&b"{\"a\":1}"[..])),
+            // A comment/keepalive line ahead of the data line.
+            (&b": ping\ndata: {\"a\":1}\n\n"[..], Some(&b"{\"a\":1}"[..])),
+            // Terminal sentinel.
+            (&b"data: [DONE]\n\n"[..], Some(&b"[DONE]"[..])),
+            // Empty payload: a zero-width range, not a panic and not the tail.
+            (&b"data:\n\n"[..], Some(&b""[..])),
+            // No data line at all.
+            (&b"event: ping\n\n"[..], None),
+            // A value containing the delimiter bytes must not confuse the scan.
+            (
+                &b"event: e\ndata: {\"t\":\"a: b\"}\n\n"[..],
+                Some(&b"{\"t\":\"a: b\"}"[..]),
+            ),
+        ] {
+            let range = extract_sse_data_range(frame);
+            assert_eq!(
+                range.clone().map(|r| &frame[r]),
+                want,
+                "range selects the payload for {:?}",
+                String::from_utf8_lossy(frame),
+            );
+            assert_eq!(
+                extract_sse_data_line(frame),
+                want,
+                "the line accessor stays equivalent for {:?}",
+                String::from_utf8_lossy(frame),
+            );
+        }
+    }
+
+    /// A frame whose data line is not splice-able JSON forwards verbatim
+    /// rather than being corrupted or dropped — the restamp is best-effort
+    /// by design, and losing one frame's model name beats mangling a stream.
+    #[test]
+    fn restamp_leaves_unparseable_frames_alone() {
+        use crate::model_echo::{anthropic_message_model, restamp_sse_frame};
+
+        for frame in [
+            &b"data: not json at all\n\n"[..],
+            &b"data: {\"message\":{\"model\":\n\n"[..],
+            &b"data:\n\n"[..],
+            &b"event: ping\n\n"[..],
+        ] {
+            assert!(
+                restamp_sse_frame(frame, "gw-alias", anthropic_message_model).is_none(),
+                "no rewrite for {:?}",
+                String::from_utf8_lossy(frame),
+            );
+        }
     }
 
     /// Issue #245: the SSE frame parser must reassemble events that

@@ -79,6 +79,34 @@ pub(crate) fn restamp_sse_frame(
     Some(out)
 }
 
+/// Restamp every frame of a COMPLETE, already-buffered SSE document.
+///
+/// The streaming relays splice frame-by-frame as they drain, but a
+/// block-capable output guardrail buffers the whole response and returns it
+/// as one body without ever reaching the relay — so that branch needs the
+/// same pass applied in one go, or the identical request answers with the
+/// upstream id whenever such a guardrail is attached.
+pub(crate) fn restamp_sse_buffer(
+    buf: &[u8],
+    client_facing_model: &str,
+    selects_model: fn(&[PathSeg]) -> bool,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(buf.len());
+    let mut rest = buf;
+    while let Some(end) = crate::messages::find_frame_end(rest) {
+        let (frame, tail) = rest.split_at(end);
+        match restamp_sse_frame(frame, client_facing_model, selects_model) {
+            Some(rewritten) => out.extend_from_slice(&rewritten),
+            None => out.extend_from_slice(frame),
+        }
+        rest = tail;
+    }
+    // A trailing fragment with no terminator is forwarded as-is: it carries
+    // no frame to splice.
+    out.extend_from_slice(rest);
+    out
+}
+
 /// `message.model` on an Anthropic `message_start` frame.
 ///
 /// The path alone identifies the frame: `message_start` is the only Anthropic
@@ -143,6 +171,26 @@ mod tests {
         ] {
             assert!(restamp_sse_frame(frame, "my-claude", anthropic_message_model).is_none());
         }
+    }
+
+    #[test]
+    fn restamp_sse_buffer_rewrites_every_snapshot_frame_and_preserves_the_rest() {
+        let buf = concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"model\":\"up-1\"}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"up-1\",\"usage\":{\"input_tokens\":1}}}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .as_bytes();
+        let out =
+            String::from_utf8(restamp_sse_buffer(buf, "alias", responses_snapshot_model)).unwrap();
+        assert_eq!(out.matches("\"model\":\"alias\"").count(), 2);
+        assert!(!out.contains("up-1"));
+        // Untouched frames survive byte-for-byte, terminator included.
+        assert!(
+            out.contains("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n")
+        );
+        assert!(out.ends_with("data: [DONE]\n\n"));
     }
 
     #[test]
