@@ -193,6 +193,33 @@ mod tests {
         assert!(out.ends_with("data: [DONE]\n\n"));
     }
 
+    /// The no-match path must be an identity function on bytes: this runs
+    /// over a whole buffered response, so anything it perturbs reaches the
+    /// client. Includes shapes the frame walk could mishandle — an empty
+    /// buffer, a lone unterminated fragment, and a final frame whose
+    /// terminator is missing.
+    #[test]
+    fn restamp_sse_buffer_is_byte_identity_when_nothing_matches() {
+        for buf in [
+            &b""[..],
+            &b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"[..],
+            &b"event: ping\ndata: {}\n\ndata: [DONE]\n\n"[..],
+            // No terminator at all — the whole buffer is a fragment.
+            &b"data: {\"type\":\"response.created\""[..],
+            // A complete frame followed by an unterminated remainder.
+            &b"data: {\"a\":1}\n\ndata: {\"b\":2"[..],
+            // CRLF framing.
+            &b"event: x\r\ndata: {\"a\":1}\r\n\r\n"[..],
+        ] {
+            assert_eq!(
+                restamp_sse_buffer(buf, "alias", responses_snapshot_model),
+                buf.to_vec(),
+                "no match must not perturb a byte: {:?}",
+                String::from_utf8_lossy(buf),
+            );
+        }
+    }
+
     #[test]
     fn responses_predicate_selects_the_snapshot_frames_only() {
         let snapshot = b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-4o-mini-2024-07-18\"}}\n\n";
