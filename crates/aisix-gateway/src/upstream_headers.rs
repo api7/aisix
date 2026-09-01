@@ -141,6 +141,11 @@ pub struct UpstreamHeaderContext<'a> {
     /// poll of an async job, a semantic-routing embedding lookup) — those
     /// requests forward nothing.
     pub client_headers: Option<&'a HeaderMap>,
+    /// The caller's verified JWT, delivered to the upstream under the
+    /// ProviderKey's `forward_jwt_header` when both are present. `None`
+    /// when the caller authenticated with an API key, or on a call with no
+    /// client request behind it.
+    pub caller_jwt: Option<&'a str>,
 }
 
 impl<'a> UpstreamHeaderContext<'a> {
@@ -160,6 +165,13 @@ impl<'a> UpstreamHeaderContext<'a> {
 
     pub fn with_client_headers(mut self, headers: &'a HeaderMap) -> Self {
         self.client_headers = Some(headers);
+        self
+    }
+
+    /// Carry the caller's verified JWT, so a ProviderKey configured with
+    /// `forward_jwt_header` can hand it to the upstream.
+    pub fn with_caller_jwt(mut self, token: Option<&'a str>) -> Self {
+        self.caller_jwt = token;
         self
     }
 }
@@ -261,6 +273,37 @@ pub fn apply_request_headers(headers: &mut HeaderMap, ctx: &UpstreamHeaderContex
         }
         headers.insert(name, value);
     }
+    apply_forwarded_jwt(headers, ctx);
+}
+
+/// Deliver the caller's verified JWT under the ProviderKey's
+/// `forward_jwt_header`, for an internal upstream that authorizes on the
+/// end user's claims.
+///
+/// This is the ONE step that overwrites: everything above it declines a
+/// name already present, because a gateway-owned header outranks operator
+/// and client config. Here the operator has named a slot explicitly, on
+/// this ProviderKey, for this upstream — including `authorization`, which
+/// the bridge has already filled with the gateway's own credential. That
+/// is the case the field exists for, so the caller's token REPLACES it:
+/// `insert` rather than `append`, since `append` would put two
+/// credentials on the wire and let the upstream pick (the #411 shape).
+fn apply_forwarded_jwt(headers: &mut HeaderMap, ctx: &UpstreamHeaderContext<'_>) {
+    let configured = ctx.overrides.and_then(|o| o.forward_jwt_header.as_deref());
+    let Some((name, value)) = aisix_core::forwarded_jwt(configured, ctx.caller_jwt) else {
+        return;
+    };
+    let (Ok(name), Ok(mut value)) = (
+        HeaderName::try_from(name.as_str()),
+        HeaderValue::from_str(&value),
+    ) else {
+        // A token that cannot be a header value is a broken credential,
+        // not a reason to fail the request: the upstream then answers the
+        // way it answers any unauthenticated call.
+        return;
+    };
+    value.set_sensitive(true);
+    headers.insert(name, value);
 }
 
 #[cfg(test)]
@@ -288,6 +331,88 @@ mod tests {
             );
         }
         map
+    }
+
+    #[test]
+    fn forwarded_jwt_reaches_the_configured_header() {
+        let r = RequestOverrides {
+            forward_jwt_header: Some("x-user-jwt".into()),
+            ..Default::default()
+        };
+        let mut headers = HeaderMap::new();
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_caller_jwt(Some("eyJraw"));
+        apply_request_headers(&mut headers, &ctx);
+        assert_eq!(headers["x-user-jwt"], "eyJraw");
+    }
+
+    #[test]
+    fn forwarded_jwt_replaces_the_bridge_owned_credential() {
+        // The one slot where operator config outranks a gateway-owned
+        // header: the operator named `authorization` on THIS ProviderKey,
+        // for an upstream that authorizes on the end user. Two credentials
+        // on the wire would let the upstream choose between them.
+        let r = RequestOverrides {
+            forward_jwt_header: Some("authorization".into()),
+            ..Default::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer gateway-held-key"),
+        );
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_caller_jwt(Some("eyJraw"));
+        apply_request_headers(&mut headers, &ctx);
+        assert_eq!(headers["authorization"], "Bearer eyJraw");
+        assert_eq!(headers.get_all("authorization").iter().count(), 1);
+    }
+
+    #[test]
+    fn an_api_key_caller_forwards_no_token() {
+        let r = RequestOverrides {
+            forward_jwt_header: Some("authorization".into()),
+            ..Default::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer gateway-held-key"),
+        );
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_caller_jwt(None);
+        apply_request_headers(&mut headers, &ctx);
+        // The gateway's own credential is untouched, not replaced by a blank.
+        assert_eq!(headers["authorization"], "Bearer gateway-held-key");
+    }
+
+    #[test]
+    fn an_unconfigured_provider_key_forwards_no_token() {
+        // The default for every existing ProviderKey: a caller's JWT never
+        // reaches an upstream nobody opted in.
+        let r = RequestOverrides::default();
+        let mut headers = HeaderMap::new();
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_caller_jwt(Some("eyJraw"));
+        apply_request_headers(&mut headers, &ctx);
+        assert!(headers.is_empty(), "got: {headers:?}");
+    }
+
+    #[test]
+    fn forwarded_jwt_is_marked_sensitive() {
+        // `Debug` on the header map is reachable from tracing; a live
+        // credential must not be printable through it.
+        let r = RequestOverrides {
+            forward_jwt_header: Some("x-user-jwt".into()),
+            ..Default::default()
+        };
+        let mut headers = HeaderMap::new();
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_caller_jwt(Some("eyJraw"));
+        apply_request_headers(&mut headers, &ctx);
+        // Pin that the token IS on the wire first: without this, a build
+        // that forwards nothing would satisfy the redaction assertion
+        // below for the wrong reason.
+        assert_eq!(headers["x-user-jwt"], "eyJraw");
+        assert!(
+            !format!("{headers:?}").contains("eyJraw"),
+            "got: {headers:?}"
+        );
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub mod config;
 pub mod config_status;
 pub mod error;
 pub mod filesource;
+pub mod forwarded_jwt;
 pub mod header_template;
 pub mod models;
 pub mod resource;
@@ -41,6 +42,7 @@ pub use config_status::{
 pub use error::{
     AdminError, AdminErrorEnvelope, BootstrapError, ProxyError, ProxyErrorEnvelope, RateLimitScope,
 };
+pub use forwarded_jwt::{forwarded_jwt, TRANSPORT_HEADER_SLOTS};
 pub use header_template::{render_header_template, HeaderVars, HEADER_TEMPLATE_VARS};
 pub use models::{
     validate_a2a_agent, validate_apikey, validate_cache_policy, validate_guardrail,

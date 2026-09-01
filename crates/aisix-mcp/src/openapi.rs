@@ -115,6 +115,11 @@ pub(crate) struct GeneratedTool {
 pub struct OpenApiBridge {
     entry: Arc<ResourceEntry<McpServer>>,
     timeout: Duration,
+    /// Header name and value delivering the calling agent's verified JWT
+    /// to the REST API behind these tools, resolved per request by
+    /// `aisix_core::forwarded_jwt` from the server's `forward_jwt_header`.
+    /// `None` when unconfigured or the agent authenticated with an API key.
+    forwarded_jwt: Option<(String, String)>,
 }
 
 impl OpenApiBridge {
@@ -124,7 +129,18 @@ impl OpenApiBridge {
             .timeout_ms
             .map(Duration::from_millis)
             .unwrap_or(crate::bridge::DEFAULT_UPSTREAM_TIMEOUT);
-        Self { entry, timeout }
+        Self {
+            entry,
+            timeout,
+            forwarded_jwt: None,
+        }
+    }
+
+    /// Deliver the calling agent's verified JWT, as already resolved to a
+    /// header name and value by `aisix_core::forwarded_jwt`.
+    pub fn with_forwarded_jwt(mut self, forwarded: Option<(String, String)>) -> Self {
+        self.forwarded_jwt = forwarded;
+        self
     }
 
     fn server(&self) -> &McpServer {
@@ -145,21 +161,36 @@ impl OpenApiBridge {
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::RequestBuilder, McpError> {
         let server = self.server();
-        Ok(match server.auth_type {
+        // The caller's JWT wins the slot it names: `RequestBuilder::header`
+        // appends, so filling a slot twice would put two credentials on the
+        // wire and let the REST API pick between them.
+        let jwt_slot = self.forwarded_jwt.as_ref().map(|(name, _)| name.as_str());
+        let api_key_header = server
+            .api_key_header
+            .as_deref()
+            .filter(|h| !h.is_empty())
+            .unwrap_or(DEFAULT_API_KEY_HEADER);
+        let request = match server.auth_type {
             McpAuthType::None => request,
+            McpAuthType::Bearer if jwt_slot == Some("authorization") => request,
             McpAuthType::Bearer => request.bearer_auth(server.secret.as_deref().unwrap_or("")),
-            McpAuthType::ApiKey => {
-                let header = server
-                    .api_key_header
-                    .as_deref()
-                    .filter(|h| !h.is_empty())
-                    .unwrap_or(DEFAULT_API_KEY_HEADER);
-                request.header(header, server.secret.as_deref().unwrap_or(""))
+            McpAuthType::ApiKey
+                if jwt_slot == Some(api_key_header.to_ascii_lowercase().as_str()) =>
+            {
+                request
             }
+            McpAuthType::ApiKey => {
+                request.header(api_key_header, server.secret.as_deref().unwrap_or(""))
+            }
+            McpAuthType::OAuth2 if jwt_slot == Some("authorization") => request,
             McpAuthType::OAuth2 => {
                 let token = crate::oauth::get_or_fetch(&self.oauth_config()).await?;
                 request.bearer_auth(token)
             }
+        };
+        Ok(match &self.forwarded_jwt {
+            Some((name, value)) => request.header(name.as_str(), value.as_str()),
+            None => request,
         })
     }
 

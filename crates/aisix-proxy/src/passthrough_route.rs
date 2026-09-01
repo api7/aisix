@@ -704,6 +704,21 @@ async fn dispatch(
         }
     }
 
+    // The caller's verified JWT, for an internal upstream that authorizes
+    // on the end user's claims. Resolved before the header loop so its
+    // slot joins the strip set: the caller's own copy of that header must
+    // never ride upstream beside the one the gateway delivers, and in
+    // `gateway_key` mode `authorization` is exactly the header the gateway
+    // just consumed to identify this caller.
+    let forwarded_jwt = aisix_core::forwarded_jwt(
+        route.forward_jwt_header.as_deref(),
+        auth.jwt.as_ref().map(|j| j.token()),
+    );
+    if let Some((name, _)) = &forwarded_jwt {
+        strip.insert(name.clone());
+    }
+    let jwt_slot = forwarded_jwt.as_ref().map(|(name, _)| name.as_str());
+
     let mut builder = http_client.request(method.clone(), &url);
     for (name, value) in &incoming_headers {
         if strip.contains(&name.as_str().to_ascii_lowercase()) {
@@ -720,11 +735,22 @@ async fn dispatch(
         if provider_lower == "anthropic" {
             // Anthropic's documented auth shape (#166): `x-api-key` +
             // `anthropic-version`, never a redundant Bearer alongside.
-            builder = builder.header("x-api-key", api_key);
+            if jwt_slot != Some("x-api-key") {
+                builder = builder.header("x-api-key", api_key);
+            }
             builder = builder.header("anthropic-version", "2023-06-01");
-        } else {
+        } else if jwt_slot != Some("authorization") {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {api_key}"));
         }
+    }
+
+    // Delivered last, into a slot the strip set cleared and the injection
+    // above declined to fill: an operator who points `forward_jwt_header`
+    // at the credential header is choosing the end user's token over the
+    // gateway's, and `RequestBuilder::header` appends — filling it twice
+    // would put both on the wire and let the upstream pick (#411).
+    if let Some((name, value)) = &forwarded_jwt {
+        builder = builder.header(name.as_str(), value.as_str());
     }
 
     builder = builder.header("x-aisix-request-id", &client.request_id);

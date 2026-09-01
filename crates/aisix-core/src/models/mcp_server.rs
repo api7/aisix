@@ -118,6 +118,39 @@ pub struct McpServer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<McpProtocolVersion>,
 
+    /// Header the calling agent's own JWT is delivered to this server in,
+    /// for an internal server that authorizes on the end user's claims
+    /// rather than on the gateway's credential. Omit — the default — to
+    /// send no caller token upstream. Applies to both `type: mcp` and
+    /// `type: openapi`, so a REST API exposed here as tools receives the
+    /// end user's token on every tool call.
+    ///
+    /// This is independent of `auth_type`, which stays the gateway's own
+    /// credential for the server: a server can require both, one in each
+    /// header. The token is the one the gateway verified for this request
+    /// (signature, expiry, and claim mapping all applied), relayed with no
+    /// claim added, removed, or rewritten. An agent that authenticated with
+    /// an API key has no token to relay, and the header is then absent
+    /// rather than empty.
+    ///
+    /// Naming `authorization` sends `Bearer <token>`, the form that header
+    /// is defined to carry, and takes precedence over the credential
+    /// `auth_type` would otherwise put there — the server receives the end
+    /// user's token in place of the gateway's, never both. Any other header
+    /// carries the bare token.
+    ///
+    /// A server that validates the `aud` claim will reject a token minted
+    /// for the gateway; this field is for internal servers that read the
+    /// claims of a token their own identity provider issued.
+    ///
+    /// Transport headers (`host`, `content-length`, `connection`, and the
+    /// rest of the hop-by-hop family) are rejected: they describe the
+    /// message rather than its sender. Lowercase-only, so that rejection
+    /// list is exhaustive on every configuration path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = "^[!#$%&'*+.^_`|~0-9a-z-]+$"), length(min = 1))]
+    pub forward_jwt_header: Option<String>,
+
     /// Maximum time, in milliseconds, to wait for a single upstream operation
     /// (establishing the session, listing tools, or calling a tool). Must be at
     /// least `1` when set. When omitted, the gateway applies a built-in default.
@@ -227,6 +260,17 @@ pub fn mcp_server_credential_coupling() -> Value {
         "properties": { "secret": { "type": "string", "minLength": 1 } }
     });
     json!([
+        // The caller-JWT slot must be a header that names a sender, not one
+        // that frames the message (`crate::forwarded_jwt`). Credential
+        // slots stay allowed: delivering the end user's token into the
+        // header an internal server already reads is the field's purpose.
+        {
+            "if": { "required": ["forward_jwt_header"] },
+            "then": { "properties": { "forward_jwt_header": {
+                "type": "string",
+                "not": { "enum": crate::forwarded_jwt::TRANSPORT_HEADER_SLOTS }
+            } } }
+        },
         {
             "if": { "properties": { "auth_type": { "const": "bearer" } }, "required": ["auth_type"] },
             "then": secret_required
@@ -646,6 +690,7 @@ mod tests {
             token_url: None,
             scopes: None,
             protocol_version: None,
+            forward_jwt_header: None,
             timeout_ms: None,
             enabled: true,
             runtime_id: String::new(),

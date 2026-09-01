@@ -484,11 +484,12 @@ pub(crate) async fn authenticate_jwt(
     Ok(AuthenticatedKey {
         anonymous: false,
         entry,
-        jwt: Some(Arc::new(JwtIdentity {
-            subject: subject.to_string(),
-            provider: prov.name.clone(),
+        jwt: Some(Arc::new(JwtIdentity::new(
+            subject.to_string(),
+            prov.name.clone(),
             claim_mapping,
-        })),
+            token.to_string(),
+        ))),
     })
 }
 

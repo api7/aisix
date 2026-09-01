@@ -375,6 +375,32 @@ pub struct RequestOverrides {
     /// insertion order on serialize, matching the etcd round-trip.
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub default_body_fields: Map<String, Value>,
+
+    /// Header the caller's own JWT is delivered to the upstream in, for
+    /// internal upstreams that authorize on the end user's claims rather
+    /// than on the gateway's credential. Omit — the default — to send no
+    /// caller token upstream.
+    ///
+    /// The token is the one the gateway already verified for this request
+    /// (signature, expiry, and claim mapping all applied), relayed
+    /// unchanged: no claim is added, removed, or rewritten. A request that
+    /// authenticated with an API key instead of a JWT has no token to
+    /// relay, and the header is then absent rather than empty.
+    ///
+    /// Naming `authorization` or `proxy-authorization` sends
+    /// `Bearer <token>`, the form those headers are defined to carry, and
+    /// replaces the credential this ProviderKey would otherwise inject
+    /// there — so the upstream receives the end user's token in place of
+    /// the gateway's, never both. Any other header carries the bare token.
+    ///
+    /// Transport headers (`host`, `content-length`, `connection`, and the
+    /// rest of the hop-by-hop family) are rejected: they describe the
+    /// message rather than its sender. Lowercase-only, so that rejection
+    /// list is exhaustive on every configuration path (header matching is
+    /// case-insensitive on the wire regardless).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = "^[!#$%&'*+.^_`|~0-9a-z-]+$"), length(min = 1))]
+    pub forward_jwt_header: Option<String>,
 }
 
 /// Numeric range clamps applied to chat-completion request bodies.

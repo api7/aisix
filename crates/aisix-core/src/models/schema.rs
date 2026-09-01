@@ -922,7 +922,31 @@ pub fn provider_key_root_schema() -> Value {
         "Accepted as an alternative spelling of `api_key`. \
          Provide the credential under exactly one of the two names.",
     );
+    reject_transport_slots_for_forwarded_jwt(&mut schema, "RequestOverrides");
     schema
+}
+
+/// Constrain the `forward_jwt_header` of a nested definition to headers
+/// that name a sender rather than frame the message.
+///
+/// The flat resources carrying the same field express this as an
+/// `if`/`then` in their own coupling; `provider_key` holds it inside
+/// `request`, which schemars emits as a `$ref`'d definition, so the rule
+/// is injected into that definition instead. All three end up enforcing
+/// one list — [`crate::forwarded_jwt::TRANSPORT_HEADER_SLOTS`] — on both
+/// the strict and the lenient path.
+fn reject_transport_slots_for_forwarded_jwt(schema: &mut Value, definition: &str) {
+    let field = schema
+        .get_mut("definitions")
+        .and_then(|d| d.get_mut(definition))
+        .and_then(|d| d.get_mut("properties"))
+        .and_then(|p| p.get_mut("forward_jwt_header"))
+        .and_then(Value::as_object_mut)
+        .unwrap_or_else(|| panic!("definition `{definition}` has a `forward_jwt_header` property"));
+    field.insert(
+        "not".to_string(),
+        json!({ "enum": crate::forwarded_jwt::TRANSPORT_HEADER_SLOTS }),
+    );
 }
 
 /// Mirror a struct field's `#[serde(alias = "…")]` in the generated schema.

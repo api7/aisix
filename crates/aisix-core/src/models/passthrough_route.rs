@@ -124,6 +124,38 @@ pub struct PassthroughRoute {
     #[schemars(regex(pattern = "^[!#$%&'*+.^_`|~0-9a-z-]+$"), length(min = 1))]
     pub identity_header: Option<String>,
 
+    /// Header the caller's own JWT is delivered to the upstream in, for
+    /// internal upstreams that authorize on the end user's claims. Omit —
+    /// the default — to send no caller token upstream.
+    ///
+    /// This is what lets a route both authenticate the caller and pass the
+    /// same token on: in `auth_mode: gateway_key` the gateway consumes
+    /// `Authorization` to identify the caller and strips it, so an upstream
+    /// that needs the end user's token sees nothing without this field.
+    /// Setting it to `authorization` puts the verified token back on the
+    /// upstream request unchanged, which is what an existing internal
+    /// service already reading `Authorization` expects.
+    ///
+    /// The token is the one the gateway verified for this request
+    /// (signature, expiry, and claim mapping all applied), relayed with no
+    /// claim added, removed, or rewritten. A caller who authenticated with
+    /// an API key has no token to relay, and the header is then absent
+    /// rather than empty.
+    ///
+    /// Naming `authorization` or `proxy-authorization` sends
+    /// `Bearer <token>`, the form those headers are defined to carry, and
+    /// takes precedence over an injected ProviderKey credential in the same
+    /// slot — the upstream receives the end user's token in place of the
+    /// gateway's, never both. Any other header carries the bare token.
+    ///
+    /// Transport headers (`host`, `content-length`, `connection`, and the
+    /// rest of the hop-by-hop family) are rejected: they describe the
+    /// message rather than its sender. Lowercase-only, so that rejection
+    /// list is exhaustive on every configuration path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = "^[!#$%&'*+.^_`|~0-9a-z-]+$"), length(min = 1))]
+    pub forward_jwt_header: Option<String>,
+
     /// Maximum time, in milliseconds, for the upstream exchange. Bounds
     /// the response-header phase and any non-SSE body read, but never a
     /// healthy SSE relay (which ends with the upstream stream or the
@@ -349,6 +381,18 @@ pub fn passthrough_route_coupling() -> Value {
             "if": { "required": ["identity_header"] },
             "then": { "properties": { "identity_header": {
                 "type": "string", "not": { "enum": FORBIDDEN_HEADER_SLOTS }
+            } } }
+        },
+        // The caller-JWT slot takes the opposite list: it must name a
+        // sender rather than frame the message (`crate::forwarded_jwt`),
+        // and the credential slots stay allowed on purpose — putting the
+        // end user's token in the `Authorization` an internal service
+        // already reads is what lets that service stay unchanged.
+        {
+            "if": { "required": ["forward_jwt_header"] },
+            "then": { "properties": { "forward_jwt_header": {
+                "type": "string",
+                "not": { "enum": crate::forwarded_jwt::TRANSPORT_HEADER_SLOTS }
             } } }
         },
         // auth_mode couplings. The mode-required companions are pinned to

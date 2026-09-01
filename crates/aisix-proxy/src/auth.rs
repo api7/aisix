@@ -40,7 +40,6 @@ pub struct AuthenticatedKey {
 }
 
 /// The verified JWT identity a request authenticated as.
-#[derive(Debug)]
 pub struct JwtIdentity {
     /// Value of the trust provider's identity claim (`sub` by default).
     pub subject: String,
@@ -49,6 +48,53 @@ pub struct JwtIdentity {
     /// Name of the claim mapping that selected the API key, or `None`
     /// when the subject was bound to the key directly via `jwt_subject`.
     pub claim_mapping: Option<String>,
+    /// The verified token itself, retained so an upstream configured with
+    /// `forward_jwt_header` can be handed the caller's own credential
+    /// (`aisix_core::forwarded_jwt`). Nothing else reads it: the fields
+    /// above are what attribution and logging use.
+    ///
+    /// Private, and reachable only through [`JwtIdentity::token`], so the
+    /// one way to a live credential is a deliberate call — this type is
+    /// published into request extensions, where a field would otherwise be
+    /// in reach of anything that can name it.
+    token: String,
+}
+
+impl JwtIdentity {
+    pub fn new(
+        subject: String,
+        provider: String,
+        claim_mapping: Option<String>,
+        token: String,
+    ) -> Self {
+        Self {
+            subject,
+            provider,
+            claim_mapping,
+            token,
+        }
+    }
+
+    /// The verified bearer, for delivery to an upstream that authorizes on
+    /// the end user's claims.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+}
+
+/// Redacts the token, like every other credential in this crate: the
+/// derived form would print it, and this type is carried on the request
+/// extensions through every handler — one `?jwt` in a tracing macro would
+/// put a live credential in the logs.
+impl std::fmt::Debug for JwtIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwtIdentity")
+            .field("subject", &self.subject)
+            .field("provider", &self.provider)
+            .field("claim_mapping", &self.claim_mapping)
+            .field("token", &"***redacted***")
+            .finish()
+    }
 }
 
 /// Per-request context carried onto an authentication denial.

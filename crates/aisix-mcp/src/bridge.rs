@@ -121,13 +121,21 @@ fn shared_http_client() -> rmcp_reqwest::Client {
 /// Header carrying the gateway-held key for `api_key` upstream auth.
 const API_KEY_HEADER: &str = "x-api-key";
 
-/// How the gateway authenticates to an upstream MCP server. The credential is
-/// held here on the gateway side and is never exposed to the calling agent —
-/// the agent presents only its AISIX key. The MCP authorization spec
-/// (2025-11-25) also requires that a downstream client token is never passed
-/// through to the upstream; every credential set here — a Bearer, an API key,
-/// or an OAuth token the gateway mints itself — is a distinct, gateway-held
-/// credential.
+/// How the gateway authenticates to an upstream MCP server. Every variant is
+/// a distinct, gateway-held credential — a Bearer, an API key, or an OAuth
+/// token the gateway mints itself — and none of them is ever exposed to the
+/// calling agent, which presents only its AISIX key.
+///
+/// Relaying the CALLER's own token is a separate, opt-in mechanism
+/// ([`McpUpstream::forwarded_jwt`], from the server's `forward_jwt_header`),
+/// never a property of this enum. The normative rule it has to respect is
+/// the audience one — a server "MUST only accept tokens specifically
+/// intended for themselves" (MCP authorization, 2025-06-18 and later) — so
+/// relaying is for an internal server that reads the claims of a token its
+/// own identity provider issued, not for one that validates `aud` against
+/// itself. There is no normative prohibition on the relay itself; the
+/// "token passthrough is forbidden" wording lives in a non-normative
+/// security best-practices guide.
 #[derive(Clone)]
 pub enum McpAuth {
     /// No upstream auth — the server is reachable as-is.
@@ -220,6 +228,16 @@ pub struct McpUpstream {
     /// Protocol revision the session is opened with. Defaults to the
     /// legacy `initialize` handshake.
     pub protocol: McpProtocol,
+    /// Header name and value delivering the calling agent's own verified
+    /// JWT, for an internal server that authorizes on the end user's
+    /// claims (the server's `forward_jwt_header`, resolved per request by
+    /// `aisix_core::forwarded_jwt`). `None` when the server does not
+    /// configure it or the agent authenticated with an API key.
+    ///
+    /// Independent of `auth`, which stays the gateway's own credential —
+    /// except when both name the same header, where the caller's token
+    /// wins and the gateway's is not sent at all.
+    pub forwarded_jwt: Option<(String, String)>,
 }
 
 // Manual so a `Bearer` token cannot leak through `McpUpstream`'s `Debug`
@@ -231,6 +249,13 @@ impl std::fmt::Debug for McpUpstream {
             .field("auth", &self.auth)
             .field("timeout", &self.timeout)
             .field("protocol", &self.protocol)
+            .field(
+                "forwarded_jwt",
+                &self
+                    .forwarded_jwt
+                    .as_ref()
+                    .map(|(name, _)| format!("{name}: ***redacted***")),
+            )
             .finish()
     }
 }
@@ -243,7 +268,15 @@ impl McpUpstream {
             auth: McpAuth::None,
             timeout: DEFAULT_UPSTREAM_TIMEOUT,
             protocol: McpProtocol::default(),
+            forwarded_jwt: None,
         }
+    }
+
+    /// Deliver the calling agent's verified JWT, as already resolved to a
+    /// header name and value by `aisix_core::forwarded_jwt`.
+    pub fn with_forwarded_jwt(mut self, forwarded: Option<(String, String)>) -> Self {
+        self.forwarded_jwt = forwarded;
+        self
     }
 
     /// Select the protocol revision the session is opened with.
@@ -369,40 +402,70 @@ impl RmcpBridge {
             // connection settings — `from_uri`/`from_config` would build
             // rmcp's own default client with none of them — and through
             // `transport_config` for the pinned transport defaults.
-            let transport = match &upstream.auth {
-                McpAuth::None => StreamableHttpClientTransport::with_client(
-                    shared_http_client(),
-                    transport_config(&upstream.url),
-                ),
-                McpAuth::Bearer(token) => StreamableHttpClientTransport::with_client(
-                    shared_http_client(),
-                    transport_config(&upstream.url).auth_header(token.clone()),
-                ),
+            // Gateway credential and caller JWT are resolved into one
+            // header set rather than one arm each, because they can name
+            // the same slot: an operator who points `forward_jwt_header`
+            // at `authorization` is choosing the end user's token over the
+            // gateway's, and the upstream must receive exactly one of them.
+            let jwt_slot = upstream
+                .forwarded_jwt
+                .as_ref()
+                .map(|(name, _)| name.as_str());
+            let mut custom: HashMap<HeaderName, HeaderValue> = HashMap::new();
+            let mut auth_header: Option<String> = None;
+            match &upstream.auth {
+                McpAuth::None => {}
+                McpAuth::Bearer(token) => {
+                    if jwt_slot != Some("authorization") {
+                        auth_header = Some(token.clone());
+                    }
+                }
                 McpAuth::ApiKey(key) => {
-                    // A key with non-header-safe bytes is a clean config error,
-                    // not a panic — and the key itself never enters the message.
-                    let mut value = HeaderValue::from_str(key).map_err(|_| {
-                        McpError::Connect(
-                            "upstream API key is not a valid HTTP header value".to_string(),
-                        )
-                    })?;
-                    // Marks the value opaque to `Debug` formatting of the
-                    // header map, mirroring this module's redaction posture.
-                    value.set_sensitive(true);
-                    let headers = HashMap::from([(HeaderName::from_static(API_KEY_HEADER), value)]);
-                    StreamableHttpClientTransport::with_client(
-                        shared_http_client(),
-                        transport_config(&upstream.url).custom_headers(headers),
-                    )
+                    if jwt_slot != Some(API_KEY_HEADER) {
+                        // A key with non-header-safe bytes is a clean config error,
+                        // not a panic — and the key itself never enters the message.
+                        let mut value = HeaderValue::from_str(key).map_err(|_| {
+                            McpError::Connect(
+                                "upstream API key is not a valid HTTP header value".to_string(),
+                            )
+                        })?;
+                        // Marks the value opaque to `Debug` formatting of the
+                        // header map, mirroring this module's redaction posture.
+                        value.set_sensitive(true);
+                        custom.insert(HeaderName::from_static(API_KEY_HEADER), value);
+                    }
                 }
                 McpAuth::OAuth2(cfg) => {
-                    let token = crate::oauth::get_or_fetch(cfg).await?;
-                    StreamableHttpClientTransport::with_client(
-                        shared_http_client(),
-                        transport_config(&upstream.url).auth_header(token),
-                    )
+                    // Minted only when it will actually be sent: a token the
+                    // caller's JWT is about to displace is a round trip to the
+                    // identity provider whose only possible effect is failing
+                    // a request that did not need it.
+                    if jwt_slot != Some("authorization") {
+                        auth_header = Some(crate::oauth::get_or_fetch(cfg).await?);
+                    }
                 }
-            };
+            }
+            if let Some((name, value)) = &upstream.forwarded_jwt {
+                // A token that cannot be a header value is a broken
+                // credential, not a reason to fail the connect: the server
+                // then answers the way it answers any unauthenticated call.
+                if let (Ok(name), Ok(mut value)) = (
+                    HeaderName::try_from(name.as_str()),
+                    HeaderValue::from_str(value),
+                ) {
+                    value.set_sensitive(true);
+                    custom.insert(name, value);
+                }
+            }
+            let mut config = transport_config(&upstream.url);
+            if let Some(token) = auth_header {
+                config = config.auth_header(token);
+            }
+            if !custom.is_empty() {
+                config = config.custom_headers(custom);
+            }
+            let transport =
+                StreamableHttpClientTransport::with_client(shared_http_client(), config);
             // Lifecycle follows the configured protocol revision. The
             // handler is `ClientInfo::default()` on BOTH paths — identical
             // handshake bytes to the previous unit handler (whose default
@@ -696,6 +759,10 @@ pub fn upstream_from_mcp_server(server: &McpServer) -> McpUpstream {
         auth,
         timeout,
         protocol,
+        // Per-caller, so it is attached by the gateway that knows who is
+        // calling (`McpGateway::from_snapshot_for_caller`), not derived
+        // from the stored server row here.
+        forwarded_jwt: None,
     }
 }
 

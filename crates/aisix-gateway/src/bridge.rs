@@ -109,6 +109,13 @@ pub struct BridgeContext {
     /// `request.forward_client_headers` allowlist. `None` on the same
     /// caller-less paths as above.
     pub client_headers: Option<std::sync::Arc<HeaderMap>>,
+    /// The caller's verified JWT, delivered to the upstream under the
+    /// ProviderKey's `request.forward_jwt_header` when that is configured.
+    /// `None` when the caller authenticated with an API key, and on the
+    /// same caller-less paths as above. Held behind an `Arc` because every
+    /// dispatch path clones the context; nothing reaches an upstream
+    /// unless an operator named a header on that ProviderKey.
+    pub caller_jwt: Option<std::sync::Arc<str>>,
     /// Snapshot ids of the resolved Model and ProviderKey, for the
     /// `${model.id}` / `${provider_key.id}` header templates. They are
     /// carried separately because a `Model` / `ProviderKey` value does not
@@ -132,6 +139,7 @@ impl BridgeContext {
             deadline: None,
             caller: CallerIdentity::default(),
             client_headers: None,
+            caller_jwt: None,
             model_id: String::new(),
             provider_key_id: String::new(),
         }
@@ -150,9 +158,11 @@ impl BridgeContext {
         mut self,
         caller: CallerIdentity,
         client_headers: Option<std::sync::Arc<HeaderMap>>,
+        caller_jwt: Option<std::sync::Arc<str>>,
     ) -> Self {
         self.caller = caller;
         self.client_headers = client_headers;
+        self.caller_jwt = caller_jwt;
         self
     }
 
@@ -185,6 +195,7 @@ impl BridgeContext {
                 provider_key_name: Some(&self.provider_key.display_name),
             },
             client_headers: self.client_headers.as_deref(),
+            caller_jwt: self.caller_jwt.as_deref(),
         }
     }
 }
