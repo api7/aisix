@@ -3725,21 +3725,47 @@ where
         // anyway. Fail closed.
         if !buf.is_empty() {
             let tail = std::mem::take(&mut buf);
-            if hold_policy.is_some() {
+            // The upstream has ended, so this fragment is a final frame it
+            // never terminated — complete, just missing its blank line. Parse
+            // it like any other frame BEFORE the scan below runs, so its text
+            // reaches `response_text` and the output guardrail actually sees
+            // it. Then it is scanned content like everything else and can be
+            // released, which is what keeps a provider that omits the last
+            // terminator from losing its `message_stop` behind a guardrail.
+            //
+            // `scannable` is false only when the fragment is not parseable —
+            // truncated mid-JSON. Nothing can extract its text, so releasing
+            // it WOULD be the bypass, and that case alone fails closed.
+            let scannable = match extract_sse_data_line(&tail) {
+                Some(data) => match serde_json::from_slice::<Value>(data) {
+                    Ok(json) => {
+                        update_anthropic_usage(
+                            guard.usage(),
+                            &json,
+                            attempt_started,
+                            &mut first_token_seen,
+                        );
+                        true
+                    }
+                    Err(_) => false,
+                },
+                // No `data:` line at all (a comment / keepalive): nothing to
+                // scan, so nothing to withhold.
+                None => true,
+            };
+            if hold_policy.is_some() && !scannable {
                 tracing::warn!(
                     guardrail_hook = "output",
                     dropped = tail.len(),
-                    "streaming /v1/messages passthrough ended on an unterminated SSE \
-                     frame; dropping it unscanned rather than releasing it past the \
-                     output guardrail",
+                    "streaming /v1/messages passthrough ended on an SSE frame that \
+                     could not be parsed; dropping it rather than releasing it past \
+                     the output guardrail",
                 );
-                // When the tail was the ENTIRE response, dropping it silently
-                // would hand the caller an empty 200 and no signal at all —
-                // and the guardrail scan is skipped too, since nothing ever
+                // When that fragment was the ENTIRE response, dropping it
+                // silently would hand the caller an empty 200 and no signal at
+                // all — and the scan is skipped too, since nothing ever
                 // reached `response_text`. Refuse explicitly instead, the same
-                // shape the frame-cap arm above uses. A stream that delivered
-                // real frames and merely lost a trailing fragment is NOT
-                // turned into a refusal.
+                // shape the frame-cap arm above uses.
                 if held.is_empty() {
                     guard.usage().guardrail_blocked = true;
                     yield Ok(Bytes::from(guardrail_block_frame(
@@ -3748,12 +3774,25 @@ where
                     )));
                     return;
                 }
+            } else if hold_policy.is_some() {
+                // Scanned like every other frame — hold it with them.
+                let tail = crate::model_echo::restamp_sse_frame(
+                    &tail,
+                    &model_label,
+                    crate::model_echo::anthropic_message_model,
+                )
+                .unwrap_or(tail);
+                held.extend_from_slice(&tail);
             } else {
                 // Restamp on the way out, for the same reason the `/v1/responses`
                 // relay does: the upstream has ended, so this is a final frame it
-                // never terminated rather than one still arriving. Anthropic's last
-                // frame is `message_stop`, which carries no model, so this is inert
-                // today — it is here so the two relays cannot answer differently.
+                // never terminated rather than one still arriving.
+                //
+                // Note this is NOT the same as Anthropic's terminal frame. That
+                // one is `message_stop` and carries no model — but an upstream
+                // that dies part-way through leaves whatever frame it was
+                // writing, and if that is `message_start` this restamp is the
+                // only thing standing between the caller and the upstream id.
                 let tail = crate::model_echo::restamp_sse_frame(
                     &tail,
                     &model_label,
@@ -6339,16 +6378,14 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
             .await
             .expect("usage event was never emitted")
             .expect("usage event sender dropped");
-        assert!(event.guardrail_blocked);
-        assert_eq!(
-            event.status_code, 200,
-            "a fail-closed refusal is not a client abandonment"
-        );
+        assert_refused_not_abandoned(&event);
     }
 
     /// Drive one streamed `/v1/messages` request through a block-capable
-    /// output guardrail (so the hold-back path is in force) and return the
-    /// body the CALLER received. `sse` is the upstream's raw SSE response.
+    /// output guardrail (so the hold-back path is in force). `sse` is the
+    /// upstream's raw SSE response; the pair returned is the body the CALLER
+    /// received and the UsageEvent the request emitted — both halves matter,
+    /// since a refusal has to look right on the wire AND in telemetry.
     ///
     /// The guardrail's literal never appears in any case below, so a refusal
     /// can only come from bytes the scan could not see — which is what these
@@ -6417,12 +6454,13 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
         );
     }
 
-    /// A stream that ends mid-frame: the scanned frames are delivered, the
-    /// unterminated remainder is not. It never reached the frame drain, so it
-    /// never fed the text the output guardrail scans — releasing it after the
-    /// scan cleared would be a way around the check.
+    /// A stream that dies mid-JSON: the scanned frames are delivered, the
+    /// unparseable remainder is not. Nothing can extract that fragment's text,
+    /// so it cannot reach the output scan, and releasing it afterwards would
+    /// be a way around the check. Contrast the test below, where the tail is
+    /// complete JSON and merely lacks its blank line — that one IS delivered.
     #[tokio::test]
-    async fn holdback_withholds_an_unterminated_tail_but_delivers_what_was_scanned() {
+    async fn holdback_withholds_an_unparseable_tail_but_delivers_what_was_scanned() {
         let sse = r#"event: message_start
 data: {"type":"message_start","message":{"id":"msg_t","role":"assistant","content":[],"model":"claude-3-5-haiku-20241022","stop_reason":null,"usage":{"input_tokens":4,"output_tokens":1}}}
 
@@ -6478,7 +6516,31 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         assert_refused_not_abandoned(&event);
     }
 
-    /// The third arm: the unterminated frame is the WHOLE response, and small
+    /// A provider that omits only the FINAL blank line. The frame is complete
+    /// JSON, so at EOF it can be parsed like any other, which puts its text in
+    /// front of the output guardrail — and once scanned there is no reason to
+    /// withhold it. Dropping it here was a regression: `message_stop` carries
+    /// no text, so withholding it protected nothing while breaking every
+    /// Anthropic SDK client that waits for it (`get_final_message`).
+    #[tokio::test]
+    async fn holdback_delivers_a_complete_tail_that_merely_lacks_its_terminator() {
+        let sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_ok\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null,\"usage\":{\"input_tokens\":4,\"output_tokens\":1}}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}";
+        let (streamed, event) = holdback_case(sse.to_string()).await;
+        assert!(
+            streamed.contains("message_stop"),
+            "a complete final frame is delivered even without its blank line: {streamed}"
+        );
+        assert!(streamed.contains("hello"));
+        assert!(
+            !event.guardrail_blocked,
+            "a scannable tail is not a refusal: {streamed}"
+        );
+        assert!(!streamed.contains(crate::error::TAG_UNSCANNABLE_BODY));
+    }
+
+    /// The third arm: the unparseable frame is the WHOLE response, and small
     /// enough that the frame cap never fires. Nothing was ever drained, so
     /// nothing was scanned and there is nothing to deliver — dropping it
     /// silently would hand the caller an empty 200 with no signal at all, so

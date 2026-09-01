@@ -2818,6 +2818,15 @@ where
                 // un-terminated remainder downstream rather than OOM. Delivery is
                 // preserved — only this frame's usage parse and model restamp
                 // are lost.
+                //
+                // The restamp cannot be recovered here, and not for want of
+                // trying: at the cap the frame is genuinely still arriving, so
+                // its JSON is incomplete, so `json_splice` refuses it and falls
+                // back to verbatim by design. Reaching this needs a single SSE
+                // frame over 1 MiB — on this surface `response.completed`
+                // carries the whole Response object, so a caller with a very
+                // large `tools[]` can get there. Named in the PR description as
+                // a known limit rather than papered over.
                 if buf.len() > crate::messages::MAX_SSE_FRAME_BUF_BYTES {
                     tracing::warn!(
                         buffered = buf.len(),
@@ -2856,13 +2865,32 @@ where
         // object from. Same reasoning as `model_echo::restamp_sse_buffer`,
         // and this path reaches it without any guardrail attached.
         if !buf.is_empty() {
-            let tail = std::mem::take(&mut buf);
-            let tail = crate::model_echo::restamp_sse_frame(
-                &tail,
+            // Parse it before releasing it. On this surface the unterminated
+            // final frame is `response.completed`, which carries the
+            // authoritative token counts and `response.id`: forwarding it to
+            // the caller while never reading it handed them real usage in the
+            // body and recorded estimated counts, with no provider request id,
+            // in the UsageEvent. Appending the terminator the upstream omitted
+            // lets the normal drain read it; the drain consumes `buf`, and
+            // what it hands back is the restamped frame plus that terminator,
+            // so the client gets its own bytes back.
+            buf.extend_from_slice(b"\n\n");
+            let mut drained: Vec<u8> = Vec::new();
+            let (usage_acc, capture) = guard.parts();
+            drain_responses_sse_frames(
+                &mut buf,
+                usage_acc,
+                capture,
+                attempt_started,
+                &mut first_frame_seen,
                 &client_facing_model,
-                crate::model_echo::responses_snapshot_model,
-            )
-            .unwrap_or(tail);
+                &mut drained,
+            );
+            let tail = match drained.len().checked_sub(2) {
+                // Drop only the terminator this branch appended.
+                Some(n) if drained.ends_with(b"\n\n") => drained[..n].to_vec(),
+                _ => drained,
+            };
             let (usage_acc, _) = guard.parts();
             let acc = usage_acc.get_or_insert_with(Default::default);
             if acc.downstream_latency_ms == 0 {
@@ -3687,6 +3715,71 @@ mod tests {
                 assert_eq!(event.requested_model, model);
             }
         }
+    }
+
+    /// A provider that omits the blank line after its terminal
+    /// `response.completed` used to cost the gateway that whole frame: it was
+    /// forwarded to the caller but never parsed, so the body carried the real
+    /// token counts while the UsageEvent carried estimates and no provider
+    /// request id. At EOF the frame is complete, so it is parsed like any
+    /// other — the caller's alias is stamped on it AND its usage is recorded.
+    #[tokio::test]
+    async fn streamed_unterminated_terminal_frame_is_still_parsed_for_usage() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        // Note the absent trailing blank line on the last frame.
+        let sse = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_eof\",\"model\":\"gpt-4o-2024-11-20\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_eof\",\"model\":\"gpt-4o-2024-11-20\",\"usage\":{\"input_tokens\":31,\"output_tokens\":17,\"total_tokens\":48}}}";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hi",
+                "stream": true,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let streamed =
+            String::from_utf8(to_bytes(resp.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+
+        // Delivered, restamped, and NOT given a terminator it never had.
+        assert!(streamed.contains(r#""model":"gpt-4o-resp""#), "{streamed}");
+        assert!(!streamed.contains("gpt-4o-2024-11-20"), "{streamed}");
+        assert!(
+            streamed.ends_with("}}}"),
+            "no invented terminator: {streamed}"
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(1000), rx.recv())
+            .await
+            .expect("usage event must be emitted")
+            .expect("usage_sink sender dropped");
+        // The authoritative counts off that frame, not a local estimate.
+        assert_eq!(event.prompt_tokens, 31, "{streamed}");
+        assert_eq!(event.completion_tokens, 17, "{streamed}");
+        assert!(!event.usage_estimated, "the frame was read, not guessed");
+        assert_eq!(event.provider_request_id, "resp_eof");
     }
 
     /// #719: the Responses `input` array form (message items with typed

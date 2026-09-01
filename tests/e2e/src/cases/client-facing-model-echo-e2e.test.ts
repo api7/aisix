@@ -282,6 +282,12 @@ describe("client-facing model echo e2e: the response names what the caller asked
     // is `response.completed`, the event an SDK builds its final Response
     // object from. No guardrail here: this is the ordinary configuration, so
     // it is the likelier way to meet the bug, not the exotic one.
+    //
+    // That the LIVE relay serves this is a property of the suite, not of the
+    // assertions — the buffered branch would satisfy them too. It holds
+    // because this describe seeds no guardrail and `seedAlias` creates only a
+    // provider key, a model and a caller key, so `runs_on_output` is false.
+    // Adding a guardrail to this describe would silently move the coverage.
     const upstream = await startOpenAiUpstream({
       rawStreamFrames: [
         `event: response.created\ndata: {"type":"response.created","response":{"id":"resp_eof","object":"response","status":"in_progress","model":"${UPSTREAM_REPORTED_MODEL}"}}\n\n`,
