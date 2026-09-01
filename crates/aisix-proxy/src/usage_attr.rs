@@ -691,6 +691,14 @@ pub(crate) fn emit_usage(
     // present on a family's success path and missing from its error or
     // streaming one (AISIX-Cloud#1461).
     event.operation = surface.operation.to_string();
+    // Request-level guardrail blocks are recorded from the terminal event,
+    // not from an individual timed execution. Some fail-closed paths (for
+    // example a streamed-output buffer overflow) reject before a guardrail
+    // member runs, while retries and ensembles can emit several non-terminal
+    // events for one request.
+    if terminal && event.guardrail_blocked {
+        state.metrics.record_guardrail_blocked_request();
+    }
     let emission = trace.map(|bundle| {
         event.trace_id = bundle.trace_id_hex();
         bundle.emission(

@@ -41,6 +41,7 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
   let responsesNativeUpstream: OpenAiUpstream | undefined;
   let responsesBridgeUpstream: OpenAiUpstream | undefined;
   let failUpstream: OpenAiUpstream | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -126,7 +127,7 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
     });
 
     app = await spawnApp();
-    const seed = new SeedClient(etcd, app.etcdPrefix);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
     const pk = await seed.createProviderKey({
       display_name: "histo-pk",
@@ -269,6 +270,20 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
       .reduce((a, b) => a + b, 0);
   }
 
+  /** Sum of `series`_sum across label combinations matching `labels`. */
+  function sumOf(body: string, series: string, labels: Record<string, string>): number {
+    return body
+      .split("\n")
+      .filter(
+        (l) =>
+          l.startsWith(`${series}_sum{`) &&
+          Object.entries(labels).every(([k, v]) => l.includes(`${k}="${v}"`)),
+      )
+      .map((l) => Number(l.split("}").at(-1)!.trim()))
+      .filter((v) => !Number.isNaN(v))
+      .reduce((a, b) => a + b, 0);
+  }
+
   test("non-streaming, streaming and failed requests land in le-bucketed series", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
@@ -387,6 +402,7 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
       ctx.skip();
       return;
     }
+    const before = await scrape();
     expect((await responses(RESPONSES_NATIVE_MODEL)).status).toBe(200);
     expect((await responses(RESPONSES_BRIDGE_MODEL)).status).toBe(200);
 
@@ -425,6 +441,10 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
         `${model} low-cardinality TTFT buckets`,
       ).toBeGreaterThan(0);
       expect(countOf(body, TTFT_SERIES, lowCardLabels)).toBe(1);
+      expect(
+        sumOf(body, TTFT_SERIES, lowCardLabels) -
+          sumOf(before, TTFT_SERIES, lowCardLabels),
+      ).toBeGreaterThan(0);
 
       const detailedLabels = {
         endpoint: "/v1/responses",
@@ -434,6 +454,79 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
         upstream_protocol: "openai",
       };
       expect(countOf(body, DETAILED_TTFT_SERIES, detailedLabels)).toBe(1);
+      expect(
+        sumOf(body, DETAILED_TTFT_SERIES, detailedLabels) -
+          sumOf(before, DETAILED_TTFT_SERIES, detailedLabels),
+      ).toBeGreaterThan(0);
     }
+  });
+
+  test("buffered Responses output-guardrail paths retain TTFT on allow and block", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    const guardrailBody = (pattern: string) => ({
+      name: "histo-responses-output",
+      enabled: true,
+      hook_point: "output",
+      kind: "keyword",
+      patterns: [{ kind: "literal", value: pattern }],
+    });
+    const guardrail = await seed.createGuardrail(guardrailBody("native reply"));
+
+    // A 422 proves the output rule has propagated and the native Responses
+    // stream took the whole-response hold-back path.
+    await waitConfigPropagation(async () => {
+      return (await responses(RESPONSES_NATIVE_MODEL)).status === 422;
+    });
+
+    const assertDelta = async (status: number, statusClass: "2xx" | "4xx") => {
+      const before = await scrape();
+      expect((await responses(RESPONSES_NATIVE_MODEL)).status).toBe(status);
+      const after = await scrape();
+      const lowCardLabels = {
+        endpoint: "/v1/responses",
+        model: RESPONSES_NATIVE_MODEL,
+        provider: "openai",
+        streaming: "true",
+        status_class: statusClass,
+      };
+      const detailedLabels = {
+        endpoint: "/v1/responses",
+        model: RESPONSES_NATIVE_MODEL,
+        provider: "openai",
+        inbound_protocol: "openai",
+        upstream_protocol: "openai",
+      };
+      expect(
+        countOf(after, TTFT_SERIES, lowCardLabels) -
+          countOf(before, TTFT_SERIES, lowCardLabels),
+      ).toBe(1);
+      expect(
+        sumOf(after, TTFT_SERIES, lowCardLabels) -
+          sumOf(before, TTFT_SERIES, lowCardLabels),
+      ).toBeGreaterThan(0);
+      expect(
+        countOf(after, DETAILED_TTFT_SERIES, detailedLabels) -
+          countOf(before, DETAILED_TTFT_SERIES, detailedLabels),
+      ).toBe(1);
+      expect(
+        sumOf(after, DETAILED_TTFT_SERIES, detailedLabels) -
+          sumOf(before, DETAILED_TTFT_SERIES, detailedLabels),
+      ).toBeGreaterThan(0);
+    };
+
+    await assertDelta(422, "4xx");
+
+    await seed.update(
+      "guardrails",
+      guardrail.id as string,
+      guardrailBody("never-matches-native-response"),
+    );
+    await waitConfigPropagation(async () => {
+      return (await responses(RESPONSES_NATIVE_MODEL)).status === 200;
+    });
+    await assertDelta(200, "2xx");
   });
 });

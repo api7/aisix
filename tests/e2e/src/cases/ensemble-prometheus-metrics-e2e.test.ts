@@ -22,12 +22,14 @@ const CALLER = "sk-ensemble-prometheus-caller";
 const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
 const NONSTREAM_MODEL = "prom-ensemble-nonstream";
 const STREAM_MODEL = "prom-ensemble-stream";
+const NONSTREAM_ESTIMATED_MODEL = "prom-ensemble-nonstream-estimated";
+const STREAM_ESTIMATED_MODEL = "prom-ensemble-stream-estimated";
 
 const PANEL_USAGE = { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 };
 const JUDGE_USAGE = { prompt_tokens: 7, completion_tokens: 11, total_tokens: 18 };
 const AGGREGATE = { input: 11, output: 17, total: 28 };
 
-function chatBody(id: string, content: string, usage: typeof PANEL_USAGE) {
+function chatBody(id: string, content: string, usage?: typeof PANEL_USAGE) {
   return {
     id,
     object: "chat.completion",
@@ -40,7 +42,7 @@ function chatBody(id: string, content: string, usage: typeof PANEL_USAGE) {
         finish_reason: "stop",
       },
     ],
-    usage,
+    ...(usage ? { usage } : {}),
   };
 }
 
@@ -109,7 +111,24 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
       streamEvents: streamEvents(),
       firstEventDelayMs: 25,
     });
-    upstreams.push(panelA, panelB, judgeNonstream, judgeStream);
+    const panelNoUsageA = await startOpenAiUpstream({
+      nonStreamBody: chatBody("chatcmpl-panel-est-a", "estimated panel answer A"),
+    });
+    const panelNoUsageB = await startOpenAiUpstream({
+      nonStreamBody: chatBody("chatcmpl-panel-est-b", "estimated panel answer B"),
+    });
+    const judgeNoUsage = await startOpenAiUpstream({
+      nonStreamBody: chatBody("chatcmpl-judge-est", "estimated buffered synthesis"),
+    });
+    upstreams.push(
+      panelA,
+      panelB,
+      judgeNonstream,
+      judgeStream,
+      panelNoUsageA,
+      panelNoUsageB,
+      judgeNoUsage,
+    );
 
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
@@ -130,6 +149,9 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
     await seedDirect("prom-ensemble-panel-b", panelB);
     await seedDirect("prom-ensemble-judge-ns", judgeNonstream);
     await seedDirect("prom-ensemble-judge-stream", judgeStream);
+    await seedDirect("prom-ensemble-panel-est-a", panelNoUsageA);
+    await seedDirect("prom-ensemble-panel-est-b", panelNoUsageB);
+    await seedDirect("prom-ensemble-judge-est", judgeNoUsage);
 
     await seed.createModel({
       display_name: NONSTREAM_MODEL,
@@ -147,15 +169,42 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
         min_responses: 2,
       },
     });
+    await seed.createModel({
+      display_name: NONSTREAM_ESTIMATED_MODEL,
+      ensemble: {
+        panel: [
+          { model: "prom-ensemble-panel-est-a" },
+          { model: "prom-ensemble-panel-est-b" },
+        ],
+        judge: { model: "prom-ensemble-judge-est" },
+        min_responses: 2,
+      },
+    });
+    await seed.createModel({
+      display_name: STREAM_ESTIMATED_MODEL,
+      ensemble: {
+        panel: [
+          { model: "prom-ensemble-panel-est-a" },
+          { model: "prom-ensemble-panel-est-b" },
+        ],
+        judge: { model: "prom-ensemble-judge-stream" },
+        min_responses: 2,
+      },
+    });
     await seed.createApiKey({
       key_hash: CALLER_HASH,
       allowed_models: [
         NONSTREAM_MODEL,
         STREAM_MODEL,
+        NONSTREAM_ESTIMATED_MODEL,
+        STREAM_ESTIMATED_MODEL,
         "prom-ensemble-panel-a",
         "prom-ensemble-panel-b",
         "prom-ensemble-judge-ns",
         "prom-ensemble-judge-stream",
+        "prom-ensemble-panel-est-a",
+        "prom-ensemble-panel-est-b",
+        "prom-ensemble-judge-est",
       ],
     });
 
@@ -164,7 +213,12 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
       const res = await proxy.listModels();
       if (res.status !== 200) return false;
       const models = (res.body as { data?: Array<{ id?: string }> }).data ?? [];
-      return [NONSTREAM_MODEL, STREAM_MODEL].every((name) =>
+      return [
+        NONSTREAM_MODEL,
+        STREAM_MODEL,
+        NONSTREAM_ESTIMATED_MODEL,
+        STREAM_ESTIMATED_MODEL,
+      ].every((name) =>
         models.some((model) => model.id === name),
       );
     });
@@ -292,16 +346,124 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
         metricValue(before, "aisix_request_ttft_seconds_count", lowCardLabels),
     ).toBe(1);
     expect(
-      metricValue(after, "aisix_llm_time_to_first_token_seconds_count", {
-        ...labels,
-        inbound_protocol: "openai",
-        upstream_protocol: "unknown",
-      }) -
-        metricValue(before, "aisix_llm_time_to_first_token_seconds_count", {
-          ...labels,
-          inbound_protocol: "openai",
-          upstream_protocol: "unknown",
-        }),
+      metricValue(after, "aisix_request_ttft_seconds_sum", lowCardLabels) -
+        metricValue(before, "aisix_request_ttft_seconds_sum", lowCardLabels),
+    ).toBeGreaterThan(0);
+    const detailedLabels = {
+      ...labels,
+      inbound_protocol: "openai",
+      upstream_protocol: "unknown",
+    };
+    expect(
+      metricValue(after, "aisix_llm_time_to_first_token_seconds_count", detailedLabels) -
+        metricValue(before, "aisix_llm_time_to_first_token_seconds_count", detailedLabels),
     ).toBe(1);
+    expect(
+      metricValue(after, "aisix_llm_time_to_first_token_seconds_sum", detailedLabels) -
+        metricValue(before, "aisix_llm_time_to_first_token_seconds_sum", detailedLabels),
+    ).toBeGreaterThan(0);
+  });
+
+  test("locally estimated subcalls contribute to non-streaming and streaming aggregates", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const before = await scrape();
+    const client = new OpenAI({ apiKey: CALLER, baseURL: `${app.proxyUrl}/v1`, maxRetries: 0 });
+
+    const nonstream = await client.chat.completions.create({
+      model: NONSTREAM_ESTIMATED_MODEL,
+      messages: [{ role: "user", content: "estimate every subcall" }],
+    });
+    expect(nonstream.choices[0]?.message?.content).toContain("estimated buffered synthesis");
+
+    const stream = await client.chat.completions.create({
+      model: STREAM_ESTIMATED_MODEL,
+      messages: [{ role: "user", content: "estimate the panel" }],
+      stream: true,
+    });
+    for await (const _chunk of stream) {
+      // Drain the stream so on_complete records its aggregate.
+    }
+
+    let after = "";
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      after = await scrape();
+      const nonstreamTotal =
+        metricValue(
+          after,
+          "aisix_llm_total_tokens_total",
+          tokenLabels(NONSTREAM_ESTIMATED_MODEL),
+        ) -
+        metricValue(
+          before,
+          "aisix_llm_total_tokens_total",
+          tokenLabels(NONSTREAM_ESTIMATED_MODEL),
+        );
+      const streamTotal =
+        metricValue(
+          after,
+          "aisix_llm_total_tokens_total",
+          tokenLabels(STREAM_ESTIMATED_MODEL),
+        ) -
+        metricValue(
+          before,
+          "aisix_llm_total_tokens_total",
+          tokenLabels(STREAM_ESTIMATED_MODEL),
+        );
+      if (nonstreamTotal > 0 && streamTotal > JUDGE_USAGE.total_tokens) break;
+      if (Date.now() > deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+
+    for (const metric of [
+      "aisix_llm_input_tokens_total",
+      "aisix_llm_output_tokens_total",
+      "aisix_llm_total_tokens_total",
+    ]) {
+      expect(
+        metricValue(after, metric, tokenLabels(NONSTREAM_ESTIMATED_MODEL)) -
+          metricValue(before, metric, tokenLabels(NONSTREAM_ESTIMATED_MODEL)),
+        `${metric} non-streaming estimate`,
+      ).toBeGreaterThan(0);
+    }
+    expect(
+      metricValue(
+        after,
+        "aisix_llm_input_tokens_total",
+        tokenLabels(STREAM_ESTIMATED_MODEL),
+      ) -
+        metricValue(
+          before,
+          "aisix_llm_input_tokens_total",
+          tokenLabels(STREAM_ESTIMATED_MODEL),
+        ),
+    ).toBeGreaterThan(JUDGE_USAGE.prompt_tokens);
+    expect(
+      metricValue(
+        after,
+        "aisix_llm_output_tokens_total",
+        tokenLabels(STREAM_ESTIMATED_MODEL),
+      ) -
+        metricValue(
+          before,
+          "aisix_llm_output_tokens_total",
+          tokenLabels(STREAM_ESTIMATED_MODEL),
+        ),
+    ).toBeGreaterThan(JUDGE_USAGE.completion_tokens);
+    expect(
+      metricValue(
+        after,
+        "aisix_llm_total_tokens_total",
+        tokenLabels(STREAM_ESTIMATED_MODEL),
+      ) -
+        metricValue(
+          before,
+          "aisix_llm_total_tokens_total",
+          tokenLabels(STREAM_ESTIMATED_MODEL),
+        ),
+    ).toBeGreaterThan(JUDGE_USAGE.total_tokens);
   });
 });

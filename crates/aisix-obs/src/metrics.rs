@@ -206,13 +206,13 @@ pub const M_BUDGET_DETAILS_PRESENT: &str = "aisix_budget_details_present";
 pub const M_REDIS_FAILURES_TOTAL: &str = "aisix_redis_failures_total";
 pub const M_USAGE_EVENT_DROPS_TOTAL: &str = "aisix_usage_event_drops_total";
 /// Guardrail outcomes (#379 observability). `aisix_guardrail_blocks_total`
-/// counts guardrail executions that rejected a request (input or output hook;
-/// policy or fail-closed combined). `aisix_guardrail_bypasses_total` counts
-/// fail-open executions — a remote-API guardrail's upstream was unreachable
-/// but `fail_open` let the request through — sliced by the bounded DP-internal
+/// counts requests rejected by guardrail enforcement, including fail-closed
+/// paths such as a streaming buffer overflow that happen before a guardrail
+/// member executes. `aisix_guardrail_bypasses_total` counts fail-open
+/// executions — a remote-API guardrail's upstream was unreachable but
+/// `fail_open` let the request through — sliced by the bounded DP-internal
 /// `reason` (e.g. `bedrock_5xx` / `bedrock_timeout` /
-/// `bedrock_throttled`). Both counters share the all-endpoint execution
-/// chokepoint with `aisix_guardrail_latency_seconds`.
+/// `bedrock_throttled`).
 pub const M_GUARDRAIL_BLOCKS_TOTAL: &str = "aisix_guardrail_blocks_total";
 pub const M_GUARDRAIL_BYPASSES_TOTAL: &str = "aisix_guardrail_bypasses_total";
 
@@ -1323,31 +1323,31 @@ impl Metrics {
         );
     }
 
-    /// Record the aggregate counters that accompany one timed guardrail
-    /// execution. Keeping this beside the per-guardrail histogram makes the
-    /// three families share the same all-endpoint coverage.
-    fn record_guardrail_outcome(&self, result: &str, error_type: Option<&str>) {
-        if result == "blocked" {
-            self.cached_counter(
-                M_GUARDRAIL_BLOCKS_TOTAL,
-                1,
-                |_| {},
-                || metrics::counter!(M_GUARDRAIL_BLOCKS_TOTAL),
-            );
-        }
-        if let ("bypassed", Some(reason)) = (result, error_type) {
-            self.cached_counter(
-                M_GUARDRAIL_BYPASSES_TOTAL,
-                1,
-                |k| k.label(reason),
-                || {
-                    metrics::counter!(
-                        M_GUARDRAIL_BYPASSES_TOTAL,
-                        "reason" => reason.to_string(),
-                    )
-                },
-            );
-        }
+    /// Count one request rejected by guardrail enforcement. The terminal
+    /// UsageEvent path calls this exactly once, including refusals that happen
+    /// before a guardrail member executes (for example a streamed-output
+    /// buffer overflow).
+    pub fn record_guardrail_blocked_request(&self) {
+        self.cached_counter(
+            M_GUARDRAIL_BLOCKS_TOTAL,
+            1,
+            |_| {},
+            || metrics::counter!(M_GUARDRAIL_BLOCKS_TOTAL),
+        );
+    }
+
+    fn record_guardrail_bypass_execution(&self, reason: &str) {
+        self.cached_counter(
+            M_GUARDRAIL_BYPASSES_TOTAL,
+            1,
+            |k| k.label(reason),
+            || {
+                metrics::counter!(
+                    M_GUARDRAIL_BYPASSES_TOTAL,
+                    "reason" => reason.to_string(),
+                )
+            },
+        );
     }
 
     /// Record one guardrail member execution on
@@ -1379,7 +1379,9 @@ impl Metrics {
                 )
             },
         );
-        self.record_guardrail_outcome(exec.result, exec.error_type);
+        if let ("bypassed", Some(reason)) = (exec.result, exec.error_type) {
+            self.record_guardrail_bypass_execution(reason);
+        }
     }
 
     /// Count one rate-limit rejection. `scope` is the exceeded
@@ -3660,6 +3662,9 @@ mod tests {
     #[test]
     fn guardrail_outcome_counters_increment() {
         let m = Metrics::new(false);
+        // Request-level block accounting is separate from timed executions:
+        // this also represents fail-closed paths that never call a member.
+        m.record_guardrail_blocked_request();
         for (result, error_type) in [
             ("blocked", None),
             ("bypassed", Some("bedrock_5xx")),
@@ -3675,7 +3680,8 @@ mod tests {
             });
         }
         let rendered = m.render();
-        // Exactly one block (the clean call must not increment it).
+        // Exactly one request block: the timed blocked execution must not
+        // double-count it.
         assert!(
             rendered.contains(&format!("{M_GUARDRAIL_BLOCKS_TOTAL} 1")),
             "want one block, got:\n{rendered}"

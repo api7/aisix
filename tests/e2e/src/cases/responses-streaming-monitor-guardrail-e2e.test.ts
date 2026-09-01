@@ -72,6 +72,15 @@ function guardrailBody(enforcementMode: "block" | "monitor") {
   };
 }
 
+function counterValue(scrape: string, series: string): number {
+  return scrape
+    .split("\n")
+    .filter((line) => line === series || line.startsWith(`${series} `))
+    .map((line) => Number(line.trim().split(/\s+/).at(-1)))
+    .filter((value) => !Number.isNaN(value))
+    .reduce((sum, value) => sum + value, 0);
+}
+
 describe("responses streaming with monitor-mode output guardrail (AISIX-Cloud#1010)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
@@ -142,10 +151,17 @@ describe("responses streaming with monitor-mode output guardrail (AISIX-Cloud#10
       const { status } = await streamOnce();
       return status === 422;
     });
+    const metricsBefore = await (await fetch(`${app.metricsUrl}/metrics`)).text();
     const blocked = await streamOnce();
     expect(blocked.status).toBe(422);
     expect(blocked.body).toContain("content_filter");
     expect(blocked.body).not.toContain(DELTA_TEXT);
+    const metricsAfter = await (await fetch(`${app.metricsUrl}/metrics`)).text();
+    expect(
+      counterValue(metricsAfter, "aisix_guardrail_blocks_total") -
+        counterValue(metricsBefore, "aisix_guardrail_blocks_total"),
+      "buffer-cap fail-closed is still a guardrail-blocked request even though no member executed",
+    ).toBe(1);
 
     // 2. Flip the SAME rule to monitor (full-resource PUT).
     await seed.update("guardrails", guardrailId, guardrailBody("monitor"));
