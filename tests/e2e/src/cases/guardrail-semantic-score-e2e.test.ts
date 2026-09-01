@@ -9,6 +9,7 @@ import {
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
+  slsLogsFor,
   waitForSlsLog,
   type MockSls,
   type OpenAiUpstream,
@@ -400,20 +401,27 @@ describe("semantic guardrail similarity scores on usage events", () => {
     // would let anyone with log access enumerate the operator's deny list
     // by reading it; an echoed candidate would make the telemetry a copy of
     // user prompts (#153).
-    // Its own traffic, so the case does not inherit rows from the tests
-    // above and does not become order-dependent.
+    // Its own traffic, so the case stands alone in any order — then it
+    // asserts over EVERY row the exporter has accumulated, not the two it
+    // just produced. `waitForSlsLog` returns the FIRST match, so a
+    // predicate written against these requests would have read the rows an
+    // earlier case left behind and the assertion would have been about
+    // whichever row happened to come first. Sweeping all of them removes
+    // the question and is the stronger claim anyway: no exported row may
+    // carry this text, whatever produced it.
     expect(await chat(ENFORCE_MODEL, BLOCKING_PROMPT)).toBe(422);
     expect(await chat(ENFORCE_MODEL, NEAR_MISS_PROMPT)).toBe(200);
-    const rows = [
-      await row(
-        (l) => forModel(ENFORCE_MODEL)(l) && l.get("guardrail_blocked") === "true",
-        "the blocked row",
-      ),
-      await row(
-        (l) => forModel(ENFORCE_MODEL)(l) && l.get("guardrail_blocked") === "false",
-        "the allowed row",
-      ),
-    ];
+    await row(
+      (l) => forModel(ENFORCE_MODEL)(l) && l.get("guardrail_blocked") === "true",
+      "a blocked row to sweep",
+    );
+    await row(
+      (l) => forModel(ENFORCE_MODEL)(l) && l.get("guardrail_blocked") === "false",
+      "an allowed row to sweep",
+    );
+
+    const rows = slsLogsFor(sls, META_LOGSTORE);
+    expect(rows.length).toBeGreaterThanOrEqual(2);
     for (const log of rows) {
       const text = [...log.entries()].map(([k, v]) => `${k}=${v}`).join("\n");
       for (const secret of [...DENY_EXAMPLES, BLOCKING_PROMPT, NEAR_MISS_PROMPT]) {

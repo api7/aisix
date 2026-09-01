@@ -526,9 +526,11 @@ fn build_one_inner(
                 });
             }
             // Compiling here (rather than on the first request that hits
-            // the row) is what turns a script typo into a rejected
-            // resource the operator sees at save time. It parses only —
-            // nothing the operator wrote runs on the config-apply path.
+            // the row) keeps the refusal off the request path: it parses
+            // only, so nothing the operator wrote runs on the config-apply
+            // path. The refusal itself is a warn line — `aisix validate` is
+            // what turns it into a report, and cp-api's own esbuild pass is
+            // what catches it at save time.
             let g = crate::custom::CustomGuardrail::new(
                 row.name.clone(),
                 cfg,

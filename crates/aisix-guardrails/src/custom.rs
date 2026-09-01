@@ -55,15 +55,18 @@
 //! tight loop that never yields. `timeout_ms` arms both.
 //!
 //! The script is parsed once at chain-build time, WITHOUT being evaluated
-//! ([`validate`]) — so a syntax error surfaces when the row lands rather
-//! than on the first request that hits it, and no operator code runs on
-//! the config-apply path.
+//! ([`validate`]) — one parse per chain build rather than one per request,
+//! and no operator code runs on the config-apply path.
 //!
-//! Where it surfaces depends on the source, and it is NOT
-//! `rejected_resources`: that list is written by the loader, which never
-//! sees a build failure. `aisix validate` reports the row through
-//! `unbuildable_guardrail_rows`; on the etcd path the row is dropped with
-//! a warn and the config status stays `synced`.
+//! Where the failure surfaces depends on the ENTRY POINT, not the source,
+//! and it is never `rejected_resources`: that list is written by the
+//! loader, which never sees a build failure. `aisix validate` reports the
+//! row through `unbuildable_guardrail_rows` and exits non-zero. A serving
+//! gateway only warns — in the boot log for a `resources_file` node, and
+//! for an etcd one on the first request after the snapshot version moves,
+//! because `LiveGuardrailIndex` rebuilds lazily rather than when the row
+//! lands. The config status stays `synced` either way. cp-api's own
+//! esbuild pass is what catches the common case at save time.
 //!
 //! Each invocation gets a brand-new runtime and context (~215µs), so no
 //! state survives between requests and the memory ceiling applies per call.
@@ -703,8 +706,9 @@ impl Guardrail for CustomGuardrail {
 /// Parse a script and report whether it is a well-formed ES module.
 ///
 /// Declaring a module parses it without evaluating it, so validation never
-/// runs a line the operator wrote. Used by the chain builder to turn a
-/// script typo into a rejected resource at save time.
+/// runs a line the operator wrote. Used by the chain builder to refuse a
+/// script that does not compile; see the module docs for where that refusal
+/// is visible (it is not `rejected_resources`).
 pub fn validate(script: &str) -> Result<(), CompileError> {
     let runtime = rquickjs::Runtime::new().map_err(|e| CompileError::Engine(e.to_string()))?;
     let context =

@@ -1517,10 +1517,11 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                     // Be precise about what that buys, because it is less
                     // than it sounds: `unbuildable_guardrail_rows` has ONE
                     // caller, inside `run_validate`, so the report is an
-                    // `aisix validate` fact. On the etcd path a build refusal
-                    // is a warn line and nothing more — `/status/config`'s
-                    // `rejected` is written only by the loader, which never
-                    // sees a build failure. Both outcomes leave the row
+                    // `aisix validate` fact. On a SERVING gateway — either
+                    // source — a build refusal is a warn line and nothing
+                    // more: `/status/config`'s `rejected` is written only by
+                    // the loader, which never sees a build failure. Both
+                    // outcomes leave the row
                     // screening nothing, so this move trades a load error for
                     // a warn rather than winning enforcement; it is here for
                     // consistency with the two fields above, whose read-path
@@ -4970,7 +4971,8 @@ mod tests {
         // pins the split — and the lenient half is the one that matters,
         // because a row the loader rejects is skipped whole and stops
         // screening, where a row that loads with an empty script is
-        // refused at chain build and reported as unbuildable.
+        // refused at chain build. Both stop screening; `aisix validate`
+        // is the only thing that turns the second into a report.
         let scriptless = json!({"name": "g", "kind": "custom"});
         assert!(
             validate_guardrail(&scriptless).is_err(),
