@@ -15,7 +15,9 @@
 //! 400 with an explanatory message.
 
 use aisix_gateway::{ChatFormat, ChatMessage};
-use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent};
+use aisix_obs::{
+    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent, UsageLabels,
+};
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
@@ -1290,6 +1292,7 @@ async fn responses_to_target(
             let read_to = timeouts.stream;
             let mut buf: Vec<u8> = Vec::new();
             let mut saw_chunk = false;
+            let mut upstream_ttft_ms = 0;
             loop {
                 // #554: bound each read so a stalled upstream fails over —
                 // the buffer path hasn't sent anything to the client yet, so
@@ -1340,6 +1343,14 @@ async fn responses_to_target(
                     })
                     .map_err(ProxyError::Bridge)?;
                 if buf.len() + chunk.len() > max_buffer_bytes {
+                    let remaining = max_buffer_bytes.saturating_sub(buf.len());
+                    if upstream_ttft_ms == 0 && remaining > 0 {
+                        buf.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
+                        if has_complete_responses_sse_event(&buf) {
+                            upstream_ttft_ms =
+                                attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                        }
+                    }
                     // Unlike chat's BufferFull, we always fail closed on
                     // overflow regardless of `on_exceeded_fail_open`: an
                     // output-hook guardrail must not release a response it
@@ -1352,13 +1363,77 @@ async fn responses_to_target(
                         max_buffer_bytes,
                         "streaming /v1/responses output exceeded buffer cap; failing closed",
                     );
-                    return Err(crate::error::guardrail_block_error(
-                        "response",
-                        None,
-                        Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
-                    ));
+                    // At least one upstream frame may already have arrived.
+                    // Return the refusal as a terminal dispatch envelope so
+                    // that measured TTFT is emitted exactly once even though
+                    // the terminal usage frame was never reached.
+                    return Ok(ResponseDispatchSuccess {
+                        response: crate::error::guardrail_block_error(
+                            "response",
+                            None,
+                            Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+                        )
+                        .into_response(),
+                        provider: provider_label,
+                        usage: Some(ResponseUsage {
+                            upstream_ttft_ms,
+                            ..Default::default()
+                        }),
+                        model_id: model_id.to_string(),
+                        provider_key_id: provider_key_id.clone(),
+                        upstream_model: upstream_model.clone(),
+                        routing: RoutingTelemetry::default(),
+                        guardrail_blocked: true,
+                        usage_handled_by_stream: false,
+                        captured_content: match (&captured_prompt, content_cap) {
+                            (Some(prompt), Some(cap)) => {
+                                Some(CapturedContent::new(prompt, "", cap as usize))
+                            }
+                            _ => None,
+                        },
+                        output_redactions: crate::redact::RedactionCounts::new(),
+                        output_monitor_hits: Vec::new(),
+                    });
                 }
                 buf.extend_from_slice(&chunk);
+                if upstream_ttft_ms == 0 && has_complete_responses_sse_event(&buf) {
+                    upstream_ttft_ms =
+                        attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                }
+            }
+            // #808: the whole SSE response is buffered here, so parse its
+            // terminal event for usage and let the handler emit (the body is
+            // a single complete chunk now, not a live stream). Do this before
+            // the guardrail verdict so a billed-then-blocked response keeps
+            // both its token usage and its first-frame latency.
+            //
+            // Token-estimation fallback (AISIX-Cloud#1074): a buffered
+            // stream with zero/missing usage fills the counters locally —
+            // telemetry only, the buffered bytes forward untouched.
+            let mut usage = responses_sse_usage(&buf).unwrap_or_default();
+            usage.upstream_ttft_ms = upstream_ttft_ms;
+            // The usage gate is independent of the id: a stream whose
+            // terminal frame reported no usage still names the upstream
+            // call it was (AISIX-Cloud#1289).
+            if usage.provider_request_id.is_empty() {
+                usage.provider_request_id = responses_sse_provider_request_id(&buf);
+            }
+            if usage.prompt_tokens == 0 || usage.completion_tokens == 0 {
+                let est = crate::token_estimate::Estimator::new(
+                    &upstream_model,
+                    crate::token_estimate::PromptInput::Responses(body.clone()),
+                );
+                let filled = crate::token_estimate::fill_missing(
+                    &est,
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    Some(&responses_sse_output_text(&buf)),
+                );
+                if filled.estimated {
+                    usage.prompt_tokens = filled.prompt_tokens;
+                    usage.completion_tokens = filled.completion_tokens;
+                    usage.usage_estimated = true;
+                }
             }
             let out_text = responses_sse_output_text(&buf);
             let synth = synth_chat_response(&upstream_model, out_text);
@@ -1397,11 +1472,34 @@ async fn responses_to_target(
                     reason = %reason,
                     "guardrail blocked streaming /v1/responses response",
                 );
-                return Err(crate::error::guardrail_block_error(
-                    "response",
-                    guardrail_name.as_deref(),
-                    unavailable.as_deref(),
-                ));
+                // The upstream completed and billed this request. Return the
+                // refusal as a successful dispatch envelope so the handler
+                // emits the terminal usage + TTFT observation with status
+                // 422, matching the cross-provider and non-streaming paths.
+                return Ok(ResponseDispatchSuccess {
+                    response: crate::error::guardrail_block_error(
+                        "response",
+                        guardrail_name.as_deref(),
+                        unavailable.as_deref(),
+                    )
+                    .into_response(),
+                    provider: provider_label,
+                    usage: Some(usage),
+                    model_id: model_id.to_string(),
+                    provider_key_id: provider_key_id.clone(),
+                    upstream_model: upstream_model.clone(),
+                    routing: RoutingTelemetry::default(),
+                    guardrail_blocked: true,
+                    usage_handled_by_stream: false,
+                    output_redactions: crate::redact::RedactionCounts::new(),
+                    output_monitor_hits,
+                    captured_content: match (&captured_prompt, content_cap) {
+                        (Some(prompt), Some(cap)) => {
+                            Some(CapturedContent::new(prompt, "", cap as usize))
+                        }
+                        _ => None,
+                    },
+                });
             }
             // #932: the whole SSE response is held here — mask the frames
             // (channel reassembly) before anything reaches the wire.
@@ -1423,40 +1521,6 @@ async fn responses_to_target(
                 requested_model,
                 crate::model_echo::responses_snapshot_model,
             );
-            // #808: the whole SSE response is buffered here, so parse its
-            // terminal event for usage and let the handler emit (the body is
-            // a single complete chunk now, not a live stream).
-            //
-            // Token-estimation fallback (AISIX-Cloud#1074): a buffered
-            // stream with zero/missing usage fills the counters locally —
-            // telemetry only, the buffered bytes forward untouched.
-            let usage = {
-                let mut u = responses_sse_usage(&buf).unwrap_or_default();
-                // The usage gate is independent of the id: a stream whose
-                // terminal frame reported no usage still names the upstream
-                // call it was (AISIX-Cloud#1289).
-                if u.provider_request_id.is_empty() {
-                    u.provider_request_id = responses_sse_provider_request_id(&buf);
-                }
-                if u.prompt_tokens == 0 || u.completion_tokens == 0 {
-                    let est = crate::token_estimate::Estimator::new(
-                        &upstream_model,
-                        crate::token_estimate::PromptInput::Responses(body.clone()),
-                    );
-                    let filled = crate::token_estimate::fill_missing(
-                        &est,
-                        u.prompt_tokens,
-                        u.completion_tokens,
-                        Some(&responses_sse_output_text(&buf)),
-                    );
-                    if filled.estimated {
-                        u.prompt_tokens = filled.prompt_tokens;
-                        u.completion_tokens = filled.completion_tokens;
-                        u.usage_estimated = true;
-                    }
-                }
-                Some(u)
-            };
             // Content capture (AISIX-Cloud#947): the assembled output text,
             // read from the POST-redaction buffer so masked PII stays masked
             // in the exported content.
@@ -1473,7 +1537,7 @@ async fn responses_to_target(
             return Ok(ResponseDispatchSuccess {
                 response,
                 provider: provider_label,
-                usage,
+                usage: Some(usage),
                 model_id: model_id.to_string(),
                 provider_key_id: provider_key_id.clone(),
                 upstream_model: upstream_model.clone(),
@@ -2480,6 +2544,23 @@ fn parse_responses_terminal_usage(json: &Value) -> Option<ResponseUsage> {
     .flatten()
 }
 
+/// Whether the buffered prefix contains at least one complete, parseable
+/// Responses SSE event. Comments, keepalives, `[DONE]`, and partial frames
+/// do not stop the TTFT clock.
+fn has_complete_responses_sse_event(bytes: &[u8]) -> bool {
+    let mut offset = 0;
+    while let Some(end) = crate::messages::find_frame_end(&bytes[offset..]) {
+        let frame = &bytes[offset..offset + end];
+        if crate::messages::extract_sse_data_line(frame)
+            .is_some_and(|data| data != b"[DONE]" && serde_json::from_slice::<Value>(data).is_ok())
+        {
+            return true;
+        }
+        offset += end;
+    }
+    false
+}
+
 /// Scan a fully-buffered Responses-API SSE body for the terminal event's
 /// usage block (#808). Used by the buffered output-guardrail path, which
 /// already holds the whole response. Returns `None` (skip emission, matching
@@ -3201,8 +3282,8 @@ fn emit_usage_event(
     // usage-bearing paths (non-streaming, verbatim streaming, bridge
     // streaming) funnel through here. `requested_model` resolved at dispatch
     // on every path that reaches this emit, so the label is bounded by the
-    // configured model set. The per-key `aisix_llm_*_tokens_total` family
-    // intentionally stays chat/messages-scoped (cross-API audit #646-652).
+    // configured model set. The shared call below also keeps the per-key
+    // `aisix_llm_*_tokens_total` families on the same path.
     // #1002: cache-inclusive total via the shared helper — cache counters are
     // non-zero only on the #825 Anthropic bridge path.
     let total_all = total_tokens_with_cache(
@@ -3212,10 +3293,11 @@ fn emit_usage_event(
         usage.cache_read_tokens,
     );
     let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
+    let caller = owned_caller.as_caller();
     crate::request_metrics::record_usage(
         state,
         "/v1/responses",
-        owned_caller.as_caller(),
+        caller,
         crate::request_metrics::Upstream {
             provider,
             model: requested_model,
@@ -3234,6 +3316,38 @@ fn emit_usage_event(
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );
+    if usage.upstream_ttft_ms > 0 {
+        let (bounded_model, bounded_upstream) =
+            crate::usage_attr::metric_model_label_pair(snap, requested_model, upstream_model);
+        let ttft = Duration::from_millis(u64::from(usage.upstream_ttft_ms));
+        state.metrics.record_request_ttft(
+            LatencyLabels {
+                endpoint: "/v1/responses",
+                model: bounded_model.as_ref(),
+                provider,
+                status: status_code,
+                streaming: true,
+            },
+            ttft,
+        );
+        state.metrics.record_time_to_first_token(
+            UsageLabels {
+                endpoint: "/v1/responses",
+                inbound_protocol: "openai",
+                upstream_protocol: pk.labels().protocol(),
+                provider,
+                model: bounded_model.as_ref(),
+                upstream_model: bounded_upstream.as_ref(),
+                provider_key_id: pk.labels().id(),
+                provider_key_name: pk.labels().name(),
+                api_key_id: caller.api_key_id,
+                team_id: caller.team_id,
+                user_id: caller.user_id,
+                user_name: caller.user_name,
+            },
+            ttft,
+        );
+    }
 }
 
 /// Emit a zero-token `UsageEvent` for a failed / pre-dispatch attempt

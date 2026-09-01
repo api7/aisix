@@ -22,6 +22,11 @@ import {
 // (moderation 5xx + fail_open), and monitor-mode would_block. The series
 // must render as a real bucketed histogram (`_bucket{le=…}`), not a
 // summary, so operators can compute P50/P95/P99.
+//
+// The aggregate block/bypass counters share that same execution chokepoint.
+// A protocol matrix below pins their coverage across Chat Completions,
+// Messages, and Responses; before this regression fix they were emitted by
+// the Chat UsageEvent path alone.
 
 const CALLER = "sk-guardrail-metrics-e2e-caller";
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -34,6 +39,7 @@ const ERROR_MARKER = "moderationfivehundredmarker";
 
 const MODEL_CLEAN = "guardrail-metrics-clean";
 const MODEL_LEAKY = "guardrail-metrics-leaky";
+const MODEL_PROTOCOL_MATRIX = "guardrail-metrics-protocol-matrix";
 
 interface ModerationMock {
   baseUrl: string;
@@ -128,6 +134,25 @@ function guardrailCount(scrape: string, labels: Record<string, string>): number 
   return sum;
 }
 
+function counterValue(
+  scrape: string,
+  series: string,
+  labels: Record<string, string> = {},
+): number {
+  let sum = 0;
+  for (const line of scrape.split("\n")) {
+    if (line !== series && !line.startsWith(`${series}{`) && !line.startsWith(`${series} `)) {
+      continue;
+    }
+    if (!Object.entries(labels).every(([k, v]) => line.includes(`${k}="${v}"`))) {
+      continue;
+    }
+    const value = Number(line.trim().split(/\s+/).at(-1));
+    if (!Number.isNaN(value)) sum += value;
+  }
+  return sum;
+}
+
 describe("guardrail latency metrics e2e: per-execution histogram", () => {
   let app: SpawnedApp | undefined;
   let cleanUpstream: OpenAiUpstream | undefined;
@@ -170,9 +195,22 @@ describe("guardrail latency metrics e2e: per-execution histogram", () => {
         provider_key_id: pk.id,
       });
     }
+    const protocolPk = await seed.createProviderKey({
+      display_name: `${MODEL_PROTOCOL_MATRIX}-pk`,
+      provider: "deepseek",
+      adapter: "openai",
+      secret: "sk-mock",
+      api_base: `${cleanUpstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: MODEL_PROTOCOL_MATRIX,
+      provider: "deepseek",
+      model_name: "deepseek-chat",
+      provider_key_id: protocolPk.id,
+    });
     await seed.createApiKey({
       key_hash: hash(CALLER),
-      allowed_models: [MODEL_CLEAN, MODEL_LEAKY],
+      allowed_models: [MODEL_CLEAN, MODEL_LEAKY, MODEL_PROTOCOL_MATRIX],
     });
 
     // Env-wide guardrails, distinct kinds/phases/modes. The blocking input
@@ -256,6 +294,42 @@ describe("guardrail latency metrics e2e: per-execution histogram", () => {
     expect(caught).toBeInstanceOf(APIError);
     if (!(caught instanceof APIError)) throw new Error("unreachable");
     expect(caught.status).toBe(422);
+  };
+
+  const protocolRequest = async (
+    protocol: "chat" | "messages" | "responses",
+    content: string,
+  ): Promise<Response> => {
+    const request = {
+      chat: {
+        path: "/v1/chat/completions",
+        body: {
+          model: MODEL_PROTOCOL_MATRIX,
+          messages: [{ role: "user", content }],
+        },
+      },
+      messages: {
+        path: "/v1/messages",
+        body: {
+          model: MODEL_PROTOCOL_MATRIX,
+          max_tokens: 16,
+          messages: [{ role: "user", content }],
+        },
+      },
+      responses: {
+        path: "/v1/responses",
+        body: { model: MODEL_PROTOCOL_MATRIX, input: content },
+      },
+    }[protocol];
+    return fetch(`${app!.proxyUrl}${request.path}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER}`,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(request.body),
+    });
   };
 
   test("clean request records result=allowed for every consulted guardrail, as a real bucketed histogram", async (ctx) => {
@@ -409,5 +483,42 @@ describe("guardrail latency metrics e2e: per-execution histogram", () => {
     expect(guardrailCount(after, labels)).toBeGreaterThan(
       guardrailCount(before, labels),
     );
+  });
+
+  test("aggregate block counter covers Chat, Messages, and Responses", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    let body = await scrape();
+    let previous = counterValue(body, "aisix_guardrail_blocks_total");
+    for (const protocol of ["chat", "messages", "responses"] as const) {
+      const res = await protocolRequest(protocol, `matrix ${protocol} ${KW_BLOCK_MARKER}`);
+      await res.text();
+      expect(res.status, `${protocol} block status`).toBe(422);
+      body = await scrape();
+      const current = counterValue(body, "aisix_guardrail_blocks_total");
+      expect(current, `${protocol} block counter`).toBe(previous + 1);
+      previous = current;
+    }
+  });
+
+  test("aggregate bypass counter covers Chat, Messages, and Responses", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const labels = { reason: "openai_moderation_5xx" };
+    let body = await scrape();
+    let previous = counterValue(body, "aisix_guardrail_bypasses_total", labels);
+    for (const protocol of ["chat", "messages", "responses"] as const) {
+      const res = await protocolRequest(protocol, `matrix ${protocol} ${ERROR_MARKER}`);
+      const responseBody = await res.text();
+      expect(res.status, `${protocol} bypass status: ${responseBody}`).toBe(200);
+      body = await scrape();
+      const current = counterValue(body, "aisix_guardrail_bypasses_total", labels);
+      expect(current, `${protocol} bypass counter`).toBe(previous + 1);
+      previous = current;
+    }
   });
 });

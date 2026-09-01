@@ -11,7 +11,8 @@
 //!   That is the full request for a non-streamed response and only time to
 //!   response START for a streamed one; `aisix_request_e2e_latency_seconds`
 //!   is the series that is end-to-end on both. See `request_metrics`.
-//! - `aisix_ratelimit_rejections_total{scope}` — counter for 429 flows.
+//! - `aisix_ratelimit_rejections_total{scope,layer,policy_id}` — counter for
+//!   429 flows.
 //! - `aisix_tokens_consumed_total{provider,model}` — counter of
 //!   `usage.total_tokens` summed across completed calls. Streamed calls are
 //!   included: they contribute from the end-of-stream emit, not at response
@@ -205,14 +206,13 @@ pub const M_BUDGET_DETAILS_PRESENT: &str = "aisix_budget_details_present";
 pub const M_REDIS_FAILURES_TOTAL: &str = "aisix_redis_failures_total";
 pub const M_USAGE_EVENT_DROPS_TOTAL: &str = "aisix_usage_event_drops_total";
 /// Guardrail outcomes (#379 observability). `aisix_guardrail_blocks_total`
-/// counts requests a guardrail rejected (input or output hook; policy or
-/// fail-closed combined). `aisix_guardrail_bypasses_total` counts fail-open
-/// events — a remote-API guardrail's upstream was unreachable but `fail_open`
-/// let the request through — sliced by the bounded DP-internal `reason`
-/// (e.g. `bedrock_5xx` / `bedrock_timeout` / `bedrock_throttled`).
-///
-/// Scope: recorded for `/v1/chat/completions` only until #519 brings the
-/// `/v1/messages` path in — read these as chat-path, not gateway-wide.
+/// counts requests rejected by guardrail enforcement, including fail-closed
+/// paths such as a streaming buffer overflow that happen before a guardrail
+/// member executes. `aisix_guardrail_bypasses_total` counts fail-open
+/// executions — a remote-API guardrail's upstream was unreachable but
+/// `fail_open` let the request through — sliced by the bounded DP-internal
+/// `reason` (e.g. `bedrock_5xx` / `bedrock_timeout` /
+/// `bedrock_throttled`).
 pub const M_GUARDRAIL_BLOCKS_TOTAL: &str = "aisix_guardrail_blocks_total";
 pub const M_GUARDRAIL_BYPASSES_TOTAL: &str = "aisix_guardrail_bypasses_total";
 
@@ -253,12 +253,11 @@ pub const M_AUTH_DECISIONS_TOTAL: &str = "aisix_auth_decisions_total";
 /// there is no separate `aisix_guardrail_requests_total` (LiteLLM's
 /// `litellm_guardrail_requests_total` equivalent = `sum by (...)` of it).
 pub const M_GUARDRAIL_LATENCY_SECONDS: &str = "aisix_guardrail_latency_seconds";
-/// Issue #408: counter for UsageEvents successfully enqueued onto the
-/// `UsageSink` (i.e. handed off to the telemetry worker for delivery
-/// to cp-api + per-env OTLP exporters). Operators slice this by:
-/// - `handler`: which OpenAI-shape handler emitted (chat /
-///   embeddings / responses / completions / rerank / audio /
-///   images / messages). Fixed enumeration, low cardinality.
+/// Issue #408: counter for UsageEvent emission attempts, incremented before
+/// the `UsageSink` accepts or rejects the event. Operators slice this by:
+/// - `handler`: the bounded handler family that emitted the event (for
+///   example `chat`, `messages`, `count_tokens`, `responses`, `mcp`, or
+///   `passthrough_route`). Fixed enumeration, low cardinality.
 /// - `status_code`: bucketed as `2xx` / `4xx` / `5xx`.
 /// - `status`: the raw code (`429`, `502`, ...), so a query can name one
 ///   failure mode instead of a whole family (AISIX-Cloud#1389). Named to
@@ -273,8 +272,8 @@ pub const M_GUARDRAIL_LATENCY_SECONDS: &str = "aisix_guardrail_latency_seconds";
 ///   their display name, from [`UsageEventLabels`]. Both come off one
 ///   ApiKey row, so the name is determined by the id and the pair is one
 ///   series, not one per name.
-/// - `inbound_protocol`: `openai` / `anthropic`. Matches the
-///   wire-level field on UsageEvent.
+/// - `inbound_protocol`: `openai` / `anthropic` / `mcp` / `other`, with
+///   non-HTTP and tunnel protocols folded into the bounded `other` bucket.
 /// - `upstream_protocol`: the wire protocol of the ProviderKey the event
 ///   was attributed to, so this family joins with the request and usage
 ///   families on that dimension (AISIX-Cloud#1403). Read off the SAME
@@ -1324,32 +1323,31 @@ impl Metrics {
         );
     }
 
-    /// Record one request's guardrail outcome. Called once per request from
-    /// the centralised telemetry emit, using the same data as the UsageEvent's
-    /// `guardrail_blocked` / `guardrail_bypassed_reason` fields. An empty
-    /// `bypass_reason` means no bypass occurred.
-    pub fn record_guardrail_outcome(&self, blocked: bool, bypass_reason: &str) {
-        if blocked {
-            self.cached_counter(
-                M_GUARDRAIL_BLOCKS_TOTAL,
-                1,
-                |_| {},
-                || metrics::counter!(M_GUARDRAIL_BLOCKS_TOTAL),
-            );
-        }
-        if !bypass_reason.is_empty() {
-            self.cached_counter(
-                M_GUARDRAIL_BYPASSES_TOTAL,
-                1,
-                |k| k.label(bypass_reason),
-                || {
-                    metrics::counter!(
-                        M_GUARDRAIL_BYPASSES_TOTAL,
-                        "reason" => bypass_reason.to_string(),
-                    )
-                },
-            );
-        }
+    /// Count one request rejected by guardrail enforcement. The terminal
+    /// UsageEvent path calls this exactly once, including refusals that happen
+    /// before a guardrail member executes (for example a streamed-output
+    /// buffer overflow).
+    pub fn record_guardrail_blocked_request(&self) {
+        self.cached_counter(
+            M_GUARDRAIL_BLOCKS_TOTAL,
+            1,
+            |_| {},
+            || metrics::counter!(M_GUARDRAIL_BLOCKS_TOTAL),
+        );
+    }
+
+    fn record_guardrail_bypass_execution(&self, reason: &str) {
+        self.cached_counter(
+            M_GUARDRAIL_BYPASSES_TOTAL,
+            1,
+            |k| k.label(reason),
+            || {
+                metrics::counter!(
+                    M_GUARDRAIL_BYPASSES_TOTAL,
+                    "reason" => reason.to_string(),
+                )
+            },
+        );
     }
 
     /// Record one guardrail member execution on
@@ -1381,6 +1379,9 @@ impl Metrics {
                 )
             },
         );
+        if let ("bypassed", Some(reason)) = (exec.result, exec.error_type) {
+            self.record_guardrail_bypass_execution(reason);
+        }
     }
 
     /// Count one rate-limit rejection. `scope` is the exceeded
@@ -2372,12 +2373,12 @@ impl Metrics {
     ///
     /// The surface labels are `&'static str` so prometheus cardinality is
     /// type-system-bounded:
-    /// - `handler`: OpenAI-shape endpoint name (`chat`, `embeddings`,
-    ///   `messages`, etc.)
+    /// - `handler`: bounded handler family (`chat`, `embeddings`,
+    ///   `messages`, `mcp`, etc.)
     /// - `status_code`: bucketed by `status_bucket()` (one of `2xx` /
     ///   `3xx` / `4xx` / `5xx` / `other`) — never a raw u16
     /// - `inbound_protocol`: normalised by the caller to one of
-    ///   `"openai"` / `"anthropic"` / `"other"` (audit MEDIUM-3 —
+    ///   `"openai"` / `"anthropic"` / `"mcp"` / `"other"` (audit MEDIUM-3 —
     ///   `&'static str` here prevents user-controlled cardinality)
     ///
     /// [`UsageEventLabels`] adds the model, the ProviderKey the event was
@@ -3661,11 +3662,26 @@ mod tests {
     #[test]
     fn guardrail_outcome_counters_increment() {
         let m = Metrics::new(false);
-        m.record_guardrail_outcome(true, ""); // blocked, no bypass
-        m.record_guardrail_outcome(false, "bedrock_5xx"); // fail-open bypass
-        m.record_guardrail_outcome(false, ""); // clean request → records nothing
+        // Request-level block accounting is separate from timed executions:
+        // this also represents fail-closed paths that never call a member.
+        m.record_guardrail_blocked_request();
+        for (result, error_type) in [
+            ("blocked", None),
+            ("bypassed", Some("bedrock_5xx")),
+            ("allowed", None),
+        ] {
+            m.record_guardrail_execution(&aisix_core::GuardrailExecution {
+                guardrail_name: "policy",
+                kind: "bedrock",
+                phase: "input",
+                result,
+                error_type,
+                elapsed: Duration::from_millis(1),
+            });
+        }
         let rendered = m.render();
-        // Exactly one block (the clean call must not increment it).
+        // Exactly one request block: the timed blocked execution must not
+        // double-count it.
         assert!(
             rendered.contains(&format!("{M_GUARDRAIL_BLOCKS_TOTAL} 1")),
             "want one block, got:\n{rendered}"

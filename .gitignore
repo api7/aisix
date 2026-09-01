@@ -1,5 +1,6 @@
 # Rust
 /target
+/target-anon
 # PGO phase target dirs (native runs of the three-phase release recipe)
 /target-pgo-gen
 /target-pgo
