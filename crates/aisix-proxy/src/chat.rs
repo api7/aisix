@@ -1097,16 +1097,16 @@ fn cache_inclusive_total(
 }
 
 #[derive(Clone)]
-struct EffectiveSubcallUsage {
-    usage: aisix_gateway::chat::UsageStats,
-    estimated: bool,
+pub(crate) struct EffectiveSubcallUsage {
+    pub(crate) usage: aisix_gateway::chat::UsageStats,
+    pub(crate) estimated: bool,
 }
 
 /// Resolve one ensemble sub-call's final accounting once, then share it
 /// between its UsageEvent, request-level Prometheus aggregate, and quota
 /// commit. The client-facing response still carries only upstream-reported
 /// usage; local estimates remain telemetry-only.
-fn effective_subcall_usage(
+pub(crate) fn effective_subcall_usage(
     req: &ChatFormat,
     model: &str,
     reported: &aisix_gateway::chat::UsageStats,
@@ -3404,6 +3404,13 @@ async fn dispatch_ensemble(
             None => (String::new(), String::new(), display_name.to_string()),
         }
     };
+    let effective_panel_member_usage =
+        |member: &crate::ensemble::PanelOutcome| -> EffectiveSubcallUsage {
+            EffectiveSubcallUsage {
+                usage: member.effective_usage.clone(),
+                estimated: member.usage_estimated,
+            }
+        };
     // Emit one usage event for a single (already-billed) panel member.
     // Defined before the `run_ensemble` match so the InsufficientPanel arm
     // can bill the survivors too — they hit upstream just like a full panel.
@@ -3415,17 +3422,12 @@ async fn dispatch_ensemble(
                              prepared: Option<&EffectiveSubcallUsage>,
                              blocked: bool,
                              bypass: &str| {
-        let (sub_model_id, sub_provider_key_id, sub_upstream_model) = resolve_sub(&member.model);
+        let (sub_model_id, sub_provider_key_id, _) = resolve_sub(&member.model);
         let computed;
         let effective = match prepared {
             Some(usage) => usage,
             None => {
-                computed = effective_subcall_usage(
-                    req,
-                    &sub_upstream_model,
-                    &member.usage,
-                    &member.est_output_text,
-                );
+                computed = effective_panel_member_usage(member);
                 &computed
             }
         };
@@ -3465,6 +3467,15 @@ async fn dispatch_ensemble(
             audit,
         );
     };
+    // Failure exits bill every successful panel member even when the
+    // upstream omitted usage. Share the same normalized accounting used by
+    // UsageEvent emission so quota and telemetry cannot diverge.
+    let survivor_total = |panel: &[crate::ensemble::PanelOutcome]| -> u64 {
+        panel
+            .iter()
+            .map(|member| u64::from(effective_panel_member_usage(member).usage.total_tokens))
+            .sum()
+    };
 
     let caller = crate::ensemble::ProxyModelCaller {
         state,
@@ -3502,20 +3513,6 @@ async fn dispatch_ensemble(
         // inline FIRST (mirroring the non-streaming ensemble path), then calls
         // this for the emit + `DispatchFailure`. `panel` is borrowed so the
         // call site still owns it to compute `survivor_total`.
-        let survivor_total = |panel: &[crate::ensemble::PanelOutcome]| -> u64 {
-            panel
-                .iter()
-                .map(|p| {
-                    cache_inclusive_total(
-                        u64::from(p.usage.total_tokens),
-                        p.usage.prompt_tokens,
-                        p.usage.completion_tokens,
-                        p.usage.cache_creation_tokens,
-                        p.usage.cache_read_tokens,
-                    )
-                })
-                .sum()
-        };
         let emit_panel_then_fail =
             |panel: &[crate::ensemble::PanelOutcome], proxy_err: ProxyError| -> DispatchFailure {
                 for (index, member) in panel.iter().enumerate() {
@@ -3661,11 +3658,9 @@ async fn dispatch_ensemble(
         // this frame — it fires on stream drop), so the `emit_panel_member` /
         // `resolve_sub` borrowing closures above are unusable inside it. Clone
         // the per-member + judge telemetry inputs up front.
-        // The `'static` on_complete closure cannot borrow `req`. Resolve
-        // each panel member's estimation fallback now so its UsageEvent,
-        // request-level aggregate, and quota commit all consume the same
-        // final counters.
-        let req_for_panel_est = req.clone();
+        // Copy the accounting already resolved by `ProxyModelCaller` so
+        // member quota, parent quota, UsageEvent, and Prometheus share the
+        // same counters inside the `'static` completion closure.
         struct PanelTelem {
             model_id: String,
             provider_key_id: String,
@@ -3676,19 +3671,13 @@ async fn dispatch_ensemble(
         let panel_telem: Vec<PanelTelem> = panel
             .iter()
             .map(|p| {
-                let (model_id, provider_key_id, est_model) = resolve_sub(&p.model);
-                let effective = effective_subcall_usage(
-                    &req_for_panel_est,
-                    &est_model,
-                    &p.usage,
-                    &p.est_output_text,
-                );
+                let (model_id, provider_key_id, _) = resolve_sub(&p.model);
                 PanelTelem {
                     model_id,
                     provider_key_id,
                     attempt_model: p.model.clone(),
-                    usage: effective.usage,
-                    usage_estimated: effective.estimated,
+                    usage: p.effective_usage.clone(),
+                    usage_estimated: p.usage_estimated,
                 }
             })
             .collect();
@@ -4093,19 +4082,7 @@ async fn dispatch_ensemble(
                     )),
                 ),
             };
-            let survivor_total: u64 = panel
-                .iter()
-                .map(|p| {
-                    cache_inclusive_total(
-                        u64::from(p.usage.total_tokens),
-                        p.usage.prompt_tokens,
-                        p.usage.completion_tokens,
-                        p.usage.cache_creation_tokens,
-                        p.usage.cache_read_tokens,
-                    )
-                })
-                .sum();
-            reservation.commit_tokens(survivor_total).await;
+            reservation.commit_tokens(survivor_total(&panel)).await;
             for (index, member) in panel.iter().enumerate() {
                 emit_panel_member(
                     member, index, None, /* blocked */ false, /* bypass */ "",
@@ -4126,18 +4103,12 @@ async fn dispatch_ensemble(
     let effective_panel: Vec<EffectiveSubcallUsage> = outcome
         .panel
         .iter()
-        .map(|member| {
-            let (_, _, upstream_model) = resolve_sub(&member.model);
-            effective_subcall_usage(req, &upstream_model, &member.usage, &member.est_output_text)
-        })
+        .map(effective_panel_member_usage)
         .collect();
-    let (_, _, judge_upstream_model) = resolve_sub(&outcome.judge_model);
-    let effective_judge = effective_subcall_usage(
-        &outcome.judge_req,
-        &judge_upstream_model,
-        &judge_usage,
-        &estimation_output_text(&outcome.response),
-    );
+    let effective_judge = EffectiveSubcallUsage {
+        usage: outcome.judge_effective_usage.clone(),
+        estimated: outcome.judge_usage_estimated,
+    };
     let panel_total: u64 = effective_panel
         .iter()
         .map(|u| u64::from(u.usage.total_tokens))

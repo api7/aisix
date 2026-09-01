@@ -235,6 +235,22 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
     return res.text();
   }
 
+  async function appliedConfig(): Promise<
+    | { applySeq: number; resourceCounts: Record<string, number> }
+    | undefined
+  > {
+    const res = await fetch(`${app!.metricsUrl}/status/config`);
+    if (!res.ok) return undefined;
+    const body = (await res.json()) as {
+      applied?: { apply_seq?: number; resource_counts?: Record<string, number> };
+    };
+    if (typeof body.applied?.apply_seq !== "number") return undefined;
+    return {
+      applySeq: body.applied.apply_seq,
+      resourceCounts: body.applied.resource_counts ?? {},
+    };
+  }
+
   async function responses(model: string): Promise<Response> {
     const res = await fetch(`${app!.proxyUrl}/v1/responses`, {
       method: "POST",
@@ -473,12 +489,18 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
       kind: "keyword",
       patterns: [{ kind: "literal", value: pattern }],
     });
+    const beforeCreate = await appliedConfig();
+    expect(beforeCreate).toBeDefined();
     const guardrail = await seed.createGuardrail(guardrailBody("native reply"));
 
-    // A 422 proves the output rule has propagated and the native Responses
-    // stream took the whole-response hold-back path.
     await waitConfigPropagation(async () => {
-      return (await responses(RESPONSES_NATIVE_MODEL)).status === 422;
+      const applied = await appliedConfig();
+      return (
+        applied !== undefined &&
+        applied.applySeq > beforeCreate!.applySeq &&
+        applied.resourceCounts.guardrails === 1 &&
+        applied.resourceCounts.guardrail_attachments === 1
+      );
     });
 
     const assertDelta = async (status: number, statusClass: "2xx" | "4xx") => {
@@ -519,13 +541,16 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
 
     await assertDelta(422, "4xx");
 
+    const beforeUpdate = await appliedConfig();
+    expect(beforeUpdate).toBeDefined();
     await seed.update(
       "guardrails",
       guardrail.id as string,
       guardrailBody("never-matches-native-response"),
     );
     await waitConfigPropagation(async () => {
-      return (await responses(RESPONSES_NATIVE_MODEL)).status === 200;
+      const applied = await appliedConfig();
+      return applied !== undefined && applied.applySeq > beforeUpdate!.applySeq;
     });
     await assertDelta(200, "2xx");
   });

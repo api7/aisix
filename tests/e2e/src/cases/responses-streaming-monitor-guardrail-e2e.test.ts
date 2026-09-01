@@ -81,6 +81,25 @@ function counterValue(scrape: string, series: string): number {
     .reduce((sum, value) => sum + value, 0);
 }
 
+function metricValue(
+  scrape: string,
+  series: string,
+  labels: Record<string, string>,
+): number {
+  return scrape
+    .split("\n")
+    .filter(
+      (line) =>
+        line.startsWith(`${series}{`) &&
+        Object.entries(labels).every(([key, value]) =>
+          line.includes(`${key}="${value}"`),
+        ),
+    )
+    .map((line) => Number(line.trim().split(/\s+/).at(-1)))
+    .filter((value) => !Number.isNaN(value))
+    .reduce((sum, value) => sum + value, 0);
+}
+
 describe("responses streaming with monitor-mode output guardrail (AISIX-Cloud#1010)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
@@ -151,17 +170,67 @@ describe("responses streaming with monitor-mode output guardrail (AISIX-Cloud#10
       const { status } = await streamOnce();
       return status === 422;
     });
-    const metricsBefore = await (await fetch(`${app.metricsUrl}/metrics`)).text();
+    const metricsBeforeResponse = await fetch(`${app.metricsUrl}/metrics`);
+    expect(metricsBeforeResponse.status).toBe(200);
+    const metricsBefore = await metricsBeforeResponse.text();
     const blocked = await streamOnce();
     expect(blocked.status).toBe(422);
     expect(blocked.body).toContain("content_filter");
     expect(blocked.body).not.toContain(DELTA_TEXT);
-    const metricsAfter = await (await fetch(`${app.metricsUrl}/metrics`)).text();
+    const metricsAfterResponse = await fetch(`${app.metricsUrl}/metrics`);
+    expect(metricsAfterResponse.status).toBe(200);
+    const metricsAfter = await metricsAfterResponse.text();
     expect(
       counterValue(metricsAfter, "aisix_guardrail_blocks_total") -
         counterValue(metricsBefore, "aisix_guardrail_blocks_total"),
       "buffer-cap fail-closed is still a guardrail-blocked request even though no member executed",
     ).toBe(1);
+    const lowCardLabels = {
+      endpoint: "/v1/responses",
+      model: "gr-1010-model",
+      provider: "openai",
+      streaming: "true",
+      status_class: "4xx",
+    };
+    expect(
+      metricValue(metricsAfter, "aisix_request_ttft_seconds_count", lowCardLabels) -
+        metricValue(metricsBefore, "aisix_request_ttft_seconds_count", lowCardLabels),
+    ).toBe(1);
+    expect(
+      metricValue(metricsAfter, "aisix_request_ttft_seconds_sum", lowCardLabels) -
+        metricValue(metricsBefore, "aisix_request_ttft_seconds_sum", lowCardLabels),
+    ).toBeGreaterThan(0);
+    const detailedLabels = {
+      endpoint: "/v1/responses",
+      model: "gr-1010-model",
+      provider: "openai",
+      inbound_protocol: "openai",
+      upstream_protocol: "openai",
+    };
+    expect(
+      metricValue(
+        metricsAfter,
+        "aisix_llm_time_to_first_token_seconds_count",
+        detailedLabels,
+      ) -
+        metricValue(
+          metricsBefore,
+          "aisix_llm_time_to_first_token_seconds_count",
+          detailedLabels,
+        ),
+    ).toBe(1);
+    expect(
+      metricValue(
+        metricsAfter,
+        "aisix_llm_time_to_first_token_seconds_sum",
+        detailedLabels,
+      ) -
+        metricValue(
+          metricsBefore,
+          "aisix_llm_time_to_first_token_seconds_sum",
+          detailedLabels,
+        ),
+    ).toBeGreaterThan(0);
 
     // 2. Flip the SAME rule to monitor (full-resource PUT).
     await seed.update("guardrails", guardrailId, guardrailBody("monitor"));

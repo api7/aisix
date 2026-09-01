@@ -24,6 +24,12 @@ const NONSTREAM_MODEL = "prom-ensemble-nonstream";
 const STREAM_MODEL = "prom-ensemble-stream";
 const NONSTREAM_ESTIMATED_MODEL = "prom-ensemble-nonstream-estimated";
 const STREAM_ESTIMATED_MODEL = "prom-ensemble-stream-estimated";
+const NONSTREAM_FAILED_ESTIMATED_MODEL = "prom-ensemble-nonstream-failed-estimated";
+const STREAM_FAILED_ESTIMATED_MODEL = "prom-ensemble-stream-failed-estimated";
+const PANEL_MEMBER_QUOTA_MODEL = "prom-ensemble-panel-member-quota";
+const JUDGE_MEMBER_QUOTA_MODEL = "prom-ensemble-judge-member-quota";
+const NONSTREAM_FAILURE_CALLER = "sk-ensemble-failed-nonstream";
+const STREAM_FAILURE_CALLER = "sk-ensemble-failed-stream";
 
 const PANEL_USAGE = { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 };
 const JUDGE_USAGE = { prompt_tokens: 7, completion_tokens: 11, total_tokens: 18 };
@@ -120,6 +126,20 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
     const judgeNoUsage = await startOpenAiUpstream({
       nonStreamBody: chatBody("chatcmpl-judge-est", "estimated buffered synthesis"),
     });
+    const judgeFailure = await startOpenAiUpstream({
+      status: 500,
+      errorBody: { error: { message: "judge unavailable", type: "server_error" } },
+    });
+    const panelFailure = await startOpenAiUpstream({
+      status: 500,
+      errorBody: { error: { message: "panel unavailable", type: "server_error" } },
+    });
+    const quotaPanel = await startOpenAiUpstream({
+      nonStreamBody: chatBody("chatcmpl-panel-quota", "estimated quota panel answer"),
+    });
+    const quotaJudge = await startOpenAiUpstream({
+      nonStreamBody: chatBody("chatcmpl-judge-quota", "estimated quota synthesis"),
+    });
     upstreams.push(
       panelA,
       panelB,
@@ -128,11 +148,19 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
       panelNoUsageA,
       panelNoUsageB,
       judgeNoUsage,
+      judgeFailure,
+      panelFailure,
+      quotaPanel,
+      quotaJudge,
     );
 
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
-    const seedDirect = async (displayName: string, upstream: OpenAiUpstream) => {
+    const seedDirect = async (
+      displayName: string,
+      upstream: OpenAiUpstream,
+      extra: Record<string, unknown> = {},
+    ) => {
       const pk = await seed.createProviderKey({
         display_name: `${displayName}-pk`,
         secret: "sk-mock",
@@ -143,6 +171,7 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
         provider: "openai",
         model_name: "gpt-4o-mini",
         provider_key_id: pk.id,
+        ...extra,
       });
     };
     await seedDirect("prom-ensemble-panel-a", panelA);
@@ -152,6 +181,14 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
     await seedDirect("prom-ensemble-panel-est-a", panelNoUsageA);
     await seedDirect("prom-ensemble-panel-est-b", panelNoUsageB);
     await seedDirect("prom-ensemble-judge-est", judgeNoUsage);
+    await seedDirect("prom-ensemble-judge-fail", judgeFailure);
+    await seedDirect("prom-ensemble-panel-fail", panelFailure);
+    await seedDirect("prom-ensemble-panel-quota", quotaPanel, {
+      rate_limit: { tpd: 1 },
+    });
+    await seedDirect("prom-ensemble-judge-quota", quotaJudge, {
+      rate_limit: { tpd: 1 },
+    });
 
     await seed.createModel({
       display_name: NONSTREAM_MODEL,
@@ -191,6 +228,47 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
         min_responses: 2,
       },
     });
+    await seed.createModel({
+      display_name: NONSTREAM_FAILED_ESTIMATED_MODEL,
+      ensemble: {
+        panel: [
+          { model: "prom-ensemble-panel-est-a" },
+          { model: "prom-ensemble-panel-fail" },
+        ],
+        judge: { model: "prom-ensemble-judge-fail" },
+        min_responses: 2,
+      },
+    });
+    await seed.createModel({
+      display_name: STREAM_FAILED_ESTIMATED_MODEL,
+      ensemble: {
+        panel: [
+          { model: "prom-ensemble-panel-est-a" },
+          { model: "prom-ensemble-panel-est-b" },
+        ],
+        judge: { model: "prom-ensemble-judge-fail" },
+        min_responses: 2,
+      },
+    });
+    await seed.createModel({
+      display_name: PANEL_MEMBER_QUOTA_MODEL,
+      ensemble: {
+        panel: [
+          { model: "prom-ensemble-panel-quota" },
+          { model: "prom-ensemble-panel-a" },
+        ],
+        judge: { model: "prom-ensemble-judge-ns" },
+        min_responses: 2,
+      },
+    });
+    await seed.createModel({
+      display_name: JUDGE_MEMBER_QUOTA_MODEL,
+      ensemble: {
+        panel: [{ model: "prom-ensemble-panel-a" }, { model: "prom-ensemble-panel-b" }],
+        judge: { model: "prom-ensemble-judge-quota" },
+        min_responses: 2,
+      },
+    });
     await seed.createApiKey({
       key_hash: CALLER_HASH,
       allowed_models: [
@@ -198,6 +276,10 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
         STREAM_MODEL,
         NONSTREAM_ESTIMATED_MODEL,
         STREAM_ESTIMATED_MODEL,
+        NONSTREAM_FAILED_ESTIMATED_MODEL,
+        STREAM_FAILED_ESTIMATED_MODEL,
+        PANEL_MEMBER_QUOTA_MODEL,
+        JUDGE_MEMBER_QUOTA_MODEL,
         "prom-ensemble-panel-a",
         "prom-ensemble-panel-b",
         "prom-ensemble-judge-ns",
@@ -205,8 +287,26 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
         "prom-ensemble-panel-est-a",
         "prom-ensemble-panel-est-b",
         "prom-ensemble-judge-est",
+        "prom-ensemble-panel-quota",
+        "prom-ensemble-judge-quota",
       ],
     });
+    for (const [caller, model] of [
+      [NONSTREAM_FAILURE_CALLER, NONSTREAM_FAILED_ESTIMATED_MODEL],
+      [STREAM_FAILURE_CALLER, STREAM_FAILED_ESTIMATED_MODEL],
+    ] as const) {
+      await seed.createApiKey({
+        key_hash: createHash("sha256").update(caller).digest("hex"),
+        allowed_models: [
+          model,
+          "prom-ensemble-panel-est-a",
+          "prom-ensemble-panel-est-b",
+          "prom-ensemble-panel-fail",
+          "prom-ensemble-judge-fail",
+        ],
+        rate_limit: { tpd: 1 },
+      });
+    }
 
     const proxy = new ProxyClient(app.proxyUrl, CALLER);
     await waitConfigPropagation(async () => {
@@ -218,6 +318,10 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
         STREAM_MODEL,
         NONSTREAM_ESTIMATED_MODEL,
         STREAM_ESTIMATED_MODEL,
+        NONSTREAM_FAILED_ESTIMATED_MODEL,
+        STREAM_FAILED_ESTIMATED_MODEL,
+        PANEL_MEMBER_QUOTA_MODEL,
+        JUDGE_MEMBER_QUOTA_MODEL,
       ].every((name) =>
         models.some((model) => model.id === name),
       );
@@ -243,6 +347,24 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
     provider_key_id: "unknown",
     provider_key_name: "unknown",
   });
+
+  const ensembleRequest = async (
+    model: string,
+    caller: string,
+    stream: boolean,
+  ): Promise<Response> =>
+    fetch(`${app!.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${caller}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: "bill surviving panel members" }],
+        stream,
+      }),
+    });
 
   test("non-streaming request records the aggregate token counters under the ensemble alias", async (ctx) => {
     if (!etcdReachable || !app) {
@@ -465,5 +587,60 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
           tokenLabels(STREAM_ESTIMATED_MODEL),
         ),
     ).toBeGreaterThan(JUDGE_USAGE.total_tokens);
+  });
+
+  for (const [name, model, caller, stream] of [
+    [
+      "non-streaming",
+      NONSTREAM_FAILED_ESTIMATED_MODEL,
+      NONSTREAM_FAILURE_CALLER,
+      false,
+    ],
+    ["streaming", STREAM_FAILED_ESTIMATED_MODEL, STREAM_FAILURE_CALLER, true],
+  ] as const) {
+    test(`${name} failure commits estimated usage for successful panel members`, async (ctx) => {
+      if (!etcdReachable || !app) {
+        ctx.skip();
+        return;
+      }
+
+      const first = await ensembleRequest(model, caller, stream);
+      await first.text();
+      expect(first.status).toBe(502);
+
+      const second = await ensembleRequest(model, caller, stream);
+      await second.text();
+      expect(second.status).toBe(429);
+    });
+  }
+
+  test("estimated panel usage is committed to the panel member model quota", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+
+    const first = await ensembleRequest(PANEL_MEMBER_QUOTA_MODEL, CALLER, false);
+    await first.text();
+    expect(first.status).toBe(200);
+
+    const second = await ensembleRequest(PANEL_MEMBER_QUOTA_MODEL, CALLER, false);
+    await second.text();
+    expect(second.status).toBe(502);
+  });
+
+  test("estimated judge usage is committed to the judge member model quota", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+
+    const first = await ensembleRequest(JUDGE_MEMBER_QUOTA_MODEL, CALLER, false);
+    await first.text();
+    expect(first.status).toBe(200);
+
+    const second = await ensembleRequest(JUDGE_MEMBER_QUOTA_MODEL, CALLER, false);
+    await second.text();
+    expect(second.status).toBe(429);
   });
 });

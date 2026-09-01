@@ -1343,6 +1343,14 @@ async fn responses_to_target(
                     })
                     .map_err(ProxyError::Bridge)?;
                 if buf.len() + chunk.len() > max_buffer_bytes {
+                    let remaining = max_buffer_bytes.saturating_sub(buf.len());
+                    if upstream_ttft_ms == 0 && remaining > 0 {
+                        buf.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
+                        if has_complete_responses_sse_event(&buf) {
+                            upstream_ttft_ms =
+                                attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                        }
+                    }
                     // Unlike chat's BufferFull, we always fail closed on
                     // overflow regardless of `on_exceeded_fail_open`: an
                     // output-hook guardrail must not release a response it
@@ -1355,16 +1363,42 @@ async fn responses_to_target(
                         max_buffer_bytes,
                         "streaming /v1/responses output exceeded buffer cap; failing closed",
                     );
-                    return Err(crate::error::guardrail_block_error(
-                        "response",
-                        None,
-                        Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
-                    ));
+                    // At least one upstream frame may already have arrived.
+                    // Return the refusal as a terminal dispatch envelope so
+                    // that measured TTFT is emitted exactly once even though
+                    // the terminal usage frame was never reached.
+                    return Ok(ResponseDispatchSuccess {
+                        response: crate::error::guardrail_block_error(
+                            "response",
+                            None,
+                            Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+                        )
+                        .into_response(),
+                        provider: provider_label,
+                        usage: Some(ResponseUsage {
+                            upstream_ttft_ms,
+                            ..Default::default()
+                        }),
+                        model_id: model_id.to_string(),
+                        provider_key_id: provider_key_id.clone(),
+                        upstream_model: upstream_model.clone(),
+                        routing: RoutingTelemetry::default(),
+                        guardrail_blocked: true,
+                        usage_handled_by_stream: false,
+                        captured_content: match (&captured_prompt, content_cap) {
+                            (Some(prompt), Some(cap)) => {
+                                Some(CapturedContent::new(prompt, "", cap as usize))
+                            }
+                            _ => None,
+                        },
+                        output_redactions: crate::redact::RedactionCounts::new(),
+                        output_monitor_hits: Vec::new(),
+                    });
                 }
                 buf.extend_from_slice(&chunk);
                 if upstream_ttft_ms == 0 && has_complete_responses_sse_event(&buf) {
                     upstream_ttft_ms =
-                        send_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                        attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                 }
             }
             // #808: the whole SSE response is buffered here, so parse its
