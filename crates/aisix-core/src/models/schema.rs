@@ -1513,9 +1513,13 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                     // above, and the asymmetry is the point rather than an
                     // oversight. Those two relax on the read path because a
                     // row that loads behaves BETTER than one that vanishes:
-                    // an empty `embedding_model` degrades per `fail_open`,
                     // an absent threshold keeps screening at its stored
-                    // default. A scriptless `custom` row screens nothing
+                    // default, and an empty `embedding_model` REFUSES every
+                    // request in scope rather than admitting it, since
+                    // `fail_open` defaults to false — fail-closed beats the
+                    // row vanishing and letting the traffic through
+                    // unscreened. It costs the `rejected[]` signal, which
+                    // api7/aisix#1084 tracks. A scriptless `custom` row screens nothing
                     // either way, so relaxing it changes no enforcement and
                     // costs the only structured signal there is — the loader
                     // rejects it into `/status/config`'s `rejected[]`,
@@ -3153,7 +3157,7 @@ mod tests {
             "deny_threshold": 0.5
         });
         validate_guardrail_lenient(&modelless)
-            .expect("an unresolvable embedding model degrades per fail_open, it does not vanish");
+            .expect("an unresolvable embedding model refuses per fail_open, it does not vanish");
         assert!(
             validate_guardrail(&modelless).is_err(),
             "but it cannot be SAVED"
@@ -5015,6 +5019,24 @@ mod tests {
         // `script` property is dropped — which would also silently ship a
         // strict branch with no `minLength`, making `""` savable.
         assert_eq!(branch["properties"]["script"]["minLength"], json!(1));
+
+        // …and pin the BEHAVIOUR that keyword produces, not just its
+        // presence. The builder's `trim().is_empty()` guard is reachable
+        // only because a whitespace-only script clears `minLength: 1` while
+        // an empty one does not — neither half was asserted anywhere.
+        let blank = json!({"name": "g", "kind": "custom", "script": ""});
+        assert!(
+            validate_guardrail(&blank).is_err(),
+            "an empty script is not savable"
+        );
+        assert!(
+            validate_guardrail_lenient(&blank).is_err(),
+            "nor loadable — so it never reaches the builder",
+        );
+        let whitespace = json!({"name": "g", "kind": "custom", "script": " "});
+        validate_guardrail(&whitespace).expect("a whitespace-only script clears minLength");
+        validate_guardrail_lenient(&whitespace)
+            .expect("on both sets — which is what makes the builder's trim() guard reachable");
         assert!(
             branch["properties"]["script"].get("default").is_none(),
             "script still advertises a default: {}",

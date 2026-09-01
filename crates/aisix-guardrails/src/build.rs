@@ -517,9 +517,9 @@ fn build_one_inner(
             // A whitespace-only script clears the schema's `minLength: 1`
             // and reaches here; an omitted or empty one is refused by BOTH
             // schemas, so it never gets this far. It must not build: an
-            // empty module parses, exports
-            // no hook, and every hook would return Allow — a row that looks
-            // configured and screens nothing.
+            // empty module parses, exports no hook, and every hook would
+            // return Allow — a row that looks configured and screens
+            // nothing.
             if cfg.script.trim().is_empty() {
                 return Err(BuildError::InvalidValue {
                     field: "script",

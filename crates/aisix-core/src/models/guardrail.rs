@@ -782,10 +782,10 @@ pub struct SemanticConfig {
     /// one against the model named in `embedding_model`, on your own
     /// traffic: a request that emits a usage event reports what it scored
     /// in `guardrail_scores`, including the requests this guardrail
-    /// allowed. Two surfaces carry no scores: `/a2a` emits a usage event
-    /// but attaches no guardrail attribution to it, and `rerank` and
-    /// `responses` emit no usage event at all when the upstream reports no
-    /// usage (api7/aisix#1083).
+    /// allowed. Some surfaces carry no scores, among them `/a2a`, which
+    /// emits a usage event but attaches no guardrail attribution to it, and
+    /// `rerank`, which emits no usage event at all when the upstream
+    /// reports no usage it can parse (api7/aisix#1083).
     // Defaulted at the TYPE level and required by the strict write schema
     // instead, for the reason `embedding_model` gives: rows written before
     // the field was required carry no key at all, and a row the loader
