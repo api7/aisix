@@ -15,7 +15,9 @@
 //! 400 with an explanatory message.
 
 use aisix_gateway::{ChatFormat, ChatMessage};
-use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent};
+use aisix_obs::{
+    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent, UsageLabels,
+};
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
@@ -3201,8 +3203,8 @@ fn emit_usage_event(
     // usage-bearing paths (non-streaming, verbatim streaming, bridge
     // streaming) funnel through here. `requested_model` resolved at dispatch
     // on every path that reaches this emit, so the label is bounded by the
-    // configured model set. The per-key `aisix_llm_*_tokens_total` family
-    // intentionally stays chat/messages-scoped (cross-API audit #646-652).
+    // configured model set. The shared call below also keeps the per-key
+    // `aisix_llm_*_tokens_total` families on the same path.
     // #1002: cache-inclusive total via the shared helper — cache counters are
     // non-zero only on the #825 Anthropic bridge path.
     let total_all = total_tokens_with_cache(
@@ -3212,10 +3214,11 @@ fn emit_usage_event(
         usage.cache_read_tokens,
     );
     let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
+    let caller = owned_caller.as_caller();
     crate::request_metrics::record_usage(
         state,
         "/v1/responses",
-        owned_caller.as_caller(),
+        caller,
         crate::request_metrics::Upstream {
             provider,
             model: requested_model,
@@ -3234,6 +3237,38 @@ fn emit_usage_event(
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );
+    if usage.upstream_ttft_ms > 0 {
+        let (bounded_model, bounded_upstream) =
+            crate::usage_attr::metric_model_label_pair(snap, requested_model, upstream_model);
+        let ttft = Duration::from_millis(u64::from(usage.upstream_ttft_ms));
+        state.metrics.record_request_ttft(
+            LatencyLabels {
+                endpoint: "/v1/responses",
+                model: bounded_model.as_ref(),
+                provider,
+                status: status_code,
+                streaming: true,
+            },
+            ttft,
+        );
+        state.metrics.record_time_to_first_token(
+            UsageLabels {
+                endpoint: "/v1/responses",
+                inbound_protocol: "openai",
+                upstream_protocol: pk.labels().protocol(),
+                provider,
+                model: bounded_model.as_ref(),
+                upstream_model: bounded_upstream.as_ref(),
+                provider_key_id: pk.labels().id(),
+                provider_key_name: pk.labels().name(),
+                api_key_id: caller.api_key_id,
+                team_id: caller.team_id,
+                user_id: caller.user_id,
+                user_name: caller.user_name,
+            },
+            ttft,
+        );
+    }
 }
 
 /// Emit a zero-token `UsageEvent` for a failed / pre-dispatch attempt

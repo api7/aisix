@@ -3631,6 +3631,7 @@ async fn dispatch_ensemble(
             .fold(aisix_gateway::chat::UsageStats::default(), |acc, p| {
                 acc.saturating_add(&p.usage)
             });
+        let panel_usage_for_metrics = panel_usage_sum.clone();
         // The streamed judge estimator keys off `judge_model.upstream_model()`
         // directly (below), so resolve_sub's upstream_model is unused here.
         let (judge_model_id, judge_provider_key_id, _) = resolve_sub(&ensemble_cfg.judge.model);
@@ -3727,6 +3728,24 @@ async fn dispatch_ensemble(
                 // Fresh snapshot at stream end, shared by every emit in this
                 // closure (#941) — see the single-model streaming path.
                 let snap = state_for_telem.snapshot.load();
+                let aggregate_input = panel_usage_for_metrics
+                    .prompt_tokens
+                    .saturating_add(comp.prompt_tokens);
+                let aggregate_output = panel_usage_for_metrics
+                    .completion_tokens
+                    .saturating_add(comp.completion_tokens);
+                let aggregate_total = panel_usage_for_metrics
+                    .total_tokens
+                    .saturating_add(comp.total_tokens.min(u64::from(u32::MAX)) as u32);
+                let aggregate_cached = panel_usage_for_metrics
+                    .cached_prompt_tokens
+                    .saturating_add(comp.cached_prompt_tokens);
+                let aggregate_cache_read = panel_usage_for_metrics
+                    .cache_read_tokens
+                    .saturating_add(comp.cache_read_tokens);
+                let aggregate_cache_creation = panel_usage_for_metrics
+                    .cache_creation_tokens
+                    .saturating_add(comp.cache_creation_tokens);
                 // Telemetry: one event per panel member (attempt_kind "panel",
                 // index 0..N) carrying that member's own buffered usage, then
                 // one judge event (attempt_kind "judge", index N) from the
@@ -3844,6 +3863,41 @@ async fn dispatch_ensemble(
                     /* dispatched */ true,
                     &audit_for_telem,
                 );
+                // The per-sub-call UsageEvents above preserve billing
+                // attribution. Prometheus token families are request-level,
+                // so record the client-visible panel+judge aggregate against
+                // the ensemble alias rather than dropping the request from
+                // those series entirely.
+                let owned_caller =
+                    crate::request_metrics::Caller::from_api_key_id(&snap, &api_key_id_for_telem);
+                let caller = owned_caller.as_caller();
+                let ensemble_pk =
+                    crate::usage_attr::ResolvedPk::resolve(&snap, crate::request_metrics::UNKNOWN);
+                crate::request_metrics::record_usage(
+                    &state_for_telem,
+                    "/v1/chat/completions",
+                    caller,
+                    crate::request_metrics::Upstream {
+                        provider: "ensemble",
+                        model: &bounded_model_for_telem,
+                        upstream_model: crate::request_metrics::UNKNOWN,
+                        pk: ensemble_pk.labels(),
+                        stream: true,
+                        is_fallback: false,
+                    },
+                    crate::request_metrics::Tokens {
+                        input: aggregate_input,
+                        output: aggregate_output,
+                        total: aggregate_total,
+                        cached: aggregate_cached,
+                        cache_read: aggregate_cache_read,
+                        cache_creation: aggregate_cache_creation,
+                        spend_usd: 0.0,
+                        client_type: state_for_telem
+                            .client_classifier
+                            .classify(&client_for_telem.user_agent),
+                    },
+                );
                 // SLO histograms (AISIX-Cloud#1011): the handler's
                 // record_success is stream-gated, so the ensemble stream
                 // records its e2e/TTFT here like the plain streaming path.
@@ -3866,6 +3920,23 @@ async fn dispatch_ensemble(
                         provider: "ensemble",
                         status: 200,
                         streaming: true,
+                    },
+                    Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
+                );
+                state_for_telem.metrics.record_time_to_first_token(
+                    UsageLabels {
+                        endpoint: "/v1/chat/completions",
+                        inbound_protocol: "openai",
+                        upstream_protocol: ensemble_pk.labels().protocol(),
+                        provider: "ensemble",
+                        model: &bounded_model_for_telem,
+                        upstream_model: crate::request_metrics::UNKNOWN,
+                        provider_key_id: ensemble_pk.labels().id(),
+                        provider_key_name: ensemble_pk.labels().name(),
+                        api_key_id: caller.api_key_id,
+                        team_id: caller.team_id,
+                        user_id: caller.user_id,
+                        user_name: caller.user_name,
                     },
                     Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
                 );
@@ -3898,8 +3969,8 @@ async fn dispatch_ensemble(
             cache_read_tokens: 0,
             provider_request_id: String::new(),
             provider_model_version: String::new(),
-            provider_key_id: String::new(),
-            upstream_model: String::new(),
+            provider_key_id: crate::request_metrics::UNKNOWN.to_string(),
+            upstream_model: crate::request_metrics::UNKNOWN.to_string(),
             finish_reason: String::new(),
             bypass_reason,
             cache_status: CacheStatus::Disabled,
@@ -4156,27 +4227,28 @@ async fn dispatch_ensemble(
         .panel
         .iter()
         .fold(judge_usage.clone(), |acc, p| acc.saturating_add(&p.usage));
-    outcome.response.usage = aggregate_usage;
+    outcome.response.usage = aggregate_usage.clone();
     let response = Json(render_response(created_ts, outcome.response, &req.model)).into_response();
     Ok(Success {
         response,
         // No single provider/model/key governs an ensemble response.
         provider: "ensemble".to_string(),
         model_id: model_id.to_string(),
-        // Per-sub-call usage was emitted above; the entry-level telemetry
-        // event is suppressed, so these top-level token fields are unused.
-        prompt_tokens: None,
-        completion_tokens: None,
-        total_tokens: None,
+        // Per-sub-call UsageEvents were emitted above, while record_success
+        // consumes these aggregate fields for the request-level Prometheus
+        // token families keyed by the ensemble alias.
+        prompt_tokens: Some(u64::from(aggregate_usage.prompt_tokens)),
+        completion_tokens: Some(u64::from(aggregate_usage.completion_tokens)),
+        total_tokens: Some(u64::from(aggregate_usage.total_tokens)),
         usage_estimated: false,
-        cached_prompt_tokens: 0,
-        reasoning_tokens: 0,
-        cache_creation_tokens: 0,
-        cache_read_tokens: 0,
+        cached_prompt_tokens: aggregate_usage.cached_prompt_tokens,
+        reasoning_tokens: aggregate_usage.reasoning_tokens,
+        cache_creation_tokens: aggregate_usage.cache_creation_tokens,
+        cache_read_tokens: aggregate_usage.cache_read_tokens,
         provider_request_id: String::new(),
         provider_model_version: String::new(),
-        provider_key_id: String::new(),
-        upstream_model: String::new(),
+        provider_key_id: crate::request_metrics::UNKNOWN.to_string(),
+        upstream_model: crate::request_metrics::UNKNOWN.to_string(),
         finish_reason: String::new(),
         cost_usd: 0.0,
         bypass_reason,
@@ -4435,12 +4507,6 @@ fn emit_usage_event(
         client.caller.user_id.as_deref(),
         client.caller.user_name.as_deref(),
     );
-    // Guardrail outcome counters (#379). Recorded here — the one place every
-    // chat path (success / error / streaming / cache-hit) funnels through —
-    // from the same guardrail fields the UsageEvent carries.
-    state
-        .metrics
-        .record_guardrail_outcome(guardrail_blocked, &event.guardrail_bypassed_reason);
     // Handler label "chat" matches the documented enumeration for
     // `aisix_usage_events_emitted_total` (#408). Keep `&'static str`
     // so prometheus cardinality stays bounded. Both emit legs (CP sink +
