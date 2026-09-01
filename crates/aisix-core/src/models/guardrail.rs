@@ -771,12 +771,40 @@ pub struct SemanticConfig {
     #[schemars(length(max = 100))]
     pub allow_examples: Vec<String>,
     /// Cosine-similarity threshold for `deny_examples`, in `[-1, 1]`.
-    /// Lower it to block more.
+    /// Lower it to block more. Required whenever `deny_examples` is
+    /// non-empty: there is no value that is right for every embedding
+    /// model, so it has to be measured against the one this row uses.
+    ///
+    /// Cosine scales differ enough between models that the SAME pair of
+    /// texts lands on opposite sides of a fixed threshold. Measured
+    /// against one deny list, unrelated benign traffic — a recipe, a git
+    /// question — peaks at 0.23 on one widely used model and 0.59 on
+    /// another; the noise floors are ~0.39 apart. A shipped default
+    /// therefore cannot be right, and a wrong one under-protects
+    /// silently, which is exactly how a policy comes to look like it is
+    /// running while catching almost nothing.
+    ///
+    /// Defaulted at the TYPE level and required by the strict write
+    /// schema instead, for the reason `embedding_model` gives: rows
+    /// written before the field was required carry no key at all, and a
+    /// row the loader cannot deserialize is skipped whole — a screening
+    /// row that vanishes is a guardrail that stopped screening, which is
+    /// fail-OPEN on a security control.
+    ///
+    /// The default stays at the historical 0.75 rather than a lowered
+    /// value: those un-migrated rows enforce 0.75 today, and changing
+    /// what they enforce without the operator asking would be a worse
+    /// surprise than leaving them. The control plane backfills the key
+    /// explicitly and reprojects, after which nothing reaches this
+    /// default and it can be retired.
     #[serde(default = "default_semantic_threshold")]
     #[schemars(range(min = -1.0, max = 1.0))]
     pub deny_threshold: f32,
     /// Cosine-similarity threshold for `allow_examples`, in `[-1, 1]`.
     /// RAISE it to block more — a text must reach it to be admitted.
+    /// Required whenever `allow_examples` is non-empty, and only then:
+    /// see `deny_threshold` for why there is no default worth shipping,
+    /// and why the type-level one nevertheless stays.
     #[serde(default = "default_semantic_threshold")]
     #[schemars(range(min = -1.0, max = 1.0))]
     pub allow_threshold: f32,
@@ -815,6 +843,11 @@ pub struct SemanticConfig {
     pub output_fail_open: bool,
 }
 
+/// Read-path only. The strict write schema requires each threshold
+/// alongside its example list, so nothing an operator saves today lands
+/// here — this exists for rows written before that requirement, which
+/// enforce 0.75 and must go on enforcing it until the control plane's
+/// backfill rewrites them. Retire it once no unmigrated row remains.
 fn default_semantic_threshold() -> f32 {
     0.75
 }
@@ -1193,6 +1226,12 @@ pub struct GuardrailScore {
     /// threshold is good or bad is the direction's business: `deny` refuses
     /// when it is `true`, `allow` refuses when it is `false`. Defining it as
     /// "this caused the block" would invert its meaning between the two.
+    ///
+    /// Other gateways spell the equivalent flag as "passed", which reads
+    /// more naturally but only works where crossing a threshold always
+    /// means the same thing. It cannot describe an allow-list gate, whose
+    /// whole shape is that falling SHORT is the refusal. The difference is
+    /// deliberate.
     pub matched: bool,
     /// Zero-based index, into this direction's example list, of the
     /// HIGHEST-SCORING example — whether or not it crossed the threshold.

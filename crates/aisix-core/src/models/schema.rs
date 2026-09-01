@@ -525,8 +525,75 @@ pub fn validate_guardrail(value: &Value) -> Result<(), SchemaError> {
             "guardrail",
             &SCHEMAS.guardrail,
             value,
-            err,
+            name_missing_semantic_threshold(value, err),
         )),
+    }
+}
+
+/// Name the similarity threshold a `kind: semantic` row left out.
+///
+/// A guardrail document is a `oneOf`, so the conditional requirement in the
+/// semantic branch collapses to the same root-level "not valid under any of
+/// the schemas" every branch failure does — true, and useless to the
+/// operator who simply has not chosen a number yet. This is the most
+/// ordinary write-path error for this kind, because there is no default to
+/// fall back on.
+///
+/// Same discipline as [`name_unknown_fields`]: the message is replaced only
+/// when the missing threshold is the WHOLE story. The document is
+/// re-validated with the absent keys filled in, and one that also violates
+/// something else keeps the original error, which points at the other
+/// problem.
+///
+/// It deliberately does not suggest a value. Cosine scales differ enough
+/// between embedding models that any number printed here would be wrong for
+/// most rows, and a suggested number is one an operator will take.
+fn name_missing_semantic_threshold(value: &Value, err: SchemaError) -> SchemaError {
+    let Some(fields) = value.as_object() else {
+        return err;
+    };
+    if fields.get("kind").and_then(Value::as_str) != Some("semantic") {
+        return err;
+    }
+    let listed = |examples: &str| {
+        fields
+            .get(examples)
+            .and_then(Value::as_array)
+            .is_some_and(|list| !list.is_empty())
+    };
+    let missing: Vec<&str> = [
+        ("deny_examples", "deny_threshold"),
+        ("allow_examples", "allow_threshold"),
+    ]
+    .into_iter()
+    .filter(|(examples, threshold)| listed(examples) && !fields.contains_key(*threshold))
+    .map(|(_, threshold)| threshold)
+    .collect();
+    if missing.is_empty() {
+        return err;
+    }
+    let mut probe = value.clone();
+    if let Some(fields) = probe.as_object_mut() {
+        for threshold in &missing {
+            fields.insert((*threshold).to_string(), json!(0.5));
+        }
+    }
+    if validate(&SCHEMAS.guardrail, &probe).is_err() {
+        return err;
+    }
+    SchemaError {
+        path: err.path,
+        message: format!(
+            "{} required: a similarity threshold has no portable default, \
+             because cosine scores are not comparable across embedding \
+             models. Measure one against `embedding_model` on your own \
+             traffic and set it explicitly.",
+            missing
+                .iter()
+                .map(|threshold| format!("`{threshold}`"))
+                .collect::<Vec<_>>()
+                .join(" and "),
+        ),
     }
 }
 
@@ -1386,6 +1453,31 @@ pub fn guardrail_root_schema() -> Value {
                             b.insert("required".to_string(), json!(["embedding_model"]));
                         }
                     }
+                    // Each threshold is required alongside ITS OWN example
+                    // list and only then — demanding an allow threshold on a
+                    // deny-only row would be asking for a number that
+                    // decides nothing. Both are defaulted in the type for
+                    // the read path; see the fields' doc comments for why
+                    // the two paths differ.
+                    b.insert(
+                        "allOf".to_string(),
+                        json!([
+                            {
+                                "if": {
+                                    "required": ["deny_examples"],
+                                    "properties": { "deny_examples": { "minItems": 1 } }
+                                },
+                                "then": { "required": ["deny_threshold"] }
+                            },
+                            {
+                                "if": {
+                                    "required": ["allow_examples"],
+                                    "properties": { "allow_examples": { "minItems": 1 } }
+                                },
+                                "then": { "required": ["allow_threshold"] }
+                            }
+                        ]),
+                    );
                 }
                 "custom" => {
                     // Required on the write path, defaulted in the type:
@@ -2905,6 +2997,107 @@ mod tests {
             "risk_level_threshold": "none"
         });
         assert!(validate_guardrail(&v).is_err());
+    }
+
+    // ---- kind=semantic: a threshold has no portable default -------------
+
+    fn semantic_row(extra: Value) -> Value {
+        let mut v = json!({
+            "name": "g",
+            "kind": "semantic",
+            "embedding_model": "embed-1"
+        });
+        let fields = v.as_object_mut().unwrap();
+        for (k, val) in extra.as_object().unwrap() {
+            fields.insert(k.clone(), val.clone());
+        }
+        v
+    }
+
+    #[test]
+    fn guardrail_semantic_deny_list_without_its_threshold_is_rejected() {
+        // The write path refuses to guess. Cosine scales differ between
+        // embedding models, so a defaulted threshold is not a convenience
+        // — it is a number that silently under-protects on whichever
+        // model it was not measured against.
+        let v = semantic_row(json!({ "deny_examples": ["forbidden"] }));
+        let err = validate_guardrail(&v).expect_err("a deny list needs its threshold");
+        assert!(err.message.contains("`deny_threshold`"), "{}", err.message);
+        // The message must not hand the operator a number to adopt.
+        assert!(!err.message.contains("0.75"), "{}", err.message);
+    }
+
+    #[test]
+    fn guardrail_semantic_allow_list_without_its_threshold_is_rejected() {
+        let v = semantic_row(json!({ "allow_examples": ["permitted"] }));
+        let err = validate_guardrail(&v).expect_err("an allow list needs its threshold");
+        assert!(err.message.contains("`allow_threshold`"), "{}", err.message);
+    }
+
+    #[test]
+    fn guardrail_semantic_needs_only_the_threshold_its_list_uses() {
+        // Each threshold is required alongside ITS OWN list. Demanding an
+        // allow threshold on a deny-only row would be asking for a number
+        // that decides nothing.
+        let deny_only = semantic_row(json!({
+            "deny_examples": ["forbidden"],
+            "deny_threshold": 0.5
+        }));
+        validate_guardrail(&deny_only).unwrap();
+
+        let allow_only = semantic_row(json!({
+            "allow_examples": ["permitted"],
+            "allow_threshold": 0.5
+        }));
+        validate_guardrail(&allow_only).unwrap();
+
+        let both_missing_one = semantic_row(json!({
+            "deny_examples": ["forbidden"],
+            "allow_examples": ["permitted"],
+            "deny_threshold": 0.5
+        }));
+        let err = validate_guardrail(&both_missing_one).expect_err("allow list unthresholded");
+        assert!(err.message.contains("`allow_threshold`"), "{}", err.message);
+        assert!(!err.message.contains("`deny_threshold`"), "{}", err.message);
+    }
+
+    #[test]
+    fn guardrail_semantic_with_no_examples_needs_no_threshold() {
+        // A row with neither list screens nothing and is skipped at chain
+        // build; requiring a number from it would reject a shape the
+        // gateway already treats as inert.
+        validate_guardrail(&semantic_row(json!({}))).unwrap();
+    }
+
+    #[test]
+    fn guardrail_semantic_missing_threshold_does_not_mask_a_second_error() {
+        // Same discipline as the unknown-field explainer: the message is
+        // replaced only when the missing threshold is the whole story.
+        let v = semantic_row(json!({
+            "deny_examples": ["forbidden"],
+            "text_source": "not_a_mode"
+        }));
+        let err = validate_guardrail(&v).expect_err("the enum is still wrong");
+        assert!(!err.message.contains("`deny_threshold`"), "{}", err.message);
+    }
+
+    #[test]
+    fn guardrail_semantic_row_without_a_threshold_still_loads() {
+        // The READ path keeps the default, and that asymmetry is the
+        // point: rows written before the requirement carry no key, and a
+        // row the loader cannot deserialize is skipped whole — a
+        // screening guardrail that disappears is fail-OPEN. They go on
+        // enforcing the 0.75 they enforce today until the control plane
+        // backfills them.
+        let row: crate::models::Guardrail = serde_json::from_value(semantic_row(json!({
+            "deny_examples": ["forbidden"]
+        })))
+        .expect("an unmigrated row must still deserialize");
+        let crate::models::GuardrailKind::Semantic(cfg) = &row.config else {
+            panic!("not a semantic row");
+        };
+        assert_eq!(cfg.deny_threshold, 0.75);
+        assert_eq!(cfg.allow_threshold, 0.75);
     }
 
     #[test]
