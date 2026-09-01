@@ -421,6 +421,10 @@ async fn dispatch(
     );
     let captured_prompt = content_cap.map(|_| serde_json::to_string(&body).unwrap_or_default());
 
+    // The name the caller addressed, kept before `body` is consumed below —
+    // the response echoes it rather than the id the provider reports (the
+    // `model_echo` contract).
+    let client_facing_model = body.model.clone();
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.id, &model_entry.value);
     let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
@@ -469,7 +473,11 @@ async fn dispatch(
     })
     .await
     {
-        Ok(embed_resp) => {
+        Ok(mut embed_resp) => {
+            // The provider bridge fills `model` from the upstream's own
+            // document (or echoes the upstream id it was sent); the client
+            // asked for an alias and gets the alias back.
+            embed_resp.model = client_facing_model;
             // #701: clear any cooldown/unhealthy mark now the upstream
             // answered — same recovery signal as rerank/audio/chat.
             state.health.record_success(&model_entry.value.display_name);

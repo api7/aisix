@@ -1785,12 +1785,18 @@ async fn dispatch_create(
 /// crafted ids. The submit path keeps its distinct 403/501 — there the
 /// caller already knows the model name they asked for, so there is
 /// nothing to disclose.
+///
+/// Returns the resolved target, the provider-side task id, and the model
+/// name the CALLER addressed at submit time. That last one is NOT the row's
+/// `display_name`: a wildcard row serves many caller-minted names, and the
+/// client-facing `model` echoes the one the caller used. Telemetry labels
+/// keep using `display_name` — see `usage_attr`.
 fn resolve_get_target(
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     video_id: &str,
     client_ctx: &ClientContext,
-) -> Result<(VideoTarget, String), ProxyError> {
+) -> Result<(VideoTarget, String, String), ProxyError> {
     let (entry_id, alias, task_id) =
         decode_video_id(video_id).ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
     let model_entry = snapshot
@@ -1798,7 +1804,7 @@ fn resolve_get_target(
         .get_by_id(&entry_id)
         .ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
     match resolve_video_target(snapshot, auth, model_entry, &alias, client_ctx) {
-        Ok(Ok(target)) => Ok((target, task_id)),
+        Ok(Ok(target)) => Ok((target, task_id, alias)),
         // Unsupported provider → uniform 404 (oracle fold, see above).
         Ok(Err(_)) => Err(ProxyError::VideoNotFound(video_id.to_string())),
         // ACL denial → uniform 404 (oracle fold, see above).
@@ -1826,7 +1832,8 @@ pub async fn get_video(
     let snapshot = state.snapshot.load();
 
     let result: Result<(Response, String, String), ProxyError> = async {
-        let (target, task_id) = resolve_get_target(&snapshot, &auth, &video_id, &client)?;
+        let (target, task_id, requested_alias) =
+            resolve_get_target(&snapshot, &auth, &video_id, &client)?;
         // Poll traffic is exempt from model-level limits BY DESIGN
         // (AISIX-Cloud#1118 decision 3): a client polling a task it
         // already paid an RPM slot to submit must not starve itself.
@@ -1835,7 +1842,20 @@ pub async fn get_video(
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;
         reservation.commit_tokens(0).await;
         let poll = result?;
-        let video = video_object_from_poll(&video_id, target.display_name(), &poll);
+        // Echo the name the caller submitted under, not the row's own — the
+        // two differ for a wildcard row, and the submit response already
+        // echoed the caller's (`model_echo`). But that name is decoded from a
+        // CLIENT-SUPPLIED id, so echo it only when this row would actually
+        // serve it: a forged id, or one left behind by a row renamed since
+        // submit, falls back to the row's own name rather than being handed
+        // back as though the gateway had attested it.
+        let echoed =
+            if crate::model_resolve::row_serves_name(&target.model_entry.value, &requested_alias) {
+                requested_alias.as_str()
+            } else {
+                target.display_name()
+            };
+        let video = video_object_from_poll(&video_id, echoed, &poll);
         Ok((
             Json(video).into_response(),
             target.provider_label.clone(),
@@ -1882,7 +1902,7 @@ pub async fn video_content(
     let snapshot = state.snapshot.load();
 
     let result: Result<(Response, String, String), ProxyError> = async {
-        let (target, task_id) = resolve_get_target(&snapshot, &auth, &video_id, &client)?;
+        let (target, task_id, _) = resolve_get_target(&snapshot, &auth, &video_id, &client)?;
         // Same model-layer exemption as the poll route (see get_video).
         let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;

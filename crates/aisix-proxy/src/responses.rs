@@ -7,7 +7,9 @@
 //! 1. Authenticate and authorise the API key + model.
 //! 2. Validate the model is an OpenAI provider.
 //! 3. Rewrite the `model` field to the upstream model name.
-//! 4. Forward verbatim — streaming SSE and non-streaming JSON both work.
+//! 4. Relay the reply — streaming SSE and non-streaming JSON both work.
+//!    The body is the upstream's own, byte for byte, except the
+//!    caller-facing `model` name (see [`crate::model_echo`]).
 //!
 //! Only OpenAI models support this endpoint. Non-OpenAI models receive a
 //! 400 with an explanatory message.
@@ -1410,6 +1412,17 @@ async fn responses_to_target(
                 }
                 None => buf,
             };
+            // A block-capable output guardrail buffers the whole response and
+            // returns it here, never reaching the live relay that splices
+            // frame-by-frame — so the same pass runs once over the buffer.
+            // Without it, attaching such a guardrail would silently change
+            // which model name the caller is told (after masking, so a mask
+            // cannot reintroduce the upstream id).
+            let buf = crate::model_echo::restamp_sse_buffer(
+                &buf,
+                requested_model,
+                crate::model_echo::responses_snapshot_model,
+            );
             // #808: the whole SSE response is buffered here, so parse its
             // terminal event for usage and let the handler emit (the body is
             // a single complete chunk now, not a live stream).
@@ -1523,8 +1536,9 @@ async fn responses_to_target(
         // #808: wrap the verbatim byte stream so the terminal
         // `response.completed` SSE event's `usage` block is parsed in-flight
         // and a UsageEvent is emitted from the stream's Drop guard at
-        // end-of-stream (or client-disconnect). Bytes forward unchanged — the
-        // client still sees the exact upstream SSE wire shape. Pre-#808 this
+        // end-of-stream (or client-disconnect). Bytes forward unchanged apart
+        // from the caller-facing `model` on the snapshot frames — see
+        // [`crate::model_echo`]. Pre-#808 this
         // path dropped the event entirely, so every streaming /v1/responses
         // call (e.g. all Codex traffic, which always streams) was invisible
         // to the dashboard Logs and the budget ledger.
@@ -1581,6 +1595,7 @@ async fn responses_to_target(
             attempt_started,
             content_cap,
             eos_scan,
+            requested_model.to_string(),
             move |mut usage, out_text, output_hits| {
                 // Streams that reach here are committed 200s — the
                 // `!status.is_success()` guard above returned early on errors.
@@ -1830,6 +1845,12 @@ async fn responses_to_target(
                 });
             }
         }
+
+        // Echo the model name the caller addressed, not the id the upstream
+        // answered with — the same contract the bridged half of this endpoint
+        // already honours, so `/v1/responses` stops answering differently
+        // depending on which provider happens to be behind the alias.
+        crate::model_echo::restamp_body(&mut json_body, requested_model);
 
         // #932: mask-action PII rules rewrite the response body AFTER the
         // block check passes.
@@ -2513,16 +2534,36 @@ fn responses_sse_provider_request_id(bytes: &[u8]) -> String {
 /// content capture (AISIX-Cloud#947). A frame ends at the first blank line;
 /// an incomplete trailing frame is left in `buf` for the next chunk. Reuses
 /// the shared SSE framing helpers from the `/v1/messages` passthrough so the
-/// two surfaces parse identically.
+/// two surfaces parse identically. Each frame is also appended to `out` with
+/// the client-facing `model` restamped onto the snapshot frames that carry
+/// one.
+///
+/// `out` is what the client receives, so the relay forwards whole frames
+/// rather than raw chunks — a value can only be spliced once the frame
+/// carrying it has arrived in full, and the Responses snapshot events are
+/// spread across the whole stream (`response.created` first,
+/// `response.completed` last). A frame is the SSE protocol's atomic unit, so
+/// holding a partial one back is not observable to a conforming client;
+/// `buf` retains only that partial tail.
 fn drain_responses_sse_frames(
     buf: &mut Vec<u8>,
     acc: &mut Option<ResponseUsage>,
     mut capture: Option<&mut SseTextCapture>,
     attempt_started: Instant,
     first_frame_seen: &mut bool,
+    client_facing_model: &str,
+    out: &mut Vec<u8>,
 ) {
     while let Some(end) = crate::messages::find_frame_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
+        match crate::model_echo::restamp_sse_frame(
+            &frame,
+            client_facing_model,
+            crate::model_echo::responses_snapshot_model,
+        ) {
+            Some(rewritten) => out.extend_from_slice(&rewritten),
+            None => out.extend_from_slice(&frame),
+        }
         if let Some(data) = crate::messages::extract_sse_data_line(&frame) {
             if data == b"[DONE]" {
                 continue;
@@ -2696,7 +2737,8 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)> Dro
 /// client-disconnect) with the accumulated counts (#808) plus the captured
 /// output text (AISIX-Cloud#947, empty when `content_cap` is `None`) and the
 /// end-of-stream scan's monitor hits (AISIX-Cloud#1010, empty without
-/// `eos_scan`). Bytes forward verbatim — the client sees the exact upstream
+/// `eos_scan`). Bytes forward unchanged apart from the caller-facing
+/// `model` on the snapshot frames — the client sees the exact upstream
 /// SSE wire shape.
 fn build_responses_passthrough_stream<S, F>(
     upstream: S,
@@ -2706,6 +2748,9 @@ fn build_responses_passthrough_stream<S, F>(
     attempt_started: Instant,
     content_cap: Option<u32>,
     eos_scan: Option<EosOutputScan>,
+    // The model name the caller addressed, restamped onto the snapshot
+    // frames so a streamed response echoes the alias like a buffered one.
+    client_facing_model: String,
     on_complete: F,
 ) -> impl futures::Stream<Item = reqwest::Result<bytes::Bytes>>
 where
@@ -2750,9 +2795,12 @@ where
         let mut first_frame_seen = false;
         while let Some(item) = upstream.next().await {
             if let Ok(bytes) = &item {
-                // Side-channel parse: copy into the frame buffer (the original
-                // `bytes` is yielded unchanged below) and drain complete frames.
+                // Accumulate, then drain every COMPLETE frame — restamped with
+                // the caller's model name — into `forward`. The client receives
+                // whole frames, never a partial one; `buf` keeps the trailing
+                // remainder until its terminator arrives.
                 buf.extend_from_slice(bytes);
+                let mut forward: Vec<u8> = Vec::new();
                 let (usage_acc, capture) = guard.parts();
                 drain_responses_sse_frames(
                     &mut buf,
@@ -2760,33 +2808,102 @@ where
                     capture,
                     attempt_started,
                     &mut first_frame_seen,
+                    &client_facing_model,
+                    &mut forward,
                 );
                 // Bound the frame buffer: the happy path drains complete frames
                 // above so `buf` only holds a partial trailing frame. A
                 // non-conformant upstream streaming bytes without a blank-line
-                // terminator would otherwise grow `buf` unboundedly; drop it
-                // (losing usage parsing for that pathological case) rather than
-                // OOM. Bytes still forward verbatim — only telemetry is affected.
+                // terminator would otherwise grow `buf` unboundedly; release the
+                // un-terminated remainder downstream rather than OOM. Delivery is
+                // preserved — only this frame's usage parse and model restamp
+                // are lost.
+                //
+                // The restamp cannot be recovered here, and not for want of
+                // trying: at the cap the frame is genuinely still arriving, so
+                // its JSON is incomplete, so `json_splice` refuses it and falls
+                // back to verbatim by design. Reaching this needs a single SSE
+                // frame over 1 MiB — on this surface `response.completed`
+                // carries the whole Response object, so a caller with a very
+                // large `tools[]` can get there. Named in the PR description as
+                // a known limit rather than papered over.
                 if buf.len() > crate::messages::MAX_SSE_FRAME_BUF_BYTES {
                     tracing::warn!(
                         buffered = buf.len(),
                         "responses stream: SSE frame buffer exceeded cap without a \
-                         terminator; dropping buffer (usage parsing skipped)"
+                         terminator; releasing it unparsed (usage parsing and model \
+                         restamp skipped)"
                     );
-                    buf.clear();
+                    forward.append(&mut buf);
                 }
-            }
-            // Forward the original item verbatim (Ok bytes OR a mid-stream Err).
-            // The first successful forward is what the caller waited for.
-            if item.is_ok() {
+                // Nothing completed yet — keep reading rather than yielding an
+                // empty chunk.
+                if forward.is_empty() {
+                    continue;
+                }
+                // The first forward is what the caller waited for.
                 let (usage_acc, _) = guard.parts();
                 let acc = usage_acc.get_or_insert_with(Default::default);
                 if acc.downstream_latency_ms == 0 {
                     acc.downstream_latency_ms =
                         started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                 }
+                yield Ok(bytes::Bytes::from(forward));
+                continue;
             }
+            // A mid-stream Err is forwarded as-is.
             yield item;
+        }
+        // A non-conformant upstream can end without terminating its last
+        // frame. Those bytes were never forwarded (they are still the partial
+        // tail), so release them now rather than truncating the response.
+        //
+        // Restamp it on the way out. Mid-stream a fragment is a frame still
+        // arriving and must be held, but the upstream has now ended: this is
+        // a final frame it never terminated, and on this surface that is
+        // `response.completed` — the event an SDK builds its final Response
+        // object from. Same reasoning as `model_echo::restamp_sse_buffer`,
+        // and this path reaches it without any guardrail attached.
+        if !buf.is_empty() {
+            // Parse it before releasing it. On this surface the unterminated
+            // final frame is `response.completed`, which carries the
+            // authoritative token counts and `response.id`: forwarding it to
+            // the caller while never reading it handed them real usage in the
+            // body and recorded estimated counts, with no provider request id,
+            // in the UsageEvent. Completing the terminator the upstream left
+            // off lets the normal drain read it; the drain consumes `buf`, and
+            // stripping back exactly what was added hands the client its own
+            // bytes.
+            //
+            // Pad by what is MISSING, not a fixed `\n\n`: a tail already
+            // ending in one `\n` needs one more, and padding two would make
+            // `find_frame_end` end the frame one byte early, so the strip
+            // below would eat the newline the upstream actually sent.
+            let pad: &[u8] = if buf.ends_with(b"\n") { b"\n" } else { b"\n\n" };
+            buf.extend_from_slice(pad);
+            let mut drained: Vec<u8> = Vec::new();
+            let (usage_acc, capture) = guard.parts();
+            drain_responses_sse_frames(
+                &mut buf,
+                usage_acc,
+                capture,
+                attempt_started,
+                &mut first_frame_seen,
+                &client_facing_model,
+                &mut drained,
+            );
+            let tail = match drained.len().checked_sub(pad.len()) {
+                // Drop only the bytes this branch appended.
+                Some(n) if drained.ends_with(pad) => drained[..n].to_vec(),
+                _ => drained,
+            };
+            let (usage_acc, _) = guard.parts();
+            let acc = usage_acc.get_or_insert_with(Default::default);
+            if acc.downstream_latency_ms == 0 {
+                acc.downstream_latency_ms =
+                    started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+            }
+            yield Ok(bytes::Bytes::from(tail));
         }
         // Upstream EOF — the response was delivered in full. Record that
         // before the scan below, which awaits a remote provider and is a
@@ -3604,6 +3721,124 @@ mod tests {
                 assert_eq!(event.requested_model, model);
             }
         }
+    }
+
+    /// A provider that omits the blank line after its terminal
+    /// `response.completed` used to cost the gateway that whole frame: it was
+    /// forwarded to the caller but never parsed, so the body carried the real
+    /// token counts while the UsageEvent carried estimates and no provider
+    /// request id. At EOF the frame is complete, so it is parsed like any
+    /// other — the caller's alias is stamped on it AND its usage is recorded.
+    #[tokio::test]
+    async fn streamed_unterminated_terminal_frame_is_still_parsed_for_usage() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        // Note the absent trailing blank line on the last frame.
+        let sse = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_eof\",\"model\":\"gpt-4o-2024-11-20\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_eof\",\"model\":\"gpt-4o-2024-11-20\",\"usage\":{\"input_tokens\":31,\"output_tokens\":17,\"total_tokens\":48}}}";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hi",
+                "stream": true,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let streamed =
+            String::from_utf8(to_bytes(resp.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+
+        // Delivered, restamped, and NOT given a terminator it never had.
+        assert!(streamed.contains(r#""model":"gpt-4o-resp""#), "{streamed}");
+        assert!(!streamed.contains("gpt-4o-2024-11-20"), "{streamed}");
+        assert!(
+            streamed.ends_with("}}}"),
+            "no invented terminator: {streamed}"
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(1000), rx.recv())
+            .await
+            .expect("usage event must be emitted")
+            .expect("usage_sink sender dropped");
+        // The authoritative counts off that frame, not a local estimate.
+        assert_eq!(event.prompt_tokens, 31, "{streamed}");
+        assert_eq!(event.completion_tokens, 17, "{streamed}");
+        assert!(!event.usage_estimated, "the frame was read, not guessed");
+        assert_eq!(event.provider_request_id, "resp_eof");
+    }
+
+    /// The same tail, but ending in ONE newline — a provider that wrote half
+    /// its terminator. The EOF branch completes the terminator so the drain
+    /// can read the frame, then strips back exactly what it added; padding a
+    /// fixed `\n\n` here would end the frame a byte early and eat the newline
+    /// the upstream really sent.
+    #[tokio::test]
+    async fn streamed_terminal_frame_with_a_half_terminator_keeps_its_own_bytes() {
+        let upstream = MockServer::start().await;
+        let sse = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_half\",\"model\":\"gpt-4o-2024-11-20\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_half\",\"model\":\"gpt-4o-2024-11-20\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8}}}\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hi",
+                "stream": true,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let streamed =
+            String::from_utf8(to_bytes(resp.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+
+        assert!(
+            streamed.contains(r#""model":"gpt-4o-resp""#),
+            "{streamed:?}"
+        );
+        // The upstream's own single trailing newline survives — not stripped,
+        // and not promoted to a full terminator it never sent.
+        assert!(
+            streamed.ends_with("}}}\n"),
+            "the provider's own trailing newline must survive: {:?}",
+            &streamed[streamed.len().saturating_sub(40)..]
+        );
+        assert!(!streamed.ends_with("}}}\n\n"), "no terminator invented");
     }
 
     /// #719: the Responses `input` array form (message items with typed
