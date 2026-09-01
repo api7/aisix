@@ -1509,34 +1509,27 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                     }
                 }
                 "custom" => {
-                    // Write path only, for the reason the semantic branch
-                    // above gives: on the READ path this would skip the row
-                    // whole, where instead it loads with an empty script and
-                    // is refused at chain build.
-                    //
-                    // Be precise about what that buys, because it is less
-                    // than it sounds — for THIS field it buys nothing at
-                    // all. `run_validate` only reads a resources FILE, and
-                    // the file source validates strictly, where `script` is
-                    // still required with `minLength: 1`. So a row missing
-                    // it never survives to chain build there; the refusal is
-                    // reachable only from etcd, where nothing reports it —
-                    // `/status/config`'s `rejected` is written only by the
-                    // loader, which never sees a build failure. Both
-                    // outcomes leave the row screening nothing, so this move
-                    // trades a load error for a warn rather than winning
-                    // enforcement; it is here for consistency with the two
-                    // fields above, whose read-path behaviour genuinely is
-                    // better (an empty `embedding_model` degrades per
-                    // `fail_open`, an absent threshold keeps screening at its
-                    // stored default).
+                    // Required on BOTH schemas, unlike the semantic fields
+                    // above, and the asymmetry is the point rather than an
+                    // oversight. Those two relax on the read path because a
+                    // row that loads behaves BETTER than one that vanishes:
+                    // an empty `embedding_model` degrades per `fail_open`,
+                    // an absent threshold keeps screening at its stored
+                    // default. A scriptless `custom` row screens nothing
+                    // either way, so relaxing it changes no enforcement and
+                    // costs the only structured signal there is — the loader
+                    // rejects it into `/status/config`'s `rejected[]`,
+                    // whereas a chain-build refusal is a warn line the
+                    // config status never learns about. Only a MISSING key
+                    // is caught here; a blank or uncompilable script clears
+                    // `minLength: 1` and is refused at build instead.
+                    require_branch_property(b, "script");
                     if strict {
-                        require_branch_property(b, "script");
-                        // Same reasoning as the thresholds above: `script`
-                        // advertised `default: ""` while carrying
-                        // `minLength: 1` and sitting in `required`, so a
-                        // generator honouring the contract pre-filled a value
-                        // the same contract rejects.
+                        // The published contract must not advertise a value
+                        // it rejects: `script` carried `default: ""` beside
+                        // `minLength: 1`, so a generator honouring it
+                        // pre-filled something the same schema refuses. Same
+                        // reasoning as the thresholds above.
                         if let Some(Value::Object(properties)) = b.get_mut("properties") {
                             if let Some(Value::Object(field)) = properties.get_mut("script") {
                                 field.remove("default");
@@ -4972,29 +4965,33 @@ mod tests {
     }
 
     #[test]
-    fn the_custom_branch_requires_a_script_on_the_write_path() {
-        // `script` defaults at the TYPE level so a projected row still
-        // loads, which means only the strict schema stands between a
-        // scriptless config and a guardrail the gateway will reject.
+    fn the_custom_branch_requires_a_script_on_both_schemas() {
+        // Deliberately NOT split, unlike the semantic fields. The rule the
+        // split serves is "a row that loads behaves better than one that
+        // vanishes", and it does not hold here: a scriptless `custom` row
+        // screens nothing whether the loader skips it or the chain builder
+        // refuses it. Relaxing the read path would therefore change no
+        // enforcement and lose the only structured signal — the loader
+        // rejects it into `/status/config`'s `rejected[]`, while a
+        // chain-build refusal is a warn line the config status never sees.
         //
-        // Reading the strict schema alone cannot show that: it says
-        // `script` is required somewhere, not that it is required ONLY
-        // there. Validating a scriptless row against both sets is what
-        // pins the split — and the lenient half is the one that matters,
-        // because a row the loader rejects is skipped whole and stops
-        // screening, where a row that loads with an empty script is
-        // refused at chain build. Both stop screening, and nothing
-        // reports the second: `aisix validate` reads a FILE, which is
-        // validated strictly, so a scriptless row is refused by the schema
-        // there rather than reaching the build. The build refusal is an
-        // etcd-only outcome, and it is a warn line.
+        // Asserted against BOTH sets, because reading one says a field is
+        // required somewhere and can never say where it is NOT.
+        //
+        // This covers a MISSING key only. A blank or uncompilable script
+        // passes both schemas — `minLength: 1` admits a single space, while
+        // the builder refuses on `trim().is_empty()` — and is refused when
+        // the chain is built, which `aisix validate` reports and a serving
+        // gateway logs.
         let scriptless = json!({"name": "g", "kind": "custom"});
         assert!(
             validate_guardrail(&scriptless).is_err(),
             "a scriptless row must not be savable"
         );
-        validate_guardrail_lenient(&scriptless)
-            .expect("a stored scriptless row still loads, then fails at chain build");
+        assert!(
+            validate_guardrail_lenient(&scriptless).is_err(),
+            "and a stored one is rejected into the config status, not loaded",
+        );
 
         let schema = guardrail_root_schema(true);
         let branch = schema["oneOf"]
@@ -5008,6 +5005,15 @@ mod tests {
             .map(|l| l.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
         assert!(required.contains(&"script"), "required = {required:?}");
+        // …and the published contract must not advertise a value it
+        // rejects. Without this the strip is guarded only by the schema
+        // drift job, which pins code against artefact and would go green on
+        // a regenerated artefact carrying the default back.
+        assert!(
+            branch["properties"]["script"].get("default").is_none(),
+            "script still advertises a default: {}",
+            branch["properties"]["script"]
+        );
     }
 
     #[test]

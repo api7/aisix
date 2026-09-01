@@ -780,9 +780,11 @@ pub struct SemanticConfig {
     /// produced the vectors, and a threshold carried over from another
     /// model under-screens without any sign that it is doing so. Measure
     /// one against the model named in `embedding_model`, on your own
-    /// traffic: every request reports what it scored in
-    /// `guardrail_scores` on its usage event, including the requests
-    /// this guardrail allowed.
+    /// traffic: a request that emits a usage event reports what it scored
+    /// in `guardrail_scores`, including the requests this guardrail
+    /// allowed. `/a2a` emits no usage event, and neither do `rerank` and
+    /// `responses` when the upstream reports no usage, so those carry no
+    /// guardrail attribution of any kind (api7/aisix#1083).
     // Defaulted at the TYPE level and required by the strict write schema
     // instead, for the reason `embedding_model` gives: rows written before
     // the field was required carry no key at all, and a row the loader
@@ -893,18 +895,18 @@ pub struct CustomConfig {
     /// `checkOutput`. A hook whose function the module does not export is
     /// skipped, so a script may cover one direction only.
     ///
-    /// Defaulted at the TYPE level and required by the strict write schema
-    /// instead (AGENTS.md: never make a projected field required at the
-    /// type level). A row the loader cannot deserialize is skipped whole,
-    /// and a screening row that vanishes is a guardrail that stopped
-    /// screening. An empty script is refused at chain-build time, so the
-    /// row screens nothing rather than silently admitting everything it was
-    /// meant to screen. That refusal is a warn line, not a config-status
-    /// rejection: `/status/config` stays `synced` with an empty `rejected`
-    /// list, so a stored row in this shape is visible only in the gateway's
-    /// log (api7/aisix#1084). A resources file never reaches that path —
-    /// this field is required on the strict write schema, so the row is
-    /// refused outright there.
+    /// Required on both the write schema and the read one, so a row that
+    /// omits it is refused rather than loaded: unlike the fields that are
+    /// write-path-only, a `custom` row with no script screens nothing
+    /// either way, and rejecting it is what puts it in `/status/config`'s
+    /// `rejected` list where an operator can see it.
+    ///
+    /// A script that is present but blank or does not compile passes the
+    /// schema — `minLength` counts characters, and a whitespace-only value
+    /// is one — and is refused when the chain is built instead. `aisix
+    /// validate` reports that and exits non-zero; on a serving gateway it
+    /// is a warn line and the config status stays `synced`
+    /// (api7/aisix#1084).
     #[serde(default)]
     #[schemars(length(min = 1))]
     pub script: String,
