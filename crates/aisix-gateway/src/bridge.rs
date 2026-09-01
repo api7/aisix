@@ -140,7 +140,16 @@ impl std::fmt::Debug for BridgeContext {
             .field("provider_key", &self.provider_key.display_name)
             .field("deadline", &self.deadline)
             .field("caller", &self.caller)
-            .field("client_headers", &self.client_headers)
+            // Names only: the inbound map holds the caller's own
+            // `Authorization` — the same token as `caller_jwt` — and
+            // nothing marks a header sensitive on the way in.
+            .field(
+                "client_headers",
+                &self
+                    .client_headers
+                    .as_ref()
+                    .map(|h| h.keys().map(|k| k.as_str()).collect::<Vec<_>>()),
+            )
             .field(
                 "caller_jwt",
                 &self.caller_jwt.as_ref().map(|_| "***redacted***"),
@@ -1043,6 +1052,12 @@ mod tests {
         let api_key = pk.api_key.clone();
         assert!(!api_key.is_empty(), "the sample must carry a real secret");
 
+        let mut inbound = HeaderMap::new();
+        inbound.insert(
+            http::header::AUTHORIZATION,
+            "Bearer header.payload.signature".parse().expect("header"),
+        );
+
         let ctx = BridgeContext::new(
             "req-1",
             std::sync::Arc::new(sample_model()),
@@ -1050,7 +1065,10 @@ mod tests {
         )
         .with_client(
             CallerIdentity::default(),
-            None,
+            // The same token also arrives as an inbound header, where
+            // nothing marked it sensitive. Redacting only `caller_jwt`
+            // would leave it printing from here.
+            Some(std::sync::Arc::new(inbound)),
             Some(std::sync::Arc::from("header.payload.signature")),
         );
 
@@ -1060,8 +1078,8 @@ mod tests {
 
         let printed = format!("{ctx:?}");
         assert!(
-            printed.contains("req-1"),
-            "the non-secret fields still print: {printed}"
+            printed.contains("req-1") && printed.contains("authorization"),
+            "the non-secret fields, header names included, still print: {printed}"
         );
         assert!(
             !printed.contains("header.payload.signature"),
