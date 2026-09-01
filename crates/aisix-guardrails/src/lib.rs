@@ -1038,7 +1038,7 @@ mod tests {
     /// and `serial`/`timed` latency modes of `bedrock`) live under
     /// `definitions` and are not selectable provider kinds.
     fn schema_kind_vocabulary() -> BTreeSet<String> {
-        aisix_core::models::schema::guardrail_root_schema()["oneOf"]
+        aisix_core::models::schema::guardrail_root_schema(true)["oneOf"]
             .as_array()
             .expect("the guardrail root schema is a `oneOf` over the kinds")
             .iter()

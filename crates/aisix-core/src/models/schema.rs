@@ -125,7 +125,7 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "model" => model_root_schema(strict),
         "api_key" => apikey_root_schema(strict),
         "provider_key" => provider_key_root_schema(),
-        "guardrail" => guardrail_root_schema(),
+        "guardrail" => guardrail_root_schema(strict),
         "guardrail_attachment" => guardrail_attachment_root_schema(),
         "cache_policy" => cache_policy_root_schema(),
         "observability_exporter" => observability_exporter_root_schema(),
@@ -891,6 +891,21 @@ fn require_property(schema: &mut Value, name: &str) {
     }
 }
 
+/// [`require_property`] for a `oneOf` branch already borrowed as its object
+/// map.
+fn require_branch_property(branch: &mut serde_json::Map<String, Value>, name: &str) {
+    match branch.get_mut("required").and_then(Value::as_array_mut) {
+        Some(list) => {
+            if !list.iter().any(|v| v.as_str() == Some(name)) {
+                list.push(json!(name));
+            }
+        }
+        None => {
+            branch.insert("required".to_string(), json!([name]));
+        }
+    }
+}
+
 /// Canonical JSON Schema for the `provider_key` resource, derived from the
 /// [`ProviderKey`](crate::models::ProviderKey) struct. Uses the nullable
 /// `Option` representation (`true`): `TelemetryTags` carries fields cp-api
@@ -1262,7 +1277,7 @@ pub fn mcp_policy_root_schema(strict: bool) -> Value {
 /// 4. `schemars` leaves discriminator tag fields and collection item schemas
 ///    without descriptions, so the public schema fills those gaps.
 /// 5. `created_at` republishes its `date-time` format (annotation-only).
-pub fn guardrail_root_schema() -> Value {
+pub fn guardrail_root_schema(strict: bool) -> Value {
     let mut schema = struct_root_schema::<crate::models::Guardrail>(false);
     let obj = schema
         .as_object_mut()
@@ -1439,45 +1454,45 @@ pub fn guardrail_root_schema() -> Value {
                 "semantic" => {
                     set_property_enum(b, "text_source", json!(["user_messages", "all_messages"]));
                     set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
-                    // Required on the write path, defaulted in the type:
-                    // see the field's doc comment. A row saved without it
-                    // would screen every request against a model that
-                    // resolves to nothing.
-                    match b.get_mut("required").and_then(Value::as_array_mut) {
-                        Some(list) => {
-                            if !list.iter().any(|v| v.as_str() == Some("embedding_model")) {
-                                list.push(json!("embedding_model"));
-                            }
-                        }
-                        None => {
-                            b.insert("required".to_string(), json!(["embedding_model"]));
-                        }
+                    // WRITE PATH ONLY, all of it. Each of these fields is
+                    // defaulted at the type level so that a STORED row
+                    // lacking it still deserializes: the loader's failure
+                    // unit is the row, and a screening guardrail that
+                    // vanishes is fail-OPEN — strictly worse than the
+                    // field defaulting. What an operator may save is the
+                    // stricter question, and it is asked here.
+                    if strict {
+                        // A row saved without an embedding model would
+                        // screen every request against a model that
+                        // resolves to nothing.
+                        require_branch_property(b, "embedding_model");
+                        // Each threshold is required alongside ITS OWN
+                        // example list and only then — demanding an allow
+                        // threshold on a deny-only row would be asking for
+                        // a number that decides nothing. There is no value
+                        // that is right for every embedding model, so
+                        // there is nothing to default to; see the fields'
+                        // doc comments.
+                        b.insert(
+                            "allOf".to_string(),
+                            json!([
+                                {
+                                    "if": {
+                                        "required": ["deny_examples"],
+                                        "properties": { "deny_examples": { "minItems": 1 } }
+                                    },
+                                    "then": { "required": ["deny_threshold"] }
+                                },
+                                {
+                                    "if": {
+                                        "required": ["allow_examples"],
+                                        "properties": { "allow_examples": { "minItems": 1 } }
+                                    },
+                                    "then": { "required": ["allow_threshold"] }
+                                }
+                            ]),
+                        );
                     }
-                    // Each threshold is required alongside ITS OWN example
-                    // list and only then — demanding an allow threshold on a
-                    // deny-only row would be asking for a number that
-                    // decides nothing. Both are defaulted in the type for
-                    // the read path; see the fields' doc comments for why
-                    // the two paths differ.
-                    b.insert(
-                        "allOf".to_string(),
-                        json!([
-                            {
-                                "if": {
-                                    "required": ["deny_examples"],
-                                    "properties": { "deny_examples": { "minItems": 1 } }
-                                },
-                                "then": { "required": ["deny_threshold"] }
-                            },
-                            {
-                                "if": {
-                                    "required": ["allow_examples"],
-                                    "properties": { "allow_examples": { "minItems": 1 } }
-                                },
-                                "then": { "required": ["allow_threshold"] }
-                            }
-                        ]),
-                    );
                 }
                 "custom" => {
                     // Required on the write path, defaulted in the type:
@@ -3079,6 +3094,43 @@ mod tests {
         }));
         let err = validate_guardrail(&v).expect_err("the enum is still wrong");
         assert!(!err.message.contains("`deny_threshold`"), "{}", err.message);
+    }
+
+    #[test]
+    fn the_semantic_write_requirements_never_reach_the_read_path() {
+        // The loader's failure unit is the ROW, so a requirement that
+        // leaks into the lenient schema does not make a stored guardrail
+        // stricter — it deletes it. A screening row that vanishes stops
+        // screening entirely, which is fail-OPEN on a security control and
+        // strictly worse than the field defaulting.
+        //
+        // Both fields below are the shape a control plane wrote before the
+        // write path demanded them, so both must still load.
+        let unthresholded = json!({
+            "name": "g",
+            "kind": "semantic",
+            "embedding_model": "embed-1",
+            "deny_examples": ["forbidden"]
+        });
+        validate_guardrail_lenient(&unthresholded)
+            .expect("a stored row written before the threshold was required keeps screening");
+        assert!(
+            validate_guardrail(&unthresholded).is_err(),
+            "but it cannot be SAVED"
+        );
+
+        let modelless = json!({
+            "name": "g",
+            "kind": "semantic",
+            "deny_examples": ["forbidden"],
+            "deny_threshold": 0.5
+        });
+        validate_guardrail_lenient(&modelless)
+            .expect("an unresolvable embedding model degrades per fail_open, it does not vanish");
+        assert!(
+            validate_guardrail(&modelless).is_err(),
+            "but it cannot be SAVED"
+        );
     }
 
     #[test]
@@ -4900,7 +4952,7 @@ mod tests {
         // `script` defaults at the TYPE level so a projected row still
         // loads, which means only the strict schema stands between a
         // scriptless config and a guardrail the gateway will reject.
-        let schema = guardrail_root_schema();
+        let schema = guardrail_root_schema(true);
         let branch = schema["oneOf"]
             .as_array()
             .expect("the guardrail schema is a `oneOf` over the kinds")
@@ -4933,7 +4985,7 @@ mod tests {
             "semantic",
         ];
 
-        let schema = guardrail_root_schema();
+        let schema = guardrail_root_schema(true);
         let branches = schema["oneOf"]
             .as_array()
             .expect("the guardrail schema is a `oneOf` over the kinds");
