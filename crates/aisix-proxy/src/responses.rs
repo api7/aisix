@@ -2870,11 +2870,17 @@ where
             // authoritative token counts and `response.id`: forwarding it to
             // the caller while never reading it handed them real usage in the
             // body and recorded estimated counts, with no provider request id,
-            // in the UsageEvent. Appending the terminator the upstream omitted
-            // lets the normal drain read it; the drain consumes `buf`, and
-            // what it hands back is the restamped frame plus that terminator,
-            // so the client gets its own bytes back.
-            buf.extend_from_slice(b"\n\n");
+            // in the UsageEvent. Completing the terminator the upstream left
+            // off lets the normal drain read it; the drain consumes `buf`, and
+            // stripping back exactly what was added hands the client its own
+            // bytes.
+            //
+            // Pad by what is MISSING, not a fixed `\n\n`: a tail already
+            // ending in one `\n` needs one more, and padding two would make
+            // `find_frame_end` end the frame one byte early, so the strip
+            // below would eat the newline the upstream actually sent.
+            let pad: &[u8] = if buf.ends_with(b"\n") { b"\n" } else { b"\n\n" };
+            buf.extend_from_slice(pad);
             let mut drained: Vec<u8> = Vec::new();
             let (usage_acc, capture) = guard.parts();
             drain_responses_sse_frames(
@@ -2886,9 +2892,9 @@ where
                 &client_facing_model,
                 &mut drained,
             );
-            let tail = match drained.len().checked_sub(2) {
-                // Drop only the terminator this branch appended.
-                Some(n) if drained.ends_with(b"\n\n") => drained[..n].to_vec(),
+            let tail = match drained.len().checked_sub(pad.len()) {
+                // Drop only the bytes this branch appended.
+                Some(n) if drained.ends_with(pad) => drained[..n].to_vec(),
                 _ => drained,
             };
             let (usage_acc, _) = guard.parts();
@@ -3780,6 +3786,59 @@ mod tests {
         assert_eq!(event.completion_tokens, 17, "{streamed}");
         assert!(!event.usage_estimated, "the frame was read, not guessed");
         assert_eq!(event.provider_request_id, "resp_eof");
+    }
+
+    /// The same tail, but ending in ONE newline — a provider that wrote half
+    /// its terminator. The EOF branch completes the terminator so the drain
+    /// can read the frame, then strips back exactly what it added; padding a
+    /// fixed `\n\n` here would end the frame a byte early and eat the newline
+    /// the upstream really sent.
+    #[tokio::test]
+    async fn streamed_terminal_frame_with_a_half_terminator_keeps_its_own_bytes() {
+        let upstream = MockServer::start().await;
+        let sse = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_half\",\"model\":\"gpt-4o-2024-11-20\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_half\",\"model\":\"gpt-4o-2024-11-20\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8}}}\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hi",
+                "stream": true,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let streamed =
+            String::from_utf8(to_bytes(resp.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+
+        assert!(
+            streamed.contains(r#""model":"gpt-4o-resp""#),
+            "{streamed:?}"
+        );
+        // The upstream's own single trailing newline survives — not stripped,
+        // and not promoted to a full terminator it never sent.
+        assert!(
+            streamed.ends_with("}}}\n"),
+            "the provider's own trailing newline must survive: {:?}",
+            &streamed[streamed.len().saturating_sub(40)..]
+        );
+        assert!(!streamed.ends_with("}}}\n\n"), "no terminator invented");
     }
 
     /// #719: the Responses `input` array form (message items with typed

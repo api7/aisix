@@ -3774,14 +3774,31 @@ where
                     )));
                     return;
                 }
-            } else if hold_policy.is_some() {
-                // Scanned like every other frame — hold it with them.
+            } else if let Some(max_hold) = hold_policy {
+                // Scanned like every other frame — hold it with them, but
+                // under the same size policy: this path reaches `held`
+                // outside the loop, so without this the last frame could
+                // carry the buffer past the cap the loop refuses at.
                 let tail = crate::model_echo::restamp_sse_frame(
                     &tail,
                     &model_label,
                     crate::model_echo::anthropic_message_model,
                 )
                 .unwrap_or(tail);
+                if held.len() + tail.len() > max_hold {
+                    tracing::warn!(
+                        guardrail_hook = "output",
+                        max_buffer_bytes = max_hold,
+                        "streaming /v1/messages passthrough exceeded hold-back cap on its \
+                         final frame; failing closed",
+                    );
+                    guard.usage().guardrail_blocked = true;
+                    yield Ok(Bytes::from(guardrail_block_frame(
+                        None,
+                        Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+                    )));
+                    return;
+                }
                 held.extend_from_slice(&tail);
             } else {
                 // Restamp on the way out, for the same reason the `/v1/responses`

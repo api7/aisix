@@ -90,6 +90,11 @@ pub(crate) fn row_serves_name(model: &Model, requested: &str) -> bool {
     if model.is_routing() || model.is_ensemble() || model.is_semantic() {
         return false;
     }
+    // Exact equality FIRST, and for wildcard rows too. `resolve_model` starts
+    // with `get_by_name(requested)`, so a caller can address `wan/*`
+    // literally and be served by that row — which makes the pattern a name
+    // the row serves, however odd it looks. Narrowing this to the glob would
+    // make the two functions disagree about the same request.
     model.display_name == requested
         || (model.display_name.contains('*')
             && wildcard_capture(&model.display_name, requested).is_some())
@@ -167,7 +172,12 @@ mod tests {
         // caller's string rather than the row's own.
         assert!(row_serves_name(&wildcard, "wan/turbo"));
         assert!(row_serves_name(&wildcard, "wan/plus"));
-        // The row's own pattern is not a name a caller addressed.
+        // The pattern itself IS accepted, and deliberately so: `resolve_model`
+        // resolves `wan/*` by exact name lookup before it ever tries globbing,
+        // so that string is a name this row really serves. Narrowing it here
+        // would make the echo refuse a name the dispatcher accepts.
+        assert!(row_serves_name(&wildcard, "wan/*"));
+        // A bare prefix is not covered by the glob.
         assert!(!row_serves_name(&wildcard, "wan"));
         // Outside the glob: a forged id must not get its string echoed.
         assert!(!row_serves_name(&wildcard, "other/turbo"));
