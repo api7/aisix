@@ -477,8 +477,11 @@ pub fn build_request<'a>(
 /// tier has said nothing about which thinking mode it wants, and on
 /// Opus 4.6 and later the model applies its own.
 ///
-/// A native field the caller supplied itself always wins, being the more
-/// specific expression of the same setting.
+/// An effort the caller expressed natively always wins, being the more
+/// specific statement of the same setting. That means `output_config.effort`
+/// specifically, not the presence of an `output_config`: the object also
+/// carries `format` and `task_budget`, and treating it as an effort
+/// declaration would drop the tier of any request that sent one of those.
 fn translate_reasoning_effort_to_anthropic(
     extras: &mut serde_json::Map<String, serde_json::Value>,
 ) {
@@ -514,11 +517,23 @@ fn translate_reasoning_effort_to_anthropic(
             return;
         }
     };
-    if !extras.contains_key("output_config") {
-        extras.insert(
-            "output_config".to_string(),
-            serde_json::json!({"effort": tier}),
-        );
+    match extras.get_mut("output_config") {
+        // `output_config` is a carrier: a caller who sent one for
+        // `format` or `task_budget` has said nothing about effort, so
+        // the tier merges in beside them. Only an `effort` they set
+        // themselves outranks it.
+        Some(serde_json::Value::Object(config)) => {
+            config.entry("effort").or_insert_with(|| tier.into());
+        }
+        // Not an object: whatever the caller meant, replacing it would
+        // lose it. Anthropic rejects the shape either way.
+        Some(_) => {}
+        None => {
+            extras.insert(
+                "output_config".to_string(),
+                serde_json::json!({"effort": tier}),
+            );
+        }
     }
 }
 
@@ -4055,6 +4070,57 @@ mod tests {
         assert_eq!(
             built.extra.get("output_config"),
             Some(&serde_json::json!({"effort": "max"}))
+        );
+        assert!(!built.extra.contains_key("reasoning_effort"));
+    }
+
+    #[test]
+    fn build_request_merges_the_tier_into_a_carrier_output_config() {
+        // `output_config` also carries `format` and `task_budget`. A
+        // request that sent one of those has said nothing about effort,
+        // so treating the object's presence as a native override drops
+        // the caller's tier — the same silent loss this change fixes on
+        // the other side.
+        let req = ChatFormat {
+            extra: {
+                let mut m = serde_json::Map::new();
+                m.insert("reasoning_effort".to_string(), "high".into());
+                m.insert(
+                    "output_config".to_string(),
+                    serde_json::json!({"task_budget": {"type": "tokens", "total": 64000}}),
+                );
+                m
+            },
+            ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+        };
+        let (_system, messages) = split_system(&req).unwrap();
+        let built = build_request(&req, "c-name", None, messages, false);
+        assert_eq!(
+            built.extra.get("output_config"),
+            Some(&serde_json::json!({
+                "task_budget": {"type": "tokens", "total": 64000},
+                "effort": "high",
+            }))
+        );
+        assert!(!built.extra.contains_key("reasoning_effort"));
+    }
+
+    #[test]
+    fn build_request_leaves_a_non_object_output_config_alone() {
+        let req = ChatFormat {
+            extra: {
+                let mut m = serde_json::Map::new();
+                m.insert("reasoning_effort".to_string(), "high".into());
+                m.insert("output_config".to_string(), serde_json::json!("nonsense"));
+                m
+            },
+            ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+        };
+        let (_system, messages) = split_system(&req).unwrap();
+        let built = build_request(&req, "c-name", None, messages, false);
+        assert_eq!(
+            built.extra.get("output_config"),
+            Some(&serde_json::json!("nonsense"))
         );
         assert!(!built.extra.contains_key("reasoning_effort"));
     }

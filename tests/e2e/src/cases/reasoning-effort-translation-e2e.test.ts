@@ -277,6 +277,7 @@ describe("OpenAI Chat → Anthropic upstream: reasoning_effort becomes output_co
 
   async function upstreamBodyFor(
     extra: Record<string, unknown>,
+    stream = false,
   ): Promise<Record<string, unknown>> {
     const baseline = upstream!.receivedRequests.length;
     const res = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
@@ -288,6 +289,7 @@ describe("OpenAI Chat → Anthropic upstream: reasoning_effort becomes output_co
       body: JSON.stringify({
         model: "effort-anth",
         messages: [{ role: "user", content: "probe" }],
+        ...(stream ? { stream: true } : {}),
         ...extra,
       }),
     });
@@ -323,5 +325,34 @@ describe("OpenAI Chat → Anthropic upstream: reasoning_effort becomes output_co
     const none = await upstreamBodyFor({ reasoning_effort: "none" });
     expect(none.output_config).toBeUndefined();
     expect(none.thinking).toEqual({ type: "disabled" });
+  });
+
+  test("the streaming call site takes the same translation", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    // The Anthropic bridge calls `build_request` from two places, one
+    // per streaming mode. They share the translation today; this keeps
+    // the streaming one from drifting out of it.
+    const body = await upstreamBodyFor({ reasoning_effort: "xhigh" }, true);
+    expect(body.reasoning_effort).toBeUndefined();
+    expect(body.output_config).toEqual({ effort: "xhigh" });
+    expect(body.stream).toBe(true);
+  });
+
+  test("a carrier output_config keeps its other keys and gains the tier", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    const body = await upstreamBodyFor({
+      reasoning_effort: "high",
+      output_config: { task_budget: { type: "tokens", total: 64000 } },
+    });
+    expect(body.output_config).toEqual({
+      task_budget: { type: "tokens", total: 64000 },
+      effort: "high",
+    });
   });
 });
