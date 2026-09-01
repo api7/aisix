@@ -897,9 +897,11 @@ pub struct CustomConfig {
     /// instead (AGENTS.md: never make a projected field required at the
     /// type level). A row the loader cannot deserialize is skipped whole,
     /// and a screening row that vanishes is a guardrail that stopped
-    /// screening. An empty script is rejected at chain-build time, so such
-    /// a row is reported rather than silently admitting everything it was
-    /// meant to screen.
+    /// screening. An empty script is refused at chain-build time, so the
+    /// row screens nothing rather than silently admitting everything it was
+    /// meant to screen. That refusal is a warn line, not a config-status
+    /// rejection — `aisix validate` is what turns it into a report
+    /// (api7/aisix#1084).
     #[serde(default)]
     #[schemars(length(min = 1))]
     pub script: String,

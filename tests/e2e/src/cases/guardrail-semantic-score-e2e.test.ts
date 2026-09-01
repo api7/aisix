@@ -427,10 +427,13 @@ describe("semantic guardrail similarity scores on usage events", () => {
       for (const secret of [...DENY_EXAMPLES, BLOCKING_PROMPT, NEAR_MISS_PROMPT]) {
         expect(text).not.toContain(secret);
       }
-      // Not even a fragment: "jailbreak" is the word both an example and a
-      // prompt are built around.
-      expect(text).not.toContain("jailbreak");
-      expect(text).not.toContain("borderline");
+      // Not even a fragment. One guard per deny example, so a truncating
+      // implementation cannot slip through on the one that has none: the
+      // whole-string checks above would miss a leak that echoed only the
+      // first 20 characters.
+      expect(text).not.toContain("refund"); // DENY_EXAMPLES[0]
+      expect(text).not.toContain("jailbreak"); // DENY_EXAMPLES[1] + the prompt
+      expect(text).not.toContain("borderline"); // the near-miss prompt
     }
   });
 });

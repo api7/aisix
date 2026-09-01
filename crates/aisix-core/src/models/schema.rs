@@ -1521,13 +1521,13 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                     // source — a build refusal is a warn line and nothing
                     // more: `/status/config`'s `rejected` is written only by
                     // the loader, which never sees a build failure. Both
-                    // outcomes leave the row
-                    // screening nothing, so this move trades a load error for
-                    // a warn rather than winning enforcement; it is here for
-                    // consistency with the two fields above, whose read-path
-                    // behaviour genuinely is better (an empty
-                    // `embedding_model` degrades per `fail_open`, an absent
-                    // threshold keeps screening at its stored default).
+                    // outcomes leave the row screening nothing, so this move
+                    // trades a load error for a warn rather than winning
+                    // enforcement; it is here for consistency with the two
+                    // fields above, whose read-path behaviour genuinely is
+                    // better (an empty `embedding_model` degrades per
+                    // `fail_open`, an absent threshold keeps screening at its
+                    // stored default).
                     if strict {
                         require_branch_property(b, "script");
                     }
