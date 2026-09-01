@@ -328,22 +328,35 @@ describe("client-facing model echo e2e: the response names what the caller asked
       model_name: "wan-echo-upstream",
       provider_key_id: pk.id,
     });
+    // A wildcard row is deliberately absent from `/v1/models`, so it cannot
+    // be the gate — and neither can the caller key, which earlier tests in
+    // this suite already seeded under the same hash, leaving that condition
+    // true before this test writes anything. Seed a sentinel row AFTER the
+    // wildcard one instead: etcd applies in revision order, so the sentinel
+    // showing up implies the provider key and the wildcard row landed too.
+    // The gate must not be a submit — that is behavior this test asserts, and
+    // a broken submit would surface as a propagation timeout rather than as
+    // the assertion naming the defect.
+    await seed.createModel({
+      display_name: "wan-echo-ready",
+      provider: "alibaba",
+      model_name: "wan-echo-upstream",
+      provider_key_id: pk.id,
+    });
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
-    // A wildcard row is deliberately absent from `/v1/models`, so the gate
-    // is the caller key authenticating there — seeded last, so that single
-    // condition implies the model and provider key landed too (see this
-    // directory's AGENTS.md). It must NOT be a submit, which is behavior
-    // this test asserts: a broken submit would then surface as a 30s
-    // propagation timeout instead of the assertion that names the defect.
     await waitConfigPropagation(async () => {
       const r = await fetch(`${app!.proxyUrl}/v1/models`, {
         headers: { authorization: HEADERS.authorization },
       });
-      await r.text();
-      return r.status === 200;
+      if (r.status !== 200) {
+        await r.text();
+        return false;
+      }
+      const j = (await r.json()) as { data?: Array<{ id?: string }> };
+      return !!j.data?.some((m) => m.id === "wan-echo-ready");
     });
 
     const created = await fetch(`${app.proxyUrl}/v1/videos`, {
@@ -484,8 +497,12 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
       const r = await fetch(`${app!.proxyUrl}/v1/models`, {
         headers: { authorization: HEADERS.authorization },
       });
-      await r.text();
-      return r.status === 200;
+      if (r.status !== 200) {
+        await r.text();
+        return false;
+      }
+      const j = (await r.json()) as { data?: Array<{ id?: string }> };
+      return !!j.data?.some((m) => m.id === "echo-guarded");
     });
 
     const res = await fetch(`${app.proxyUrl}/v1/responses`, {
@@ -541,12 +558,19 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
+    // Gate on THIS test's row, not on the key: the preceding test in this
+    // suite already seeded the same key hash, so key-authenticates-200 is
+    // true before this test writes anything and would not wait at all.
     await waitConfigPropagation(async () => {
       const r = await fetch(`${app!.proxyUrl}/v1/models`, {
         headers: { authorization: HEADERS.authorization },
       });
-      await r.text();
-      return r.status === 200;
+      if (r.status !== 200) {
+        await r.text();
+        return false;
+      }
+      const j = (await r.json()) as { data?: Array<{ id?: string }> };
+      return !!j.data?.some((m) => m.id === "echo-tail");
     });
 
     const res = await fetch(`${app.proxyUrl}/v1/messages`, {

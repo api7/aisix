@@ -82,6 +82,14 @@ fn best_wildcard_row(
 /// body (a client-supplied video id) and must not be echoed back as though
 /// the gateway had attested it.
 pub(crate) fn row_serves_name(model: &Model, requested: &str) -> bool {
+    // The same kind gate `best_wildcard_row` applies: only a direct row can
+    // serve a caller-minted alias. Unreachable today on the one surface that
+    // calls this — `dispatch::require_provider` rejects those kinds first —
+    // but this sits beside the function it mirrors, and it judges an entry
+    // the CLIENT named, so the two answer alike rather than by coincidence.
+    if model.is_routing() || model.is_ensemble() || model.is_semantic() {
+        return false;
+    }
     model.display_name == requested
         || (model.display_name.contains('*')
             && wildcard_capture(&model.display_name, requested).is_some())

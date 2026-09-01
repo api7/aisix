@@ -10,8 +10,15 @@
 //! The bridged dispatch paths satisfy that by construction: they build the
 //! client-facing body themselves and stamp the caller's name into it. The
 //! NATIVE passthrough paths do not — they forward the upstream's own document,
-//! which carries the upstream's own id. This module is the one place that
-//! difference is repaired, so the family cannot drift again.
+//! which carries the upstream's own id. This module is where that difference
+//! is repaired, so the paths that use it cannot drift apart again.
+//!
+//! It is NOT yet the whole family. `/v1/rerank` (a Jina response carries a
+//! top-level `model`) and `/v1/realtime` (`session.created` / `session.updated`
+//! carry `session.model`) still hand the upstream id back — tracked as #1087
+//! and #1088. `/v1/fine_tuning/jobs` is deliberately outside it: its request
+//! half forwards the caller's `model` to the provider verbatim, so naming the
+//! upstream base model on both halves is the symmetric answer there (#1089).
 //!
 //! Two shapes, because a native path answers in two:
 //!
@@ -101,9 +108,18 @@ pub(crate) fn restamp_sse_buffer(
         }
         rest = tail;
     }
-    // A trailing fragment with no terminator is forwarded as-is: it carries
-    // no frame to splice.
-    out.extend_from_slice(rest);
+    // The document is COMPLETE, so a trailing fragment is not a frame still
+    // arriving — it is a final frame the upstream never terminated, and it is
+    // the one carrying `response.completed` when a provider omits the last
+    // blank line. Splice it too. (The streaming relays are the opposite case
+    // and must keep holding their tail: more bytes may still come.) The other
+    // readers of this same buffer parse it line-by-line, so they already see
+    // this frame; skipping it here would make the echo the only thing that
+    // misses it.
+    match restamp_sse_frame(rest, client_facing_model, selects_model) {
+        Some(rewritten) => out.extend_from_slice(&rewritten),
+        None => out.extend_from_slice(rest),
+    }
     out
 }
 
@@ -204,7 +220,7 @@ mod tests {
             &b""[..],
             &b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"[..],
             &b"event: ping\ndata: {}\n\ndata: [DONE]\n\n"[..],
-            // No terminator at all — the whole buffer is a fragment.
+            // No terminator at all, and nothing to match inside it.
             &b"data: {\"type\":\"response.created\""[..],
             // A complete frame followed by an unterminated remainder.
             &b"data: {\"a\":1}\n\ndata: {\"b\":2"[..],
@@ -218,6 +234,29 @@ mod tests {
                 String::from_utf8_lossy(buf),
             );
         }
+    }
+
+    /// A provider that omits the final blank line still gets its last frame
+    /// restamped. That frame is `response.completed` — the one an SDK builds
+    /// its final Response object from — so skipping it would leak the
+    /// upstream id on exactly the event that matters most, and only when a
+    /// buffering guardrail is attached.
+    #[test]
+    fn restamp_sse_buffer_splices_a_final_frame_that_was_never_terminated() {
+        let buf = concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"model\":\"up-1\"}}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"up-1\"}}",
+        )
+        .as_bytes();
+        let out =
+            String::from_utf8(restamp_sse_buffer(buf, "alias", responses_snapshot_model)).unwrap();
+        assert_eq!(out.matches("\"model\":\"alias\"").count(), 2);
+        assert!(
+            !out.contains("up-1"),
+            "the unterminated final frame too: {out}"
+        );
+        // Still no terminator invented for it.
+        assert!(out.ends_with("}}"));
     }
 
     #[test]

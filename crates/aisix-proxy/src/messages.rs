@@ -3550,6 +3550,11 @@ impl<T> Stream for AnthropicDeliveryCounter<T> {
 /// unchanged apart from the caller-facing `model` on `message_start`: the
 /// client sees the upstream's own SSE wire shape, byte for byte, with that
 /// one value spliced (see [`crate::model_echo`]).
+///
+/// Under a hold-back output policy the relay additionally WITHHOLDS bytes it
+/// could not scan — an unterminated frame at EOF, or one that ran past the
+/// frame cap. See the two arms below; on the live-forward path neither
+/// applies and every byte is delivered.
 #[allow(clippy::too_many_arguments)]
 fn build_anthropic_passthrough_stream<S, F>(
     upstream: S,
@@ -3648,7 +3653,11 @@ where
                              it unscanned",
                         );
                         guard.usage().guardrail_blocked = true;
-                        yield Ok(Bytes::from(guardrail_block_frame(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED))));
+                        // `unscannable_body`, not `output_buffer_exceeded`:
+                        // the frame is refused because it never reached the
+                        // scan, not because of its size. The hold-back cap
+                        // below keeps the size-based tag.
+                        yield Ok(Bytes::from(guardrail_block_frame(None, Some(crate::error::TAG_UNSCANNABLE_BODY))));
                         return;
                     }
                     tracing::warn!(
@@ -3722,6 +3731,21 @@ where
                      frame; dropping it unscanned rather than releasing it past the \
                      output guardrail",
                 );
+                // When the tail was the ENTIRE response, dropping it silently
+                // would hand the caller an empty 200 and no signal at all —
+                // and the guardrail scan is skipped too, since nothing ever
+                // reached `response_text`. Refuse explicitly instead, the same
+                // shape the frame-cap arm above uses. A stream that delivered
+                // real frames and merely lost a trailing fragment is NOT
+                // turned into a refusal.
+                if held.is_empty() {
+                    guard.usage().guardrail_blocked = true;
+                    yield Ok(Bytes::from(guardrail_block_frame(
+                        None,
+                        Some(crate::error::TAG_UNSCANNABLE_BODY),
+                    )));
+                    return;
+                }
             } else {
                 if guard.usage().downstream_latency_ms == 0 {
                     guard.usage().downstream_latency_ms =
@@ -6305,6 +6329,112 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
         assert_eq!(
             event.status_code, 200,
             "a fail-closed refusal is not a client abandonment"
+        );
+    }
+
+    /// The two other ways an unscanned byte could reach a client under a
+    /// hold-back policy, both deterministic here rather than only in e2e.
+    ///
+    /// `case` is the upstream's SSE body; `expect_released` is text that must
+    /// reach the caller, `expect_withheld` text that must not.
+    async fn holdback_case(sse: String) -> String {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("my-claude"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        // Block-capable, so the stream is held back; the literal never
+        // appears, so only the unscannable-bytes arms can refuse.
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"out-block","enabled":true,"kind":"keyword","hook_point":"output","fail_open":false,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-out", row, 1));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "my-claude",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100,
+                "stream": true,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        String::from_utf8(to_bytes(resp.into_body(), 1 << 21).await.unwrap().to_vec()).unwrap()
+    }
+
+    /// A stream that ends mid-frame: the scanned frames are delivered, the
+    /// unterminated remainder is not. It never reached the frame drain, so it
+    /// never fed the text the output guardrail scans — releasing it after the
+    /// scan cleared would be a way around the check.
+    #[tokio::test]
+    async fn holdback_withholds_an_unterminated_tail_but_delivers_what_was_scanned() {
+        let sse = concat!(
+            r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_t","role":"assistant","content":[],"model":"claude-3-5-haiku-20241022","stop_reason":null,"usage":{"input_tokens":4,"output_tokens":1}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"SCANNEDTEXT"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"UNSCANNEDTAIL""#,
+        );
+        let streamed = holdback_case(sse.to_string()).await;
+        assert!(
+            streamed.contains("SCANNEDTEXT"),
+            "frames that were scanned still reach the caller: {streamed}"
+        );
+        assert!(
+            !streamed.contains("UNSCANNEDTAIL"),
+            "the unterminated tail must not be released: {streamed}"
+        );
+        // The caller's alias, not the upstream id, on the way past.
+        assert!(streamed.contains(r#""model":"my-claude""#));
+        assert!(!streamed.contains("claude-3-5-haiku-20241022"));
+    }
+
+    /// A single frame that never terminates and runs past the 1 MiB frame
+    /// cap. Same bypass as the tail, reached by size instead of by EOF, so it
+    /// takes the same refusal — and `unscannable_body` rather than a
+    /// size-shaped tag, because the scan is what it missed.
+    #[tokio::test]
+    async fn holdback_refuses_a_frame_that_overruns_the_cap_without_terminating() {
+        let huge = "y".repeat(super::MAX_SSE_FRAME_BUF_BYTES + 1024);
+        let sse = format!(
+            concat!(
+                "event: content_block_delta\n",
+                r#"data: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{huge}""#,
+            ),
+            huge = huge
+        );
+        let streamed = holdback_case(sse).await;
+        assert!(
+            streamed.contains(crate::error::TAG_UNSCANNABLE_BODY),
+            "an unterminated oversized frame is refused, not released: {}",
+            &streamed[..streamed.len().min(400)]
+        );
+        assert!(
+            !streamed.contains(&huge),
+            "unscannable content must not be released"
         );
     }
 }

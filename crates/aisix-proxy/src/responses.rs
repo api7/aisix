@@ -1536,8 +1536,9 @@ async fn responses_to_target(
         // #808: wrap the verbatim byte stream so the terminal
         // `response.completed` SSE event's `usage` block is parsed in-flight
         // and a UsageEvent is emitted from the stream's Drop guard at
-        // end-of-stream (or client-disconnect). Bytes forward unchanged — the
-        // client still sees the exact upstream SSE wire shape. Pre-#808 this
+        // end-of-stream (or client-disconnect). Bytes forward unchanged apart
+        // from the caller-facing `model` on the snapshot frames — see
+        // [`crate::model_echo`]. Pre-#808 this
         // path dropped the event entirely, so every streaming /v1/responses
         // call (e.g. all Codex traffic, which always streams) was invisible
         // to the dashboard Logs and the budget ledger.
