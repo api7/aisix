@@ -879,4 +879,267 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
     expect(text).toContain("[EMAIL_REDACTED]");
     expect(text.endsWith("\n\n")).toBe(true);
   });
+
+  // #1100. The sibling of the three cases above, in the frames BEFORE the
+  // fragment. A COMPLETE, terminated frame was scanned and masked only if
+  // its `data:` payload happened to be exactly one JSON document, and two
+  // shapes are not:
+  //
+  //   - a payload that is not JSON at all — the scan `continue`s past a line
+  //     it cannot parse and the redactor skips a frame with no parsed
+  //     payload, so it went out byte-for-byte having been read by nothing;
+  //   - a payload written over several `data:` lines, which the spec joins
+  //     with `\n` — only the first was read, so a literal on a later line was
+  //     never seen and a mask deleted every line after the first.
+  //
+  // Neither is reachable from the providers proxied today, which is why the
+  // upstreams below are hand-written frames.
+
+  test("/v1/responses: a terminated frame whose payload is not JSON is scanned, not released", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return void ctx.skip();
+
+    const snapshot = (status: string) =>
+      `"id":"resp_raw","object":"response","status":"${status}","model":"${UPSTREAM_REPORTED_MODEL}"`;
+    const upstream = await startOpenAiUpstream({
+      rawStreamFrames: [
+        `event: response.created\ndata: {"type":"response.created","response":{${snapshot("in_progress")}}}\n\n`,
+        `event: response.output_text.delta\ndata: {"type":"response.output_text.delta","item_id":"m","delta":"perfectly fine text"}\n\n`,
+        // Complete and terminated, but its payload is plain text. Both passes
+        // used to skip it, so the guardrail's literal rode out untouched in a
+        // 200.
+        `data: ABSOLUTELYFORBIDDENWORD arrived as plain text\n\n`,
+        `event: response.completed\ndata: {"type":"response.completed","response":{${snapshot("completed")},"usage":{"input_tokens":4,"output_tokens":3,"total_tokens":7}}}\n\n`,
+        `data: [DONE]\n\n`,
+      ],
+    });
+    upstreams.push(upstream);
+
+    const pk = await seed.createProviderKey({
+      display_name: "pk-echo-raw-frame",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "echo-raw-frame",
+      provider: "openai",
+      model_name: CONFIGURED_MODEL_NAME,
+      provider_key_id: pk.id,
+    });
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["*"],
+    });
+    await waitConfigPropagation(async () => {
+      const r = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: HEADERS.authorization },
+      });
+      if (r.status !== 200) {
+        await r.text();
+        return false;
+      }
+      const j = (await r.json()) as { data?: Array<{ id?: string }> };
+      return !!j.data?.some((m) => m.id === "echo-raw-frame");
+    });
+
+    const res = await fetch(`${app.proxyUrl}/v1/responses`, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify({
+        model: "echo-raw-frame",
+        input: "say something",
+        stream: true,
+      }),
+    });
+    // Blocked, not delivered: the block pass reads raw text, so a payload
+    // nothing can parse is still scanned. Pre-fix this was a 200 carrying the
+    // literal.
+    expect(res.status).toBe(422);
+    const text = await res.text();
+    expect(text).not.toContain("ABSOLUTELYFORBIDDENWORD");
+  });
+
+  test("/v1/responses: a frame whose payload spans several data lines is masked whole", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return void ctx.skip();
+
+    const snapshot = (status: string) =>
+      `"id":"resp_multiline","object":"response","status":"${status}","model":"${UPSTREAM_REPORTED_MODEL}"`;
+    const upstream = await startOpenAiUpstream({
+      rawStreamFrames: [
+        `event: response.created\ndata: {"type":"response.created","response":{${snapshot("in_progress")}}}\n\n`,
+        // ONE frame, ONE JSON document, two `data:` lines. The maskable
+        // literal is on the second — invisible while only the first was read.
+        `event: response.output_text.delta\ndata: {"type":"response.output_text.delta","item_id":"m",\ndata: "delta":"write to tail@example.com"}\n\n`,
+        `event: response.completed\ndata: {"type":"response.completed","response":{${snapshot("completed")},"usage":{"input_tokens":4,"output_tokens":3,"total_tokens":7}}}\n\n`,
+        `data: [DONE]\n\n`,
+      ],
+    });
+    upstreams.push(upstream);
+
+    const pk = await seed.createProviderKey({
+      display_name: "pk-echo-multiline",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "echo-multiline",
+      provider: "openai",
+      model_name: CONFIGURED_MODEL_NAME,
+      provider_key_id: pk.id,
+    });
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["*"],
+    });
+    await waitConfigPropagation(async () => {
+      const r = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: HEADERS.authorization },
+      });
+      if (r.status !== 200) {
+        await r.text();
+        return false;
+      }
+      const j = (await r.json()) as { data?: Array<{ id?: string }> };
+      return !!j.data?.some((m) => m.id === "echo-multiline");
+    });
+
+    const res = await fetch(`${app.proxyUrl}/v1/responses`, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify({
+        model: "echo-multiline",
+        input: "who do I write to",
+        stream: true,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain("tail@example.com");
+    expect(text).toContain("[EMAIL_REDACTED]");
+    // The second line's content survives the rewrite — the frame is
+    // re-emitted as the whole document, not truncated to its first line.
+    expect(text).toContain("write to [EMAIL_REDACTED]");
+    expect(text).toContain('"item_id":"m"');
+  });
+
+  test("/v1/messages hold-back: a terminated frame whose payload is not JSON is scanned, not released", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return void ctx.skip();
+
+    const upstream = await startOpenAiUpstream({
+      rawStreamFrames: [
+        `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_raw","type":"message","role":"assistant","model":"${UPSTREAM_REPORTED_MODEL}","content":[],"usage":{"input_tokens":4,"output_tokens":0}}}\n\n`,
+        `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"perfectly fine text"}}\n\n`,
+        `data: ABSOLUTELYFORBIDDENWORD arrived as plain text\n\n`,
+        `event: message_stop\ndata: {"type":"message_stop"}\n\n`,
+      ],
+    });
+    upstreams.push(upstream);
+
+    const pk = await seed.createProviderKey({
+      display_name: "pk-echo-raw-frame-anthropic",
+      secret: "sk-mock",
+      api_base: upstream.baseUrl,
+      provider: "anthropic",
+      adapter: "anthropic",
+    });
+    await seed.createModel({
+      display_name: "echo-raw-frame-anthropic",
+      provider: "anthropic",
+      model_name: CONFIGURED_MODEL_NAME,
+      provider_key_id: pk.id,
+    });
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["*"],
+    });
+    await waitConfigPropagation(async () => {
+      const r = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: HEADERS.authorization },
+      });
+      if (r.status !== 200) {
+        await r.text();
+        return false;
+      }
+      const j = (await r.json()) as { data?: Array<{ id?: string }> };
+      return !!j.data?.some((m) => m.id === "echo-raw-frame-anthropic");
+    });
+
+    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify({
+        model: "echo-raw-frame-anthropic",
+        max_tokens: 16,
+        stream: true,
+        messages: [{ role: "user", content: "say something" }],
+      }),
+    });
+    // The stream committed its 200 before the scan; the block is in-band.
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain("content_filter");
+    expect(text).not.toContain("ABSOLUTELYFORBIDDENWORD");
+    // Hold-back: nothing was forwarded before the verdict, so the frames
+    // that DID clear are withheld too.
+    expect(text).not.toContain("perfectly fine text");
+  });
+
+  test("/v1/messages hold-back: a frame whose payload spans several data lines is masked whole", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return void ctx.skip();
+
+    const upstream = await startOpenAiUpstream({
+      rawStreamFrames: [
+        `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_multiline","type":"message","role":"assistant","model":"${UPSTREAM_REPORTED_MODEL}","content":[],"usage":{"input_tokens":4,"output_tokens":0}}}\n\n`,
+        `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,\ndata: "delta":{"type":"text_delta","text":"write to tail@example.com"}}\n\n`,
+        `event: message_stop\ndata: {"type":"message_stop"}\n\n`,
+      ],
+    });
+    upstreams.push(upstream);
+
+    const pk = await seed.createProviderKey({
+      display_name: "pk-echo-multiline-anthropic",
+      secret: "sk-mock",
+      api_base: upstream.baseUrl,
+      provider: "anthropic",
+      adapter: "anthropic",
+    });
+    await seed.createModel({
+      display_name: "echo-multiline-anthropic",
+      provider: "anthropic",
+      model_name: CONFIGURED_MODEL_NAME,
+      provider_key_id: pk.id,
+    });
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["*"],
+    });
+    await waitConfigPropagation(async () => {
+      const r = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: HEADERS.authorization },
+      });
+      if (r.status !== 200) {
+        await r.text();
+        return false;
+      }
+      const j = (await r.json()) as { data?: Array<{ id?: string }> };
+      return !!j.data?.some((m) => m.id === "echo-multiline-anthropic");
+    });
+
+    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify({
+        model: "echo-multiline-anthropic",
+        max_tokens: 16,
+        stream: true,
+        messages: [{ role: "user", content: "who do I write to" }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain("tail@example.com");
+    expect(text).toContain("[EMAIL_REDACTED]");
+    expect(text).toContain("write to [EMAIL_REDACTED]");
+    // The line the payload continued onto is still there.
+    expect(text).toContain('"text_delta"');
+  });
 });

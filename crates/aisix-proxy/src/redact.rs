@@ -825,9 +825,11 @@ struct SseFrame {
 }
 
 impl SseFrame {
-    /// Re-render the frame: the first `data:` line is replaced with the
-    /// re-serialised payload (subsequent `data:` lines dropped); every
-    /// other line passes through untouched.
+    /// Re-render the frame: the first `data:` line carries the whole
+    /// re-serialised payload and the frame's other `data:` lines go with
+    /// it; every other line passes through untouched. Collapsing them is
+    /// not a loss — the payload is the lines joined with `\n`, and a
+    /// compact JSON document holds none, so one line says the same thing.
     fn render(&self) -> Vec<u8> {
         if !self.dirty {
             return self.raw.clone();
@@ -904,23 +906,59 @@ fn last_frame_end(raw: &[u8]) -> usize {
     end
 }
 
-/// The text of a frame's `data:` line, un-parsed (`None` = the frame
-/// carries no `data:` line at all — a comment or keepalive).
-fn frame_data_line(frame_raw: &[u8]) -> Option<String> {
-    String::from_utf8_lossy(frame_raw)
-        .split('\n')
-        .find(|l| l.starts_with("data:"))
-        .map(|l| l["data:".len()..].trim().to_owned())
+/// A frame's `data:` payload, un-parsed (`None` = the frame carries no
+/// `data:` line at all — a comment or keepalive).
+///
+/// A frame may carry SEVERAL `data:` lines, and the payload is all of them
+/// joined with `\n`; one leading space after the colon belongs to the
+/// framing, not the payload
+/// (<https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation>).
+/// Reading only the first line truncates the payload silently, which is
+/// how such a frame used to be invisible to the scan and rendered down to
+/// its first line by the redactor (#1100).
+pub(crate) fn frame_payload(frame_raw: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(frame_raw);
+    let mut lines = text.split('\n').filter_map(|l| {
+        let l = l.strip_suffix('\r').unwrap_or(l);
+        let l = l.strip_prefix("data:")?;
+        Some(l.strip_prefix(' ').unwrap_or(l))
+    });
+    let mut payload = lines.next()?.to_owned();
+    for l in lines {
+        payload.push('\n');
+        payload.push_str(l);
+    }
+    Some(payload)
 }
 
-/// Every `data:` line in a frame, un-parsed. A well-formed frame has at
-/// most one; more than one means the bytes are not one frame.
-fn frame_data_lines(frame_raw: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(frame_raw)
-        .split('\n')
-        .filter(|l| l.starts_with("data:"))
-        .map(|l| l["data:".len()..].trim().to_owned())
-        .collect()
+/// The `data:` payload of every frame in a buffered SSE body, in order,
+/// plus a trailing unterminated fragment's if there is one. Frames with no
+/// `data:` line are skipped.
+///
+/// The line-based block scans read this rather than raw lines, so the
+/// payload they scan is the payload the redaction pass rewrites — the two
+/// cannot disagree about what a frame carries (#1100).
+pub(crate) fn sse_frame_payloads(raw: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = raw;
+    while let Some((pos, len)) = frame_terminator(rest) {
+        if let Some(p) = frame_payload(&rest[..pos]) {
+            out.push(p);
+        }
+        rest = &rest[pos + len..];
+    }
+    if let Some(p) = frame_payload(rest) {
+        out.push(p);
+    }
+    out
+}
+
+/// Whether a payload is one the passes can read: one JSON document, or
+/// nothing to read at all (empty, or the `[DONE]` sentinel — both are
+/// skipped by every scan).
+fn payload_scannable(payload: &str) -> bool {
+    let t = payload.trim();
+    t.is_empty() || t == "[DONE]" || serde_json::from_str::<Value>(t).is_ok()
 }
 
 /// Split a buffered SSE byte stream into frames on the blank-line
@@ -936,7 +974,8 @@ fn split_sse_frames(raw: &[u8]) -> (Vec<SseFrame>, &[u8]) {
         let frame_raw = &rest[..pos];
         frames.push(SseFrame {
             raw: frame_raw.to_vec(),
-            data: frame_data_line(frame_raw).and_then(|l| serde_json::from_str::<Value>(&l).ok()),
+            data: frame_payload(frame_raw)
+                .and_then(|l| serde_json::from_str::<Value>(l.trim()).ok()),
             term: if len == 4 { b"\r\n\r\n" } else { b"\n\n" },
             dirty: false,
         });
@@ -958,53 +997,91 @@ pub enum SseTailSeal {
     Dropped { dropped: usize },
 }
 
+/// What [`seal_buffered_sse`] did to a buffered body.
+#[derive(Debug)]
+pub struct BufferedSseSeal {
+    /// The trailing, unterminated fragment's disposition (#1091).
+    pub tail: SseTailSeal,
+    /// The payloads of terminated frames excised because they are not one
+    /// JSON document (#1100) — plain text, or several `data:` lines that
+    /// do not join into one.
+    ///
+    /// They are gone from the buffer, and the caller MUST fold them into
+    /// the text it hands the block scan: nothing can mask such a payload,
+    /// but a forbidden literal in one still has to block the response.
+    pub excised: Vec<String>,
+    /// How many bytes that excision removed (log detail).
+    pub excised_bytes: usize,
+}
+
+impl BufferedSseSeal {
+    /// Whether anything was removed from the buffer. A buffer left empty
+    /// by a cut has nothing scanned in it and must be refused; one that
+    /// was empty to begin with is just an empty upstream response.
+    pub fn cut_anything(&self) -> bool {
+        matches!(self.tail, SseTailSeal::Dropped { .. }) || !self.excised.is_empty()
+    }
+}
+
 /// Seal a fully-buffered SSE body so a guardrail scan and the redaction
-/// pass read the SAME frames (#1091).
+/// pass read the SAME frames, and so nothing in it reaches the client
+/// without having been read by one of them (#1091, #1100).
 ///
-/// A non-conformant upstream can end mid-frame. That fragment is where the
-/// two passes disagreed: the line-based block scan reads whatever lines it
-/// finds, while the frame-based redactor hands the fragment back as
-/// `trailing` and appends it verbatim — never masked. Either way something
-/// unscanned reaches the client.
+/// Two passes run over such a buffer and they used to disagree about what
+/// it contains: the line-based block scan reads whatever `data:` lines it
+/// finds and parses each one, while the frame-based redactor walks
+/// terminator-delimited frames. Wherever they disagreed, something
+/// unscanned reached the client. Both shapes of disagreement are resolved
+/// here, BEFORE either pass runs:
 ///
-/// So the fragment is resolved BEFORE either pass runs, exactly as the
-/// `/v1/messages` EOF tail is:
+/// - **The trailing fragment** (#1091) — a non-conformant upstream can end
+///   mid-frame. If it parses, or carries nothing a scan could read (no
+///   `data:` line at all, an empty payload, or the `[DONE]` sentinel), the
+///   terminator it left off is completed and it becomes an ordinary frame
+///   to both passes. If it does not, it is cut.
+/// - **A terminated frame whose payload is not one JSON document** (#1100)
+///   — plain text, or `data:` lines that do not join into one document.
+///   Neither pass could read it: the scan `continue`s past a line it
+///   cannot parse, and the redactor skips a frame with no parsed payload,
+///   so it was released byte-for-byte having been seen by nothing. Nothing
+///   can mask such a payload structurally, so it is excised and returned
+///   in [`BufferedSseSeal::excised`] for the caller's block scan to read.
 ///
-/// - it is ONE frame and it parses, or carries nothing a scan could read —
-///   no `data:` line at all (a comment / keepalive), an empty payload, or
-///   the `[DONE]` sentinel: complete the terminator the upstream left off. It is then an ordinary
-///   frame, scanned and maskable like every other one, and the client gets a
-///   frame it can actually parse.
-/// - it does not parse, or is not one frame at all (several `data:` lines
-///   with no blank line between them): nothing can extract its text, so
-///   releasing it WOULD be the bypass. It is cut, and the caller warns. A caller whose buffer
-///   is left empty by that cut has nothing scanned at all and must refuse
-///   (`unscannable_body`) rather than answer with an empty 200.
+/// A caller whose buffer is left empty by either cut has nothing scanned
+/// at all and must refuse (`unscannable_body`) rather than answer with an
+/// empty 200.
+///
+/// Note what is NOT cut: a frame carrying several `data:` lines that join
+/// into one JSON document is a well-formed frame, and is scanned and
+/// masked like any other. The payload is the lines joined with `\n` —
+/// reading only the first is the truncation #1100 is about, not a reason
+/// to drop the frame.
+pub fn seal_buffered_sse(buf: &mut Vec<u8>) -> BufferedSseSeal {
+    let tail = seal_sse_tail(buf);
+    let (excised, excised_bytes) = excise_unscannable_frames(buf);
+    BufferedSseSeal {
+        tail,
+        excised,
+        excised_bytes,
+    }
+}
+
+/// Resolve the unterminated trailing fragment (#1091). See
+/// [`seal_buffered_sse`].
 ///
 /// Pads by what is MISSING, not a fixed `\n\n`: a fragment that already
 /// ends in half its terminator needs only the other half, and a full pad
 /// would leave a stray blank line in the released bytes. The upstream's own
 /// line ending is matched, so a CRLF stream stays a CRLF stream.
-pub fn seal_buffered_sse(buf: &mut Vec<u8>) -> SseTailSeal {
+fn seal_sse_tail(buf: &mut Vec<u8>) -> SseTailSeal {
     let end = last_frame_end(buf);
     if end == buf.len() {
         return SseTailSeal::Terminated;
     }
-    let payloads = frame_data_lines(&buf[end..]);
-    // One frame carries one payload here. Several `data:` lines with no
-    // blank line between them are an upstream that never wrote its frame
-    // separators, and padding THAT into a single frame is worse than
-    // leaving it: the redactor renders a rewritten frame down to its first
-    // `data:` line, so masking would silently delete everything after it.
-    // Nothing can frame it, so nothing can scan it — cut it.
-    //
-    // Otherwise: an empty payload and the `[DONE]` sentinel carry no text
-    // (the scan passes skip both), so cutting one protects nothing and
-    // takes the terminal event the client is waiting for with it.
-    let scannable = payloads.len() <= 1
-        && payloads
-            .iter()
-            .all(|l| l.is_empty() || l == "[DONE]" || serde_json::from_str::<Value>(l).is_ok());
+    // An empty payload and the `[DONE]` sentinel carry no text (the scan
+    // passes skip both), so cutting one protects nothing and takes the
+    // terminal event the client is waiting for with it.
+    let scannable = frame_payload(&buf[end..]).is_none_or(|p| payload_scannable(&p));
     if !scannable {
         let dropped = buf.len() - end;
         buf.truncate(end);
@@ -1033,6 +1110,40 @@ pub fn seal_buffered_sse(buf: &mut Vec<u8>) -> SseTailSeal {
     };
     buf.extend_from_slice(pad);
     SseTailSeal::Completed { padded: pad.len() }
+}
+
+/// Cut every terminated frame whose payload is not one JSON document
+/// (#1100), returning those payloads and the bytes removed. See
+/// [`seal_buffered_sse`].
+///
+/// Runs AFTER the tail seal, so a fragment that was padded into a frame is
+/// judged by the same rule as the frames before it.
+fn excise_unscannable_frames(buf: &mut Vec<u8>) -> (Vec<String>, usize) {
+    let mut excised: Vec<String> = Vec::new();
+    let mut excised_bytes = 0usize;
+    let mut kept: Vec<u8> = Vec::with_capacity(buf.len());
+    let mut rest: &[u8] = buf;
+    while let Some((pos, len)) = frame_terminator(rest) {
+        match frame_payload(&rest[..pos]) {
+            // A frame with no `data:` line at all is a comment or a
+            // keepalive: there is nothing in it for a scan to read and
+            // nothing for a mask to rewrite, so it is not a bypass.
+            Some(p) if !payload_scannable(&p) => {
+                excised.push(p);
+                excised_bytes += pos + len;
+            }
+            _ => kept.extend_from_slice(&rest[..pos + len]),
+        }
+        rest = &rest[pos + len..];
+    }
+    if excised.is_empty() {
+        return (excised, 0);
+    }
+    // Empty after the tail seal, but appending it keeps this function
+    // correct on its own terms rather than on its caller's.
+    kept.extend_from_slice(rest);
+    *buf = kept;
+    (excised, excised_bytes)
 }
 
 /// Mask a fully-buffered Anthropic-native SSE response (the `/v1/messages`
@@ -1851,7 +1962,7 @@ mod tests {
         .as_bytes()
         .to_vec();
         assert_eq!(
-            seal_buffered_sse(&mut raw),
+            seal_buffered_sse(&mut raw).tail,
             SseTailSeal::Completed { padded: 2 }
         );
         let (out, counts) = redact_responses_sse(chain.as_ref(), &raw)
@@ -1874,7 +1985,7 @@ mod tests {
         .as_bytes()
         .to_vec();
         assert_eq!(
-            seal_buffered_sse(&mut raw),
+            seal_buffered_sse(&mut raw).tail,
             SseTailSeal::Completed { padded: 2 }
         );
         let (out, counts) = redact_anthropic_sse(chain.as_ref(), &raw)
@@ -1890,7 +2001,7 @@ mod tests {
     fn seal_leaves_a_terminated_body_byte_identical() {
         let raw = b"event: x\ndata: {\"a\":1}\n\n".to_vec();
         let mut sealed = raw.clone();
-        assert_eq!(seal_buffered_sse(&mut sealed), SseTailSeal::Terminated);
+        assert_eq!(seal_buffered_sse(&mut sealed).tail, SseTailSeal::Terminated);
         assert_eq!(sealed, raw);
     }
 
@@ -1899,7 +2010,7 @@ mod tests {
         // Nothing of the terminator written.
         let mut none = b"data: {\"a\":1}".to_vec();
         assert_eq!(
-            seal_buffered_sse(&mut none),
+            seal_buffered_sse(&mut none).tail,
             SseTailSeal::Completed { padded: 2 }
         );
         assert_eq!(none, b"data: {\"a\":1}\n\n");
@@ -1907,14 +2018,14 @@ mod tests {
         // fixed `\n\n` here would leave a stray blank line in the frames.
         let mut half = b"data: {\"a\":1}\n".to_vec();
         assert_eq!(
-            seal_buffered_sse(&mut half),
+            seal_buffered_sse(&mut half).tail,
             SseTailSeal::Completed { padded: 1 }
         );
         assert_eq!(half, b"data: {\"a\":1}\n\n");
         // A comment / keepalive carries nothing to scan, so it is kept.
         let mut comment = b"data: {\"a\":1}\n\n: ping".to_vec();
         assert_eq!(
-            seal_buffered_sse(&mut comment),
+            seal_buffered_sse(&mut comment).tail,
             SseTailSeal::Completed { padded: 2 }
         );
     }
@@ -1934,7 +2045,7 @@ mod tests {
         .as_bytes()
         .to_vec();
         let mut sealed = raw.clone();
-        assert_eq!(seal_buffered_sse(&mut sealed), SseTailSeal::Terminated);
+        assert_eq!(seal_buffered_sse(&mut sealed).tail, SseTailSeal::Terminated);
         assert_eq!(sealed, raw, "a terminated CRLF body must not be repadded");
         let (out, counts) = redact_responses_sse(chain.as_ref(), &sealed).unwrap();
         let out = String::from_utf8(out).unwrap();
@@ -1950,14 +2061,14 @@ mod tests {
     fn seal_matches_the_upstreams_own_line_ending() {
         let mut crlf = b"data: {\"a\":1}\r\n".to_vec();
         assert_eq!(
-            seal_buffered_sse(&mut crlf),
+            seal_buffered_sse(&mut crlf).tail,
             SseTailSeal::Completed { padded: 2 }
         );
         assert_eq!(crlf, b"data: {\"a\":1}\r\n\r\n");
         // Three quarters of a CRLF terminator written.
         let mut partial = b"data: {\"a\":1}\r\n\r".to_vec();
         assert_eq!(
-            seal_buffered_sse(&mut partial),
+            seal_buffered_sse(&mut partial).tail,
             SseTailSeal::Completed { padded: 1 }
         );
         assert_eq!(partial, b"data: {\"a\":1}\r\n\r\n");
@@ -1974,7 +2085,7 @@ mod tests {
         .as_bytes()
         .to_vec();
         assert_eq!(
-            seal_buffered_sse(&mut raw),
+            seal_buffered_sse(&mut raw).tail,
             SseTailSeal::Completed { padded: 4 }
         );
         assert!(raw.ends_with(b"\r\n\r\n"));
@@ -1986,7 +2097,7 @@ mod tests {
         // Half a payload line written: the CR is there, its LF is not.
         let mut half_line = b"data: {\"a\":1}\r\n\r\ndata: {\"b\":2}\r".to_vec();
         assert_eq!(
-            seal_buffered_sse(&mut half_line),
+            seal_buffered_sse(&mut half_line).tail,
             SseTailSeal::Completed { padded: 3 }
         );
         assert!(half_line.ends_with(b"data: {\"b\":2}\r\n\r\n"));
@@ -2006,7 +2117,7 @@ mod tests {
         .as_bytes()
         .to_vec();
         assert!(matches!(
-            seal_buffered_sse(&mut raw),
+            seal_buffered_sse(&mut raw).tail,
             SseTailSeal::Dropped { .. }
         ));
         // Nothing was scanned, so nothing is released — the caller refuses.
@@ -2071,7 +2182,7 @@ mod tests {
                 );
                 // And sealing is settled: a second pass changes nothing.
                 let once = buf.clone();
-                assert_eq!(seal_buffered_sse(&mut buf), SseTailSeal::Terminated);
+                assert_eq!(seal_buffered_sse(&mut buf).tail, SseTailSeal::Terminated);
                 assert_eq!(buf, once, "seal is not idempotent on {before:?}");
             }
             words = next;
@@ -2085,7 +2196,10 @@ mod tests {
         for tail in ["data: [DONE]", "data:"] {
             let mut raw = format!("data: {{\"a\":1}}\n\n{tail}").into_bytes();
             assert!(
-                matches!(seal_buffered_sse(&mut raw), SseTailSeal::Completed { .. }),
+                matches!(
+                    seal_buffered_sse(&mut raw).tail,
+                    SseTailSeal::Completed { .. }
+                ),
                 "cut {tail}",
             );
             assert!(String::from_utf8(raw)
@@ -2100,7 +2214,7 @@ mod tests {
         // scan it, so it must not be released.
         let mut raw = b"data: {\"a\":1}\n\ndata: {\"text\":\"SECRET".to_vec();
         assert_eq!(
-            seal_buffered_sse(&mut raw),
+            seal_buffered_sse(&mut raw).tail,
             SseTailSeal::Dropped { dropped: 21 },
         );
         assert_eq!(raw, b"data: {\"a\":1}\n\n");
@@ -2108,10 +2222,149 @@ mod tests {
         // refuses rather than answering with an empty 200.
         let mut only = b"data: {\"text\":\"SECRET".to_vec();
         assert!(matches!(
-            seal_buffered_sse(&mut only),
+            seal_buffered_sse(&mut only).tail,
             SseTailSeal::Dropped { .. }
         ));
         assert!(only.is_empty());
+    }
+
+    // #1100: the sibling of the fragment above, in the frames BEFORE it. A
+    // terminated frame whose payload is not one JSON document was read by
+    // neither pass — the scan `continue`d past a line it could not parse and
+    // the redactor skipped a frame with no parsed payload — so it went out
+    // byte-for-byte, seen by nothing. And a frame whose payload legitimately
+    // spans several `data:` lines lost every line after the first when the
+    // redactor rewrote it.
+
+    #[test]
+    fn a_frames_payload_is_all_of_its_data_lines_joined() {
+        // Split mid-document, which is exactly what the spec's `\n` join is
+        // for. Reading only the first line leaves neither half parseable.
+        let frame = b"event: x\ndata: {\"type\":\"content_block_delta\",\ndata: \"index\":0}";
+        assert_eq!(
+            frame_payload(frame).as_deref(),
+            Some("{\"type\":\"content_block_delta\",\n\"index\":0}"),
+        );
+        // One leading space belongs to the framing, the rest to the payload.
+        assert_eq!(frame_payload(b"data:  x").as_deref(), Some(" x"));
+        // No `data:` line at all: a comment or keepalive, nothing to read.
+        assert_eq!(frame_payload(b": ping"), None);
+    }
+
+    #[test]
+    fn anthropic_sse_masks_a_frame_whose_payload_spans_several_data_lines() {
+        let chain = both();
+        let mut raw = concat!(
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello \"}}\n\n",
+            // One frame, one JSON document, written over two `data:` lines.
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\n",
+            "data: \"delta\":{\"type\":\"text_delta\",\"text\":\"mail a@x.com\"}}\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+        // Nothing to seal — every frame here is terminated — and nothing to
+        // excise either: the joined payload IS one JSON document.
+        let seal = seal_buffered_sse(&mut raw);
+        assert_eq!(seal.tail, SseTailSeal::Terminated);
+        assert!(seal.excised.is_empty(), "excised: {:?}", seal.excised);
+        let (out, counts) = redact_anthropic_sse(chain.as_ref(), &raw)
+            .expect("the whole payload must reach the redactor");
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@x.com"), "left unmasked: {out}");
+        assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
+        assert_eq!(counts.get("email"), Some(&1));
+        // The rewritten frame carries the whole document, re-serialised onto
+        // one `data:` line — the payload is preserved, not truncated to its
+        // first line.
+        assert!(out.contains("\"index\":0"), "second line dropped: {out}");
+        assert!(out.contains("\"text_delta\""), "second line dropped: {out}");
+    }
+
+    #[test]
+    fn responses_sse_masks_a_frame_whose_payload_spans_several_data_lines() {
+        let chain = both();
+        let mut raw = concat!(
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"delta\":\"hello \"}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\n",
+            "data: \"item_id\":\"m\",\"delta\":\"mail a@x.com\"}\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let seal = seal_buffered_sse(&mut raw);
+        assert!(seal.excised.is_empty(), "excised: {:?}", seal.excised);
+        let (out, counts) = redact_responses_sse(chain.as_ref(), &raw)
+            .expect("the whole payload must reach the redactor");
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@x.com"), "left unmasked: {out}");
+        assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
+        assert_eq!(counts.get("email"), Some(&1));
+        assert!(
+            out.contains("\"item_id\":\"m\""),
+            "second line dropped: {out}"
+        );
+    }
+
+    #[test]
+    fn seal_excises_a_terminated_frame_whose_payload_is_not_json() {
+        // Plain text in the middle of an otherwise well-formed stream. No
+        // pass could read it, so it used to be released having been scanned
+        // by nothing.
+        let mut raw = b"data: {\"a\":1}\n\ndata: my mail is a@x.com\n\ndata: [DONE]\n\n".to_vec();
+        let seal = seal_buffered_sse(&mut raw);
+        assert_eq!(seal.tail, SseTailSeal::Terminated);
+        // Handed back for the caller's block scan: nothing can mask it, but
+        // a forbidden literal in it still has to block the response.
+        assert_eq!(seal.excised, vec!["my mail is a@x.com".to_string()]);
+        assert_eq!(seal.excised_bytes, "data: my mail is a@x.com\n\n".len());
+        assert!(seal.cut_anything());
+        // ...and it is gone from what will be released, while its neighbours
+        // — including the frames with nothing to scan — are untouched.
+        assert_eq!(raw, b"data: {\"a\":1}\n\ndata: [DONE]\n\n");
+    }
+
+    #[test]
+    fn seal_excises_a_terminated_frame_whose_data_lines_do_not_join_into_one_document() {
+        // Two complete events run together with no blank line between them:
+        // not one frame, and the join is not one document either. Same rule
+        // as the tail shape, now applied wherever it appears.
+        let mut raw =
+            b"data: {\"a\":1}\n\ndata: {\"b\":2}\ndata: {\"c\":3}\n\ndata: [DONE]\n\n".to_vec();
+        let seal = seal_buffered_sse(&mut raw);
+        assert_eq!(
+            seal.excised,
+            vec!["{\"b\":2}\n{\"c\":3}".to_string()],
+            "raw: {}",
+            String::from_utf8_lossy(&raw),
+        );
+        assert_eq!(raw, b"data: {\"a\":1}\n\ndata: [DONE]\n\n");
+    }
+
+    #[test]
+    fn seal_can_excise_the_whole_buffer() {
+        // The caller refuses with `unscannable_body` rather than answering
+        // with an empty 200 — `cut_anything` is what tells it apart from an
+        // upstream that simply sent nothing.
+        let mut raw = b"data: not json at all\n\n".to_vec();
+        let seal = seal_buffered_sse(&mut raw);
+        assert!(raw.is_empty());
+        assert!(seal.cut_anything());
+
+        let mut empty = Vec::new();
+        let seal = seal_buffered_sse(&mut empty);
+        assert!(!seal.cut_anything(), "an empty body is not a cut");
+    }
+
+    #[test]
+    fn seal_keeps_frames_with_nothing_to_scan_and_crlf_frames() {
+        // A comment, a keepalive and an empty payload carry no text any pass
+        // reads, so excising them would cost the client its events and
+        // protect nothing. Framed CRLF, since that is the form the splitter
+        // used to miss entirely.
+        let raw = b": ping\r\n\r\ndata:\r\n\r\ndata: [DONE]\r\n\r\n".to_vec();
+        let mut sealed = raw.clone();
+        let seal = seal_buffered_sse(&mut sealed);
+        assert!(seal.excised.is_empty(), "excised: {:?}", seal.excised);
+        assert_eq!(sealed, raw);
     }
 
     #[test]
