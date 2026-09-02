@@ -222,7 +222,7 @@ describe("files: an unscannable upload is refused, not forwarded", () => {
     expect(open.upstream.uploads[0].includes(NON_UTF8_LINE)).toBe(true);
   });
 
-  test("a clean UTF-8 blob still scans and forwards", async (ctx) => {
+  test("a decodable blob with a guardrail attached is still forwarded", async (ctx) => {
     if (!etcdReachable || !guarded) {
       ctx.skip();
       return;

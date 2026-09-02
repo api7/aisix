@@ -533,7 +533,19 @@ async fn scan_input_blob(
     Ok(())
 }
 
-/// Output-side twin of [`scan_input_blob`].
+/// Output-side counterpart of [`scan_input_blob`] — but NOT a symmetric
+/// one, and deliberately not renamed to hide that.
+///
+/// The input side refuses a blob it cannot decode (#1022). This side still
+/// scans `from_utf8_lossy` and still relays the original bytes, so the same
+/// evasion is open on `GET /v1/files/{id}/content`, whose `relay_raw_body`
+/// arm returns the provider's bytes untouched. That is not an oversight to
+/// tidy up in passing: the download path legitimately carries binary the
+/// caller never chose (whatever the provider holds under a file id),
+/// whereas an upload's bytes come from the caller and a batch/fine-tune
+/// input is contractually UTF-8 JSONL. Failing closed here would refuse
+/// lawful downloads, so the direction needs a product decision rather than
+/// a mirrored `match`. Tracked in #1022.
 async fn scan_output_blob(
     state: &ProxyState,
     auth: &AuthenticatedKey,
@@ -2914,12 +2926,16 @@ mod tests {
         );
     }
 
-    /// The existing whole-blob scan is unchanged for an upload that does
-    /// decode: the chain runs, finds nothing, and the file forwards.
-    /// (`blocked_upload_names_the_policy_on_the_usage_event` pins the
-    /// other half — a matching pattern still blocks.)
+    /// An upload that DOES decode is still forwarded with a chain
+    /// attached — the new arm must not catch it.
+    ///
+    /// Named for what it asserts: that the chain actually ran is not
+    /// observable here, because a never-matching keyword produces no
+    /// enforced hit, no monitor hit, and no `applied` field on the jobs
+    /// usage event. `blocked_upload_names_the_policy_on_the_usage_event`
+    /// is what pins that the chain runs at all.
     #[tokio::test]
-    async fn clean_utf8_upload_still_scans_and_forwards() {
+    async fn decodable_upload_with_a_chain_attached_still_forwards() {
         let upstream = MockServer::start().await;
         files_upstream_mock().expect(1).mount(&upstream).await;
 
