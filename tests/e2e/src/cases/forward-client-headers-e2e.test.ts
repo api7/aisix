@@ -90,6 +90,10 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
   const since = (mark: number): ReceivedRequest[] =>
     upstream!.receivedRequests.slice(mark);
 
+  /** How many times `name` arrived on the wire, occurrences not values. */
+  const occurrences = (req: ReceivedRequest, name: string): number =>
+    req.headerNames.filter((n) => n === name).length;
+
   const bodyOf = async (res: Response, what: string): Promise<string> => {
     const text = await res.text();
     expect(
@@ -326,8 +330,10 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
 
     const seen = since(mark).at(-1)!;
     expect(seen.headers.authorization).toBe(`Bearer ${CALLER_KEY}`);
-    // Single-valued: not `Bearer sk-mock..., Bearer sk-fwd...`.
-    expect(seen.headers.authorization).not.toContain(GATEWAY_SECRET);
+    // And ALONE. Counting occurrences rather than reading the collapsed
+    // value is the whole point: node keeps only the FIRST `authorization`,
+    // so a second one appended behind it would be invisible here.
+    expect(occurrences(seen, "authorization")).toBe(1);
   });
 
   test("the Anthropic bridge forwards too, into its own credential slot", async () => {
@@ -380,10 +386,13 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
 
     const forwarded = since(mark2).at(-1)!;
     expect(forwarded.headers[CUSTOM_HEADER]).toBe("carried.verbatim");
-    // The consumed credential slot too — and single-valued, so the
-    // injected ProviderKey credential stood aside rather than joining it.
+    // The consumed credential slot too. Passthrough relays the caller's
+    // copy FIRST and appends the gateway's after it, so the collapsed
+    // value would read correctly even if the suppression failed entirely
+    // — only the occurrence count shows the ProviderKey credential really
+    // stood aside rather than joining it on the wire.
     expect(forwarded.headers.authorization).toBe(`Bearer ${CALLER_KEY}`);
-    expect(forwarded.headers.authorization).not.toContain(GATEWAY_SECRET);
+    expect(occurrences(forwarded, "authorization")).toBe(1);
   });
 
   test("a REST system server exposed as MCP tools receives them", async () => {
@@ -407,19 +416,25 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
     if (!etcdReachable) return;
     const mark = mcpUpstream!.receivedHeaders.length;
 
-    await callTool("nativeserver__echo", { [CUSTOM_HEADER]: "carried.verbatim" });
+    // The caller really sends the session slots, so the assertion below
+    // fails if the block is removed rather than because nothing matched.
+    await callTool("nativeserver__echo", {
+      [CUSTOM_HEADER]: "carried.verbatim",
+      "mcp-session-id": "callers-own-session",
+      "last-event-id": "callers-own-event",
+    });
 
     const seen = mcpUpstream!.receivedHeaders.slice(mark);
     expect(seen.length, "the tool call must reach the MCP upstream").toBeGreaterThan(0);
     expect(seen.some((h) => h[CUSTOM_HEADER] === "carried.verbatim")).toBe(true);
     // `*` sweeps in everything else, but never the session this gateway
-    // holds with the CALLER: an MCP upstream rejects a foreign value for
-    // it outright, so forwarding would break the connection, not just
-    // misidentify it. Every request carries the upstream's own id.
-    const callerSession = seen.find(
-      (h) => h["mcp-session-id"] !== undefined && h["mcp-session-id"] === "callers-own",
-    );
-    expect(callerSession).toBeUndefined();
+    // holds with the CALLER: it names a session the upstream never issued,
+    // and rmcp refuses a foreign `mcp-session-id` outright — the
+    // connection fails rather than degrades.
+    for (const h of seen) {
+      expect(h["mcp-session-id"]).not.toBe("callers-own-session");
+      expect(h["last-event-id"]).not.toBe("callers-own-event");
+    }
   });
 
   test("the gateway's own namespace and trace context resist a glob", async () => {

@@ -140,14 +140,19 @@ pub struct PassthroughRoute {
     /// service that already authorizes on the end user's `Authorization`
     /// keep doing so unchanged.
     ///
+    /// A credential slot — `authorization`, `proxy-authorization`,
+    /// `x-api-key`, `api-key`, `x-goog-api-key`, `cookie` — and
+    /// `traceparent` / `tracestate` are forwarded only when a pattern
+    /// names them exactly. A glob such as `"*"` or `"x-*"` is a statement
+    /// about the operator's own headers, not consent to hand a third party
+    /// the caller's credential or to graft the caller's trace onto that
+    /// party's telemetry, so a broad pattern overrides the rest of the
+    /// strip set and leaves those alone.
+    ///
     /// Headers whose forwarding would break the exchange rather than
     /// change who it comes from are stripped whatever the patterns say:
     /// `host`, `content-length`, the hop-by-hop headers that describe the
     /// caller's own connection, and the gateway's `x-aisix-*` namespace.
-    /// `traceparent` and `tracestate` are stripped by default and
-    /// forwarded only when a pattern names them exactly — a glob is not
-    /// read as consent to graft the caller's trace onto the upstream's
-    /// telemetry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forward_client_headers: Vec<String>,
 

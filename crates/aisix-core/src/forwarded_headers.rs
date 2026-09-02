@@ -1,6 +1,6 @@
 //! Forwarding inbound client headers to an upstream.
 //!
-//! Four resources let an operator name headers that must reach the
+//! Three resources let an operator name headers that must reach the
 //! upstream — `provider_key`'s `request.forward_client_headers`, and the
 //! same field on `passthrough_route` and `mcp_server` — because the
 //! gateway fronts upstreams on three different surfaces and the choice is
@@ -97,16 +97,60 @@ pub const NEVER_FORWARD_FROM_CLIENT: &[&str] = &[
 /// for the same reason.
 pub const NEVER_FORWARD_FROM_CLIENT_PREFIXES: &[&str] = &["x-stainless-"];
 
-/// Headers a glob never sweeps in — only a pattern naming them exactly.
+/// Headers whose value is, or stands in for, a caller credential.
+///
+/// Forwardable — an internal upstream reading the end user's own
+/// credential in the slot it already reads is what this capability is for
+/// — and the one set a forwarded value may DISPLACE a gateway-injected
+/// header in. Everything else the gateway put on the request it put there
+/// to make the exchange work, so a forward leaves it alone.
+pub const CREDENTIAL_SLOT_HEADERS: &[&str] = &[
+    "api-key",             // Azure OpenAI key
+    "authorization",       // OpenAI / Anthropic / Vertex Bearer
+    "cookie",              // session credential
+    "proxy-authorization", // proxy auth
+    "x-api-key",           // Anthropic raw, also OpenAI legacy proxies
+    "x-goog-api-key",      // Gemini API key
+];
+
+/// Trace-context headers, which a glob never sweeps in.
 ///
 /// The caller's `traceparent` names a span in the CALLER's trace. Relayed
 /// to an upstream it links that upstream's internal telemetry into the
-/// caller's tracing backend and discloses the caller's trace ids to a third
-/// party. An operator fronting a first-party service may well want exactly
-/// that continuity, so naming the header is honoured; a `"*"` or `"x-*"`
-/// pattern is a decision about the operator's OWN headers and is not read
-/// as consent to graft one tenant's trace onto another party's.
-pub const EXACT_MATCH_ONLY_HEADERS: &[&str] = &["traceparent", "tracestate"];
+/// caller's tracing backend and discloses the caller's trace ids to a
+/// third party.
+pub const TRACE_CONTEXT_HEADERS: &[&str] = &["traceparent", "tracestate"];
+
+/// Whether `name` (already lowercase) needs a pattern that spells it out.
+///
+/// A `"*"` or `"x-*"` pattern is a statement about the operator's OWN
+/// headers. It is not consent to hand a third-party provider the caller's
+/// credential, nor to graft one tenant's trace onto that provider's
+/// telemetry — both of which a broad glob would otherwise do the moment
+/// the caller happened to send the header. Naming the header IS that
+/// consent, and is honoured on every face.
+///
+/// This is also what keeps an already-configured broad pattern meaning
+/// what it meant when it was written: a deployment carrying
+/// `forward_client_headers: ["x-*"]` does not start relaying the caller's
+/// `x-api-key` — which on `/v1/*` is the caller's own gateway key — the
+/// day it upgrades.
+pub fn exact_match_only(name: &str) -> bool {
+    CREDENTIAL_SLOT_HEADERS.contains(&name) || TRACE_CONTEXT_HEADERS.contains(&name)
+}
+
+/// Whether a forwarded value may DISPLACE a header the gateway already
+/// placed on the outbound request.
+///
+/// Only a credential slot: the operator named it on this upstream so the
+/// caller's own credential is used instead of the gateway's, and two
+/// credentials on the wire would let the upstream pick between them.
+/// Everything else the gateway set, it set to make the exchange work — a
+/// provider's async-mode or API-version selector, say — and a caller's
+/// value there breaks the call rather than re-identifying it.
+pub fn displaces_a_gateway_header(name: &str) -> bool {
+    CREDENTIAL_SLOT_HEADERS.contains(&name)
+}
 
 /// Whether `name` (already lowercase) may never reach an upstream, on any
 /// surface and through any configuration path.
@@ -130,10 +174,10 @@ pub fn client_header_forwardable(name: &str) -> bool {
 /// Patterns are matched case-insensitively against the lowercase name, and
 /// a single `*` glob is supported (`"x-trace-*"`), matching how
 /// `allowed_models` / `allowed_agents` patterns behave elsewhere in the
-/// snapshot. [`EXACT_MATCH_ONLY_HEADERS`] are the one exception: they need
+/// snapshot. [`exact_match_only`] names the exception: those headers need
 /// a pattern that spells them out.
 pub fn forward_pattern_admits(patterns: &[String], name: &str) -> bool {
-    if EXACT_MATCH_ONLY_HEADERS.contains(&name) {
+    if exact_match_only(name) {
         return patterns.iter().any(|p| p.eq_ignore_ascii_case(name));
     }
     patterns
@@ -202,19 +246,33 @@ mod tests {
     }
 
     #[test]
-    fn credential_slots_are_forwardable() {
+    fn credential_slots_are_forwardable_but_only_by_name() {
         // The capability's whole point: an internal upstream reading the
         // end user's own credential keeps reading it.
-        for name in [
-            "authorization",
-            "proxy-authorization",
-            "x-api-key",
-            "api-key",
-            "x-goog-api-key",
-            "cookie",
-        ] {
+        for name in CREDENTIAL_SLOT_HEADERS {
             assert!(client_header_forwardable(name), "{name}");
             assert!(!header_forward_blocked(name), "{name}");
+            assert!(forward_pattern_admits(&[name.to_string()], name), "{name}");
+            // But a broad pattern is a statement about the operator's own
+            // headers. On `/v1/*` the caller's `authorization` and
+            // `x-api-key` carry its AISIX gateway key, and a deployment
+            // that wrote `["x-*"]` before this rule existed must not start
+            // relaying it to a third party on upgrade.
+            assert!(!forward_pattern_admits(&["*".into()], name), "{name}");
+            assert!(!forward_pattern_admits(&["x-*".into()], name), "{name}");
+        }
+    }
+
+    #[test]
+    fn only_a_credential_slot_displaces_a_gateway_header() {
+        for name in CREDENTIAL_SLOT_HEADERS {
+            assert!(displaces_a_gateway_header(name), "{name}");
+        }
+        // A provider's own wire-shape selectors are gateway decisions, not
+        // identity: `x-dashscope-async` picks the submission mode and
+        // `x-runway-version` the API revision the gateway then decodes.
+        for name in ["x-dashscope-async", "x-runway-version", "anthropic-beta"] {
+            assert!(!displaces_a_gateway_header(name), "{name}");
         }
     }
 
@@ -252,8 +310,9 @@ mod tests {
             &["TraceParent".into()],
             "traceparent"
         ));
-        // Everything else still answers to a glob.
-        assert!(forward_pattern_admits(&["*".into()], "authorization"));
+        // An ordinary header still answers to a glob — the exact-name
+        // rule is the exception, not the policy.
+        assert!(forward_pattern_admits(&["*".into()], "anthropic-beta"));
         assert!(forward_pattern_admits(&["x-trace-*".into()], "x-trace-id"));
         assert!(!forward_pattern_admits(&["x-trace-*".into()], "x-other"));
     }
@@ -274,7 +333,11 @@ mod tests {
             ("mcp-session-id", "s1"),
             ("x-trace-id", "t"),
         ]);
-        let got = resolve_forwarded_client_headers(&["*".into()], &client, &["mcp-session-id"]);
+        let got = resolve_forwarded_client_headers(
+            &["*".into(), "authorization".into()],
+            &client,
+            &["mcp-session-id"],
+        );
         let mut got = names(&got);
         got.sort_unstable();
         assert_eq!(got, vec!["authorization", "x-trace-id"]);

@@ -125,13 +125,19 @@ pub struct McpServer {
     /// API exposed here as tools receives them on every tool call.
     ///
     /// A header named here reaches the server whatever the gateway would
-    /// otherwise do with it, including a credential slot: naming the slot
-    /// `auth_type` would fill — `authorization` for `bearer` and `oauth2`,
-    /// `api_key_header` for `api_key` — hands the server the caller's own
-    /// credential in place of the gateway's, never both. That is what lets
-    /// an internal server that already authorizes on the end user's
-    /// `Authorization` keep doing so unchanged. A server that validates
-    /// the `aud` claim will reject a token minted for the gateway.
+    /// otherwise do with it. Naming the credential slot `auth_type` would
+    /// fill — `authorization` for `bearer` and `oauth2`, `api_key_header`
+    /// for `api_key` — hands the server the caller's own credential in
+    /// place of the gateway's, never both. That is what lets an internal
+    /// server that already authorizes on the end user's `Authorization`
+    /// keep doing so unchanged. A server that validates the `aud` claim
+    /// will reject a token minted for the gateway.
+    ///
+    /// A credential slot, and `traceparent` / `tracestate`, are forwarded
+    /// only when a pattern names them exactly — a glob such as `"*"` or
+    /// `"x-*"` is a statement about the operator's own headers, not
+    /// consent to hand a third party the caller's credential or to graft
+    /// the caller's trace onto that party's telemetry.
     ///
     /// Headers whose forwarding would break the exchange rather than
     /// change who it comes from are never forwarded whatever the patterns
@@ -141,9 +147,7 @@ pub struct McpServer {
     /// `content-length`, `accept`), and the MCP session slots
     /// (`mcp-session-id`, `mcp-protocol-version`, `last-event-id`), which
     /// name the caller's session with this gateway and which an upstream
-    /// MCP server rejects outright when they carry a foreign value.
-    /// `traceparent` and `tracestate` are forwarded only when a pattern
-    /// names them exactly.
+    /// MCP server refuses outright when they carry a foreign value.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forward_client_headers: Vec<String>,
 

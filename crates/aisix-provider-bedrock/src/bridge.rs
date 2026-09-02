@@ -428,16 +428,24 @@ fn build_client(
 /// It is dropped here instead, with a warning, so the operator can see it.
 fn filtered_extra_headers(hdr: &UpstreamHeaderContext<'_>) -> Vec<(String, String)> {
     let reserved = wire::reserved_sigv4_headers();
+    // An operator's `default_headers` entry is a standing misconfiguration
+    // and warns. A forwarded CLIENT header is not — the caller chooses
+    // whether to send one, so a warning there is a log-volume lever in the
+    // caller's hand rather than something the operator can act on.
+    let forwarded = aisix_gateway::ForwardedClientHeaders::resolve(hdr);
     aisix_gateway::resolve_extra_headers(hdr)
         .into_iter()
         .filter(|(name, _)| {
             if reserved.contains(&name.as_str()) {
-                tracing::warn!(
-                    header = %name,
-                    "header not sent to a Bedrock upstream: AWS SigV4 derives this \
-                     header from the request it signs, so a configured value would \
-                     break the signature rather than reach the upstream"
-                );
+                let dropped = "header not sent to a Bedrock upstream: AWS SigV4 derives \
+                               this header from the request it signs, so a supplied \
+                               value would break the signature rather than reach the \
+                               upstream";
+                if forwarded.claims(name.as_str()) {
+                    tracing::debug!(header = %name, "{dropped}");
+                } else {
+                    tracing::warn!(header = %name, "{dropped}");
+                }
                 return false;
             }
             true

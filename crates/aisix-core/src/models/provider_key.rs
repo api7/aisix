@@ -371,11 +371,20 @@ pub struct RequestOverrides {
     /// standard-protocol endpoint before AISIX-Cloud#1167.
     ///
     /// A header named here reaches the upstream whatever the gateway would
-    /// otherwise do with it, including a credential slot: naming
-    /// `authorization` hands the upstream the caller's own credential in
-    /// place of the one this ProviderKey would inject there, never
-    /// both. That is what lets an internal service that already authorizes
-    /// on the end user's `Authorization` keep doing so unchanged.
+    /// otherwise do with it. Naming a credential slot — `authorization`,
+    /// `proxy-authorization`, `x-api-key`, `api-key`, `x-goog-api-key`,
+    /// `cookie` — hands the upstream the caller's own credential in place of the
+    /// one this ProviderKey would inject there, never both. That is what lets an
+    /// internal service that already authorizes on the end user's
+    /// `Authorization` keep doing so unchanged. Any OTHER header the
+    /// gateway had already set is left alone: it selects how the exchange
+    /// works, not who it is from.
+    ///
+    /// A credential slot, and `traceparent` / `tracestate`, are forwarded
+    /// only when a pattern names them exactly — a glob such as `"*"` or
+    /// `"x-*"` is a statement about the operator's own headers, not
+    /// consent to hand a third party the caller's credential or to graft
+    /// the caller's trace onto that party's telemetry.
     ///
     /// Headers whose forwarding would break the exchange rather than
     /// change who it comes from are never forwarded whatever the patterns

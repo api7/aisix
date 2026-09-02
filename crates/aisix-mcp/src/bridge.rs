@@ -734,9 +734,12 @@ pub(crate) fn warn_cleartext_credential(server: &McpServer) {
 ///
 /// `mcp-session-id`, `mcp-protocol-version` and `last-event-id` name the
 /// session the CALLER holds with this gateway, not the one the gateway
-/// opens upstream — and rmcp rejects a custom value for them outright, so
-/// forwarding a caller's copy stops the upstream connecting at all rather
-/// than merely misidentifying anyone.
+/// opens upstream, so a relayed copy identifies a session the upstream
+/// never issued. rmcp refuses a custom `mcp-session-id` / `last-event-id`
+/// outright — the connection then fails rather than degrades — and while
+/// it does let `mcp-protocol-version` through, that one selects the
+/// revision the session is opened at, which is the transport's decision
+/// and not the caller's.
 pub const MCP_PROTOCOL_HEADERS: &[&str] =
     &["last-event-id", "mcp-protocol-version", "mcp-session-id"];
 

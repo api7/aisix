@@ -714,10 +714,16 @@ async fn dispatch(
     //
     // `header_forward_blocked` still holds: `host`, the hop-by-hop
     // headers, and the gateway's own namespace break the exchange rather
-    // than changing who it comes from, so no pattern reaches them.
+    // than changing who it comes from, so no pattern reaches them. And
+    // `content-length` on top of it, which the standard pipeline gets from
+    // its second tier: reqwest derives the outbound length from the body
+    // it is handed, but hyper honours a caller-set value verbatim instead,
+    // so a relayed copy is a request-framing bug waiting for the first
+    // body this route rewrites.
     let forwards = |name: &str| {
         aisix_core::forward_pattern_admits(&route.forward_client_headers, name)
             && !aisix_core::header_forward_blocked(name)
+            && name != "content-length"
     };
 
     let mut builder = http_client.request(method.clone(), &url);

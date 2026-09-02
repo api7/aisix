@@ -237,13 +237,28 @@ impl ForwardedClientHeaders {
         self.entries.is_empty()
     }
 
-    /// Deliver the forwarded headers, OVERWRITING their slots.
+    /// Deliver the forwarded headers.
     ///
-    /// `insert` rather than `append`: a slot filled twice would put two
-    /// values on the wire and let the upstream pick between them, which on
-    /// a credential slot is the #411 shape.
+    /// A CREDENTIAL slot is overwritten — that is the collision the field
+    /// exists for, and the operator named it on this upstream. Any other
+    /// name already on the request was put there by the gateway (or by
+    /// `default_headers`) to make the exchange work — a provider's
+    /// async-mode flag, its API-version selector — so it is left alone; a
+    /// caller's value there breaks the call rather than re-identifying it.
+    ///
+    /// `insert` rather than `append` throughout: a slot filled twice would
+    /// put two values on the wire and let the upstream pick between them,
+    /// which on a credential slot is the #411 shape.
+    ///
+    /// Every surface delivers through here, including the ones that
+    /// resolve once and reuse across several round-trips (jobs, videos) —
+    /// the precedence is a property of this type, not of each call site.
     pub fn apply(&self, headers: &mut HeaderMap) {
         for (name, value) in &self.entries {
+            if headers.contains_key(name) && !aisix_core::displaces_a_gateway_header(name.as_str())
+            {
+                continue;
+            }
             headers.insert(name.clone(), value.clone());
         }
     }
@@ -257,21 +272,18 @@ impl ForwardedClientHeaders {
 /// a `default_headers` entry unable to displace them — and what lets a
 /// forwarded client header displace the credential deliberately.
 pub fn apply_request_headers(headers: &mut HeaderMap, ctx: &UpstreamHeaderContext<'_>) {
-    // A `default_headers` entry the gateway's own header shut out did not
-    // "win" the slot — so it does not shut out the forward either. Only a
-    // name this pass actually PLACED shadows a client header of the same
-    // name, which is the operator-beats-client half of the precedence.
-    let mut placed: HashSet<HeaderName> = HashSet::new();
     for (name, value) in resolve_default_headers(ctx) {
         if headers.contains_key(&name) {
             continue;
         }
-        placed.insert(name.clone());
         headers.insert(name, value);
     }
-    let mut forwarded = ForwardedClientHeaders::resolve(ctx);
-    forwarded.entries.retain(|(name, _)| !placed.contains(name));
-    forwarded.apply(headers);
+    // Runs after, so a `default_headers` entry shadows a forwarded header
+    // of the same name — both are operator configuration and the static
+    // one is the more specific statement of intent. `apply` is what makes
+    // that hold: it declines a name already present unless the slot is a
+    // credential one.
+    ForwardedClientHeaders::resolve(ctx).apply(headers);
 }
 
 #[cfg(test)]
@@ -494,6 +506,38 @@ mod tests {
     /// caller's own credential is the capability's purpose — but only where
     /// the gateway has not already claimed the slot, and only with the
     /// operator's own patterns behind them.
+    /// A forwarded header may take a CREDENTIAL slot from the gateway and
+    /// nothing else. Every surface delivers through `apply`, including the
+    /// ones that resolve once and reuse across round-trips (jobs, videos),
+    /// so this is the one place the rule has to hold.
+    #[test]
+    fn a_forward_displaces_only_a_credential_slot() {
+        let r = overrides(&[], &["authorization", "x-dashscope-async", "x-fresh"]);
+        let inbound = client(&[
+            ("authorization", "Bearer caller"),
+            // A provider's own wire-shape selector: the gateway set it to
+            // pick the submission mode it then decodes, so a caller's
+            // value there breaks the call rather than re-identifying it.
+            ("x-dashscope-async", "disable"),
+            ("x-fresh", "from-client"),
+        ]);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer gateway-held-key"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-dashscope-async"),
+            HeaderValue::from_static("enable"),
+        );
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
+        apply_request_headers(&mut headers, &ctx);
+        assert_eq!(headers["authorization"], "Bearer caller");
+        assert_eq!(headers["x-dashscope-async"], "enable");
+        // A slot nobody had claimed is still filled.
+        assert_eq!(headers["x-fresh"], "from-client");
+    }
+
     #[test]
     fn credential_slots_reach_an_upstream_the_operator_opted_in() {
         let r = overrides(&[], &["authorization", "x-api-key", "cookie"]);
@@ -509,6 +553,16 @@ mod tests {
         assert_eq!(headers["authorization"], "Bearer caller");
         assert_eq!(headers["x-api-key"], "caller");
         assert_eq!(headers["cookie"], "session=1");
+        assert!(!headers.contains_key("x-goog-api-key"), "got: {headers:?}");
+
+        // And a credential slot needs its OWN name: a broad glob does not
+        // reach one, which is what keeps an already-configured `["x-*"]`
+        // meaning what it meant when it was written.
+        let r = overrides(&[], &["x-*"]);
+        let mut headers = HeaderMap::new();
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
+        apply_request_headers(&mut headers, &ctx);
+        assert!(!headers.contains_key("x-api-key"), "got: {headers:?}");
         assert!(!headers.contains_key("x-goog-api-key"), "got: {headers:?}");
     }
 
