@@ -1325,14 +1325,10 @@ async fn anthropic_passthrough_dispatch(
         .unwrap_or("unknown")
         .to_ascii_lowercase();
 
-    // Pick the relay branch from what the upstream ACTUALLY sent, not from
-    // the request's `stream` flag. An upstream that ignores `stream: true`
-    // and answers with one JSON document used to enter the SSE branch
-    // anyway: with no frames in it nothing scanned it, and the hold-back's
-    // seal pass appended a `\n\n` frame terminator to a body that is not
-    // SSE before releasing it under the upstream's own content type. Such
-    // a response belongs on the non-streaming buffered scan+mask path
-    // below, which reads it as the JSON document it is.
+    // The relay branch follows what the upstream ACTUALLY sent, not the
+    // request's `stream` flag — see `dispatch::upstream_body_is_sse`. A
+    // JSON document answering `stream: true` takes the non-streaming
+    // buffered scan+mask path below.
     let is_stream = is_stream && crate::dispatch::upstream_body_is_sse(upstream_resp.headers());
 
     if is_stream {

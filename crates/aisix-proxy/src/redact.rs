@@ -437,13 +437,20 @@ pub fn redact_anthropic_request(chain: &dyn Guardrail, body: &mut Value) -> Reda
 /// rather than forward the match unmasked.
 ///
 /// An Anthropic `thinking` / `redacted_thinking` block is signed by the
-/// provider (`signature`, and the encrypted `data` of a redacted one). Any
-/// rewrite invalidates that signature and the upstream rejects the
-/// replayed turn, so a Mask-action hit inside one cannot be applied. The
-/// scan reads these blocks (`parse_inbound_request_for_scan`), so a Block
-/// rule still blocks normally; only the Mask action has nowhere to go, and
-/// silently leaving the match in place is the fail-open this exists to
-/// close. The same rule holds for any block carrying a `signature`.
+/// provider, so any rewrite invalidates that signature and the upstream
+/// rejects the replayed turn — a Mask-action hit inside one cannot be
+/// applied. The scan reads these blocks
+/// (`parse_inbound_request_for_scan`), so a Block rule still blocks
+/// normally; only the Mask action has nowhere to go, and silently leaving
+/// the match in place is the fail-open this exists to close. The same rule
+/// holds for any block carrying a `signature`.
+///
+/// Only the PLAINTEXT slots are probed. A `redacted_thinking` block's
+/// `data` is opaque provider ciphertext: the scan never reads it, so no
+/// mask can have reported a hit there and there is no fail-open to close —
+/// while running a detector over base64 would refuse ordinary requests on
+/// a coincidental match inside the ciphertext. Probing exactly what the
+/// scan reads is what keeps the two from disagreeing in either direction.
 ///
 /// Rewrites nothing — it asks the chain's input redactor whether the text
 /// WOULD change.
@@ -460,7 +467,7 @@ pub fn anthropic_request_masks_signed_reasoning(chain: &dyn Guardrail, body: &Va
         .flatten()
         .filter(|block| is_signed_reasoning_block(block))
         .any(|block| {
-            ["thinking", "data", "text"]
+            ["thinking", "text"]
                 .into_iter()
                 .filter_map(|k| block.get(k).and_then(Value::as_str))
                 .filter(|t| !t.is_empty())
@@ -1879,6 +1886,45 @@ mod tests {
             clean["messages"][0]["content"][1]["text"].as_str(),
             Some("mail [EMAIL_REDACTED]")
         );
+    }
+
+    /// A `redacted_thinking` block carries only the provider's opaque
+    /// ciphertext. The scan never reads it, so no mask can have reported a
+    /// hit there — and running a detector over the blob would refuse
+    /// ordinary requests whenever it happens to contain a matching span.
+    ///
+    /// The `data` below is a deliberately unmissable match rather than a
+    /// realistic blob: the claim under test is that this field is never
+    /// offered to a detector at all, so the value has to be one that WOULD
+    /// fire if it were. (A realistic base64 blob makes the test unable to
+    /// go red — its digit runs sit between alphanumerics, where the
+    /// boundary-anchored detectors do not match, so it would pass whether
+    /// or not the field is probed.)
+    #[test]
+    fn signed_reasoning_probe_ignores_opaque_ciphertext() {
+        let chain = both();
+        let body = json!({
+            "messages": [{"role": "assistant", "content": [
+                {"type": "redacted_thinking", "data": "RXJVUUtvVUJ a@x.com CkYIBBgCKkC"}
+            ]}]
+        });
+        assert!(!anthropic_request_masks_signed_reasoning(
+            chain.as_ref(),
+            &body
+        ));
+
+        // Control: the same chain DOES fire on a plaintext thinking block,
+        // so a green above means "this field is skipped", not "this chain
+        // matches nothing".
+        let plaintext = json!({
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "a@x.com", "signature": "s"}
+            ]}]
+        });
+        assert!(anthropic_request_masks_signed_reasoning(
+            chain.as_ref(),
+            &plaintext
+        ));
     }
 
     /// An output-only chain must not make the request probe fire — it has

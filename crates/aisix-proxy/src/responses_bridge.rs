@@ -1136,12 +1136,10 @@ pub fn build_responses_bridge_stream(
                     }
                 }
                 Err(e) => {
-                    let frame = format!(
-                        "event: error\ndata: {{\"type\":\"error\",\"code\":\"{}\",\"message\":{}}}\n\n",
+                    yield Ok(bytes::Bytes::from(upstream_error_frame(
                         e.error_type(),
-                        serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"error\"".into()),
-                    );
-                    yield Ok(bytes::Bytes::from(frame));
+                        &e.to_string(),
+                    )));
                     return;
                 }
             }
@@ -1352,15 +1350,32 @@ pub fn build_responses_bridge_stream(
     ))
 }
 
+/// Responses-API SSE `error` frame for an upstream failure mid-stream.
+///
+/// Same envelope as [`guardrail_error_frame`] — the two are the only SSE
+/// errors this relay emits and a client should not have to branch on which
+/// one it got to find the error type.
+fn upstream_error_frame(error_type: &str, message: &str) -> String {
+    format!(
+        "event: error\ndata: {}\n\n",
+        json!({
+            "error": {
+                "type": error_type,
+                "message": message,
+            }
+        })
+    )
+}
+
 /// Responses-API SSE `error` frame for an output-guardrail block. Carries the
 /// firing guardrail's name (#519 B.4b) but never the matched-pattern detail.
 ///
-/// Nested under `error`, like every other SSE error this crate emits (the
-/// chat relay's `error_frame_payload`, the passthrough route's frame of
-/// the same name): a flat `{type, code, message}` was the odd one out, so
-/// a client branching on `error.type` saw nothing on this surface alone.
-/// `content_filter` moves onto `error.type`, which is the key that carries
-/// it everywhere else; the `event: error` line already names the event.
+/// Nested under `error`, matching the chat relay's `error_frame_payload`
+/// and the passthrough route's frame of the same name: a flat
+/// `{type, code, message}` left a client branching on `error.type` with
+/// nothing on this surface. `content_filter` moves onto `error.type`, the
+/// key that carries it everywhere else; the `event: error` line already
+/// names the event.
 fn guardrail_error_frame(guardrail_name: Option<&str>, unavailable: Option<&str>) -> String {
     format!(
         "event: error\ndata: {}\n\n",
@@ -1831,25 +1846,41 @@ mod tests {
         );
     }
 
-    /// Every SSE error this crate emits nests under an `error` object —
-    /// the chat relay's `error_frame_payload` and the passthrough route's
-    /// frame of the same name both do. This one was flat
-    /// (`{type, code, message}`), so a client branching on `error.type`
-    /// saw nothing on the `/v1/responses` bridge alone.
+    /// The chat relay's `error_frame_payload` and the passthrough route's
+    /// frame of the same name both nest under an `error` object. BOTH of
+    /// this relay's error frames were flat (`{type, code, message}`), so a
+    /// client branching on `error.type` saw nothing on the
+    /// `/v1/responses` bridge whichever failure it hit.
     #[test]
-    fn guardrail_error_frame_nests_under_error_like_every_other_sse_error() {
-        let frame = guardrail_error_frame(Some("gr-block"), None);
-        let payload = frame
-            .strip_prefix("event: error\ndata: ")
-            .and_then(|r| r.strip_suffix("\n\n"))
-            .expect("an SSE error frame labelled `error`");
-        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
-        assert_eq!(v["error"]["type"], "content_filter");
-        assert!(v["error"]["message"].as_str().unwrap().contains("gr-block"));
-        // The flat keys are gone: `type` and `code` at the top level were
-        // the divergence.
-        assert!(v.get("type").is_none());
-        assert!(v.get("code").is_none());
-        assert_eq!(v.as_object().unwrap().len(), 1);
+    fn both_sse_error_frames_nest_under_error() {
+        let payload_of = |frame: &str| -> serde_json::Value {
+            let body = frame
+                .strip_prefix("event: error\ndata: ")
+                .and_then(|r| r.strip_suffix("\n\n"))
+                .expect("an SSE error frame labelled `error`")
+                .to_owned();
+            serde_json::from_str(&body).expect("one JSON document")
+        };
+
+        let block = payload_of(&guardrail_error_frame(Some("gr-block"), None));
+        assert_eq!(block["error"]["type"], "content_filter");
+        assert!(block["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("gr-block"));
+
+        // The upstream-failure frame on the same stream, same envelope. Its
+        // message is JSON-escaped through serde rather than interpolated.
+        let upstream = payload_of(&upstream_error_frame("upstream_error", "boom \"quoted\""));
+        assert_eq!(upstream["error"]["type"], "upstream_error");
+        assert_eq!(upstream["error"]["message"], "boom \"quoted\"");
+
+        // The flat keys are gone from both: `type` and `code` at the top
+        // level were the divergence.
+        for v in [&block, &upstream] {
+            assert!(v.get("type").is_none());
+            assert!(v.get("code").is_none());
+            assert_eq!(v.as_object().unwrap().len(), 1);
+        }
     }
 }

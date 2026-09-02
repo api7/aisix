@@ -581,11 +581,14 @@ pub(crate) fn upstream_header_ctx<'a>(
 /// Whether the upstream's 200 response body is an SSE stream, rather than
 /// the single JSON document an upstream that ignored `stream: true` sends.
 ///
-/// The relays used to pick their streaming branch from the REQUEST's
-/// `stream` flag alone, so a JSON body answering a streaming request
-/// entered the SSE hold-back: it has no frames, so nothing scanned it, and
-/// the seal pass appended a `\n\n` frame terminator to a document that is
-/// not SSE before releasing it under the upstream's own content type.
+/// `/v1/responses` and `/v1/messages` both pick their relay branch through
+/// this, and both used to pick it from the REQUEST's `stream` flag alone —
+/// so a JSON body answering a streaming request entered the SSE hold-back:
+/// it has no frames, so nothing scanned it, and the seal pass appended a
+/// `\n\n` frame terminator to a document that is not SSE before releasing
+/// it under the upstream's own content type. Such a body belongs on the
+/// non-streaming buffered scan+mask path each of those functions already
+/// has beside its streaming branch.
 ///
 /// Only an explicitly-JSON content type is treated as non-SSE. A missing
 /// or unrecognised one stays on the streaming path — a conforming SSE
