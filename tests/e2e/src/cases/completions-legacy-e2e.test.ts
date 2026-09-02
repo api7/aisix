@@ -265,8 +265,12 @@ describe("legacy /v1/completions e2e: text-in / text-out passthrough", () => {
       expect(body.error?.type).toBe("invalid_request_error");
       // The message names the endpoint that does stream, so a caller can
       // act on it without reading the docs.
-      expect(body.error?.message).toContain("`stream` is not supported");
-      expect(body.error?.message).toContain("/v1/chat/completions");
+      // Pinned whole, not by substring: this exact sentence is what the
+      // published docs quote, so a reworded message has to come here first.
+      expect(body.error?.message).toBe(
+        "request payload is invalid: `stream` is not supported on " +
+          "/v1/completions; use /v1/chat/completions for streaming",
+      );
 
       // The no-billing property: the provider was never asked.
       expect(upstream.receivedRequests.slice(baseline)).toHaveLength(0);
