@@ -730,13 +730,15 @@ async fn dispatch(
     // this a `["x-*"]` pattern would relay the very header this gateway
     // authenticated the caller with. Naming either in full still forwards
     // it — the rule is unchanged, only its input.
-    let route_slots: Vec<&str> = [
-        route.auth_header_name.as_deref(),
-        route.identity_header.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    //
+    // A fixed array rather than a collected `Vec`: there are at most two,
+    // on a per-request path. An unset slot stands as `""`, which matches
+    // nothing — a header name is never empty, on the wire or in the
+    // schema, so the empty entry needs no filtering out.
+    let route_slots = [
+        route.auth_header_name.as_deref().unwrap_or_default(),
+        route.identity_header.as_deref().unwrap_or_default(),
+    ];
     let forwards = |name: &str| {
         aisix_core::forward_pattern_admits_with(&route.forward_client_headers, name, &route_slots)
             && !aisix_core::header_forward_blocked(name)

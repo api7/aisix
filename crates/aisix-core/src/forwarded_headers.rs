@@ -407,11 +407,22 @@ mod tests {
             "x-trace-id",
             &slots
         ));
-        // And a surface that names none behaves exactly as before.
+        // And a surface that names none behaves exactly as before —
+        // whether it passes an empty list, or (as the passthrough call
+        // site does, to keep a two-element list off the heap) a fixed
+        // array with `""` standing for an unset slot. A header name is
+        // never empty, on the wire or in the schema, so the sentinel
+        // matches nothing and needs no filtering out.
         assert!(forward_pattern_admits_with(
             &["x-*".into()],
             "x-gw-key",
             &[]
+        ));
+        assert!(!exact_match_only_with("x-gw-key", &["", ""]));
+        assert!(forward_pattern_admits_with(
+            &["x-*".into()],
+            "x-gw-key",
+            &["", ""]
         ));
     }
 

@@ -99,16 +99,24 @@ const SUBPROTOCOL_BETA_ITEM: &str = "openai-beta.realtime-v1";
 ///
 /// Every other `/v1/*` face rebuilds an HTTP request; this one performs a
 /// second WebSocket handshake, and these headers describe the handshake
-/// the CALLER made rather than the request's content. Relaying
-/// `sec-websocket-key` / `-version` / `-extensions` breaks the upstream
-/// handshake outright — the gateway's client generated its own key and
-/// negotiates its own extensions, and the accept value is computed
-/// against them. `sec-websocket-protocol` is worse than broken: the
-/// documented browser flow puts the caller's own AISIX key in it
+/// the CALLER made rather than the request's content.
+///
+/// `sec-websocket-protocol` is the dangerous one: the documented browser
+/// flow puts the caller's own AISIX key in it
 /// (`openai-insecure-api-key.<key>`), so relaying it would hand the
 /// provider the credential this gateway authenticates with. It also
 /// selects the subprotocol the gateway echoes back to the client, which
-/// is the gateway's answer to make, not the upstream's.
+/// is the gateway's answer to make, not the upstream's. Nothing else
+/// declines it — the outbound handshake does not carry one, so a matching
+/// pattern would insert the caller's list verbatim. `-extensions` is the
+/// same shape and enables a compression the gateway's own codec never
+/// negotiated.
+///
+/// `sec-websocket-key` and `-version` are listed for completeness rather
+/// than because they are reachable today: the outbound request already
+/// carries both, and a non-credential name already present is declined on
+/// delivery. Naming them here keeps that from being the only thing
+/// standing between a caller's key and the accept value computed from it.
 const REALTIME_HANDSHAKE_SLOTS: &[&str] = &[
     "sec-websocket-accept",
     "sec-websocket-extensions",
