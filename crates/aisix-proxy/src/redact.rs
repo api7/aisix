@@ -857,15 +857,28 @@ impl SseFrame {
     }
 }
 
-/// Offset of the first frame terminator (a blank line) in `raw`.
+/// Offset and length of the first frame terminator (a blank line) in `raw`.
 ///
 /// The ONE place this crate decides where an SSE frame ends. Everything
 /// below derives from it, so the frame-based redaction pass and the
 /// line-based scan passes cannot end up with two notions of framing —
 /// which is exactly how an unterminated final frame slipped past one pass
 /// while the other read it (#1091).
-fn frame_terminator(raw: &[u8]) -> Option<usize> {
-    raw.windows(2).position(|w| w == b"\n\n")
+///
+/// Both blank-line forms count. The scan passes read lines and trim, so a
+/// CRLF-framed upstream is ordinary text to them; a splitter that knew only
+/// `\n\n` would hand that whole body back as one unframed blob, and the
+/// redactor would then rewrite it as a single frame — dropping every
+/// `data:` line after the first. Same disagreement, second costume.
+fn frame_terminator(raw: &[u8]) -> Option<(usize, usize)> {
+    let lf = raw.windows(2).position(|w| w == b"\n\n");
+    let crlf = raw.windows(4).position(|w| w == b"\r\n\r\n");
+    match (lf, crlf) {
+        (Some(l), Some(c)) => Some(if c < l { (c, 4) } else { (l, 2) }),
+        (Some(l), None) => Some((l, 2)),
+        (None, Some(c)) => Some((c, 4)),
+        (None, None) => None,
+    }
 }
 
 /// Byte offset just past the LAST complete frame terminator in `raw`
@@ -874,9 +887,9 @@ fn frame_terminator(raw: &[u8]) -> Option<usize> {
 fn last_frame_end(raw: &[u8]) -> usize {
     let mut end = 0usize;
     let mut rest = raw;
-    while let Some(pos) = frame_terminator(rest) {
-        end += pos + 2;
-        rest = &rest[pos + 2..];
+    while let Some((pos, len)) = frame_terminator(rest) {
+        end += pos + len;
+        rest = &rest[pos + len..];
     }
     end
 }
@@ -899,14 +912,14 @@ fn split_sse_frames(raw: &[u8]) -> (Vec<SseFrame>, &[u8]) {
     let (complete, trailing) = raw.split_at(last_frame_end(raw));
     let mut frames = Vec::new();
     let mut rest = complete;
-    while let Some(pos) = frame_terminator(rest) {
+    while let Some((pos, len)) = frame_terminator(rest) {
         let frame_raw = &rest[..pos];
         frames.push(SseFrame {
             raw: frame_raw.to_vec(),
             data: frame_data_line(frame_raw).and_then(|l| serde_json::from_str::<Value>(&l).ok()),
             dirty: false,
         });
-        rest = &rest[pos + 2..];
+        rest = &rest[pos + len..];
     }
     (frames, trailing)
 }
@@ -946,8 +959,9 @@ pub enum SseTailSeal {
 ///   (`unscannable_body`) rather than answer with an empty 200.
 ///
 /// Pads by what is MISSING, not a fixed `\n\n`: a fragment that already
-/// ends in one `\n` needs one more, and two would leave a stray blank line
-/// in the released bytes.
+/// ends in half its terminator needs only the other half, and a full pad
+/// would leave a stray blank line in the released bytes. The upstream's own
+/// line ending is matched, so a CRLF stream stays a CRLF stream.
 pub fn seal_buffered_sse(buf: &mut Vec<u8>) -> SseTailSeal {
     let end = last_frame_end(buf);
     if end == buf.len() {
@@ -962,7 +976,15 @@ pub fn seal_buffered_sse(buf: &mut Vec<u8>) -> SseTailSeal {
         buf.truncate(end);
         return SseTailSeal::Dropped { dropped };
     }
-    let pad: &[u8] = if buf.ends_with(b"\n") { b"\n" } else { b"\n\n" };
+    let pad: &[u8] = if buf.ends_with(b"\r\n\r") {
+        b"\n"
+    } else if buf.ends_with(b"\r\n") {
+        b"\r\n"
+    } else if buf.ends_with(b"\n") {
+        b"\n"
+    } else {
+        b"\n\n"
+    };
     buf.extend_from_slice(pad);
     SseTailSeal::Completed { padded: pad.len() }
 }
@@ -1849,6 +1871,50 @@ mod tests {
             seal_buffered_sse(&mut comment),
             SseTailSeal::Completed { padded: 2 }
         );
+    }
+
+    #[test]
+    fn crlf_framed_bodies_are_framed_and_masked_like_any_other() {
+        let chain = both();
+        // A CRLF-framed stream is ordinary text to the line-based scan, so
+        // the redactor has to read the same frames out of it. Reading none
+        // would leave it unmasked; reading ONE would drop every `data:` line
+        // after the first when that frame is rewritten.
+        let raw = concat!(
+            "event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"delta\":\"mail a@\"}\r\n\r\n",
+            "event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"delta\":\"x.com ok\"}\r\n\r\n",
+            "event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{}}\r\n\r\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let mut sealed = raw.clone();
+        assert_eq!(seal_buffered_sse(&mut sealed), SseTailSeal::Terminated);
+        assert_eq!(sealed, raw, "a terminated CRLF body must not be repadded");
+        let (out, counts) = redact_responses_sse(chain.as_ref(), &sealed).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@x.com"), "out: {out}");
+        assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
+        assert_eq!(counts.get("email"), Some(&1));
+        // Every frame survives the rewrite.
+        assert_eq!(out.matches("data:").count(), 3, "out: {out}");
+        assert!(out.contains("response.completed"), "out: {out}");
+    }
+
+    #[test]
+    fn seal_matches_the_upstreams_own_line_ending() {
+        let mut crlf = b"data: {\"a\":1}\r\n".to_vec();
+        assert_eq!(
+            seal_buffered_sse(&mut crlf),
+            SseTailSeal::Completed { padded: 2 }
+        );
+        assert_eq!(crlf, b"data: {\"a\":1}\r\n\r\n");
+        // Three quarters of a CRLF terminator written.
+        let mut partial = b"data: {\"a\":1}\r\n\r".to_vec();
+        assert_eq!(
+            seal_buffered_sse(&mut partial),
+            SseTailSeal::Completed { padded: 1 }
+        );
+        assert_eq!(partial, b"data: {\"a\":1}\r\n\r\n");
     }
 
     #[test]
