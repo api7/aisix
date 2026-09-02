@@ -2,7 +2,8 @@
 //!
 //! This endpoint is a thin passthrough to the provider's `/completions`
 //! surface. The upstream `model` field is rewritten to the provider's own
-//! model id; everything else in the request body is forwarded verbatim.
+//! model id, `stream: true` is refused, and everything else in the request
+//! body is forwarded verbatim.
 //!
 //! Flow:
 //! 1. [`AuthenticatedKey`] extractor — 401 if auth fails.
@@ -10,9 +11,10 @@
 //! 3. Validate `model` is present.
 //! 4. Resolve model name → `Model` in snapshot → 404 if absent.
 //! 5. Check `allowed_models` → 403 if denied.
-//! 6. Look up Bridge on Hub → 503 if not registered.
-//! 7. Call `bridge.complete(body, ctx)` → JSON response.
-//! 8. Providers that don't support completions return 501.
+//! 6. Refuse `stream: true` → 400, before any upstream call (#1093).
+//! 7. Look up Bridge on Hub → 503 if not registered.
+//! 8. Call `bridge.complete(body, ctx)` → JSON response.
+//! 9. Providers that don't support completions return 501.
 
 use aisix_gateway::{BridgeError, ChatMessage, ChatResponse, FinishReason, UsageStats};
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
@@ -313,6 +315,25 @@ async fn dispatch(
 
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
+
+    // #1093: this route has no streaming relay, and the dispatch below reads
+    // the upstream answer as a single JSON document. Forwarding `stream` had
+    // the provider generate — and charge for — a response the gateway then
+    // failed to decode, so the caller got a 502 and no usage was recorded.
+    // Refuse it here, before the provider is contacted.
+    //
+    // Rejected AFTER model resolution so an unknown model still answers 404
+    // (matching the other JSON endpoints' precedence), and BEFORE the
+    // guardrail chain and the rate-limit reservation so a request that
+    // cannot be served burns neither — the same placement /v1/images/edits
+    // uses for its own `stream` refusal.
+    if body.get("stream").and_then(Value::as_bool) == Some(true) {
+        return Err(ProxyError::InvalidRequest(
+            "`stream` is not supported on /v1/completions; \
+             use /v1/chat/completions for streaming"
+                .into(),
+        ));
+    }
 
     // #545: /v1/completions must run input guardrails. Before this it
     // forwarded the user `prompt` to the upstream with no configured

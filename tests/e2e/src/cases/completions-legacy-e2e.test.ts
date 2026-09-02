@@ -206,4 +206,119 @@ describe("legacy /v1/completions e2e: text-in / text-out passthrough", () => {
     },
     60_000,
   );
+
+  // #1093. `stream: true` used to be forwarded verbatim: the provider
+  // generated (and charged for) an SSE response, the dispatch path — which
+  // reads the upstream answer as a single JSON document — failed to decode
+  // it, and the caller got a 502 with no usage recorded. The upstream had
+  // already done the work.
+  //
+  // The route has no streaming relay, so the request is refused instead,
+  // and refused BEFORE the provider is contacted. That the upstream is
+  // never called is the property under test: a fix that returned 400 after
+  // dispatching would still have the caller paying for a refused request,
+  // and a status-only assertion could not tell the two apart.
+  test(
+    "POST /v1/completions with stream:true is refused without calling the upstream",
+    async (ctx) => {
+      if (!etcdReachable || !app || !upstream) {
+        ctx.skip();
+        return;
+      }
+
+      const reqHeaders = {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      };
+      await waitConfigPropagation(async () => {
+        try {
+          const r = await fetch(`${app!.proxyUrl}/v1/completions`, {
+            method: "POST",
+            headers: reqHeaders,
+            body: JSON.stringify({
+              model: "completions-legacy-model",
+              prompt: "ready-probe-stream",
+            }),
+          });
+          await r.text();
+          return r.status === 200;
+        } catch {
+          return false;
+        }
+      });
+
+      const baseline = upstream.receivedRequests.length;
+      const res = await fetch(`${app.proxyUrl}/v1/completions`, {
+        method: "POST",
+        headers: reqHeaders,
+        body: JSON.stringify({
+          model: "completions-legacy-model",
+          prompt: PROMPT_TEXT,
+          stream: true,
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as {
+        error?: { message?: string; type?: string };
+      };
+      expect(body.error?.type).toBe("invalid_request_error");
+      // The message names the endpoint that does stream, so a caller can
+      // act on it without reading the docs.
+      expect(body.error?.message).toContain("`stream` is not supported");
+      expect(body.error?.message).toContain("/v1/chat/completions");
+
+      // The no-billing property: the provider was never asked.
+      expect(upstream.receivedRequests.slice(baseline)).toHaveLength(0);
+    },
+    60_000,
+  );
+
+  test(
+    "POST /v1/completions without stream still answers 200 with usage",
+    async (ctx) => {
+      if (!etcdReachable || !app || !upstream) {
+        ctx.skip();
+        return;
+      }
+
+      // The other half of the #1093 contract: the refusal is scoped to the
+      // streaming request. An over-broad guard — reading `stream` as
+      // "present" rather than "true" — would take the ordinary path down
+      // with it, and `stream: false` is what an SDK sends by default.
+      const reqHeaders = {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      };
+      const baseline = upstream.receivedRequests.length;
+      const res = await fetch(`${app.proxyUrl}/v1/completions`, {
+        method: "POST",
+        headers: reqHeaders,
+        body: JSON.stringify({
+          model: "completions-legacy-model",
+          prompt: PROMPT_TEXT,
+          stream: false,
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        object?: string;
+        choices?: Array<{ text?: string }>;
+        usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+      };
+      expect(body.object).toBe("text_completion");
+      expect(body.choices?.[0]?.text).toBe(COMPLETION_TEXT);
+      expect(body.usage?.prompt_tokens).toBe(6);
+      expect(body.usage?.completion_tokens).toBe(7);
+      expect(body.usage?.total_tokens).toBe(13);
+
+      const sent = upstream.receivedRequests
+        .slice(baseline)
+        .filter((r) => r.path === "/v1/completions");
+      expect(sent).toHaveLength(1);
+      expect(JSON.parse(sent[0]!.body).stream).toBe(false);
+    },
+    60_000,
+  );
 });

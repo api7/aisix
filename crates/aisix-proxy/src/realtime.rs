@@ -4,6 +4,9 @@
 //! Authenticates on connect, resolves the target Model from `?model=`,
 //! opens the provider WebSocket and relays frames bidirectionally.
 //!
+//! The relay is verbatim with one exception, `session.model` — see
+//! [`restamp_session_model_out`] and its mirror.
+//!
 //! ## Protocol scope
 //!
 //! v1 relays the **OpenAI Realtime wire protocol**: adapter `openai`
@@ -262,6 +265,9 @@ struct Prepared {
     upstream_request: tokio_tungstenite::tungstenite::handshake::client::Request,
     reservation: aisix_ratelimit::MultiReservation,
     requested_model: String,
+    /// Provider-side model id the upstream session was opened with. Only
+    /// [`restamp_session_model_in`] reads it — see there for why.
+    upstream_model: String,
     provider_label: String,
 }
 
@@ -395,6 +401,7 @@ async fn prepare(
         upstream_request,
         reservation,
         requested_model,
+        upstream_model,
         provider_label,
     })
 }
@@ -474,6 +481,67 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+/// Restamp `session.model` on its way DOWN to the client.
+///
+/// `session.created` and `session.updated` are the only Realtime server
+/// events that name a model, and they name the one the provider is running —
+/// so a caller who connected with a gateway alias was told a different name
+/// than the one they addressed. That is the `model_echo` contract, applied on
+/// this surface (#1088).
+///
+/// A frame that names no model, or that the splice scanner refuses, is
+/// returned unchanged.
+fn restamp_session_model_out(text: String, client_facing_model: &str) -> String {
+    splice_or_keep(text, |bytes| {
+        crate::model_echo::restamp_json_bytes(
+            bytes,
+            client_facing_model,
+            crate::model_echo::realtime_session_model,
+        )
+    })
+}
+
+/// Translate `session.model` back on its way UP to the provider.
+///
+/// The mirror of [`restamp_session_model_out`], and it exists because of it.
+/// Realtime clients routinely take the `session` object the gateway just
+/// handed them, change one field and send the whole thing back as
+/// `session.update` — which now carries the gateway's alias where it used to
+/// carry the provider's own id. Only that alias is translated; a client that
+/// names anything else reaches the provider with its own words, and gets the
+/// provider's own answer about it.
+///
+/// This does not let a client SWITCH models mid-session: the model is fixed
+/// by the connect-time query parameter, and `session.update` cannot change it.
+fn restamp_session_model_in(
+    text: String,
+    client_facing_model: &str,
+    upstream_model: &str,
+) -> String {
+    splice_or_keep(text, |bytes| {
+        crate::model_echo::splice_model_value(
+            bytes,
+            crate::model_echo::realtime_session_model,
+            |named| (named == client_facing_model).then(|| upstream_model.to_string()),
+        )
+    })
+}
+
+/// Run a splice over one WebSocket text frame, keeping the original string
+/// whenever there is nothing to rewrite.
+///
+/// The fast path matters: every audio delta is a text frame, and only two
+/// event types in the protocol carry a session at all.
+fn splice_or_keep(text: String, splice: impl FnOnce(&[u8]) -> Option<Vec<u8>>) -> String {
+    if !text.contains("\"session\"") {
+        return text;
+    }
+    match splice(text.as_bytes()).map(String::from_utf8) {
+        Some(Ok(rewritten)) => rewritten,
+        _ => text,
+    }
+}
+
 /// Accumulated session usage harvested from upstream frames.
 #[derive(Default)]
 struct SessionUsage {
@@ -534,6 +602,7 @@ async fn run_session(
         upstream_request,
         reservation,
         requested_model,
+        upstream_model,
         provider_label,
     } = prep;
 
@@ -693,6 +762,7 @@ async fn run_session(
                             break;
                         }
                     }
+                    let text = restamp_session_model_in(text, &requested_model, &upstream_model);
                     if up_tx.send(TgMessage::Text(text)).await.is_err() {
                         break;
                     }
@@ -740,6 +810,7 @@ async fn run_session(
                             break;
                         }
                     }
+                    let text = restamp_session_model_out(text, &requested_model);
                     if client_tx.send(AxMessage::Text(text)).await.is_err() {
                         break;
                     }
