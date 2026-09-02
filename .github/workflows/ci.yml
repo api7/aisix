@@ -83,7 +83,11 @@ jobs:
   lint:
     name: lint (fmt + clippy)
     needs: [changes]
-    if: needs.changes.outputs.code == 'true'
+    # `!cancelled()` overrides the default "skip when a dependency failed",
+    # and `!= 'false'` treats an absent classification as unknown rather
+    # than as documentation. A classifier that dies therefore runs the full
+    # pipeline instead of skipping every job into a satisfied required check.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -100,7 +104,11 @@ jobs:
   schema-drift:
     name: schema drift (resources)
     needs: [changes]
-    if: needs.changes.outputs.code == 'true'
+    # `!cancelled()` overrides the default "skip when a dependency failed",
+    # and `!= 'false'` treats an absent classification as unknown rather
+    # than as documentation. A classifier that dies therefore runs the full
+    # pipeline instead of skipping every job into a satisfied required check.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -120,7 +128,11 @@ jobs:
   openapi-generate:
     name: generate admin openapi
     needs: [changes]
-    if: needs.changes.outputs.code == 'true'
+    # `!cancelled()` overrides the default "skip when a dependency failed",
+    # and `!= 'false'` treats an absent classification as unknown rather
+    # than as documentation. A classifier that dies therefore runs the full
+    # pipeline instead of skipping every job into a satisfied required check.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -148,7 +160,11 @@ jobs:
   rust-unit:
     name: rust unit + coverage
     needs: [changes]
-    if: needs.changes.outputs.code == 'true'
+    # `!cancelled()` overrides the default "skip when a dependency failed",
+    # and `!= 'false'` treats an absent classification as unknown rather
+    # than as documentation. A classifier that dies therefore runs the full
+    # pipeline instead of skipping every job into a satisfied required check.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     services:
       redis:
@@ -289,7 +305,11 @@ jobs:
   build-bin:
     name: build aisix (instrumented)
     needs: [changes]
-    if: needs.changes.outputs.code == 'true'
+    # `!cancelled()` overrides the default "skip when a dependency failed",
+    # and `!= 'false'` treats an absent classification as unknown rather
+    # than as documentation. A classifier that dies therefore runs the full
+    # pipeline instead of skipping every job into a satisfied required check.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: "-C instrument-coverage"
@@ -515,7 +535,11 @@ jobs:
     # through the e2e-gate aggregate below.
     name: mcp conformance (official suite)
     needs: [changes]
-    if: needs.changes.outputs.code == 'true'
+    # `!cancelled()` overrides the default "skip when a dependency failed",
+    # and `!= 'false'` treats an absent classification as unknown rather
+    # than as documentation. A classifier that dies therefore runs the full
+    # pipeline instead of skipping every job into a satisfied required check.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # This job executes third-party code (npm ci + cargo build scripts):
