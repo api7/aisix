@@ -257,4 +257,91 @@ describe("images generations e2e: /v1/images/generations verbatim forward + mode
     // refuses for provider mismatch.
     expect(upstream.receivedRequests.length).toBe(upstreamHitsBefore);
   });
+
+  // #1101. `stream: true` used to be forwarded verbatim: the provider
+  // generated (and charged for) a partial-image SSE response, the dispatch
+  // path — which reads the upstream answer as a single JSON document —
+  // failed to decode it, and that decode failure is retryable. This route
+  // dispatches through `retrying_dispatch`, so ONE caller request re-ran the
+  // whole generation for the model's retry budget: the provider billed N+1
+  // image generations, no usage was recorded, and the caller got a 502.
+  //
+  // The route has no partial-image relay, so the request is refused instead,
+  // and refused BEFORE the provider is contacted. That the upstream is never
+  // called is the property under test — the billing was the harm, and a
+  // status-only assertion cannot tell "refused up front" from "refused after
+  // paying for N generations".
+  test("POST /v1/images/generations with stream:true is refused without calling the upstream", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    const headers = {
+      authorization: `Bearer ${CALLER_PLAINTEXT}`,
+      "content-type": "application/json",
+    };
+    const baseline = upstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/images/generations`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "img-e2e",
+        prompt: "A cat sitting in a sunbeam",
+        stream: true,
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as {
+      error?: { message?: string; type?: string };
+    };
+    expect(body.error?.type).toBe("invalid_request_error");
+    // Pinned whole rather than by substring: this sentence is the
+    // endpoint's refusal contract, and it deliberately matches the one
+    // /v1/images/edits already gives, differing only in the route name.
+    expect(body.error?.message).toBe(
+      "request payload is invalid: `stream` is not supported on " +
+        "/v1/images/generations",
+    );
+
+    // The no-billing property: the provider was never asked, so the retry
+    // budget could not re-run the generation either.
+    expect(upstream.receivedRequests.slice(baseline)).toHaveLength(0);
+  });
+
+  test("POST /v1/images/generations with stream:false still reaches the upstream", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    // The other half of the contract: the refusal is scoped to a request
+    // that actually asked to stream. A guard reading `stream` as "present"
+    // rather than "true" would take the ordinary path down with it, and
+    // `stream: false` is what an SDK sends by default.
+    const headers = {
+      authorization: `Bearer ${CALLER_PLAINTEXT}`,
+      "content-type": "application/json",
+    };
+    const baseline = upstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/images/generations`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "img-e2e",
+        prompt: "A cat sitting in a sunbeam",
+        stream: false,
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data?: Array<{ url?: unknown }> };
+    expect(body.data?.[0]?.url).toBe("https://mock.example.com/img-1.png");
+    expect(
+      upstream.receivedRequests
+        .slice(baseline)
+        .filter((r) => r.path === "/v1/images/generations"),
+    ).toHaveLength(1);
+  });
 });

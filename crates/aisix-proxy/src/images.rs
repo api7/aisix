@@ -277,6 +277,29 @@ async fn dispatch(
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
 
+    // #1101: partial-image SSE (`stream: true`) is not relayed on this
+    // route, and the dispatch below reads the upstream answer as a single
+    // JSON document. Forwarding `stream` had the provider generate — and
+    // charge for — a stream the gateway then failed to decode; that decode
+    // failure is retryable, and this route dispatches through
+    // `retrying_dispatch`, so ONE caller request re-ran the generation for
+    // the whole retry budget and still answered 502.
+    //
+    // Refuse it here, before the provider is contacted, and in the same
+    // words `/v1/images/edits` already uses — the two are one family and a
+    // caller should not have to learn two refusals. Unlike /v1/completions
+    // there is no streaming route to point at, so the message names none.
+    //
+    // Rejected AFTER model resolution so an unknown model still answers 404
+    // (matching the other JSON endpoints' precedence), and BEFORE the
+    // guardrail chain and the rate-limit reservation so a request that
+    // cannot be served burns neither.
+    if body.get("stream").and_then(Value::as_bool) == Some(true) {
+        return Err(ProxyError::InvalidRequest(
+            "`stream` is not supported on /v1/images/generations".into(),
+        ));
+    }
+
     // #545: /v1/images/generations must run input guardrails. Before this it
     // forwarded the user `prompt` with no configured content/DLP check, so a
     // block enforced on /v1/chat/completions was bypassable by switching
