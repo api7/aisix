@@ -755,7 +755,15 @@ async fn dispatch(
             if !forwarded_slots.contains("x-api-key") {
                 builder = builder.header("x-api-key", api_key);
             }
-            builder = builder.header("anthropic-version", "2023-06-01");
+            // Only when the caller sent none. `RequestBuilder::header`
+            // appends, and `anthropic-version` is in no strip set — every
+            // Anthropic SDK sends its own, so injecting unconditionally
+            // put two revisions on the wire and let the upstream pick.
+            // A route relays the body verbatim and decodes nothing, so
+            // the caller's revision is the right one to keep.
+            if !incoming_headers.contains_key("anthropic-version") {
+                builder = builder.header("anthropic-version", "2023-06-01");
+            }
         } else if !forwarded_slots.contains("authorization") {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {api_key}"));
         }

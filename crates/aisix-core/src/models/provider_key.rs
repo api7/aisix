@@ -386,6 +386,15 @@ pub struct RequestOverrides {
     /// consent to hand a third party the caller's credential or to graft
     /// the caller's trace onto that party's telemetry.
     ///
+    /// Two cases where a named header still does not reach the upstream:
+    /// a `default_headers` entry of the same name wins it, since both are
+    /// operator configuration and the static one is the more specific
+    /// choice; and on an AWS Bedrock provider the SigV4-signed names
+    /// (`authorization`, `x-amz-date`, `x-amz-content-sha256`,
+    /// `x-amz-security-token`) are refused from either source, because
+    /// the request signer derives them and a supplied value would break
+    /// the signature rather than authenticate anyone.
+    ///
     /// Headers whose forwarding would break the exchange rather than
     /// change who it comes from are never forwarded whatever the patterns
     /// say: `host`, the hop-by-hop headers that describe the caller's own

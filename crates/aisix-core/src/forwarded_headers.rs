@@ -315,6 +315,14 @@ mod tests {
         assert!(forward_pattern_admits(&["*".into()], "anthropic-beta"));
         assert!(forward_pattern_admits(&["x-trace-*".into()], "x-trace-id"));
         assert!(!forward_pattern_admits(&["x-trace-*".into()], "x-other"));
+        // Header names are case-insensitive on the wire, so a pattern
+        // written in the spelling the operator's own docs use still
+        // matches the lowercase name the parser hands us.
+        assert!(forward_pattern_admits(&["X-Trace-*".into()], "x-trace-id"));
+        assert!(forward_pattern_admits(
+            &["Anthropic-Beta".into()],
+            "anthropic-beta"
+        ));
     }
 
     #[test]

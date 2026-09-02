@@ -189,7 +189,11 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
       api_key: GATEWAY_SECRET,
       api_base: `${upstream.baseUrl}/v1`,
       request: {
-        forward_client_headers: [CUSTOM_HEADER, "authorization", "x-*", "trace*"],
+        // `X-*` and `Trace*` deliberately in the spelling an operator's
+        // own docs use: header names are case-insensitive on the wire, so
+        // a matcher that compared case-sensitively would forward nothing
+        // under either.
+        forward_client_headers: [CUSTOM_HEADER, "authorization", "X-*", "Trace*"],
       },
     });
     // A second upstream with no opt-in — the default every ProviderKey has.
@@ -246,6 +250,23 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
       credential_mode: "inject",
       provider_key_id: routePk.id,
       forward_client_headers: [CUSTOM_HEADER, "authorization"],
+    });
+    // Anthropic under `inject`: the route injects `anthropic-version`,
+    // which is in no strip set, so a caller sending its own (every
+    // Anthropic SDK does) is the duplicate-header case.
+    const anthropicRoutePk = await seed.createProviderKey({
+      display_name: "fwd-route-anthropic-pk",
+      api_key: GATEWAY_SECRET,
+      provider: "anthropic",
+      api_base: upstream.baseUrl,
+    });
+    await seed.createPassthroughRoute({
+      name: "fwd-route-anthropic",
+      path_prefix: `${ROUTE_PREFIX}-anthropic`,
+      target_url: upstream.baseUrl,
+      auth_mode: "gateway_key",
+      credential_mode: "inject",
+      provider_key_id: anthropicRoutePk.id,
     });
     await seed.createPassthroughRoute({
       name: "fwd-route-plain",
@@ -393,6 +414,30 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
     // stood aside rather than joining it on the wire.
     expect(forwarded.headers.authorization).toBe(`Bearer ${CALLER_KEY}`);
     expect(occurrences(forwarded, "authorization")).toBe(1);
+  });
+
+  test("a passthrough route never doubles a header it injects", async () => {
+    if (!etcdReachable) return;
+    const mark = upstream!.receivedRequests.length;
+
+    // `anthropic-version` is in no strip set, so the caller's own copy is
+    // relayed by the default forward — the route must then not append a
+    // second value behind it and leave the upstream to pick.
+    await fetch(`${app!.proxyUrl}${ROUTE_PREFIX}-anthropic/v1/messages`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_KEY}`,
+        "content-type": "application/json",
+        "anthropic-version": "2023-01-01",
+      },
+      body: JSON.stringify({ model: "claude-sonnet-4", messages: [] }),
+    }).then((r) => bodyOf(r, "the anthropic passthrough route"));
+
+    const seen = since(mark).at(-1)!;
+    expect(occurrences(seen, "anthropic-version")).toBe(1);
+    expect(seen.headers["anthropic-version"]).toBe("2023-01-01");
+    // And the gateway's own credential still authenticates the call.
+    expect(seen.headers["x-api-key"]).toBe(GATEWAY_SECRET);
   });
 
   test("a REST system server exposed as MCP tools receives them", async () => {
