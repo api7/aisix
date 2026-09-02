@@ -36,6 +36,12 @@ import {
 //                          default is the opposite (forward everything)
 //                          and the list OVERRIDES a strip.
 //
+// And beside them, the sub-dispatch paths of the model kinds that do NOT
+// go through the one convergence point the faces above share: an
+// ensemble's panel members and its judge each reach a DIFFERENT upstream,
+// so each obeys ITS OWN ProviderKey's list rather than the ensemble
+// entry's — the entry has no ProviderKey at all.
+//
 // The credential collision is asserted on every face: a header the
 // operator named beats the credential the gateway would otherwise inject
 // into that slot, and rides ALONE — two credentials on the wire would let
@@ -49,7 +55,12 @@ const CALLER_HASH = createHash("sha256").update(CALLER_KEY).digest("hex");
 const FORWARD_MODEL = "fwd-openai-model";
 const PLAIN_MODEL = "fwd-plain-model";
 const ANTHROPIC_MODEL = "fwd-anthropic-model";
+const ENSEMBLE_MODEL = "fwd-ensemble-model";
+const ENSEMBLE_MEMBER_A = "fwd-ensemble-member-a";
+const ENSEMBLE_MEMBER_B = "fwd-ensemble-member-b";
+const ENSEMBLE_JUDGE = "fwd-ensemble-judge";
 const ROUTE_PREFIX = "/passthrough/fwd";
+const GATEWAY_KEY_HEADER = "x-gw-key";
 const CUSTOM_HEADER = "x-user-jwt";
 const CALLER_CREDENTIAL = "Bearer callers-own-credential";
 const GATEWAY_SECRET = "sk-mock-provider-secret";
@@ -215,6 +226,28 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
       provider_key_id: plainPk.id,
     });
 
+    // An ensemble whose panel members and judge all sit behind the
+    // opted-in ProviderKey. `ProxyModelCaller::call` and the streaming
+    // judge build their own dispatch contexts instead of reusing the
+    // entry's, which is the shape this repo's model-kind rule calls the
+    // most-repeated silent gap.
+    for (const member of [ENSEMBLE_MEMBER_A, ENSEMBLE_MEMBER_B, ENSEMBLE_JUDGE]) {
+      await seed.createModel({
+        display_name: member,
+        provider: "openai",
+        model_name: "gpt-4o-mini",
+        provider_key_id: forwardingPk.id,
+      });
+    }
+    await seed.createModel({
+      display_name: ENSEMBLE_MODEL,
+      ensemble: {
+        panel: [{ model: ENSEMBLE_MEMBER_A }, { model: ENSEMBLE_MEMBER_B }],
+        judge: { model: ENSEMBLE_JUDGE },
+        min_responses: 2,
+      },
+    });
+
     // The Anthropic bridge assembles its upstream request by hand rather
     // than through the shared pipeline — the classic place a per-request
     // mechanism goes silently missing. Its credential slot is `x-api-key`.
@@ -295,11 +328,37 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
       forward_client_headers: [CUSTOM_HEADER, "*"],
     });
 
-    await seed.createApiKey({
+    const callerKey = await seed.createApiKey({
       key_hash: CALLER_HASH,
       allowed_models: ["*"],
       allowed_routes: ["*"],
       mcp_access: { allow: ["*"] },
+    });
+
+    // A route that names its OWN gateway-credential slot, and one that
+    // names none. `x-*` is the same pattern on both: what differs is
+    // whether the route declared a slot for it to have to leave alone.
+    await seed.createPassthroughRoute({
+      name: "fwd-route-headerkey",
+      path_prefix: `${ROUTE_PREFIX}-headerkey`,
+      target_url: upstream.baseUrl,
+      auth_mode: "header_key",
+      auth_header_name: GATEWAY_KEY_HEADER,
+      credential_mode: "inject",
+      provider_key_id: routePk.id,
+      identity_header: "x-end-user",
+      forward_client_headers: ["x-*"],
+    });
+    await seed.createPassthroughRoute({
+      name: "fwd-route-anon",
+      path_prefix: `${ROUTE_PREFIX}-anon`,
+      target_url: upstream.baseUrl,
+      auth_mode: "anonymous",
+      anonymous_key_id: callerKey.id,
+      source_cidrs: ["127.0.0.0/8", "::1/128"],
+      credential_mode: "inject",
+      provider_key_id: routePk.id,
+      forward_client_headers: ["x-*"],
     });
 
     await waitConfigPropagation(async () => {
@@ -422,6 +481,60 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
     expect(occurrences(forwarded, "authorization")).toBe(1);
   });
 
+  test("a glob never sweeps the slots a route named for itself", async () => {
+    if (!etcdReachable) return;
+    const mark = upstream!.receivedRequests.length;
+
+    // `header_key`: the caller's AISIX key arrives in the route's own
+    // `x-gw-key`, and the end-user identity in its own `x-end-user`.
+    // Both match `x-*`, and neither is on the credential list every
+    // surface shares — the route schema in fact forbids those names —
+    // so only the per-route rule keeps them off the wire.
+    await fetch(`${app!.proxyUrl}${ROUTE_PREFIX}-headerkey/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        [GATEWAY_KEY_HEADER]: CALLER_KEY,
+        "x-end-user": "alice@example.com",
+        "x-allowed": "yes",
+      },
+      body: JSON.stringify({ model: "gpt-4o-mini", messages: [] }),
+    }).then((r) => bodyOf(r, "the header_key route"));
+
+    const seen = since(mark).at(-1)!;
+    expect(seen.headers[GATEWAY_KEY_HEADER]).toBeUndefined();
+    expect(seen.headers["x-end-user"]).toBeUndefined();
+    // The same `x-*` still carries an ordinary header, so the two
+    // assertions above are the rule firing rather than a dead pattern.
+    expect(seen.headers["x-allowed"]).toBe("yes");
+  });
+
+  test("a route that names no slot of its own is unchanged", async () => {
+    if (!etcdReachable) return;
+    const mark = upstream!.receivedRequests.length;
+
+    // `anonymous` reads no inbound credential at all, so nothing joins
+    // the exact-name set and `x-*` means exactly what it always did —
+    // including for a header another route would have treated as a slot.
+    await fetch(`${app!.proxyUrl}${ROUTE_PREFIX}-anon/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        [GATEWAY_KEY_HEADER]: "not-a-slot-on-this-route",
+        "x-allowed": "yes",
+      },
+      body: JSON.stringify({ model: "gpt-4o-mini", messages: [] }),
+    }).then((r) => bodyOf(r, "the anonymous route"));
+
+    const seen = since(mark).at(-1)!;
+    expect(seen.headers[GATEWAY_KEY_HEADER]).toBe("not-a-slot-on-this-route");
+    expect(seen.headers["x-allowed"]).toBe("yes");
+    // And the shared rule is untouched: the ProviderKey's credential
+    // still rides alone.
+    expect(seen.headers.authorization).toBe(`Bearer ${GATEWAY_SECRET}`);
+    expect(occurrences(seen, "authorization")).toBe(1);
+  });
+
   test("a passthrough route never doubles a header it injects", async () => {
     if (!etcdReachable) return;
     const mark = upstream!.receivedRequests.length;
@@ -488,6 +601,56 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
       // an equality check would call that clean.
       expect(h["mcp-session-id"] ?? "").not.toContain("callers-own-session");
       expect(h["last-event-id"] ?? "").not.toContain("callers-own-event");
+    }
+  });
+
+  test("an ensemble's panel and judge each forward on their own upstream", async () => {
+    if (!etcdReachable) return;
+    const mark = upstream!.receivedRequests.length;
+
+    await chat(ENSEMBLE_MODEL, { [CUSTOM_HEADER]: "carried.verbatim" }).then((r) =>
+      bodyOf(r, "the ensemble entry"),
+    );
+
+    // Two panel members plus the judge, each a separate upstream call
+    // built by `ProxyModelCaller::call` rather than by the single
+    // dispatch chokepoint.
+    const calls = since(mark);
+    expect(calls.length, "panel of two plus a judge").toBe(3);
+    for (const call of calls) {
+      expect(call.headers[CUSTOM_HEADER]).toBe("carried.verbatim");
+      // Each sub-call reads its OWN ProviderKey's list, which here also
+      // names the credential slot — the ensemble entry has no
+      // ProviderKey to inherit one from.
+      expect(call.headers.authorization).toBe(`Bearer ${CALLER_KEY}`);
+    }
+  });
+
+  test("a streamed ensemble judge forwards too", async () => {
+    if (!etcdReachable) return;
+    const mark = upstream!.receivedRequests.length;
+
+    // The streaming judge is dispatched from a different call site than
+    // the buffered one, and only this path exercises it.
+    const res = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_KEY}`,
+        "content-type": "application/json",
+        [CUSTOM_HEADER]: "carried.verbatim",
+      },
+      body: JSON.stringify({
+        model: ENSEMBLE_MODEL,
+        messages: [{ role: "user", content: "probe" }],
+        stream: true,
+      }),
+    });
+    await bodyOf(res, "the streamed ensemble");
+
+    const calls = since(mark);
+    expect(calls.length).toBe(3);
+    for (const call of calls) {
+      expect(call.headers[CUSTOM_HEADER]).toBe("carried.verbatim");
     }
   });
 

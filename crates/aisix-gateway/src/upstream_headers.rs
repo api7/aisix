@@ -105,6 +105,11 @@ pub struct UpstreamHeaderContext<'a> {
     /// poll of an async job, a semantic-routing embedding lookup) — those
     /// requests forward nothing.
     pub client_headers: Option<&'a HeaderMap>,
+    /// Header names THIS surface owns, which the shared lists cannot know
+    /// about. `/v1/realtime` opens its own WebSocket, so the caller's
+    /// `sec-websocket-*` slots describe the connection the caller opened
+    /// and one of them carries the caller's own gateway key.
+    pub surface_blocked: &'a [&'a str],
 }
 
 impl<'a> UpstreamHeaderContext<'a> {
@@ -124,6 +129,13 @@ impl<'a> UpstreamHeaderContext<'a> {
 
     pub fn with_client_headers(mut self, headers: &'a HeaderMap) -> Self {
         self.client_headers = Some(headers);
+        self
+    }
+
+    /// Names this surface refuses on top of the shared lists — see
+    /// [`UpstreamHeaderContext::surface_blocked`].
+    pub fn with_surface_blocked(mut self, blocked: &'a [&'a str]) -> Self {
+        self.surface_blocked = blocked;
         self
     }
 }
@@ -221,7 +233,7 @@ impl ForwardedClientHeaders {
             entries: aisix_core::resolve_forwarded_client_headers(
                 &r.forward_client_headers,
                 client,
-                &[],
+                ctx.surface_blocked,
             ),
         }
     }

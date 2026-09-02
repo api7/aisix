@@ -135,8 +135,32 @@ pub const TRACE_CONTEXT_HEADERS: &[&str] = &["traceparent", "tracestate"];
 /// `forward_client_headers: ["x-*"]` does not start relaying the caller's
 /// `x-api-key` — which on `/v1/*` is the caller's own gateway key — the
 /// day it upgrades.
+///
+/// The list here is the one every surface shares, and it is complete only
+/// where the caller's credential always arrives in a slot it names — on
+/// `/v1/*` and MCP the gateway reads `authorization` or `x-api-key` and
+/// nothing else. A surface where the OPERATOR chooses the slot has to add
+/// its own; see [`exact_match_only_with`].
 pub fn exact_match_only(name: &str) -> bool {
     CREDENTIAL_SLOT_HEADERS.contains(&name) || TRACE_CONTEXT_HEADERS.contains(&name)
+}
+
+/// [`exact_match_only`] plus the slots one surface names for itself.
+///
+/// A `passthrough_route` picks its own header names: under `auth_mode:
+/// header_key` the gateway credential arrives in the route's
+/// `auth_header_name`, and `identity_header` carries an end-user identity
+/// the route promises to record and strip. Nothing constrains an operator
+/// to choose a name from the shared list — the route schema in fact
+/// forbids the credential ones — so without this a `["x-*"]` pattern
+/// sweeps in exactly the header the gateway just consumed to authenticate
+/// the caller and relays it upstream, where it can be replayed against
+/// this gateway.
+///
+/// The rule is unchanged, only its input: a glob does not reach these
+/// names, and a pattern that spells one out still forwards it.
+pub fn exact_match_only_with(name: &str, surface_slots: &[&str]) -> bool {
+    exact_match_only(name) || surface_slots.iter().any(|s| s.eq_ignore_ascii_case(name))
 }
 
 /// Whether a forwarded value may DISPLACE a header the gateway already
@@ -177,7 +201,17 @@ pub fn client_header_forwardable(name: &str) -> bool {
 /// snapshot. [`exact_match_only`] names the exception: those headers need
 /// a pattern that spells them out.
 pub fn forward_pattern_admits(patterns: &[String], name: &str) -> bool {
-    if exact_match_only(name) {
+    forward_pattern_admits_with(patterns, name, &[])
+}
+
+/// [`forward_pattern_admits`] for a surface that names credential slots of
+/// its own — see [`exact_match_only_with`].
+pub fn forward_pattern_admits_with(
+    patterns: &[String],
+    name: &str,
+    surface_slots: &[&str],
+) -> bool {
+    if exact_match_only_with(name, surface_slots) {
         return patterns.iter().any(|p| p.eq_ignore_ascii_case(name));
     }
     patterns
@@ -339,6 +373,46 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// The shared list cannot know the name a `passthrough_route` picked
+    /// for its own gateway credential, and the route schema guarantees it
+    /// is NOT one of the shared names. So a glob would sweep in exactly
+    /// the header the gateway consumed to authenticate this caller.
+    #[test]
+    fn a_surface_slot_needs_its_own_name_not_a_glob() {
+        let slots = ["x-gw-key", "x-end-user"];
+        for name in slots {
+            assert!(!exact_match_only(name), "{name}");
+            assert!(exact_match_only_with(name, &slots), "{name}");
+            assert!(!forward_pattern_admits_with(&["*".into()], name, &slots));
+            assert!(!forward_pattern_admits_with(&["x-*".into()], name, &slots));
+            // Naming it in full is still consent, on this face as on
+            // every other.
+            assert!(forward_pattern_admits_with(
+                &[name.to_string()],
+                name,
+                &slots
+            ));
+            assert!(forward_pattern_admits_with(
+                &[name.to_uppercase()],
+                name,
+                &slots
+            ));
+        }
+        // Only the named slots move: an ordinary header on the same
+        // surface still answers to the glob.
+        assert!(forward_pattern_admits_with(
+            &["x-*".into()],
+            "x-trace-id",
+            &slots
+        ));
+        // And a surface that names none behaves exactly as before.
+        assert!(forward_pattern_admits_with(
+            &["x-*".into()],
+            "x-gw-key",
+            &[]
+        ));
     }
 
     #[test]

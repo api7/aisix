@@ -41,6 +41,16 @@
 //! envelope) rather than accept-then-close-1008: same enforcement point,
 //! observable to every WS client as a failed handshake.
 //!
+//! ## Forwarded client headers
+//!
+//! The ProviderKey's `request.forward_client_headers` applies here as on
+//! every other `/v1/*` face: the named headers ride the upstream
+//! handshake, and a named credential slot displaces the ProviderKey's own
+//! rather than joining it. The handshake slots this surface owns are the
+//! one addition to the shared refusals — see [`REALTIME_HANDSHAKE_SLOTS`].
+//! `request.default_headers` is a separate feature that this face has
+//! never applied.
+//!
 //! ## Usage
 //!
 //! The relay harvests `response.done` usage frames (and
@@ -83,6 +93,29 @@ const HEADER_BETA_VALUE: &str = "realtime=v1";
 /// event shape (a subprotocol token cannot contain `=`, so the header's
 /// `realtime=v1` is spelled `realtime-v1` here).
 const SUBPROTOCOL_BETA_ITEM: &str = "openai-beta.realtime-v1";
+
+/// Handshake slots this surface owns, refused to `forward_client_headers`
+/// on top of the shared lists.
+///
+/// Every other `/v1/*` face rebuilds an HTTP request; this one performs a
+/// second WebSocket handshake, and these headers describe the handshake
+/// the CALLER made rather than the request's content. Relaying
+/// `sec-websocket-key` / `-version` / `-extensions` breaks the upstream
+/// handshake outright — the gateway's client generated its own key and
+/// negotiates its own extensions, and the accept value is computed
+/// against them. `sec-websocket-protocol` is worse than broken: the
+/// documented browser flow puts the caller's own AISIX key in it
+/// (`openai-insecure-api-key.<key>`), so relaying it would hand the
+/// provider the credential this gateway authenticates with. It also
+/// selects the subprotocol the gateway echoes back to the client, which
+/// is the gateway's answer to make, not the upstream's.
+const REALTIME_HANDSHAKE_SLOTS: &[&str] = &[
+    "sec-websocket-accept",
+    "sec-websocket-extensions",
+    "sec-websocket-key",
+    "sec-websocket-protocol",
+    "sec-websocket-version",
+];
 
 /// Is `needle` one of the comma-separated items across every value of
 /// `name`? Both headers are list-valued and may repeat, so a first-value
@@ -311,7 +344,19 @@ async fn prepare(
     let secret = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
-    let upstream_request = match pk_entry.value.adapter {
+    // The ProviderKey's `request.forward_client_headers`, resolved against
+    // the caller's own handshake. This face builds its upstream request by
+    // hand instead of through the shared bridge pipeline, which is exactly
+    // where a per-request mechanism goes silently missing — an operator
+    // who declared that this upstream reads the caller's credential got it
+    // on every other `/v1/*` endpoint and not here.
+    let forwarded = aisix_gateway::ForwardedClientHeaders::resolve(
+        &aisix_gateway::UpstreamHeaderContext::from_overrides(pk_entry.value.request.as_ref())
+            .with_client_headers(headers)
+            .with_surface_blocked(REALTIME_HANDSHAKE_SLOTS),
+    );
+
+    let mut upstream_request = match pk_entry.value.adapter {
         Some(Adapter::Openai) => {
             let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
             let url = crate::dispatch::build_openai_url(&base, "/realtime");
@@ -381,6 +426,13 @@ async fn prepare(
             )));
         }
     };
+    // AFTER the per-adapter build, which is what lets a credential slot
+    // the operator named displace the ProviderKey's own — the ordering
+    // `apply` documents and every other face follows. It leaves any other
+    // header the arms above set alone: those select how the exchange
+    // works, not who it is from.
+    forwarded.apply(upstream_request.headers_mut());
+
     let reservation = crate::quota::enforce(
         state,
         snapshot,
@@ -1188,6 +1240,20 @@ mod tests {
         snap
     }
 
+    /// [`snapshot`] whose ProviderKey opted into forwarding `forward`.
+    fn snapshot_forwarding(api_base: &str, forward: &[&str]) -> AisixSnapshot {
+        let snap = snapshot(api_base, "openai", "openai");
+        let pk_json = format!(
+            r#"{{"display_name":"rt-pk","secret":"sk-up","api_base":"{api_base}",
+                 "provider":"openai","adapter":"openai",
+                 "request":{{"forward_client_headers":{}}}}}"#,
+            serde_json::to_string(forward).unwrap()
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
+        snap
+    }
+
     /// Bind the full proxy router on a real TCP port (WS handshakes need a
     /// live connection; `oneshot` can't upgrade).
     async fn serve(
@@ -1214,10 +1280,20 @@ mod tests {
         (addr, state, rx)
     }
 
+    /// One header's value as a string, `""` when absent — the mock
+    /// records the whole map, and every assertion below reads one name.
+    fn header_str(headers: &HeaderMap, name: &str) -> String {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    }
+
     /// Scripted mock upstream: accepts ONE WebSocket, records the request
-    /// path + auth header + any `openai-beta` header, waits for one text
-    /// frame, replies with a `response.done` usage frame, then closes.
-    type SeenHandshake = Option<(String, String, Option<String>)>;
+    /// path and its FULL header map, waits for one text frame, replies
+    /// with a `response.done` usage frame, then closes.
+    type SeenHandshake = Option<(String, HeaderMap)>;
 
     async fn spawn_upstream() -> (
         std::net::SocketAddr,
@@ -1237,18 +1313,7 @@ mod tests {
                 stream,
                 move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
                       resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                    let auth = req
-                        .headers()
-                        .get("authorization")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
-                    let beta = req
-                        .headers()
-                        .get("openai-beta")
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_string);
-                    *hs2.lock().unwrap() = Some((req.uri().to_string(), auth, beta));
+                    *hs2.lock().unwrap() = Some((req.uri().to_string(), req.headers().clone()));
                     Ok(resp)
                 },
             )
@@ -1318,11 +1383,13 @@ mod tests {
         // Upstream saw the relayed client frame + the gateway's provider auth.
         assert_eq!(frames.lock().unwrap().len(), 1);
         assert!(frames.lock().unwrap()[0].contains("session.update"));
-        let (uri, auth, beta) = handshake
+        let (uri, seen) = handshake
             .lock()
             .unwrap()
             .clone()
             .expect("handshake recorded");
+        let auth = header_str(&seen, "authorization");
+        let beta = seen.get("openai-beta").map(|_| ());
         assert!(
             uri.contains("/v1/realtime") && uri.contains("model=gpt-realtime"),
             "upstream URI must be the realtime path with the UPSTREAM model id, got {uri}"
@@ -1345,6 +1412,139 @@ mod tests {
         assert_eq!(ev.cached_prompt_tokens, 1);
         assert_eq!(ev.requested_model, "rt-model");
         assert_eq!(ev.api_key_id, "k-1");
+    }
+
+    /// `/v1/realtime` builds its upstream handshake by hand rather than
+    /// through the shared bridge pipeline, which is exactly where a
+    /// per-request mechanism goes silently missing: the operator
+    /// configured `forward_client_headers` on this ProviderKey and every
+    /// other `/v1/*` endpoint honoured it.
+    #[tokio::test]
+    async fn a_named_client_header_rides_the_upstream_handshake() {
+        let (up_addr, handshake, _frames) = spawn_upstream().await;
+        let snap = snapshot_forwarding(
+            &format!("http://{up_addr}/v1"),
+            &["x-user-jwt", "sec-websocket-extensions", "x-*"],
+        );
+        let (addr, _state, _rx) = serve(snap).await;
+
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        req.headers_mut()
+            .insert("x-user-jwt", "eyJraw".parse().unwrap());
+        // A handshake slot the gateway's own client did NOT set, so
+        // nothing would decline it on the way out — only the surface
+        // list stops it.
+        req.headers_mut().insert(
+            "sec-websocket-extensions",
+            "permessage-deflate".parse().unwrap(),
+        );
+        let (ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("handshake");
+        let (mut tx, mut client_rx) = ws.split();
+        tx.send(TgMessage::Text("{\"type\":\"session.update\"}".into()))
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(3), client_rx.next()).await;
+
+        let (_uri, seen) = handshake
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("handshake recorded");
+        assert_eq!(header_str(&seen, "x-user-jwt"), "eyJraw");
+        // The caller did not name `authorization`, so the gateway's own
+        // provider credential still authenticates the session.
+        assert_eq!(header_str(&seen, "authorization"), "Bearer sk-up");
+        // A `"*"`-shaped pattern is not consent to relay the handshake
+        // this surface owns. `permessage-deflate` at the upstream would
+        // enable a compression the gateway's own codec never negotiated,
+        // so the relay would decode garbage.
+        assert_eq!(
+            header_str(&seen, "sec-websocket-extensions"),
+            "",
+            "the caller's own handshake negotiation must not reach the upstream"
+        );
+    }
+
+    /// The credential collision, on this face as on every other: the
+    /// operator declared that this upstream reads the caller's own
+    /// credential, so the ProviderKey's stands aside rather than joining
+    /// it on the wire.
+    #[tokio::test]
+    async fn a_named_credential_slot_displaces_the_provider_key_s_own() {
+        let (up_addr, handshake, _frames) = spawn_upstream().await;
+        let snap = snapshot_forwarding(&format!("http://{up_addr}/v1"), &["authorization"]);
+        let (addr, _state, _rx) = serve(snap).await;
+
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("handshake");
+        let (mut tx, mut client_rx) = ws.split();
+        tx.send(TgMessage::Text("{\"type\":\"session.update\"}".into()))
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(3), client_rx.next()).await;
+
+        let (_uri, seen) = handshake
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("handshake recorded");
+        assert_eq!(header_str(&seen, "authorization"), "Bearer sk-caller");
+        // And alone: a second value would let the upstream pick.
+        assert_eq!(seen.get_all("authorization").iter().count(), 1);
+    }
+
+    /// The browser flow puts the caller's own AISIX key in
+    /// `sec-websocket-protocol`. Relaying that list would hand the
+    /// provider the credential this gateway authenticates with, so no
+    /// pattern reaches it — not even one naming it in full.
+    #[tokio::test]
+    async fn the_browser_credential_never_rides_the_upstream_handshake() {
+        let (up_addr, handshake, _frames) = spawn_upstream().await;
+        let snap = snapshot_forwarding(
+            &format!("http://{up_addr}/v1"),
+            &["sec-websocket-protocol", "*"],
+        );
+        let (addr, _state, _rx) = serve(snap).await;
+
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut().insert(
+            "sec-websocket-protocol",
+            "realtime, openai-insecure-api-key.sk-caller"
+                .parse()
+                .unwrap(),
+        );
+        let (ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("subprotocol auth must be accepted");
+        let (mut tx, mut client_rx) = ws.split();
+        tx.send(TgMessage::Text("{\"type\":\"session.update\"}".into()))
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(3), client_rx.next()).await;
+
+        let (_uri, seen) = handshake
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("handshake recorded");
+        assert!(
+            !header_str(&seen, "sec-websocket-protocol").contains("sk-caller"),
+            "the caller's gateway key must not reach the provider"
+        );
     }
 
     #[tokio::test]
@@ -1408,12 +1608,12 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(3), client_rx.next()).await;
 
         // The opt-in rode the same later field, so it reaches upstream.
-        let (_uri, _auth, beta) = handshake
+        let (_uri, seen) = handshake
             .lock()
             .unwrap()
             .clone()
             .expect("handshake recorded");
-        assert_eq!(beta.as_deref(), Some("realtime=v1"));
+        assert_eq!(header_str(&seen, "openai-beta"), "realtime=v1");
     }
 
     /// The predicate itself: neither channel set => GA (no header).
@@ -1501,14 +1701,14 @@ mod tests {
         .unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(3), client_rx.next()).await;
 
-        let (_uri, _auth, beta) = handshake
+        let (_uri, seen) = handshake
             .lock()
             .unwrap()
             .clone()
             .expect("handshake recorded");
         assert_eq!(
-            beta.as_deref(),
-            Some("realtime=v1"),
+            header_str(&seen, "openai-beta"),
+            "realtime=v1",
             "an explicit client opt-in must reach the upstream"
         );
     }
