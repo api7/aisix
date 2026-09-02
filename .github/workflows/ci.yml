@@ -31,6 +31,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: check guardrails without provider features
+        run: cargo check --locked -p aisix-guardrails --no-default-features
 
   schema-drift:
     name: schema drift (resources)

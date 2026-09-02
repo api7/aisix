@@ -38,7 +38,11 @@
 //!   `serving_stale_since` on `rejected[]`), and nothing for a rejected key
 //!   with no last good. When everything is accepted the two hashes are
 //!   equal; a rejection makes them diverge, with `rejected[]` as the
-//!   authoritative per-resource explanation.
+//!   authoritative per-resource explanation. A row rejected later by a
+//!   runtime builder is removed from the reported count and derives a stable
+//!   effective hash from that loader hash plus the sorted rejected identities;
+//!   this keeps the source/applied hashes divergent without retaining a second
+//!   copy of every source document in the status handle.
 //! - **file**: `sha256` over the raw file bytes. On a clean load the applied
 //!   `config_hash` equals `source_hash` (the whole file is applied); on a
 //!   rejected reload the applied hash stays at the last-good file's hash.
@@ -48,6 +52,12 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+
+/// Maximum number of source + runtime rejections retained for status and
+/// heartbeat reporting. Bounds both memory and the managed heartbeat payload.
+pub const MAX_CONFIG_REJECTIONS: usize = 256;
+
+const MAX_REJECTION_ERROR_CHARS: usize = 256;
 
 /// Which source the data plane reads configuration from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -365,6 +375,8 @@ impl ConfigStatus {
     pub fn record_load(&self, obs: LoadObservation) {
         let now = Utc::now();
         let mut inner = self.inner.lock().unwrap();
+        let previous_effective_hash = inner.effective_config_hash();
+        let was_applied = inner.ever_applied;
 
         inner.connected = true;
         inner.observed_at = Some(now);
@@ -373,11 +385,6 @@ impl ConfigStatus {
         inner.latest_wholly_rejected = obs.wholly_rejected;
 
         if let Some(applied) = obs.applied {
-            let changed = inner.config_hash.as_deref() != Some(applied.config_hash.as_str());
-            if changed || !inner.ever_applied {
-                inner.apply_seq += 1;
-                inner.applied_at = Some(now);
-            }
             inner.ever_applied = true;
             inner.config_hash = Some(applied.config_hash);
             inner.applied_revision = applied.revision;
@@ -386,7 +393,8 @@ impl ConfigStatus {
 
         // Merge rejections, preserving first_seen for identities still present.
         let mut merged: BTreeMap<String, RetainedRejection> = BTreeMap::new();
-        for r in obs.rejected {
+        let loader_limit = MAX_CONFIG_REJECTIONS.saturating_sub(inner.build_rejected.len());
+        for r in obs.rejected.into_iter().take(loader_limit) {
             let first_seen_at = inner
                 .rejected
                 .get(&r.identity)
@@ -398,7 +406,7 @@ impl ConfigStatus {
                     resource_kind: r.resource_kind,
                     resource_id: r.resource_id,
                     last_error_kind: r.last_error_kind,
-                    last_error: r.last_error,
+                    last_error: bounded_rejection_error(r.last_error),
                     first_seen_at,
                     last_seen_at: r.seen_at,
                     serving_stale_since: r.serving_stale_since,
@@ -409,6 +417,13 @@ impl ConfigStatus {
         inner.partially_compatible = obs.partially_compatible;
         inner.partially_compatible_rows_by_kind = obs.partially_compatible_rows_by_kind;
         inner.stale_served_rows_by_kind = obs.stale_served_rows_by_kind;
+
+        if inner.ever_applied
+            && (!was_applied || previous_effective_hash != inner.effective_config_hash())
+        {
+            inner.apply_seq += 1;
+            inner.applied_at = Some(now);
+        }
 
         let clean = inner.rejected.is_empty() && inner.build_rejected.is_empty();
         inner.last_reload_successful = clean;
@@ -453,8 +468,10 @@ impl ConfigStatus {
     pub fn record_build_rejections(&self, rejected: Vec<IncomingRejection>) {
         let now = Utc::now();
         let mut inner = self.inner.lock().unwrap();
+        let previous_effective_hash = inner.effective_config_hash();
         let mut merged = BTreeMap::new();
-        for r in rejected {
+        let build_limit = MAX_CONFIG_REJECTIONS.saturating_sub(inner.rejected.len());
+        for r in rejected.into_iter().take(build_limit) {
             let first_seen_at = inner
                 .build_rejected
                 .get(&r.identity)
@@ -466,7 +483,7 @@ impl ConfigStatus {
                     resource_kind: r.resource_kind,
                     resource_id: r.resource_id,
                     last_error_kind: r.last_error_kind,
-                    last_error: r.last_error,
+                    last_error: bounded_rejection_error(r.last_error),
                     first_seen_at,
                     last_seen_at: r.seen_at,
                     serving_stale_since: r.serving_stale_since,
@@ -474,6 +491,10 @@ impl ConfigStatus {
             );
         }
         inner.build_rejected = merged;
+        if inner.ever_applied && previous_effective_hash != inner.effective_config_hash() {
+            inner.apply_seq += 1;
+            inner.applied_at = Some(now);
+        }
 
         // A builder is constructed before the first source observation on a
         // cold start. Its empty result must not fabricate a successful reload.
@@ -533,7 +554,7 @@ impl ConfigStatus {
     /// per-node config-verification field — without building the full
     /// [`Self::view`] / [`Self::metrics`] snapshot.
     pub fn applied_config_hash(&self) -> Option<String> {
-        self.inner.lock().unwrap().config_hash.clone()
+        self.inner.lock().unwrap().effective_config_hash()
     }
 
     /// Current loader + runtime-builder rejections for heartbeat reporting.
@@ -569,8 +590,33 @@ impl ConfigStatus {
 }
 
 impl ConfigStatusInner {
+    fn effective_config_hash(&self) -> Option<String> {
+        let base = self.config_hash.as_ref()?;
+        if self.build_rejected.is_empty() {
+            return Some(base.clone());
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"aisix-runtime-filtered-v1\0");
+        hasher.update(base.as_bytes());
+        hasher.update([0u8]);
+        for identity in self.build_rejected.keys() {
+            hasher.update(identity.as_bytes());
+            hasher.update([b'\n']);
+        }
+        Some(hex(hasher.finalize().as_slice()))
+    }
+
+    fn effective_resource_counts(&self) -> BTreeMap<String, usize> {
+        let mut counts = self.resource_counts.clone();
+        for rejection in self.build_rejected.values() {
+            let count = counts.entry(rejection.resource_kind.clone()).or_default();
+            *count = count.saturating_sub(1);
+        }
+        counts
+    }
+
     fn applied_total(&self) -> usize {
-        self.resource_counts.values().sum()
+        self.effective_resource_counts().values().sum()
     }
 
     fn derive_state(&self) -> ConfigState {
@@ -608,10 +654,10 @@ impl ConfigStatusInner {
         let applied = if self.ever_applied {
             Some(AppliedView {
                 applied_revision: if etcd { self.applied_revision } else { None },
-                config_hash: self.config_hash.clone().unwrap_or_default(),
+                config_hash: self.effective_config_hash().unwrap_or_default(),
                 apply_seq: self.apply_seq,
                 applied_at: self.applied_at.map(rfc3339).unwrap_or_default(),
-                resource_counts: self.resource_counts.clone(),
+                resource_counts: self.effective_resource_counts(),
             })
         } else {
             None
@@ -768,6 +814,15 @@ pub struct ConfigMetricsView {
 
 fn rfc3339(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn bounded_rejection_error(error: String) -> String {
+    if error.chars().count() <= MAX_REJECTION_ERROR_CHARS {
+        return error;
+    }
+    let mut out: String = error.chars().take(MAX_REJECTION_ERROR_CHARS - 1).collect();
+    out.push('…');
+    out
 }
 
 /// Hash an etcd entry set: `sha256` over `key '\0' canonical_value '\n'` for
@@ -1023,6 +1078,9 @@ mod tests {
             is_reload: true,
             wholly_rejected: false,
         });
+        let clean = cs.view();
+        let clean_hash = clean.applied.as_ref().unwrap().config_hash.clone();
+        let clean_seq = clean.applied.as_ref().unwrap().apply_seq;
         cs.record_build_rejections(vec![incoming(
             "/aisix/runtime/guardrails/g-1",
             "guardrails",
@@ -1030,7 +1088,21 @@ mod tests {
             "schema_failed",
             "guardrail failed to build",
         )]);
-        assert_eq!(cs.view().state, ConfigState::Degraded);
+        let runtime_rejected = cs.view();
+        assert_eq!(runtime_rejected.state, ConfigState::Degraded);
+        let effective = runtime_rejected.applied.as_ref().unwrap();
+        assert_ne!(effective.config_hash, clean_hash);
+        assert_ne!(
+            effective.config_hash,
+            runtime_rejected.source.source_hash.unwrap()
+        );
+        assert_eq!(effective.resource_counts["guardrails"], 0);
+        assert_eq!(effective.resource_counts["models"], 1);
+        assert_eq!(effective.apply_seq, clean_seq + 1);
+        assert_eq!(
+            cs.applied_config_hash().as_deref(),
+            Some(effective.config_hash.as_str())
+        );
         assert_eq!(
             cs.rejection_snapshots()[0].key,
             "/aisix/runtime/guardrails/g-1"
@@ -1060,6 +1132,56 @@ mod tests {
         assert_eq!(view.state, ConfigState::Degraded);
         assert_eq!(view.rejected.len(), 1);
         assert_eq!(view.rejected[0].resource_kind, "models");
+        assert_eq!(
+            view.applied.as_ref().unwrap().resource_counts["guardrails"],
+            1
+        );
+    }
+
+    #[test]
+    fn rejection_reporting_is_bounded_across_loader_and_runtime_sources() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        cs.record_load(LoadObservation {
+            source_hash: "src".into(),
+            observed_revision: Some(1),
+            applied: Some(applied("src", &[("guardrails", 400)])),
+            rejected: (0..100)
+                .map(|i| {
+                    incoming(
+                        &format!("/aisix/models/l-{i}"),
+                        "models",
+                        "l",
+                        "schema_failed",
+                        &"x".repeat(1000),
+                    )
+                })
+                .collect(),
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: true,
+            wholly_rejected: false,
+        });
+        cs.record_build_rejections(
+            (0..300)
+                .map(|i| {
+                    incoming(
+                        &format!("/aisix/runtime/guardrails/g-{i}"),
+                        "guardrails",
+                        "g",
+                        "schema_failed",
+                        &"y".repeat(1000),
+                    )
+                })
+                .collect(),
+        );
+
+        let rejected = cs.view().rejected;
+        assert_eq!(rejected.len(), MAX_CONFIG_REJECTIONS);
+        assert!(rejected
+            .iter()
+            .all(|row| row.last_error.chars().count() <= MAX_REJECTION_ERROR_CHARS));
+        assert_eq!(cs.rejection_snapshots().len(), MAX_CONFIG_REJECTIONS);
     }
 
     #[test]

@@ -122,8 +122,7 @@ fn build_chain_from_snapshot_reported(
                 );
                 rejected.push(GuardrailBuildRejection {
                     id: entry.id.clone(),
-                    name: row.name.clone(),
-                    reason: err.to_string(),
+                    reason: err.status_reason(),
                 });
             }
         }
@@ -243,6 +242,7 @@ fn build_one_inner(
                     KeywordPattern::Literal(s) => KeywordRule::literal(s.clone()),
                     KeywordPattern::Regex(s) => {
                         KeywordRule::regex(s).map_err(|e| BuildError::InvalidRegex {
+                            field: "patterns[].value",
                             pattern: s.clone(),
                             source: e,
                         })?
@@ -308,6 +308,7 @@ fn build_one_inner(
                 }
                 let rule = PiiRule::new(p.name.clone(), &p.regex, action, None)
                     .map_err(|e| BuildError::InvalidRegex {
+                        field: "custom_patterns[].regex",
                         pattern: p.regex.clone(),
                         source: e,
                     })?
@@ -562,6 +563,7 @@ fn build_one_inner(
 enum BuildError {
     #[error("invalid regex {pattern:?}: {source}")]
     InvalidRegex {
+        field: &'static str,
         pattern: String,
         source: regex::Error,
     },
@@ -605,6 +607,24 @@ enum BuildError {
     /// the operator sees the same diagnostic their editor would show.
     #[error("custom guardrail script does not compile: {0}")]
     ScriptCompile(crate::custom::CompileError),
+}
+
+impl BuildError {
+    /// Bounded, value-free diagnostic for unauthenticated status surfaces.
+    /// Detailed values remain in the local warning log and validation output.
+    fn status_reason(&self) -> String {
+        let (category, field) = match self {
+            Self::InvalidRegex { field, .. } => ("invalid_regex", *field),
+            Self::InvalidValue { field, .. } => ("invalid_value", *field),
+            Self::ReplacementOnBlock { .. } => {
+                ("incompatible_fields", "custom_patterns[].replacement")
+            }
+            Self::FeatureDisabled(_) => ("feature_disabled", "kind"),
+            Self::EmbedderUnavailable => ("runtime_unavailable", "embedding_model"),
+            Self::ScriptCompile(_) => ("compile_failed", "script"),
+        };
+        format!("guardrail runtime build failed: {category} at config.{field}")
+    }
 }
 
 /// `enforcement_mode: monitor` decorator. Runs the wrapped guardrail exactly
@@ -1038,7 +1058,6 @@ pub fn build_index_from_snapshot(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GuardrailBuildRejection {
     id: String,
-    name: String,
     reason: String,
 }
 
@@ -1100,8 +1119,7 @@ fn build_index_from_snapshot_reported(
                     .entry(gid.clone())
                     .or_insert_with(|| GuardrailBuildRejection {
                         id: gid.clone(),
-                        name: row.name.clone(),
-                        reason: err.to_string(),
+                        reason: err.status_reason(),
                     });
                 continue;
             }
@@ -1153,7 +1171,7 @@ fn publish_build_rejections(
                 resource_kind: "guardrails".to_string(),
                 resource_id: row.id,
                 last_error_kind: "schema_failed".to_string(),
-                last_error: format!("guardrail {:?} failed to build: {}", row.name, row.reason),
+                last_error: row.reason,
                 seen_at,
                 serving_stale_since: None,
             })
@@ -1495,42 +1513,59 @@ impl LiveGuardrailIndex {
     }
 
     fn current(&self) -> Arc<GuardrailIndex> {
-        let cur_version = self.snapshot.version();
+        loop {
+            let build_version = self.snapshot.version();
 
-        // Fast path: return cached index without building.
-        {
-            let cache = self
-                .cache
-                .lock()
-                .expect("LiveGuardrailIndex mutex poisoned");
-            if cache.last_version == cur_version {
-                return Arc::clone(&cache.index);
+            // Fast path: return cached index without building.
+            {
+                let cache = self
+                    .cache
+                    .lock()
+                    .expect("LiveGuardrailIndex mutex poisoned");
+                if cache.last_version >= build_version {
+                    return Arc::clone(&cache.index);
+                }
+            }
+
+            // Build outside the lock. A snapshot swap during this work makes
+            // the result obsolete; try_install_index rejects it and the loop
+            // retries from the newer version.
+            let snap = self.snapshot.load();
+            if self.snapshot.version() != build_version {
+                continue;
+            }
+            let (new_index, rejected) = build_index_from_snapshot_reported(
+                &snap.guardrails,
+                &snap.guardrail_attachments,
+                self.bedrock_endpoint_url.as_deref(),
+                &self.embedder,
+            );
+            if let Some(index) = self.try_install_index(build_version, new_index, rejected) {
+                return index;
             }
         }
+    }
 
-        // Build the new index OUTSIDE the lock so a panic (e.g. from a
-        // badly-behaved regex engine) does not poison the mutex.
-        let snap = self.snapshot.load();
-        let (new_index, rejected) = build_index_from_snapshot_reported(
-            &snap.guardrails,
-            &snap.guardrail_attachments,
-            self.bedrock_endpoint_url.as_deref(),
-            &self.embedder,
-        );
-        publish_build_rejections(self.config_status.as_ref(), rejected);
-        let new_index = Arc::new(new_index);
-
-        // Re-acquire and store. A concurrent rebuild (rare) is harmless —
-        // both produce equivalent indexes from the same snapshot version.
+    /// Install a completed build only when it is still the newest snapshot.
+    /// Publishing status while holding the same cache lock makes cache and
+    /// rejection state advance in one monotonic version order.
+    fn try_install_index(
+        &self,
+        build_version: u64,
+        new_index: GuardrailIndex,
+        rejected: Vec<GuardrailBuildRejection>,
+    ) -> Option<Arc<GuardrailIndex>> {
         let mut cache = self
             .cache
             .lock()
             .expect("LiveGuardrailIndex mutex poisoned");
-        if cache.last_version != cur_version {
-            cache.index = new_index;
-            cache.last_version = cur_version;
+        if cache.last_version >= build_version || self.snapshot.version() != build_version {
+            return None;
         }
-        Arc::clone(&cache.index)
+        cache.index = Arc::new(new_index);
+        cache.last_version = build_version;
+        publish_build_rejections(self.config_status.as_ref(), rejected);
+        Some(Arc::clone(&cache.index))
     }
 
     /// Resolve the guardrail chain applicable to `ctx`.
@@ -2185,9 +2220,9 @@ mod tests {
             "g-1",
             parse(
                 r#"{
-                    "name": "broken-script",
+                    "name": "sensitive-name-do-not-expose",
                     "kind": "custom",
-                    "script": "export function checkInput( {"
+                    "script": "sensitive-script-do-not-expose export function checkInput( {"
                 }"#,
             ),
         ));
@@ -2200,9 +2235,10 @@ mod tests {
             Some(status.clone()),
         );
         assert_eq!(status.view().rejected.len(), 1);
-        assert!(status.view().rejected[0]
-            .last_error
-            .contains("broken-script"));
+        assert_eq!(
+            status.view().rejected[0].last_error,
+            "guardrail runtime build failed: compile_failed at config.script"
+        );
 
         let fixed = AisixSnapshot::new();
         fixed.guardrails.insert(entry(
@@ -2219,6 +2255,40 @@ mod tests {
         handle.store(fixed);
         assert!(live.check_input(&req("AKIA")).await.is_block());
         assert!(status.view().rejected.is_empty());
+    }
+
+    #[test]
+    fn runtime_status_redacts_invalid_regex_values() {
+        let broken = AisixSnapshot::new();
+        broken.guardrails.insert(entry(
+            "private-name-do-not-expose",
+            "g-private",
+            parse(
+                r#"{
+                    "name": "private-name-do-not-expose",
+                    "kind": "keyword",
+                    "patterns": [{"kind":"regex","value":"private-pattern-do-not-expose[("}]
+                }"#,
+            ),
+        ));
+        let status = ConfigStatus::new(aisix_core::SourceKind::Etcd);
+        let _live = LiveGuardrailChain::new_with_status(
+            SnapshotHandle::new(broken),
+            None,
+            GuardrailEmbedderSlot::none(),
+            Some(status.clone()),
+        );
+
+        let body = serde_json::to_string(&status.view()).unwrap();
+        assert!(body.contains("invalid_regex at config.patterns[].value"));
+        assert!(!body.contains("private-pattern-do-not-expose"));
+        assert!(!body.contains("private-name-do-not-expose"));
+        let heartbeat = status.rejection_snapshots();
+        assert_eq!(heartbeat.len(), 1);
+        assert_eq!(
+            heartbeat[0].error,
+            "guardrail runtime build failed: invalid_regex at config.patterns[].value"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3175,7 +3245,7 @@ mod tests {
             applied: Some(aisix_core::AppliedSnapshot {
                 config_hash: "broken".into(),
                 revision: Some(1),
-                resource_counts: [("guardrails".to_string(), 1)].into_iter().collect(),
+                resource_counts: [("guardrails".to_string(), 2)].into_iter().collect(),
             }),
             rejected: vec![],
             partially_compatible: vec![],
@@ -3201,7 +3271,16 @@ mod tests {
             .find(|row| row.resource_id == "g-1")
             .expect("custom rejection");
         assert_eq!(custom.resource_kind, "guardrails");
-        assert!(custom.last_error.contains("broken-script"));
+        assert_eq!(
+            custom.last_error,
+            "guardrail runtime build failed: invalid_value at config.script"
+        );
+        let applied = rejected.applied.as_ref().unwrap();
+        assert_eq!(applied.resource_counts["guardrails"], 1);
+        assert_ne!(
+            applied.config_hash.as_str(),
+            rejected.source.source_hash.as_deref().unwrap()
+        );
         assert_eq!(
             status
                 .rejection_snapshots()
@@ -3240,12 +3319,135 @@ mod tests {
             ),
         ));
         handle.store(fixed);
+        status.record_load(aisix_core::LoadObservation {
+            source_hash: "fixed".into(),
+            observed_revision: Some(2),
+            applied: Some(aisix_core::AppliedSnapshot {
+                config_hash: "fixed".into(),
+                revision: Some(2),
+                resource_counts: [("guardrails".to_string(), 1)].into_iter().collect(),
+            }),
+            rejected: vec![],
+            partially_compatible: vec![],
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: false,
+            wholly_rejected: false,
+        });
         // Rebuilds are deliberately lazy, so the previous signal remains
         // until the first request observes the new snapshot.
         assert_eq!(status.view().rejected.len(), 1);
         let _ = live.resolve(&any_ctx());
         assert!(status.view().rejected.is_empty());
-        assert_eq!(status.view().state, aisix_core::ConfigState::Synced);
+        let repaired = status.view();
+        assert_eq!(repaired.state, aisix_core::ConfigState::Synced);
+        assert_eq!(repaired.applied.unwrap().resource_counts["guardrails"], 1);
+    }
+
+    #[test]
+    fn older_index_build_cannot_restore_a_superseded_rejection() {
+        let broken = AisixSnapshot::new();
+        broken.guardrails.insert(entry(
+            "broken",
+            "g-1",
+            parse(r#"{"name":"broken","kind":"custom","script":" "}"#),
+        ));
+        broken.guardrail_attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(r#"{"guardrail_id":"g-1","scope_type":"env","priority":0}"#),
+        ));
+        let handle = SnapshotHandle::new(broken);
+        let old_version = handle.version();
+        let status = ConfigStatus::new(aisix_core::SourceKind::Etcd);
+        status.record_load(aisix_core::LoadObservation {
+            source_hash: "old".into(),
+            observed_revision: Some(1),
+            applied: Some(aisix_core::AppliedSnapshot {
+                config_hash: "old".into(),
+                revision: Some(1),
+                resource_counts: [("guardrails".to_string(), 1)].into_iter().collect(),
+            }),
+            rejected: vec![],
+            partially_compatible: vec![],
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: true,
+            wholly_rejected: false,
+        });
+        let live = LiveGuardrailIndex::new_with_sink_and_status(
+            handle.clone(),
+            None,
+            None,
+            GuardrailEmbedderSlot::none(),
+            Some(status.clone()),
+        );
+        assert_eq!(status.view().rejected.len(), 1);
+
+        let fixed = AisixSnapshot::new();
+        fixed.guardrails.insert(entry(
+            "fixed",
+            "g-1",
+            parse(
+                r#"{"name":"fixed","kind":"keyword","patterns":[{"kind":"literal","value":"AKIA"}]}"#,
+            ),
+        ));
+        fixed.guardrail_attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(r#"{"guardrail_id":"g-1","scope_type":"env","priority":0}"#),
+        ));
+        handle.store(fixed);
+        let new_version = handle.version();
+        status.record_load(aisix_core::LoadObservation {
+            source_hash: "new".into(),
+            observed_revision: Some(2),
+            applied: Some(aisix_core::AppliedSnapshot {
+                config_hash: "new".into(),
+                revision: Some(2),
+                resource_counts: [("guardrails".to_string(), 1)].into_iter().collect(),
+            }),
+            rejected: vec![],
+            partially_compatible: vec![],
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: false,
+            wholly_rejected: false,
+        });
+
+        // Hold the old result until the newer build has installed, then let
+        // it race the cache/status publication in the previously-buggy order.
+        let (release_old, wait_old) = std::sync::mpsc::channel();
+        let old_live = Arc::clone(&live);
+        let old = std::thread::spawn(move || {
+            wait_old.recv().unwrap();
+            old_live.try_install_index(
+                old_version,
+                GuardrailIndex::from_entries(Vec::new()),
+                vec![GuardrailBuildRejection {
+                    id: "g-1".into(),
+                    reason: "obsolete rejection".into(),
+                }],
+            )
+        });
+
+        let snap = handle.load();
+        let (new_index, new_rejected) = build_index_from_snapshot_reported(
+            &snap.guardrails,
+            &snap.guardrail_attachments,
+            None,
+            &GuardrailEmbedderSlot::none(),
+        );
+        assert!(live
+            .try_install_index(new_version, new_index, new_rejected)
+            .is_some());
+        release_old.send(()).unwrap();
+        assert!(old.join().unwrap().is_none());
+
+        let view = status.view();
+        assert!(
+            view.rejected.is_empty(),
+            "obsolete result restored: {view:?}"
+        );
+        assert_eq!(view.applied.unwrap().config_hash, "new");
     }
 
     #[tokio::test]
