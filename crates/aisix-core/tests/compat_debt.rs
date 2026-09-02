@@ -70,15 +70,13 @@ use std::process::Command;
 const MARKER: &str = "COMPAT-SINCE:";
 
 /// Paths that talk ABOUT the convention and must not be scanned as if they
-/// carried real debt.
-const EXEMPT: &[&str] = &["crates/aisix-core/tests/compat_debt.rs"];
-
-/// Instruction files anywhere in the tree, not just at the root. They exist to
-/// explain conventions, so an example marker in one is prose rather than debt.
-/// Matching by name matters now that CI can skip the only job that runs this
-/// gate on a documentation-only change: a per-crate instruction file tripping
-/// the gate would land on main and fail the next unrelated author's build.
-const EXEMPT_FILE_NAMES: &[&str] = &["CLAUDE.md", "AGENTS.md"];
+/// carried real debt: this file, and the instruction files whose examples
+/// would otherwise register as live markers.
+const EXEMPT: &[&str] = &[
+    "crates/aisix-core/tests/compat_debt.rs",
+    "CLAUDE.md",
+    "AGENTS.md",
+];
 
 /// Directory names never worth walking: build output, vendored deps, VCS.
 const SKIP_DIRS: &[&str] = &[
@@ -361,13 +359,6 @@ fn scan_file(root: &Path, path: &Path, out: &mut Vec<Found>) {
         .to_string_lossy()
         .replace('\\', "/");
     if EXEMPT.contains(&rel.as_str()) {
-        return;
-    }
-    if path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| EXEMPT_FILE_NAMES.contains(&n))
-    {
         return;
     }
     if std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_FILE_BYTES) {
