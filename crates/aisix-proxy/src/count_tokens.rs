@@ -309,7 +309,12 @@ async fn screen_input(
         crate::redact::Direction::Input,
         verdict,
         &mut screening.redactions,
-        &mut Vec::new(),
+        // The segment pass's monitor-mode observations belong on the same
+        // event as the non-segment ones above. A throwaway `Vec` here made
+        // this route report fewer monitor hits than `/v1/messages` for an
+        // identical body and chain — and the scan-only channel feeds this
+        // pass more text, so the gap would have widened.
+        &mut screening.monitor_hits,
         signed_reasoning,
         |g| crate::redact::redact_anthropic_request(g, body),
     )
