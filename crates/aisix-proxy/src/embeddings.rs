@@ -15,7 +15,7 @@
 //! `"type": "not_implemented"`.
 
 use aisix_core::AppliedGuardrail;
-use aisix_gateway::{BridgeError, ChatFormat, ChatMessage, EmbeddingRequest};
+use aisix_gateway::{BridgeCapability, BridgeError, ChatFormat, ChatMessage, EmbeddingRequest};
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -540,13 +540,13 @@ async fn dispatch(
                 captured_content,
             })
         }
-        Err(BridgeError::Config(msg)) if msg.contains("does not support embeddings") => {
+        Err(e @ BridgeError::UnsupportedCapability(BridgeCapability::Embeddings)) => {
             // Provider doesn't implement embed → 501 Not Implemented.
             // Drop the reservation without committing — the request
             // didn't hit the upstream. The handler emits no usage unless a
             // guardrail decision was already recorded before this branch.
             reservation.commit_tokens(0).await;
-            let env = ErrorEnvelope::new(msg, "not_implemented");
+            let env = ErrorEnvelope::new(e.to_string(), "not_implemented");
             Ok(EmbedDispatchSuccess {
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
                 provider: provider.to_ascii_lowercase(),

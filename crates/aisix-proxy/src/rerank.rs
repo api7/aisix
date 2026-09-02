@@ -3,7 +3,9 @@
 //! This endpoint proxies rerank requests to the upstream provider.
 //! The `model` field is resolved and authorised via the same path as
 //! chat completions. The body is forwarded verbatim after rewriting the
-//! `model` field to the upstream model name.
+//! `model` field to the upstream model name, and the response is relayed
+//! verbatim except for that same field, restamped back to the name the
+//! caller addressed (`model_echo`).
 //!
 //! Providers that support rerank natively (Cohere, Voyage, etc.) should
 //! be configured with a `base_url` pointing to their rerank endpoint root.
@@ -579,6 +581,24 @@ async fn dispatch(
             );
             (None, String::new())
         }
+    };
+
+    // #1087: echo the model name the CALLER addressed, not the id the
+    // upstream answered with (the `model_echo` contract). The request half
+    // already rewrote `model` to the upstream id, so without this the
+    // response half handed that id straight back. Among the supported
+    // rerank shapes only Jina's response names a model — Cohere's and the
+    // OpenAI-compatible one carry none, so this is a no-op there rather
+    // than inventing the field. Spliced rather than re-serialised so every
+    // other byte the provider wrote (relevance-score spellings included)
+    // still reaches the caller exactly as written.
+    let body_bytes = match crate::model_echo::restamp_json_bytes(
+        &body_bytes,
+        &model_name,
+        crate::model_echo::top_level_model,
+    ) {
+        Some(rewritten) => bytes::Bytes::from(rewritten),
+        None => body_bytes,
     };
 
     // Content capture (#700): the relayed response bytes are the JSON the

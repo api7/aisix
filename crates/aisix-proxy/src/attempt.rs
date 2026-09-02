@@ -230,7 +230,11 @@ pub(crate) fn routing_error_class(err: &BridgeError) -> &'static str {
         BridgeError::UpstreamStatus { .. } => "upstream_status",
         BridgeError::UpstreamDecode(_) => "upstream_decode",
         BridgeError::UpstreamInBand { .. } => "upstream_in_band",
-        BridgeError::Config(_) => "config",
+        // Deliberately the same class `Config` reports: this variant was
+        // spelled as a `Config` until #1093, and giving it a class of its
+        // own would retire one series and create another for a failure that
+        // did not change.
+        BridgeError::Config(_) | BridgeError::UnsupportedCapability(_) => "config",
         BridgeError::InvalidUpstreamConfig(_) => "invalid_config",
         BridgeError::InvalidUpstreamCredentials(_) => "invalid_credentials",
         BridgeError::Transport(_) => "transport",
@@ -351,36 +355,23 @@ pub(crate) fn ms_since(started: Instant) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aisix_gateway::{UpstreamWire, MAX_UPSTREAM_ERROR_MESSAGE_BYTES};
+    use aisix_gateway::{BridgeCapability, UpstreamWire, MAX_UPSTREAM_ERROR_MESSAGE_BYTES};
 
-    /// The `aisix_deployment_*` families read as upstream health, so an
-    /// error raised while the request was still being assembled has to stay
-    /// out of them. Both matches are exhaustive, so a NEW variant is already
-    /// a compile error; this pins the classification of the existing ones,
-    /// which is what a well-meaning refactor would silently flip.
-    #[test]
-    fn only_errors_that_reached_the_provider_count_as_upstream_attempts() {
-        for err in [
-            BridgeError::Config("serialize request body: eof".into()),
-            BridgeError::InvalidUpstreamConfig("model.model_name missing".into()),
-            BridgeError::InvalidUpstreamCredentials("provider_key.api_key is empty".into()),
-        ] {
-            assert!(
-                !err.reached_upstream(),
-                "{err} is raised before the request is sent"
-            );
-            assert!(!attempt_reached_upstream(&ProxyError::Bridge(err)));
-        }
-
-        // A timeout or a refused connection IS upstream health: we tried to
-        // reach the provider and could not. Excluding these would hide the
-        // outage the family exists to show.
-        for err in [
+    /// One sample of every `BridgeError` variant.
+    ///
+    /// Hand-written, because the enum carries no reflection — but the
+    /// classification below is an EXHAUSTIVE match, so a variant added to
+    /// `BridgeError` stops this file compiling until someone decides which
+    /// side of the network boundary it sits on and which telemetry class it
+    /// reports. That is the decision this test exists to force. It does not
+    /// force the sample to be added here as well; the compile error is what
+    /// brings a reader to this function.
+    fn bridge_error_samples() -> Vec<BridgeError> {
+        vec![
             BridgeError::Timeout {
                 elapsed_ms: 7167,
                 cause: String::new(),
             },
-            BridgeError::Transport("connection refused".into()),
             BridgeError::upstream_status(502, "bad gateway"),
             BridgeError::UpstreamDecode("unparseable body".into()),
             BridgeError::UpstreamInBand {
@@ -389,15 +380,57 @@ mod tests {
                 parsed: None,
                 wire: UpstreamWire::Unknown,
             },
+            BridgeError::Transport("connection refused".into()),
             BridgeError::StreamAborted,
-        ] {
-            assert!(
-                err.reached_upstream(),
-                "{err} means the provider was contacted"
-            );
-            assert!(attempt_reached_upstream(&ProxyError::Bridge(err)));
-        }
+            BridgeError::Config("serialize request body: eof".into()),
+            BridgeError::UnsupportedCapability(BridgeCapability::Embeddings),
+            BridgeError::InvalidUpstreamConfig("model.model_name missing".into()),
+            BridgeError::InvalidUpstreamCredentials("provider_key.api_key is empty".into()),
+        ]
+    }
 
+    /// The `aisix_deployment_*` families read as upstream health, so an
+    /// error raised while the request was still being assembled has to stay
+    /// out of them — and `error_class` is a telemetry label, so a variant
+    /// silently minting a new series retires the one dashboards read.
+    #[test]
+    fn every_bridge_error_declares_its_side_of_the_network_and_its_class() {
+        for err in bridge_error_samples() {
+            let (reached, class) = match &err {
+                // A timeout or a refused connection IS upstream health: we
+                // tried to reach the provider and could not. Excluding these
+                // would hide the outage the family exists to show.
+                BridgeError::Timeout { .. } => (true, "timeout"),
+                BridgeError::UpstreamStatus { .. } => (true, "upstream_status"),
+                BridgeError::UpstreamDecode(_) => (true, "upstream_decode"),
+                BridgeError::UpstreamInBand { .. } => (true, "upstream_in_band"),
+                BridgeError::Transport(_) => (true, "transport"),
+                BridgeError::StreamAborted => (true, "stream_aborted"),
+                BridgeError::Config(_) => (false, "config"),
+                // Raised by the `Bridge` default impl itself, so no request
+                // was ever assembled — and it keeps the class `Config`
+                // reports, because until #1093 it WAS a `Config`. A class of
+                // its own would retire a series nothing else feeds.
+                BridgeError::UnsupportedCapability(_) => (false, "config"),
+                BridgeError::InvalidUpstreamConfig(_) => (false, "invalid_config"),
+                BridgeError::InvalidUpstreamCredentials(_) => (false, "invalid_credentials"),
+            };
+            assert_eq!(
+                routing_error_class(&err),
+                class,
+                "{err} reports the wrong attempt error_class"
+            );
+            assert_eq!(
+                err.reached_upstream(),
+                reached,
+                "{err} is on the wrong side of the network boundary"
+            );
+            assert_eq!(attempt_reached_upstream(&ProxyError::Bridge(err)), reached);
+        }
+    }
+
+    #[test]
+    fn only_errors_that_reached_the_provider_count_as_upstream_attempts() {
         // Only the output hook can fire inside a dispatch call, so the
         // provider had already answered — the attempt did reach it.
         assert!(attempt_reached_upstream(&ProxyError::ContentFiltered {

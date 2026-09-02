@@ -4,6 +4,9 @@
 //! Authenticates on connect, resolves the target Model from `?model=`,
 //! opens the provider WebSocket and relays frames bidirectionally.
 //!
+//! The relay is verbatim with one exception, `session.model` — see
+//! [`restamp_session_model_out`] and its mirror.
+//!
 //! ## Protocol scope
 //!
 //! v1 relays the **OpenAI Realtime wire protocol**: adapter `openai`
@@ -262,6 +265,9 @@ struct Prepared {
     upstream_request: tokio_tungstenite::tungstenite::handshake::client::Request,
     reservation: aisix_ratelimit::MultiReservation,
     requested_model: String,
+    /// Provider-side model id the upstream session was opened with. Only
+    /// [`restamp_session_model_in`] reads it — see there for why.
+    upstream_model: String,
     provider_label: String,
 }
 
@@ -395,6 +401,7 @@ async fn prepare(
         upstream_request,
         reservation,
         requested_model,
+        upstream_model,
         provider_label,
     })
 }
@@ -474,6 +481,85 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+/// Restamp `session.model` on its way DOWN to the client.
+///
+/// `session.created` and `session.updated` are the only Realtime server
+/// events that name a model, and they name the one the provider is running —
+/// so a caller who connected with a gateway alias was told a different name
+/// than the one they addressed. That is the `model_echo` contract, applied on
+/// this surface (#1088).
+///
+/// A frame that names no model, or that the splice scanner refuses, is
+/// returned unchanged.
+fn restamp_session_model_out(text: String, client_facing_model: &str) -> String {
+    splice_or_keep(text, |bytes| {
+        crate::model_echo::restamp_json_bytes(
+            bytes,
+            client_facing_model,
+            crate::model_echo::realtime_session_model,
+        )
+    })
+}
+
+/// Translate `session.model` back on its way UP to the provider.
+///
+/// The mirror of [`restamp_session_model_out`], and it exists because of it.
+/// Realtime clients routinely take the `session` object the gateway just
+/// handed them, change one field and send the whole thing back as
+/// `session.update` — which now carries the gateway's alias where it used to
+/// carry the provider's own id. Only that alias is translated; a client that
+/// names anything else reaches the provider with its own words, and gets the
+/// provider's own answer about it.
+///
+/// Forwarding those other values verbatim is what this relay has always
+/// done, and this function does not change it — but note what it is and is
+/// not. The upstream session's model is fixed by the connect-time query
+/// parameter, and the Realtime protocol documents `model` as one of the two
+/// fields `session.update` cannot change, so a provider that follows the
+/// spec ignores whatever a client puts there. That is the PROVIDER's
+/// guarantee, not one the gateway enforces: against a permissive
+/// OpenAI-compatible server that did honour it, a caller could name a model
+/// the gateway attributed nothing to. Pre-existing either way, and out of
+/// scope here — do not read the passthrough as a check.
+fn restamp_session_model_in(
+    text: String,
+    client_facing_model: &str,
+    upstream_model: &str,
+) -> String {
+    splice_or_keep(text, |bytes| {
+        crate::model_echo::splice_model_value(
+            bytes,
+            crate::model_echo::realtime_session_model,
+            |named| (named == client_facing_model).then(|| upstream_model.to_string()),
+        )
+    })
+}
+
+/// Run a splice over one WebSocket text frame, keeping the original string
+/// whenever there is nothing to rewrite.
+///
+/// The fast path matters: every audio delta is a text frame, and only two
+/// event types in the protocol carry a session at all.
+///
+/// It tests for a backslash as well as for the literal key, and that second
+/// condition is what makes it safe rather than merely quick. JSON lets a key
+/// be spelled with escapes, so `session` can also arrive as
+/// `\u0073ession` — the splice walker decodes keys and would match it, but a
+/// fast path looking only for the literal spelling would have skipped the
+/// frame before the walker ever saw it. An escape needs a backslash, so a
+/// frame carrying neither cannot name `session` at all, and skipping it is
+/// sound. (An audio delta is base64, which has no backslash, so the cheap
+/// case stays cheap.)
+fn splice_or_keep(text: String, splice: impl FnOnce(&[u8]) -> Option<Vec<u8>>) -> String {
+    if !text.contains("\"session\"") && !text.contains('\\') {
+        return text;
+    }
+    match splice(text.as_bytes()).map(String::from_utf8) {
+        Some(Ok(rewritten)) => rewritten,
+        _ => text,
+    }
+}
+
 /// Accumulated session usage harvested from upstream frames.
 #[derive(Default)]
 struct SessionUsage {
@@ -534,6 +620,7 @@ async fn run_session(
         upstream_request,
         reservation,
         requested_model,
+        upstream_model,
         provider_label,
     } = prep;
 
@@ -693,6 +780,7 @@ async fn run_session(
                             break;
                         }
                     }
+                    let text = restamp_session_model_in(text, &requested_model, &upstream_model);
                     if up_tx.send(TgMessage::Text(text)).await.is_err() {
                         break;
                     }
@@ -740,6 +828,7 @@ async fn run_session(
                             break;
                         }
                     }
+                    let text = restamp_session_model_out(text, &requested_model);
                     if client_tx.send(AxMessage::Text(text)).await.is_err() {
                         break;
                     }
@@ -1004,6 +1093,56 @@ fn emit_access_log(
 
 #[cfg(test)]
 mod tests {
+
+    /// JSON lets both a key and a string value be spelled with escapes, and
+    /// the two halves are handled in different places — so they are pinned
+    /// separately.
+    ///
+    /// The KEY half is the one that was broken: the splice walker decodes
+    /// keys and matches `"\u0073ession"` fine, but `splice_or_keep`'s fast
+    /// path tested only for the literal spelling and returned before the
+    /// walker ran, leaking the upstream model id.
+    #[test]
+    fn an_escaped_session_key_is_still_restamped() {
+        let frame = r#"{"type":"session.created","\u0073ession":{"model":"up-1"}}"#;
+        let out = restamp_session_model_out(frame.to_string(), "echo-realtime");
+        assert!(
+            out.contains(r#""model":"echo-realtime""#),
+            "the fast path must not skip an escaped key: {out}"
+        );
+        assert!(!out.contains("up-1"));
+    }
+
+    /// The VALUE half needs no special handling and this proves it rather
+    /// than assuming it: the walker offers the DECODED text to the rewrite
+    /// closure, so an alias spelled with escapes compares equal and is
+    /// translated back to the provider's own id.
+    #[test]
+    fn an_escaped_alias_value_still_translates_back_upstream() {
+        let frame = r#"{"type":"session.update","session":{"model":"echo-\u0072ealtime"}}"#;
+        let out = restamp_session_model_in(frame.to_string(), "echo-realtime", "gpt-realtime");
+        assert!(
+            out.contains(r#""model":"gpt-realtime""#),
+            "an escaped spelling of the alias is still the alias: {out}"
+        );
+    }
+
+    /// The fast path still skips the frames it exists for. An audio delta is
+    /// base64 with no backslash and no session, so it must come back as the
+    /// very same allocation-free string.
+    #[test]
+    fn an_audio_delta_takes_the_fast_path_unchanged() {
+        let frame =
+            r#"{"type":"response.output_audio.delta","delta":"UklGRiQAAABXQVZFZm10IBAAAAA="}"#;
+        assert_eq!(
+            restamp_session_model_out(frame.to_string(), "echo-realtime"),
+            frame
+        );
+        assert_eq!(
+            restamp_session_model_in(frame.to_string(), "echo-realtime", "gpt-realtime"),
+            frame
+        );
+    }
     use super::*;
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;

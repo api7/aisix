@@ -13,24 +13,26 @@
 //! which carries the upstream's own id. This module is where that difference
 //! is repaired, so the paths that use it cannot drift apart again.
 //!
-//! It is NOT yet the whole family. `/v1/rerank` (a Jina response carries a
-//! top-level `model`) and `/v1/realtime` (`session.created` / `session.updated`
-//! carry `session.model`) still hand the upstream id back — tracked as #1087
-//! and #1088. `/v1/fine_tuning/jobs` is deliberately outside it: its request
+//! `/v1/fine_tuning/jobs` is deliberately outside the family: its request
 //! half forwards the caller's `model` to the provider verbatim, so naming the
 //! upstream base model on both halves is the symmetric answer there (#1089).
 //!
-//! Two shapes, because a native path answers in two:
+//! Three shapes, because a native path answers in three:
 //!
 //! - [`restamp_body`] for a parsed JSON response.
-//! - [`restamp_sse_frame`] for one frame of a streamed response. It splices
-//!   the value through [`crate::json_splice`] rather than re-serialising the
-//!   frame, so every byte the gateway is not deliberately changing — key
-//!   order, whitespace, number spellings, escape choices — reaches the client
-//!   exactly as the provider wrote it.
+//! - [`restamp_json_bytes`] for a response the path relays as raw bytes
+//!   rather than re-serialising (`/v1/rerank`), and for one WebSocket text
+//!   frame (`/v1/realtime`).
+//! - [`restamp_sse_frame`] for one frame of a streamed response.
 //!
-//! Both are deliberately no-ops when the document carries no `model` at the
-//! selected path. A response that never had the field does not acquire one.
+//! The last two splice the value through [`crate::json_splice`] rather than
+//! re-serialising the document, so every byte the gateway is not deliberately
+//! changing — key order, whitespace, number spellings, escape choices —
+//! reaches the client exactly as the provider wrote it.
+//!
+//! All three are deliberately no-ops when the document carries no `model` at
+//! the selected path. A response that never had the field does not acquire
+//! one.
 
 use serde_json::Value;
 
@@ -46,6 +48,48 @@ use crate::json_splice::{self, PathSeg};
 pub(crate) fn restamp_body(body: &mut Value, client_facing_model: &str) {
     if let Some(m) = body.get_mut("model") {
         *m = Value::String(client_facing_model.to_string());
+    }
+}
+
+/// Restamp the `model` value inside a raw JSON document, byte-preserving.
+///
+/// For the paths that relay the provider's own bytes instead of
+/// re-serialising a parsed body — `/v1/rerank`, and one `/v1/realtime`
+/// WebSocket text frame. Returns `None` when the document carries no value
+/// at the selected path, or when the scanner refuses it; a `None` caller
+/// forwards the original bytes.
+pub(crate) fn restamp_json_bytes(
+    doc: &[u8],
+    client_facing_model: &str,
+    selects_model: fn(&[PathSeg]) -> bool,
+) -> Option<Vec<u8>> {
+    splice_model_value(doc, selects_model, |_| {
+        Some(client_facing_model.to_string())
+    })
+}
+
+/// Splice new text into the `model` values `selects_model` picks out.
+///
+/// The one failure policy every caller shares: the scanner fails whole
+/// rather than half-rewriting, and a document it cannot read is forwarded
+/// verbatim — leaking the upstream id on one frame is a smaller harm than
+/// corrupting the stream.
+///
+/// `rewrite` sees the value as the document wrote it, so a caller that only
+/// wants to translate ONE name back (the realtime relay's client-to-upstream
+/// direction) answers `None` for every other and leaves those bytes alone.
+pub(crate) fn splice_model_value(
+    doc: &[u8],
+    selects_model: fn(&[PathSeg]) -> bool,
+    rewrite: impl FnMut(&str) -> Option<String>,
+) -> Option<Vec<u8>> {
+    match json_splice::rewrite_string_values(doc, selects_model, rewrite) {
+        Ok(Some(bytes)) => Some(bytes),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::debug!(%error, "model restamp skipped; forwarding verbatim");
+            None
+        }
     }
 }
 
@@ -66,19 +110,7 @@ pub(crate) fn restamp_sse_frame(
     if payload == b"[DONE]" {
         return None;
     }
-    let spliced = match json_splice::rewrite_string_values(payload, selects_model, |_| {
-        Some(client_facing_model.to_string())
-    }) {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => return None,
-        Err(error) => {
-            // The scanner fails whole rather than half-rewriting. A frame it
-            // cannot read forwards verbatim: leaking the upstream id on one
-            // frame is a smaller harm than corrupting the stream.
-            tracing::debug!(%error, "sse frame model restamp skipped; forwarding verbatim");
-            return None;
-        }
-    };
+    let spliced = restamp_json_bytes(payload, client_facing_model, selects_model)?;
     let mut out = Vec::with_capacity(frame.len() - payload.len() + spliced.len());
     out.extend_from_slice(&frame[..range.start]);
     out.extend_from_slice(&spliced);
@@ -121,6 +153,34 @@ pub(crate) fn restamp_sse_buffer(
         None => out.extend_from_slice(rest),
     }
     out
+}
+
+/// A `model` at the document's TOP level.
+///
+/// The shape `/v1/rerank` answers in: among the supported rerank backends
+/// only Jina's response names a model, and it names it here. The Cohere and
+/// OpenAI-compatible shapes carry none, so the splice is a no-op on them
+/// rather than inventing the field.
+///
+/// Depth-exact, so a `model` nested inside a result or a `meta` block — not
+/// the caller-facing field — is left alone.
+pub(crate) fn top_level_model(path: &[PathSeg]) -> bool {
+    path.len() == 1 && path[0].is_key("model")
+}
+
+/// `session.model` on a Realtime `session.created` / `session.updated` frame.
+///
+/// Those two are the only Realtime server events that name a model: the
+/// Response object a `response.created` / `response.done` frame carries has
+/// no `model` field at all.
+///
+/// Depth-exact for a second reason here. A session's audio config can name a
+/// SEPARATE transcription model at
+/// `session.audio.input.transcription.model`, which the client chose itself
+/// and the gateway never aliased — restamping that one would rename a model
+/// the caller is entitled to see.
+pub(crate) fn realtime_session_model(path: &[PathSeg]) -> bool {
+    path.len() == 2 && path[0].is_key("session") && path[1].is_key("model")
 }
 
 /// `message.model` on an Anthropic `message_start` frame.
@@ -257,6 +317,99 @@ mod tests {
         );
         // Still no terminator invented for it.
         assert!(out.ends_with("}}"));
+    }
+
+    /// The first depth-1 predicate in production code (`/v1/rerank`). The
+    /// depth-2 ones above cannot exercise a top-level match, so this pins it
+    /// directly rather than assuming the walker offers a root-level value
+    /// the same way it offers a nested one.
+    #[test]
+    fn top_level_predicate_selects_the_root_model_only() {
+        // A Jina rerank response: the model is named at the root.
+        let body = br#"{"model":"jina-reranker-v2-base-multilingual","results":[{"index":0,"relevance_score":0.9}],"usage":{"total_tokens":11}}"#;
+        let out = restamp_json_bytes(body, "my-reranker", top_level_model)
+            .expect("a top-level `model` is selected");
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.starts_with(r#"{"model":"my-reranker","results":"#));
+        // Everything outside the replaced value is byte-identical, the
+        // score's spelling included.
+        assert!(out.contains(r#""relevance_score":0.9"#));
+        assert!(out.ends_with(r#""usage":{"total_tokens":11}}"#));
+
+        // A Cohere-shape response names no model — nothing to rewrite, and
+        // the field is not invented.
+        assert!(restamp_json_bytes(
+            br#"{"id":"rr-1","results":[{"index":0}]}"#,
+            "my-reranker",
+            top_level_model,
+        )
+        .is_none());
+
+        // A `model` nested anywhere deeper is NOT the caller-facing field.
+        assert!(restamp_json_bytes(
+            br#"{"results":[{"model":"aux"}],"meta":{"model":"aux"}}"#,
+            "my-reranker",
+            top_level_model,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn realtime_predicate_selects_the_session_model_only() {
+        let frame = br#"{"type":"session.created","event_id":"e1","session":{"id":"sess_1","model":"gpt-realtime-2026-01-01","output_modalities":["audio"]}}"#;
+        let out = restamp_json_bytes(frame, "my-realtime", realtime_session_model)
+            .expect("session.created carries session.model");
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains(r#""model":"my-realtime""#));
+        assert!(out.starts_with(r#"{"type":"session.created","event_id":"e1""#));
+        assert!(out.ends_with(r#""output_modalities":["audio"]}}"#));
+
+        // The transcription model the CLIENT configured sits deeper and is
+        // not an alias the gateway handed out — leave it as written.
+        assert!(restamp_json_bytes(
+            br#"{"type":"session.updated","session":{"audio":{"input":{"transcription":{"model":"gpt-4o-transcribe"}}}}}"#,
+            "my-realtime",
+            realtime_session_model,
+        )
+        .is_none());
+
+        // A `response.done` frame names no model at all.
+        assert!(restamp_json_bytes(
+            br#"{"type":"response.done","response":{"id":"resp_1","usage":{"input_tokens":9}}}"#,
+            "my-realtime",
+            realtime_session_model,
+        )
+        .is_none());
+    }
+
+    /// The reverse direction the realtime relay uses on its way UP: only the
+    /// alias the gateway handed out is translated back, so a client naming
+    /// anything else still reaches the upstream with its own words.
+    #[test]
+    fn splice_model_value_rewrites_only_what_the_closure_answers_for() {
+        let update = |model: &str| {
+            format!(
+                r#"{{"type":"session.update","session":{{"model":"{model}","voice":"alloy"}}}}"#
+            )
+        };
+        let translate = |v: &str| (v == "my-realtime").then(|| "gpt-realtime".to_string());
+
+        let out = splice_model_value(
+            update("my-realtime").as_bytes(),
+            realtime_session_model,
+            translate,
+        )
+        .expect("the alias is translated back");
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains(r#""model":"gpt-realtime""#));
+
+        assert!(splice_model_value(
+            update("some-other-model").as_bytes(),
+            realtime_session_model,
+            translate,
+        )
+        .is_none());
     }
 
     #[test]
