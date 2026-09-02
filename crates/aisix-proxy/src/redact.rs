@@ -982,12 +982,20 @@ pub fn seal_buffered_sse(buf: &mut Vec<u8>) -> SseTailSeal {
         buf.truncate(end);
         return SseTailSeal::Dropped { dropped };
     }
+    // A fragment that stopped part-way through its terminator says which
+    // style it was writing; one that stopped right after its payload says
+    // nothing, so the frames before it are the only evidence.
+    let crlf_stream = buf[..end].ends_with(b"\r\n\r\n");
     let pad: &[u8] = if buf.ends_with(b"\r\n\r") {
         b"\n"
     } else if buf.ends_with(b"\r\n") {
         b"\r\n"
+    } else if buf.ends_with(b"\r") && crlf_stream {
+        b"\n\r\n"
     } else if buf.ends_with(b"\n") {
         b"\n"
+    } else if crlf_stream {
+        b"\r\n\r\n"
     } else {
         b"\n\n"
     };
@@ -1921,6 +1929,35 @@ mod tests {
             SseTailSeal::Completed { padded: 1 }
         );
         assert_eq!(partial, b"data: {\"a\":1}\r\n\r\n");
+    }
+
+    #[test]
+    fn seal_keeps_a_crlf_stream_crlf_when_the_tail_has_no_terminator_bytes() {
+        // The fragment itself carries no clue — it stops right after its
+        // payload — so the completed frames before it settle the style.
+        let mut raw = concat!(
+            "event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"delta\":\"hello \"}\r\n\r\n",
+            "event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"delta\":\"mail a@x.com\"}",
+        )
+        .as_bytes()
+        .to_vec();
+        assert_eq!(
+            seal_buffered_sse(&mut raw),
+            SseTailSeal::Completed { padded: 4 }
+        );
+        assert!(raw.ends_with(b"\r\n\r\n"));
+        // And the sealed frame is a frame to the redactor, like the first.
+        let (out, _) = redact_responses_sse(both().as_ref(), &raw).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@x.com"), "out: {out}");
+        assert_eq!(out.matches("data:").count(), 2, "out: {out}");
+        // Half a payload line written: the CR is there, its LF is not.
+        let mut half_line = b"data: {\"a\":1}\r\n\r\ndata: {\"b\":2}\r".to_vec();
+        assert_eq!(
+            seal_buffered_sse(&mut half_line),
+            SseTailSeal::Completed { padded: 3 }
+        );
+        assert!(half_line.ends_with(b"data: {\"b\":2}\r\n\r\n"));
     }
 
     #[test]
