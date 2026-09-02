@@ -301,12 +301,16 @@ async fn screen_input(
     let (verdict, monitor_hits) =
         aisix_guardrails::Guardrail::check_input_non_segment_observed(&chain, &chat).await;
     screening.monitor_hits = monitor_hits;
-    let verdict = crate::redact::moderate_body(
+    // Same scan-only submission as `/v1/messages` — the two routes screen
+    // the same body with the same chain and must reach the same verdict.
+    let signed_reasoning = crate::redact::anthropic_signed_reasoning_texts(body);
+    let verdict = crate::redact::moderate_body_scanning(
         &chain,
         crate::redact::Direction::Input,
         verdict,
         &mut screening.redactions,
         &mut Vec::new(),
+        signed_reasoning,
         |g| crate::redact::redact_anthropic_request(g, body),
     )
     .await;

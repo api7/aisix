@@ -614,6 +614,14 @@ pub(crate) fn upstream_header_ctx<'a>(
 /// The bug this exists for — an upstream ignoring `stream: true` and
 /// answering with a JSON document — is caught by the JSON test alone, so
 /// the stricter rule would buy nothing for it and cost the above.
+///
+/// A third sibling, `audio::is_event_stream`, is strict like the
+/// passthrough one even though `/v1/audio/transcriptions` is a typed relay
+/// that also just asked to stream. That is consistent, not an oversight:
+/// its non-stream arm relays opaque bytes rather than parsing them as
+/// JSON, so guessing wrong there costs nothing. The asymmetry here comes
+/// from the `.json()` on the other side of the branch, not from the
+/// question being asked.
 pub(crate) fn upstream_body_is_sse(headers: &axum::http::HeaderMap) -> bool {
     let essence = headers
         .get(axum::http::header::CONTENT_TYPE)

@@ -25,8 +25,10 @@ import { startMockSls, waitForSlsLog, type MockSls } from "../harness/sls-mock.j
 //  2. Reasoning replayed by the CALLER is request text: it is scanned, and a
 //     mask that reports a hit there has to actually rewrite the dispatched
 //     body. Where the block is signed by the provider (Anthropic `thinking`),
-//     a rewrite would invalidate the signature, so the request is refused
-//     instead of forwarded with the match still in it.
+//     a rewrite would invalidate the signature and refusing the replay
+//     protects nothing already disclosed, so the block is forwarded
+//     unchanged while its unsigned neighbours still mask (#1104). A block
+//     rule still fires on it.
 //  3. Reasoning the MODEL generates stays out of the output-guardrail scope,
 //     on every `/v1/messages` and `/v1/responses` shape — neither scanned nor
 //     rewritten.
@@ -151,6 +153,7 @@ describe("sse frames + reasoning scope e2e (#1103/#1104)", () => {
 
   let maskGuardrailId = "";
   let blockGuardrailId = "";
+  let segmentGuardrailId = "";
 
   beforeAll(async () => {
     etcd = new EtcdClient();
@@ -202,6 +205,34 @@ describe("sse frames + reasoning scope e2e (#1103/#1104)", () => {
       { attach: false },
     );
     blockGuardrailId = block.id;
+
+    // A `custom` script is a SEGMENT-moderating kind: it answers `Allow`
+    // from the non-segment check by design and takes its real verdict from
+    // the segment pass, which walks the redactor. That walk never offers a
+    // signed thinking block, so a block policy on any segment kind
+    // (`custom`, `bedrock`, `presidio`, `lakera`, `aliyun_ai_guardrail`)
+    // used to be bypassable by moving the text into one. Self-contained on
+    // purpose — no screening service, so the case tests our plumbing.
+    const seg = await seed.createGuardrail(
+      {
+        name: "sse-reasoning-segment-block",
+        enabled: true,
+        hook_point: "input",
+        fail_open: false,
+        kind: "custom",
+        timeout_ms: 5000,
+        script: `
+export async function checkInput(ctx) {
+  if (ctx.text.includes("${BLOCKED}")) {
+    return { action: "block", reason_code: "segment_thinking_scan" };
+  }
+  return { action: "none" };
+}
+`,
+      },
+      { attach: false },
+    );
+    segmentGuardrailId = seg.id;
 
     await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
   });
@@ -496,6 +527,53 @@ describe("sse frames + reasoning scope e2e (#1103/#1104)", () => {
     // The mask exception is for the MASK only. A block rule still reaches
     // thinking text, or the exemption would have opened a channel any
     // forbidden content could travel through.
+    expect(res.status).toBe(422);
+    expect(await res.text()).not.toContain(BLOCKED);
+    expect(upstream.receivedRequests.length).toBe(before);
+  });
+
+  test("/v1/messages: a SEGMENT-kind block rule also fires on thinking content", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return void ctx.skip();
+
+    const upstream = await upstreamWith({
+      nonStreamBody: {
+        id: "msg_segment_block",
+        type: "message",
+        role: "assistant",
+        model: "upstream-model-x",
+        content: [{ type: "text", text: "ok" }],
+        usage: { input_tokens: 3, output_tokens: 1 },
+      },
+    });
+    await seedScenario("thinking-segment-block", upstream, "anthropic", [segmentGuardrailId]);
+
+    const before = upstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify({
+        model: "thinking-segment-block",
+        max_tokens: 16,
+        messages: [
+          { role: "user", content: "benign question" },
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "thinking",
+                thinking: `I will ${BLOCKED} quietly`,
+                signature: "sig-abc",
+              },
+            ],
+          },
+          { role: "user", content: "go on" },
+        ],
+      }),
+    });
+
+    // The keyword case above cannot see this: keyword is not a segment
+    // moderator, so it took a different route to the same text. A segment
+    // kind reaches thinking only through the scan-only channel.
     expect(res.status).toBe(422);
     expect(await res.text()).not.toContain(BLOCKED);
     expect(upstream.receivedRequests.length).toBe(before);

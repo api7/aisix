@@ -662,12 +662,18 @@ async fn dispatch(
         // Segment pass: one Bedrock call over the body's text slots;
         // an ANONYMIZE disposition writes the masked text back into
         // the Anthropic-native body (#932 bedrock follow-up).
-        let verdict = crate::redact::moderate_body(
+        // Signed `thinking` blocks go in as SCAN-ONLY text: a segment
+        // kind's block rule must still fire on them, and the block itself
+        // must come back byte-identical (#1104). The walker below cannot
+        // carry them — it is also the write-back path.
+        let signed_reasoning = crate::redact::anthropic_signed_reasoning_texts(body);
+        let verdict = crate::redact::moderate_body_scanning(
             resolved_chain.as_ref(),
             crate::redact::Direction::Input,
             verdict,
             redactions_out,
             monitor_hits_out,
+            signed_reasoning,
             |g| crate::redact::redact_anthropic_request(g, body),
         )
         .await;
