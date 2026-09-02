@@ -16,7 +16,9 @@
 //! 8. Call `bridge.complete(body, ctx)` → JSON response.
 //! 9. Providers that don't support completions return 501.
 
-use aisix_gateway::{BridgeError, ChatMessage, ChatResponse, FinishReason, UsageStats};
+use aisix_gateway::{
+    BridgeCapability, BridgeError, ChatMessage, ChatResponse, FinishReason, UsageStats,
+};
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -621,10 +623,10 @@ async fn dispatch(
                 captured_content,
             })
         }
-        Err(BridgeError::Config(msg)) if msg.contains("does not support text completions") => {
+        Err(e @ BridgeError::UnsupportedCapability(BridgeCapability::TextCompletions)) => {
             // No upstream call → no tokens to count; release the reservation.
             reservation.commit_tokens(0).await;
-            let env = ErrorEnvelope::new(msg, "not_implemented");
+            let env = ErrorEnvelope::new(e.to_string(), "not_implemented");
             Ok(CompletionDispatchSuccess {
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
                 provider: provider_label,
