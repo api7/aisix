@@ -338,6 +338,22 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
     // A route that names its OWN gateway-credential slot, and one that
     // names none. `x-*` is the same pattern on both: what differs is
     // whether the route declared a slot for it to have to leave alone.
+    //
+    // Their ProviderKey strips all three `x-` names below, which is what
+    // makes the assertions mean anything: a passthrough route relays
+    // whatever it does not strip, so a header outside the strip set
+    // arrives upstream whether or not a pattern matched it.
+    const slotPk = await seed.createProviderKey({
+      display_name: "fwd-slot-pk",
+      api_key: GATEWAY_SECRET,
+      api_base: upstream.baseUrl,
+      strip_headers: [
+        "authorization",
+        GATEWAY_KEY_HEADER,
+        "x-end-user",
+        CUSTOM_HEADER,
+      ],
+    });
     await seed.createPassthroughRoute({
       name: "fwd-route-headerkey",
       path_prefix: `${ROUTE_PREFIX}-headerkey`,
@@ -345,7 +361,7 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
       auth_mode: "header_key",
       auth_header_name: GATEWAY_KEY_HEADER,
       credential_mode: "inject",
-      provider_key_id: routePk.id,
+      provider_key_id: slotPk.id,
       identity_header: "x-end-user",
       forward_client_headers: ["x-*"],
     });
@@ -357,7 +373,7 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
       anonymous_key_id: callerKey.id,
       source_cidrs: ["127.0.0.0/8", "::1/128"],
       credential_mode: "inject",
-      provider_key_id: routePk.id,
+      provider_key_id: slotPk.id,
       forward_client_headers: ["x-*"],
     });
 
@@ -496,7 +512,7 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
         "content-type": "application/json",
         [GATEWAY_KEY_HEADER]: CALLER_KEY,
         "x-end-user": "alice@example.com",
-        "x-allowed": "yes",
+        [CUSTOM_HEADER]: "recovered",
       },
       body: JSON.stringify({ model: "gpt-4o-mini", messages: [] }),
     }).then((r) => bodyOf(r, "the header_key route"));
@@ -504,9 +520,11 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
     const seen = since(mark).at(-1)!;
     expect(seen.headers[GATEWAY_KEY_HEADER]).toBeUndefined();
     expect(seen.headers["x-end-user"]).toBeUndefined();
-    // The same `x-*` still carries an ordinary header, so the two
-    // assertions above are the rule firing rather than a dead pattern.
-    expect(seen.headers["x-allowed"]).toBe("yes");
+    // The SAME `x-*` recovers a stripped header that is not a slot. All
+    // three are in this ProviderKey's strip set, so the pattern was asked
+    // about each of them — without that, a header the route never strips
+    // arrives upstream regardless and proves nothing.
+    expect(seen.headers[CUSTOM_HEADER]).toBe("recovered");
   });
 
   test("a route that names no slot of its own is unchanged", async () => {
@@ -521,14 +539,17 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
       headers: {
         "content-type": "application/json",
         [GATEWAY_KEY_HEADER]: "not-a-slot-on-this-route",
-        "x-allowed": "yes",
+        [CUSTOM_HEADER]: "recovered",
       },
       body: JSON.stringify({ model: "gpt-4o-mini", messages: [] }),
     }).then((r) => bodyOf(r, "the anonymous route"));
 
     const seen = since(mark).at(-1)!;
+    // `x-gw-key` is in this ProviderKey's strip set, so the pattern IS
+    // asked about it — and answers yes, because THIS route declared no
+    // slot. Widen the narrowing to a global list and this line fails.
     expect(seen.headers[GATEWAY_KEY_HEADER]).toBe("not-a-slot-on-this-route");
-    expect(seen.headers["x-allowed"]).toBe("yes");
+    expect(seen.headers[CUSTOM_HEADER]).toBe("recovered");
     // And the shared rule is untouched: the ProviderKey's credential
     // still rides alone.
     expect(seen.headers.authorization).toBe(`Bearer ${GATEWAY_SECRET}`);

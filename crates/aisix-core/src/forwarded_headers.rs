@@ -150,10 +150,12 @@ pub fn exact_match_only(name: &str) -> bool {
 /// A `passthrough_route` picks its own header names: under `auth_mode:
 /// header_key` the gateway credential arrives in the route's
 /// `auth_header_name`, and `identity_header` carries an end-user identity
-/// the route promises to record and strip. Nothing constrains an operator
-/// to choose a name from the shared list — the route schema in fact
-/// forbids the credential ones — so without this a `["x-*"]` pattern
-/// sweeps in exactly the header the gateway just consumed to authenticate
+/// the route promises to record and strip. The route schema forbids MOST
+/// of the shared credential names for those two fields, and the two it
+/// does allow (`api-key`, `x-goog-api-key`) are on the shared list
+/// already — so the union below is what makes the rule complete, and
+/// without it a `["x-*"]` pattern sweeps in exactly the header the
+/// gateway just consumed to authenticate
 /// the caller and relays it upstream, where it can be replayed against
 /// this gateway.
 ///

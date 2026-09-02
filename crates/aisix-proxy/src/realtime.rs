@@ -358,11 +358,23 @@ async fn prepare(
     // where a per-request mechanism goes silently missing — an operator
     // who declared that this upstream reads the caller's credential got it
     // on every other `/v1/*` endpoint and not here.
-    let forwarded = aisix_gateway::ForwardedClientHeaders::resolve(
+    let mut forwarded = aisix_gateway::ForwardedClientHeaders::resolve(
         &aisix_gateway::UpstreamHeaderContext::from_overrides(pk_entry.value.request.as_ref())
             .with_client_headers(headers)
             .with_surface_blocked(REALTIME_HANDSHAKE_SLOTS),
     );
+    // The WebSocket client renders the handshake as text and refuses a
+    // header value it cannot read as a string, failing the whole upstream
+    // connection. Dropping the entry keeps a caller who sent one obs-text
+    // byte from being unable to open a session at all — on every other
+    // face the same header is forwarded byte-for-byte.
+    let dropped = forwarded.drop_non_ascii_values();
+    if dropped > 0 {
+        tracing::debug!(
+            dropped,
+            "forwarded client headers with non-ASCII values are not sent on a realtime handshake"
+        );
+    }
 
     let mut upstream_request = match pk_entry.value.adapter {
         Some(Adapter::Openai) => {
@@ -1477,6 +1489,67 @@ mod tests {
             "",
             "the caller's own handshake negotiation must not reach the upstream"
         );
+    }
+
+    /// A header value the WebSocket client cannot render as text fails
+    /// the whole upstream connection, not just that header — so the
+    /// session must still open, minus the one entry. The same value is
+    /// forwarded byte-for-byte on every other face.
+    ///
+    /// Driven over a raw socket rather than through `connect_async`:
+    /// tungstenite renders the handshake as text on the way OUT too, so a
+    /// tungstenite client cannot send this header at all. A browser can,
+    /// and hyper accepts it inbound — which is exactly why the gateway
+    /// has to handle it.
+    #[tokio::test]
+    async fn a_non_ascii_forwarded_value_does_not_sink_the_session() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (up_addr, handshake, _frames) = spawn_upstream().await;
+        let snap = snapshot_forwarding(&format!("http://{up_addr}/v1"), &["x-*"]);
+        let (addr, _state, _rx) = serve(snap).await;
+
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Latin-1 `José` in `x-user-name`: legal in a header value, and
+        // `x-*` admits it alongside the readable `x-user-jwt`.
+        let mut req = Vec::new();
+        req.extend_from_slice(b"GET /v1/realtime?model=rt-model HTTP/1.1\r\n");
+        req.extend_from_slice(format!("Host: {addr}\r\n").as_bytes());
+        req.extend_from_slice(b"Upgrade: websocket\r\nConnection: Upgrade\r\n");
+        req.extend_from_slice(b"Sec-WebSocket-Version: 13\r\n");
+        req.extend_from_slice(b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n");
+        req.extend_from_slice(b"Authorization: Bearer sk-caller\r\n");
+        req.extend_from_slice(b"x-user-jwt: eyJraw\r\n");
+        req.extend_from_slice(b"x-user-name: Jos\xe9\r\n");
+        req.extend_from_slice(b"\r\n");
+        sock.write_all(&req).await.unwrap();
+
+        let mut buf = [0u8; 256];
+        let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf))
+            .await
+            .expect("the gateway must answer the upgrade")
+            .unwrap();
+        let status = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(
+            status.starts_with("HTTP/1.1 101"),
+            "one unreadable header must not fail the session, got: {}",
+            status.lines().next().unwrap_or_default()
+        );
+
+        // The upstream handshake happened, carrying the readable header
+        // and not the other one.
+        let (_uri, seen) = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(h) = handshake.lock().unwrap().clone() {
+                    return h;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("upstream handshake recorded");
+        assert_eq!(header_str(&seen, "x-user-jwt"), "eyJraw");
+        assert!(seen.get("x-user-name").is_none());
     }
 
     /// The credential collision, on this face as on every other: the

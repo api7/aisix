@@ -389,13 +389,11 @@ pub struct RequestOverrides {
     /// Two cases where a named header still does not reach the upstream:
     /// a `default_headers` entry of the same name wins it, since both are
     /// operator configuration and the static one is the more specific
-    /// choice; and on an AWS Bedrock provider six names are refused from
-    /// either source. Five of them (`authorization`, `x-amz-date`,
-    /// `x-amz-content-sha256`, `x-amz-security-token`, `x-amz-target`)
-    /// are SigV4 inputs the request signer derives, so a supplied value
-    /// would break the signature rather than authenticate anyone; the
-    /// sixth, `x-amzn-bedrock-accept`, selects the response wire shape
-    /// the gateway then decodes.
+    /// choice; and on an AWS Bedrock provider the request signer owns
+    /// `authorization`, `x-amz-date`, `x-amz-content-sha256`,
+    /// `x-amz-security-token`, `x-amz-target` and `x-amzn-bedrock-accept`,
+    /// and drops any supplied value. A value there would not authenticate
+    /// anyone: it either loses to the signer or breaks the signature.
     ///
     /// Naming a credential slot needs a data plane new enough to honor
     /// it; an older one refuses those names outright, so the pattern has

@@ -262,6 +262,26 @@ impl ForwardedClientHeaders {
     /// put two values on the wire and let the upstream pick between them,
     /// which on a credential slot is the #411 shape.
     ///
+    /// Drop the entries whose value is not ASCII, returning how many went.
+    ///
+    /// Only `/v1/realtime` calls this. Its WebSocket client writes the
+    /// upstream handshake as text and calls `HeaderValue::to_str` on every
+    /// header it was given, so a single obs-text byte (0x80-0xFF — legal
+    /// in a header value, and accepted on the way in) fails the whole
+    /// upstream connection rather than that one header. Every other face
+    /// hands the bytes to reqwest, which writes them out unexamined, so a
+    /// caller sending `x-user-name: José` is forwarded there and would
+    /// otherwise be unable to open a realtime session at all.
+    ///
+    /// Dropping rather than failing matches how this pipeline treats an
+    /// entry it cannot turn into a header anywhere else: the exchange goes
+    /// ahead without it.
+    pub fn drop_non_ascii_values(&mut self) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|(_, v)| v.to_str().is_ok());
+        before - self.entries.len()
+    }
+
     /// Every surface delivers through here, including the ones that
     /// resolve once and reuse across several round-trips (jobs, videos) —
     /// the precedence is a property of this type, not of each call site.
