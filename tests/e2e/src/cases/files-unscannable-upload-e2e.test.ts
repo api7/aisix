@@ -148,7 +148,12 @@ const startEnv = async (
     const res = await fetch(`${app.proxyUrl}/v1/models`, {
       headers: { authorization: `Bearer ${key}` },
     });
-    if (res.status !== 200) return false;
+    if (res.status !== 200) {
+      // Drain it: an unread body leaves the socket held, and a failure
+      // while reading should surface here rather than as a gate timeout.
+      await res.text();
+      return false;
+    }
     const body = (await res.json()) as { data?: Array<{ id?: string }> };
     return (body.data ?? []).some((m) => m.id === model);
   });
