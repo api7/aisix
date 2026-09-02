@@ -36,8 +36,9 @@ pub use config::{
     UrlRewriteRule, RESERVED_UPSTREAM_HEADERS,
 };
 pub use config_status::{
-    hash_bytes, hash_entries, AppliedSnapshot, ConfigMetricsView, ConfigState, ConfigStatus,
-    ConfigStatusView, IncomingRejection, LoadObservation, RejectedResource, SourceKind,
+    hash_bytes, hash_entries, AppliedSnapshot, ConfigMetricsView, ConfigRejectionSnapshot,
+    ConfigState, ConfigStatus, ConfigStatusView, IncomingRejection, LoadObservation,
+    RejectedResource, SourceKind,
 };
 pub use error::{
     AdminError, AdminErrorEnvelope, BootstrapError, ProxyError, ProxyErrorEnvelope, RateLimitScope,
@@ -59,6 +60,6 @@ pub use models::{
     TelemetryTags, WhenAllUnavailablePolicy, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use resource::{Resource, ResourceEntry};
-pub use similarity::{best_similarity, cosine_similarity};
+pub use similarity::{best_similarity, best_similarity_by, cosine_similarity};
 pub use snapshot::{ResourceTable, SnapshotHandle};
 pub use version::BUILD_VERSION;

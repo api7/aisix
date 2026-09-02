@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   decodedTextFor,
@@ -7,10 +7,12 @@ import {
   ProxyClient,
   SeedClient,
   spawnApp,
+  startA2aUpstream,
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
   waitForToken,
+  type A2aUpstream,
   type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -28,10 +30,11 @@ import {
 // forever while the two families that matter misbehaved — which is why
 // both are driven here by hand, streaming and not.
 //
-// One guardrail row governs every endpoint. Each endpoint gets its OWN
-// detector inside that row, matching a marker only that endpoint's
-// upstream emits, so the exported entry's `counts` key says which handler
-// produced it — no ordering assumptions, no cross-talk between cases.
+// One PII row governs every LLM endpoint. Each endpoint gets its OWN detector
+// inside that row, matching a marker only that endpoint's upstream emits, so
+// the exported entry's `counts` key says which handler produced it — no
+// ordering assumptions, no cross-talk between cases. A dedicated keyword row
+// covers the A2A block path, whose terminal event has no LLM usage envelope.
 //
 // Pinned contract, per endpoint:
 //   - the exported usage event carries an enforced-hit entry naming the
@@ -48,6 +51,8 @@ const SLS_PROJECT = "aisix-e2e-obs";
 const LOGSTORE = "enforced-hits-llm";
 
 const ROW = "llm-family-mask";
+const A2A_ROW = "a2a-input-block";
+const A2A_MARKER = "a2ablock-7f3a06";
 
 /** Per-endpoint marker + the detector name that masks it. */
 const CASES = {
@@ -55,6 +60,7 @@ const CASES = {
   chatStream: { marker: "streammark-7f3a02", detector: "chat_stream_marker" },
   messages: { marker: "msgmark-7f3a03", detector: "messages_marker" },
   responses: { marker: "respmark-7f3a04", detector: "responses_marker" },
+  rerank: { marker: "rerankmark-7f3a05", detector: "rerank_marker" },
 } as const;
 
 interface EnforcedHit {
@@ -95,6 +101,7 @@ const hitsIn = (decoded: string): EnforcedHit[] =>
 describe("guardrail enforced hits on the LLM handler family", () => {
   let app: SpawnedApp | undefined;
   let sls: MockSls | undefined;
+  let a2aUpstream: A2aUpstream | undefined;
   const upstreams: OpenAiUpstream[] = [];
   let etcdReachable = false;
 
@@ -176,7 +183,16 @@ describe("guardrail enforced hits on the LLM handler family", () => {
         usage: { input_tokens: 6, output_tokens: 4, total_tokens: 10 },
       },
     });
-    upstreams.push(chatUp, chatStreamUp, messagesUp, responsesUp);
+    // Deliberately no usage object: /v1/rerank historically dropped the
+    // entire event here, including a mask that already happened on input.
+    const rerankUp = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "rerank-enforced-5",
+        results: [],
+      },
+    });
+    upstreams.push(chatUp, chatStreamUp, messagesUp, responsesUp, rerankUp);
+    a2aUpstream = await startA2aUpstream({ wireShape: "0.3" });
 
     sls = await startMockSls();
     app = await spawnApp({
@@ -211,6 +227,20 @@ describe("guardrail enforced hits on the LLM handler family", () => {
         replacement: "***",
       })),
     });
+    await seed.createGuardrail({
+      name: A2A_ROW,
+      enabled: true,
+      hook_point: "input",
+      kind: "keyword",
+      patterns: [{ kind: "literal", value: A2A_MARKER }],
+    });
+    await seed.update("a2a_agents", randomUUID(), {
+      name: "enforced-a2a",
+      url: a2aUpstream.url,
+      protocol_version: "0.3",
+      auth_type: "none",
+      enabled: true,
+    });
 
     const mk = async (
       display: string,
@@ -236,10 +266,15 @@ describe("guardrail enforced hits on the LLM handler family", () => {
     await mk("enforced-chat-stream", "openai", "gpt-4o", chatStreamUp);
     await mk("enforced-messages", "anthropic", "claude-3-5-haiku-20241022", messagesUp);
     await mk("enforced-responses", "openai", "gpt-4o", responsesUp);
+    await mk("enforced-rerank", "openai", "rerank-model", rerankUp);
 
     // Caller key LAST (AGENTS.md gate rule): a key that authenticates
     // implies every row above is already in the snapshot.
-    await seed.createApiKey({ key_hash: sha256(KEY), allowed_models: ["*"] });
+    await seed.createApiKey({
+      key_hash: sha256(KEY),
+      allowed_models: ["*"],
+      allowed_agents: ["*"],
+    });
     // Gate on the key authenticating, not on a masked request: a gate that
     // exercises the behavior under test fails by timeout instead of by an
     // assertion, and its own traffic would be exported alongside the cases'.
@@ -250,6 +285,7 @@ describe("guardrail enforced hits on the LLM handler family", () => {
   afterAll(async () => {
     await app?.exit();
     await Promise.all(upstreams.map((u) => u.close()));
+    await a2aUpstream?.close();
     await sls?.close();
   });
 
@@ -269,6 +305,7 @@ describe("guardrail enforced hits on the LLM handler family", () => {
     model: string,
     detector: string,
     marker: string,
+    hook = "output",
   ): Promise<void> => {
     await waitForToken(sls!, LOGSTORE, model);
     const decoded = decodedTextFor(sls!, LOGSTORE);
@@ -282,7 +319,7 @@ describe("guardrail enforced hits on the LLM handler family", () => {
     ).toBeGreaterThan(0);
     for (const hit of hits) {
       expect(hit.action).toBe("masked");
-      expect(hit.hook).toBe("output");
+      expect(hit.hook).toBe(hook);
       expect(hit.counts?.[detector]).toBeGreaterThan(0);
       // A mask is not a refusal, so no cause rides along
       // (AISIX-Cloud#1365).
@@ -362,6 +399,49 @@ describe("guardrail enforced hits on the LLM handler family", () => {
     expect(body).not.toContain(CASES.responses.marker);
 
     await expectAuditedMask("enforced-responses", CASES.responses.detector, CASES.responses.marker);
+  });
+
+  test("/v1/rerank keeps an input mask when the upstream reports no usage", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+
+    const res = await post("/v1/rerank", {
+      model: "enforced-rerank",
+      query: `find ${CASES.rerank.marker}`,
+      documents: ["clean"],
+    });
+    expect(res.status).toBe(200);
+
+    await expectAuditedMask(
+      "enforced-rerank",
+      CASES.rerank.detector,
+      CASES.rerank.marker,
+      "input",
+    );
+  });
+
+  test("/a2a keeps the enforced input decision on a blocked call", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+
+    const res = await post("/a2a/enforced-a2a", {
+      jsonrpc: "2.0",
+      id: "guardrail-audit",
+      method: "message/send",
+      params: {
+        message: {
+          role: "user",
+          parts: [{ kind: "text", text: `send ${A2A_MARKER}` }],
+          messageId: "guardrail-audit-message",
+        },
+      },
+    });
+    expect(res.status).toBe(422);
+
+    await waitForToken(sls, LOGSTORE, "enforced-a2a");
+    const decoded = decodedTextFor(sls, LOGSTORE);
+    const hits = hitsIn(decoded).filter((h) => h.guardrail_name === A2A_ROW);
+    expect(hits.length).toBeGreaterThan(0);
+    expect(hits.every((h) => h.action === "blocked" && h.hook === "input")).toBe(true);
+    expect(decoded).not.toContain(A2A_MARKER);
   });
 });
 

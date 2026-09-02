@@ -78,6 +78,12 @@ struct A2aCall {
     stream: A2aStreamProgress,
     /// What was said, for token metering and opt-in content capture.
     text: A2aCallText,
+    /// Guardrails that governed this call, plus the decisions they recorded.
+    /// Kept on the call because a streamed emit may happen from `Drop`, long
+    /// after the handler frame that resolved the chain has returned.
+    applied_guardrails: Vec<aisix_core::AppliedGuardrail>,
+    guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    guardrail_audit: crate::usage_attr::GuardrailAudit,
 }
 
 /// The words exchanged on one A2A call.
@@ -274,6 +280,9 @@ async fn dispatch(
             },
             response: ResultText::default(),
         },
+        applied_guardrails: Vec::new(),
+        guardrail_monitor_hits: Vec::new(),
+        guardrail_audit: None,
     };
     // Read before the upstream is contacted, so a call that never lands still
     // records which task the caller was asking about.
@@ -284,13 +293,25 @@ async fn dispatch(
     // endpoint used to run no chain at all, so an operator's env-wide
     // policy was a no-op the moment a caller switched from `/v1/*` to
     // `/a2a/*` with the same key.
+    let guardrail_chain = state
+        .guardrail_index
+        .resolve(&aisix_guardrails::RequestContext {
+            passthrough_route_id: "",
+            model_id: "",
+            mcp_server_id: "",
+            api_key_id: &auth.entry.id,
+            team_id: auth.key().team_id.as_deref(),
+        });
+    call.applied_guardrails = guardrail_chain.applied().to_vec();
+    call.guardrail_audit = guardrail_chain.audit_log();
     if let Some(response) = guardrail_block_response(
         state,
         &snapshot,
         &auth,
         request_id,
         agent,
-        &call,
+        &guardrail_chain,
+        &mut call,
         &value,
         rpc_id.clone(),
         trace.as_ref(),
@@ -734,20 +755,12 @@ async fn guardrail_block_response(
     auth: &AuthenticatedKey,
     request_id: &str,
     agent: &str,
-    call: &A2aCall,
+    chain: &aisix_guardrails::GuardrailChain,
+    call: &mut A2aCall,
     value: &serde_json::Value,
     rpc_id: Option<serde_json::Value>,
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
 ) -> Option<Response> {
-    let chain = state
-        .guardrail_index
-        .resolve(&aisix_guardrails::RequestContext {
-            passthrough_route_id: "",
-            model_id: "",
-            mcp_server_id: "",
-            api_key_id: &auth.entry.id,
-            team_id: auth.key().team_id.as_deref(),
-        });
     if chain.is_empty() {
         return None;
     }
@@ -756,7 +769,8 @@ async fn guardrail_block_response(
         A2A_MODEL_LABEL,
         vec![aisix_gateway::ChatMessage::user(text)],
     );
-    let (verdict, _hits) = aisix_guardrails::Guardrail::check_input_observed(&chain, &chat).await;
+    let (verdict, hits) = aisix_guardrails::Guardrail::check_input_observed(chain, &chat).await;
+    call.guardrail_monitor_hits.extend(hits);
     let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
@@ -887,6 +901,10 @@ fn emit_a2a_usage(
             .map(|d| d.as_millis().min(u32::MAX as u128) as u32)
             .unwrap_or_default(),
         guardrail_blocked,
+        applied_guardrails: call.applied_guardrails.clone(),
+        guardrail_monitor_hits: call.guardrail_monitor_hits.clone(),
+        guardrail_enforced_hits: crate::usage_attr::enforced_hits(&call.guardrail_audit),
+        guardrail_scores: crate::usage_attr::guardrail_scores(&call.guardrail_audit),
         ..Default::default()
     };
     crate::usage_attr::apply_caller_identity(
@@ -1141,6 +1159,80 @@ mod tests {
         let _ = axum::body::to_bytes(response.into_body(), 1_048_576).await;
         tokio::task::yield_now().await;
         rx.try_recv().expect("a usage event is emitted")
+    }
+
+    #[tokio::test]
+    async fn a2a_event_carries_all_guardrail_attribution() {
+        use aisix_obs::UsageSink;
+
+        let agent_url = spawn_task_agent().await;
+        let snap = snapshot_with(&agent_url, true, serde_json::json!(["*"]));
+        let guardrail: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+            "name": "observe-secret",
+            "enabled": true,
+            "hook_point": "input",
+            "enforcement_mode": "monitor",
+            "kind": "keyword",
+            "patterns": [{"kind": "literal", "value": "SECRET"}]
+        }))
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1-monitor", guardrail, 1));
+        let enforcing: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+            "name": "enforce-secret",
+            "enabled": true,
+            "hook_point": "input",
+            "kind": "keyword",
+            "patterns": [{"kind": "literal", "value": "SECRET"}]
+        }))
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-2-enforce", enforcing, 1));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = ProxyState::new(
+            SnapshotHandle::new(snap),
+            Arc::new(aisix_gateway::Hub::new()),
+            &proxy_cfg(),
+        )
+        .without_cache()
+        .with_usage_sink(UsageSink::new(tx));
+        let response = build_router(state)
+            .oneshot(
+                HttpRequest::post("/a2a/invoice")
+                    .header("host", "gw.example.com")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "message/send",
+                            "params": {"message": {"role": "user", "parts": [
+                                {"kind": "text", "text": "SECRET"}
+                            ]}}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let event = rx.recv().await.expect("A2A emits one terminal event");
+        assert_eq!(event.applied_guardrails.len(), 2, "{event:?}");
+        assert_eq!(event.applied_guardrails[0].kind, "keyword");
+        assert_eq!(event.guardrail_monitor_hits.len(), 1, "{event:?}");
+        assert_eq!(
+            event.guardrail_monitor_hits[0].guardrail_name,
+            "observe-secret"
+        );
+        assert_eq!(event.guardrail_enforced_hits.len(), 1, "{event:?}");
+        assert_eq!(
+            event.guardrail_enforced_hits[0].guardrail_name,
+            "enforce-secret"
+        );
+        assert_eq!(event.guardrail_enforced_hits[0].action, "blocked");
+        assert!(event.guardrail_blocked);
     }
 
     /// An agent that reports a task's progress and then keeps the stream open

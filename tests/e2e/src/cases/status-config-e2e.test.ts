@@ -259,6 +259,80 @@ describe("status/config: etcd watch source", () => {
 
     await etcd.delete(`${app.etcdPrefix}/provider_keys/${leakId}`);
   });
+
+  test("a lazy guardrail build failure degrades status and clears after repair", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    const guardrail = await seed.createGuardrail(
+      {
+        name: "status-broken-script",
+        enabled: true,
+        hook_point: "input",
+        kind: "custom",
+        script: "export function checkInput( {",
+      },
+      { attach: false },
+    );
+    const attachment = await seed.attachGuardrailToEnv(guardrail.id);
+
+    await waitConfigPropagation(async () => {
+      const cfg = await getStatusConfig(app!);
+      return (
+        cfg.applied?.resource_counts.guardrails === 1 &&
+        cfg.applied?.resource_counts.guardrail_attachments === 1
+      );
+    });
+
+    // Index construction is lazy: the first request after the snapshot swap
+    // is what discovers the script the loader deliberately accepted cannot
+    // compile.
+    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    expect(
+      (
+        await proxy.chat({
+          model: "status-model",
+          messages: [{ role: "user", content: "trigger the lazy build" }],
+        })
+      ).status,
+    ).toBe(200);
+
+    let cfg: StatusConfig | undefined;
+    await waitConfigPropagation(async () => {
+      cfg = await getStatusConfig(app!);
+      return cfg.rejected.some((r) => r.resource_id === guardrail.id);
+    });
+    const rejection = cfg!.rejected.find((r) => r.resource_id === guardrail.id)!;
+    expect(cfg!.state).toBe("degraded");
+    expect(rejection.resource_kind).toBe("guardrails");
+    expect(rejection.last_error_kind).toBe("schema_failed");
+    expect(rejection.last_error).toContain("status-broken-script");
+
+    const text = await scrape(app);
+    expect(text).toMatch(/aisix_config_rejected_resources\{kind="guardrails"\} 1/);
+
+    await seed.update("guardrails", guardrail.id, {
+      name: "status-fixed-guardrail",
+      enabled: true,
+      hook_point: "input",
+      kind: "keyword",
+      patterns: [{ kind: "literal", value: "NEVER-MATCH" }],
+    });
+    await waitConfigPropagation(async () => {
+      await proxy.chat({
+        model: "status-model",
+        messages: [{ role: "user", content: "trigger the repaired build" }],
+      });
+      cfg = await getStatusConfig(app!);
+      return !cfg.rejected.some((r) => r.resource_id === guardrail.id);
+    });
+    expect(cfg!.state).toBe("synced");
+
+    await seed.delete("guardrail_attachments", attachment.id);
+    await seed.delete("guardrails", guardrail.id);
+  });
 });
 
 describe("status/config: standalone file source", () => {

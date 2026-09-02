@@ -22,6 +22,7 @@
 //! Like the exact memory backend, it is per-instance — replicas do not
 //! share entries.
 
+use aisix_core::best_similarity_by;
 use aisix_gateway::ChatResponse;
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -84,27 +85,6 @@ pub trait SemanticCacheStore: Send + Sync + 'static {
     ) -> Result<(), CacheError>;
 }
 
-/// Cosine similarity of two equal-length vectors. Returns `0.0` for a
-/// length mismatch or a zero-magnitude vector so a degenerate embedding
-/// can never produce `NaN` (which would poison the max-tracking scan).
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() {
-        return 0.0;
-    }
-    let mut dot = 0.0f32;
-    let mut na = 0.0f32;
-    let mut nb = 0.0f32;
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
-    if na == 0.0 || nb == 0.0 {
-        return 0.0;
-    }
-    dot / (na.sqrt() * nb.sqrt())
-}
-
 struct SemanticEntry {
     scope_fp: String,
     exact_key: String,
@@ -162,26 +142,23 @@ impl SemanticCacheStore for MemorySemanticCache {
             return Ok(None);
         }
         let now = Instant::now();
-        let mut best: Option<SemanticHit> = None;
-        for entry in &policy.entries {
-            if entry.scope_fp != scope_fp || entry.expires_at <= now {
-                continue;
-            }
-            let similarity = cosine_similarity(embedding, &entry.embedding);
+        let best = best_similarity_by(
+            embedding,
+            policy
+                .entries
+                .iter()
+                .filter(|entry| entry.scope_fp == scope_fp && entry.expires_at > now)
+                .map(|entry| (entry, entry.embedding.as_slice())),
+        );
+        Ok(best.and_then(|(entry, similarity)| {
             // `> 0.0` (not just `>= threshold`): 0.0 is the degenerate
             // fold — see the trait docs.
-            if similarity >= threshold
-                && similarity > 0.0
-                && best.as_ref().is_none_or(|b| similarity > b.similarity)
-            {
-                best = Some(SemanticHit {
-                    response: entry.response.clone(),
-                    similarity,
-                    expires_at: entry.expires_at,
-                });
-            }
-        }
-        Ok(best)
+            (similarity >= threshold && similarity > 0.0).then(|| SemanticHit {
+                response: entry.response.clone(),
+                similarity,
+                expires_at: entry.expires_at,
+            })
+        }))
     }
 
     async fn store(
@@ -554,13 +531,5 @@ mod tests {
             .unwrap();
         let got = store.lookup("p", 0, "fp", &[1.0, 0.0], 0.0).await.unwrap();
         assert!(got.is_none());
-    }
-
-    #[test]
-    fn cosine_degenerate_inputs_are_zero_not_nan() {
-        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
-        assert_eq!(cosine_similarity(&[1.0, 2.0, 3.0], &[1.0, 2.0]), 0.0);
-        assert!((cosine_similarity(&[1.0, 1.0], &[5.0, 5.0]) - 1.0).abs() < 1e-6);
-        assert!(!cosine_similarity(&[0.0], &[0.0]).is_nan());
     }
 }

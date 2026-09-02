@@ -257,10 +257,9 @@ fn run_validate(resources: &Path) -> anyhow::Result<()> {
     // Loading only proves the file parses. A guardrail row whose config
     // does not build — an invalid regex, an unknown detector, a
     // `kind: custom` script with a syntax error — is dropped from the
-    // chain with a warn line and nothing else: the gateway serves, the
-    // config status stays `synced` with an empty `rejected` list, and the
-    // screening that row describes never runs. Reporting OK for that
-    // would validate the file while missing the thing the file is for.
+    // chain while the gateway keeps serving. Runtime status reports that
+    // rejection, but this command still needs to fail synchronously rather
+    // than validate a file whose screening rule cannot run.
     let unbuildable = aisix_guardrails::unbuildable_guardrail_rows(&snapshot.guardrails, None);
     if !unbuildable.is_empty() {
         eprintln!(
@@ -1045,16 +1044,18 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     let bedrock_endpoint_url = cfg.bedrock_endpoint_url.clone().filter(|s| !s.is_empty());
     let guardrail_metrics_sink = proxy_state.metrics.clone();
     let guardrail_embedder = proxy_state.guardrail_embedder();
-    proxy_state =
-        proxy_state.with_guardrail_index(aisix_guardrails::LiveGuardrailIndex::new_with_sink(
+    proxy_state = proxy_state.with_guardrail_index(
+        aisix_guardrails::LiveGuardrailIndex::new_with_sink_and_status(
             snapshot_handle.clone(),
             bedrock_endpoint_url,
             Some(guardrail_metrics_sink),
             guardrail_embedder,
-        ));
+            Some(config_status.clone()),
+        ),
+    );
     // Heartbeat worker — spawned after proxy_state exists so it can read
     // the exporter fan-out's delivery counters. Each tick reports:
-    //   - rejected_resources: the supervisor's loader rejections (#115)
+    //   - rejected_resources: loader + runtime-build rejections (#115, #1084)
     //   - applied_revision: the highest etcd revision the supervisor has
     //     applied, so cp-api can show "propagating…" until the DP catches
     //     up with a kine write (#519 B.3)
@@ -1069,9 +1070,9 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         let supervisor = supervisor
             .as_ref()
             .expect("managed mode implies the etcd resource source (validated at boot)");
-        let supervisor_for_heartbeat = Arc::clone(supervisor);
+        let config_status_for_rejections = config_status.clone();
         h = h.with_rejection_fetcher(Arc::new(move || {
-            supervisor_for_heartbeat.recent_rejections()
+            config_status_for_rejections.rejection_snapshots()
         }));
         let watch_status = supervisor.watch_status();
         h = h.with_applied_revision_fetcher(Arc::new(move || watch_status.snapshot().revision));

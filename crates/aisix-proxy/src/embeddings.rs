@@ -176,16 +176,15 @@ pub async fn embeddings(
             // spend. Pre-#226 the embedding handler dropped the
             // event entirely, so any /v1/embeddings traffic was
             // invisible to budget enforcement and billing
-            // reconciliation. Skip when `upstream_called == false`
-            // — the dispatch's 501-NotImplemented path returns the
-            // false flag because no upstream call happened, and
-            // attributing a zero-everything event to the api_key
-            // would bloat /logs with noise. Distinguished from
+            // reconciliation. A 501 normally remains suppressed because no
+            // upstream call happened; if screening recorded a guardrail
+            // decision, preserve it in a zero-token event. Distinguished from
             // `prompt_tokens == 0` so a 200 with legitimately zero
             // tokens (empty input, provider-specific billing
-            // convention) still emits. Same emit-on-success-only
-            // convention as chat.rs.
-            if success.upstream_called {
+            // convention) still emits.
+            if success.upstream_called
+                || crate::usage_attr::has_guardrail_attribution(&audit, &success.monitor_hits)
+            {
                 emit_usage_event(
                     &state,
                     &snapshot,
@@ -206,6 +205,7 @@ pub async fn embeddings(
                     success.monitor_hits.clone(),
                     success.captured_content.as_ref(),
                     &audit,
+                    success.upstream_called,
                 );
             }
             success.response
@@ -543,10 +543,8 @@ async fn dispatch(
         Err(BridgeError::Config(msg)) if msg.contains("does not support embeddings") => {
             // Provider doesn't implement embed → 501 Not Implemented.
             // Drop the reservation without committing — the request
-            // didn't hit the upstream. No UsageEvent emission either
-            // (`upstream_called: false` → handler skips emit per the
-            // chat.rs convention that we only attribute usage on a
-            // real upstream completion).
+            // didn't hit the upstream. The handler emits no usage unless a
+            // guardrail decision was already recorded before this branch.
             reservation.commit_tokens(0).await;
             let env = ErrorEnvelope::new(msg, "not_implemented");
             Ok(EmbedDispatchSuccess {
@@ -561,8 +559,9 @@ async fn dispatch(
                 prompt_tokens: 0,
                 usage_estimated: false,
                 captured_content: None,
-                // No upstream call happened — the handler reads this
-                // and skips UsageEvent emission. Distinguished from
+                // No upstream call happened. The handler normally skips the
+                // event, except when guardrail attribution must survive.
+                // Distinguished from
                 // `prompt_tokens == 0` so a 200 that legitimately
                 // reports zero tokens still emits.
                 upstream_called: false,
@@ -673,6 +672,7 @@ fn emit_usage_event(
     content: Option<&CapturedContent>,
     // The request's enforced-guardrail audit handle (AISIX-Cloud#1330).
     audit: &crate::usage_attr::GuardrailAudit,
+    dispatched: bool,
 ) {
     // Only populate fields meaningful to /v1/embeddings; rely on
     // UsageEvent's `#[derive(Default)]` for everything else. Wire-level
@@ -742,7 +742,7 @@ fn emit_usage_event(
         content,
         client.trace.as_ref(),
         /* terminal */ true,
-        /* dispatched */ true,
+        dispatched,
     );
     let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
     crate::request_metrics::record_usage(
@@ -1634,10 +1634,9 @@ mod tests {
         // The `.expect(1)` on both mocks asserts exactly two upstream calls.
     }
 
-    /// Issue #456 (#226 family): the 501 NotImplemented path (provider
-    /// doesn't support embeddings) must NOT emit a UsageEvent — no
-    /// upstream call happened, so there's nothing to attribute. Mirrors
-    /// the canonical `completions.rs::provider_lacking_complete_returns_501_without_emit`.
+    /// A 501 without a guardrail decision stays out of usage, while a 501
+    /// reached after a mask must preserve that attribution in a zero-token
+    /// event (#1083).
     /// Triggers the path by routing /v1/embeddings at an Anthropic-backed
     /// model; `AnthropicBridge` doesn't override `Bridge::embed()` so the
     /// trait default returns `BridgeError::Config(...)` → 501. Without this
@@ -1645,7 +1644,7 @@ mod tests {
     /// `usage: None` → `Some(zero)`) on the 501 branch would silently emit
     /// a bogus zero event.
     #[tokio::test]
-    async fn provider_lacking_embed_returns_501_without_emit_issue_456() {
+    async fn provider_lacking_embed_emits_only_for_guardrail_attribution() {
         use aisix_obs::UsageSink;
         use aisix_provider_anthropic::AnthropicBridge;
 
@@ -1666,6 +1665,7 @@ mod tests {
         snap.provider_keys.insert(anthropic_pk_entry);
         snap.models.insert(anthropic_model_entry);
         snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, masking_input_guardrail());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
@@ -1677,7 +1677,7 @@ mod tests {
         let app = crate::build_router(state);
 
         let body = serde_json::json!({"model": "claude-embed", "input": "hello"});
-        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+        let resp = tower::ServiceExt::oneshot(app.clone(), make_req(body))
             .await
             .unwrap();
         assert_eq!(
@@ -1695,6 +1695,23 @@ mod tests {
                 ev.prompt_tokens, ev.status_code,
             );
         }
+
+        let body = serde_json::json!({
+            "model": "claude-embed",
+            "input": "build version: 9.9.9"
+        });
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the masked 501 must emit its guardrail attribution")
+            .expect("usage sink remains open");
+        assert_eq!(ev.status_code, 501);
+        assert_eq!(ev.prompt_tokens, 0);
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "masked");
     }
 
     /// Issue #226 audit M1: a 200 response with upstream-reported

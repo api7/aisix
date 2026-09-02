@@ -72,13 +72,7 @@
 //!
 //! An execution also reports its numbers as [`GuardrailScore`] summaries on
 //! the request's telemetry — pass or block, enforce or monitor
-//! (AISIX-Cloud#1467) — wherever the request's usage event carries
-//! guardrail attribution at all. Some surfaces do not, and they fail in
-//! DIFFERENT ways: `/a2a` emits a usage event and attaches no attribution
-//! to it (only `guardrail_blocked` survives), while `rerank` emits no
-//! usage event at all when the upstream reports no usage it can parse.
-//! Neither carries enforced hits or monitor hits either; api7/aisix#1083
-//! tracks closing all three fields together. A similarity policy is untunable without them: the
+//! (AISIX-Cloud#1467). A similarity policy is untunable without them: the
 //! verdict says whether the threshold was crossed, and an operator whose
 //! threshold is slightly too high sees only a guardrail that never fires.
 //! The score sink is the request's [`GuardrailAuditLog`], bound per request
@@ -87,7 +81,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aisix_core::cosine_similarity;
+use aisix_core::best_similarity_by;
 use aisix_core::models::{GuardrailHookPoint, GuardrailScore, SemanticConfig};
 use aisix_gateway::{ChatFormat, ChatResponse, Role};
 use async_trait::async_trait;
@@ -360,17 +354,13 @@ struct JudgedCandidate {
 /// block reason and a score entry actionable without echoing either the
 /// example or the screened text (#153).
 fn closest(candidate: &[f32], prototypes: &[Vec<f32>]) -> Option<(usize, f32)> {
-    let mut best: Option<(usize, f32)> = None;
-    for (i, prototype) in prototypes.iter().enumerate() {
-        let score = cosine_similarity(candidate, prototype);
-        if !score.is_finite() {
-            continue;
-        }
-        if best.is_none_or(|(_, current)| score > current) {
-            best = Some((i, score));
-        }
-    }
-    best
+    best_similarity_by(
+        candidate,
+        prototypes
+            .iter()
+            .enumerate()
+            .map(|(index, prototype)| (index, prototype.as_slice())),
+    )
 }
 
 /// The texts the INPUT hook screens: one per message, NEWEST FIRST,

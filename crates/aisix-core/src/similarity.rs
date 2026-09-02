@@ -50,14 +50,27 @@ pub fn best_similarity<'a>(
     probe: &[f32],
     prototypes: impl IntoIterator<Item = &'a [f32]>,
 ) -> Option<f32> {
-    let mut best: Option<f32> = None;
-    for p in prototypes {
+    best_similarity_by(probe, prototypes.into_iter().map(|p| ((), p))).map(|(_, score)| score)
+}
+
+/// The item whose vector has the highest cosine similarity to `probe`.
+///
+/// This is the keyed form of [`best_similarity`]: callers that need the
+/// winning prototype's identity (rather than only its score) carry any key
+/// alongside each vector. The key can be an index, a cache-entry reference,
+/// or another cheap handle; no temporary vector is required.
+pub fn best_similarity_by<'a, K>(
+    probe: &[f32],
+    prototypes: impl IntoIterator<Item = (K, &'a [f32])>,
+) -> Option<(K, f32)> {
+    let mut best: Option<(K, f32)> = None;
+    for (key, p) in prototypes {
         let score = cosine_similarity(probe, p);
         if !score.is_finite() {
             continue;
         }
-        if best.is_none_or(|current| score > current) {
-            best = Some(score);
+        if best.as_ref().is_none_or(|(_, current)| score > *current) {
+            best = Some((key, score));
         }
     }
     best
@@ -96,6 +109,21 @@ mod tests {
         let protos = vec![vec![0.0, 1.0], vec![1.0, 0.0]];
         let got = best_similarity(&[1.0, 0.0], slices(&protos)).unwrap();
         assert!((got - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn best_similarity_by_returns_the_closest_key() {
+        let protos = [vec![0.0, 1.0], vec![1.0, 0.0]];
+        let got = best_similarity_by(
+            &[1.0, 0.0],
+            protos
+                .iter()
+                .enumerate()
+                .map(|(index, vector)| (index, vector.as_slice())),
+        )
+        .unwrap();
+        assert_eq!(got.0, 1);
+        assert!((got.1 - 1.0).abs() < 1e-6);
     }
 
     #[test]

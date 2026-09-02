@@ -905,9 +905,8 @@ pub struct CustomConfig {
     /// A script that is present but blank or does not compile passes the
     /// schema — `minLength` counts characters, and a whitespace-only value
     /// is one — and is refused when the chain is built instead. `aisix
-    /// validate` reports that and exits non-zero; on a serving gateway it
-    /// is a warn line and the config status stays `synced`
-    /// (api7/aisix#1084).
+    /// validate` reports that and exits non-zero; a serving gateway reports
+    /// the runtime rejection through config status (api7/aisix#1084).
     #[serde(default)]
     #[schemars(length(min = 1))]
     pub script: String,

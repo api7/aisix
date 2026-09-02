@@ -49,9 +49,8 @@ struct ImageDispatchSuccess {
     /// event so the request is visible + attributed.
     usage: Option<(u32, u32)>,
     /// `false` on the 501 NotImplemented branch (provider lacks image
-    /// generation → no upstream call). Gates emission so the
-    /// not-implemented path stays out of /logs (same convention as
-    /// embeddings #402).
+    /// generation → no upstream call). That path emits only when screening
+    /// already produced guardrail attribution.
     upstream_called: bool,
     /// Per-detector PII mask counts (#932/#696) applied to the prompt.
     /// Attached to the emitted UsageEvent. Empty = no redaction.
@@ -154,13 +153,15 @@ pub async fn image_generations(
             // Issue #407: emit UsageEvent so cp-api's budget ledger +
             // /logs see image-generation traffic. Pre-#407 the handler
             // dropped the event entirely. Emit on a real upstream call
-            // (even zero tokens — request visible/attributed); skip the
-            // 501 NotImplemented path. Tokens come from the upstream
+            // (even zero tokens — request visible/attributed). A 501 emits
+            // only to preserve a guardrail decision. Tokens come from the upstream
             // `usage` block when present (gpt-image-1); dall-e-3 has no
             // usage block → zero tokens (precise per-image cost is a
             // documented cross-repo follow-up — needs image-count /
             // size / quality on the wire + cp-api pricing).
-            if success.upstream_called {
+            if success.upstream_called
+                || crate::usage_attr::has_guardrail_attribution(&audit, &success.monitor_hits)
+            {
                 let (prompt_tokens, completion_tokens) = success.usage.unwrap_or((0, 0));
                 emit_usage_event(
                     &state,
@@ -175,7 +176,7 @@ pub async fn image_generations(
                     &success.provider,
                     &success.upstream_model,
                     &success.applied_guardrails,
-                    200,
+                    status,
                     elapsed,
                     prompt_tokens,
                     completion_tokens,
@@ -184,6 +185,7 @@ pub async fn image_generations(
                     success.monitor_hits.clone(),
                     success.captured_content.as_ref(),
                     &audit,
+                    success.upstream_called,
                 );
             }
             success.response
@@ -451,7 +453,8 @@ async fn dispatch(
                 upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 usage: None,
-                // No upstream call happened → handler skips emit.
+                // No upstream call happened; only guardrail attribution can
+                // make the handler emit this branch.
                 upstream_called: false,
                 redactions,
                 monitor_hits: monitor_hits.clone(),
@@ -531,6 +534,7 @@ pub(crate) fn emit_usage_event(
     // The request's enforced-guardrail audit handle (AISIX-Cloud#1330).
     // Shared by both image surfaces, like the rest of this emit.
     audit: &crate::usage_attr::GuardrailAudit,
+    dispatched: bool,
 ) {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -573,7 +577,7 @@ pub(crate) fn emit_usage_event(
         content,
         client.trace.as_ref(),
         /* terminal */ true,
-        /* dispatched */ true,
+        dispatched,
     );
     let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
     crate::request_metrics::record_usage(
@@ -1057,11 +1061,9 @@ mod tests {
         assert_eq!(event.inbound_protocol, "openai");
     }
 
-    /// Issue #456 (#226 family): the 501 NotImplemented path (resolved
-    /// bridge doesn't support image generation) must NOT emit a
-    /// UsageEvent — no upstream call happened. Mirrors
-    /// `completions.rs::provider_lacking_complete_returns_501_without_emit`
-    /// and the embeddings sibling. Unlike those, /v1/images/generations
+    /// A 501 without a guardrail decision stays out of usage, while a 501
+    /// reached after a mask must preserve that attribution in a zero-token
+    /// event (#1083). Unlike completions and embeddings, /v1/images/generations
     /// rejects non-OpenAI providers with 400 *before* dispatch (see
     /// `non_openai_provider_returns_400_invalid_request`) and the real
     /// `OpenAiBridge` overrides `generate_image`, so the only way to reach
@@ -1069,7 +1071,7 @@ mod tests {
     /// leaves `Bridge::generate_image` at the trait default. We register a
     /// minimal stub under the "openai" key to exercise exactly that.
     #[tokio::test]
-    async fn resolved_bridge_lacking_generate_image_returns_501_without_emit_issue_456() {
+    async fn image_501_emits_only_for_guardrail_attribution() {
         use aisix_gateway::{
             Bridge, BridgeContext, BridgeError, ChatChunkStream, ChatFormat, ChatMessage,
             ChatResponse, FinishReason, UsageStats,
@@ -1112,6 +1114,7 @@ mod tests {
         let snap = new_snap("https://api.openai.com");
         snap.models.insert(model_entry("stub-image"));
         snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, masking_input_guardrail());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
@@ -1123,7 +1126,7 @@ mod tests {
         let app = crate::build_router(state);
 
         let body = serde_json::json!({"model": "stub-image", "prompt": "a cat", "n": 1});
-        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+        let resp = tower::ServiceExt::oneshot(app.clone(), make_req(body))
             .await
             .unwrap();
         assert_eq!(
@@ -1141,6 +1144,24 @@ mod tests {
                 ev.prompt_tokens, ev.status_code,
             );
         }
+
+        let body = serde_json::json!({
+            "model": "stub-image",
+            "prompt": "draw version: 9.9.9",
+            "n": 1
+        });
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the masked 501 must emit its guardrail attribution")
+            .expect("usage sink remains open");
+        assert_eq!(ev.status_code, 501);
+        assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "masked");
     }
 
     /// AISIX-Cloud#867 parity: a successful /v1/images/generations 200 must

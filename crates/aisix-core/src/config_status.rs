@@ -11,10 +11,10 @@
 //! metrics/status listener to serve `GET /status/config`, `GET /status/ready`,
 //! and the `aisix_config_*` Prometheus series.
 //!
-//! Nothing here does new *tracking* — the etcd supervisor and the file source
-//! already collect rejected entries and revisions. This module gives that
-//! internal state one canonical, source-agnostic shape and derives the
-//! reported [`ConfigState`] from it.
+//! The etcd supervisor and file source supply loader observations. Runtime
+//! builders may add rejections for rows that passed the lenient loader but
+//! could not materialise; those are retained independently so a subsequent
+//! loader observation cannot erase a still-broken runtime row.
 //!
 //! ## Reported state
 //!
@@ -172,6 +172,20 @@ pub struct IncomingRejection {
     pub serving_stale_since: Option<DateTime<Utc>>,
 }
 
+/// A retained rejection snapshot for consumers outside the status HTTP
+/// surface, notably the managed-mode heartbeat.
+///
+/// `key` is the load path's stable identity. Loader rejections use the source
+/// key; runtime builders use a synthetic, stable identity for the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigRejectionSnapshot {
+    pub key: String,
+    pub kind: String,
+    pub error: String,
+    pub timestamp_unix_secs: u64,
+    pub stale_serving_since_unix_secs: Option<u64>,
+}
+
 /// One partially compatible observation, aggregated per (kind, field):
 /// `count` resources of `resource_kind` are currently served with `field`
 /// ignored because this gateway version does not know it — a field the
@@ -287,6 +301,11 @@ struct ConfigStatusInner {
     // Retained rejections, keyed by source identity to keep first_seen stable.
     rejected: BTreeMap<String, RetainedRejection>,
 
+    // Rows accepted by the loader but rejected by a runtime builder. Kept
+    // separate because `record_load` replaces only the loader's observation;
+    // a watch event unrelated to the broken row must not clear its signal.
+    build_rejected: BTreeMap<String, RetainedRejection>,
+
     // Partially compatible observations for the served snapshot (#871).
     // Replaced wholesale on every load; the load paths own the retention.
     partially_compatible: Vec<PartialCompatResource>,
@@ -330,6 +349,7 @@ impl ConfigStatus {
                 last_reload_success_at: None,
                 last_failure: None,
                 rejected: BTreeMap::new(),
+                build_rejected: BTreeMap::new(),
                 partially_compatible: Vec::new(),
                 partially_compatible_rows_by_kind: BTreeMap::new(),
                 stale_served_rows_by_kind: BTreeMap::new(),
@@ -390,7 +410,7 @@ impl ConfigStatus {
         inner.partially_compatible_rows_by_kind = obs.partially_compatible_rows_by_kind;
         inner.stale_served_rows_by_kind = obs.stale_served_rows_by_kind;
 
-        let clean = inner.rejected.is_empty();
+        let clean = inner.rejected.is_empty() && inner.build_rejected.is_empty();
         inner.last_reload_successful = clean;
         inner.last_reload_at = Some(now);
         if clean {
@@ -398,6 +418,7 @@ impl ConfigStatus {
         } else if let Some((kind, err)) = inner
             .rejected
             .values()
+            .chain(inner.build_rejected.values())
             .next()
             .map(|r| (r.last_error_kind.clone(), r.last_error.clone()))
         {
@@ -421,6 +442,61 @@ impl ConfigStatus {
             for reason in reasons.keys() {
                 *inner.reload_failures.entry(reason).or_insert(0) += 1;
             }
+        }
+    }
+
+    /// Replace the runtime-builder rejection set while preserving loader
+    /// rejections and each still-broken row's first-seen time.
+    ///
+    /// Called after a lazy runtime rebuild. Passing an empty vector clears
+    /// stale build failures after the offending row is fixed or removed.
+    pub fn record_build_rejections(&self, rejected: Vec<IncomingRejection>) {
+        let now = Utc::now();
+        let mut inner = self.inner.lock().unwrap();
+        let mut merged = BTreeMap::new();
+        for r in rejected {
+            let first_seen_at = inner
+                .build_rejected
+                .get(&r.identity)
+                .map(|prev| prev.first_seen_at)
+                .unwrap_or(r.seen_at);
+            merged.insert(
+                r.identity,
+                RetainedRejection {
+                    resource_kind: r.resource_kind,
+                    resource_id: r.resource_id,
+                    last_error_kind: r.last_error_kind,
+                    last_error: r.last_error,
+                    first_seen_at,
+                    last_seen_at: r.seen_at,
+                    serving_stale_since: r.serving_stale_since,
+                },
+            );
+        }
+        inner.build_rejected = merged;
+
+        // A builder is constructed before the first source observation on a
+        // cold start. Its empty result must not fabricate a successful reload.
+        let clean = inner.connected && inner.rejected.is_empty() && inner.build_rejected.is_empty();
+        inner.last_reload_successful = clean;
+        if inner.connected {
+            inner.last_reload_at = Some(now);
+            if clean {
+                inner.last_reload_success_at = Some(now);
+            }
+        }
+        if let Some((kind, err)) = inner
+            .build_rejected
+            .values()
+            .chain(inner.rejected.values())
+            .next()
+            .map(|r| (r.last_error_kind.clone(), r.last_error.clone()))
+        {
+            inner.last_failure = Some(StickyFailure {
+                at: now,
+                last_error_kind: kind,
+                last_error: err,
+            });
         }
     }
 
@@ -460,6 +536,27 @@ impl ConfigStatus {
         self.inner.lock().unwrap().config_hash.clone()
     }
 
+    /// Current loader + runtime-builder rejections for heartbeat reporting.
+    pub fn rejection_snapshots(&self) -> Vec<ConfigRejectionSnapshot> {
+        let inner = self.inner.lock().unwrap();
+        let mut out: Vec<_> = inner
+            .rejected
+            .iter()
+            .chain(inner.build_rejected.iter())
+            .map(|(key, r)| ConfigRejectionSnapshot {
+                key: key.clone(),
+                kind: r.last_error_kind.clone(),
+                error: r.last_error.clone(),
+                timestamp_unix_secs: r.last_seen_at.timestamp().max(0) as u64,
+                stale_serving_since_unix_secs: r
+                    .serving_stale_since
+                    .map(|at| at.timestamp().max(0) as u64),
+            })
+            .collect();
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        out
+    }
+
     /// Point-in-time JSON view for `GET /status/config`.
     pub fn view(&self) -> ConfigStatusView {
         self.inner.lock().unwrap().view()
@@ -484,7 +581,7 @@ impl ConfigStatusInner {
             return ConfigState::OutOfSync;
         }
         let total = self.applied_total();
-        if !self.rejected.is_empty() {
+        if !self.rejected.is_empty() || !self.build_rejected.is_empty() {
             // A whole-snapshot rejection that stored an empty snapshot still
             // reads as out-of-sync; a partial rejection is degraded.
             if total == 0 {
@@ -532,6 +629,7 @@ impl ConfigStatusInner {
         let mut rejected: Vec<RejectedResource> = self
             .rejected
             .values()
+            .chain(self.build_rejected.values())
             .map(|r| RejectedResource {
                 resource_kind: r.resource_kind.clone(),
                 resource_id: r.resource_id.clone(),
@@ -568,6 +666,9 @@ impl ConfigStatusInner {
         let etcd = self.source_kind.is_etcd();
         let mut rejected_by_kind: BTreeMap<String, usize> = BTreeMap::new();
         for r in self.rejected.values() {
+            *rejected_by_kind.entry(r.resource_kind.clone()).or_insert(0) += 1;
+        }
+        for r in self.build_rejected.values() {
             *rejected_by_kind.entry(r.resource_kind.clone()).or_insert(0) += 1;
         }
         ConfigMetricsView {
@@ -906,6 +1007,71 @@ mod tests {
         assert_eq!(v.rejected[0].resource_kind, "models");
         assert_eq!(v.rejected[0].last_error_kind, "schema_failed");
         assert!(v.last_failure.is_some());
+    }
+
+    #[test]
+    fn runtime_build_rejections_merge_with_loader_state_and_clear_independently() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        cs.record_load(LoadObservation {
+            source_hash: "src".into(),
+            observed_revision: Some(9),
+            applied: Some(applied("src", &[("guardrails", 1), ("models", 1)])),
+            rejected: vec![],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: true,
+            wholly_rejected: false,
+        });
+        cs.record_build_rejections(vec![incoming(
+            "/aisix/runtime/guardrails/g-1",
+            "guardrails",
+            "g-1",
+            "schema_failed",
+            "guardrail failed to build",
+        )]);
+        assert_eq!(cs.view().state, ConfigState::Degraded);
+        assert_eq!(
+            cs.rejection_snapshots()[0].key,
+            "/aisix/runtime/guardrails/g-1"
+        );
+
+        cs.record_load(LoadObservation {
+            source_hash: "src2".into(),
+            observed_revision: Some(10),
+            applied: Some(applied("applied2", &[("guardrails", 1), ("models", 1)])),
+            rejected: vec![incoming(
+                "/aisix/models/bad",
+                "models",
+                "bad",
+                "schema_failed",
+                "model schema failed",
+            )],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: false,
+            wholly_rejected: false,
+        });
+        assert_eq!(cs.view().rejected.len(), 2);
+
+        cs.record_build_rejections(vec![]);
+        let view = cs.view();
+        assert_eq!(view.state, ConfigState::Degraded);
+        assert_eq!(view.rejected.len(), 1);
+        assert_eq!(view.rejected[0].resource_kind, "models");
+    }
+
+    #[test]
+    fn an_initial_empty_build_does_not_fabricate_a_reload() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        cs.record_build_rejections(vec![]);
+
+        let view = cs.view();
+        assert_eq!(view.state, ConfigState::NeverLoaded);
+        assert!(view.last_reload.is_none());
+        assert!(!cs.metrics().last_reload_successful);
+        assert!(cs.metrics().last_reload_success_ts.is_none());
     }
 
     #[test]
