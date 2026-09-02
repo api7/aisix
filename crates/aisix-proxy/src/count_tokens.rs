@@ -282,7 +282,7 @@ async fn screen_input(
     }
     // Fail closed on a body the scanner cannot read — see the same arm in
     // `messages.rs`.
-    let chat = match aisix_provider_anthropic::parse_inbound_request(body) {
+    let chat = match aisix_provider_anthropic::parse_inbound_request_for_scan(body) {
         Ok(chat) => chat,
         Err(err) => {
             tracing::warn!(
@@ -326,6 +326,22 @@ async fn screen_input(
             "request",
             guardrail_name.as_deref(),
             unavailable.as_deref(),
+        ));
+    }
+    // Same refusal as `/v1/messages`: a mask that would have to rewrite a
+    // signed `thinking` block cannot be applied, so the request is refused
+    // rather than forwarded with the match still in it.
+    if crate::redact::anthropic_request_masks_signed_reasoning(&chain, body) {
+        tracing::warn!(
+            guardrail_hook = "input",
+            model = %model_name,
+            "mask-action guardrail matched inside a signed reasoning block on \
+             /v1/messages/count_tokens; refusing rather than forwarding it unmasked",
+        );
+        return Err(crate::error::guardrail_block_error(
+            "request",
+            None,
+            Some(crate::error::TAG_MASK_WRITEBACK_FAILED),
         ));
     }
     // Mask-action rules rewrite the body that is about to be forwarded.

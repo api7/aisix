@@ -122,10 +122,20 @@ pub(crate) async fn read_body_capped(resp: &mut reqwest::Response, cap: usize) -
 ///     payload is serialized so neither a function name nor an argument
 ///     can hide a banned token, matching `ChatResponse::guardrail_output_text`
 ///     and `redact_chat_format`, which already cover this surface.
+///   * `extra["reasoning_content"]` — an assistant turn's reasoning
+///     replayed in history. It is the canonical slot every vendor
+///     spelling is normalised onto, and it travels upstream verbatim
+///     through `extra` like `tool_calls` do, so a payload parked there
+///     reaches the model unread otherwise. Reasoning the model GENERATES
+///     is a different question and stays out of the output scope — this
+///     helper only ever sees REQUEST messages (`check_input`); the output
+///     collectors read `ChatResponse::guardrail_output_text`.
 ///
 /// Non-text content blocks (image/audio) are out of scope — multimodal
-/// moderation is a separate feature. Every guardrail's input/output
-/// collector goes through this so the families can't drift.
+/// moderation is a separate feature. Every guardrail's input collector
+/// goes through this so the families can't drift, and `redact_chat_format`
+/// masks exactly this list — the two must stay in lockstep or a Mask rule
+/// reports a hit on text it then forwards unmasked.
 pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
     let mut parts: Vec<String> = Vec::new();
     let content = m.content_str();
@@ -144,6 +154,11 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
     if let Some(tool_calls) = m.extra.get("tool_calls") {
         if !tool_calls.is_null() {
             parts.push(tool_calls.to_string());
+        }
+    }
+    if let Some(reasoning) = m.extra.get("reasoning_content").and_then(|v| v.as_str()) {
+        if !reasoning.is_empty() {
+            parts.push(reasoning.to_string());
         }
     }
     parts.join("\n")
@@ -967,6 +982,26 @@ mod tests {
             scanned.contains("benign cover text") && scanned.contains("hidden payload"),
             "scan must cover both content and content_blocks, got {scanned:?}"
         );
+    }
+
+    /// Same bypass class again, via `extra["reasoning_content"]`: an
+    /// assistant turn's replayed reasoning is caller-supplied text that the
+    /// bridges forward upstream verbatim, so parking a payload there must
+    /// not be a way past a deny-list the same text trips in `content`.
+    #[test]
+    fn message_scan_text_scans_replayed_reasoning_content() {
+        let msg: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": "nothing to see",
+            "reasoning_content": "hidden reasoning payload"
+        }))
+        .unwrap();
+        let scanned = message_scan_text(&msg);
+        assert!(
+            scanned.contains("hidden reasoning payload"),
+            "scan must cover replayed reasoning_content, got {scanned:?}",
+        );
+        assert!(scanned.contains("nothing to see"));
     }
 
     #[test]

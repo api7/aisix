@@ -1354,13 +1354,21 @@ pub fn build_responses_bridge_stream(
 
 /// Responses-API SSE `error` frame for an output-guardrail block. Carries the
 /// firing guardrail's name (#519 B.4b) but never the matched-pattern detail.
+///
+/// Nested under `error`, like every other SSE error this crate emits (the
+/// chat relay's `error_frame_payload`, the passthrough route's frame of
+/// the same name): a flat `{type, code, message}` was the odd one out, so
+/// a client branching on `error.type` saw nothing on this surface alone.
+/// `content_filter` moves onto `error.type`, which is the key that carries
+/// it everywhere else; the `event: error` line already names the event.
 fn guardrail_error_frame(guardrail_name: Option<&str>, unavailable: Option<&str>) -> String {
     format!(
         "event: error\ndata: {}\n\n",
         json!({
-            "type": "error",
-            "code": "content_filter",
-            "message": crate::error::guardrail_block_message("response", guardrail_name, unavailable),
+            "error": {
+                "type": "content_filter",
+                "message": crate::error::guardrail_block_message("response", guardrail_name, unavailable),
+            }
         })
     )
 }
@@ -1821,5 +1829,27 @@ mod tests {
             completed.data["response"]["incomplete_details"]["reason"],
             "max_output_tokens"
         );
+    }
+
+    /// Every SSE error this crate emits nests under an `error` object —
+    /// the chat relay's `error_frame_payload` and the passthrough route's
+    /// frame of the same name both do. This one was flat
+    /// (`{type, code, message}`), so a client branching on `error.type`
+    /// saw nothing on the `/v1/responses` bridge alone.
+    #[test]
+    fn guardrail_error_frame_nests_under_error_like_every_other_sse_error() {
+        let frame = guardrail_error_frame(Some("gr-block"), None);
+        let payload = frame
+            .strip_prefix("event: error\ndata: ")
+            .and_then(|r| r.strip_suffix("\n\n"))
+            .expect("an SSE error frame labelled `error`");
+        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+        assert!(v["error"]["message"].as_str().unwrap().contains("gr-block"));
+        // The flat keys are gone: `type` and `code` at the top level were
+        // the divergence.
+        assert!(v.get("type").is_none());
+        assert!(v.get("code").is_none());
+        assert_eq!(v.as_object().unwrap().len(), 1);
     }
 }

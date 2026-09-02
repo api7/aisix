@@ -578,6 +578,33 @@ pub(crate) fn upstream_header_ctx<'a>(
         .with_client_headers(&client.headers)
 }
 
+/// Whether the upstream's 200 response body is an SSE stream, rather than
+/// the single JSON document an upstream that ignored `stream: true` sends.
+///
+/// The relays used to pick their streaming branch from the REQUEST's
+/// `stream` flag alone, so a JSON body answering a streaming request
+/// entered the SSE hold-back: it has no frames, so nothing scanned it, and
+/// the seal pass appended a `\n\n` frame terminator to a document that is
+/// not SSE before releasing it under the upstream's own content type.
+///
+/// Only an explicitly-JSON content type is treated as non-SSE. A missing
+/// or unrecognised one stays on the streaming path — a conforming SSE
+/// upstream labels itself `text/event-stream`, and a relay that guessed
+/// "not SSE" on an unfamiliar label would buffer a real stream to a
+/// `.json()` decode error.
+pub(crate) fn upstream_body_is_sse(headers: &axum::http::HeaderMap) -> bool {
+    let essence = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    !(essence == "application/json" || essence.ends_with("+json"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1561,5 +1588,44 @@ mod tests {
             let pk = pk_with_provider_and_adapter("vendor-without-specialized", Some("openai"));
             assert!(resolve_bridge(&hub, &pk).is_none());
         }
+    }
+
+    /// The relays used to pick their streaming branch from the REQUEST's
+    /// `stream` flag alone, so a JSON body answering `stream: true` entered
+    /// the SSE hold-back — unscanned, and released with a `\n\n` appended.
+    /// Only an explicitly-JSON content type routes such a body away from
+    /// the SSE path; everything else stays on it, so an SSE upstream with
+    /// an unfamiliar label is never buffered into a `.json()` decode error.
+    #[test]
+    fn only_a_json_content_type_says_the_upstream_did_not_stream() {
+        let ct = |v: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+            h
+        };
+        for json in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "Application/JSON",
+            "application/vnd.openai+json",
+        ] {
+            assert!(!upstream_body_is_sse(&ct(json)), "{json} is not a stream");
+        }
+        for streamed in [
+            "text/event-stream",
+            "text/event-stream; charset=utf-8",
+            "application/octet-stream",
+            "text/plain",
+        ] {
+            assert!(
+                upstream_body_is_sse(&ct(streamed)),
+                "{streamed} stays on the streaming path"
+            );
+        }
+        // No content-type at all: stay on the streaming path.
+        assert!(upstream_body_is_sse(&axum::http::HeaderMap::new()));
     }
 }

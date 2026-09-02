@@ -636,7 +636,7 @@ async fn dispatch(
         // complete as the parser, and the parser lags the provider by
         // construction. `/mcp` already takes this arm on an unscannable
         // body; this is the same rule on the LLM side.
-        let chat = match aisix_provider_anthropic::parse_inbound_request(body) {
+        let chat = match aisix_provider_anthropic::parse_inbound_request_for_scan(body) {
             Ok(chat) => chat,
             Err(err) => {
                 tracing::warn!(
@@ -693,6 +693,25 @@ async fn dispatch(
                 "request",
                 guardrail_name.as_deref(),
                 unavailable.as_deref(),
+            )
+            .into());
+        }
+        // A Mask-action hit inside a signed `thinking` / `redacted_thinking`
+        // block has nowhere to go: rewriting the block invalidates the
+        // provider signature and the upstream rejects the replayed turn.
+        // The scan reads those blocks, so leaving the match in place would
+        // be a reported-but-unmasked dispatch — refuse instead.
+        if crate::redact::anthropic_request_masks_signed_reasoning(resolved_chain.as_ref(), body) {
+            tracing::warn!(
+                guardrail_hook = "input",
+                model = %model_name,
+                "mask-action guardrail matched inside a signed reasoning block on \
+                 /v1/messages; refusing rather than forwarding it unmasked",
+            );
+            return Err(crate::error::guardrail_block_error(
+                "request",
+                None,
+                Some(crate::error::TAG_MASK_WRITEBACK_FAILED),
             )
             .into());
         }
@@ -1306,6 +1325,16 @@ async fn anthropic_passthrough_dispatch(
         .unwrap_or("unknown")
         .to_ascii_lowercase();
 
+    // Pick the relay branch from what the upstream ACTUALLY sent, not from
+    // the request's `stream` flag. An upstream that ignores `stream: true`
+    // and answers with one JSON document used to enter the SSE branch
+    // anyway: with no frames in it nothing scanned it, and the hold-back's
+    // seal pass appended a `\n\n` frame terminator to a body that is not
+    // SSE before releasing it under the upstream's own content type. Such
+    // a response belongs on the non-streaming buffered scan+mask path
+    // below, which reads it as the JSON document it is.
+    let is_stream = is_stream && crate::dispatch::upstream_body_is_sse(upstream_resp.headers());
+
     if is_stream {
         // For SSE streaming: pass through the response body as a streaming
         // `text/event-stream` response.
@@ -1653,8 +1682,27 @@ async fn anthropic_passthrough_dispatch(
         let mut output_monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
         if !resolved_chain.is_empty() {
             if let Some(content) = json_body.get("content").and_then(|v| v.as_array()) {
+                // Generated reasoning is out of the output-guardrail scope
+                // on every other `/v1/messages` path — the streaming
+                // accumulator reads `delta.text` and `delta.partial_json`
+                // and never `delta.thinking`. The raw-array dump below was
+                // added for tool-use arguments and swept thinking text in
+                // with them, so the buffered path scanned more than the
+                // streaming one for the same response. Drop the two
+                // reasoning block types from the dump; everything the dump
+                // exists for (`tool_use` name/input, and any block shape
+                // the loop above cannot name) is untouched.
+                let scannable: Vec<&Value> = content
+                    .iter()
+                    .filter(|b| {
+                        !matches!(
+                            b.get("type").and_then(|v| v.as_str()),
+                            Some("thinking") | Some("redacted_thinking")
+                        )
+                    })
+                    .collect();
                 let mut out_text = String::new();
-                for block in content {
+                for block in &scannable {
                     if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
                         if !out_text.is_empty() {
                             out_text.push('\n');
@@ -1665,7 +1713,7 @@ async fn anthropic_passthrough_dispatch(
                 if !out_text.is_empty() {
                     out_text.push('\n');
                 }
-                out_text.push_str(&Value::Array(content.clone()).to_string());
+                out_text.push_str(&serde_json::to_string(&scannable).unwrap_or_default());
 
                 let synth = aisix_gateway::ChatResponse {
                     id: String::new(),
@@ -2702,13 +2750,21 @@ fn build_anthropic_sse_stream(
 /// with serde_json so an operator-supplied guardrail name is JSON-escaped
 /// correctly; the message carries the firing guardrail's name (#519 B.4b)
 /// but never the matched-pattern detail (#153).
+///
+/// `error.type` is `invalid_request_error`, the same value the HTTP 422
+/// path renders for this refusal (`anthropic_kind_from_status`). It has to
+/// be: Anthropic's `error.type` is a closed enum in its SDK and carries no
+/// `content_filter` member, so emitting one made the streaming half of
+/// this endpoint disagree with the buffered half AND fail the SDK's typed
+/// parse. No `code` field either — the Anthropic envelope has none, and
+/// the caller reads WHICH guardrail fired from the message.
 fn guardrail_block_frame(guardrail_name: Option<&str>, unavailable: Option<&str>) -> String {
     format!(
         "event: error\ndata: {}\n\n",
         serde_json::json!({
             "type": "error",
             "error": {
-                "type": "content_filter",
+                "type": "invalid_request_error",
                 "message": crate::error::guardrail_block_message("response", guardrail_name, unavailable),
             }
         })
@@ -3430,19 +3486,18 @@ pub(crate) fn find_frame_end(buf: &[u8]) -> Option<usize> {
     None
 }
 
-/// Extract the `data:` payload bytes from one SSE frame. Returns the
-/// JSON slice (after `data:` and an optional leading space), or `None`
-/// if the frame has no data line. Only the first data line is read —
-/// Anthropic emits single-line data for the frames we care about.
-/// Shared with the `/v1/responses` streaming usage parser (#808).
-pub(crate) fn extract_sse_data_line(frame: &[u8]) -> Option<&[u8]> {
-    extract_sse_data_range(frame).map(|r| &frame[r])
-}
-
-/// The same payload as [`extract_sse_data_line`], as a range into
-/// `frame`. The restamp path needs the offsets so it can splice a value
-/// back into the frame without rebuilding the bytes around it
-/// (`model_echo::restamp_sse_frame`).
+/// The FIRST `data:` line of one SSE frame, as a range into `frame`
+/// (after `data:` and an optional leading space), or `None` if the frame
+/// has no data line.
+///
+/// First line only, and deliberately so: the restamp path is the one
+/// consumer, and it needs byte offsets so it can splice a value back into
+/// the frame without rebuilding the bytes around it
+/// (`model_echo::restamp_sse_frame`) — offsets a payload joined across
+/// several lines cannot supply. Every consumer that only READS a frame
+/// takes `redact::frame_payload` instead, which is the whole payload
+/// (#1100). A multi-`data:`-line frame therefore goes un-restamped rather
+/// than half-restamped; that gap is tracked in #1105.
 pub(crate) fn extract_sse_data_range(frame: &[u8]) -> Option<std::ops::Range<usize>> {
     let mut offset = 0usize;
     for line in frame.split(|&b| b == b'\n') {
@@ -5560,13 +5615,10 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     /// `extract_sse_data_range` is what the model restamp splices into, so
     /// an off-by-one in its arithmetic would rewrite the wrong bytes. The
     /// range is checked against the payload it must select on every framing
-    /// variant a provider is allowed to emit. The `extract_sse_data_line`
-    /// assertion beside it is a cheap guard for the day someone gives that
-    /// accessor its own implementation again — today it delegates here, so
-    /// only the `want` table can actually catch a regression.
+    /// variant a provider is allowed to emit.
     #[test]
     fn extract_sse_data_range_selects_exactly_the_payload() {
-        use super::{extract_sse_data_line, extract_sse_data_range};
+        use super::extract_sse_data_range;
 
         for (frame, want) in [
             // Canonical: labelled event, LF terminators, one space after the colon.
@@ -5600,12 +5652,6 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
                 range.clone().map(|r| &frame[r]),
                 want,
                 "range selects the payload for {:?}",
-                String::from_utf8_lossy(frame),
-            );
-            assert_eq!(
-                extract_sse_data_line(frame),
-                want,
-                "the line accessor stays equivalent for {:?}",
                 String::from_utf8_lossy(frame),
             );
         }
@@ -6608,5 +6654,34 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
             "unscanned content must not be released: {streamed}"
         );
         assert_refused_not_abandoned(&event);
+    }
+
+    /// The two halves of `/v1/messages` must render the same refusal the
+    /// same way. The HTTP 422 path maps that status to
+    /// `invalid_request_error` (`anthropic_kind_from_status`), because
+    /// Anthropic's `error.type` is a closed enum with no `content_filter`
+    /// member — so the streaming terminal frame emitting `content_filter`
+    /// both disagreed with its own sibling and failed the SDK's typed
+    /// parse. The envelope carries no `code` either; Anthropic's shape has
+    /// none.
+    #[test]
+    fn streaming_block_frame_uses_a_legal_anthropic_error_type() {
+        let frame = super::guardrail_block_frame(Some("gr-block"), None);
+        let payload = frame
+            .strip_prefix("event: error\ndata: ")
+            .and_then(|r| r.strip_suffix("\n\n"))
+            .expect("an SSE error frame labelled `error`");
+        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert!(v["error"]["message"].as_str().unwrap().contains("gr-block"));
+        assert!(v["error"].get("code").is_none());
+        assert_eq!(v["error"].as_object().unwrap().len(), 2);
+
+        // The same value the buffered half renders for this refusal.
+        assert_eq!(
+            v["error"]["type"].as_str().unwrap(),
+            crate::error::anthropic_kind_from_status(axum::http::StatusCode::UNPROCESSABLE_ENTITY),
+        );
     }
 }

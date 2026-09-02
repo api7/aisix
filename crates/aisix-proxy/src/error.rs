@@ -860,7 +860,7 @@ struct AnthropicErrorBody {
 /// (The OpenAI envelope's inner `error.type` keeps the DP-stable
 /// strings per ai-gateway#327; that contract is unchanged on
 /// `/v1/chat/completions`.)
-fn anthropic_kind_from_status(status: StatusCode) -> &'static str {
+pub(crate) fn anthropic_kind_from_status(status: StatusCode) -> &'static str {
     match status.as_u16() {
         400 | 422 => "invalid_request_error",
         401 => "authentication_error",

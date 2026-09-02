@@ -14,8 +14,8 @@ import {
 // payloads (#448 #22). Anthropic streams tool_use args as input_json_delta
 // (and the name in content_block_start), with no text_delta. The
 // passthrough end-of-stream guardrail must scan that too — a forbidden
-// token in the tool arguments must trigger a terminal content_filter
-// error, matching the non-streaming path.
+// token in the tool arguments must trigger a terminal Anthropic-shape
+// error event, matching the non-streaming path.
 
 const CALLER = "sk-msgtool-gr-caller";
 const HASH = createHash("sha256").update(CALLER).digest("hex");
@@ -78,18 +78,21 @@ describe("streaming /v1/messages tool_use output guardrail (#448)", () => {
       body: JSON.stringify({ model: "msgtool-gr", max_tokens: 64, stream: true, messages: [{ role: "user", content: "go" }] }),
     });
 
-  test("forbidden tool_use arguments in a stream trigger a content_filter error", async (ctx) => {
+  test("forbidden tool_use arguments in a stream trigger a terminal error event", async (ctx) => {
     if (!etcdReachable || !app || !upstream) {
       ctx.skip();
       return;
     }
-    await waitConfigPropagation(async () => (await stream().then((r) => r.text())).includes("content_filter"));
+    await waitConfigPropagation(async () => (await stream().then((r) => r.text())).includes("event: error"));
 
     const body = await stream().then((r) => r.text());
     // #932 / #466-class: keyword output guardrails carry the BufferFull
     // hold-back policy, so the tool_use arguments are withheld until the
     // end-of-stream scan — the matched content must NOT reach the wire.
     expect(body, "hold-back keeps the matched arguments off the wire").not.toContain(FORBIDDEN);
-    expect(body, "stream must end with a content_filter error event").toContain("content_filter");
+    // `error.type` matches the HTTP 422 half of this endpoint; Anthropic's
+    // error-type enum has no `content_filter` member.
+    expect(body, "stream must end with an SSE error event").toContain("event: error");
+    expect(body).toContain('"type":"invalid_request_error"');
   });
 });

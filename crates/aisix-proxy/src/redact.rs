@@ -347,8 +347,13 @@ pub fn redact_json_encoded(
 /// Mask the request messages of a normalised [`ChatFormat`] in place:
 /// the flat `content` string and the `text` field of typed content
 /// blocks — the same surface `check_input` scans (`message_scan_text`).
-/// Tool-call arguments replayed in history are covered too (they reach
-/// the upstream verbatim). Returns the merged counts (empty = untouched).
+/// Tool-call arguments and replayed `reasoning_content` are covered too
+/// (both reach the upstream verbatim through `extra`). Returns the merged
+/// counts (empty = untouched).
+///
+/// This list and `message_scan_text`'s must stay equal: a slot the scan
+/// reads but this does not is a Mask rule that reports a hit and then
+/// dispatches the match unmasked.
 pub fn redact_chat_format(chain: &dyn Guardrail, req: &mut ChatFormat) -> RedactionCounts {
     let mut counts = RedactionCounts::new();
     if !chain.redacts_input() {
@@ -371,6 +376,13 @@ pub fn redact_chat_format(chain: &dyn Guardrail, req: &mut ChatFormat) -> Redact
         // verbatim through `extra`, so mask them like fresh content.
         if let Some(tool_calls) = msg.extra.get_mut("tool_calls") {
             redact_tool_call_arguments(chain, Direction::Input, tool_calls, &mut counts);
+        }
+        // Same reason for replayed reasoning: `reasoning_content` is the
+        // canonical slot the provider overrides normalise every vendor
+        // spelling onto, and it rides `extra` to the upstream untouched.
+        // Nothing signs it on this wire, so masking it is safe.
+        if let Some(reasoning @ Value::String(_)) = msg.extra.get_mut("reasoning_content") {
+            apply_to_value_string(chain, Direction::Input, reasoning, &mut counts);
         }
     }
     counts
@@ -420,9 +432,59 @@ pub fn redact_anthropic_request(chain: &dyn Guardrail, body: &mut Value) -> Reda
     counts
 }
 
+/// Whether an input mask would have to rewrite a signed reasoning block
+/// to be honoured — in which case the caller must refuse the request
+/// rather than forward the match unmasked.
+///
+/// An Anthropic `thinking` / `redacted_thinking` block is signed by the
+/// provider (`signature`, and the encrypted `data` of a redacted one). Any
+/// rewrite invalidates that signature and the upstream rejects the
+/// replayed turn, so a Mask-action hit inside one cannot be applied. The
+/// scan reads these blocks (`parse_inbound_request_for_scan`), so a Block
+/// rule still blocks normally; only the Mask action has nowhere to go, and
+/// silently leaving the match in place is the fail-open this exists to
+/// close. The same rule holds for any block carrying a `signature`.
+///
+/// Rewrites nothing — it asks the chain's input redactor whether the text
+/// WOULD change.
+pub fn anthropic_request_masks_signed_reasoning(chain: &dyn Guardrail, body: &Value) -> bool {
+    if !chain.redacts_input() {
+        return false;
+    }
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return false;
+    };
+    messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|block| is_signed_reasoning_block(block))
+        .any(|block| {
+            ["thinking", "data", "text"]
+                .into_iter()
+                .filter_map(|k| block.get(k).and_then(Value::as_str))
+                .filter(|t| !t.is_empty())
+                .any(|t| redact_str(chain, Direction::Input, t).is_some_and(|r| r.text != t))
+        })
+}
+
+/// A content block whose bytes the provider signed: Anthropic's two
+/// reasoning block types, plus anything else carrying a `signature`.
+fn is_signed_reasoning_block(block: &Value) -> bool {
+    matches!(
+        block.get("type").and_then(Value::as_str),
+        Some("thinking") | Some("redacted_thinking")
+    ) || block.get("signature").and_then(Value::as_str).is_some()
+}
+
 /// Anthropic `content` is either a bare string or an array of typed
 /// blocks. Rewrites `text` blocks, `tool_result` nested content, and
 /// `tool_use` input objects; leaves image/document blocks alone.
+///
+/// `thinking` / `redacted_thinking` blocks are deliberately NOT rewritten
+/// — see [`anthropic_request_masks_signed_reasoning`], which is what the
+/// handlers consult before masking so a hit there refuses the request
+/// instead of travelling upstream unmasked.
 fn redact_anthropic_content(
     chain: &dyn Guardrail,
     dir: Direction,
@@ -535,6 +597,30 @@ fn redact_responses_item(
         Some("function_call_output") => {
             if let Some(output) = item.get_mut("output") {
                 apply_to_value_string(chain, dir, output, counts);
+            }
+        }
+        // A `reasoning` item replayed on the REQUEST. Its `content[].text`
+        // and `summary[].text` are both read by the scan
+        // (`responses::responses_item_text`), so a Mask rule matching there
+        // reported a hit, returned Allow, and dispatched the body with the
+        // match still in it — the mask has to reach the same slots the scan
+        // does. Neither slot carries a provider signature, so rewriting one
+        // is not replay-breaking; the Anthropic `thinking` block is the
+        // signed case and is refused instead (`anthropic_masks_signed_
+        // reasoning`).
+        //
+        // Input only. Reasoning the model GENERATES is out of
+        // output-guardrail scope, so this arm must not fire on
+        // `redact_responses_response`.
+        Some("reasoning") if dir == Direction::Input => {
+            for key in ["content", "summary"] {
+                if let Some(Value::Array(parts)) = item.get_mut(key) {
+                    for part in parts {
+                        if let Some(text) = part.get_mut("text") {
+                            apply_to_value_string(chain, dir, text, counts);
+                        }
+                    }
+                }
             }
         }
         _ => {}
@@ -1063,12 +1149,17 @@ impl BufferedSseSeal {
 /// that everything released was *understood*. The test here is whether a
 /// payload PARSES, because that is the most this layer can decide without
 /// knowing the route's event vocabulary. A frame carrying valid JSON of a
-/// `type` no pass models — and a 200 body that is not SSE at all, which an
-/// upstream ignoring `stream: true` will produce and which has no `data:`
-/// line to read — still travel through unread. Both predate #1100 and
-/// closing them would cut responses that reach clients today, so they are
-/// deliberately left; see #1100 for the reasoning. Do not build on a
+/// `type` no pass models still travels through unread; that predates #1100
+/// and closing it would cut responses that reach clients today, so it is
+/// deliberately left (see #1100 for the reasoning). Do not build on a
 /// stronger invariant than the one stated above.
+///
+/// A 200 body that is not SSE at all — what an upstream ignoring
+/// `stream: true` returns — used to reach here too, and was released with
+/// a `\n\n` appended to it. It no longer does: `/v1/responses` and
+/// `/v1/messages` choose their relay branch from the upstream's own
+/// content type (`dispatch::upstream_body_is_sse`), so such a body takes
+/// the non-streaming buffered scan+mask path instead of this one.
 ///
 /// Note what is NOT cut: a frame carrying several `data:` lines that join
 /// into one JSON document is a well-formed frame, and is scanned and
@@ -1636,6 +1727,174 @@ mod tests {
 
     fn both() -> Arc<dyn Guardrail> {
         mask_chain(aisix_core::models::GuardrailHookPoint::Both)
+    }
+
+    /// `message_scan_text` reads `extra["reasoning_content"]`, so this
+    /// must rewrite it or a Mask rule reports a hit on reasoning it then
+    /// forwards to the upstream verbatim. Nothing on the OpenAI wire signs
+    /// this slot, so rewriting it is safe — unlike the Anthropic `thinking`
+    /// block below.
+    #[test]
+    fn chat_format_masks_replayed_reasoning_content() {
+        let chain = both();
+        let mut req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "who?"},
+                {
+                    "role": "assistant",
+                    "content": "checking",
+                    "reasoning_content": "the user meant a@x.com I think"
+                }
+            ]
+        }))
+        .unwrap();
+        let counts = redact_chat_format(chain.as_ref(), &mut req);
+        assert_eq!(
+            req.messages[1]
+                .extra
+                .get("reasoning_content")
+                .and_then(Value::as_str),
+            Some("the user meant [EMAIL_REDACTED] I think"),
+        );
+        assert!(!counts.is_empty());
+    }
+
+    /// C1: the `/v1/responses` scan reads a `reasoning` item's
+    /// `content[].text` AND `summary[].text`, so the request mask has to
+    /// reach both — otherwise a Mask rule matching there reported a hit,
+    /// returned Allow, and dispatched the body with the match intact.
+    #[test]
+    fn responses_request_masks_reasoning_content_and_summary() {
+        let chain = both();
+        let mut body = json!({
+            "model": "m",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "ask a@x.com"}],
+                    "content": [{"type": "reasoning_text", "text": "or call 13800138000"}]
+                }
+            ]
+        });
+        let counts = redact_responses_request(chain.as_ref(), &mut body);
+        let item = &body["input"][1];
+        assert_eq!(
+            item["summary"][0]["text"].as_str(),
+            Some("ask [EMAIL_REDACTED]")
+        );
+        assert_eq!(
+            item["content"][0]["text"].as_str(),
+            Some("or call [CHINA_MOBILE_REDACTED]")
+        );
+        assert!(!counts.is_empty());
+    }
+
+    /// The mirror of the test above, and the reason the arm is gated on
+    /// `Direction::Input`: reasoning the model GENERATED is out of the
+    /// output-guardrail scope, so the response mask must leave a
+    /// `reasoning` item in `output[]` byte-identical.
+    #[test]
+    fn responses_response_leaves_generated_reasoning_alone() {
+        let chain = both();
+        let mut body = json!({
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "ask a@x.com"}],
+                    "content": [{"type": "reasoning_text", "text": "or call 13800138000"}]
+                },
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "reply to b@y.org"}]
+                }
+            ]
+        });
+        let before = body["output"][0].clone();
+        redact_responses_response(chain.as_ref(), &mut body);
+        assert_eq!(
+            body["output"][0], before,
+            "generated reasoning is untouched"
+        );
+        assert_eq!(
+            body["output"][1]["content"][0]["text"].as_str(),
+            Some("reply to [EMAIL_REDACTED]"),
+            "the message item is still masked",
+        );
+    }
+
+    /// C4: a Mask hit inside a signed Anthropic `thinking` block cannot be
+    /// honoured — rewriting invalidates the signature — so the handler has
+    /// to refuse. This is the probe it refuses on; the block itself stays
+    /// untouched by the mask pass.
+    #[test]
+    fn signed_reasoning_mask_is_reported_and_never_applied() {
+        let chain = both();
+        let mut body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "mail a@x.com", "signature": "sig-abc"},
+                    {"type": "text", "text": "sure"}
+                ]}
+            ]
+        });
+        assert!(anthropic_request_masks_signed_reasoning(
+            chain.as_ref(),
+            &body
+        ));
+        let before = body["messages"][1]["content"][0].clone();
+        redact_anthropic_request(chain.as_ref(), &mut body);
+        assert_eq!(
+            body["messages"][1]["content"][0], before,
+            "the signed block is never rewritten",
+        );
+    }
+
+    /// The probe must not fire on a body the mask can honour, or every
+    /// thinking-carrying request would 422. Two negatives: a thinking block
+    /// with nothing to mask, and a maskable literal in an ordinary `text`
+    /// block beside one.
+    #[test]
+    fn signed_reasoning_probe_is_quiet_when_the_mask_has_somewhere_to_go() {
+        let chain = both();
+        let clean = json!({
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "nothing sensitive here", "signature": "s"},
+                {"type": "text", "text": "mail a@x.com"}
+            ]}]
+        });
+        assert!(!anthropic_request_masks_signed_reasoning(
+            chain.as_ref(),
+            &clean
+        ));
+        // …and that ordinary block still masks normally.
+        let mut clean = clean;
+        redact_anthropic_request(chain.as_ref(), &mut clean);
+        assert_eq!(
+            clean["messages"][0]["content"][1]["text"].as_str(),
+            Some("mail [EMAIL_REDACTED]")
+        );
+    }
+
+    /// An output-only chain must not make the request probe fire — it has
+    /// no input redactor to ask.
+    #[test]
+    fn signed_reasoning_probe_ignores_an_output_only_chain() {
+        let out_only = mask_chain(aisix_core::models::GuardrailHookPoint::Output);
+        let body = json!({
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "mail a@x.com", "signature": "s"}
+            ]}]
+        });
+        assert!(!anthropic_request_masks_signed_reasoning(
+            out_only.as_ref(),
+            &body
+        ));
     }
 
     #[test]

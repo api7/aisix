@@ -1083,12 +1083,16 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
     // The stream committed its 200 before the scan; the block is in-band.
     expect(res.status).toBe(200);
     const text = await res.text();
-    expect(text).toContain("content_filter");
+    // The Anthropic-shape terminal error frame. `error.type` is
+    // `invalid_request_error` here, matching this endpoint's HTTP 422 half —
+    // Anthropic's error-type enum has no `content_filter` member.
+    expect(text).toContain("event: error");
+    expect(text).toContain('"type":"invalid_request_error"');
     expect(text).not.toContain("ABSOLUTELYFORBIDDENWORD");
     // As on /v1/responses above: `unscannable_body` produces the same
-    // `content_filter` frame, so name the guardrail to pin that the block
-    // came from scanning the excised frame's text and not from the buffer
-    // having been emptied.
+    // error frame, so name the guardrail to pin that the block came from
+    // scanning the excised frame's text and not from the buffer having been
+    // emptied.
     expect(text).toContain("gr-model-echo-holdback");
     expect(text).not.toContain("unscannable_body");
     // Hold-back: nothing was forwarded before the verdict, so the frames
