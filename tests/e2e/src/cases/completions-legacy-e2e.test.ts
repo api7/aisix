@@ -266,10 +266,11 @@ describe("legacy /v1/completions e2e: text-in / text-out passthrough", () => {
         error?: { message?: string; type?: string };
       };
       expect(body.error?.type).toBe("invalid_request_error");
-      // The message names the endpoint that does stream, so a caller can
-      // act on it without reading the docs.
-      // Pinned whole, not by substring: this exact sentence is what the
-      // published docs quote, so a reworded message has to come here first.
+      // The message names the endpoint that does stream, so a caller can act
+      // on it without reading the docs. Pinned whole rather than by
+      // substring: this sentence is the endpoint's refusal contract, and a
+      // substring assertion would pass through a reword that changed what a
+      // caller is told to do next.
       expect(body.error?.message).toBe(
         "request payload is invalid: `stream` is not supported on " +
           "/v1/completions; use /v1/chat/completions for streaming",

@@ -30,8 +30,9 @@
 //! changing — key order, whitespace, number spellings, escape choices —
 //! reaches the client exactly as the provider wrote it.
 //!
-//! Both are deliberately no-ops when the document carries no `model` at the
-//! selected path. A response that never had the field does not acquire one.
+//! All three are deliberately no-ops when the document carries no `model` at
+//! the selected path. A response that never had the field does not acquire
+//! one.
 
 use serde_json::Value;
 

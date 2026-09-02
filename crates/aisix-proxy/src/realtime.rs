@@ -511,8 +511,16 @@ fn restamp_session_model_out(text: String, client_facing_model: &str) -> String 
 /// names anything else reaches the provider with its own words, and gets the
 /// provider's own answer about it.
 ///
-/// This does not let a client SWITCH models mid-session: the model is fixed
-/// by the connect-time query parameter, and `session.update` cannot change it.
+/// Forwarding those other values verbatim is what this relay has always
+/// done, and this function does not change it — but note what it is and is
+/// not. The upstream session's model is fixed by the connect-time query
+/// parameter, and the Realtime protocol documents `model` as one of the two
+/// fields `session.update` cannot change, so a provider that follows the
+/// spec ignores whatever a client puts there. That is the PROVIDER's
+/// guarantee, not one the gateway enforces: against a permissive
+/// OpenAI-compatible server that did honour it, a caller could name a model
+/// the gateway attributed nothing to. Pre-existing either way, and out of
+/// scope here — do not read the passthrough as a check.
 fn restamp_session_model_in(
     text: String,
     client_facing_model: &str,
