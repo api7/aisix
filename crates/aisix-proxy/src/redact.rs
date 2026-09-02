@@ -949,8 +949,9 @@ pub enum SseTailSeal {
 /// So the fragment is resolved BEFORE either pass runs, exactly as the
 /// `/v1/messages` EOF tail is:
 ///
-/// - it parses (or carries no `data:` line at all — a comment / keepalive):
-///   complete the terminator the upstream left off. It is then an ordinary
+/// - it parses, or carries nothing a scan could read — no `data:` line at
+///   all (a comment / keepalive), an empty payload, or the `[DONE]`
+///   sentinel: complete the terminator the upstream left off. It is then an ordinary
 ///   frame, scanned and maskable like every other one, and the client gets a
 ///   frame it can actually parse.
 /// - it does not parse: nothing can extract its text, so releasing it WOULD
@@ -968,7 +969,12 @@ pub fn seal_buffered_sse(buf: &mut Vec<u8>) -> SseTailSeal {
         return SseTailSeal::Terminated;
     }
     let scannable = match frame_data_line(&buf[end..]) {
-        Some(line) => serde_json::from_str::<Value>(&line).is_ok(),
+        // An empty payload and the `[DONE]` sentinel carry no text — the
+        // scan passes skip both — so cutting one protects nothing and takes
+        // the terminal event the client is waiting for with it.
+        Some(line) => {
+            line.is_empty() || line == "[DONE]" || serde_json::from_str::<Value>(&line).is_ok()
+        }
         None => true,
     };
     if !scannable {
@@ -1915,6 +1921,22 @@ mod tests {
             SseTailSeal::Completed { padded: 1 }
         );
         assert_eq!(partial, b"data: {\"a\":1}\r\n\r\n");
+    }
+
+    #[test]
+    fn seal_keeps_a_final_frame_with_nothing_to_scan() {
+        // Neither payload is JSON, and neither carries text any pass reads —
+        // cutting them would only cost the client its terminal event.
+        for tail in ["data: [DONE]", "data:"] {
+            let mut raw = format!("data: {{\"a\":1}}\n\n{tail}").into_bytes();
+            assert!(
+                matches!(seal_buffered_sse(&mut raw), SseTailSeal::Completed { .. }),
+                "cut {tail}",
+            );
+            assert!(String::from_utf8(raw)
+                .unwrap()
+                .ends_with(&format!("{tail}\n\n")));
+        }
     }
 
     #[test]
