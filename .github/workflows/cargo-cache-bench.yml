@@ -1,0 +1,368 @@
+# Build-cache benchmark — measurement only, never merges to main.
+#
+# Answers: is `sccache` + `CARGO_INCREMENTAL=0` worth adopting for a dev
+# machine that runs many worktrees, each with its own CARGO_TARGET_DIR?
+#
+# Runs on any push to a `ci-stress/**` branch (push events use the workflow
+# file at the pushed ref, so this never needs to exist on main).
+#
+# Disk: a full aisix debug target is ~23G and `/` on a hosted runner has
+# ~14G free, so every target dir and the sccache dir live on `/mnt` (the
+# runner's ~65G temp disk). There is deliberately NO `Swatinem/rust-cache`
+# or `actions/cache` anywhere: a shared cargo cache would silently pre-warm
+# the legs that are supposed to be cold.
+name: cargo-cache-bench
+
+on:
+  push:
+    branches: ["ci-stress/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_NET_RETRY: 10
+
+jobs:
+  # A (cold baseline, incremental on, no sccache) + D1 (one-line rebuild,
+  # incremental on). Same tree, so D1's warmth comes from A.
+  leg-a-d1:
+    name: "A baseline + D1 incremental rebuild"
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      CARGO_TARGET_DIR: /mnt/bench/target-a
+      CARGO_INCREMENTAL: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with: { path: main-tree }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./main-tree/.github/actions/setup-protoc
+
+      - name: environment + scratch disk
+        run: |
+          set -uo pipefail
+          echo "nproc=$(nproc)  mem=$(free -g | awk '/Mem:/{print $2}')G"
+          grep -m1 'model name' /proc/cpuinfo
+          df -h / /mnt || { echo "::error::/mnt missing on this runner"; exit 1; }
+          sudo mkdir -p /mnt/bench && sudo chown -R "$(id -u):$(id -g)" /mnt/bench
+          cd main-tree && cargo --version && rustc --version
+
+      - name: prefetch deps (untimed, so download time is out of every leg)
+        working-directory: main-tree
+        run: cargo fetch --locked
+
+      - name: "leg A - cold build, CARGO_INCREMENTAL=1, no sccache"
+        working-directory: main-tree
+        run: |
+          set -uo pipefail
+          rm -rf "$CARGO_TARGET_DIR"
+          rc=0
+          t0=$(date +%s%N); cargo build --workspace || rc=$?; t1=$(date +%s%N)
+          echo "A.wall_s=$(( (t1-t0)/1000000000 ))" | tee -a /mnt/bench/results.txt
+          for sub in debug/deps debug/incremental debug/build; do
+            s=0; [ -d "$CARGO_TARGET_DIR/$sub" ] && s=$(du -sb "$CARGO_TARGET_DIR/$sub" | cut -f1)
+            echo "A.size.$sub=$s" | tee -a /mnt/bench/results.txt
+          done
+          echo "A.size.total=$(du -sb "$CARGO_TARGET_DIR" | cut -f1)" | tee -a /mnt/bench/results.txt
+          df -h /mnt
+          exit $rc
+
+      - name: "leg D1 - one-line body edit in aisix-gateway, CARGO_INCREMENTAL=1"
+        working-directory: main-tree
+        run: |
+          set -uo pipefail
+          # aisix-gateway: 13 of the 18 workspace crates depend on it. A real
+          # mid-graph pick (aisix-core, with 17 dependents, is the graph floor).
+          cat >> crates/aisix-gateway/src/lib.rs <<'RS'
+
+          #[allow(dead_code)]
+          fn cache_bench_marker() -> u64 {
+              0xB0000000u64 + 0
+          }
+          RS
+          # untimed: absorb the cost of the function first APPEARING, so each
+          # timed run below is a pure one-line function-body edit.
+          cargo build --workspace >/dev/null 2>&1
+          rc=0
+          for n in 1 2; do
+            sed -i "s/0xB0000000u64 + [0-9]*/0xB0000000u64 + $n/" crates/aisix-gateway/src/lib.rs
+            t0=$(date +%s%N); cargo build --workspace || rc=$?; t1=$(date +%s%N)
+            echo "D1.rep$n.wall_s=$(( (t1-t0)/1000000000 ))" | tee -a /mnt/bench/results.txt
+          done
+          git checkout -- crates/aisix-gateway/src/lib.rs
+          exit $rc
+
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo '### leg-a-d1'
+            echo '```'
+            cat /mnt/bench/results.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # B (sccache cold) -> C (sccache warm, DIFFERENT source tree) -> D2 (one-line
+  # rebuild, incremental off + warm sccache). They must share one sccache dir,
+  # so they share a job.
+  leg-b-c-d2:
+    name: "B/C sccache + D2 non-incremental rebuild"
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: /mnt/bench/sccache
+      SCCACHE_CACHE_SIZE: 40G
+    steps:
+      - uses: actions/checkout@v6
+        with: { path: main-tree }
+      - uses: actions/checkout@v6
+        with:
+          path: feat-tree
+          ref: feat/forward-client-headers-all-faces
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./main-tree/.github/actions/setup-protoc
+      - uses: taiki-e/install-action@v2
+        with: { tool: sccache }
+
+      - name: environment + scratch disk
+        run: |
+          set -uo pipefail
+          echo "nproc=$(nproc)  mem=$(free -g | awk '/Mem:/{print $2}')G"
+          df -h / /mnt || { echo "::error::/mnt missing on this runner"; exit 1; }
+          sudo mkdir -p /mnt/bench && sudo chown -R "$(id -u):$(id -g)" /mnt/bench
+          sccache --version
+          (cd main-tree && cargo --version && git log -1 --oneline)
+          (cd feat-tree && git log -1 --oneline)
+
+      - name: prefetch deps (untimed)
+        run: |
+          set -uo pipefail
+          (cd main-tree && RUSTC_WRAPPER= cargo fetch --locked)
+          (cd feat-tree && RUSTC_WRAPPER= cargo fetch --locked)
+
+      - name: "leg B - cold sccache, empty target, CARGO_INCREMENTAL=0"
+        working-directory: main-tree
+        env:
+          CARGO_TARGET_DIR: /mnt/bench/target-b
+        run: |
+          set -uo pipefail
+          sccache --stop-server >/dev/null 2>&1 || true
+          rm -rf "$CARGO_TARGET_DIR" "$SCCACHE_DIR"
+          sccache --start-server
+          sccache --zero-stats
+          rc=0
+          t0=$(date +%s%N); cargo build --workspace || rc=$?; t1=$(date +%s%N)
+          echo "B.wall_s=$(( (t1-t0)/1000000000 ))" | tee -a /mnt/bench/results.txt
+          for sub in debug/deps debug/incremental debug/build; do
+            s=0; [ -d "$CARGO_TARGET_DIR/$sub" ] && s=$(du -sb "$CARGO_TARGET_DIR/$sub" | cut -f1)
+            echo "B.size.$sub=$s" | tee -a /mnt/bench/results.txt
+          done
+          echo "B.size.total=$(du -sb "$CARGO_TARGET_DIR" | cut -f1)" | tee -a /mnt/bench/results.txt
+          echo "B.sccache_dir_bytes=$(du -sb "$SCCACHE_DIR" | cut -f1)" | tee -a /mnt/bench/results.txt
+          { echo "--- B sccache --show-stats ---"; sccache --show-stats; } | tee -a /mnt/bench/results.txt
+          df -h /mnt
+          exit $rc
+
+      - name: "leg C - warm sccache, DIFFERENT source tree (feature branch), empty target"
+        working-directory: feat-tree
+        env:
+          CARGO_TARGET_DIR: /mnt/bench/target-c
+        run: |
+          set -uo pipefail
+          rm -rf "$CARGO_TARGET_DIR"
+          sccache --zero-stats
+          rc=0
+          t0=$(date +%s%N); cargo build --workspace || rc=$?; t1=$(date +%s%N)
+          echo "C.wall_s=$(( (t1-t0)/1000000000 ))" | tee -a /mnt/bench/results.txt
+          for sub in debug/deps debug/incremental debug/build; do
+            s=0; [ -d "$CARGO_TARGET_DIR/$sub" ] && s=$(du -sb "$CARGO_TARGET_DIR/$sub" | cut -f1)
+            echo "C.size.$sub=$s" | tee -a /mnt/bench/results.txt
+          done
+          echo "C.size.total=$(du -sb "$CARGO_TARGET_DIR" | cut -f1)" | tee -a /mnt/bench/results.txt
+          { echo "--- C sccache --show-stats (zeroed immediately before this build) ---"; sccache --show-stats; } | tee -a /mnt/bench/results.txt
+          df -h /mnt
+          exit $rc
+
+      - name: "leg D2 - one-line body edit, CARGO_INCREMENTAL=0 + warm sccache"
+        working-directory: main-tree
+        env:
+          CARGO_TARGET_DIR: /mnt/bench/target-b
+        run: |
+          set -uo pipefail
+          cat >> crates/aisix-gateway/src/lib.rs <<'RS'
+
+          #[allow(dead_code)]
+          fn cache_bench_marker() -> u64 {
+              0xB0000000u64 + 0
+          }
+          RS
+          cargo build --workspace >/dev/null 2>&1
+          rc=0
+          for n in 1 2; do
+            sed -i "s/0xB0000000u64 + [0-9]*/0xB0000000u64 + $n/" crates/aisix-gateway/src/lib.rs
+            sccache --zero-stats
+            t0=$(date +%s%N); cargo build --workspace || rc=$?; t1=$(date +%s%N)
+            echo "D2.rep$n.wall_s=$(( (t1-t0)/1000000000 ))" | tee -a /mnt/bench/results.txt
+            { echo "--- D2.rep$n stats ---"; sccache --show-stats; } | tee -a /mnt/bench/results.txt
+          done
+          git checkout -- crates/aisix-gateway/src/lib.rs
+          exit $rc
+
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo '### leg-b-c-d2'
+            echo '```'
+            cat /mnt/bench/results.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # E1 - mold vs default linker, isolated to the LINK step.
+  #
+  # RUSTFLAGS is part of cargo's fingerprint, so switching linkers through
+  # RUSTFLAGS would force a full rebuild and make a link-only comparison
+  # impossible. So RUSTFLAGS is FIXED at `-C link-arg=-B<dir>` and <dir>/ld is
+  # a symlink swapped between the system ld and mold. cargo sees no change, so
+  # a touched source recompiles one crate and relinks.
+  #
+  # `cargo build --workspace` links exactly ONE binary (aisix), so this is the
+  # linker delta for the build the task specifies. E2 covers the link-heavy case.
+  leg-e1:
+    name: "E1 mold vs default linker (one binary)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      RUSTFLAGS: "-C link-arg=-B/mnt/bench/ldswap"
+      CARGO_TARGET_DIR: /mnt/bench/target-e1
+      CARGO_INCREMENTAL: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with: { path: main-tree }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./main-tree/.github/actions/setup-protoc
+
+      - name: environment, scratch disk, linker swap dir
+        run: |
+          set -uo pipefail
+          echo "nproc=$(nproc)"
+          df -h / /mnt || { echo "::error::/mnt missing on this runner"; exit 1; }
+          sudo mkdir -p /mnt/bench && sudo chown -R "$(id -u):$(id -g)" /mnt/bench
+          sudo apt-get update -qq && sudo apt-get install -y -qq mold
+          mold --version
+          mkdir -p /mnt/bench/ldswap
+          echo "system ld resolves to $(readlink -f /usr/bin/ld)"
+          printf 'int main(void){return 0;}\n' > /tmp/t.c
+          ln -sf "$(readlink -f /usr/bin/ld)" /mnt/bench/ldswap/ld
+          echo -n "swap dir with system ld -> "; gcc -B/mnt/bench/ldswap -o /tmp/t /tmp/t.c -Wl,--version 2>&1 | head -1
+          ln -sf "$(command -v mold)" /mnt/bench/ldswap/ld
+          echo -n "swap dir with mold      -> "; gcc -B/mnt/bench/ldswap -o /tmp/t /tmp/t.c -Wl,--version 2>&1 | head -1
+          ln -sf "$(readlink -f /usr/bin/ld)" /mnt/bench/ldswap/ld
+          cd main-tree && cargo --version
+
+      - name: prefetch deps (untimed)
+        working-directory: main-tree
+        run: cargo fetch --locked
+
+      - name: "E1 - cold build with system ld, then alternating relink reps"
+        working-directory: main-tree
+        run: |
+          set -uo pipefail
+          SYSLD=$(readlink -f /usr/bin/ld); MOLD=$(command -v mold)
+          rc=0
+          rm -rf "$CARGO_TARGET_DIR"
+          ln -sf "$SYSLD" /mnt/bench/ldswap/ld
+          t0=$(date +%s%N); cargo build --workspace || rc=$?; t1=$(date +%s%N)
+          echo "E1.cold_default.wall_s=$(( (t1-t0)/1000000000 ))" | tee -a /mnt/bench/results.txt
+          for rep in 1 2 3; do
+            for ld in default mold; do
+              [ "$ld" = mold ] && ln -sf "$MOLD" /mnt/bench/ldswap/ld || ln -sf "$SYSLD" /mnt/bench/ldswap/ld
+              touch crates/aisix-server/src/main.rs
+              t0=$(date +%s%N); cargo build --workspace || rc=$?; t1=$(date +%s%N)
+              echo "E1.$ld.rep$rep.wall_ms=$(( (t1-t0)/1000000 ))" | tee -a /mnt/bench/results.txt
+            done
+          done
+          df -h /mnt
+          exit $rc
+
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo '### leg-e1'
+            echo '```'
+            cat /mnt/bench/results.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # E2 - the link-heavy case: `--all-targets` links 19 integration-test
+  # binaries plus the gateway, which is what the real dev loop (`cargo test`)
+  # actually pays for. CARGO_INCREMENTAL=0 here purely to keep the target dir
+  # inside /mnt; the linker delta is unaffected.
+  leg-e2:
+    name: "E2 mold vs default linker (link-heavy, --all-targets)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      RUSTFLAGS: "-C link-arg=-B/mnt/bench/ldswap"
+      CARGO_TARGET_DIR: /mnt/bench/target-e2
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v6
+        with: { path: main-tree }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./main-tree/.github/actions/setup-protoc
+
+      - name: environment, scratch disk, linker swap dir
+        run: |
+          set -uo pipefail
+          echo "nproc=$(nproc)"
+          df -h / /mnt || { echo "::error::/mnt missing on this runner"; exit 1; }
+          sudo mkdir -p /mnt/bench && sudo chown -R "$(id -u):$(id -g)" /mnt/bench
+          sudo apt-get update -qq && sudo apt-get install -y -qq mold
+          mold --version
+          mkdir -p /mnt/bench/ldswap
+          ln -sf "$(readlink -f /usr/bin/ld)" /mnt/bench/ldswap/ld
+          cd main-tree && cargo --version
+
+      - name: prefetch deps (untimed)
+        working-directory: main-tree
+        run: cargo fetch --locked
+
+      - name: "E2 - warm --all-targets tree, then alternating relink reps"
+        working-directory: main-tree
+        run: |
+          set -uo pipefail
+          SYSLD=$(readlink -f /usr/bin/ld); MOLD=$(command -v mold)
+          rc=0
+          rm -rf "$CARGO_TARGET_DIR"
+          ln -sf "$SYSLD" /mnt/bench/ldswap/ld
+          t0=$(date +%s%N); cargo build --workspace --all-targets || rc=$?; t1=$(date +%s%N)
+          echo "E2.cold_default_alltargets.wall_s=$(( (t1-t0)/1000000000 ))" | tee -a /mnt/bench/results.txt
+          echo "E2.test_roots_touched=$(ls crates/*/tests/*.rs | wc -l)" | tee -a /mnt/bench/results.txt
+          df -h /mnt
+          for rep in 1 2 3; do
+            for ld in default mold; do
+              [ "$ld" = mold ] && ln -sf "$MOLD" /mnt/bench/ldswap/ld || ln -sf "$SYSLD" /mnt/bench/ldswap/ld
+              touch crates/*/tests/*.rs crates/aisix-server/src/main.rs
+              t0=$(date +%s%N); cargo build --workspace --all-targets || rc=$?; t1=$(date +%s%N)
+              echo "E2.$ld.rep$rep.wall_ms=$(( (t1-t0)/1000000 ))" | tee -a /mnt/bench/results.txt
+            done
+          done
+          df -h /mnt
+          exit $rc
+
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo '### leg-e2'
+            echo '```'
+            cat /mnt/bench/results.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
