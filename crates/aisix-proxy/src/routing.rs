@@ -96,6 +96,20 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
         // mistake — retrying or failing over won't help, same as a
         // non-429 4xx.
         BridgeError::InvalidUpstreamConfig(_) | BridgeError::InvalidUpstreamCredentials(_) => false,
+        // A capability the adapter simply does not implement. Static per
+        // adapter, so the same call answers the same way every time and a
+        // retry can only add latency to a refusal the caller is going to
+        // get anyway. Spelled as `Config` before #1093, which made it
+        // retryable and burned the whole budget before the 501 surfaced.
+        //
+        // There is no failover to preserve underneath this `false`. The
+        // three routes that can raise it — `/v1/completions`,
+        // `/v1/embeddings`, `/v1/images/generations` — dispatch through
+        // `retrying_dispatch`, which walks no candidates, and they refuse a
+        // routing model outright in `dispatch::require_provider`. The one
+        // loop that does fail over (chat's) only ever calls `chat` /
+        // `chat_stream`, which have no default impl to raise this.
+        BridgeError::UnsupportedCapability(_) => false,
         BridgeError::Timeout { .. }
         | BridgeError::Transport(_)
         | BridgeError::UpstreamDecode(_)
@@ -1166,6 +1180,7 @@ pub(crate) fn resolve_attempt_models(
 mod tests {
     use super::*;
     use aisix_core::{Routing, RoutingStrategy, RoutingTarget};
+    use aisix_gateway::BridgeCapability;
 
     fn r(
         strategy: RoutingStrategy,
@@ -1761,6 +1776,63 @@ mod tests {
             false,
             &[]
         ));
+        // #1093: the adapter simply does not implement this operation, and
+        // that is static — the same call answers the same way every time.
+        assert!(!is_retryable(
+            &BridgeError::UnsupportedCapability(BridgeCapability::TextCompletions),
+            false,
+            &[]
+        ));
+    }
+
+    /// The classifier answering `false` is only worth something if the loop
+    /// stops on it. This is the half that would go red if
+    /// `retrying_dispatch` ever consulted something other than
+    /// `is_retryable` — and the `Config` control is what shows the harness
+    /// can see a retry at all, so a mis-wired counter cannot pass by
+    /// reporting one call for both.
+    #[tokio::test(start_paused = true)]
+    async fn the_retry_loop_spends_no_attempt_on_a_capability_gap() {
+        let state = crate::ProxyState::new(
+            aisix_core::snapshot::SnapshotHandle::new(aisix_core::AisixSnapshot::new()),
+            std::sync::Arc::new(aisix_gateway::Hub::new()),
+            &aisix_core::ProxyConfig {
+                addr: "127.0.0.1:0".into(),
+                request_body_limit_bytes: 1_048_576,
+                tls: None,
+                real_ip: Default::default(),
+                request_id: Default::default(),
+                thread_per_core: None,
+                workers: None,
+                url_rewrites: Vec::new(),
+            },
+        );
+        let model = model_with_retries(Some(2));
+
+        let calls = std::cell::Cell::new(0u32);
+        let err = retrying_dispatch(&state, &model, "/v1/completions", || {
+            calls.set(calls.get() + 1);
+            async {
+                Err::<(), _>(BridgeError::UnsupportedCapability(
+                    BridgeCapability::TextCompletions,
+                ))
+            }
+        })
+        .await
+        .expect_err("the capability gap surfaces");
+        assert!(matches!(err, BridgeError::UnsupportedCapability(_)));
+        assert_eq!(calls.get(), 1, "a capability gap must not spend a retry");
+
+        // Control: the shape this used to have. Two configured retries mean
+        // three calls, which is the budget the 501 was burning before the
+        // variant was typed.
+        let calls = std::cell::Cell::new(0u32);
+        let _ = retrying_dispatch(&state, &model, "/v1/completions", || {
+            calls.set(calls.get() + 1);
+            async { Err::<(), _>(BridgeError::Config("serialize request body: eof".into())) }
+        })
+        .await;
+        assert_eq!(calls.get(), 3);
     }
 
     /// AISIX-Cloud#1222: in-band stream errors follow the same status

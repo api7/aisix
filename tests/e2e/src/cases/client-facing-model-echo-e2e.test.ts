@@ -343,6 +343,52 @@ describe("client-facing model echo e2e: the response names what the caller asked
     expectAliasNotUpstreamId(await res.text(), "echo-completions");
   });
 
+  test("/v1/rerank: a Jina-shaped response echoes the alias", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return void ctx.skip();
+
+    // Among the supported rerank backends only Jina's response names a
+    // model, and it names it at the top level. Cohere's and the
+    // OpenAI-compatible shape carry none, so they are covered by the
+    // byte-for-byte relay assertions in `rerank-e2e` rather than here.
+    const upstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        model: UPSTREAM_REPORTED_MODEL,
+        results: [
+          { index: 2, relevance_score: 0.92, document: { text: "Paris" } },
+          { index: 0, relevance_score: 0.31, document: { text: "Berlin" } },
+        ],
+        usage: { total_tokens: 11 },
+      },
+    });
+    upstreams.push(upstream);
+    await seedAlias("echo-rerank", upstream, { provider: "jina" });
+
+    const res = await fetch(`${app.proxyUrl}/v1/rerank`, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify({
+        model: "echo-rerank",
+        query: "What is the capital of France?",
+        documents: ["Berlin", "London", "Paris"],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expectAliasNotUpstreamId(text, "echo-rerank");
+    // The rest of the document is relayed as the provider wrote it — the
+    // scores above all, since a re-serialised body would silently reorder
+    // or re-spell them and break a RAG caller's ranking.
+    const body = JSON.parse(text) as {
+      results?: Array<{ index?: number; relevance_score?: number }>;
+      usage?: { total_tokens?: number };
+    };
+    expect(body.results?.[0]?.index).toBe(2);
+    expect(body.results?.[0]?.relevance_score).toBe(0.92);
+    expect(body.results?.[1]?.index).toBe(0);
+    expect(body.results?.[1]?.relevance_score).toBe(0.31);
+    expect(body.usage?.total_tokens).toBe(11);
+  });
+
   test("/v1/videos: the poll echoes the name the caller submitted under, not the wildcard row's", async (ctx) => {
     if (!etcdReachable || !app || !seed) return void ctx.skip();
 
