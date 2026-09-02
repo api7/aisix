@@ -1033,19 +1033,17 @@ struct VideoTarget {
     /// round-trip on this surface (submit, poll, content fetch) dials the
     /// endpoint under the same trust settings.
     tls: Option<aisix_core::models::provider_key::ProviderKeyTls>,
-    /// The ProviderKey's rendered `default_headers` plus the client headers
-    /// its `forward_client_headers` allowlist admits, resolved once when the
-    /// target is resolved so every round-trip on this surface (submit, poll,
-    /// content fetch) sends the same set (AISIX-Cloud#1112 / #1167).
+    /// The ProviderKey's rendered `default_headers`, resolved once when the
+    /// target is resolved so every round-trip on this surface (submit,
+    /// poll, content fetch) sends the same set (AISIX-Cloud#1112).
     extra_headers: Vec<(axum::http::HeaderName, axum::http::HeaderValue)>,
-    /// The caller-JWT slot for this call, captured before the outbound
-    /// header map is merged. Kept beside `extra_headers` because it must
-    /// OVERWRITE its slot while `extra_headers` merges with
-    /// skip-if-present — and because with no token to deliver it still has
-    /// to CLEAR a copy that arrived from the caller, which an inbound
-    /// header allowlist can otherwise walk into a slot the upstream was
-    /// told carries a verified identity.
-    forwarded_jwt: aisix_gateway::ForwardedJwt,
+    /// The client headers this ProviderKey's `forward_client_headers`
+    /// admits, resolved from the same inbound request and reused on the
+    /// same round-trips (AISIX-Cloud#1167). Kept beside `extra_headers`
+    /// because it OVERWRITES its slots while `extra_headers` merges with
+    /// skip-if-present — a forwarded credential is meant to displace the
+    /// gateway's own.
+    forwarded_client: aisix_gateway::ForwardedClientHeaders,
 }
 
 impl VideoTarget {
@@ -1105,8 +1103,8 @@ fn resolve_video_target(
         &model_entry.id,
         client_ctx,
     );
-    let extra_headers = aisix_gateway::resolve_extra_headers(&header_ctx);
-    let forwarded_jwt = aisix_gateway::ForwardedJwt::resolve(&header_ctx);
+    let forwarded_client = aisix_gateway::ForwardedClientHeaders::resolve(&header_ctx);
+    let extra_headers = aisix_gateway::resolve_default_headers(&header_ctx);
     Ok(Ok(VideoTarget {
         pk_id: pk_entry.id.to_string(),
         tls: pk_entry.value.tls.clone(),
@@ -1116,7 +1114,7 @@ fn resolve_video_target(
         secret,
         model_entry,
         extra_headers,
-        forwarded_jwt,
+        forwarded_client,
     }))
 }
 
@@ -1200,14 +1198,13 @@ async fn provider_call(
                     header::HeaderValue::from_static("enable"),
                 );
             }
-            // Captured before the merge — see the field's doc comment.
-            let jwt_slot = target.forwarded_jwt.capture(&headers);
             for (name, value) in &target.extra_headers {
                 if !headers.contains_key(name) {
                     headers.insert(name.clone(), value.clone());
                 }
             }
-            jwt_slot.apply(&mut headers);
+            // Last, and overwriting — see the field's doc comment.
+            target.forwarded_client.apply(&mut headers);
 
             let mut builder = client.request(method.clone(), url).headers(headers);
             if let Some(b) = body {
@@ -1316,14 +1313,13 @@ async fn proxy_content(
             headers.insert(n, v);
         }
     }
-    // Captured before the merge — see the field's doc comment.
-    let jwt_slot = target.forwarded_jwt.capture(&headers);
     for (name, value) in &target.extra_headers {
         if !headers.contains_key(name) {
             headers.insert(name.clone(), value.clone());
         }
     }
-    jwt_slot.apply(&mut headers);
+    // Last, and overwriting — see the field's doc comment.
+    target.forwarded_client.apply(&mut headers);
 
     let builder = client.get(url).headers(headers);
 

@@ -1195,13 +1195,12 @@ async fn anthropic_passthrough_dispatch(
 
     // Build the outbound HeaderMap explicitly so the PK's
     // `request.default_headers` / `request.forward_client_headers` can
-    // inject operator-supplied and allowlisted client headers via the
+    // inject operator-supplied and forwarded client headers via the
     // shared apply pipeline. The bridge-owned headers (x-api-key,
     // anthropic-version, content-type, x-aisix-request-id) are inserted
-    // FIRST — `apply_request_headers` skips keys already present + the
-    // reserved auth-header blacklist (`x-api-key` is in
-    // `RESERVED_UPSTREAM_HEADERS`), so neither source can clobber auth
-    // here (ai-gateway#337).
+    // FIRST, which is what stops a `default_headers` entry clobbering
+    // auth here (ai-gateway#337) — that merge is skip-if-present. Only a
+    // header the operator explicitly forwards takes the credential slot.
     let mut headers = axum::http::HeaderMap::new();
     let api_key_hv = HeaderValue::from_str(api_key).map_err(|e| {
         ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
@@ -4527,12 +4526,11 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_passthrough_default_headers_cannot_overwrite_x_api_key() {
-        // Defense-in-depth: `x-api-key` is in
-        // `aisix_gateway::upstream_headers::RESERVED_UPSTREAM_HEADERS`
-        // — even if cp-api validation slips and lets the operator
-        // register a default_headers entry with `x-api-key`, the apply
-        // function MUST drop it so the PK's secret remains the auth
-        // value upstream sees.
+        // `default_headers` is a fallback, never an override: the
+        // bridge fills `x-api-key` before the merge, so an operator
+        // entry of the same name is declined and the PK's secret stays
+        // the auth value upstream sees. (Putting the CALLER's own
+        // credential there is what `forward_client_headers` is for.)
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))

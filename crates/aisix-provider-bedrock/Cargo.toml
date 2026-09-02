@@ -9,6 +9,7 @@ authors.workspace = true
 description = "aisix: AWS Bedrock runtime provider bridge (skeleton — multi-publisher dispatch)"
 
 [dependencies]
+tracing.workspace = true
 aisix-core = { path = "../aisix-core" }
 aisix-gateway = { path = "../aisix-gateway", features = ["aws"] }
 # Reuse Anthropic Messages request/response wire types for the

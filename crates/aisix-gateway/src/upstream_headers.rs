@@ -10,83 +10,47 @@
 //!    operator-configured allowlist, forwarded verbatim
 //!    (AISIX-Cloud#1167).
 //!
-//! **Precedence is gateway > operator > client, and it is structural.** Every
-//! caller inserts its own bridge-owned headers (auth, `content-type`,
-//! `x-aisix-request-id`, streaming `accept`) into the `HeaderMap` *first*, and
-//! nothing here overwrites a name that is already present. Within this module
-//! `default_headers` is resolved before the client allowlist, so an operator
-//! header wins over a client header of the same name. On top of that, the
-//! [`RESERVED_UPSTREAM_HEADERS`] / [`NEVER_FORWARD_HEADERS`] guards drop the
-//! auth and transport families outright, so neither an operator typo nor a
-//! `"*"`-happy allowlist can reach them.
+//! **`default_headers` defers to the gateway; `forward_client_headers`
+//! does not.** Every caller inserts its own bridge-owned headers (auth,
+//! `content-type`, `x-aisix-request-id`, streaming `accept`) into the
+//! `HeaderMap` *first*, and the `default_headers` merge declines a name
+//! that is already present — a static operator value never displaces the
+//! gateway's own. A FORWARDED CLIENT header does displace it, because the
+//! operator named that header on this specific upstream and the slot they
+//! most often name is the credential one: handing an internal service the
+//! caller's own `Authorization` in place of the gateway's is the whole
+//! reason the field exists. `insert` rather than `append`, so exactly one
+//! credential reaches the wire and the upstream never picks between two
+//! (the #411 shape). Within this module `default_headers` still resolves
+//! first, so an operator's static header beats a client header of the same
+//! name.
+//!
+//! What can never be forwarded is narrow and lives in
+//! `aisix_core::forwarded_headers`: the transport slots whose forwarding
+//! breaks the exchange, the gateway's own `x-aisix-*` namespace, and — on
+//! this pipeline, which REBUILDS the outbound message — the headers that
+//! describe a body the gateway re-serializes or a response shape it
+//! parses.
 //!
 //! Before #1167 the standard endpoints rebuilt the outbound header set from
 //! scratch and dropped every client header — the default this module
 //! preserves. `/passthrough/*` is the opposite policy (forward everything
-//! except `pk.strip_headers`) and does not use this pipeline.
+//! except `pk.strip_headers`) and does not use this pipeline; there
+//! `forward_client_headers` overrides the strip instead.
 
 use std::collections::HashSet;
 
-use aisix_core::{wildcard::wildcard_matches, HeaderVars, RequestOverrides};
+use aisix_core::{HeaderVars, RequestOverrides};
 use http::{
     header::{HeaderName, HeaderValue},
     HeaderMap,
 };
 
-/// Headers an operator's `default_headers` block may never set, and that are
-/// never forwarded from a client.
+/// Whether a client's copy of a header may be forwarded by this pipeline.
 ///
-/// Re-exported from `aisix-core`, which owns the list so that
-/// `Config::validate` can reject the same names in
-/// `proxy.request_id.accept_headers` — reading a request id out of
-/// `authorization` would copy the caller's credential into a response header,
-/// the logs, and the upstream request, walking straight around this guard.
-pub use aisix_core::RESERVED_UPSTREAM_HEADERS;
-
-/// Client headers never forwarded, on top of [`RESERVED_UPSTREAM_HEADERS`].
-///
-/// Hop-by-hop headers (RFC 9110 §7.6.1) describe *this* connection, not the
-/// one the gateway opens to the upstream. The content/accept entries describe
-/// a body this gateway re-serializes and a response shape it parses, so
-/// relaying the caller's copies would describe the wrong message.
-const NEVER_FORWARD_HEADERS: &[&str] = &[
-    "accept",
-    "accept-encoding",
-    "connection",
-    "content-encoding",
-    "content-length",
-    "content-type",
-    "expect",
-    "keep-alive",
-    "proxy-authenticate",
-    "set-cookie",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    // W3C trace context (AISIX-Cloud#1279): the caller's `traceparent`
-    // names a span in the CALLER's trace — relayed to a provider it links
-    // the provider's internal telemetry into the caller's tracing backend
-    // and leaks the caller's trace ids to a third party. The gateway is a
-    // fresh hop; provider-side propagation, if ever wanted, is a separate
-    // opt-in that injects the gateway's own context, never the inbound
-    // value. Listed here rather than in RESERVED_UPSTREAM_HEADERS so an
-    // operator's deliberate `default_headers` entry for a trusted
-    // first-party upstream still works — only the client's copy is
-    // blocked.
-    "traceparent",
-    "tracestate",
-    "upgrade",
-];
-
-/// Client header prefixes never forwarded whatever the allowlist says.
-///
-/// `x-aisix-*` is the gateway's own namespace (`x-aisix-request-id`,
-/// `x-aisix-routing-tags`, …) — forwarding a client's copy would let a caller
-/// spoof gateway-asserted context upstream. `x-stainless-*` is the client
-/// SDK's self-description; LiteLLM excludes it from its own forwarding for
-/// the same reason we do — relaying one SDK's version headers to a provider
-/// that reads them for its own SDK breaks the call.
-const NEVER_FORWARD_PREFIXES: &[&str] = &["x-aisix-", "x-stainless-"];
+/// Re-exported from `aisix-core`, which owns the criterion so that every
+/// surface — `/v1/*`, MCP, and `/passthrough/*` — answers it alike.
+pub use aisix_core::{client_header_forwardable, header_forward_blocked};
 
 /// The authenticated caller's non-secret identity, resolved once per
 /// request so `${request.api_key.*}` templates can name it.
@@ -141,11 +105,6 @@ pub struct UpstreamHeaderContext<'a> {
     /// poll of an async job, a semantic-routing embedding lookup) — those
     /// requests forward nothing.
     pub client_headers: Option<&'a HeaderMap>,
-    /// The caller's verified JWT, delivered to the upstream under the
-    /// ProviderKey's `forward_jwt_header` when both are present. `None`
-    /// when the caller authenticated with an API key, or on a call with no
-    /// client request behind it.
-    pub caller_jwt: Option<&'a str>,
 }
 
 impl<'a> UpstreamHeaderContext<'a> {
@@ -167,33 +126,6 @@ impl<'a> UpstreamHeaderContext<'a> {
         self.client_headers = Some(headers);
         self
     }
-
-    /// Carry the caller's verified JWT, so a ProviderKey configured with
-    /// `forward_jwt_header` can hand it to the upstream.
-    pub fn with_caller_jwt(mut self, token: Option<&'a str>) -> Self {
-        self.caller_jwt = token;
-        self
-    }
-}
-
-fn is_reserved(name: &str) -> bool {
-    RESERVED_UPSTREAM_HEADERS.contains(&name)
-}
-
-fn is_forwardable_name(name: &str) -> bool {
-    !is_reserved(name)
-        && !NEVER_FORWARD_HEADERS.contains(&name)
-        && !NEVER_FORWARD_PREFIXES.iter().any(|p| name.starts_with(p))
-}
-
-/// Whether an allowlist pattern admits a header name. Patterns are matched
-/// case-insensitively against the lowercase name, and a single `*` glob is
-/// supported (`"x-trace-*"`), matching how `allowed_models` / `allowed_agents`
-/// patterns behave elsewhere in the snapshot.
-fn allowlist_admits(patterns: &[String], name: &str) -> bool {
-    patterns
-        .iter()
-        .any(|p| wildcard_matches(&p.to_ascii_lowercase(), name))
 }
 
 /// Resolve the operator-configured headers for one upstream call: rendered
@@ -207,8 +139,31 @@ fn allowlist_admits(patterns: &[String], name: &str) -> bool {
 ///
 /// Callers that build a [`HeaderMap`] should use [`apply_request_headers`];
 /// this lower-level form exists for the Bedrock path, whose headers have to
-/// be handed to the AWS SDK's pre-signing interceptor instead.
+/// be handed to the AWS SDK's pre-signing interceptor instead. Note that it
+/// FLATTENS the two features into one list and so loses the distinction
+/// [`apply_request_headers`] draws between them — that is correct for
+/// Bedrock, whose interceptor is first-wins and which resolves the
+/// credential collision by clearing the slot up front instead.
 pub fn resolve_extra_headers(ctx: &UpstreamHeaderContext<'_>) -> Vec<(HeaderName, HeaderValue)> {
+    let mut out = resolve_default_headers(ctx);
+    let taken: HashSet<HeaderName> = out.iter().map(|(name, _)| name.clone()).collect();
+    out.extend(
+        ForwardedClientHeaders::resolve(ctx)
+            .entries
+            .into_iter()
+            .filter(|(name, _)| !taken.contains(name)),
+    );
+    out
+}
+
+/// The ProviderKey's rendered `default_headers`, in declaration order.
+///
+/// Public for the dispatch surfaces that resolve the two features once at
+/// target-resolution time and reuse them across several round-trips (the
+/// jobs and video surfaces): they hold [`ForwardedClientHeaders`]
+/// separately, because the two merge into the outbound map with opposite
+/// rules.
+pub fn resolve_default_headers(ctx: &UpstreamHeaderContext<'_>) -> Vec<(HeaderName, HeaderValue)> {
     let Some(r) = ctx.overrides else {
         return Vec::new();
     };
@@ -219,7 +174,9 @@ pub fn resolve_extra_headers(ctx: &UpstreamHeaderContext<'_>) -> Vec<(HeaderName
         let Ok(parsed_name) = name.parse::<HeaderName>() else {
             continue;
         };
-        if is_reserved(parsed_name.as_str()) || !seen.insert(parsed_name.as_str().to_string()) {
+        if aisix_core::header_forward_blocked(parsed_name.as_str())
+            || !seen.insert(parsed_name.as_str().to_string())
+        {
             continue;
         }
         // An unresolvable template drops just this header — see
@@ -232,166 +189,89 @@ pub fn resolve_extra_headers(ctx: &UpstreamHeaderContext<'_>) -> Vec<(HeaderName
         };
         out.push((parsed_name, parsed_value));
     }
-
-    if r.forward_client_headers.is_empty() {
-        return out;
-    }
-    let Some(client) = ctx.client_headers else {
-        return out;
-    };
-    for name in client.keys() {
-        // `HeaderName` is already lowercase on the wire-parsed side.
-        let lower = name.as_str();
-        if !is_forwardable_name(lower)
-            || !allowlist_admits(&r.forward_client_headers, lower)
-            || seen.contains(lower)
-        {
-            continue;
-        }
-        // A repeated header (`anthropic-beta: a` twice) forwards its first
-        // value only; the upstream sees one well-formed header rather than
-        // a list this gateway never interpreted.
-        let Some(value) = client.get(name) else {
-            continue;
-        };
-        seen.insert(lower.to_string());
-        out.push((name.clone(), value.clone()));
-    }
     out
 }
 
+/// The inbound client headers one upstream call forwards, resolved from
+/// the operator's allowlist against the request that is actually in
+/// flight.
+///
+/// Two things read it, and they must agree: the merge below, which
+/// DELIVERS the headers into the outbound map, and every dispatch site
+/// that injects a gateway credential, which asks [`Self::claims`] first
+/// and stands aside for the slot the operator named. Resolving once and
+/// asking both questions of the same value is what keeps them from
+/// disagreeing — a value that will not become a header claims no slot, and
+/// the upstream then keeps the credential it would otherwise have had.
+#[derive(Debug, Clone, Default)]
+pub struct ForwardedClientHeaders {
+    entries: Vec<(HeaderName, HeaderValue)>,
+}
+
+impl ForwardedClientHeaders {
+    /// Resolve the forward for this call. Empty when the ProviderKey
+    /// configures none, and on a call with no client request behind it (a
+    /// background poll of an async job, a semantic-routing embedding
+    /// lookup) — those forward nothing.
+    pub fn resolve(ctx: &UpstreamHeaderContext<'_>) -> Self {
+        let (Some(r), Some(client)) = (ctx.overrides, ctx.client_headers) else {
+            return Self::default();
+        };
+        Self {
+            entries: aisix_core::resolve_forwarded_client_headers(
+                &r.forward_client_headers,
+                client,
+                &[],
+            ),
+        }
+    }
+
+    /// Whether the forward claims `name` (lowercase) — the question a site
+    /// injecting its own credential into that slot must ask before
+    /// injecting, since the forwarded value is going to take it.
+    pub fn claims(&self, name: &str) -> bool {
+        self.entries.iter().any(|(n, _)| n.as_str() == name)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Deliver the forwarded headers, OVERWRITING their slots.
+    ///
+    /// `insert` rather than `append`: a slot filled twice would put two
+    /// values on the wire and let the upstream pick between them, which on
+    /// a credential slot is the #411 shape.
+    pub fn apply(&self, headers: &mut HeaderMap) {
+        for (name, value) in &self.entries {
+            headers.insert(name.clone(), value.clone());
+        }
+    }
+}
+
 /// Merge the operator-configured headers into an outbound request's
-/// `HeaderMap`, leaving every name the caller already set untouched.
+/// `HeaderMap`.
 ///
 /// Callers MUST insert their bridge-owned headers (auth, `content-type`,
-/// `x-aisix-request-id`) before calling this — that ordering is what makes
-/// gateway-owned headers un-overridable.
+/// `x-aisix-request-id`) before calling this. That ordering is what makes
+/// a `default_headers` entry unable to displace them — and what lets a
+/// forwarded client header displace the credential deliberately.
 pub fn apply_request_headers(headers: &mut HeaderMap, ctx: &UpstreamHeaderContext<'_>) {
-    let slot = ForwardedJwt::resolve(ctx).capture(headers);
-    for (name, value) in resolve_extra_headers(ctx) {
+    // A `default_headers` entry the gateway's own header shut out did not
+    // "win" the slot — so it does not shut out the forward either. Only a
+    // name this pass actually PLACED shadows a client header of the same
+    // name, which is the operator-beats-client half of the precedence.
+    let mut placed: HashSet<HeaderName> = HashSet::new();
+    for (name, value) in resolve_default_headers(ctx) {
         if headers.contains_key(&name) {
             continue;
         }
+        placed.insert(name.clone());
         headers.insert(name, value);
     }
-    slot.apply(headers);
-}
-
-/// Deliver the caller's verified JWT under the ProviderKey's
-/// `forward_jwt_header`, for an internal upstream that authorizes on the
-/// end user's claims.
-///
-/// This is the ONE step that overwrites: everything above it declines a
-/// name already present, because a gateway-owned header outranks operator
-/// and client config. Here the operator has named a slot explicitly, on
-/// this ProviderKey, for this upstream — including `authorization`, which
-/// the bridge has already filled with the gateway's own credential. That
-/// is the case the field exists for, so the caller's token REPLACES it:
-/// `insert` rather than `append`, since `append` would put two
-/// credentials on the wire and let the upstream pick (the #411 shape).
-/// The caller-JWT delivery for one upstream call: which header, and the
-/// value if there is a token to put in it.
-///
-/// Resolved from the request context, then CAPTURED against the outbound
-/// header map before any operator or client header is merged in — the
-/// order is what makes the two required behaviours distinguishable. A
-/// token must land in the slot, replacing whatever is there, including
-/// the gateway's own credential (which is the point of allowing
-/// `authorization`). But with NO token, a copy that arrived from the
-/// caller must not survive into a slot the upstream was told carries a
-/// gateway-VERIFIED identity, while the gateway's own credential must
-/// survive — otherwise an API-key caller on that upstream loses its
-/// authentication entirely. Only "was this already here before the merge"
-/// tells those two apart.
-#[derive(Debug, Clone, Default)]
-pub struct ForwardedJwt {
-    name: Option<HeaderName>,
-    value: Option<HeaderValue>,
-}
-
-impl ForwardedJwt {
-    /// Resolve the configured slot and the token, if any, for this call.
-    pub fn resolve(ctx: &UpstreamHeaderContext<'_>) -> Self {
-        let name = configured_jwt_slot(ctx);
-        let value = forwarded_jwt_header(ctx).map(|(_, value)| value);
-        Self { name, value }
-    }
-
-    /// Record whether `headers` already owns the slot. Call before merging
-    /// operator or client headers.
-    pub fn capture(&self, headers: &HeaderMap) -> ForwardedJwtSlot {
-        let gateway_owned = self.name.as_ref().is_some_and(|n| headers.contains_key(n));
-        ForwardedJwtSlot {
-            forwarded: self.clone(),
-            gateway_owned,
-        }
-    }
-}
-
-/// A [`ForwardedJwt`] plus the one fact only the pre-merge map could tell.
-#[derive(Debug, Clone, Default)]
-pub struct ForwardedJwtSlot {
-    forwarded: ForwardedJwt,
-    gateway_owned: bool,
-}
-
-impl ForwardedJwtSlot {
-    /// Deliver the token, or clear a caller's copy of the slot.
-    pub fn apply(self, headers: &mut HeaderMap) {
-        let Some(name) = self.forwarded.name else {
-            return;
-        };
-        match self.forwarded.value {
-            Some(value) => {
-                headers.insert(name, value);
-            }
-            None if !self.gateway_owned => {
-                headers.remove(&name);
-            }
-            None => {}
-        }
-    }
-}
-
-/// The header name this call's `forward_jwt_header` names, if it is one a
-/// token may be delivered in at all.
-///
-/// Public because a dispatch path that has no `HeaderMap` to capture from
-/// still has to know which name is the caller-JWT slot — the Bedrock
-/// bridge hands its headers to a SigV4 interceptor as name/value strings.
-pub fn forwarded_jwt_slot(ctx: &UpstreamHeaderContext<'_>) -> Option<HeaderName> {
-    configured_jwt_slot(ctx)
-}
-
-fn configured_jwt_slot(ctx: &UpstreamHeaderContext<'_>) -> Option<HeaderName> {
-    let configured = ctx
-        .overrides
-        .and_then(|o| o.forward_jwt_header.as_deref())?;
-    let name = configured.to_ascii_lowercase();
-    if aisix_core::forwarded_jwt_slot_rejected(&name) {
-        return None;
-    }
-    HeaderName::try_from(name.as_str()).ok()
-}
-
-/// The caller-JWT header and value for this call, for a dispatch path that
-/// builds its own outbound header map instead of going through
-/// [`apply_request_headers`] (the files/batches/fine-tuning and video
-/// surfaces, which merge their headers with skip-if-present semantics).
-///
-/// A caller of this function is also responsible for CLEARING the slot when
-/// there is no token — see [`configured_jwt_slot`] — since a header the
-/// caller sent must never be mistaken upstream for a verified identity.
-pub fn forwarded_jwt_header(ctx: &UpstreamHeaderContext<'_>) -> Option<(HeaderName, HeaderValue)> {
-    let configured = ctx.overrides.and_then(|o| o.forward_jwt_header.as_deref());
-    let (name, value) = aisix_core::forwarded_jwt(configured, ctx.caller_jwt)?;
-    // A token that cannot be a header value is a broken credential, not a
-    // reason to fail the request: the upstream then answers the way it
-    // answers any unauthenticated call.
-    let name = HeaderName::try_from(name.as_str()).ok()?;
-    let mut value = HeaderValue::from_str(&value).ok()?;
-    value.set_sensitive(true);
-    Some((name, value))
+    let mut forwarded = ForwardedClientHeaders::resolve(ctx);
+    forwarded.entries.retain(|(name, _)| !placed.contains(name));
+    forwarded.apply(headers);
 }
 
 #[cfg(test)]
@@ -422,142 +302,126 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_jwt_reaches_the_configured_header() {
-        let r = RequestOverrides {
-            forward_jwt_header: Some("x-user-jwt".into()),
-            ..Default::default()
-        };
+    fn a_forwarded_header_reaches_the_upstream() {
+        let r = overrides(&[], &["x-user-jwt"]);
+        let inbound = client(&[("x-user-jwt", "eyJraw")]);
         let mut headers = HeaderMap::new();
-        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_caller_jwt(Some("eyJraw"));
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
         apply_request_headers(&mut headers, &ctx);
         assert_eq!(headers["x-user-jwt"], "eyJraw");
     }
 
     #[test]
-    fn forwarded_jwt_replaces_the_bridge_owned_credential() {
-        // The one slot where operator config outranks a gateway-owned
-        // header: the operator named `authorization` on THIS ProviderKey,
-        // for an upstream that authorizes on the end user. Two credentials
-        // on the wire would let the upstream choose between them.
-        let r = RequestOverrides {
-            forward_jwt_header: Some("authorization".into()),
-            ..Default::default()
-        };
+    fn a_forwarded_header_replaces_the_bridge_owned_credential() {
+        // The case the field exists for: the operator named
+        // `authorization` on THIS ProviderKey, for an upstream that
+        // authorizes on the end user. Two credentials on the wire would
+        // let the upstream choose between them.
+        let r = overrides(&[], &["authorization"]);
+        let inbound = client(&[("authorization", "Bearer callers-own")]);
         let mut headers = HeaderMap::new();
         headers.insert(
             HeaderName::from_static("authorization"),
             HeaderValue::from_static("Bearer gateway-held-key"),
         );
-        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_caller_jwt(Some("eyJraw"));
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
         apply_request_headers(&mut headers, &ctx);
-        assert_eq!(headers["authorization"], "Bearer eyJraw");
+        assert_eq!(headers["authorization"], "Bearer callers-own");
         assert_eq!(headers.get_all("authorization").iter().count(), 1);
     }
 
     #[test]
-    fn an_api_key_caller_forwards_no_token() {
-        let r = RequestOverrides {
-            forward_jwt_header: Some("authorization".into()),
-            ..Default::default()
-        };
+    fn a_caller_that_sent_nothing_leaves_the_credential_alone() {
+        // The forward is keyed on what the caller actually sent, not on
+        // the configuration: an operator who opts the slot in must not
+        // blank out the gateway's own credential for every caller who
+        // happens not to send one.
+        let r = overrides(&[], &["authorization"]);
+        let inbound = client(&[("x-other", "v")]);
         let mut headers = HeaderMap::new();
         headers.insert(
             HeaderName::from_static("authorization"),
             HeaderValue::from_static("Bearer gateway-held-key"),
         );
-        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_caller_jwt(None);
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
         apply_request_headers(&mut headers, &ctx);
-        // The gateway's own credential is untouched, not replaced by a blank.
         assert_eq!(headers["authorization"], "Bearer gateway-held-key");
     }
 
     #[test]
-    fn a_caller_cannot_fill_the_verified_identity_slot() {
-        // The upstream is told this header carries a gateway-VERIFIED
-        // identity. A caller with no JWT must not be able to put its own
-        // value there, even when the operator's allowlist would otherwise
-        // forward that header.
-        let r = RequestOverrides {
-            forward_jwt_header: Some("x-user-jwt".into()),
-            forward_client_headers: vec!["x-user-jwt".into()],
-            ..Default::default()
-        };
+    fn an_operator_static_header_still_wins_a_forwarded_one() {
+        // Both are operator configuration; the static value is the more
+        // specific statement of intent, and this is the pre-existing
+        // precedence.
+        let r = overrides(&[("x-overlap", "from-operator")], &["x-overlap"]);
+        let inbound = client(&[("x-overlap", "from-client")]);
         let mut headers = HeaderMap::new();
-        let inbound = client(&[("x-user-jwt", "forged.by.the.caller")]);
-        let ctx = UpstreamHeaderContext::from_overrides(Some(&r))
-            .with_client_headers(&inbound)
-            .with_caller_jwt(None);
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
         apply_request_headers(&mut headers, &ctx);
-        assert!(!headers.contains_key("x-user-jwt"), "got: {headers:?}");
+        assert_eq!(headers["x-overlap"], "from-operator");
     }
 
     #[test]
-    fn a_caller_copy_is_replaced_rather_than_joined() {
-        // Same allowlist, but this caller DID authenticate with a JWT: the
-        // verified token wins the slot, and rides alone.
-        let r = RequestOverrides {
-            forward_jwt_header: Some("x-user-jwt".into()),
-            forward_client_headers: vec!["x-user-jwt".into()],
-            ..Default::default()
-        };
+    fn a_default_header_the_gateway_shut_out_does_not_shut_out_the_forward() {
+        // `default_headers` cannot displace a gateway-owned slot, so it
+        // never "won" that name — and must not silently suppress the
+        // forward, which CAN displace it.
+        let r = overrides(&[("authorization", "Bearer static")], &["authorization"]);
+        let inbound = client(&[("authorization", "Bearer callers-own")]);
         let mut headers = HeaderMap::new();
-        let inbound = client(&[("x-user-jwt", "forged.by.the.caller")]);
-        let ctx = UpstreamHeaderContext::from_overrides(Some(&r))
-            .with_client_headers(&inbound)
-            .with_caller_jwt(Some("verified"));
+        headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer gateway-held-key"),
+        );
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
         apply_request_headers(&mut headers, &ctx);
-        assert_eq!(headers["x-user-jwt"], "verified");
-        assert_eq!(headers.get_all("x-user-jwt").iter().count(), 1);
+        assert_eq!(headers["authorization"], "Bearer callers-own");
     }
 
     #[test]
-    fn an_operator_header_does_not_win_the_slot() {
-        // `default_headers` outranks a client header, but not the token:
-        // the slot means "verified identity", so a static operator value
-        // there would be a lie the upstream cannot detect.
-        let r = RequestOverrides {
-            forward_jwt_header: Some("x-user-jwt".into()),
-            default_headers: [("x-user-jwt".to_string(), "static".to_string())]
-                .into_iter()
-                .collect::<HashMap<_, _>>(),
-            ..Default::default()
-        };
+    fn a_call_with_no_client_request_forwards_nothing() {
+        // Background job polls and semantic-routing embedding lookups have
+        // no inbound headers to draw on.
+        let r = overrides(&[], &["*"]);
         let mut headers = HeaderMap::new();
-        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_caller_jwt(Some("verified"));
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r));
         apply_request_headers(&mut headers, &ctx);
-        assert_eq!(headers["x-user-jwt"], "verified");
+        assert!(headers.is_empty(), "got: {headers:?}");
+        assert!(ForwardedClientHeaders::resolve(&ctx).is_empty());
     }
 
     #[test]
-    fn an_unconfigured_provider_key_forwards_no_token() {
-        // The default for every existing ProviderKey: a caller's JWT never
-        // reaches an upstream nobody opted in.
+    fn an_unconfigured_provider_key_forwards_nothing() {
         let r = RequestOverrides::default();
+        let inbound = client(&[("authorization", "Bearer callers-own")]);
         let mut headers = HeaderMap::new();
-        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_caller_jwt(Some("eyJraw"));
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
         apply_request_headers(&mut headers, &ctx);
         assert!(headers.is_empty(), "got: {headers:?}");
     }
 
     #[test]
-    fn forwarded_jwt_is_marked_sensitive() {
-        // `Debug` on the header map is reachable from tracing; a live
+    fn the_claimed_set_is_what_a_credential_site_asks() {
+        let r = overrides(&[], &["authorization", "x-trace-*"]);
+        let inbound = client(&[("authorization", "Bearer c"), ("x-trace-id", "t")]);
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
+        let forwarded = ForwardedClientHeaders::resolve(&ctx);
+        assert!(forwarded.claims("authorization"));
+        assert!(forwarded.claims("x-trace-id"));
+        // Configured but not sent: the site keeps injecting its own.
+        assert!(!forwarded.claims("x-api-key"));
+    }
+
+    #[test]
+    fn a_forwarded_value_is_marked_sensitive() {
+        // `Debug` on the header map is reachable from tracing; a forwarded
         // credential must not be printable through it.
-        let r = RequestOverrides {
-            forward_jwt_header: Some("x-user-jwt".into()),
-            ..Default::default()
-        };
+        let r = overrides(&[], &["authorization"]);
+        let inbound = client(&[("authorization", "Bearer callers-own")]);
         let mut headers = HeaderMap::new();
-        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_caller_jwt(Some("eyJraw"));
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
         apply_request_headers(&mut headers, &ctx);
-        // Pin that the token IS on the wire first: without this, a build
-        // that forwards nothing would satisfy the redaction assertion
-        // below for the wrong reason.
-        assert_eq!(headers["x-user-jwt"], "eyJraw");
-        assert!(
-            !format!("{headers:?}").contains("eyJraw"),
-            "got: {headers:?}"
-        );
+        assert!(headers["authorization"].is_sensitive());
     }
 
     #[test]
@@ -605,12 +469,13 @@ mod tests {
     }
 
     #[test]
-    fn caller_owned_headers_are_never_overwritten() {
-        let r = overrides(&[("x-corp-trace", "operator")], &["x-corp-trace"]);
+    fn a_gateway_owned_header_survives_a_static_operator_one() {
+        // `default_headers` is a fallback, never an override: only the
+        // forward displaces a slot the gateway already filled.
+        let r = overrides(&[("x-corp-trace", "operator")], &[]);
         let mut headers = HeaderMap::new();
         headers.insert("x-corp-trace", HeaderValue::from_static("gateway"));
-        let inbound = client(&[("x-corp-trace", "client")]);
-        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r));
         apply_request_headers(&mut headers, &ctx);
         assert_eq!(headers["x-corp-trace"], "gateway");
     }
@@ -625,24 +490,26 @@ mod tests {
         assert_eq!(headers["x-tenant-id"], "operator");
     }
 
+    /// Credential slots are forwardable — an internal upstream reading the
+    /// caller's own credential is the capability's purpose — but only where
+    /// the gateway has not already claimed the slot, and only with the
+    /// operator's own patterns behind them.
     #[test]
-    fn reserved_auth_headers_are_dropped_from_both_sources() {
-        let r = overrides(
-            &[
-                ("authorization", "Bearer attacker"),
-                ("api-key", "attacker"),
-            ],
-            &["authorization", "x-api-key", "cookie", "*"],
-        );
+    fn credential_slots_reach_an_upstream_the_operator_opted_in() {
+        let r = overrides(&[], &["authorization", "x-api-key", "cookie"]);
         let mut headers = HeaderMap::new();
         let inbound = client(&[
             ("authorization", "Bearer caller"),
             ("x-api-key", "caller"),
             ("cookie", "session=1"),
+            ("x-goog-api-key", "not-allowlisted"),
         ]);
         let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
         apply_request_headers(&mut headers, &ctx);
-        assert!(headers.is_empty(), "leaked: {headers:?}");
+        assert_eq!(headers["authorization"], "Bearer caller");
+        assert_eq!(headers["x-api-key"], "caller");
+        assert_eq!(headers["cookie"], "session=1");
+        assert!(!headers.contains_key("x-goog-api-key"), "got: {headers:?}");
     }
 
     #[test]
@@ -662,30 +529,42 @@ mod tests {
         assert_eq!(headers["x-keep"], "yes");
     }
 
-    // AISIX-Cloud#1279: the caller's W3C trace context must never reach a
-    // provider — not under a `*` glob, and not even when an allowlist names
-    // the headers outright. The gateway is a fresh tracing hop; a future
-    // provider-side propagation opt-in injects the gateway's OWN context.
+    // AISIX-Cloud#1279: the caller's W3C trace context must not reach a
+    // provider under a GLOB. The gateway is a fresh tracing hop, and an
+    // operator asking for their own `x-*` headers is not asking to graft
+    // one tenant's trace onto a third party's telemetry. Naming the
+    // headers outright IS that request, and is honoured.
     #[test]
-    fn trace_context_headers_are_never_forwarded() {
-        for allowlist in [&["*"][..], &["traceparent", "tracestate"][..]] {
-            let patterns: Vec<&str> = allowlist.to_vec();
+    fn trace_context_needs_its_own_name_not_a_glob() {
+        let inbound = client(&[
+            (
+                "traceparent",
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            ),
+            ("tracestate", "vendor=x"),
+        ]);
+
+        for glob in [&["*"][..], &["trace*"][..]] {
+            let patterns: Vec<&str> = glob.to_vec();
             let r = overrides(&[], &patterns);
             let mut headers = HeaderMap::new();
-            let inbound = client(&[
-                (
-                    "traceparent",
-                    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-                ),
-                ("tracestate", "vendor=x"),
-            ]);
             let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
             apply_request_headers(&mut headers, &ctx);
             assert!(
                 headers.is_empty(),
-                "trace context leaked under {allowlist:?}: {headers:?}"
+                "trace context leaked under {glob:?}: {headers:?}"
             );
         }
+
+        let r = overrides(&[], &["traceparent", "tracestate"]);
+        let mut headers = HeaderMap::new();
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
+        apply_request_headers(&mut headers, &ctx);
+        assert_eq!(
+            headers["traceparent"],
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
+        assert_eq!(headers["tracestate"], "vendor=x");
     }
 
     #[test]

@@ -126,16 +126,16 @@ const API_KEY_HEADER: &str = "x-api-key";
 /// token the gateway mints itself — and none of them is ever exposed to the
 /// calling agent, which presents only its AISIX key.
 ///
-/// Relaying the CALLER's own token is a separate, opt-in mechanism
-/// ([`McpUpstream::forwarded_jwt`], from the server's `forward_jwt_header`),
-/// never a property of this enum. The normative rule it has to respect is
-/// the audience one — a server "MUST only accept tokens specifically
-/// intended for themselves" (MCP authorization, 2025-06-18 and later) — so
-/// relaying is for an internal server that reads the claims of a token its
-/// own identity provider issued, not for one that validates `aud` against
-/// itself. There is no normative prohibition on the relay itself; the
-/// "token passthrough is forbidden" wording lives in a non-normative
-/// security best-practices guide.
+/// Relaying the CALLER's own credentials is a separate, opt-in mechanism
+/// ([`McpUpstream::forwarded_client_headers`], from the server's
+/// `forward_client_headers`), never a property of this enum. The normative
+/// rule it has to respect is the audience one — a server "MUST only accept
+/// tokens specifically intended for themselves" (MCP authorization,
+/// 2025-06-18 and later) — so relaying is for an internal server that reads
+/// the claims of a token its own identity provider issued, not for one that
+/// validates `aud` against itself. There is no normative prohibition on the
+/// relay itself; the "token passthrough is forbidden" wording lives in a
+/// non-normative security best-practices guide.
 #[derive(Clone)]
 pub enum McpAuth {
     /// No upstream auth — the server is reachable as-is.
@@ -228,16 +228,15 @@ pub struct McpUpstream {
     /// Protocol revision the session is opened with. Defaults to the
     /// legacy `initialize` handshake.
     pub protocol: McpProtocol,
-    /// Header name and value delivering the calling agent's own verified
-    /// JWT, for an internal server that authorizes on the end user's
-    /// claims (the server's `forward_jwt_header`, resolved per request by
-    /// `aisix_core::forwarded_jwt`). `None` when the server does not
-    /// configure it or the agent authenticated with an API key.
+    /// Inbound client headers this server's `forward_client_headers`
+    /// admits, resolved per request against the calling agent's own
+    /// request. Empty when the server configures none, or when nothing the
+    /// agent sent matched.
     ///
     /// Independent of `auth`, which stays the gateway's own credential —
-    /// except when both name the same header, where the caller's token
+    /// except when both name the same header, where the forwarded value
     /// wins and the gateway's is not sent at all.
-    pub forwarded_jwt: Option<(String, String)>,
+    pub forwarded_client_headers: Vec<(HeaderName, HeaderValue)>,
 }
 
 // Manual so a `Bearer` token cannot leak through `McpUpstream`'s `Debug`
@@ -250,11 +249,14 @@ impl std::fmt::Debug for McpUpstream {
             .field("timeout", &self.timeout)
             .field("protocol", &self.protocol)
             .field(
-                "forwarded_jwt",
+                // Names only: a forwarded header may be the caller's own
+                // credential.
+                "forwarded_client_headers",
                 &self
-                    .forwarded_jwt
-                    .as_ref()
-                    .map(|(name, _)| format!("{name}: ***redacted***")),
+                    .forwarded_client_headers
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
             )
             .finish()
     }
@@ -268,14 +270,17 @@ impl McpUpstream {
             auth: McpAuth::None,
             timeout: DEFAULT_UPSTREAM_TIMEOUT,
             protocol: McpProtocol::default(),
-            forwarded_jwt: None,
+            forwarded_client_headers: Vec::new(),
         }
     }
 
-    /// Deliver the calling agent's verified JWT, as already resolved to a
-    /// header name and value by `aisix_core::forwarded_jwt`.
-    pub fn with_forwarded_jwt(mut self, forwarded: Option<(String, String)>) -> Self {
-        self.forwarded_jwt = forwarded;
+    /// Deliver the client headers this server forwards, as already
+    /// resolved against the inbound request.
+    pub fn with_forwarded_client_headers(
+        mut self,
+        forwarded: Vec<(HeaderName, HeaderValue)>,
+    ) -> Self {
+        self.forwarded_client_headers = forwarded;
         self
     }
 
@@ -402,36 +407,29 @@ impl RmcpBridge {
             // connection settings — `from_uri`/`from_config` would build
             // rmcp's own default client with none of them — and through
             // `transport_config` for the pinned transport defaults.
-            // Gateway credential and caller JWT are resolved into one
-            // header set rather than one arm each, because they can name
-            // the same slot: an operator who points `forward_jwt_header`
-            // at `authorization` is choosing the end user's token over the
-            // gateway's, and the upstream must receive exactly one of them.
+            // Gateway credential and forwarded client headers are
+            // resolved into one header set rather than one arm each,
+            // because they can name the same slot: an operator who lists
+            // `authorization` in `forward_client_headers` is choosing the
+            // caller's own credential over the gateway's, and the upstream
+            // must receive exactly one of them.
             //
-            // Resolved before anything reads the slot, so suppressing the
-            // gateway credential and delivering the token cannot disagree:
-            // a token that cannot become a header does not claim the slot,
-            // and the server keeps the credential it would otherwise have
-            // had. `set_sensitive` marks the value opaque to `Debug`
-            // formatting of the header map.
-            let forwarded = upstream.forwarded_jwt.as_ref().and_then(|(name, value)| {
-                let name = HeaderName::try_from(name.as_str()).ok()?;
-                let mut value = HeaderValue::from_str(value).ok()?;
-                value.set_sensitive(true);
-                Some((name, value))
-            });
-            let jwt_slot = forwarded.as_ref().map(|(name, _)| name.as_str());
+            // The claimed set is read before anything fills a slot, so
+            // suppressing the gateway credential and delivering the
+            // forwarded value cannot disagree.
+            let forwarded = &upstream.forwarded_client_headers;
+            let claims = |name: &str| forwarded.iter().any(|(n, _)| n.as_str() == name);
             let mut custom: HashMap<HeaderName, HeaderValue> = HashMap::new();
             let mut auth_header: Option<String> = None;
             match &upstream.auth {
                 McpAuth::None => {}
                 McpAuth::Bearer(token) => {
-                    if jwt_slot != Some("authorization") {
+                    if !claims("authorization") {
                         auth_header = Some(token.clone());
                     }
                 }
                 McpAuth::ApiKey(key) => {
-                    if jwt_slot != Some(API_KEY_HEADER) {
+                    if !claims(API_KEY_HEADER) {
                         // A key with non-header-safe bytes is a clean config error,
                         // not a panic — and the key itself never enters the message.
                         let mut value = HeaderValue::from_str(key).map_err(|_| {
@@ -446,17 +444,17 @@ impl RmcpBridge {
                     }
                 }
                 McpAuth::OAuth2(cfg) => {
-                    // Minted only when it will actually be sent: a token the
-                    // caller's JWT is about to displace is a round trip to the
-                    // identity provider whose only possible effect is failing
-                    // a request that did not need it.
-                    if jwt_slot != Some("authorization") {
+                    // Minted only when it will actually be sent: a token a
+                    // forwarded header is about to displace is a round trip
+                    // to the identity provider whose only possible effect is
+                    // failing a request that did not need it.
+                    if !claims("authorization") {
                         auth_header = Some(crate::oauth::get_or_fetch(cfg).await?);
                     }
                 }
             }
-            if let Some((name, value)) = forwarded {
-                custom.insert(name, value);
+            for (name, value) in forwarded {
+                custom.insert(name.clone(), value.clone());
             }
             let mut config = transport_config(&upstream.url);
             if let Some(token) = auth_header {
@@ -732,6 +730,34 @@ pub(crate) fn warn_cleartext_credential(server: &McpServer) {
     }
 }
 
+/// Header slots the MCP transport itself owns on this hop.
+///
+/// `mcp-session-id`, `mcp-protocol-version` and `last-event-id` name the
+/// session the CALLER holds with this gateway, not the one the gateway
+/// opens upstream — and rmcp rejects a custom value for them outright, so
+/// forwarding a caller's copy stops the upstream connecting at all rather
+/// than merely misidentifying anyone.
+pub const MCP_PROTOCOL_HEADERS: &[&str] =
+    &["last-event-id", "mcp-protocol-version", "mcp-session-id"];
+
+/// The inbound client headers `server` forwards out of `client_headers`.
+///
+/// `None` — a gateway built from the snapshot alone, with no request
+/// behind it — forwards nothing.
+pub fn forwarded_client_headers(
+    server: &McpServer,
+    client_headers: Option<&http::HeaderMap>,
+) -> Vec<(HeaderName, HeaderValue)> {
+    let Some(client) = client_headers else {
+        return Vec::new();
+    };
+    aisix_core::resolve_forwarded_client_headers(
+        &server.forward_client_headers,
+        client,
+        MCP_PROTOCOL_HEADERS,
+    )
+}
+
 pub fn upstream_from_mcp_server(server: &McpServer) -> McpUpstream {
     let auth = match server.auth_type {
         McpAuthType::None => McpAuth::None,
@@ -760,10 +786,10 @@ pub fn upstream_from_mcp_server(server: &McpServer) -> McpUpstream {
         auth,
         timeout,
         protocol,
-        // Per-caller, so it is attached by the gateway that knows who is
-        // calling (`McpGateway::from_snapshot_for_caller`), not derived
-        // from the stored server row here.
-        forwarded_jwt: None,
+        // Per-request, so it is attached by the gateway that holds the
+        // inbound headers (`McpGateway::from_snapshot_for_request`), not
+        // derived from the stored server row here.
+        forwarded_client_headers: Vec::new(),
     }
 }
 

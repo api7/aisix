@@ -43,7 +43,9 @@ use rmcp::{RoleServer, ServerHandler};
 use aisix_core::models::{ApiKey, McpPolicy, McpPolicyScope, McpServerType};
 use aisix_core::{AisixSnapshot, ResourceEntry};
 
-use crate::bridge::{upstream_from_mcp_server, EphemeralBridge, McpBridge};
+use crate::bridge::{
+    forwarded_client_headers, upstream_from_mcp_server, EphemeralBridge, McpBridge,
+};
 use crate::openapi::OpenApiBridge;
 
 /// Separator between an upstream server's registered name and a tool name in
@@ -347,19 +349,22 @@ impl McpGateway {
     /// iteration order; duplicate names are deduped (first wins) by
     /// [`McpGateway::new`], though the Admin API already enforces uniqueness.
     pub fn from_snapshot(snapshot: &AisixSnapshot) -> Self {
-        Self::from_snapshot_for_caller(snapshot, None)
+        Self::from_snapshot_for_request(snapshot, None)
     }
 
-    /// [`McpGateway::from_snapshot`], additionally delivering `caller_jwt`
-    /// — the verified token the calling agent authenticated with — to
-    /// every registered server that configures `forward_jwt_header`.
+    /// [`McpGateway::from_snapshot`], additionally forwarding the inbound
+    /// request's headers to every registered server whose
+    /// `forward_client_headers` admits them.
     ///
-    /// Separate from the plain constructor because the caller is a
+    /// Separate from the plain constructor because the headers are a
     /// property of the REQUEST, not of the snapshot: the `/mcp` handler
-    /// builds a gateway per request and is the only place that knows who
-    /// is calling. `None` (no JWT, or an API-key caller) is exactly the
-    /// pre-existing behaviour on every server.
-    pub fn from_snapshot_for_caller(snapshot: &AisixSnapshot, caller_jwt: Option<&str>) -> Self {
+    /// builds a gateway per request and is the only place that holds them.
+    /// `None` forwards nothing, which is what every server does by
+    /// default.
+    pub fn from_snapshot_for_request(
+        snapshot: &AisixSnapshot,
+        client_headers: Option<&http::HeaderMap>,
+    ) -> Self {
         let upstreams = snapshot
             .mcp_servers
             .entries()
@@ -371,18 +376,15 @@ impl McpGateway {
                 // cleartext warning covers both.
                 crate::bridge::warn_cleartext_credential(&entry.value);
                 let name = entry.value.name.clone();
-                let forwarded = aisix_core::forwarded_jwt(
-                    entry.value.forward_jwt_header.as_deref(),
-                    caller_jwt,
-                );
+                let forwarded = forwarded_client_headers(&entry.value, client_headers);
                 let bridge: Arc<dyn McpBridge> = match entry.value.server_type {
                     McpServerType::Mcp => {
-                        let upstream =
-                            upstream_from_mcp_server(&entry.value).with_forwarded_jwt(forwarded);
+                        let upstream = upstream_from_mcp_server(&entry.value)
+                            .with_forwarded_client_headers(forwarded);
                         Arc::new(EphemeralBridge::new(upstream))
                     }
                     McpServerType::Openapi => {
-                        Arc::new(OpenApiBridge::new(entry).with_forwarded_jwt(forwarded))
+                        Arc::new(OpenApiBridge::new(entry).with_forwarded_client_headers(forwarded))
                     }
                 };
                 (name, bridge)
@@ -396,15 +398,15 @@ impl McpGateway {
     /// registered or is disabled — a disabled server is treated as absent,
     /// same as the aggregated endpoint skipping it.
     pub fn from_snapshot_scoped(snapshot: &AisixSnapshot, server: &str) -> Option<Self> {
-        Self::from_snapshot_scoped_for_caller(snapshot, server, None)
+        Self::from_snapshot_scoped_for_request(snapshot, server, None)
     }
 
-    /// [`McpGateway::from_snapshot_scoped`], delivering `caller_jwt` the
-    /// same way [`McpGateway::from_snapshot_for_caller`] does.
-    pub fn from_snapshot_scoped_for_caller(
+    /// [`McpGateway::from_snapshot_scoped`], forwarding client headers the
+    /// same way [`McpGateway::from_snapshot_for_request`] does.
+    pub fn from_snapshot_scoped_for_request(
         snapshot: &AisixSnapshot,
         server: &str,
-        caller_jwt: Option<&str>,
+        client_headers: Option<&http::HeaderMap>,
     ) -> Option<Self> {
         let entry = snapshot.mcp_servers.get_by_name(server)?;
         if !entry.value.enabled {
@@ -412,15 +414,15 @@ impl McpGateway {
         }
         crate::bridge::warn_cleartext_credential(&entry.value);
         let name = entry.value.name.clone();
-        let forwarded =
-            aisix_core::forwarded_jwt(entry.value.forward_jwt_header.as_deref(), caller_jwt);
+        let forwarded = forwarded_client_headers(&entry.value, client_headers);
         let bridge: Arc<dyn McpBridge> = match entry.value.server_type {
             McpServerType::Mcp => {
-                let upstream = upstream_from_mcp_server(&entry.value).with_forwarded_jwt(forwarded);
+                let upstream =
+                    upstream_from_mcp_server(&entry.value).with_forwarded_client_headers(forwarded);
                 Arc::new(EphemeralBridge::new(upstream))
             }
             McpServerType::Openapi => {
-                Arc::new(OpenApiBridge::new(entry).with_forwarded_jwt(forwarded))
+                Arc::new(OpenApiBridge::new(entry).with_forwarded_client_headers(forwarded))
             }
         };
         let foreign = snapshot

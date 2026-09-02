@@ -676,28 +676,20 @@ impl RealIpConfig {
     }
 }
 
-/// Headers an operator's `default_headers` block may never set, that are
-/// never forwarded from a client, and that a caller-supplied request id may
+/// Headers that carry a credential, which a caller-supplied request id may
 /// never be read out of.
 ///
-/// The auth entries are the credentials each bridge mints for itself: letting
-/// config override them would swap the gateway's upstream identity for an
-/// attacker-supplied one. The last three are host-routing / session /
-/// proxy-auth headers that no provider auth scheme uses but that are still
-/// dangerous to hand to config.
+/// The id a caller sends becomes THE id for the request: it is echoed in
+/// the `x-aisix-request-id` response header, written to the logs and
+/// telemetry, and sent upstream. Reading it out of `authorization` would
+/// disclose the caller's secret through all three.
 ///
-/// cp-api rejects these at write time
-/// (`internal/cpapi/resources/provider_key_overrides.go`); this list is the
-/// runtime half of that pair, and the two must stay in sync.
-///
-/// Lives here rather than in `aisix-gateway` (which re-exports it as
-/// `upstream_headers::RESERVED_UPSTREAM_HEADERS`) so that [`Config::validate`]
-/// can enforce it too: naming one of these in
-/// `proxy.request_id.accept_headers` would turn the caller's credential into
-/// the request id, which the gateway then writes to its logs and telemetry,
-/// returns in `x-aisix-request-id`, and sends upstream — routing around this
-/// very guard by a different door.
-pub const RESERVED_UPSTREAM_HEADERS: &[&str] = &[
+/// This is NOT the upstream-forwarding guard — that lives in
+/// [`crate::forwarded_headers`], and is deliberately much narrower:
+/// handing an internal upstream the caller's own credential is a
+/// supported, operator-declared capability, while turning that credential
+/// into a logged identifier is never useful.
+pub const CREDENTIAL_HEADERS: &[&str] = &[
     "authorization",        // OpenAI / Anthropic / Vertex Bearer
     "x-api-key",            // Anthropic raw, also OpenAI legacy proxies
     "x-goog-api-key",       // Gemini API key
@@ -745,7 +737,7 @@ impl Default for RequestIdConfig {
 
 impl RequestIdConfig {
     /// Parse `accept_headers` into header names, rejecting malformed entries
-    /// and any name in [`RESERVED_UPSTREAM_HEADERS`]. Header names are
+    /// and any name in [`CREDENTIAL_HEADERS`]. Header names are
     /// case-insensitive on the wire, so the parse also lowercases and gives
     /// the proxy ready-to-use keys.
     ///
@@ -761,7 +753,7 @@ impl RequestIdConfig {
                     .trim()
                     .parse::<http::HeaderName>()
                     .map_err(|_| s.clone())?;
-                if RESERVED_UPSTREAM_HEADERS.contains(&name.as_str()) {
+                if CREDENTIAL_HEADERS.contains(&name.as_str()) {
                     return Err(s.clone());
                 }
                 // W3C trace-context headers can't be request-id sources
@@ -1654,7 +1646,7 @@ impl Config {
                 "proxy.request_id.accept_headers rejects {bad:?}: not a valid HTTP \
                  header name, or a reserved header a request id must never be read \
                  from ({})",
-                RESERVED_UPSTREAM_HEADERS.join(", ")
+                CREDENTIAL_HEADERS.join(", ")
             )));
         }
         // Zero workers would bind no listener at all: the proxy would
@@ -1853,11 +1845,10 @@ admin:
     // A request id read out of a credential header would be echoed to the
     // caller, written to the logs and telemetry, and sent upstream as
     // `x-aisix-request-id` — disclosing the caller's secret through all
-    // three, and walking around the RESERVED_UPSTREAM_HEADERS guard by a
-    // different door. Every reserved name must fail the boot.
+    // three. Every credential-bearing name must fail the boot.
     #[test]
     fn request_id_accept_headers_rejects_credential_headers() {
-        for reserved in RESERVED_UPSTREAM_HEADERS {
+        for reserved in CREDENTIAL_HEADERS {
             for spelling in [reserved.to_string(), reserved.to_uppercase()] {
                 let f = write_yaml(&format!(
                     r#"

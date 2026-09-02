@@ -11,9 +11,11 @@
 /// computes them per-request from the canonical request, and an
 /// operator-supplied override would invalidate the signature.
 ///
-/// Same defense-in-depth pattern as OpenAiBridge's
-/// `RESERVED_UPSTREAM_HEADERS` — cp-api should reject these at write
-/// time, but the DP enforces it again at apply time.
+/// Unlike every other upstream, where naming a credential slot is the
+/// point of `default_headers` / `forward_client_headers`, these are
+/// DERIVED by the signer from the request it signs — a configured value
+/// authenticates nobody here. `filtered_extra_headers` drops them with a
+/// warning rather than letting the first-wins interceptor swallow them.
 pub(crate) fn reserved_sigv4_headers() -> &'static [&'static str] {
     &[
         // SigV4 canonical headers — the signer computes / derives all of

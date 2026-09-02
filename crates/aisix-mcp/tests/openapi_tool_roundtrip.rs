@@ -335,9 +335,9 @@ async fn broken_spec_degrades_gracefully_next_to_healthy_servers() {
     client.cancel().await.ok();
 }
 
-/// A fake internal system server that reports back the identity headers it
+/// A fake internal system server that reports back the headers it
 /// received — the P4-04 shape: a REST API registered as tools, authorizing
-/// on the end user's claims rather than on the gateway's credential.
+/// on the caller's own credential rather than on the gateway's.
 async fn spawn_claims_api() -> SocketAddr {
     let app = axum::Router::new().route(
         "/v1/whoami",
@@ -352,7 +352,17 @@ async fn spawn_claims_api() -> SocketAddr {
                 .iter()
                 .filter_map(|v| v.to_str().ok().map(str::to_string))
                 .collect();
-            Json(json!({ "user_jwt": jwt, "authorizations": authorizations })).into_response()
+            let session = headers
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            Json(json!({
+                "user_jwt": jwt,
+                "authorizations": authorizations,
+                "mcp_session_id": session,
+            }))
+            .into_response()
         }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -377,13 +387,24 @@ fn whoami_spec() -> Value {
     })
 }
 
-/// Drive a tool call through the gateway as a JWT-authenticated caller and
-/// read back what the REST API actually received.
-async fn whoami_via_gateway(config: Value, caller_jwt: Option<&str>) -> Value {
+/// Drive a tool call through the gateway with `client` as the inbound
+/// request's headers, and read back what the REST API actually received.
+async fn whoami_via_gateway(config: Value, client: &[(&str, &str)]) -> Value {
     let snapshot = AisixSnapshot::new();
     snapshot.mcp_servers.insert(openapi_entry("claims", config));
 
-    let gw = spawn_gateway(McpGateway::from_snapshot_for_caller(&snapshot, caller_jwt)).await;
+    let mut inbound = http::HeaderMap::new();
+    for (k, v) in client {
+        inbound.insert(
+            http::HeaderName::try_from(*k).expect("header name"),
+            http::HeaderValue::from_str(v).expect("header value"),
+        );
+    }
+    let gw = spawn_gateway(McpGateway::from_snapshot_for_request(
+        &snapshot,
+        Some(&inbound),
+    ))
+    .await;
     let client = ()
         .serve(StreamableHttpClientTransport::from_uri(format!(
             "http://{gw}/mcp"
@@ -399,7 +420,7 @@ async fn whoami_via_gateway(config: Value, caller_jwt: Option<&str>) -> Value {
 }
 
 #[tokio::test]
-async fn caller_jwt_reaches_a_rest_api_exposed_as_tools() {
+async fn a_forwarded_client_header_reaches_a_rest_api_exposed_as_tools() {
     let api = spawn_claims_api().await;
     let seen = whoami_via_gateway(
         json!({
@@ -407,16 +428,16 @@ async fn caller_jwt_reaches_a_rest_api_exposed_as_tools() {
             "type": "openapi",
             "url": format!("http://{api}/v1"),
             "spec": whoami_spec(),
-            "forward_jwt_header": "x-user-jwt",
+            "forward_client_headers": ["x-user-jwt"],
         }),
-        Some("eyJhbGciOi.caller"),
+        &[("x-user-jwt", "eyJhbGciOi.caller")],
     )
     .await;
     assert_eq!(seen["user_jwt"], "eyJhbGciOi.caller");
 }
 
 #[tokio::test]
-async fn caller_jwt_replaces_the_gateway_credential_in_the_same_slot() {
+async fn a_forwarded_header_replaces_the_gateway_credential_in_the_same_slot() {
     let api = spawn_claims_api().await;
     let seen = whoami_via_gateway(
         json!({
@@ -426,20 +447,20 @@ async fn caller_jwt_replaces_the_gateway_credential_in_the_same_slot() {
             "spec": whoami_spec(),
             "auth_type": "bearer",
             "secret": "gateway-held-secret",
-            "forward_jwt_header": "authorization",
+            "forward_client_headers": ["authorization"],
         }),
-        Some("eyJhbGciOi.caller"),
+        &[("authorization", "Bearer eyJhbGciOi.caller")],
     )
     .await;
     assert_eq!(
         seen["authorizations"],
         json!(["Bearer eyJhbGciOi.caller"]),
-        "the caller's token replaces the gateway's, and rides alone"
+        "the caller's credential replaces the gateway's, and rides alone"
     );
 }
 
 #[tokio::test]
-async fn an_api_key_caller_sends_no_token_and_keeps_the_gateway_credential() {
+async fn a_caller_that_sent_nothing_keeps_the_gateway_credential() {
     let api = spawn_claims_api().await;
     let seen = whoami_via_gateway(
         json!({
@@ -449,21 +470,21 @@ async fn an_api_key_caller_sends_no_token_and_keeps_the_gateway_credential() {
             "spec": whoami_spec(),
             "auth_type": "bearer",
             "secret": "gateway-held-secret",
-            "forward_jwt_header": "authorization",
+            "forward_client_headers": ["authorization"],
         }),
-        None,
+        &[],
     )
     .await;
     assert_eq!(seen["user_jwt"], "");
     assert_eq!(
         seen["authorizations"],
         json!(["Bearer gateway-held-secret"]),
-        "with no caller token the gateway's own credential still goes"
+        "an opted-in slot the caller left empty keeps the gateway's own credential"
     );
 }
 
 #[tokio::test]
-async fn a_server_without_the_field_forwards_no_caller_token() {
+async fn a_server_without_the_field_forwards_nothing() {
     let api = spawn_claims_api().await;
     let seen = whoami_via_gateway(
         json!({
@@ -472,7 +493,10 @@ async fn a_server_without_the_field_forwards_no_caller_token() {
             "url": format!("http://{api}/v1"),
             "spec": whoami_spec(),
         }),
-        Some("eyJhbGciOi.caller"),
+        &[
+            ("x-user-jwt", "eyJhbGciOi.caller"),
+            ("authorization", "Bearer eyJhbGciOi.caller"),
+        ],
     )
     .await;
     assert_eq!(seen["user_jwt"], "");
@@ -480,28 +504,21 @@ async fn a_server_without_the_field_forwards_no_caller_token() {
 }
 
 #[tokio::test]
-async fn a_token_that_cannot_be_a_header_leaves_the_gateway_credential_alone() {
+async fn the_mcp_session_slots_are_never_forwarded() {
     let api = spawn_claims_api().await;
-    // Verified tokens are base64url and so always header-safe; the point of
-    // the assertion is that the two halves of the slot decision are taken
-    // together, so no future token source can suppress the gateway's
-    // credential without replacing it.
+    // The caller's own session with THIS gateway. Forwarding it names a
+    // session the upstream never opened, and an MCP upstream rejects a
+    // foreign value outright — so no pattern reaches these.
     let seen = whoami_via_gateway(
         json!({
             "name": "claims",
             "type": "openapi",
             "url": format!("http://{api}/v1"),
             "spec": whoami_spec(),
-            "auth_type": "bearer",
-            "secret": "gateway-held-secret",
-            "forward_jwt_header": "authorization",
+            "forward_client_headers": ["*"],
         }),
-        Some("eyJhbGciOi\ncaller"),
+        &[("mcp-session-id", "callers-own-session")],
     )
     .await;
-    assert_eq!(
-        seen["authorizations"],
-        json!(["Bearer gateway-held-secret"]),
-        "an undeliverable token must not cost the request its only credential"
-    );
+    assert_eq!(seen["mcp_session_id"], "");
 }

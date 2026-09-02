@@ -20,7 +20,7 @@ pub mod config;
 pub mod config_status;
 pub mod error;
 pub mod filesource;
-pub mod forwarded_jwt;
+pub mod forwarded_headers;
 pub mod header_template;
 pub mod models;
 pub mod resource;
@@ -33,7 +33,7 @@ pub use config::{
     AdminConfig, CacheBackend, CacheConfig, ClientTypeRule, Config, EtcdConfig, EtcdTlsConfig,
     HistogramBucketsConfig, ManagedConfig, ObservabilityConfig, ProxyConfig, RateLimitBackend,
     RateLimitConfig, RealIpConfig, RedisConnConfig, RedisMode, RequestIdConfig, TlsConfig,
-    UrlRewriteRule, RESERVED_UPSTREAM_HEADERS,
+    UrlRewriteRule, CREDENTIAL_HEADERS,
 };
 pub use config_status::{
     hash_bytes, hash_entries, AppliedSnapshot, ConfigMetricsView, ConfigRejectionSnapshot,
@@ -43,7 +43,11 @@ pub use config_status::{
 pub use error::{
     AdminError, AdminErrorEnvelope, BootstrapError, ProxyError, ProxyErrorEnvelope, RateLimitScope,
 };
-pub use forwarded_jwt::{forwarded_jwt, forwarded_jwt_slot_rejected, NON_SENDER_HEADER_SLOTS};
+pub use forwarded_headers::{
+    client_header_forwardable, forward_pattern_admits, header_forward_blocked,
+    resolve_forwarded_client_headers, EXACT_MATCH_ONLY_HEADERS, GATEWAY_HEADER_PREFIX,
+    NEVER_FORWARD_FROM_CLIENT, NEVER_FORWARD_FROM_CLIENT_PREFIXES, NON_FORWARDABLE_HEADERS,
+};
 pub use header_template::{render_header_template, HeaderVars, HEADER_TEMPLATE_VARS};
 pub use models::{
     validate_a2a_agent, validate_apikey, validate_cache_policy, validate_guardrail,

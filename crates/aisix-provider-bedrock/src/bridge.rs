@@ -413,31 +413,35 @@ fn build_client(
 }
 
 /// Resolve the ProviderKey's extra headers (rendered `default_headers` plus
-/// allowlisted client headers) and drop the SigV4-owned names
+/// forwarded client headers) and drop the SigV4-owned names
 /// ([`wire::reserved_sigv4_headers`]) before they reach the signing
-/// interceptor. cp-api SHOULD reject those at write time (#302 §5), but the DP
-/// enforces it again here as defense-in-depth — an override naming e.g.
-/// `x-amz-date` or `authorization` must never perturb the signature. Matching
-/// is case-insensitive (HTTP header names are).
+/// interceptor. Matching is case-insensitive (HTTP header names are).
+///
+/// This is the ONE place SigV4's inputs are protected. Everywhere else in
+/// the gateway an operator who names a header on a specific upstream gets
+/// it, credential slots included — but here the signer DERIVES
+/// `authorization` and the `x-amz-*` inputs from the canonical request, so
+/// a supplied value does not authenticate anyone: it either loses to the
+/// signer or breaks the signature. The interceptor that consumes this list
+/// is FIRST-WINS (see `intercept` below), the opposite of every other
+/// delivery site, so the value would vanish with no failure to look at.
+/// It is dropped here instead, with a warning, so the operator can see it.
 fn filtered_extra_headers(hdr: &UpstreamHeaderContext<'_>) -> Vec<(String, String)> {
     let reserved = wire::reserved_sigv4_headers();
-    // The caller's JWT rides the same filter: an internal Bedrock-shaped
-    // upstream can be handed the end user's token, but never in a slot
-    // SigV4 signs over — `authorization` there would invalidate the
-    // signature rather than authenticate anyone.
-    //
-    // The interceptor that consumes this is FIRST-WINS (see `intercept`
-    // below), the opposite of every other delivery site, so the slot is
-    // cleared out of the operator/client headers rather than the token
-    // being appended after them. Clearing is unconditional: with a slot
-    // configured and no token to relay, a caller's own copy must not reach
-    // an upstream that was told this header carries a verified identity.
-    let jwt_slot = aisix_gateway::forwarded_jwt_slot(hdr);
     aisix_gateway::resolve_extra_headers(hdr)
         .into_iter()
-        .filter(|(name, _)| jwt_slot.as_ref() != Some(name))
-        .chain(aisix_gateway::forwarded_jwt_header(hdr))
-        .filter(|(name, _)| !reserved.contains(&name.as_str()))
+        .filter(|(name, _)| {
+            if reserved.contains(&name.as_str()) {
+                tracing::warn!(
+                    header = %name,
+                    "header not sent to a Bedrock upstream: AWS SigV4 derives this \
+                     header from the request it signs, so a configured value would \
+                     break the signature rather than reach the upstream"
+                );
+                return false;
+            }
+            true
+        })
         .map(|(name, value)| {
             (
                 name.as_str().to_string(),
@@ -4709,14 +4713,13 @@ mod tests {
 }
 
 #[cfg(test)]
-mod forwarded_jwt_tests {
+mod forwarded_header_tests {
     use super::*;
     use aisix_core::RequestOverrides;
     use std::collections::HashMap;
 
-    fn overrides(slot: &str, defaults: &[(&str, &str)], forward: &[&str]) -> RequestOverrides {
+    fn overrides(defaults: &[(&str, &str)], forward: &[&str]) -> RequestOverrides {
         RequestOverrides {
-            forward_jwt_header: Some(slot.to_string()),
             default_headers: defaults
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -4737,52 +4740,42 @@ mod forwarded_jwt_tests {
         map
     }
 
+    #[test]
+    fn a_forwarded_header_reaches_the_interceptor() {
+        let r = overrides(&[], &["x-user-jwt"]);
+        let inbound = header_map(&[("x-user-jwt", "callers-own")]);
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
+        assert_eq!(
+            filtered_extra_headers(&ctx),
+            vec![("x-user-jwt".to_string(), "callers-own".to_string())]
+        );
+    }
+
     /// The interceptor that consumes this list is FIRST-WINS, unlike every
-    /// other delivery site, so an operator's static header of the same name
-    /// would otherwise shadow the verified token.
+    /// other delivery site, so the two features must already be ordered by
+    /// the time they get here: an operator's static header wins.
     #[test]
-    fn the_token_outranks_an_operator_header_of_the_same_name() {
-        let r = overrides("x-user-jwt", &[("x-user-jwt", "static")], &[]);
-        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_caller_jwt(Some("verified"));
-        let headers = filtered_extra_headers(&ctx);
+    fn an_operator_header_outranks_a_forwarded_one_of_the_same_name() {
+        let r = overrides(&[("x-user-jwt", "static")], &["x-user-jwt"]);
+        let inbound = header_map(&[("x-user-jwt", "callers-own")]);
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
         assert_eq!(
-            headers,
-            vec![("x-user-jwt".to_string(), "verified".to_string())]
+            filtered_extra_headers(&ctx),
+            vec![("x-user-jwt".to_string(), "static".to_string())]
         );
     }
 
+    /// The SigV4 filter is this bridge's own, narrower rule: the signer
+    /// DERIVES these headers, so a configured value cannot authenticate
+    /// anyone here — unlike every other upstream, where naming a credential
+    /// slot is exactly the point.
     #[test]
-    fn the_token_outranks_a_caller_header_of_the_same_name() {
-        let r = overrides("x-user-jwt", &[], &["x-user-jwt"]);
-        let inbound = header_map(&[("x-user-jwt", "forged.by.the.caller")]);
-        let ctx = UpstreamHeaderContext::from_overrides(Some(&r))
-            .with_client_headers(&inbound)
-            .with_caller_jwt(Some("verified"));
-        let headers = filtered_extra_headers(&ctx);
-        assert_eq!(
-            headers,
-            vec![("x-user-jwt".to_string(), "verified".to_string())]
-        );
-    }
-
-    /// With no token to relay, the caller's own copy must not reach an
-    /// upstream that was told this slot carries a verified identity.
-    #[test]
-    fn an_api_key_caller_cannot_fill_the_slot() {
-        let r = overrides("x-user-jwt", &[], &["x-user-jwt"]);
-        let inbound = header_map(&[("x-user-jwt", "forged.by.the.caller")]);
-        let ctx = UpstreamHeaderContext::from_overrides(Some(&r))
-            .with_client_headers(&inbound)
-            .with_caller_jwt(None);
-        assert!(filtered_extra_headers(&ctx).is_empty());
-    }
-
-    /// The SigV4 filter still applies: a token can never land in a signed
-    /// slot, whatever the operator names.
-    #[test]
-    fn a_signed_slot_is_still_refused() {
-        let r = overrides("authorization", &[], &[]);
-        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_caller_jwt(Some("verified"));
-        assert!(filtered_extra_headers(&ctx).is_empty());
+    fn a_signed_slot_is_refused_from_both_sources() {
+        for slot in ["authorization", "x-amz-date", "x-amz-content-sha256"] {
+            let r = overrides(&[(slot, "static")], &[slot]);
+            let inbound = header_map(&[(slot, "callers-own")]);
+            let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
+            assert!(filtered_extra_headers(&ctx).is_empty(), "{slot}");
+        }
     }
 }

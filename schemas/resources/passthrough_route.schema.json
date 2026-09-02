@@ -191,48 +191,6 @@
     },
     {
       "if": {
-        "required": [
-          "forward_jwt_header"
-        ]
-      },
-      "then": {
-        "properties": {
-          "forward_jwt_header": {
-            "not": {
-              "anyOf": [
-                {
-                  "enum": [
-                    "accept",
-                    "accept-encoding",
-                    "connection",
-                    "content-encoding",
-                    "content-length",
-                    "content-type",
-                    "expect",
-                    "host",
-                    "keep-alive",
-                    "te",
-                    "trailer",
-                    "transfer-encoding",
-                    "upgrade",
-                    "anthropic-version",
-                    "last-event-id",
-                    "mcp-protocol-version",
-                    "mcp-session-id"
-                  ]
-                },
-                {
-                  "pattern": "^x-aisix-",
-                  "type": "string"
-                }
-              ]
-            }
-          }
-        }
-      }
-    },
-    {
-      "if": {
         "properties": {
           "auth_mode": {
             "const": "header_key"
@@ -526,14 +484,12 @@
       "description": "Whether this route is active. A disabled route matches nothing.",
       "type": "boolean"
     },
-    "forward_jwt_header": {
-      "description": "Header the caller's own JWT is delivered to the upstream in, for internal upstreams that authorize on the end user's claims. Omit — the default — to send no caller token upstream.\n\nThis is what lets a route both authenticate the caller and pass the same token on: in `auth_mode: gateway_key` the gateway consumes `Authorization` to identify the caller and strips it, so an upstream that needs the end user's token sees nothing without this field. Setting it to `authorization` puts the verified token back on the upstream request unchanged, which is what an existing internal service already reading `Authorization` expects.\n\nThe token is the one the gateway verified for this request (signature, expiry, and claim mapping all applied), relayed with no claim added, removed, or rewritten. A caller who authenticated with an API key has no token to relay, and the header is then absent rather than empty.\n\nNaming `authorization` or `proxy-authorization` sends `Bearer <token>`, the form those headers are defined to carry, and takes precedence over an injected ProviderKey credential in the same slot — the upstream receives the end user's token in place of the gateway's, never both. Any other header carries the bare token.\n\nHeaders that describe the message rather than its sender — its framing (`host`, `content-length`), the connection carrying it (`connection`, `keep-alive`), and what it negotiates (`accept`, `content-type`) — are rejected. Lowercase-only, so that rejection list is exhaustive on every configuration path.",
-      "minLength": 1,
-      "pattern": "^[!#$%&'*+.^_`|~0-9a-z-]+$",
-      "type": [
-        "string",
-        "null"
-      ]
+    "forward_client_headers": {
+      "description": "Inbound client headers forwarded to the upstream even when this route would otherwise strip them, as single-`*` glob patterns matched case-insensitively against the header name (`\"authorization\"`, `\"x-trace-*\"`). Empty — the default — overrides no stripping.\n\nA route forwards the caller's headers by default, so this field only matters for the ones it removes: the ProviderKey's `strip_headers` under `credential_mode: inject`, and the slot the gateway consumed to authenticate the caller. Naming `authorization` under `auth_mode: gateway_key` therefore puts the caller's own credential back on the upstream request in place of the one this route would inject, never both — which is what lets an internal service that already authorizes on the end user's `Authorization` keep doing so unchanged.\n\nHeaders whose forwarding would break the exchange rather than change who it comes from are stripped whatever the patterns say: `host`, `content-length`, the hop-by-hop headers that describe the caller's own connection, and the gateway's `x-aisix-*` namespace. `traceparent` and `tracestate` are stripped by default and forwarded only when a pattern names them exactly — a glob is not read as consent to graft the caller's trace onto the upstream's telemetry.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     },
     "hosts": {
       "description": "Inbound `Host` values this route serves (the forward-proxy entry: a TLS-terminating device delivers plaintext traffic with the original host, e.g. `api.githubcopilot.com`). Matched case-insensitively, ignoring any `:port` suffix; a leading `*.` wildcard matches exactly one extra label (`*.githubcopilot.com` matches `proxy.githubcopilot.com`). Host-matched requests keep their full path (no prefix stripping unless `path_prefix` also matched).",

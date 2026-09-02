@@ -65,7 +65,7 @@ use std::time::{Duration, Instant};
 use aisix_obs::AccessLog;
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
@@ -704,40 +704,36 @@ async fn dispatch(
         }
     }
 
-    // The caller's verified JWT, for an internal upstream that authorizes
-    // on the end user's claims. Resolved before the header loop so its
-    // slot joins the strip set: the caller's own copy of that header must
-    // never ride upstream beside the one the gateway delivers, and in
-    // `gateway_key` mode `authorization` is exactly the header the gateway
-    // just consumed to identify this caller.
+    // A route forwards the caller's headers by default, so the operator's
+    // `forward_client_headers` is an OVERRIDE of the strip set above: the
+    // names it admits ride upstream even though this route would otherwise
+    // have removed them. That is what puts the caller's own credential on
+    // an internal upstream that authorizes on it — in `gateway_key` mode
+    // `authorization` is exactly the header the gateway just consumed to
+    // identify this caller, and the strip set would otherwise take it.
     //
-    // The slot is stripped from whether or not there is a token to put in
-    // it: an API-key caller has none to relay, and without this its OWN
-    // copy of that header would ride upstream into a slot the upstream was
-    // told carries a gateway-VERIFIED identity.
-    let jwt_slot = route
-        .forward_jwt_header
-        .as_deref()
-        .map(|h| h.to_ascii_lowercase())
-        .filter(|h| !aisix_core::forwarded_jwt_slot_rejected(h));
-    if let Some(name) = &jwt_slot {
-        strip.insert(name.clone());
-    }
-    let forwarded_jwt = aisix_core::forwarded_jwt(
-        route.forward_jwt_header.as_deref(),
-        auth.jwt.as_ref().map(|j| j.token()),
-    );
-    // Which slot the gateway must LEAVE EMPTY because a token is actually
-    // going there. Keyed on the token, not on the configuration: with a
-    // slot configured but no token to relay (an API-key caller), the
-    // gateway's own credential must still be injected, or that caller
-    // loses its upstream authentication entirely.
-    let jwt_slot = forwarded_jwt.as_ref().map(|(name, _)| name.as_str());
+    // `header_forward_blocked` still holds: `host`, the hop-by-hop
+    // headers, and the gateway's own namespace break the exchange rather
+    // than changing who it comes from, so no pattern reaches them.
+    let forwards = |name: &str| {
+        aisix_core::forward_pattern_admits(&route.forward_client_headers, name)
+            && !aisix_core::header_forward_blocked(name)
+    };
 
     let mut builder = http_client.request(method.clone(), &url);
+    // Which slots the caller's own headers are taking, so the injection
+    // below leaves them alone. Resolved from what the caller ACTUALLY
+    // sent, not from the configuration: an operator who opts a slot in
+    // must not blank the gateway's credential for every caller who happens
+    // to send nothing there.
+    let mut forwarded_slots: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (name, value) in &incoming_headers {
-        if strip.contains(&name.as_str().to_ascii_lowercase()) {
-            continue;
+        let lower = name.as_str().to_ascii_lowercase();
+        if strip.contains(&lower) {
+            if !forwards(&lower) {
+                continue;
+            }
+            forwarded_slots.insert(lower);
         }
         builder = builder.header(name, value);
     }
@@ -750,29 +746,12 @@ async fn dispatch(
         if provider_lower == "anthropic" {
             // Anthropic's documented auth shape (#166): `x-api-key` +
             // `anthropic-version`, never a redundant Bearer alongside.
-            if jwt_slot != Some("x-api-key") {
+            if !forwarded_slots.contains("x-api-key") {
                 builder = builder.header("x-api-key", api_key);
             }
             builder = builder.header("anthropic-version", "2023-06-01");
-        } else if jwt_slot != Some("authorization") {
+        } else if !forwarded_slots.contains("authorization") {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {api_key}"));
-        }
-    }
-
-    // Delivered last, into a slot the strip set cleared and the injection
-    // above declined to fill: an operator who points `forward_jwt_header`
-    // at the credential header is choosing the end user's token over the
-    // gateway's, and `RequestBuilder::header` appends — filling it twice
-    // would put both on the wire and let the upstream pick (#411).
-    if let Some((name, value)) = &forwarded_jwt {
-        // Built as a HeaderValue first so `set_sensitive` survives: passing
-        // a `&str` would have reqwest construct a fresh, unmarked value.
-        if let (Ok(name), Ok(mut value)) = (
-            HeaderName::try_from(name.as_str()),
-            HeaderValue::from_str(value),
-        ) {
-            value.set_sensitive(true);
-            builder = builder.header(name, value);
         }
     }
 

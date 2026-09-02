@@ -599,15 +599,21 @@ async fn dispatch(
             None => resolved,
         }
     };
-    // The agent's own verified token, delivered to every registered server
-    // that configures `forward_jwt_header` — an internal server that
-    // authorizes on the end user's claims rather than on the gateway's
-    // credential. `None` when the agent presented an AISIX key.
-    let caller_jwt = auth.jwt.as_ref().map(|j| j.token());
+    // The agent's own inbound headers, forwarded to every registered
+    // server whose `forward_client_headers` admits them — an internal
+    // server that authorizes on the end user's own credential rather than
+    // on the gateway's. Every server forwards nothing by default.
+    //
+    // Read off `parts` rather than the request that is about to be rebuilt
+    // below: only `content-length` was ever rewritten, and that header is
+    // never forwarded.
+    let client_headers = parts.headers.clone();
     let gateway = match scope {
         // Same snapshot as the resolution above, so the entry is still there.
-        Some(server) => match aisix_mcp::McpGateway::from_snapshot_scoped_for_caller(
-            &snapshot, server, caller_jwt,
+        Some(server) => match aisix_mcp::McpGateway::from_snapshot_scoped_for_request(
+            &snapshot,
+            server,
+            Some(&client_headers),
         ) {
             Some(gateway) => gateway,
             None => {
@@ -618,7 +624,7 @@ async fn dispatch(
                     .into_response()
             }
         },
-        None => aisix_mcp::McpGateway::from_snapshot_for_caller(&snapshot, caller_jwt),
+        None => aisix_mcp::McpGateway::from_snapshot_for_request(&snapshot, Some(&client_headers)),
     }
     .with_tool_acl(acl);
     // The deployment's body cap replaces rmcp's own 4 MiB default inside
