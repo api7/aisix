@@ -1088,7 +1088,8 @@ pub struct AppliedGuardrail {
 /// it to `block`.
 ///
 /// `reason` is a code-owned kind/outcome summary, never the inner guardrail's
-/// dynamic reason. Built-in mask `counts` carry detector/entity/category names;
+/// dynamic reason. An availability failure may append its bounded, code-owned
+/// failure tag. Built-in mask `counts` carry detector/entity/category names;
 /// custom masks use the fixed key `custom` and count rewritten segments. No
 /// matched content enters this structure (#153 no-leak criterion).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1104,6 +1105,12 @@ pub struct GuardrailMonitorHit {
     /// (`would_block` only; empty for `would_mask`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reason: String,
+    /// Bounded failure tag retained only until the execution metrics sink has
+    /// recorded this monitor hit. The public usage-event summary carries the
+    /// same tag in `reason`, so this internal copy must not change its shape.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub error_type: String,
     /// detector/entity name → span count the guardrail would have masked
     /// (`would_mask` only; empty for `would_block`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]

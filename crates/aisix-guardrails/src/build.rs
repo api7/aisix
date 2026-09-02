@@ -679,17 +679,21 @@ impl MonitorGuardrail {
     }
 
     /// `would_block` telemetry hit for a downgraded Block (AISIX-Cloud#562).
-    fn would_block_hit(&self, hook: &'static str, unavailable: bool) -> GuardrailMonitorHit {
-        let outcome = if unavailable {
-            "evaluation unavailable"
-        } else {
-            "policy matched"
+    fn would_block_hit(
+        &self,
+        hook: &'static str,
+        unavailable: Option<&str>,
+    ) -> GuardrailMonitorHit {
+        let reason = match unavailable {
+            Some(tag) => format!("{} guardrail evaluation unavailable ({tag})", self.kind),
+            None => format!("{} guardrail policy matched", self.kind),
         };
         GuardrailMonitorHit {
             guardrail_name: self.row_name.clone(),
             hook: hook.to_owned(),
             action: "would_block".to_owned(),
-            reason: format!("{} guardrail {outcome}", self.kind),
+            reason,
+            error_type: unavailable.unwrap_or_default().to_owned(),
             counts: std::collections::BTreeMap::new(),
         }
     }
@@ -705,6 +709,7 @@ impl MonitorGuardrail {
             hook: hook.to_owned(),
             action: "would_mask".to_owned(),
             reason: String::new(),
+            error_type: String::new(),
             counts,
         }
     }
@@ -721,7 +726,7 @@ impl MonitorGuardrail {
             ref unavailable, ..
         } = verdict
         {
-            hits.push(self.would_block_hit(hook, unavailable.is_some()));
+            hits.push(self.would_block_hit(hook, unavailable.as_deref()));
         }
         self.observe(hook, verdict)
     }
@@ -1813,6 +1818,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_monitor_preserves_each_safe_failure_tag() {
+        #[derive(Default)]
+        struct ErrorTypes(std::sync::Mutex<Vec<Option<String>>>);
+
+        impl aisix_core::GuardrailMetricsSink for ErrorTypes {
+            fn record_guardrail_execution(&self, exec: &aisix_core::GuardrailExecution<'_>) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(exec.error_type.map(str::to_owned));
+            }
+        }
+
+        for (script, tag) in [
+            (
+                "export function checkInput() { return { action: 'maybe' }; }",
+                "custom_unknown_action",
+            ),
+            (
+                "export function checkInput() { return {}; }",
+                "custom_no_verdict",
+            ),
+        ] {
+            let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+            table.insert(entry(
+                "custom-monitor",
+                "g-1",
+                serde_json::from_value(serde_json::json!({
+                    "name": "custom-monitor",
+                    "enforcement_mode": "monitor",
+                    "kind": "custom",
+                    "script": script,
+                }))
+                .unwrap(),
+            ));
+            let sink = Arc::new(ErrorTypes::default());
+            let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none())
+                .with_metrics_sink(Some(sink.clone()));
+
+            let (verdict, hits) = chain.check_input_observed(&req("anything")).await;
+            assert_eq!(verdict, GuardrailVerdict::Allow);
+            assert_eq!(hits.len(), 1, "{tag}: {hits:?}");
+            assert_eq!(hits[0].error_type, tag);
+            assert_eq!(
+                hits[0].reason,
+                format!("custom guardrail evaluation unavailable ({tag})")
+            );
+            let wire = serde_json::to_string(&hits).unwrap();
+            assert!(wire.contains(tag), "{wire}");
+            assert!(!wire.contains("error_type"), "{wire}");
+            assert_eq!(
+                *sink.0.lock().unwrap(),
+                vec![Some(tag.to_owned())],
+                "{tag} must reach the histogram label",
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn keyword_monitor_reason_cannot_enter_usage_telemetry() {
         let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
         table.insert(entry(
@@ -2140,8 +2204,9 @@ mod tests {
         assert_eq!(hits[0].action, "would_block");
         assert_eq!(
             hits[0].reason,
-            "aliyun_text_moderation guardrail evaluation unavailable"
+            "aliyun_text_moderation guardrail evaluation unavailable (aliyun_5xx)"
         );
+        assert_eq!(hits[0].error_type, "aliyun_5xx");
     }
 
     /// Monitor mode is unconditional: a provider outage is still only

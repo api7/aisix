@@ -236,7 +236,7 @@ impl GuardrailChain {
 fn classify_execution<'v>(
     verdict: &'v GuardrailVerdict,
     masked: bool,
-    hits: &[GuardrailMonitorHit],
+    hits: &'v [GuardrailMonitorHit],
 ) -> (&'static str, Option<&'v str>) {
     match verdict {
         GuardrailVerdict::Block { unavailable, .. } => ("blocked", unavailable.as_deref()),
@@ -244,8 +244,9 @@ fn classify_execution<'v>(
         GuardrailVerdict::Allow => {
             if masked {
                 ("masked", None)
-            } else if hits.iter().any(|h| h.action == "would_block") {
-                ("would_block", None)
+            } else if let Some(hit) = hits.iter().find(|h| h.action == "would_block") {
+                let error_type = (!hit.error_type.is_empty()).then_some(hit.error_type.as_str());
+                ("would_block", error_type)
             } else if hits.iter().any(|h| h.action == "would_mask") {
                 ("would_mask", None)
             } else {
