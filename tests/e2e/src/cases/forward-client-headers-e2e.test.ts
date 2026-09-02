@@ -401,12 +401,18 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
         authorization: `Bearer ${CALLER_KEY}`,
         "content-type": "application/json",
         [CUSTOM_HEADER]: "carried.verbatim",
+        "x-aisix-routing-tags": "spoofed-by-caller",
       },
       body: JSON.stringify({ model: "gpt-4o-mini", messages: [] }),
     }).then((r) => bodyOf(r, "the route with a forward"));
 
     const forwarded = since(mark2).at(-1)!;
     expect(forwarded.headers[CUSTOM_HEADER]).toBe("carried.verbatim");
+    // A route forwards by default, so the gateway's own namespace has to
+    // be refused explicitly — nothing in the strip set names it beyond
+    // `x-aisix-request-id`, and a relayed copy would forge a gateway
+    // assertion at the upstream.
+    expect(forwarded.headers["x-aisix-routing-tags"]).toBeUndefined();
     // The consumed credential slot too. Passthrough relays the caller's
     // copy FIRST and appends the gateway's after it, so the collapsed
     // value would read correctly even if the suppression failed entirely
@@ -477,8 +483,11 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
     // and rmcp refuses a foreign `mcp-session-id` outright — the
     // connection fails rather than degrades.
     for (const h of seen) {
-      expect(h["mcp-session-id"]).not.toBe("callers-own-session");
-      expect(h["last-event-id"]).not.toBe("callers-own-event");
+      // `toContain`, not `toBe`: node joins a repeated header, so a
+      // relayed copy could arrive as `callers-own-session,<real id>` and
+      // an equality check would call that clean.
+      expect(h["mcp-session-id"] ?? "").not.toContain("callers-own-session");
+      expect(h["last-event-id"] ?? "").not.toContain("callers-own-event");
     }
   });
 

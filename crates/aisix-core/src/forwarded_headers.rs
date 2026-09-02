@@ -325,6 +325,22 @@ mod tests {
         ));
     }
 
+    /// `forward_pattern_admits` is the ONE predicate every face asks,
+    /// `/passthrough/*` included — so the exact-name rule for credential
+    /// and trace-context headers reaches the strip-override path too,
+    /// where a wildcard would otherwise restore the credential the
+    /// gateway just consumed to authenticate the caller.
+    #[test]
+    fn the_exact_name_rule_is_in_the_predicate_every_face_asks() {
+        for name in CREDENTIAL_SLOT_HEADERS.iter().chain(TRACE_CONTEXT_HEADERS) {
+            assert!(!forward_pattern_admits(&["*".into()], name), "{name}");
+            assert!(
+                forward_pattern_admits(&[name.to_uppercase()], name),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn an_empty_allowlist_forwards_nothing() {
         let client = map(&[("authorization", "Bearer caller"), ("x-trace-id", "t")]);

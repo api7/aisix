@@ -735,6 +735,15 @@ async fn dispatch(
     let mut forwarded_slots: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (name, value) in &incoming_headers {
         let lower = name.as_str().to_ascii_lowercase();
+        // Asked of EVERY inbound header, not only the ones the strip set
+        // named: `x-aisix-*` is the gateway's own namespace, and only
+        // `x-aisix-request-id` was ever in `ALWAYS_STRIP`, so a caller's
+        // `x-aisix-routing-tags` used to ride upstream and forge a
+        // gateway assertion there. Nothing an operator writes overrides
+        // this, which is what the field's own description promises.
+        if aisix_core::header_forward_blocked(&lower) {
+            continue;
+        }
         if strip.contains(&lower) {
             if !forwards(&lower) {
                 continue;
