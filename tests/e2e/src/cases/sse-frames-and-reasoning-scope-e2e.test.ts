@@ -398,7 +398,7 @@ describe("sse frames + reasoning scope e2e (#1103/#1104)", () => {
     expect(upstream.receivedRequests.length).toBe(before);
   });
 
-  test("/v1/messages: a mask hit inside a signed thinking block refuses rather than dispatching it unmasked", async (ctx) => {
+  test("/v1/messages: a mask hit inside a signed thinking block is forwarded unchanged", async (ctx) => {
     if (!etcdReachable || !app || !seed) return void ctx.skip();
 
     const upstream = await upstreamWith({
@@ -413,7 +413,6 @@ describe("sse frames + reasoning scope e2e (#1103/#1104)", () => {
     });
     await seedScenario("thinking-request-mask", upstream, "anthropic", [maskGuardrailId]);
 
-    const before = upstream.receivedRequests.length;
     const res = await fetch(`${app.proxyUrl}/v1/messages`, {
       method: "POST",
       headers: HEADERS,
@@ -426,40 +425,80 @@ describe("sse frames + reasoning scope e2e (#1103/#1104)", () => {
             role: "assistant",
             content: [
               { type: "thinking", thinking: `write to ${EMAIL}`, signature: "sig-abc" },
-              { type: "text", text: "nothing to see" },
+              { type: "text", text: `and also ${EMAIL}` },
             ],
           },
           { role: "user", content: "go on" },
         ],
       }),
     });
-    // Rewriting a signed block invalidates its signature and the upstream
-    // rejects the replayed turn, so the mask cannot be honoured — and
-    // forwarding the match unmasked is exactly the fail-open the scan
-    // coverage would otherwise create. Refuse, and say why.
-    expect(res.status).toBe(422);
-    const body = await res.text();
-    expect(body).toContain("mask_writeback_failed");
-    expect(body).not.toContain(EMAIL);
-    expect(upstream.receivedRequests.length).toBe(before);
 
-    // The ordinary (unsigned) case still masks and dispatches — the refusal
-    // is specific to the signed slot, not a blanket rejection of any
-    // request whose history mentions an email.
-    const ok = await fetch(`${app.proxyUrl}/v1/messages`, {
+    // The deliberate exception to "no write-back channel means block": the
+    // signed block cannot be rewritten without invalidating its signature,
+    // and refusing the replay protects nothing, because the gateway itself
+    // emitted that block unmasked on the previous turn (generated reasoning
+    // is out of the output scope). So it is forwarded as-is.
+    expect(res.status).toBe(200);
+    await res.text();
+
+    const dispatched = JSON.parse(upstream.receivedRequests.at(-1)!.body) as {
+      messages: Array<{ content: Array<Record<string, unknown>> }>;
+    };
+    const assistant = dispatched.messages[1].content;
+    expect(assistant[0]).toEqual({
+      type: "thinking",
+      thinking: `write to ${EMAIL}`,
+      signature: "sig-abc",
+    });
+    // …and the ordinary text block beside it in the SAME message is still
+    // masked, so this pins an exception for the signed block rather than an
+    // exemption for the whole request.
+    expect(assistant[1]).toEqual({ type: "text", text: `and also ${MASKED}` });
+  });
+
+  test("/v1/messages: a block rule still fires on thinking content", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return void ctx.skip();
+
+    const upstream = await upstreamWith({
+      nonStreamBody: {
+        id: "msg_thinking_blockrule",
+        type: "message",
+        role: "assistant",
+        model: "upstream-model-x",
+        content: [{ type: "text", text: "ok" }],
+        usage: { input_tokens: 3, output_tokens: 1 },
+      },
+    });
+    await seedScenario("thinking-mask-vs-block", upstream, "anthropic", [blockGuardrailId]);
+
+    const before = upstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
       method: "POST",
       headers: HEADERS,
       body: JSON.stringify({
-        model: "thinking-request-mask",
+        model: "thinking-mask-vs-block",
         max_tokens: 16,
-        messages: [{ role: "user", content: `write to ${EMAIL}` }],
+        messages: [
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "thinking",
+                thinking: `I will ${BLOCKED} quietly`,
+                signature: "sig-abc",
+              },
+            ],
+          },
+          { role: "user", content: "go on" },
+        ],
       }),
     });
-    expect(ok.status).toBe(200);
-    await ok.text();
-    const dispatched = upstream.receivedRequests.at(-1)!.body;
-    expect(dispatched).toContain(MASKED);
-    expect(dispatched).not.toContain(EMAIL);
+    // The mask exception is for the MASK only. A block rule still reaches
+    // thinking text, or the exemption would have opened a channel any
+    // forbidden content could travel through.
+    expect(res.status).toBe(422);
+    expect(await res.text()).not.toContain(BLOCKED);
+    expect(upstream.receivedRequests.length).toBe(before);
   });
 
   // ── 3. generated reasoning stays out of the OUTPUT scope ───────────

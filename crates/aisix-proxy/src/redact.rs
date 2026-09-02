@@ -432,66 +432,28 @@ pub fn redact_anthropic_request(chain: &dyn Guardrail, body: &mut Value) -> Reda
     counts
 }
 
-/// Whether an input mask would have to rewrite a signed reasoning block
-/// to be honoured — in which case the caller must refuse the request
-/// rather than forward the match unmasked.
-///
-/// An Anthropic `thinking` / `redacted_thinking` block is signed by the
-/// provider, so any rewrite invalidates that signature and the upstream
-/// rejects the replayed turn — a Mask-action hit inside one cannot be
-/// applied. The scan reads these blocks
-/// (`parse_inbound_request_for_scan`), so a Block rule still blocks
-/// normally; only the Mask action has nowhere to go, and silently leaving
-/// the match in place is the fail-open this exists to close. The same rule
-/// holds for any block carrying a `signature`.
-///
-/// Only the PLAINTEXT slots are probed. A `redacted_thinking` block's
-/// `data` is opaque provider ciphertext: the scan never reads it, so no
-/// mask can have reported a hit there and there is no fail-open to close —
-/// while running a detector over base64 would refuse ordinary requests on
-/// a coincidental match inside the ciphertext. Probing exactly what the
-/// scan reads is what keeps the two from disagreeing in either direction.
-///
-/// Rewrites nothing — it asks the chain's input redactor whether the text
-/// WOULD change.
-pub fn anthropic_request_masks_signed_reasoning(chain: &dyn Guardrail, body: &Value) -> bool {
-    if !chain.redacts_input() {
-        return false;
-    }
-    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
-        return false;
-    };
-    messages
-        .iter()
-        .filter_map(|m| m.get("content").and_then(Value::as_array))
-        .flatten()
-        .filter(|block| is_signed_reasoning_block(block))
-        .any(|block| {
-            ["thinking", "text"]
-                .into_iter()
-                .filter_map(|k| block.get(k).and_then(Value::as_str))
-                .filter(|t| !t.is_empty())
-                .any(|t| redact_str(chain, Direction::Input, t).is_some_and(|r| r.text != t))
-        })
-}
-
-/// A content block whose bytes the provider signed: Anthropic's two
-/// reasoning block types, plus anything else carrying a `signature`.
-fn is_signed_reasoning_block(block: &Value) -> bool {
-    matches!(
-        block.get("type").and_then(Value::as_str),
-        Some("thinking") | Some("redacted_thinking")
-    ) || block.get("signature").and_then(Value::as_str).is_some()
-}
-
 /// Anthropic `content` is either a bare string or an array of typed
 /// blocks. Rewrites `text` blocks, `tool_result` nested content, and
 /// `tool_use` input objects; leaves image/document blocks alone.
 ///
-/// `thinking` / `redacted_thinking` blocks are deliberately NOT rewritten
-/// — see [`anthropic_request_masks_signed_reasoning`], which is what the
-/// handlers consult before masking so a hit there refuses the request
-/// instead of travelling upstream unmasked.
+/// **Deliberate exception to "no write-back channel means block".** A
+/// `thinking` / `redacted_thinking` block is signed by the provider, so it
+/// can be neither rewritten (the signature would no longer verify and the
+/// upstream rejects the replayed turn) nor, per the ruling on #1104,
+/// blocked. A mask-action hit inside one is FORWARDED UNCHANGED, for every
+/// guardrail kind — including the kinds that otherwise turn an unmaskable
+/// result into a blocking verdict.
+///
+/// Why refusing it buys nothing: the same bytes already left the gateway.
+/// Generated reasoning is out of the OUTPUT scope by design, so this block
+/// is one the gateway itself handed to the client, unmasked, on the
+/// previous turn. Blocking the replay protects nothing that was not already
+/// disclosed, and it denies service permanently, because a client following
+/// Anthropic's extended-thinking protocol re-sends the block every turn.
+///
+/// BLOCK-action rules are unaffected and still fire on thinking content —
+/// the scan reads it (`parse_inbound_request_for_scan`); only the mask has
+/// nowhere to write.
 fn redact_anthropic_content(
     chain: &dyn Guardrail,
     dir: Direction,
@@ -613,8 +575,8 @@ fn redact_responses_item(
         // match still in it — the mask has to reach the same slots the scan
         // does. Neither slot carries a provider signature, so rewriting one
         // is not replay-breaking; the Anthropic `thinking` block is the
-        // signed case and is refused instead
-        // (`anthropic_request_masks_signed_reasoning`).
+        // signed case and is forwarded unchanged instead (see
+        // `redact_anthropic_content`).
         //
         // NOT closed here: a reasoning item's `encrypted_content` is
         // forwarded verbatim and is neither scanned nor rewritten, so on a
@@ -1841,12 +1803,14 @@ mod tests {
         );
     }
 
-    /// C4: a Mask hit inside a signed Anthropic `thinking` block cannot be
-    /// honoured — rewriting invalidates the signature — so the handler has
-    /// to refuse. This is the probe it refuses on; the block itself stays
-    /// untouched by the mask pass.
+    /// A mask-action hit inside a signed `thinking` / `redacted_thinking`
+    /// block is FORWARDED UNCHANGED — the deliberate exception to "no
+    /// write-back channel means block" (#1104). The block is byte-identical
+    /// afterwards, and the ordinary block beside it still masks, so this
+    /// pins an exception for the signed block rather than an exemption for
+    /// the whole message.
     #[test]
-    fn signed_reasoning_mask_is_reported_and_never_applied() {
+    fn signed_reasoning_is_forwarded_unchanged_while_its_neighbours_mask() {
         let chain = both();
         let mut body = json!({
             "model": "m",
@@ -1854,101 +1818,56 @@ mod tests {
                 {"role": "user", "content": "hi"},
                 {"role": "assistant", "content": [
                     {"type": "thinking", "thinking": "mail a@x.com", "signature": "sig-abc"},
-                    {"type": "text", "text": "sure"}
+                    {"type": "redacted_thinking", "data": "opaque a@x.com blob"},
+                    {"type": "text", "text": "also mail a@x.com"}
                 ]}
             ]
         });
-        assert!(anthropic_request_masks_signed_reasoning(
-            chain.as_ref(),
-            &body
-        ));
-        let before = body["messages"][1]["content"][0].clone();
+        let before = body["messages"][1]["content"].clone();
         redact_anthropic_request(chain.as_ref(), &mut body);
+
         assert_eq!(
-            body["messages"][1]["content"][0], before,
-            "the signed block is never rewritten",
+            body["messages"][1]["content"][0], before[0],
+            "the signed thinking block is byte-identical",
+        );
+        assert_eq!(
+            body["messages"][1]["content"][1], before[1],
+            "so is the redacted_thinking block",
+        );
+        assert_eq!(
+            body["messages"][1]["content"][2]["text"].as_str(),
+            Some("also mail [EMAIL_REDACTED]"),
+            "the mask is demonstrably running on this very request",
         );
     }
 
-    /// The probe must not fire on a body the mask can honour, or every
-    /// thinking-carrying request would 422. Two negatives: a thinking block
-    /// with nothing to mask, and a maskable literal in an ordinary `text`
-    /// block beside one.
+    /// The exception is for the MASK only. A block-action rule still fires
+    /// on thinking content, because the scan reads it — otherwise the
+    /// exception would have turned a signed block into a channel any
+    /// forbidden text could travel through.
     #[test]
-    fn signed_reasoning_probe_is_quiet_when_the_mask_has_somewhere_to_go() {
-        let chain = both();
-        let clean = json!({
+    fn a_block_rule_still_fires_on_thinking_content() {
+        use aisix_guardrails::{KeywordBlocklist, KeywordRule};
+
+        let chain: Arc<dyn Guardrail> = Arc::new(GuardrailChain::new(vec![Arc::new(
+            KeywordBlocklist::input_only(vec![KeywordRule::literal("FORBIDDENTHOUGHT")]),
+        )]));
+
+        let body = json!({
+            "model": "claude",
             "messages": [{"role": "assistant", "content": [
-                {"type": "thinking", "thinking": "nothing sensitive here", "signature": "s"},
-                {"type": "text", "text": "mail a@x.com"}
+                {"type": "thinking", "thinking": "I will FORBIDDENTHOUGHT now", "signature": "s"}
             ]}]
         });
-        assert!(!anthropic_request_masks_signed_reasoning(
+        let chat = aisix_provider_anthropic::parse_inbound_request_for_scan(&body).unwrap();
+        let verdict = futures::executor::block_on(aisix_guardrails::Guardrail::check_input(
             chain.as_ref(),
-            &clean
+            &chat,
         ));
-        // …and that ordinary block still masks normally.
-        let mut clean = clean;
-        redact_anthropic_request(chain.as_ref(), &mut clean);
-        assert_eq!(
-            clean["messages"][0]["content"][1]["text"].as_str(),
-            Some("mail [EMAIL_REDACTED]")
+        assert!(
+            matches!(verdict, aisix_guardrails::GuardrailVerdict::Block { .. }),
+            "a block rule must still reach thinking text, got {verdict:?}",
         );
-    }
-
-    /// A `redacted_thinking` block carries only the provider's opaque
-    /// ciphertext. The scan never reads it, so no mask can have reported a
-    /// hit there — and running a detector over the blob would refuse
-    /// ordinary requests whenever it happens to contain a matching span.
-    ///
-    /// The `data` below is a deliberately unmissable match rather than a
-    /// realistic blob: the claim under test is that this field is never
-    /// offered to a detector at all, so the value has to be one that WOULD
-    /// fire if it were. (A realistic base64 blob makes the test unable to
-    /// go red — its digit runs sit between alphanumerics, where the
-    /// boundary-anchored detectors do not match, so it would pass whether
-    /// or not the field is probed.)
-    #[test]
-    fn signed_reasoning_probe_ignores_opaque_ciphertext() {
-        let chain = both();
-        let body = json!({
-            "messages": [{"role": "assistant", "content": [
-                {"type": "redacted_thinking", "data": "RXJVUUtvVUJ a@x.com CkYIBBgCKkC"}
-            ]}]
-        });
-        assert!(!anthropic_request_masks_signed_reasoning(
-            chain.as_ref(),
-            &body
-        ));
-
-        // Control: the same chain DOES fire on a plaintext thinking block,
-        // so a green above means "this field is skipped", not "this chain
-        // matches nothing".
-        let plaintext = json!({
-            "messages": [{"role": "assistant", "content": [
-                {"type": "thinking", "thinking": "a@x.com", "signature": "s"}
-            ]}]
-        });
-        assert!(anthropic_request_masks_signed_reasoning(
-            chain.as_ref(),
-            &plaintext
-        ));
-    }
-
-    /// An output-only chain must not make the request probe fire — it has
-    /// no input redactor to ask.
-    #[test]
-    fn signed_reasoning_probe_ignores_an_output_only_chain() {
-        let out_only = mask_chain(aisix_core::models::GuardrailHookPoint::Output);
-        let body = json!({
-            "messages": [{"role": "assistant", "content": [
-                {"type": "thinking", "thinking": "mail a@x.com", "signature": "s"}
-            ]}]
-        });
-        assert!(!anthropic_request_masks_signed_reasoning(
-            out_only.as_ref(),
-            &body
-        ));
     }
 
     #[test]

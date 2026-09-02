@@ -696,25 +696,6 @@ async fn dispatch(
             )
             .into());
         }
-        // A Mask-action hit inside a signed `thinking` / `redacted_thinking`
-        // block has nowhere to go: rewriting the block invalidates the
-        // provider signature and the upstream rejects the replayed turn.
-        // The scan reads those blocks, so leaving the match in place would
-        // be a reported-but-unmasked dispatch — refuse instead.
-        if crate::redact::anthropic_request_masks_signed_reasoning(resolved_chain.as_ref(), body) {
-            tracing::warn!(
-                guardrail_hook = "input",
-                model = %model_name,
-                "mask-action guardrail matched inside a signed reasoning block on \
-                 /v1/messages; refusing rather than forwarding it unmasked",
-            );
-            return Err(crate::error::guardrail_block_error(
-                "request",
-                None,
-                Some(crate::error::TAG_MASK_WRITEBACK_FAILED),
-            )
-            .into());
-        }
         // #932: mask-action PII rules rewrite the Anthropic-native body in
         // place AFTER the block check passes — both the passthrough and the
         // cross-provider bridge forward from this body, so the masked text

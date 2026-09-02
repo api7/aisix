@@ -820,6 +820,14 @@ async fn dispatch(
 
     let status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
+    // Explicit `text/event-stream` only. Deliberately STRICTER than
+    // `dispatch::upstream_body_is_sse`, which the typed relays use: a
+    // passthrough route carries arbitrary REST traffic where most responses
+    // are not SSE, so an unknown content type buffers — the arm that scans
+    // — here, while on a relay that has just asked an LLM to stream the
+    // same guess would 502 an upstream that merely mislabels itself. Not
+    // drift: see that function's doc comment for why the two populations
+    // take opposite defaults.
     let is_sse = resp_headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())

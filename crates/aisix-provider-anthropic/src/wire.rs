@@ -1531,8 +1531,8 @@ pub fn parse_inbound_request(
 /// what reaches a non-Anthropic upstream is unchanged. `redacted_thinking`
 /// carries only the provider's encrypted `data` blob — there is no
 /// plaintext in it for a scan to read, so it contributes nothing here (a
-/// Mask rule that would rewrite either block is refused outright rather
-/// than applied — see `redact::anthropic_request_masks_signed_reasoning`).
+/// mask-action hit inside either block is forwarded unchanged — see
+/// `redact::redact_anthropic_content`).
 pub fn parse_inbound_request_for_scan(
     body: &serde_json::Value,
 ) -> Result<ChatFormat, AnthropicInboundError> {

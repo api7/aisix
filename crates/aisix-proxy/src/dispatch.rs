@@ -591,10 +591,29 @@ pub(crate) fn upstream_header_ctx<'a>(
 /// has beside its streaming branch.
 ///
 /// Only an explicitly-JSON content type is treated as non-SSE. A missing
-/// or unrecognised one stays on the streaming path — a conforming SSE
-/// upstream labels itself `text/event-stream`, and a relay that guessed
-/// "not SSE" on an unfamiliar label would buffer a real stream to a
-/// `.json()` decode error.
+/// or unrecognised one stays on the streaming path.
+///
+/// **This deliberately differs from `passthrough_route`'s own `is_sse`,
+/// which requires an explicit `text/event-stream`.** They look like the
+/// same question and are not, because the populations differ: a passthrough
+/// route relays arbitrary REST traffic where most responses are genuinely
+/// not SSE, so "unknown means buffer" — the arm that scans — is right
+/// there. These typed relays have just asked an LLM provider to stream, so
+/// "unknown means stream" is right here, and the cost of being wrong is
+/// asymmetric. Guessing "not a stream" turns a working relay whose upstream
+/// merely mislabels its content type into a hard `502`, because the
+/// buffered arm then parses SSE text as JSON.
+///
+/// That mislabelling is not hypothetical: eight of this crate's own
+/// `/v1/messages` streaming tests produce it by accident. Their mock sets
+/// `text/event-stream` and then `set_body_string` overwrites the header
+/// with `text/plain` (wiremock `response_template.rs` sets `self.mime`), so
+/// they serve a real SSE body under the wrong label — and every one of them
+/// fails with a `502` if this predicate demands the correct one.
+///
+/// The bug this exists for — an upstream ignoring `stream: true` and
+/// answering with a JSON document — is caught by the JSON test alone, so
+/// the stricter rule would buy nothing for it and cost the above.
 pub(crate) fn upstream_body_is_sse(headers: &axum::http::HeaderMap) -> bool {
     let essence = headers
         .get(axum::http::header::CONTENT_TYPE)
