@@ -1488,16 +1488,60 @@ pub enum AnthropicInboundError {
     UnsupportedSystem,
 }
 
+/// What a parsed body is going to be used for.
+///
+/// The two answers differ in exactly one place — an assistant turn's
+/// `thinking` / `redacted_thinking` blocks — and that difference is the
+/// whole reason this enum exists. Dropping them is right for a body being
+/// bridged to a non-Anthropic upstream and wrong for a body being handed
+/// to the guardrail chain, so the two callers must not share one parse.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InboundUse {
+    /// The result is translated onto the OpenAI wire and sent upstream.
+    Dispatch,
+    /// The result is scan text for the input guardrail chain and is never
+    /// sent anywhere.
+    Scan,
+}
+
 /// Parse an Anthropic `POST /v1/messages` JSON body into the gateway's
-/// internal [`ChatFormat`]. The `system` field is folded into a leading
-/// system message. Message content blocks translate to their OpenAI
-/// equivalents (see the module comment above for the per-block map);
-/// a user message whose blocks include `tool_result`s expands into the
-/// preceding `role:"tool"` messages OpenAI expects. Unrecognized
-/// top-level keys (`metadata`, `tools`, `tool_choice`, etc.) flow into
-/// `ChatFormat::extra` for `translate_extras_to_openai_shape`.
+/// internal [`ChatFormat`], for **cross-provider dispatch**. The `system`
+/// field is folded into a leading system message. Message content blocks
+/// translate to their OpenAI equivalents (see the module comment above for
+/// the per-block map); a user message whose blocks include `tool_result`s
+/// expands into the preceding `role:"tool"` messages OpenAI expects.
+/// Unrecognized top-level keys (`metadata`, `tools`, `tool_choice`, etc.)
+/// flow into `ChatFormat::extra` for `translate_extras_to_openai_shape`.
+///
+/// Assistant `thinking` / `redacted_thinking` blocks are dropped, because
+/// they are not replayable on the OpenAI wire. Use
+/// [`parse_inbound_request_for_scan`] for a guardrail scan, where dropping
+/// them would leave caller-supplied text unread.
 pub fn parse_inbound_request(
     body: &serde_json::Value,
+) -> Result<ChatFormat, AnthropicInboundError> {
+    parse_inbound(body, InboundUse::Dispatch)
+}
+
+/// The same parse, for the **input guardrail scan**: an assistant turn's
+/// `thinking` blocks contribute their text.
+///
+/// Reasoning replayed by the caller is text entering the model like any
+/// other, so the scan has to see it; the dispatch parse still drops it, so
+/// what reaches a non-Anthropic upstream is unchanged. `redacted_thinking`
+/// carries only the provider's encrypted `data` blob — there is no
+/// plaintext in it for a scan to read, so it contributes nothing here (a
+/// mask-action hit inside either block is forwarded unchanged — see
+/// `redact::redact_anthropic_content`).
+pub fn parse_inbound_request_for_scan(
+    body: &serde_json::Value,
+) -> Result<ChatFormat, AnthropicInboundError> {
+    parse_inbound(body, InboundUse::Scan)
+}
+
+fn parse_inbound(
+    body: &serde_json::Value,
+    purpose: InboundUse,
 ) -> Result<ChatFormat, AnthropicInboundError> {
     use serde_json::Value;
     let obj = body.as_object().ok_or(AnthropicInboundError::NotAnObject)?;
@@ -1556,7 +1600,7 @@ pub fn parse_inbound_request(
                 translate_user_blocks(blocks, &mut messages);
             }
             ("assistant", Some(Value::Array(blocks))) => {
-                messages.push(translate_assistant_blocks(blocks));
+                messages.push(translate_assistant_blocks(blocks, purpose));
             }
             ("system", Some(Value::Array(blocks))) => {
                 messages.push(ChatMessage::system(concat_text_blocks(blocks)));
@@ -1790,9 +1834,10 @@ fn translate_user_blocks(blocks: &[serde_json::Value], out: &mut Vec<ChatMessage
 
 /// Collapse one Anthropic assistant message's content blocks into a
 /// ChatMessage: text concatenates, `tool_use` becomes OpenAI
-/// `tool_calls`, thinking blocks drop (non-replayable on the OpenAI
-/// wire — see the module comment).
-fn translate_assistant_blocks(blocks: &[serde_json::Value]) -> ChatMessage {
+/// `tool_calls`, thinking blocks drop for [`InboundUse::Dispatch`]
+/// (non-replayable on the OpenAI wire — see the module comment) and
+/// contribute their text for [`InboundUse::Scan`].
+fn translate_assistant_blocks(blocks: &[serde_json::Value], purpose: InboundUse) -> ChatMessage {
     use serde_json::Value;
     let mut text = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
@@ -1812,6 +1857,11 @@ fn translate_assistant_blocks(blocks: &[serde_json::Value]) -> ChatMessage {
                         "dropping malformed tool_use block (missing id/name) on \
                          cross-provider dispatch",
                     );
+                }
+            }
+            Some("thinking") if purpose == InboundUse::Scan => {
+                if let Some(t) = block.get("thinking").and_then(Value::as_str) {
+                    text.push_str(t);
                 }
             }
             Some("thinking") | Some("redacted_thinking") => {
@@ -5022,5 +5072,55 @@ mod tests {
         assert!(!serde_json::to_string(&chat.messages[0])
             .unwrap()
             .contains("secret chain"));
+    }
+
+    /// The scan parse is the other half of the pair above: the same body
+    /// that dispatches WITHOUT its thinking text must SCAN with it, or a
+    /// caller can park a payload in a replayed `thinking` block and reach
+    /// the model past a deny-list the same text trips in `content`.
+    #[test]
+    fn scan_parse_keeps_thinking_text_the_dispatch_parse_drops() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "secret chain", "signature": "sig"},
+                {"type": "redacted_thinking", "data": "opaque"},
+                {"type": "text", "text": "answer"},
+            ]}],
+        });
+        let scan = parse_inbound_request_for_scan(&body).unwrap();
+        assert_eq!(scan.messages[0].content_str(), "secret chainanswer");
+
+        // …and the dispatch parse is unchanged by that, which is the whole
+        // point of splitting them: what reaches a non-Anthropic upstream
+        // still carries no thinking block.
+        let dispatch = parse_inbound_request(&body).unwrap();
+        assert_eq!(dispatch.messages[0].content_str(), "answer");
+    }
+
+    /// The two parses differ ONLY on thinking blocks. Anything else that
+    /// diverged would mean the guardrail chain screened a request the
+    /// gateway did not actually dispatch.
+    #[test]
+    fn scan_and_dispatch_parses_agree_on_a_body_without_thinking() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "system": "be terse",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "look it up"},
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "42"},
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "answer"},
+                    {"type": "tool_use", "id": "t2", "name": "search", "input": {"q": "x"}},
+                ]},
+            ],
+        });
+        assert_eq!(
+            serde_json::to_value(parse_inbound_request_for_scan(&body).unwrap()).unwrap(),
+            serde_json::to_value(parse_inbound_request(&body).unwrap()).unwrap(),
+        );
     }
 }

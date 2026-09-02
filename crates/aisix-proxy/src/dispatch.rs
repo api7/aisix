@@ -578,6 +578,94 @@ pub(crate) fn upstream_header_ctx<'a>(
         .with_client_headers(&client.headers)
 }
 
+/// Whether the upstream's 200 response body is an SSE stream, rather than
+/// the single JSON document an upstream that ignored `stream: true` sends.
+///
+/// `/v1/responses` and `/v1/messages` both pick their relay branch through
+/// this, and both used to pick it from the REQUEST's `stream` flag alone —
+/// so a JSON body answering a streaming request entered the SSE hold-back:
+/// it has no frames, so nothing scanned it, and the seal pass appended a
+/// `\n\n` frame terminator to a document that is not SSE before releasing
+/// it under the upstream's own content type. Such a body belongs on the
+/// non-streaming buffered scan+mask path each of those functions already
+/// has beside its streaming branch.
+///
+/// Only an explicitly-JSON content type is treated as non-SSE. A missing
+/// or unrecognised one stays on the streaming path.
+///
+/// **This deliberately differs from `passthrough_route`'s own `is_sse`,
+/// which requires an explicit `text/event-stream`.** They look like the
+/// same question and are not, because the populations differ: a passthrough
+/// route relays arbitrary REST traffic where most responses are genuinely
+/// not SSE, so "unknown means buffer" — the arm that scans — is right
+/// there. These typed relays have just asked an LLM provider to stream, so
+/// "unknown means stream" is right here, and the cost of being wrong is
+/// asymmetric. Guessing "not a stream" turns a working relay whose upstream
+/// merely mislabels its content type into a hard `502`, because the
+/// buffered arm then parses SSE text as JSON.
+///
+/// That mislabelling is not hypothetical: eight of this crate's own
+/// `/v1/messages` streaming tests produce it by accident. Their mock sets
+/// `text/event-stream` and then `set_body_string` overwrites the header
+/// with `text/plain` (wiremock `response_template.rs` sets `self.mime`), so
+/// they serve a real SSE body under the wrong label — and every one of them
+/// fails with a `502` if this predicate demands the correct one.
+///
+/// The bug this exists for — an upstream ignoring `stream: true` and
+/// answering with a JSON document — is caught by the JSON test alone, so
+/// the stricter rule would buy nothing for it and cost the above.
+///
+/// A third sibling, `audio::is_event_stream`, is strict like the
+/// passthrough one even though `/v1/audio/transcriptions` is a typed relay
+/// that also just asked to stream. That is consistent, not an oversight:
+/// its non-stream arm relays opaque bytes rather than parsing them as
+/// JSON, so guessing wrong there costs nothing. The asymmetry here comes
+/// from the `.json()` on the other side of the branch, not from the
+/// question being asked.
+pub(crate) fn upstream_body_is_sse(headers: &axum::http::HeaderMap) -> bool {
+    let essence = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    !(essence == "application/json" || essence.ends_with("+json"))
+}
+
+/// Buffer a JSON response body under an optional deadline.
+///
+/// The relays attach reqwest's request-level timeout only when the REQUEST
+/// did not ask to stream, because that timeout bounds the body read too and
+/// would cut a real stream off mid-response. So when a `stream: true`
+/// request is answered with a JSON document — the case
+/// [`upstream_body_is_sse`] exists to detect — the buffered read it now
+/// takes has no deadline from that source, and the per-chunk read timeout
+/// that used to bound it lives only on the SSE branch. Pass the streaming
+/// budget here for that case; `None` where the request-level timeout is
+/// already in force.
+pub(crate) async fn json_body_within(
+    resp: reqwest::Response,
+    deadline: Option<std::time::Duration>,
+) -> Result<serde_json::Value, BridgeError> {
+    let read = resp.json::<serde_json::Value>();
+    match deadline {
+        Some(d) => tokio::time::timeout(d, read)
+            .await
+            .map_err(|_| BridgeError::Timeout {
+                elapsed_ms: d.as_millis() as u64,
+                cause: "upstream answered a streaming request with a JSON body that stalled"
+                    .to_string(),
+            })?
+            .map_err(|e| BridgeError::UpstreamDecode(e.to_string())),
+        None => read
+            .await
+            .map_err(|e| BridgeError::UpstreamDecode(e.to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1561,5 +1649,44 @@ mod tests {
             let pk = pk_with_provider_and_adapter("vendor-without-specialized", Some("openai"));
             assert!(resolve_bridge(&hub, &pk).is_none());
         }
+    }
+
+    /// The relays used to pick their streaming branch from the REQUEST's
+    /// `stream` flag alone, so a JSON body answering `stream: true` entered
+    /// the SSE hold-back — unscanned, and released with a `\n\n` appended.
+    /// Only an explicitly-JSON content type routes such a body away from
+    /// the SSE path; everything else stays on it, so an SSE upstream with
+    /// an unfamiliar label is never buffered into a `.json()` decode error.
+    #[test]
+    fn only_a_json_content_type_says_the_upstream_did_not_stream() {
+        let ct = |v: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+            h
+        };
+        for json in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "Application/JSON",
+            "application/vnd.openai+json",
+        ] {
+            assert!(!upstream_body_is_sse(&ct(json)), "{json} is not a stream");
+        }
+        for streamed in [
+            "text/event-stream",
+            "text/event-stream; charset=utf-8",
+            "application/octet-stream",
+            "text/plain",
+        ] {
+            assert!(
+                upstream_body_is_sse(&ct(streamed)),
+                "{streamed} stays on the streaming path"
+            );
+        }
+        // No content-type at all: stay on the streaming path.
+        assert!(upstream_body_is_sse(&axum::http::HeaderMap::new()));
     }
 }

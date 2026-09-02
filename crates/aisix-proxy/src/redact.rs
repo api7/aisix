@@ -204,6 +204,43 @@ pub async fn moderate_body(
     non_segment_verdict: aisix_guardrails::GuardrailVerdict,
     counts_out: &mut RedactionCounts,
     monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+    walk: impl FnMut(&dyn Guardrail) -> RedactionCounts,
+) -> aisix_guardrails::GuardrailVerdict {
+    moderate_body_scanning(
+        chain,
+        dir,
+        non_segment_verdict,
+        counts_out,
+        monitor_hits_out,
+        Vec::new(),
+        walk,
+    )
+    .await
+}
+
+/// [`moderate_body`] plus text that must be SCANNED but must never be
+/// written back.
+///
+/// The walker is both the collect pass and the apply pass, so a slot it
+/// offers is a slot the provider may rewrite. That makes it the wrong place
+/// for a signed Anthropic `thinking` block: the block has to reach the
+/// screening call (an operator's block rule must still fire on it) and must
+/// come back byte-identical (#1104). `scan_only` is appended after the
+/// collected slots and truncated off the masked reply before the apply
+/// walk, so those texts are judged and never rewritten.
+///
+/// Without it the segment kinds — `bedrock`, `presidio`, `lakera`,
+/// `aliyun_ai_guardrail`, `custom` — never saw thinking content at all on
+/// `/v1/messages`: they answer `Allow` from `check_input_non_segment` by
+/// design and take their real verdict from this pass, so a block policy on
+/// any of them was bypassable by moving the text into a thinking block.
+pub async fn moderate_body_scanning(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+    scan_only: Vec<String>,
     mut walk: impl FnMut(&dyn Guardrail) -> RedactionCounts,
 ) -> aisix_guardrails::GuardrailVerdict {
     if non_segment_verdict.is_block() || !chain.moderates_segments() {
@@ -211,7 +248,11 @@ pub async fn moderate_body(
     }
     let collector = SegmentCollector::default();
     walk(&collector);
-    let texts = collector.take();
+    let mut texts = collector.take();
+    // Everything past here is judged but unwritable; the apply walk only
+    // ever offers the first `writable` slots back.
+    let writable = texts.len();
+    texts.extend(scan_only);
     // The pass runs even with zero collected slots. "Nothing to scan" is
     // not "nothing to decide": a segment-moderating member may hold a
     // verdict that does not depend on the text (a `kind: custom` policy
@@ -226,7 +267,15 @@ pub async fn moderate_body(
     };
     monitor_hits_out.append(&mut outcome.monitor_hits);
     if !outcome.verdict.is_block() {
-        if let Some(masked) = outcome.masked {
+        if let Some(mut masked) = outcome.masked {
+            // Drop the scan-only tail. The applier is positional and the
+            // walk offers only the first `writable` slots, so slots 0..n
+            // land correctly either way — this is not what keeps the signed
+            // block unwritten (the walk never offering it is). What it
+            // buys: without it `warn_if_misaligned` fires on every request
+            // that carries a thinking block, reporting a drift that did not
+            // happen and training operators to ignore a real one.
+            masked.truncate(writable);
             let applier = SegmentApplier::new(masked);
             // Marker counts are plumbing (see SEGMENT_APPLY_MARKER) —
             // discard them; the provider counts below are the real ones.
@@ -347,8 +396,13 @@ pub fn redact_json_encoded(
 /// Mask the request messages of a normalised [`ChatFormat`] in place:
 /// the flat `content` string and the `text` field of typed content
 /// blocks — the same surface `check_input` scans (`message_scan_text`).
-/// Tool-call arguments replayed in history are covered too (they reach
-/// the upstream verbatim). Returns the merged counts (empty = untouched).
+/// Tool-call arguments and replayed `reasoning_content` are covered too
+/// (both reach the upstream verbatim through `extra`). Returns the merged
+/// counts (empty = untouched).
+///
+/// This list and `message_scan_text`'s must stay equal: a slot the scan
+/// reads but this does not is a Mask rule that reports a hit and then
+/// dispatches the match unmasked.
 pub fn redact_chat_format(chain: &dyn Guardrail, req: &mut ChatFormat) -> RedactionCounts {
     let mut counts = RedactionCounts::new();
     if !chain.redacts_input() {
@@ -371,6 +425,13 @@ pub fn redact_chat_format(chain: &dyn Guardrail, req: &mut ChatFormat) -> Redact
         // verbatim through `extra`, so mask them like fresh content.
         if let Some(tool_calls) = msg.extra.get_mut("tool_calls") {
             redact_tool_call_arguments(chain, Direction::Input, tool_calls, &mut counts);
+        }
+        // Same reason for replayed reasoning: `reasoning_content` is the
+        // canonical slot the provider overrides normalise every vendor
+        // spelling onto, and it rides `extra` to the upstream untouched.
+        // Nothing signs it on this wire, so masking it is safe.
+        if let Some(reasoning @ Value::String(_)) = msg.extra.get_mut("reasoning_content") {
+            apply_to_value_string(chain, Direction::Input, reasoning, &mut counts);
         }
     }
     counts
@@ -423,6 +484,25 @@ pub fn redact_anthropic_request(chain: &dyn Guardrail, body: &mut Value) -> Reda
 /// Anthropic `content` is either a bare string or an array of typed
 /// blocks. Rewrites `text` blocks, `tool_result` nested content, and
 /// `tool_use` input objects; leaves image/document blocks alone.
+///
+/// **Deliberate exception to "no write-back channel means block".** A
+/// `thinking` / `redacted_thinking` block is signed by the provider, so it
+/// can be neither rewritten (the signature would no longer verify and the
+/// upstream rejects the replayed turn) nor, per the ruling on #1104,
+/// blocked. A mask-action hit inside one is FORWARDED UNCHANGED, for every
+/// guardrail kind — including the kinds that otherwise turn an unmaskable
+/// result into a blocking verdict.
+///
+/// Why refusing it buys nothing: the same bytes already left the gateway.
+/// Generated reasoning is out of the OUTPUT scope by design, so this block
+/// is one the gateway itself handed to the client, unmasked, on the
+/// previous turn. Blocking the replay protects nothing that was not already
+/// disclosed, and it denies service permanently, because a client following
+/// Anthropic's extended-thinking protocol re-sends the block every turn.
+///
+/// BLOCK-action rules are unaffected and still fire on thinking content —
+/// the scan reads it (`parse_inbound_request_for_scan`); only the mask has
+/// nowhere to write.
 fn redact_anthropic_content(
     chain: &dyn Guardrail,
     dir: Direction,
@@ -455,6 +535,35 @@ fn redact_anthropic_content(
         }
         _ => {}
     }
+}
+
+/// The plaintext of every signed reasoning block in an Anthropic request,
+/// for SCAN-ONLY submission to the segment pass
+/// ([`moderate_body_scanning`]).
+///
+/// Deliberately not part of `redact_anthropic_content`'s walk: that walk is
+/// also the write-back path, and a signed `thinking` block must be
+/// forwarded byte-identical (#1104). Collecting it here is what lets a
+/// segment-moderating kind — `bedrock`, `presidio`, `lakera`,
+/// `aliyun_ai_guardrail`, `custom` — judge the text without being handed a
+/// slot it could rewrite.
+///
+/// `redacted_thinking` carries only provider ciphertext under `data`, so
+/// there is no plaintext in it to screen.
+pub fn anthropic_signed_reasoning_texts(body: &Value) -> Vec<String> {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .map(|msgs| {
+            msgs.iter()
+                .filter_map(|m| m.get("content").and_then(Value::as_array))
+                .flatten()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("thinking"))
+                .filter_map(|b| b.get("thinking").and_then(Value::as_str))
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Mask an Anthropic-native `/v1/messages` RESPONSE body in place (the
@@ -535,6 +644,38 @@ fn redact_responses_item(
         Some("function_call_output") => {
             if let Some(output) = item.get_mut("output") {
                 apply_to_value_string(chain, dir, output, counts);
+            }
+        }
+        // A `reasoning` item replayed on the REQUEST. Its `content[].text`
+        // and `summary[].text` are both read by the scan
+        // (`responses::responses_item_text`), so a Mask rule matching there
+        // reported a hit, returned Allow, and dispatched the body with the
+        // match still in it — the mask has to reach the same slots the scan
+        // does. Neither slot carries a provider signature, so rewriting one
+        // is not replay-breaking; the Anthropic `thinking` block is the
+        // signed case and is forwarded unchanged instead (see
+        // `redact_anthropic_content`).
+        //
+        // NOT closed here: a reasoning item's `encrypted_content` is
+        // forwarded verbatim and is neither scanned nor rewritten, so on a
+        // request that replays one the masked `text` is a readable copy
+        // while the provider still receives the original. Masking it is not
+        // possible (it is provider ciphertext) and refusing on it is the
+        // open question this arm's Anthropic sibling raises — do not read
+        // this arm as closing the `/v1/responses` side.
+        //
+        // Input only. Reasoning the model GENERATES is out of
+        // output-guardrail scope, so this arm must not fire on
+        // `redact_responses_response`.
+        Some("reasoning") if dir == Direction::Input => {
+            for key in ["content", "summary"] {
+                if let Some(Value::Array(parts)) = item.get_mut(key) {
+                    for part in parts {
+                        if let Some(text) = part.get_mut("text") {
+                            apply_to_value_string(chain, dir, text, counts);
+                        }
+                    }
+                }
             }
         }
         _ => {}
@@ -1063,12 +1204,17 @@ impl BufferedSseSeal {
 /// that everything released was *understood*. The test here is whether a
 /// payload PARSES, because that is the most this layer can decide without
 /// knowing the route's event vocabulary. A frame carrying valid JSON of a
-/// `type` no pass models — and a 200 body that is not SSE at all, which an
-/// upstream ignoring `stream: true` will produce and which has no `data:`
-/// line to read — still travel through unread. Both predate #1100 and
-/// closing them would cut responses that reach clients today, so they are
-/// deliberately left; see #1100 for the reasoning. Do not build on a
+/// `type` no pass models still travels through unread; that predates #1100
+/// and closing it would cut responses that reach clients today, so it is
+/// deliberately left (see #1100 for the reasoning). Do not build on a
 /// stronger invariant than the one stated above.
+///
+/// A 200 body that is not SSE at all — what an upstream ignoring
+/// `stream: true` returns — used to reach here too, and was released with
+/// a `\n\n` appended to it. It no longer does: `/v1/responses` and
+/// `/v1/messages` choose their relay branch from the upstream's own
+/// content type (`dispatch::upstream_body_is_sse`), so such a body takes
+/// the non-streaming buffered scan+mask path instead of this one.
 ///
 /// Note what is NOT cut: a frame carrying several `data:` lines that join
 /// into one JSON document is a well-formed frame, and is scanned and
@@ -1636,6 +1782,317 @@ mod tests {
 
     fn both() -> Arc<dyn Guardrail> {
         mask_chain(aisix_core::models::GuardrailHookPoint::Both)
+    }
+
+    /// `message_scan_text` reads `extra["reasoning_content"]`, so this
+    /// must rewrite it or a Mask rule reports a hit on reasoning it then
+    /// forwards to the upstream verbatim. Nothing on the OpenAI wire signs
+    /// this slot, so rewriting it is safe — unlike the Anthropic `thinking`
+    /// block below.
+    #[test]
+    fn chat_format_masks_replayed_reasoning_content() {
+        let chain = both();
+        let mut req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "who?"},
+                {
+                    "role": "assistant",
+                    "content": "checking",
+                    "reasoning_content": "the user meant a@x.com I think"
+                }
+            ]
+        }))
+        .unwrap();
+        let counts = redact_chat_format(chain.as_ref(), &mut req);
+        assert_eq!(
+            req.messages[1]
+                .extra
+                .get("reasoning_content")
+                .and_then(Value::as_str),
+            Some("the user meant [EMAIL_REDACTED] I think"),
+        );
+        assert!(!counts.is_empty());
+    }
+
+    /// C1: the `/v1/responses` scan reads a `reasoning` item's
+    /// `content[].text` AND `summary[].text`, so the request mask has to
+    /// reach both — otherwise a Mask rule matching there reported a hit,
+    /// returned Allow, and dispatched the body with the match intact.
+    #[test]
+    fn responses_request_masks_reasoning_content_and_summary() {
+        let chain = both();
+        let mut body = json!({
+            "model": "m",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "ask a@x.com"}],
+                    "content": [{"type": "reasoning_text", "text": "or call 13800138000"}]
+                }
+            ]
+        });
+        let counts = redact_responses_request(chain.as_ref(), &mut body);
+        let item = &body["input"][1];
+        assert_eq!(
+            item["summary"][0]["text"].as_str(),
+            Some("ask [EMAIL_REDACTED]")
+        );
+        assert_eq!(
+            item["content"][0]["text"].as_str(),
+            Some("or call [CHINA_MOBILE_REDACTED]")
+        );
+        assert!(!counts.is_empty());
+    }
+
+    /// The mirror of the test above, and the reason the arm is gated on
+    /// `Direction::Input`: reasoning the model GENERATED is out of the
+    /// output-guardrail scope, so the response mask must leave a
+    /// `reasoning` item in `output[]` byte-identical.
+    #[test]
+    fn responses_response_leaves_generated_reasoning_alone() {
+        let chain = both();
+        let mut body = json!({
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "ask a@x.com"}],
+                    "content": [{"type": "reasoning_text", "text": "or call 13800138000"}]
+                },
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "reply to b@y.org"}]
+                }
+            ]
+        });
+        let before = body["output"][0].clone();
+        redact_responses_response(chain.as_ref(), &mut body);
+        assert_eq!(
+            body["output"][0], before,
+            "generated reasoning is untouched"
+        );
+        assert_eq!(
+            body["output"][1]["content"][0]["text"].as_str(),
+            Some("reply to [EMAIL_REDACTED]"),
+            "the message item is still masked",
+        );
+    }
+
+    /// A mask-action hit inside a signed `thinking` / `redacted_thinking`
+    /// block is FORWARDED UNCHANGED — the deliberate exception to "no
+    /// write-back channel means block" (#1104). The block is byte-identical
+    /// afterwards, and the ordinary block beside it still masks, so this
+    /// pins an exception for the signed block rather than an exemption for
+    /// the whole message.
+    #[test]
+    fn signed_reasoning_is_forwarded_unchanged_while_its_neighbours_mask() {
+        let chain = both();
+        let mut body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "mail a@x.com", "signature": "sig-abc"},
+                    {"type": "redacted_thinking", "data": "opaque a@x.com blob"},
+                    {"type": "text", "text": "also mail a@x.com"}
+                ]}
+            ]
+        });
+        let before = body["messages"][1]["content"].clone();
+        redact_anthropic_request(chain.as_ref(), &mut body);
+
+        assert_eq!(
+            body["messages"][1]["content"][0], before[0],
+            "the signed thinking block is byte-identical",
+        );
+        assert_eq!(
+            body["messages"][1]["content"][1], before[1],
+            "so is the redacted_thinking block",
+        );
+        assert_eq!(
+            body["messages"][1]["content"][2]["text"].as_str(),
+            Some("also mail [EMAIL_REDACTED]"),
+            "the mask is demonstrably running on this very request",
+        );
+    }
+
+    /// The exception is for the MASK only. A block-action rule still fires
+    /// on thinking content, because the scan reads it — otherwise the
+    /// exception would have turned a signed block into a channel any
+    /// forbidden text could travel through.
+    #[test]
+    fn a_block_rule_still_fires_on_thinking_content() {
+        use aisix_guardrails::{KeywordBlocklist, KeywordRule};
+
+        let chain: Arc<dyn Guardrail> = Arc::new(GuardrailChain::new(vec![Arc::new(
+            KeywordBlocklist::input_only(vec![KeywordRule::literal("FORBIDDENTHOUGHT")]),
+        )]));
+
+        let body = json!({
+            "model": "claude",
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "I will FORBIDDENTHOUGHT now", "signature": "s"}
+            ]}]
+        });
+        let chat = aisix_provider_anthropic::parse_inbound_request_for_scan(&body).unwrap();
+        let verdict = futures::executor::block_on(aisix_guardrails::Guardrail::check_input(
+            chain.as_ref(),
+            &chat,
+        ));
+        assert!(
+            matches!(verdict, aisix_guardrails::GuardrailVerdict::Block { .. }),
+            "a block rule must still reach thinking text, got {verdict:?}",
+        );
+    }
+
+    /// The FIVE segment-moderating kinds — `bedrock`, `presidio`, `lakera`,
+    /// `aliyun_ai_guardrail`, `custom` — answer `Allow` from
+    /// `check_input_non_segment` by design and take their real verdict from
+    /// the segment pass. That pass walks the redactor, which never offers a
+    /// signed `thinking` block, so before the scan-only channel existed a
+    /// block policy on any of those kinds was bypassable by moving the text
+    /// into a thinking block. The keyword test above cannot see this: keyword
+    /// is not a segment moderator.
+    #[tokio::test]
+    async fn a_segment_kind_sees_thinking_text_and_can_block_on_it() {
+        use aisix_guardrails::{GuardrailVerdict, SegmentsOutcome};
+        use std::sync::Mutex;
+
+        /// Records what the segment pass was offered, and blocks on a
+        /// literal — the shape a Presidio/Bedrock/custom block policy has.
+        struct RecordingSegmenter {
+            seen: Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl Guardrail for RecordingSegmenter {
+            fn name(&self) -> &'static str {
+                "recording-segmenter"
+            }
+            fn moderates_segments(&self) -> bool {
+                true
+            }
+            async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
+                *self.seen.lock().unwrap() = texts.to_vec();
+                let hit = texts.iter().any(|t| t.contains("FORBIDDENTHOUGHT"));
+                SegmentsOutcome {
+                    verdict: if hit {
+                        GuardrailVerdict::block("segment block".to_string())
+                    } else {
+                        GuardrailVerdict::Allow
+                    },
+                    masked: None,
+                    counts: Default::default(),
+                    monitor_hits: Vec::new(),
+                }
+            }
+        }
+
+        let seg = Arc::new(RecordingSegmenter {
+            seen: Mutex::new(Vec::new()),
+        });
+        let chain: Arc<dyn Guardrail> = Arc::new(GuardrailChain::new(vec![seg.clone()]));
+
+        let mut body = json!({
+            "model": "claude",
+            "messages": [
+                {"role": "user", "content": "benign question"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "I will FORBIDDENTHOUGHT now", "signature": "s"}
+                ]}
+            ]
+        });
+        let before = body.clone();
+
+        let mut counts = RedactionCounts::new();
+        let mut hits = Vec::new();
+        let verdict = moderate_body_scanning(
+            chain.as_ref(),
+            Direction::Input,
+            GuardrailVerdict::Allow,
+            &mut counts,
+            &mut hits,
+            anthropic_signed_reasoning_texts(&body),
+            |g| redact_anthropic_request(g, &mut body),
+        )
+        .await;
+
+        let seen = seg.seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|t| t.contains("FORBIDDENTHOUGHT")),
+            "the segment pass must be offered the thinking text, got {seen:?}",
+        );
+        assert!(
+            matches!(verdict, GuardrailVerdict::Block { .. }),
+            "a segment kind's block rule must fire on thinking content, got {verdict:?}",
+        );
+        assert_eq!(body, before, "and the body is never rewritten");
+    }
+
+    /// The scan-only text is judged but never written back: a segment kind
+    /// that masks every slot it was offered must not have that mask land on
+    /// the signed block, and must still land on the ordinary ones. (What
+    /// enforces that is the walk not offering the block — see the note on
+    /// `masked.truncate`, which is about log truthfulness, not this.)
+    #[tokio::test]
+    async fn a_segment_masks_ordinary_slots_but_never_the_signed_block() {
+        use aisix_guardrails::{GuardrailVerdict, SegmentsOutcome};
+
+        struct MaskEverything;
+        #[async_trait::async_trait]
+        impl Guardrail for MaskEverything {
+            fn name(&self) -> &'static str {
+                "mask-everything"
+            }
+            fn moderates_segments(&self) -> bool {
+                true
+            }
+            async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
+                SegmentsOutcome {
+                    verdict: GuardrailVerdict::Allow,
+                    masked: Some(texts.iter().map(|_| "MASKED".to_owned()).collect()),
+                    counts: std::collections::BTreeMap::from([("X".to_owned(), 1)]),
+                    monitor_hits: Vec::new(),
+                }
+            }
+        }
+
+        let chain: Arc<dyn Guardrail> =
+            Arc::new(GuardrailChain::new(vec![Arc::new(MaskEverything)]));
+        let mut body = json!({
+            "model": "claude",
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "secret chain", "signature": "s"},
+                {"type": "text", "text": "ordinary text"}
+            ]}]
+        });
+
+        let mut counts = RedactionCounts::new();
+        let mut hits = Vec::new();
+        moderate_body_scanning(
+            chain.as_ref(),
+            Direction::Input,
+            GuardrailVerdict::Allow,
+            &mut counts,
+            &mut hits,
+            anthropic_signed_reasoning_texts(&body),
+            |g| redact_anthropic_request(g, &mut body),
+        )
+        .await;
+
+        let blocks = &body["messages"][0]["content"];
+        assert_eq!(
+            blocks[0]["thinking"].as_str(),
+            Some("secret chain"),
+            "the signed block is byte-identical even under a mask-everything segmenter",
+        );
+        assert_eq!(
+            blocks[1]["text"].as_str(),
+            Some("MASKED"),
+            "…while the ordinary slot beside it is rewritten",
+        );
     }
 
     #[test]

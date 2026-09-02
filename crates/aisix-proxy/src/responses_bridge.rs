@@ -477,6 +477,16 @@ impl ResponsesSseEncoder {
         }
     }
 
+    /// Take the next `sequence_number` for an event this relay emits
+    /// outside the state machine — the terminal `error` frames. They are
+    /// part of the same numbered event stream a client is reading, so they
+    /// must continue its numbering rather than restart or repeat it.
+    pub fn take_sequence_number(&mut self) -> u64 {
+        let seq = self.sequence_number;
+        self.sequence_number += 1;
+        seq
+    }
+
     /// Build one event, stamping `type` + `sequence_number`.
     fn event(&mut self, event_type: &'static str, mut data: Value) -> ResponsesSseEvent {
         let seq = self.sequence_number;
@@ -1136,12 +1146,11 @@ pub fn build_responses_bridge_stream(
                     }
                 }
                 Err(e) => {
-                    let frame = format!(
-                        "event: error\ndata: {{\"type\":\"error\",\"code\":\"{}\",\"message\":{}}}\n\n",
+                    yield Ok(bytes::Bytes::from(upstream_error_frame(
+                        encoder.take_sequence_number(),
                         e.error_type(),
-                        serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"error\"".into()),
-                    );
-                    yield Ok(bytes::Bytes::from(frame));
+                        &e.to_string(),
+                    )));
                     return;
                 }
             }
@@ -1182,7 +1191,7 @@ pub fn build_responses_bridge_stream(
                 "streaming /v1/responses (cross-provider) output exceeded buffer cap; failing closed",
             );
             guard.comp().guardrail_blocked = true;
-            yield Ok(bytes::Bytes::from(guardrail_error_frame(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED))));
+            yield Ok(bytes::Bytes::from(guardrail_error_frame(encoder.take_sequence_number(), None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED))));
             return;
         }
 
@@ -1304,7 +1313,7 @@ pub fn build_responses_bridge_stream(
                     "guardrail blocked streaming /v1/responses (cross-provider) response",
                 );
                 guard.comp().guardrail_blocked = true;
-                yield Ok(bytes::Bytes::from(guardrail_error_frame(guardrail_name.as_deref(), unavailable.as_deref())));
+                yield Ok(bytes::Bytes::from(guardrail_error_frame(encoder.take_sequence_number(), guardrail_name.as_deref(), unavailable.as_deref())));
                 return;
             }
             if seg_rewrote {
@@ -1352,16 +1361,51 @@ pub fn build_responses_bridge_stream(
     ))
 }
 
-/// Responses-API SSE `error` frame for an output-guardrail block. Carries the
-/// firing guardrail's name (#519 B.4b) but never the matched-pattern detail.
-fn guardrail_error_frame(guardrail_name: Option<&str>, unavailable: Option<&str>) -> String {
+/// The Responses-API `error` event, as the API itself defines it — FLAT,
+/// with the discriminant on the top-level `type`.
+///
+/// Every OTHER SSE error this crate emits nests under an `error` object,
+/// and this one deliberately does not, because each surface matches its own
+/// protocol rather than the crate's internal habit. The Responses event
+/// stream is a union discriminated on `type`, and the official SDKs parse
+/// it that way — `openai-python`'s `ResponseErrorEvent` is
+/// `{type: Literal["error"], code, message, param, sequence_number}`,
+/// generated from OpenAI's own OpenAPI spec. Nesting the payload would hand
+/// a `responses.stream()` client an event it cannot classify at all. (The
+/// mirror-image argument is why the Anthropic surface uses Anthropic's
+/// closed `error.type` enum instead of ours.)
+///
+/// `sequence_number` continues the encoder's own numbering, so the error is
+/// an ordinary member of the stream a client has been counting.
+fn responses_error_frame(seq: u64, code: &str, message: &str) -> String {
     format!(
         "event: error\ndata: {}\n\n",
         json!({
             "type": "error",
-            "code": "content_filter",
-            "message": crate::error::guardrail_block_message("response", guardrail_name, unavailable),
+            "code": code,
+            "message": message,
+            "param": Value::Null,
+            "sequence_number": seq,
         })
+    )
+}
+
+/// Responses-API SSE `error` frame for an upstream failure mid-relay.
+fn upstream_error_frame(seq: u64, error_type: &str, message: &str) -> String {
+    responses_error_frame(seq, error_type, message)
+}
+
+/// Responses-API SSE `error` frame for an output-guardrail block. Carries the
+/// firing guardrail's name (#519 B.4b) but never the matched-pattern detail.
+fn guardrail_error_frame(
+    seq: u64,
+    guardrail_name: Option<&str>,
+    unavailable: Option<&str>,
+) -> String {
+    responses_error_frame(
+        seq,
+        "content_filter",
+        &crate::error::guardrail_block_message("response", guardrail_name, unavailable),
     )
 }
 
@@ -1821,5 +1865,58 @@ mod tests {
             completed.data["response"]["incomplete_details"]["reason"],
             "max_output_tokens"
         );
+    }
+
+    /// The Responses API defines its `error` event FLAT, discriminated on
+    /// the top-level `type`, and the official SDKs parse it that way —
+    /// `openai-python`'s `ResponseErrorEvent` is
+    /// `{type, code, message, param, sequence_number}`. Nesting it under an
+    /// `error` object (which is what every other SSE error in this crate
+    /// does) would hand a `responses.stream()` client an event it cannot
+    /// classify. Both of this relay's error frames are checked, because a
+    /// client should not have to know which failure it hit.
+    #[test]
+    fn both_sse_error_frames_match_the_responses_api_error_event() {
+        let payload_of = |frame: &str| -> serde_json::Value {
+            let body = frame
+                .strip_prefix("event: error\ndata: ")
+                .and_then(|r| r.strip_suffix("\n\n"))
+                .expect("an SSE error frame labelled `error`")
+                .to_owned();
+            serde_json::from_str(&body).expect("one JSON document")
+        };
+
+        let block = payload_of(&guardrail_error_frame(7, Some("gr-block"), None));
+        assert_eq!(block["type"], "error");
+        assert_eq!(block["code"], "content_filter");
+        assert!(block["message"].as_str().unwrap().contains("gr-block"));
+        assert_eq!(block["param"], serde_json::Value::Null);
+        assert_eq!(block["sequence_number"], 7);
+
+        // The upstream-failure frame on the same stream, same envelope. Its
+        // message is JSON-escaped through serde rather than interpolated.
+        let upstream = payload_of(&upstream_error_frame(
+            8,
+            "upstream_error",
+            "boom \"quoted\"",
+        ));
+        assert_eq!(upstream["type"], "error");
+        assert_eq!(upstream["code"], "upstream_error");
+        assert_eq!(upstream["message"], "boom \"quoted\"");
+        assert_eq!(upstream["sequence_number"], 8);
+
+        // Exactly the SDK's field set, and nothing nested: an `error` key
+        // here is the shape this deliberately does NOT use.
+        for v in [&block, &upstream] {
+            assert!(v.get("error").is_none());
+            let keys: std::collections::BTreeSet<&str> =
+                v.as_object().unwrap().keys().map(String::as_str).collect();
+            assert_eq!(
+                keys,
+                ["code", "message", "param", "sequence_number", "type"]
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>(),
+            );
+        }
     }
 }

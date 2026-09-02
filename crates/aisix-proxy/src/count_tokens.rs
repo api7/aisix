@@ -282,7 +282,7 @@ async fn screen_input(
     }
     // Fail closed on a body the scanner cannot read — see the same arm in
     // `messages.rs`.
-    let chat = match aisix_provider_anthropic::parse_inbound_request(body) {
+    let chat = match aisix_provider_anthropic::parse_inbound_request_for_scan(body) {
         Ok(chat) => chat,
         Err(err) => {
             tracing::warn!(
@@ -301,12 +301,21 @@ async fn screen_input(
     let (verdict, monitor_hits) =
         aisix_guardrails::Guardrail::check_input_non_segment_observed(&chain, &chat).await;
     screening.monitor_hits = monitor_hits;
-    let verdict = crate::redact::moderate_body(
+    // Same scan-only submission as `/v1/messages` — the two routes screen
+    // the same body with the same chain and must reach the same verdict.
+    let signed_reasoning = crate::redact::anthropic_signed_reasoning_texts(body);
+    let verdict = crate::redact::moderate_body_scanning(
         &chain,
         crate::redact::Direction::Input,
         verdict,
         &mut screening.redactions,
-        &mut Vec::new(),
+        // The segment pass's monitor-mode observations belong on the same
+        // event as the non-segment ones above. A throwaway `Vec` here made
+        // this route report fewer monitor hits than `/v1/messages` for an
+        // identical body and chain — and the scan-only channel feeds this
+        // pass more text, so the gap would have widened.
+        &mut screening.monitor_hits,
+        signed_reasoning,
         |g| crate::redact::redact_anthropic_request(g, body),
     )
     .await;

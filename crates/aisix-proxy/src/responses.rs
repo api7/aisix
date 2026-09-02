@@ -1001,7 +1001,15 @@ fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
 /// - `content` — message items;
 /// - `output` — tool-result items (`function_call_output`,
 ///   `custom_tool_call_output`, `*_call_output`) the caller feeds back;
-/// - `reason` — an `mcp_approval_response` justification.
+/// - `reason` — an `mcp_approval_response` justification;
+/// - `summary` — a `reasoning` item's summary parts.
+///
+/// A `reasoning` item's `content[]` parts are covered by the `content`
+/// key above. Reasoning replayed on the REQUEST is caller-supplied text
+/// entering the model like any other, so it is scanned — and masked, at
+/// the same two slots (`redact::redact_responses_item`). Reasoning the
+/// model GENERATES is a separate question and stays out of the
+/// output-guardrail scope.
 ///
 /// All are user-controlled content entering the model — the
 /// `/v1/chat/completions` equivalent (a `role:"tool"` message) is
@@ -1013,13 +1021,18 @@ fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
 /// kind). Reading a key absent on other item types is a harmless no-op.
 /// <https://platform.openai.com/docs/api-reference/responses/create>
 fn responses_item_text(item: &Value) -> String {
-    [item.get("content"), item.get("output"), item.get("reason")]
-        .into_iter()
-        .flatten()
-        .map(responses_value_text)
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    [
+        item.get("content"),
+        item.get("output"),
+        item.get("reason"),
+        item.get("summary"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(responses_value_text)
+    .filter(|s| !s.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n")
 }
 
 /// Plain text of one Responses-API content slot: a bare string, or the
@@ -1253,6 +1266,18 @@ async fn responses_to_target(
         .as_deref()
         .unwrap_or("unknown")
         .to_ascii_lowercase();
+
+    // The relay branch follows what the upstream ACTUALLY sent, not the
+    // request's `stream` flag — see `dispatch::upstream_body_is_sse`. A
+    // JSON document answering `stream: true` takes the non-streaming
+    // buffered scan+mask path below.
+    //
+    // That body needs its own deadline: the request-level timeout above was
+    // deliberately NOT attached for a streaming request, and the per-chunk
+    // read timeout lives on the SSE branch this response no longer takes,
+    // so without one a stalled JSON body would be held with no bound at all.
+    let buffered_body_deadline = if is_stream { timeouts.stream } else { None };
+    let is_stream = is_stream && crate::dispatch::upstream_body_is_sse(upstream_resp.headers());
 
     if is_stream {
         let headers = upstream_resp.headers().clone();
@@ -1868,18 +1893,18 @@ async fn responses_to_target(
             captured_content: None,
         })
     } else {
-        let json_body: Value = upstream_resp
-            .json()
-            .await
-            .map_err(|e| {
-                crate::cooldown::note_failure(
-                    &state.runtime_status,
-                    model_id,
-                    model.cooldown.as_ref(),
-                    aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
-                )
-            })
-            .map_err(ProxyError::Bridge)?;
+        let json_body: Value =
+            crate::dispatch::json_body_within(upstream_resp, buffered_body_deadline)
+                .await
+                .map_err(|be| {
+                    crate::cooldown::note_failure(
+                        &state.runtime_status,
+                        model_id,
+                        model.cooldown.as_ref(),
+                        be,
+                    )
+                })
+                .map_err(ProxyError::Bridge)?;
 
         // Extract the upstream-reported usage block for telemetry
         // emission. Pulled here (before the response is moved into
@@ -2725,11 +2750,19 @@ fn drain_responses_sse_frames(
             Some(rewritten) => out.extend_from_slice(&rewritten),
             None => out.extend_from_slice(&frame),
         }
-        if let Some(data) = crate::messages::extract_sse_data_line(&frame) {
-            if data == b"[DONE]" {
+        // Whole payload, not the first `data:` line (#1100): a frame whose
+        // JSON is written over several `data:` lines parses only once they
+        // are joined. Reading one line at a time leaves the terminal
+        // `response.completed` unparseable, and the buffered path then
+        // bills the request from the token estimator instead of the
+        // provider's own counters. This site only READS the frame — the
+        // bytes forwarded to the client are `frame` itself.
+        if let Some(payload) = crate::redact::frame_payload(&frame) {
+            let data = payload.trim();
+            if data == "[DONE]" {
                 continue;
             }
-            if let Ok(json) = serde_json::from_slice::<Value>(data) {
+            if let Ok(json) = serde_json::from_str::<Value>(data) {
                 // First parsed frame of ANY type (`response.created`
                 // included) → upstream TTFT. The industry convention
                 // (LiteLLM, caller-side gateways) stamps the same event, so
@@ -3109,9 +3142,13 @@ where
 ///   surface scans tool-call output too (`ChatResponse::guardrail_output_text`,
 ///   the #448 fix); this keeps the surfaces symmetric.
 ///
-/// Reasoning items are intentionally excluded (out of output-guardrail
-/// scope, matching the chat surface) — they carry `summary`, not `content`
-/// / `arguments`, so they're naturally skipped.
+/// Reasoning items are excluded (out of output-guardrail scope, matching
+/// the chat surface). That used to be left to the shape — the comment here
+/// said they carry `summary`, not `content`, so they are naturally
+/// skipped — but a reasoning item DOES carry `content[]` with `text`
+/// parts, and the walk below reads `content` off every item regardless of
+/// type, so generated reasoning was reaching the output scan. The skip is
+/// explicit now.
 /// <https://platform.openai.com/docs/api-reference/responses/object>
 fn responses_output_text(resp: &Value) -> String {
     let Some(items) = resp.get("output").and_then(|v| v.as_array()) else {
@@ -3119,6 +3156,9 @@ fn responses_output_text(resp: &Value) -> String {
     };
     let mut parts: Vec<&str> = Vec::new();
     for it in items {
+        if it.get("type").and_then(|t| t.as_str()) == Some("reasoning") {
+            continue;
+        }
         if let Some(content) = it.get("content").and_then(|c| c.as_array()) {
             parts.extend(
                 content
@@ -6452,5 +6492,112 @@ data: [DONE]\n\n";
             .expect("usage_sink sender dropped");
         // Two spans: the delta frame and the terminal event's repeat.
         assert_masked_by_eda(&event, 2);
+    }
+
+    /// The live `/v1/responses` relay reads each frame to find the terminal
+    /// event's usage. Reading only the FIRST `data:` line left a terminal
+    /// frame written over several lines unparseable, and the counters then
+    /// came from the local token estimator instead of the provider — which
+    /// is invisible unless the assertion pins the exact numbers, because
+    /// "usage exists" is true either way.
+    #[test]
+    fn drain_reads_a_terminal_frame_spread_over_several_data_lines() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(
+            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ml\"}}\n\n",
+        );
+        // ONE frame, ONE JSON document, three `data:` lines.
+        buf.extend_from_slice(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\ndata: \"response\":{\"id\":\"resp_ml\",\"usage\":\n\
+              data: {\"input_tokens\":4321,\"output_tokens\":765,\"total_tokens\":5086}}}\n\n",
+        );
+        let mut acc = None;
+        let mut out = Vec::new();
+        let mut first = false;
+        super::drain_responses_sse_frames(
+            &mut buf,
+            &mut acc,
+            None,
+            std::time::Instant::now(),
+            &mut first,
+            "client-facing",
+            &mut out,
+        );
+        let usage = acc.expect("the terminal frame must be parsed");
+        assert_eq!(usage.prompt_tokens, 4321);
+        assert_eq!(usage.completion_tokens, 765);
+        assert_eq!(usage.provider_request_id, "resp_ml");
+    }
+
+    /// The same drain on a CRLF-framed stream with no `[DONE]` sentinel —
+    /// what OpenAI's Responses API actually sends — must read identically.
+    #[test]
+    fn drain_reads_a_crlf_framed_stream_with_no_done_sentinel() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b": keep-alive\r\n\r\n");
+        buf.extend_from_slice(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_crlf\",\"usage\":{\"input_tokens\":11,\"output_tokens\":3,\"total_tokens\":14}}}\r\n\r\n",
+        );
+        let mut acc = None;
+        let mut out = Vec::new();
+        let mut first = false;
+        super::drain_responses_sse_frames(
+            &mut buf,
+            &mut acc,
+            None,
+            std::time::Instant::now(),
+            &mut first,
+            "client-facing",
+            &mut out,
+        );
+        let usage = acc.expect("a CRLF terminal frame must be parsed");
+        assert_eq!(usage.prompt_tokens, 11);
+        assert_eq!(usage.completion_tokens, 3);
+        assert!(buf.is_empty(), "both complete frames were drained");
+    }
+
+    /// Generated reasoning is out of the output-guardrail scope. A
+    /// `reasoning` item DOES carry `content[]` with `text` parts, and the
+    /// walk reads `content` off every item regardless of type — so without
+    /// an explicit skip the model's own reasoning reached the output scan
+    /// on this surface while the chat and `/v1/messages` surfaces excluded
+    /// it.
+    #[test]
+    fn responses_output_scan_excludes_generated_reasoning() {
+        let resp = serde_json::json!({
+            "output": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "SUMMARYSECRET"}],
+                    "content": [{"type": "reasoning_text", "text": "REASONINGSECRET"}]
+                },
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "the visible answer"}]
+                },
+                {"type": "function_call", "name": "lookup", "arguments": "{\"q\":\"argtext\"}"}
+            ]
+        });
+        let scanned = super::responses_output_text(&resp);
+        assert!(!scanned.contains("REASONINGSECRET"), "got {scanned:?}");
+        assert!(!scanned.contains("SUMMARYSECRET"), "got {scanned:?}");
+        // The tool-call coverage the walk exists for is untouched.
+        assert!(scanned.contains("the visible answer"));
+        assert!(scanned.contains("lookup") && scanned.contains("argtext"));
+    }
+
+    /// The request side is the mirror: a `reasoning` item replayed by the
+    /// caller is text entering the model, and both slots the mask rewrites
+    /// have to be slots the scan reads.
+    #[test]
+    fn responses_input_scan_covers_replayed_reasoning_content_and_summary() {
+        let item = serde_json::json!({
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "SUMMARYSECRET"}],
+            "content": [{"type": "reasoning_text", "text": "REASONINGSECRET"}]
+        });
+        let scanned = super::responses_item_text(&item);
+        assert!(scanned.contains("REASONINGSECRET"), "got {scanned:?}");
+        assert!(scanned.contains("SUMMARYSECRET"), "got {scanned:?}");
     }
 }
