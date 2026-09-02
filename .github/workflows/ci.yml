@@ -17,8 +17,63 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  changes:
+    # Classifies the PR diff so the expensive jobs can skip on a
+    # documentation-only change while still reporting a required check
+    # run — a skipped check counts as satisfied, an absent one blocks
+    # forever. Lists the PR files via the API; no checkout.
+    #
+    # This must NOT become a trigger-level `paths-ignore`. `main` requires
+    # three status checks by literal name, and a filtered-out trigger never
+    # produces them, so the PR sits at "Expected" with no way to clear it.
+    #
+    # Non-PR events (push to main, manual dispatch) always run everything.
+    name: classify diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      pull-requests: read
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - name: classify
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "non-PR event — full pipeline"
+            exit 0
+          fi
+          # Fail CLOSED: if the listing errors for any reason, classify as
+          # code. A classify failure must never let a PR merge on checks
+          # that were skipped rather than run.
+          if ! files=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files?per_page=100" --paginate --jq '.[].filename'); then
+            echo "::warning::listing PR files failed — defaulting to code=true (full pipeline)"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed files:"; echo "$files"
+          code=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              docs/*) ;;
+              *.md) ;;
+              *) code=true; break ;;
+            esac
+          done <<EOT
+          $files
+          EOT
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "classification: code=$code"
+
   lint:
     name: lint (fmt + clippy)
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -34,6 +89,8 @@ jobs:
 
   schema-drift:
     name: schema drift (resources)
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -52,6 +109,8 @@ jobs:
 
   openapi-generate:
     name: generate admin openapi
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -78,6 +137,8 @@ jobs:
 
   rust-unit:
     name: rust unit + coverage
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     services:
       redis:
@@ -217,6 +278,8 @@ jobs:
 
   build-bin:
     name: build aisix (instrumented)
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: "-C instrument-coverage"
@@ -240,7 +303,7 @@ jobs:
 
   e2e:
     name: e2e (vitest, ${{ matrix.serving }}) + coverage
-    needs: [build-bin]
+    needs: [changes, build-bin]
     runs-on: ubuntu-latest
     # Explicit, so the job's token stays read-only regardless of the
     # repository-level default (currently `read`, but that is a setting).
@@ -391,27 +454,42 @@ jobs:
     # other open PRs still report the old name and would all break the
     # moment the required contexts were renamed to the two leg names.
     name: e2e (vitest) + coverage
-    needs: [e2e, mcp-conformance]
+    needs: [changes, e2e, mcp-conformance]
     # A skipped required check counts as satisfied, so this must still run
     # when the matrix fails — otherwise the gate would vanish exactly when
     # it matters.
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: assert every serving mode passed
+      # MCP conformance is folded in here so the official-suite gate is
+      # merge-blocking without renaming the branch-protection contexts.
+      #
+      # `skipped` is accepted only when this PR touches no code. Without
+      # that carve-out, gating the matrix on the diff would turn every
+      # documentation PR red here: the legs skip, `skipped != success`,
+      # and the one required check that still runs is the one that fails.
+      # Accepting `skipped` unconditionally would be worse — it would also
+      # pass when a leg was skipped because something upstream of it broke.
+      - name: assert e2e and MCP conformance passed
+        env:
+          CODE: ${{ needs.changes.outputs.code }}
+          E2E: ${{ needs.e2e.result }}
+          MCP: ${{ needs.mcp-conformance.result }}
         run: |
-          if [ "${{ needs.e2e.result }}" != "success" ]; then
-            echo "::error::e2e matrix result: ${{ needs.e2e.result }}"
-            exit 1
-          fi
-      - name: assert MCP conformance passed
-        # Folded into this required aggregate so the official-suite gate is
-        # merge-blocking without renaming the branch-protection contexts.
-        run: |
-          if [ "${{ needs.mcp-conformance.result }}" != "success" ]; then
-            echo "::error::mcp conformance result: ${{ needs.mcp-conformance.result }}"
-            exit 1
-          fi
+          fail=0
+          for pair in "e2e:$E2E" "mcp conformance:$MCP"; do
+            job=${pair%%:*}; res=${pair##*:}
+            if [ "$res" = success ]; then
+              continue
+            fi
+            if [ "$res" = skipped ] && [ "$CODE" != true ]; then
+              echo "$job skipped: this pull request changes no code"
+              continue
+            fi
+            echo "::error::$job result: $res"
+            fail=1
+          done
+          exit $fail
 
   mcp-conformance:
     # The OFFICIAL MCP conformance suite against the shipped /mcp chain
@@ -421,6 +499,8 @@ jobs:
     # package-lock.json; needs Node >= 22 (fs.globSync). Merge-blocking
     # through the e2e-gate aggregate below.
     name: mcp conformance (official suite)
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # This job executes third-party code (npm ci + cargo build scripts):
