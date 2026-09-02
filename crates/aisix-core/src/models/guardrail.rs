@@ -902,9 +902,9 @@ pub struct CustomConfig {
     /// either way, and rejecting it is what puts it in `/status/config`'s
     /// `rejected` list where an operator can see it.
     ///
-    /// A script that is present but blank or does not compile passes the
-    /// schema — `minLength` counts characters, and a whitespace-only value
-    /// is one — and is refused when the chain is built instead. `aisix
+    /// A script that is whitespace-only or does not compile passes the
+    /// schema — `minLength` counts characters, so a whitespace-only value is
+    /// non-empty — and is refused when the chain is built instead. `aisix
     /// validate` reports that and exits non-zero; a serving gateway reports
     /// the runtime rejection through config status (api7/aisix#1084).
     #[serde(default)]

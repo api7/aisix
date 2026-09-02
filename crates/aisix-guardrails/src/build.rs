@@ -509,12 +509,6 @@ fn build_one_inner(
             if cfg.deny_examples.is_empty() && cfg.allow_examples.is_empty() {
                 return Ok(None);
             }
-            if cfg.embedding_model.trim().is_empty() {
-                return Err(BuildError::InvalidValue {
-                    field: "embedding_model",
-                    value: String::new(),
-                });
-            }
             // Unlike the compile-time kinds, this one needs a RUNTIME
             // capability the guardrails crate cannot supply itself: a
             // dispatcher for the `embedding`-kind Model the row names.
@@ -3132,7 +3126,7 @@ mod tests {
                 r#"{
                     "name": "broken-script",
                     "kind": "custom",
-                    "script": ""
+                    "script": " "
                 }"#,
             ),
         ));
@@ -3146,6 +3140,10 @@ mod tests {
                 }"#,
             ),
         ));
+        // A blank semantic model is deliberately valid on the lenient read
+        // path: the built guardrail fails closed at request time. It must not
+        // be reclassified as a build rejection, which would drop the row and
+        // admit traffic instead.
         broken.guardrails.insert(entry(
             "semantic-empty-model",
             "g-2",
@@ -3196,7 +3194,7 @@ mod tests {
 
         let rejected = status.view();
         assert_eq!(rejected.state, aisix_core::ConfigState::Degraded);
-        assert_eq!(rejected.rejected.len(), 2, "{rejected:?}");
+        assert_eq!(rejected.rejected.len(), 1, "{rejected:?}");
         let custom = rejected
             .rejected
             .iter()
@@ -3204,24 +3202,20 @@ mod tests {
             .expect("custom rejection");
         assert_eq!(custom.resource_kind, "guardrails");
         assert!(custom.last_error.contains("broken-script"));
-        let semantic = rejected
-            .rejected
-            .iter()
-            .find(|row| row.resource_id == "g-2")
-            .expect("semantic rejection");
-        assert!(semantic.last_error.contains("embedding_model"));
         assert_eq!(
             status
                 .rejection_snapshots()
                 .into_iter()
                 .map(|row| row.key)
                 .collect::<Vec<_>>(),
-            vec![
-                "/aisix/runtime/guardrails/g-1".to_string(),
-                "/aisix/runtime/guardrails/g-2".to_string(),
-            ],
+            vec!["/aisix/runtime/guardrails/g-1".to_string()],
             "heartbeat keys must retain the kine shape cp-api parses"
         );
+        assert!(live
+            .resolve(&any_ctx())
+            .check_input(&req("anything"))
+            .await
+            .is_block());
 
         let fixed = AisixSnapshot::new();
         fixed.guardrails.insert(entry(
@@ -3248,7 +3242,7 @@ mod tests {
         handle.store(fixed);
         // Rebuilds are deliberately lazy, so the previous signal remains
         // until the first request observes the new snapshot.
-        assert_eq!(status.view().rejected.len(), 2);
+        assert_eq!(status.view().rejected.len(), 1);
         let _ = live.resolve(&any_ctx());
         assert!(status.view().rejected.is_empty());
         assert_eq!(status.view().state, aisix_core::ConfigState::Synced);

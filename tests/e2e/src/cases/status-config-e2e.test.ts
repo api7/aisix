@@ -278,18 +278,19 @@ describe("status/config: etcd watch source", () => {
     );
     const attachment = await seed.attachGuardrailToEnv(guardrail.id);
 
+    const buildProbePlaintext = `sk-status-build-${randomUUID()}`;
+    const buildProbe = await seed.createApiKey({
+      key_hash: createHash("sha256").update(buildProbePlaintext).digest("hex"),
+      allowed_models: ["status-model"],
+    });
+    const proxy = new ProxyClient(app.proxyUrl, buildProbePlaintext);
     await waitConfigPropagation(async () => {
-      const cfg = await getStatusConfig(app!);
-      return (
-        cfg.applied?.resource_counts.guardrails === 1 &&
-        cfg.applied?.resource_counts.guardrail_attachments === 1
-      );
+      return (await proxy.listModels()).status === 200;
     });
 
     // Index construction is lazy: the first request after the snapshot swap
     // is what discovers the script the loader deliberately accepted cannot
     // compile.
-    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
     expect(
       (
         await proxy.chat({
@@ -320,11 +321,24 @@ describe("status/config: etcd watch source", () => {
       kind: "keyword",
       patterns: [{ kind: "literal", value: "NEVER-MATCH" }],
     });
+    const repairProbePlaintext = `sk-status-repair-${randomUUID()}`;
+    const repairProbe = await seed.createApiKey({
+      key_hash: createHash("sha256").update(repairProbePlaintext).digest("hex"),
+      allowed_models: ["status-model"],
+    });
+    const repairProxy = new ProxyClient(app.proxyUrl, repairProbePlaintext);
     await waitConfigPropagation(async () => {
-      await proxy.chat({
-        model: "status-model",
-        messages: [{ role: "user", content: "trigger the repaired build" }],
-      });
+      return (await repairProxy.listModels()).status === 200;
+    });
+    expect(
+      (
+        await repairProxy.chat({
+          model: "status-model",
+          messages: [{ role: "user", content: "trigger the repaired build" }],
+        })
+      ).status,
+    ).toBe(200);
+    await waitConfigPropagation(async () => {
       cfg = await getStatusConfig(app!);
       return !cfg.rejected.some((r) => r.resource_id === guardrail.id);
     });
@@ -332,6 +346,8 @@ describe("status/config: etcd watch source", () => {
 
     await seed.delete("guardrail_attachments", attachment.id);
     await seed.delete("guardrails", guardrail.id);
+    await seed.delete("api_keys", buildProbe.id);
+    await seed.delete("api_keys", repairProbe.id);
   });
 });
 
