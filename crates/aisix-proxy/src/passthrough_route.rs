@@ -1239,15 +1239,31 @@ fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String 
             })
             .unwrap_or_default(),
         // Responses API: `input` is either a bare string or an array of
-        // items whose `content` parts carry the text. `summary` rides
-        // alongside on a replayed `reasoning` item — caller-supplied text on
-        // the request side, and read by the typed route's scan
-        // (`responses::responses_item_text`), so it is read here too.
+        // items, and the text can sit in any of FOUR slots — the same four
+        // the typed route reads (`responses::responses_item_text`):
+        // `content` on a message, `output` on a tool result fed back,
+        // `reason` on an `mcp_approval_response`, and `summary` on a
+        // replayed `reasoning` item.
+        //
+        // All four, not just the common one: the raw-body fallback below
+        // fires only when the WHOLE extraction came back empty, so a body
+        // mixing a benign message item with a `function_call_output`
+        // produces non-empty text and the tool result is never scanned —
+        // while `/v1/responses` blocks that same body. A passthrough route
+        // must not enforce less than the typed route in front of the same
+        // envelope.
         PassthroughProtocol::OpenaiResponses => match v.get("input") {
             Some(serde_json::Value::String(t)) => t.clone(),
             Some(serde_json::Value::Array(items)) => items
                 .iter()
-                .flat_map(|i| [i.get("content"), i.get("summary")])
+                .flat_map(|i| {
+                    [
+                        i.get("content"),
+                        i.get("output"),
+                        i.get("reason"),
+                        i.get("summary"),
+                    ]
+                })
                 .flatten()
                 .map(content_text)
                 .filter(|t| !t.is_empty())
@@ -3198,7 +3214,9 @@ mod tests {
                     "type": "reasoning",
                     "summary": [{"type": "summary_text", "text": "SUMMARYSECRET"}],
                     "content": [{"type": "reasoning_text", "text": "REASONINGSECRET"}]
-                }
+                },
+                {"type": "function_call_output", "call_id": "c1", "output": "TOOLRESULTSECRET"},
+                {"type": "mcp_approval_response", "approve": true, "reason": "APPROVALSECRET"}
             ]
         })
         .to_string();
@@ -3207,6 +3225,13 @@ mod tests {
         assert!(scanned.contains("VISIBLE"), "got {scanned:?}");
         assert!(scanned.contains("REASONINGSECRET"), "got {scanned:?}");
         assert!(scanned.contains("SUMMARYSECRET"), "got {scanned:?}");
+        // The tool-result and approval slots too. These matter precisely
+        // because the items beside them yield text: the raw-body fallback
+        // fires only on a WHOLLY empty extraction, so a mixed body would
+        // otherwise carry them past the scan while `/v1/responses` blocks
+        // the same envelope.
+        assert!(scanned.contains("TOOLRESULTSECRET"), "got {scanned:?}");
+        assert!(scanned.contains("APPROVALSECRET"), "got {scanned:?}");
 
         let response = serde_json::json!({
             "output": [
