@@ -501,12 +501,11 @@ async fn spawn_echo_server_requiring_sole_authorization(expected: String) -> Soc
     addr
 }
 
-/// An internal MCP server that authorizes on the end user's claims receives
-/// the caller's own token, in the header the operator named — on the
-/// session handshake and on every subsequent operation, since the bridge
+/// A forwarded client header reaches the upstream server — on the session
+/// handshake and on every subsequent operation, since the bridge
 /// reconnects per operation.
 #[tokio::test]
-async fn forwarded_caller_jwt_reaches_the_upstream_server() {
+async fn a_forwarded_client_header_reaches_the_upstream_server() {
     let addr = spawn_echo_server_requiring_header(RequiredHeader {
         name: "x-user-jwt",
         expected: "eyJhbGciOi.caller".to_string(),
@@ -514,48 +513,46 @@ async fn forwarded_caller_jwt_reaches_the_upstream_server() {
     })
     .await;
 
-    let upstream = McpUpstream::new(format!("http://{addr}/mcp")).with_forwarded_jwt(Some((
-        "x-user-jwt".to_string(),
-        "eyJhbGciOi.caller".to_string(),
-    )));
-
-    let bridge = EphemeralBridge::new(upstream);
-    let tools = bridge.list_tools().await.expect("list with caller jwt");
-    assert_eq!(tools.len(), 1);
-    let result = bridge
-        .call_tool("echo", serde_json::json!({ "text": "hi" }))
-        .await
-        .expect("call with caller jwt");
-    assert_eq!(result.content[0]["text"], "hi");
-}
-
-/// Pointing `forward_jwt_header` at `authorization` hands the upstream the
-/// end user's token INSTEAD of the gateway's own bearer — exactly one
-/// credential on the wire, not both.
-#[tokio::test]
-async fn forwarded_caller_jwt_replaces_the_gateway_bearer() {
-    let addr =
-        spawn_echo_server_requiring_sole_authorization("Bearer caller-token".to_string()).await;
-
     let upstream = McpUpstream::new(format!("http://{addr}/mcp"))
-        .with_bearer("gateway-held-secret")
-        .with_forwarded_jwt(Some((
-            "authorization".to_string(),
-            "Bearer caller-token".to_string(),
-        )));
+        .with_forwarded_client_headers(headers(&[("x-user-jwt", "eyJhbGciOi.caller")]));
 
     let bridge = EphemeralBridge::new(upstream);
     let tools = bridge
         .list_tools()
         .await
-        .expect("caller token must win the authorization slot, alone");
+        .expect("list with forwarded header");
+    assert_eq!(tools.len(), 1);
+    let result = bridge
+        .call_tool("echo", serde_json::json!({ "text": "hi" }))
+        .await
+        .expect("call with forwarded header");
+    assert_eq!(result.content[0]["text"], "hi");
+}
+
+/// Forwarding `authorization` hands the upstream the caller's own
+/// credential INSTEAD of the gateway's bearer — exactly one credential on
+/// the wire, not both.
+#[tokio::test]
+async fn a_forwarded_authorization_replaces_the_gateway_bearer() {
+    let addr =
+        spawn_echo_server_requiring_sole_authorization("Bearer caller-token".to_string()).await;
+
+    let upstream = McpUpstream::new(format!("http://{addr}/mcp"))
+        .with_bearer("gateway-held-secret")
+        .with_forwarded_client_headers(headers(&[("authorization", "Bearer caller-token")]));
+
+    let bridge = EphemeralBridge::new(upstream);
+    let tools = bridge
+        .list_tools()
+        .await
+        .expect("the caller's credential must win the authorization slot, alone");
     assert_eq!(tools.len(), 1);
 }
 
-/// A server with no `forward_jwt_header` still gets the gateway's own
-/// credential and nothing else — the default every registered server keeps.
+/// A server forwarding nothing still gets the gateway's own credential and
+/// nothing else — the default every registered server keeps.
 #[tokio::test]
-async fn without_the_field_the_gateway_bearer_is_still_the_only_credential() {
+async fn without_a_forward_the_gateway_bearer_is_still_the_only_credential() {
     let addr =
         spawn_echo_server_requiring_sole_authorization("Bearer gateway-held-secret".to_string())
             .await;
@@ -568,14 +565,12 @@ async fn without_the_field_the_gateway_bearer_is_still_the_only_credential() {
     assert_eq!(tools.len(), 1);
 }
 
-/// The token never reaches a log through `Debug`, which the connect path
-/// formats on error.
+/// A forwarded value never reaches a log through `Debug`, which the
+/// connect path formats on error — it may be the caller's own credential.
 #[test]
-fn forwarded_jwt_is_redacted_in_debug() {
-    let upstream = McpUpstream::new("http://x/mcp").with_forwarded_jwt(Some((
-        "x-user-jwt".to_string(),
-        "eyJhbGciOi.caller".to_string(),
-    )));
+fn a_forwarded_value_is_redacted_in_debug() {
+    let upstream = McpUpstream::new("http://x/mcp")
+        .with_forwarded_client_headers(headers(&[("x-user-jwt", "eyJhbGciOi.caller")]));
     let rendered = format!("{upstream:?}");
     assert!(
         rendered.contains("x-user-jwt"),
@@ -583,31 +578,19 @@ fn forwarded_jwt_is_redacted_in_debug() {
     );
     assert!(
         !rendered.contains("eyJhbGciOi.caller"),
-        "token must not print: {rendered}"
+        "the value must not print: {rendered}"
     );
 }
 
-/// The slot is claimed only by a token that can actually be delivered.
-/// Verified tokens are base64url and so always header-safe; the assertion
-/// is that the suppression and the delivery are one decision, so no future
-/// token source can leave the session with neither credential.
-#[tokio::test]
-async fn a_token_that_cannot_be_a_header_leaves_the_gateway_bearer_alone() {
-    let addr =
-        spawn_echo_server_requiring_sole_authorization("Bearer gateway-held-secret".to_string())
-            .await;
-
-    let upstream = McpUpstream::new(format!("http://{addr}/mcp"))
-        .with_bearer("gateway-held-secret")
-        .with_forwarded_jwt(Some((
-            "authorization".to_string(),
-            "Bearer caller\ntoken".to_string(),
-        )));
-
-    let bridge = EphemeralBridge::new(upstream);
-    let tools = bridge
-        .list_tools()
-        .await
-        .expect("an undeliverable token must not cost the session its only credential");
-    assert_eq!(tools.len(), 1);
+/// Header name/value pairs for the forward, as the gateway resolves them.
+fn headers(pairs: &[(&str, &str)]) -> Vec<(http::HeaderName, http::HeaderValue)> {
+    pairs
+        .iter()
+        .map(|(k, v)| {
+            (
+                http::HeaderName::try_from(*k).expect("header name"),
+                http::HeaderValue::from_str(v).expect("header value"),
+            )
+        })
+        .collect()
 }

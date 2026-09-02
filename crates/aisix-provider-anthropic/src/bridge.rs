@@ -289,6 +289,57 @@ where
     }
 }
 
+/// Build this bridge's outbound `HeaderMap`.
+///
+/// Bridge-owned headers go in FIRST, then the ProviderKey's
+/// `request.default_headers` / `request.forward_client_headers` through the
+/// shared pipeline: a static operator header cannot displace them, and a
+/// forwarded client header displaces only the credential slot it was
+/// explicitly pointed at. Building a map rather than chaining
+/// `RequestBuilder::header` — which APPENDS — is what keeps a slot both
+/// sides name single-valued on the wire.
+fn build_request_headers(
+    api_key_str: &str,
+    api_version: &'static str,
+    request_id: &str,
+    sse: bool,
+    hdr: &aisix_gateway::UpstreamHeaderContext<'_>,
+) -> Result<reqwest::header::HeaderMap, BridgeError> {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+    // Suppressed when the operator forwards the caller's own credential
+    // into this slot: two `x-api-key` values would let the upstream pick.
+    if !aisix_gateway::ForwardedClientHeaders::resolve(hdr).claims("x-api-key") {
+        let key = HeaderValue::from_str(api_key_str).map_err(|e| {
+            BridgeError::InvalidUpstreamCredentials(format!(
+                "api key contains invalid header chars: {e}"
+            ))
+        })?;
+        headers.insert(HeaderName::from_static("x-api-key"), key);
+    }
+    headers.insert(
+        HeaderName::from_static("anthropic-version"),
+        HeaderValue::from_static(api_version),
+    );
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let rid = HeaderValue::from_str(request_id).map_err(|e| {
+        BridgeError::Config(format!("request_id contains invalid header chars: {e}"))
+    })?;
+    headers.insert(HeaderName::from_static("x-aisix-request-id"), rid);
+    if sse {
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+    }
+    aisix_gateway::apply_request_headers(&mut headers, hdr);
+    Ok(headers)
+}
+
 #[async_trait]
 impl Bridge for AnthropicBridge {
     fn name(&self) -> &'static str {
@@ -325,28 +376,13 @@ impl Bridge for AnthropicBridge {
         let api_version = self.api_version;
         let started = Instant::now();
         let request_id = ctx.request_id.clone();
-        // This bridge builds its upstream request by hand rather than
-        // through the shared header pipeline, so the caller-JWT delivery
-        // is resolved here explicitly. Taking the `x-api-key` slot means
-        // the end user's token replaces the gateway's key rather than
-        // joining it — `RequestBuilder::header` appends.
-        let forwarded_jwt = aisix_gateway::forwarded_jwt_header(&ctx.header_ctx());
-        let jwt_took_api_key_slot = forwarded_jwt
-            .as_ref()
-            .is_some_and(|(n, _)| n == "x-api-key");
+        let headers =
+            build_request_headers(key, api_version, &request_id, false, &ctx.header_ctx())?;
 
         with_deadline(ctx.deadline, started, async move {
-            let mut request = url.post_on(&client);
-            if !jwt_took_api_key_slot {
-                request = request.header("x-api-key", key);
-            }
-            if let Some((name, value)) = forwarded_jwt {
-                request = request.header(name, value);
-            }
-            let resp = request
-                .header("anthropic-version", api_version)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("x-aisix-request-id", &request_id)
+            let resp = url
+                .post_on(&client)
+                .headers(headers)
                 .json(&body)
                 .send()
                 .await
@@ -392,25 +428,12 @@ impl Bridge for AnthropicBridge {
         let api_version = self.api_version;
         let started = Instant::now();
         let request_id = ctx.request_id.clone();
-        // Same explicit delivery as the non-streaming path above.
-        let forwarded_jwt = aisix_gateway::forwarded_jwt_header(&ctx.header_ctx());
-        let jwt_took_api_key_slot = forwarded_jwt
-            .as_ref()
-            .is_some_and(|(n, _)| n == "x-api-key");
+        let headers =
+            build_request_headers(key, api_version, &request_id, true, &ctx.header_ctx())?;
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            let mut request = url.post_on(&client);
-            if !jwt_took_api_key_slot {
-                request = request.header("x-api-key", key);
-            }
-            if let Some((name, value)) = forwarded_jwt {
-                request = request.header(name, value);
-            }
-            request
-                .header("anthropic-version", api_version)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::ACCEPT, "text/event-stream")
-                .header("x-aisix-request-id", &request_id)
+            url.post_on(&client)
+                .headers(headers)
                 .json(&body)
                 .send()
                 .await

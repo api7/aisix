@@ -109,13 +109,6 @@ pub struct BridgeContext {
     /// `request.forward_client_headers` allowlist. `None` on the same
     /// caller-less paths as above.
     pub client_headers: Option<std::sync::Arc<HeaderMap>>,
-    /// The caller's verified JWT, delivered to the upstream under the
-    /// ProviderKey's `request.forward_jwt_header` when that is configured.
-    /// `None` when the caller authenticated with an API key, and on the
-    /// same caller-less paths as above. Held behind an `Arc` because every
-    /// dispatch path clones the context; nothing reaches an upstream
-    /// unless an operator named a header on that ProviderKey.
-    pub caller_jwt: Option<std::sync::Arc<str>>,
     /// Snapshot ids of the resolved Model and ProviderKey, for the
     /// `${model.id}` / `${provider_key.id}` header templates. They are
     /// carried separately because a `Model` / `ProviderKey` value does not
@@ -128,9 +121,9 @@ pub struct BridgeContext {
 
 /// Print the context without its credentials.
 ///
-/// Two of these fields are live secrets: `provider_key` carries the
-/// gateway's own upstream `api_key`, and `caller_jwt` the end user's
-/// token. A derived `Debug` would put both in any log line that ever
+/// Two of these fields reach live secrets: `provider_key` carries the
+/// gateway's own upstream `api_key`, and `client_headers` the caller's
+/// own. A derived `Debug` would put both in any log line that ever
 /// formats a context, so the type names them instead of quoting them.
 impl std::fmt::Debug for BridgeContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -141,18 +134,14 @@ impl std::fmt::Debug for BridgeContext {
             .field("deadline", &self.deadline)
             .field("caller", &self.caller)
             // Names only: the inbound map holds the caller's own
-            // `Authorization` — the same token as `caller_jwt` — and
-            // nothing marks a header sensitive on the way in.
+            // `Authorization`, and nothing marks a header sensitive on
+            // the way in.
             .field(
                 "client_headers",
                 &self
                     .client_headers
                     .as_ref()
                     .map(|h| h.keys().map(|k| k.as_str()).collect::<Vec<_>>()),
-            )
-            .field(
-                "caller_jwt",
-                &self.caller_jwt.as_ref().map(|_| "***redacted***"),
             )
             .field("model_id", &self.model_id)
             .field("provider_key_id", &self.provider_key_id)
@@ -173,7 +162,6 @@ impl BridgeContext {
             deadline: None,
             caller: CallerIdentity::default(),
             client_headers: None,
-            caller_jwt: None,
             model_id: String::new(),
             provider_key_id: String::new(),
         }
@@ -192,11 +180,9 @@ impl BridgeContext {
         mut self,
         caller: CallerIdentity,
         client_headers: Option<std::sync::Arc<HeaderMap>>,
-        caller_jwt: Option<std::sync::Arc<str>>,
     ) -> Self {
         self.caller = caller;
         self.client_headers = client_headers;
-        self.caller_jwt = caller_jwt;
         self
     }
 
@@ -229,7 +215,6 @@ impl BridgeContext {
                 provider_key_name: Some(&self.provider_key.display_name),
             },
             client_headers: self.client_headers.as_deref(),
-            caller_jwt: self.caller_jwt.as_deref(),
         }
     }
 }
@@ -1229,16 +1214,15 @@ mod tests {
         )
         .with_client(
             CallerIdentity::default(),
-            // The same token also arrives as an inbound header, where
-            // nothing marked it sensitive. Redacting only `caller_jwt`
-            // would leave it printing from here.
             Some(std::sync::Arc::new(inbound)),
-            Some(std::sync::Arc::from("header.payload.signature")),
         );
 
-        // The token is really on the context: without this the assertions
-        // below would pass on an empty one.
-        assert_eq!(ctx.caller_jwt.as_deref(), Some("header.payload.signature"));
+        // The credential is really on the context: without this the
+        // assertions below would pass on an empty one.
+        assert_eq!(
+            ctx.client_headers.as_ref().expect("headers")[http::header::AUTHORIZATION],
+            "Bearer header.payload.signature"
+        );
 
         let printed = format!("{ctx:?}");
         assert!(

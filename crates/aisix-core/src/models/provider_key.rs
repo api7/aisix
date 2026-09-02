@@ -356,17 +356,55 @@ pub struct RequestOverrides {
     /// variables, such as `"${request.api_key.team_id}"`; a header whose
     /// variables do not all resolve is dropped rather than sent blank. See
     /// [`crate::header_template`] for the closed variable vocabulary.
-    /// Reserved auth headers are dropped as defense-in-depth.
+    ///
+    /// "When the caller did not set them" includes the gateway itself:
+    /// an entry naming the slot this ProviderKey's credential occupies
+    /// is not applied. Use `forward_client_headers` to put the caller's
+    /// own credential there instead.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub default_headers: HashMap<String, String>,
 
-    /// Inbound client headers forwarded to the upstream provider, as
-    /// single-`*` glob patterns matched case-insensitively against the
-    /// header name (`"anthropic-beta"`, `"x-trace-*"`). Empty — the
+    /// Inbound client headers forwarded to the upstream, as single-`*`
+    /// glob patterns matched case-insensitively against the header name
+    /// (`"anthropic-beta"`, `"x-trace-*"`, `"authorization"`). Empty — the
     /// default — forwards nothing, which is the behavior of every
-    /// standard-protocol endpoint before AISIX-Cloud#1167. Auth,
-    /// transport, and gateway-owned headers are never forwarded whatever
-    /// the patterns say.
+    /// standard-protocol endpoint before AISIX-Cloud#1167.
+    ///
+    /// A header named here reaches the upstream whatever the gateway would
+    /// otherwise do with it. Naming a credential slot — `authorization`,
+    /// `proxy-authorization`, `x-api-key`, `api-key`, `x-goog-api-key`,
+    /// `cookie` — hands the upstream the caller's own credential in place of the
+    /// one this ProviderKey would inject there, never both. That is what lets an
+    /// internal service that already authorizes on the end user's
+    /// `Authorization` keep doing so unchanged. Any OTHER header the
+    /// gateway had already set is left alone: it selects how the exchange
+    /// works, not who it is from.
+    ///
+    /// A credential slot, and `traceparent` / `tracestate`, are forwarded
+    /// only when a pattern names them exactly — a glob such as `"*"` or
+    /// `"x-*"` is a statement about the operator's own headers, not
+    /// consent to hand a third party the caller's credential or to graft
+    /// the caller's trace onto that party's telemetry.
+    ///
+    /// Two cases where a named header still does not reach the upstream:
+    /// a `default_headers` entry of the same name wins it, since both are
+    /// operator configuration and the static one is the more specific
+    /// choice; and on an AWS Bedrock provider the SigV4-signed names
+    /// (`authorization`, `x-amz-date`, `x-amz-content-sha256`,
+    /// `x-amz-security-token`) are refused from either source, because
+    /// the request signer derives them and a supplied value would break
+    /// the signature rather than authenticate anyone.
+    ///
+    /// Headers whose forwarding would break the exchange rather than
+    /// change who it comes from are never forwarded whatever the patterns
+    /// say: `host`, the hop-by-hop headers that describe the caller's own
+    /// connection, and the gateway's `x-aisix-*` namespace. The headers
+    /// describing a body this gateway re-serializes or a response shape it
+    /// parses (`content-type`, `content-length`, `accept`,
+    /// `anthropic-version`, `x-stainless-*`) are excluded for the same
+    /// reason. `traceparent` and `tracestate` are forwarded only when a
+    /// pattern names them exactly — a glob is not read as consent to graft
+    /// the caller's trace onto the upstream's telemetry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forward_client_headers: Vec<String>,
 
@@ -375,33 +413,6 @@ pub struct RequestOverrides {
     /// insertion order on serialize, matching the etcd round-trip.
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub default_body_fields: Map<String, Value>,
-
-    /// Header the caller's own JWT is delivered to the upstream in, for
-    /// internal upstreams that authorize on the end user's claims rather
-    /// than on the gateway's credential. Omit — the default — to send no
-    /// caller token upstream.
-    ///
-    /// The token is the one the gateway already verified for this request
-    /// (signature, expiry, and claim mapping all applied), relayed
-    /// unchanged: no claim is added, removed, or rewritten. A request that
-    /// authenticated with an API key instead of a JWT has no token to
-    /// relay, and the header is then absent rather than empty.
-    ///
-    /// Naming `authorization` or `proxy-authorization` sends
-    /// `Bearer <token>`, the form those headers are defined to carry, and
-    /// replaces the credential this ProviderKey would otherwise inject
-    /// there — so the upstream receives the end user's token in place of
-    /// the gateway's, never both. Any other header carries the bare token.
-    ///
-    /// Headers that describe the message rather than its sender — its
-    /// framing (`host`, `content-length`), the connection carrying it
-    /// (`connection`, `keep-alive`), and what it negotiates (`accept`,
-    /// `content-type`) — are rejected. Lowercase-only, so that rejection
-    /// list is exhaustive on every configuration path (header matching is
-    /// case-insensitive on the wire regardless).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(regex(pattern = "^[!#$%&'*+.^_`|~0-9a-z-]+$"), length(min = 1))]
-    pub forward_jwt_header: Option<String>,
 }
 
 /// Numeric range clamps applied to chat-completion request bodies.

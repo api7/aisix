@@ -330,11 +330,10 @@ fn prepare_outbound_body<T: serde::Serialize>(
 /// Build the base outbound `HeaderMap` (Authorization, Content-Type,
 /// x-aisix-request-id, and optionally Accept: text/event-stream
 /// for streaming calls), then merge any `default_headers` the PK carries.
-/// Bridge-owned headers are inserted before the merge so
-/// [`apply_request_headers`] cannot overwrite them — its skip-if-present
-/// rule plus `RESERVED_UPSTREAM_HEADERS` gives two layers of defense
-/// against an operator-supplied `default_headers` entry (or a forwarded
-/// client header) clobbering auth.
+/// Bridge-owned headers are inserted before the merge, which is what makes
+/// a `default_headers` entry unable to displace them — that merge is
+/// skip-if-present. A FORWARDED client header does displace the credential,
+/// deliberately: see [`apply_request_headers`].
 ///
 /// The previous `bridge_name` parameter + `X-Aisix-Bridge` outbound
 /// header was removed in AISIX-Cloud#468: after the Phase A clean

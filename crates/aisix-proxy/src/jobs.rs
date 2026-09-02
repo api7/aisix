@@ -144,19 +144,17 @@ pub(crate) struct JobTarget {
     pub pk_entry: Arc<ResourceEntry<ProviderKey>>,
     pub secret: String,
     pub adapter: Adapter,
-    /// The ProviderKey's rendered `default_headers` plus the client headers
-    /// its `forward_client_headers` allowlist admits, resolved once when the
-    /// target is resolved so every round-trip on this surface (upload, poll,
-    /// download) sends the same set (AISIX-Cloud#1112 / #1167).
+    /// The ProviderKey's rendered `default_headers`, resolved once when the
+    /// target is resolved so every round-trip on this surface (upload,
+    /// poll, download) sends the same set (AISIX-Cloud#1112).
     pub extra_headers: Vec<(axum::http::HeaderName, axum::http::HeaderValue)>,
-    /// The caller-JWT slot for this call, captured before the outbound
-    /// header map is merged. Kept beside `extra_headers` because it must
-    /// OVERWRITE its slot while `extra_headers` merges with
-    /// skip-if-present — and because with no token to deliver it still has
-    /// to CLEAR a copy that arrived from the caller, which an inbound
-    /// header allowlist can otherwise walk into a slot the upstream was
-    /// told carries a verified identity.
-    forwarded_jwt: aisix_gateway::ForwardedJwt,
+    /// The client headers this ProviderKey's `forward_client_headers`
+    /// admits, resolved from the same inbound request and reused on the
+    /// same round-trips (AISIX-Cloud#1167). Kept beside `extra_headers`
+    /// because it OVERWRITES its slots while `extra_headers` merges with
+    /// skip-if-present — a forwarded credential is meant to displace the
+    /// gateway's own.
+    forwarded_client: aisix_gateway::ForwardedClientHeaders,
 }
 
 impl JobTarget {
@@ -265,15 +263,15 @@ pub(crate) fn resolve_target(
         &model_entry.id,
         client_ctx,
     );
-    let extra_headers = aisix_gateway::resolve_extra_headers(&header_ctx);
-    let forwarded_jwt = aisix_gateway::ForwardedJwt::resolve(&header_ctx);
+    let forwarded_client = aisix_gateway::ForwardedClientHeaders::resolve(&header_ctx);
+    let extra_headers = aisix_gateway::resolve_default_headers(&header_ctx);
     Ok(JobTarget {
         model_entry,
         pk_entry,
         secret,
         adapter,
         extra_headers,
-        forwarded_jwt,
+        forwarded_client,
     })
 }
 
@@ -387,16 +385,15 @@ async fn send_upstream(
     if let Ok(v) = axum::http::HeaderValue::from_str(request_id) {
         headers.insert(axum::http::HeaderName::from_static("x-aisix-request-id"), v);
     }
-    // Captured BEFORE the merge: the gateway's own credential went in
-    // above and must survive when there is no token, while a caller's copy
-    // could only arrive through the merge and must not.
-    let jwt_slot = target.forwarded_jwt.capture(&headers);
     for (name, value) in &target.extra_headers {
         if !headers.contains_key(name) {
             headers.insert(name.clone(), value.clone());
         }
     }
-    jwt_slot.apply(&mut headers);
+    // Last, and overwriting: an operator who forwards the caller's own
+    // credential into the slot the gateway just filled is choosing it over
+    // the gateway's, and the upstream must receive exactly one.
+    target.forwarded_client.apply(&mut headers);
 
     builder = builder.headers(headers);
 
