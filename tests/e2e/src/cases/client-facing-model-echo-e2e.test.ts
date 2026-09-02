@@ -956,6 +956,13 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
     expect(res.status).toBe(422);
     const text = await res.text();
     expect(text).not.toContain("ABSOLUTELYFORBIDDENWORD");
+    // Which refusal matters. `unscannable_body` — the arm for a buffer the
+    // cut emptied — is the same 422 and the same `content_filter` type, so
+    // a status-only assertion would still pass if the excised frame's text
+    // never reached the block scan. Only a keyword verdict names the
+    // guardrail; the unavailable arm names the tag instead.
+    expect(text).toContain("gr-model-echo-holdback");
+    expect(text).not.toContain("unscannable_body");
   });
 
   test("/v1/responses: a frame whose payload spans several data lines is masked whole", async (ctx) => {
@@ -1078,6 +1085,12 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
     const text = await res.text();
     expect(text).toContain("content_filter");
     expect(text).not.toContain("ABSOLUTELYFORBIDDENWORD");
+    // As on /v1/responses above: `unscannable_body` produces the same
+    // `content_filter` frame, so name the guardrail to pin that the block
+    // came from scanning the excised frame's text and not from the buffer
+    // having been emptied.
+    expect(text).toContain("gr-model-echo-holdback");
+    expect(text).not.toContain("unscannable_body");
     // Hold-back: nothing was forwarded before the verdict, so the frames
     // that DID clear are withheld too.
     expect(text).not.toContain("perfectly fine text");

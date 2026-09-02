@@ -864,6 +864,14 @@ impl SseFrame {
         if out.ends_with('\n') {
             out.pop();
         }
+        // ...and, on a CRLF frame whose LAST line was a dropped `data:`
+        // line, the CR that line ending left behind. The frame's own
+        // terminator CR was split off with the frame, so anything trailing
+        // here belongs to a line that is no longer followed by one — it
+        // would reach the client as a lone CR before the separator.
+        if out.ends_with('\r') {
+            out.pop();
+        }
         out.into_bytes()
     }
 }
@@ -1024,8 +1032,8 @@ impl BufferedSseSeal {
 }
 
 /// Seal a fully-buffered SSE body so a guardrail scan and the redaction
-/// pass read the SAME frames, and so nothing in it reaches the client
-/// without having been read by one of them (#1091, #1100).
+/// pass read the SAME frames, and so no frame reaches the client whose
+/// payload neither of them could parse (#1091, #1100).
 ///
 /// Two passes run over such a buffer and they used to disagree about what
 /// it contains: the line-based block scan reads whatever `data:` lines it
@@ -1050,6 +1058,17 @@ impl BufferedSseSeal {
 /// A caller whose buffer is left empty by either cut has nothing scanned
 /// at all and must refuse (`unscannable_body`) rather than answer with an
 /// empty 200.
+///
+/// What this does NOT establish, and must not be read as establishing:
+/// that everything released was *understood*. The test here is whether a
+/// payload PARSES, because that is the most this layer can decide without
+/// knowing the route's event vocabulary. A frame carrying valid JSON of a
+/// `type` no pass models — and a 200 body that is not SSE at all, which an
+/// upstream ignoring `stream: true` will produce and which has no `data:`
+/// line to read — still travel through unread. Both predate #1100 and
+/// closing them would cut responses that reach clients today, so they are
+/// deliberately left; see #1100 for the reasoning. Do not build on a
+/// stronger invariant than the one stated above.
 ///
 /// Note what is NOT cut: a frame carrying several `data:` lines that join
 /// into one JSON document is a well-formed frame, and is scanned and
@@ -1119,15 +1138,33 @@ fn seal_sse_tail(buf: &mut Vec<u8>) -> SseTailSeal {
 /// Runs AFTER the tail seal, so a fragment that was padded into a frame is
 /// judged by the same rule as the frames before it.
 fn excise_unscannable_frames(buf: &mut Vec<u8>) -> (Vec<String>, usize) {
+    // A frame with no `data:` line at all is a comment or a keepalive:
+    // there is nothing in it for a scan to read and nothing for a mask to
+    // rewrite, so it is not a bypass.
+    let unscannable =
+        |frame: &[u8]| matches!(frame_payload(frame), Some(p) if !payload_scannable(&p));
+    // Look before copying. Every buffered response reaches this, and almost
+    // none of them has a frame to cut, so the common path must not rebuild
+    // the buffer to discover that.
+    let mut rest: &[u8] = buf;
+    let mut any = false;
+    while let Some((pos, len)) = frame_terminator(rest) {
+        if unscannable(&rest[..pos]) {
+            any = true;
+            break;
+        }
+        rest = &rest[pos + len..];
+    }
+    if !any {
+        return (Vec::new(), 0);
+    }
+
     let mut excised: Vec<String> = Vec::new();
     let mut excised_bytes = 0usize;
     let mut kept: Vec<u8> = Vec::with_capacity(buf.len());
     let mut rest: &[u8] = buf;
     while let Some((pos, len)) = frame_terminator(rest) {
         match frame_payload(&rest[..pos]) {
-            // A frame with no `data:` line at all is a comment or a
-            // keepalive: there is nothing in it for a scan to read and
-            // nothing for a mask to rewrite, so it is not a bypass.
             Some(p) if !payload_scannable(&p) => {
                 excised.push(p);
                 excised_bytes += pos + len;
@@ -1135,9 +1172,6 @@ fn excise_unscannable_frames(buf: &mut Vec<u8>) -> (Vec<String>, usize) {
             _ => kept.extend_from_slice(&rest[..pos + len]),
         }
         rest = &rest[pos + len..];
-    }
-    if excised.is_empty() {
-        return (excised, 0);
     }
     // Empty after the tail seal, but appending it keeps this function
     // correct on its own terms rather than on its caller's.
@@ -2247,6 +2281,13 @@ mod tests {
         );
         // One leading space belongs to the framing, the rest to the payload.
         assert_eq!(frame_payload(b"data:  x").as_deref(), Some(" x"));
+        // So does the CR of a CRLF line ending — the payload is the text
+        // between them. Only a continued payload can carry one: a frame's
+        // last line hands its CR to the terminator.
+        assert_eq!(
+            frame_payload(b"data: one\r\ndata: two").as_deref(),
+            Some("one\ntwo"),
+        );
         // No `data:` line at all: a comment or keepalive, nothing to read.
         assert_eq!(frame_payload(b": ping"), None);
     }
@@ -2365,6 +2406,49 @@ mod tests {
         let seal = seal_buffered_sse(&mut sealed);
         assert!(seal.excised.is_empty(), "excised: {:?}", seal.excised);
         assert_eq!(sealed, raw);
+        // `sealed == raw` alone would hold even if the splitter saw one
+        // unframed blob, since an empty excision returns the buffer
+        // untouched. Assert the framing itself: three CRLF frames, and the
+        // `\r` stripped from each payload rather than left in it.
+        assert_eq!(
+            sse_frame_payloads(&raw),
+            vec![String::new(), "[DONE]".to_string()],
+        );
+    }
+
+    #[test]
+    fn seal_excises_a_crlf_frame_and_leaves_its_neighbours_crlf() {
+        let mut crlf =
+            b"data: {\"a\":1}\r\n\r\ndata: not json\r\n\r\ndata: [DONE]\r\n\r\n".to_vec();
+        let seal = seal_buffered_sse(&mut crlf);
+        assert_eq!(seal.excised, vec!["not json".to_string()]);
+        assert_eq!(crlf, b"data: {\"a\":1}\r\n\r\ndata: [DONE]\r\n\r\n");
+    }
+
+    #[test]
+    fn anthropic_sse_masks_a_crlf_frame_whose_payload_spans_several_data_lines() {
+        // The CRLF half of the LF case above. The dropped `data:` line takes
+        // its line ending with it, so without care the CR of the line BEFORE
+        // the separator is left stranded and the client reads `...}\r` as
+        // the payload.
+        let chain = both();
+        let mut raw = concat!(
+            "event: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"index\":0,\r\n",
+            "data: \"delta\":{\"type\":\"text_delta\",\"text\":\"mail a@x.com\"}}\r\n\r\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let seal = seal_buffered_sse(&mut raw);
+        assert!(seal.excised.is_empty(), "excised: {:?}", seal.excised);
+        let (out, _) = redact_anthropic_sse(chain.as_ref(), &raw)
+            .expect("the whole payload must reach the redactor");
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@x.com"), "left unmasked: {out}");
+        assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
+        // A masked CRLF frame stays a well-formed CRLF frame: the payload
+        // ends at `}`, not at a stray CR.
+        assert!(out.ends_with("}\r\n\r\n"), "stray CR: {out:?}");
+        assert!(!out.contains("\r\r"), "stray CR: {out:?}");
     }
 
     #[test]

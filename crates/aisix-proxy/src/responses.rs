@@ -1405,10 +1405,11 @@ async fn responses_to_target(
             // differently — the line-based scan reads `data:` lines it can
             // parse, the frame-based redactor reads terminator-delimited
             // frames whose payload parses. Seal it first, so both read the
-            // same frames and nothing in it can reach the client unread: a
-            // final frame missing only its terminator gets it, and a frame
-            // whose payload is not one JSON document is cut (its text still
-            // goes to the block scan below).
+            // same frames and no frame reaches the client whose payload
+            // neither could parse: a final frame missing only its terminator
+            // gets it, and a frame whose payload is not one JSON document is
+            // cut (its text still goes to the block scan below). Parsing is
+            // the whole test — see `seal_buffered_sse` for what that leaves.
             let seal = crate::redact::seal_buffered_sse(&mut buf);
             if let crate::redact::SseTailSeal::Dropped { dropped } = seal.tail {
                 tracing::warn!(
@@ -2627,9 +2628,14 @@ fn has_complete_responses_sse_event(bytes: &[u8]) -> bool {
     let mut offset = 0;
     while let Some(end) = crate::messages::find_frame_end(&bytes[offset..]) {
         let frame = &bytes[offset..offset + end];
-        if crate::messages::extract_sse_data_line(frame)
-            .is_some_and(|data| data != b"[DONE]" && serde_json::from_slice::<Value>(data).is_ok())
-        {
+        // Whole payload, not the first `data:` line (#1100). Only COMPLETE
+        // frames count, so this walks them rather than taking the whole
+        // prefix: a partial frame can hold complete JSON without its
+        // terminator, and that must not stop the clock early.
+        if crate::redact::frame_payload(frame).is_some_and(|p| {
+            let p = p.trim();
+            p != "[DONE]" && serde_json::from_str::<Value>(p).is_ok()
+        }) {
             return true;
         }
         offset += end;
@@ -2642,13 +2648,13 @@ fn has_complete_responses_sse_event(bytes: &[u8]) -> bool {
 /// already holds the whole response. Returns `None` (skip emission, matching
 /// the non-streaming gate) when no terminal event carried a usage block.
 fn responses_sse_usage(bytes: &[u8]) -> Option<ResponseUsage> {
-    let text = String::from_utf8_lossy(bytes);
     let mut usage = None;
-    for line in text.lines() {
-        let data = match line.strip_prefix("data:") {
-            Some(d) => d.trim(),
-            None => continue,
-        };
+    // Per frame, like the scan and the redaction pass (#1100): a terminal
+    // event written over several `data:` lines parses only once they are
+    // joined, and reading one line at a time would bill it from the token
+    // estimator instead of the provider's own counters.
+    for payload in crate::redact::sse_frame_payloads(bytes) {
+        let data = payload.trim();
         if data.is_empty() || data == "[DONE]" {
             continue;
         }
@@ -2666,11 +2672,9 @@ fn responses_sse_usage(bytes: &[u8]) -> Option<ResponseUsage> {
 /// terminal frame reported no usage and therefore produced no
 /// [`ResponseUsage`] (AISIX-Cloud#1289).
 fn responses_sse_provider_request_id(bytes: &[u8]) -> String {
-    let text = String::from_utf8_lossy(bytes);
-    for line in text.lines() {
-        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
-            continue;
-        };
+    // Same framing as everything else that reads this buffer (#1100).
+    for payload in crate::redact::sse_frame_payloads(bytes) {
+        let data = payload.trim();
         if data.is_empty() || data == "[DONE]" {
             continue;
         }
