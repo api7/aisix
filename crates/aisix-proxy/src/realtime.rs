@@ -532,8 +532,18 @@ fn restamp_session_model_in(
 ///
 /// The fast path matters: every audio delta is a text frame, and only two
 /// event types in the protocol carry a session at all.
+///
+/// It tests for a backslash as well as for the literal key, and that second
+/// condition is what makes it safe rather than merely quick. JSON lets a key
+/// be spelled with escapes, so `session` can also arrive as
+/// `\u0073ession` — the splice walker decodes keys and would match it, but a
+/// fast path looking only for the literal spelling would have skipped the
+/// frame before the walker ever saw it. An escape needs a backslash, so a
+/// frame carrying neither cannot name `session` at all, and skipping it is
+/// sound. (An audio delta is base64, which has no backslash, so the cheap
+/// case stays cheap.)
 fn splice_or_keep(text: String, splice: impl FnOnce(&[u8]) -> Option<Vec<u8>>) -> String {
-    if !text.contains("\"session\"") {
+    if !text.contains("\"session\"") && !text.contains('\\') {
         return text;
     }
     match splice(text.as_bytes()).map(String::from_utf8) {
@@ -1075,6 +1085,56 @@ fn emit_access_log(
 
 #[cfg(test)]
 mod tests {
+
+    /// JSON lets both a key and a string value be spelled with escapes, and
+    /// the two halves are handled in different places — so they are pinned
+    /// separately.
+    ///
+    /// The KEY half is the one that was broken: the splice walker decodes
+    /// keys and matches `"\u0073ession"` fine, but `splice_or_keep`'s fast
+    /// path tested only for the literal spelling and returned before the
+    /// walker ran, leaking the upstream model id.
+    #[test]
+    fn an_escaped_session_key_is_still_restamped() {
+        let frame = r#"{"type":"session.created","\u0073ession":{"model":"up-1"}}"#;
+        let out = restamp_session_model_out(frame.to_string(), "echo-realtime");
+        assert!(
+            out.contains(r#""model":"echo-realtime""#),
+            "the fast path must not skip an escaped key: {out}"
+        );
+        assert!(!out.contains("up-1"));
+    }
+
+    /// The VALUE half needs no special handling and this proves it rather
+    /// than assuming it: the walker offers the DECODED text to the rewrite
+    /// closure, so an alias spelled with escapes compares equal and is
+    /// translated back to the provider's own id.
+    #[test]
+    fn an_escaped_alias_value_still_translates_back_upstream() {
+        let frame = r#"{"type":"session.update","session":{"model":"echo-\u0072ealtime"}}"#;
+        let out = restamp_session_model_in(frame.to_string(), "echo-realtime", "gpt-realtime");
+        assert!(
+            out.contains(r#""model":"gpt-realtime""#),
+            "an escaped spelling of the alias is still the alias: {out}"
+        );
+    }
+
+    /// The fast path still skips the frames it exists for. An audio delta is
+    /// base64 with no backslash and no session, so it must come back as the
+    /// very same allocation-free string.
+    #[test]
+    fn an_audio_delta_takes_the_fast_path_unchanged() {
+        let frame =
+            r#"{"type":"response.output_audio.delta","delta":"UklGRiQAAABXQVZFZm10IBAAAAA="}"#;
+        assert_eq!(
+            restamp_session_model_out(frame.to_string(), "echo-realtime"),
+            frame
+        );
+        assert_eq!(
+            restamp_session_model_in(frame.to_string(), "echo-realtime", "gpt-realtime"),
+            frame
+        );
+    }
     use super::*;
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;

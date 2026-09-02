@@ -101,7 +101,27 @@ describe("legacy /v1/completions e2e: text-in / text-out passthrough", () => {
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["completions-legacy-model"],
     });
-  });
+
+    // The caller key is seeded last, so it authenticating implies every
+    // earlier resource is in the snapshot (see this directory's AGENTS.md).
+    // Gating here rather than inside a test means each test does not depend
+    // on an earlier one having warmed the snapshot — an ordering dependency
+    // that passes locally and races the moment a test is run on its own.
+    // `/v1/models` is also not a request that exercises anything asserted
+    // below, so a broken dispatch surfaces as its own assertion rather than
+    // as a propagation timeout.
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      if (res.status !== 200) {
+        await res.text();
+        return false;
+      }
+      const body = (await res.json()) as { data?: Array<{ id?: string }> };
+      return (body.data ?? []).some((m) => m.id === "completions-legacy-model");
+    });
+  }, 60_000);
 
   afterAll(async () => {
     await app?.exit();
@@ -230,23 +250,6 @@ describe("legacy /v1/completions e2e: text-in / text-out passthrough", () => {
         authorization: `Bearer ${CALLER_PLAINTEXT}`,
         "content-type": "application/json",
       };
-      await waitConfigPropagation(async () => {
-        try {
-          const r = await fetch(`${app!.proxyUrl}/v1/completions`, {
-            method: "POST",
-            headers: reqHeaders,
-            body: JSON.stringify({
-              model: "completions-legacy-model",
-              prompt: "ready-probe-stream",
-            }),
-          });
-          await r.text();
-          return r.status === 200;
-        } catch {
-          return false;
-        }
-      });
-
       const baseline = upstream.receivedRequests.length;
       const res = await fetch(`${app.proxyUrl}/v1/completions`, {
         method: "POST",
