@@ -213,7 +213,7 @@ fn apply_enforcement_mode(row: &DomainGuardrail, inner: Arc<dyn Guardrail>) -> A
         "block" => inner,
         "monitor" => Arc::new(MonitorGuardrail {
             row_name: row.name.clone(),
-            telemetry_reason_safe: row.config.kind_str() != "custom",
+            kind: row.config.kind_str(),
             inner,
         }),
         other => {
@@ -642,10 +642,10 @@ impl BuildError {
 /// the strictest member).
 struct MonitorGuardrail {
     row_name: String,
-    /// Built-in guardrails produce code-owned detector/category reasons.
-    /// A custom script's reason is arbitrary operator code and may contain
-    /// `ctx.text` or `ctx.secrets`, so it must never enter usage telemetry.
-    telemetry_reason_safe: bool,
+    /// Code-owned discriminator used to replace the inner Block reason in
+    /// usage telemetry. Inner reasons can contain operator patterns, remote
+    /// category names, or custom-script data and remain in ops logs only.
+    kind: &'static str,
     inner: Arc<dyn Guardrail>,
 }
 
@@ -679,16 +679,17 @@ impl MonitorGuardrail {
     }
 
     /// `would_block` telemetry hit for a downgraded Block (AISIX-Cloud#562).
-    fn would_block_hit(&self, hook: &'static str, reason: &str) -> GuardrailMonitorHit {
+    fn would_block_hit(&self, hook: &'static str, unavailable: bool) -> GuardrailMonitorHit {
+        let outcome = if unavailable {
+            "evaluation unavailable"
+        } else {
+            "policy matched"
+        };
         GuardrailMonitorHit {
             guardrail_name: self.row_name.clone(),
             hook: hook.to_owned(),
             action: "would_block".to_owned(),
-            reason: if self.telemetry_reason_safe {
-                reason.to_owned()
-            } else {
-                String::new()
-            },
+            reason: format!("{} guardrail {outcome}", self.kind),
             counts: std::collections::BTreeMap::new(),
         }
     }
@@ -716,8 +717,11 @@ impl MonitorGuardrail {
         verdict: GuardrailVerdict,
         hits: &mut Vec<GuardrailMonitorHit>,
     ) -> GuardrailVerdict {
-        if let GuardrailVerdict::Block { ref reason, .. } = verdict {
-            hits.push(self.would_block_hit(hook, reason));
+        if let GuardrailVerdict::Block {
+            ref unavailable, ..
+        } = verdict
+        {
+            hits.push(self.would_block_hit(hook, unavailable.is_some()));
         }
         self.observe(hook, verdict)
     }
@@ -859,7 +863,7 @@ impl Guardrail for MonitorGuardrail {
         self.inner.bind_score_log(log).map(|inner| {
             Arc::new(MonitorGuardrail {
                 row_name: self.row_name.clone(),
-                telemetry_reason_safe: self.telemetry_reason_safe,
+                kind: self.kind,
                 inner,
             }) as Arc<dyn Guardrail>
         })
@@ -1762,16 +1766,14 @@ mod tests {
             "matched value must never ride a hit",
         );
 
-        // block-action detector match → would_block hit carrying the reason.
+        // block-action detector match → would_block hit carrying only a
+        // code-owned summary, not the detector or matched value.
         let (v, hits) = chain.check_input_observed(&req("ssn 123-45-6789")).await;
         assert_eq!(v, GuardrailVerdict::Allow);
         assert_eq!(hits.len(), 1, "hits: {hits:?}");
         assert_eq!(hits[0].action, "would_block");
-        assert!(
-            hits[0].reason.contains("us_ssn"),
-            "reason: {}",
-            hits[0].reason
-        );
+        assert_eq!(hits[0].reason, "pii guardrail policy matched");
+        assert!(!hits[0].reason.contains("us_ssn"));
         assert!(!hits[0].reason.contains("123-45-6789"));
 
         // clean input → no hits.
@@ -1804,10 +1806,95 @@ mod tests {
         assert_eq!(verdict, GuardrailVerdict::Allow);
         assert_eq!(hits.len(), 1, "hits: {hits:?}");
         assert_eq!(hits[0].action, "would_block");
-        assert!(hits[0].reason.is_empty(), "hits: {hits:?}");
+        assert_eq!(hits[0].reason, "custom guardrail policy matched");
         let wire = serde_json::to_string(&hits).unwrap();
         assert!(!wire.contains("telemetry-secret"), "{wire}");
         assert!(!wire.contains("customer-private-text"), "{wire}");
+    }
+
+    #[tokio::test]
+    async fn keyword_monitor_reason_cannot_enter_usage_telemetry() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "keyword-monitor",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "keyword-monitor",
+                    "enforcement_mode": "monitor",
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "customer-private-pattern" }]
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+
+        let (verdict, hits) = chain
+            .check_input_observed(&req("prefix customer-private-pattern suffix"))
+            .await;
+        assert_eq!(verdict, GuardrailVerdict::Allow);
+        assert_eq!(hits.len(), 1, "hits: {hits:?}");
+        assert_eq!(hits[0].reason, "keyword guardrail policy matched");
+        let wire = serde_json::to_string(&hits).unwrap();
+        assert!(!wire.contains("customer-private-pattern"), "{wire}");
+        assert!(!wire.contains("prefix"), "{wire}");
+    }
+
+    fn custom_mask_table(enforcement_mode: &str) -> ResourceTable<DomainGuardrail> {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "custom-mask",
+            "g-1",
+            parse(&format!(
+                r#"{{
+                    "name": "custom-mask",
+                    "enforcement_mode": "{enforcement_mode}",
+                    "kind": "custom",
+                    "secrets": {{"TOKEN": "telemetry-secret"}},
+                    "script": "export function checkInput(ctx) {{ const key = ctx.secrets.TOKEN + ':' + ctx.text; return {{ action: 'mask', segments: ctx.segments.map(() => '***'), counts: {{ [key]: 4294967295 }} }}; }}"
+                }}"#,
+            )),
+        ));
+        table
+    }
+
+    #[tokio::test]
+    async fn custom_monitor_mask_uses_code_owned_counts() {
+        let table = custom_mask_table("monitor");
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let original = vec!["customer-private-text".to_owned()];
+
+        let outcome = chain.moderate_input_segments(&original).await;
+        assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
+        assert_eq!(outcome.masked, None, "monitor mode must not rewrite");
+        assert!(outcome.counts.is_empty(), "monitor counts are not applied");
+        assert_eq!(outcome.monitor_hits.len(), 1, "{outcome:?}");
+        assert_eq!(outcome.monitor_hits[0].action, "would_mask");
+        assert_eq!(outcome.monitor_hits[0].counts.get("custom"), Some(&1));
+        let wire = serde_json::to_string(&outcome.monitor_hits).unwrap();
+        assert!(!wire.contains("telemetry-secret"), "{wire}");
+        assert!(!wire.contains("customer-private-text"), "{wire}");
+        assert!(!wire.contains("4294967295"), "{wire}");
+    }
+
+    #[tokio::test]
+    async fn custom_enforced_mask_uses_code_owned_counts() {
+        let table = custom_mask_table("block");
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none())
+            .with_audit_log(Some(Arc::new(crate::GuardrailAuditLog::new())));
+        let original = vec!["customer-private-text".to_owned()];
+
+        let outcome = chain.moderate_input_segments(&original).await;
+        assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
+        assert_eq!(outcome.masked, Some(vec!["***".to_owned()]));
+        assert_eq!(outcome.counts.get("custom"), Some(&1));
+        let hits = chain.enforced_hits();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].counts.get("custom"), Some(&1));
+        let wire = serde_json::to_string(&(outcome.counts, hits)).unwrap();
+        assert!(!wire.contains("telemetry-secret"), "{wire}");
+        assert!(!wire.contains("customer-private-text"), "{wire}");
+        assert!(!wire.contains("4294967295"), "{wire}");
     }
 
     /// An ENFORCING (block-mode) guardrail must not produce monitor hits —
@@ -2051,6 +2138,10 @@ mod tests {
         assert_eq!(verdict, GuardrailVerdict::Allow, "monitor downgrades it");
         assert_eq!(hits.len(), 1, "the suppression is still reported");
         assert_eq!(hits[0].action, "would_block");
+        assert_eq!(
+            hits[0].reason,
+            "aliyun_text_moderation guardrail evaluation unavailable"
+        );
     }
 
     /// Monitor mode is unconditional: a provider outage is still only

@@ -1087,10 +1087,10 @@ pub struct AppliedGuardrail {
 /// stage a policy, watch its hit rate in the dashboard, and only then flip
 /// it to `block`.
 ///
-/// Built-in `reason` values and all `counts` carry detector/entity/category
-/// NAMES only — never matched content (#153 no-leak criterion). Custom-script
-/// reasons are omitted because operator code can derive them from request
-/// text or secrets.
+/// `reason` is a code-owned kind/outcome summary, never the inner guardrail's
+/// dynamic reason. Built-in mask `counts` carry detector/entity/category names;
+/// custom masks use the fixed key `custom` and count rewritten segments. No
+/// matched content enters this structure (#153 no-leak criterion).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuardrailMonitorHit {
     /// The configured (row) name of the monitor-mode guardrail that fired.
@@ -1100,8 +1100,8 @@ pub struct GuardrailMonitorHit {
     /// `would_block` (a Block verdict was downgraded) or `would_mask`
     /// (maskable spans were observed but not rewritten).
     pub action: String,
-    /// The suppressed Block's operator-facing reason for built-in guardrails
-    /// (`would_block` only; empty for `would_mask` and custom scripts).
+    /// Code-owned summary of the suppressed Block's kind and outcome
+    /// (`would_block` only; empty for `would_mask`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reason: String,
     /// detector/entity name → span count the guardrail would have masked

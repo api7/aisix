@@ -323,10 +323,10 @@ pub struct UsageEvent {
 
     /// What each `enforcement_mode: monitor` guardrail WOULD have done to
     /// this request (AISIX-Cloud#562): one entry per suppressed Block
-    /// (`would_block`, with a code-owned reason for built-in kinds) or
-    /// suppressed mask (`would_mask`, with per-detector counts). Custom-script
-    /// reasons are omitted because they may contain request text or secrets.
-    /// Names only — never matched content (#153). Lets operators stage a
+    /// (`would_block`, with a code-owned kind/outcome summary) or suppressed
+    /// mask (`would_mask`, with safe per-detector counts; custom scripts use
+    /// the fixed key `custom`). Names only — never matched content (#153).
+    /// Lets operators stage a
     /// policy and audit its hit rate in the dashboard before flipping it to
     /// `block`. Empty (no monitor-mode guardrail fired) is omitted from the
     /// wire; cp-api's `/dp/telemetry` binds JSON leniently, so older CP images
