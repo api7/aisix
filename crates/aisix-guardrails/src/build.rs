@@ -213,6 +213,7 @@ fn apply_enforcement_mode(row: &DomainGuardrail, inner: Arc<dyn Guardrail>) -> A
         "block" => inner,
         "monitor" => Arc::new(MonitorGuardrail {
             row_name: row.name.clone(),
+            telemetry_reason_safe: row.config.kind_str() != "custom",
             inner,
         }),
         other => {
@@ -641,6 +642,10 @@ impl BuildError {
 /// the strictest member).
 struct MonitorGuardrail {
     row_name: String,
+    /// Built-in guardrails produce code-owned detector/category reasons.
+    /// A custom script's reason is arbitrary operator code and may contain
+    /// `ctx.text` or `ctx.secrets`, so it must never enter usage telemetry.
+    telemetry_reason_safe: bool,
     inner: Arc<dyn Guardrail>,
 }
 
@@ -679,7 +684,11 @@ impl MonitorGuardrail {
             guardrail_name: self.row_name.clone(),
             hook: hook.to_owned(),
             action: "would_block".to_owned(),
-            reason: reason.to_owned(),
+            reason: if self.telemetry_reason_safe {
+                reason.to_owned()
+            } else {
+                String::new()
+            },
             counts: std::collections::BTreeMap::new(),
         }
     }
@@ -850,6 +859,7 @@ impl Guardrail for MonitorGuardrail {
         self.inner.bind_score_log(log).map(|inner| {
             Arc::new(MonitorGuardrail {
                 row_name: self.row_name.clone(),
+                telemetry_reason_safe: self.telemetry_reason_safe,
                 inner,
             }) as Arc<dyn Guardrail>
         })
@@ -1768,6 +1778,36 @@ mod tests {
         let (v, hits) = chain.check_input_observed(&req("all fine")).await;
         assert_eq!(v, GuardrailVerdict::Allow);
         assert!(hits.is_empty(), "hits: {hits:?}");
+    }
+
+    #[tokio::test]
+    async fn custom_monitor_reason_cannot_enter_usage_telemetry() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "custom-monitor",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "custom-monitor",
+                    "enforcement_mode": "monitor",
+                    "kind": "custom",
+                    "secrets": {"TOKEN": "telemetry-secret"},
+                    "script": "export function checkInput(ctx) { return { action: 'block', reason: ctx.secrets.TOKEN + ':' + ctx.text }; }"
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+
+        let (verdict, hits) = chain
+            .check_input_observed(&req("customer-private-text"))
+            .await;
+        assert_eq!(verdict, GuardrailVerdict::Allow);
+        assert_eq!(hits.len(), 1, "hits: {hits:?}");
+        assert_eq!(hits[0].action, "would_block");
+        assert!(hits[0].reason.is_empty(), "hits: {hits:?}");
+        let wire = serde_json::to_string(&hits).unwrap();
+        assert!(!wire.contains("telemetry-secret"), "{wire}");
+        assert!(!wire.contains("customer-private-text"), "{wire}");
     }
 
     /// An ENFORCING (block-mode) guardrail must not produce monitor hits —

@@ -11,6 +11,7 @@ import {
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForSlsLog,
   waitForToken,
   type A2aUpstream,
   type MockSls,
@@ -61,6 +62,15 @@ const CASES = {
   messages: { marker: "msgmark-7f3a03", detector: "messages_marker" },
   responses: { marker: "respmark-7f3a04", detector: "responses_marker" },
   rerank: { marker: "rerankmark-7f3a05", detector: "rerank_marker" },
+  completions501: {
+    marker: "completion501-7f3a07",
+    detector: "completion_501_marker",
+  },
+  embeddings501: {
+    marker: "embedding501-7f3a08",
+    detector: "embedding_501_marker",
+  },
+  images501: { marker: "image501-7f3a09", detector: "image_501_marker" },
 } as const;
 
 interface EnforcedHit {
@@ -247,13 +257,14 @@ describe("guardrail enforced hits on the LLM handler family", () => {
       provider: string,
       modelName: string,
       up: OpenAiUpstream,
+      adapter = provider,
     ): Promise<void> => {
       const pk = await seed.createProviderKey({
         display_name: `${display}-pk`,
         secret: "sk-mock-upstream",
         api_base: up.baseUrl,
-        provider,
-        adapter: provider,
+        provider: adapter,
+        adapter,
       });
       await seed.createModel({
         display_name: display,
@@ -267,6 +278,23 @@ describe("guardrail enforced hits on the LLM handler family", () => {
     await mk("enforced-messages", "anthropic", "claude-3-5-haiku-20241022", messagesUp);
     await mk("enforced-responses", "openai", "gpt-4o", responsesUp);
     await mk("enforced-rerank", "openai", "rerank-model", rerankUp);
+    // The Anthropic bridge implements none of these three operations. For
+    // images, the model stays OpenAI-labelled to pass that route's model
+    // check while its provider-key adapter selects the unsupported bridge.
+    // Each request reaches the real 501 after input guardrails have run.
+    await mk(
+      "enforced-completions-501",
+      "anthropic",
+      "claude-3-5-haiku",
+      messagesUp,
+    );
+    await mk(
+      "enforced-embeddings-501",
+      "anthropic",
+      "claude-3-5-haiku",
+      messagesUp,
+    );
+    await mk("enforced-images-501", "openai", "gpt-image-1", messagesUp, "anthropic");
 
     // Caller key LAST (AGENTS.md gate rule): a key that authenticates
     // implies every row above is already in the snapshot.
@@ -416,6 +444,72 @@ describe("guardrail enforced hits on the LLM handler family", () => {
       CASES.rerank.detector,
       CASES.rerank.marker,
       "input",
+    );
+  });
+
+  const expectAudited501 = async (
+    path: string,
+    model: string,
+    detector: string,
+    marker: string,
+    body: Record<string, unknown>,
+  ): Promise<void> => {
+    const res = await post(path, { model, ...body });
+    expect(res.status).toBe(501);
+    const response = (await res.json()) as { error?: { type?: string } };
+    expect(response.error?.type).toBe("not_implemented");
+
+    const log = await waitForSlsLog(
+      sls!,
+      LOGSTORE,
+      (entry) => entry.get("requested_model") === model,
+      `${path} attributed 501 usage event`,
+    );
+    expect(log.get("status_code")).toBe("501");
+    expect(log.get("prompt_tokens") ?? "0").toBe("0");
+    expect(log.get("completion_tokens") ?? "0").toBe("0");
+    const hits = JSON.parse(log.get("guardrail_enforced_hits") ?? "[]") as EnforcedHit[];
+    const hit = hits.find(
+      (candidate) =>
+        candidate.guardrail_name === ROW && Object.keys(candidate.counts ?? {}).includes(detector),
+    );
+    expect(hit, `no enforced input mask on ${path}'s 501 event`).toBeDefined();
+    expect(hit!.action).toBe("masked");
+    expect(hit!.hook).toBe("input");
+    expect(hit!.counts?.[detector]).toBeGreaterThan(0);
+    expect(decodedTextFor(sls!, LOGSTORE)).not.toContain(marker);
+  };
+
+  test("provider-unsupported /v1/completions keeps guardrail attribution", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    await expectAudited501(
+      "/v1/completions",
+      "enforced-completions-501",
+      CASES.completions501.detector,
+      CASES.completions501.marker,
+      { prompt: `screen ${CASES.completions501.marker}`, max_tokens: 8 },
+    );
+  });
+
+  test("provider-unsupported /v1/embeddings keeps guardrail attribution", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    await expectAudited501(
+      "/v1/embeddings",
+      "enforced-embeddings-501",
+      CASES.embeddings501.detector,
+      CASES.embeddings501.marker,
+      { input: `screen ${CASES.embeddings501.marker}` },
+    );
+  });
+
+  test("provider-unsupported /v1/images/generations keeps guardrail attribution", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    await expectAudited501(
+      "/v1/images/generations",
+      "enforced-images-501",
+      CASES.images501.detector,
+      CASES.images501.marker,
+      { prompt: `screen ${CASES.images501.marker}` },
     );
   });
 
