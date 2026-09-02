@@ -3388,8 +3388,12 @@ fn drain_anthropic_sse_frames(
     // tolerate `\r\n\r\n` defensively by normalising the search.
     while let Some(end) = find_frame_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
-        if let Some(data) = extract_sse_data_line(&frame) {
-            if let Ok(json) = serde_json::from_slice::<Value>(data) {
+        // The frame's WHOLE payload, not just its first `data:` line: this
+        // is what feeds `response_text`, the text the end-of-stream output
+        // guardrail scans, and a payload split over several `data:` lines
+        // parses only once they are joined (#1100).
+        if let Some(payload) = crate::redact::frame_payload(&frame) {
+            if let Ok(json) = serde_json::from_str::<Value>(payload.trim()) {
                 update_anthropic_usage(acc, &json, attempt_started, first_token_seen);
             }
         }
@@ -3736,8 +3740,8 @@ where
             //
             // Its counts are as real as any other frame's, so read them
             // whether or not the fragment survives the seal below.
-            if let Some(data) = extract_sse_data_line(&tail) {
-                if let Ok(json) = serde_json::from_slice::<Value>(data) {
+            if let Some(payload) = crate::redact::frame_payload(&tail) {
+                if let Ok(json) = serde_json::from_str::<Value>(payload.trim()) {
                     update_anthropic_usage(
                         guard.usage(),
                         &json,
@@ -3772,41 +3776,6 @@ where
                     return;
                 }
                 held.extend_from_slice(&tail);
-                // #1091: seal what will actually be released. Held
-                // unterminated, this fragment was read by the block scan
-                // (which parses text out line by line) but handed back by
-                // the redaction pass as `trailing` and appended verbatim —
-                // so a maskable literal in the last frame went out unmasked.
-                // Sealed, it is an ordinary frame to both passes. Sealing
-                // `held` rather than the fragment alone is deliberate: the
-                // frames already in it are what say which line ending this
-                // upstream writes.
-                if let crate::redact::SseTailSeal::Dropped { dropped } =
-                    crate::redact::seal_buffered_sse(&mut held)
-                {
-                    // Not one parseable frame — nothing can extract its
-                    // text, so releasing it WOULD be the bypass.
-                    tracing::warn!(
-                        guardrail_hook = "output",
-                        dropped,
-                        "streaming /v1/messages passthrough ended on an SSE frame that \
-                         could not be scanned; dropping it rather than releasing it past \
-                         the output guardrail",
-                    );
-                    // When that fragment was the ENTIRE response, dropping it
-                    // silently would hand the caller an empty 200 and no signal at
-                    // all — and the scan is skipped too, since nothing ever
-                    // reached `response_text`. Refuse explicitly instead, the same
-                    // shape the frame-cap arm above uses.
-                    if held.is_empty() {
-                        guard.usage().guardrail_blocked = true;
-                        yield Ok(Bytes::from(guardrail_block_frame(
-                            None,
-                            Some(crate::error::TAG_UNSCANNABLE_BODY),
-                        )));
-                        return;
-                    }
-                }
             } else {
                 // Restamp on the way out, for the same reason the `/v1/responses`
                 // relay does: the upstream has ended, so this is a final frame it
@@ -3830,6 +3799,53 @@ where
                 yield Ok(Bytes::from(tail));
             }
         }
+        // #1091/#1100: seal what will actually be released, before either
+        // pass reads it. The block scan takes its text from the frames the
+        // drain loop parsed, while the redaction pass walks the held bytes
+        // as terminator-delimited frames — so anything the drain loop could
+        // not parse was in `held` having been read by neither. Sealing
+        // `held` whole (rather than the EOF fragment alone) is what makes
+        // the two agree: an unterminated final frame that parses gets the
+        // terminator its upstream left off, and a frame whose payload is
+        // not one JSON document is cut, since nothing can mask it.
+        let mut unscanned: Vec<String> = Vec::new();
+        if hold_policy.is_some() {
+            let seal = crate::redact::seal_buffered_sse(&mut held);
+            if let crate::redact::SseTailSeal::Dropped { dropped } = seal.tail {
+                tracing::warn!(
+                    guardrail_hook = "output",
+                    dropped,
+                    "streaming /v1/messages passthrough ended on an SSE frame that \
+                     could not be scanned; dropping it rather than releasing it past \
+                     the output guardrail",
+                );
+            }
+            if !seal.excised.is_empty() {
+                tracing::warn!(
+                    guardrail_hook = "output",
+                    frames = seal.excised.len(),
+                    dropped = seal.excised_bytes,
+                    "streaming /v1/messages passthrough carried SSE frames whose payload \
+                     is not one JSON document; dropping them rather than releasing them \
+                     past the output guardrail (their text is still scanned)",
+                );
+            }
+            // When the cut took the ENTIRE response, dropping it silently
+            // would hand the caller an empty 200 and no signal at all — and
+            // the scan below is skipped too, since nothing ever reached
+            // `response_text`. Refuse explicitly instead, the same shape the
+            // frame-cap arm above uses. A `held` that was empty to begin
+            // with is an empty upstream response and is left alone.
+            if held.is_empty() && seal.cut_anything() {
+                guard.usage().guardrail_blocked = true;
+                yield Ok(Bytes::from(guardrail_block_frame(
+                    None,
+                    Some(crate::error::TAG_UNSCANNABLE_BODY),
+                )));
+                return;
+            }
+            unscanned = seal.excised;
+        }
         // Upstream stream over. Record it before the scan below, which awaits
         // a remote provider and is a routine drop point for clients that close
         // on the terminal event. NOT the same as "all of it was forwarded":
@@ -3847,11 +3863,22 @@ where
             // Clone (not take) when content capture is on, so the assembled
             // response survives for the on_complete content capture below;
             // otherwise take it (nothing downstream reads it).
-            let text = if content_cap.is_some() {
+            let mut text = if content_cap.is_some() {
                 guard.usage().response_text.clone()
             } else {
                 std::mem::take(&mut guard.usage().response_text)
             };
+            // #1100: an excised frame is not released, but a forbidden
+            // literal inside it must still block the response — the block
+            // pass reads raw text, so it can scan a payload nothing could
+            // parse. Appended to the scanned copy only: it never reached
+            // the client, so it must not reach the captured content either.
+            for payload in &unscanned {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(payload);
+            }
             if !text.is_empty() {
                 let synth = aisix_gateway::ChatResponse {
                     id: String::new(),

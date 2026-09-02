@@ -1401,15 +1401,17 @@ async fn responses_to_target(
                         attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                 }
             }
-            // #1091: an upstream that ends mid-frame leaves a fragment the
-            // two passes below read differently — the line-based scan sees
-            // it, the frame-based redactor appends it verbatim without ever
-            // masking it. Seal the buffer first, so both read the same
-            // frames: a parseable final frame gets the terminator its
-            // upstream left off, an unparseable one is cut.
-            if let crate::redact::SseTailSeal::Dropped { dropped } =
-                crate::redact::seal_buffered_sse(&mut buf)
-            {
+            // #1091/#1100: the two passes below read this buffer
+            // differently — the line-based scan reads `data:` lines it can
+            // parse, the frame-based redactor reads terminator-delimited
+            // frames whose payload parses. Seal it first, so both read the
+            // same frames and no frame reaches the client whose payload
+            // neither could parse: a final frame missing only its terminator
+            // gets it, and a frame whose payload is not one JSON document is
+            // cut (its text still goes to the block scan below). Parsing is
+            // the whole test — see `seal_buffered_sse` for what that leaves.
+            let seal = crate::redact::seal_buffered_sse(&mut buf);
+            if let crate::redact::SseTailSeal::Dropped { dropped } = seal.tail {
                 tracing::warn!(
                     guardrail_hook = "output",
                     model = %model.display_name,
@@ -1418,40 +1420,53 @@ async fn responses_to_target(
                      parsed; dropping it rather than releasing it past the output \
                      guardrail",
                 );
-                // Nothing else arrived: the whole response was that one
-                // unparseable frame. Dropping it silently would hand the
-                // caller an empty 200 with no signal, and there is no
-                // scanned content to release — refuse, the same shape the
-                // buffer-cap arm above and `/v1/messages` use.
-                if buf.is_empty() {
-                    return Ok(ResponseDispatchSuccess {
-                        response: crate::error::guardrail_block_error(
-                            "response",
-                            None,
-                            Some(crate::error::TAG_UNSCANNABLE_BODY),
-                        )
-                        .into_response(),
-                        provider: provider_label,
-                        usage: Some(ResponseUsage {
-                            upstream_ttft_ms,
-                            ..Default::default()
-                        }),
-                        model_id: model_id.to_string(),
-                        provider_key_id: provider_key_id.clone(),
-                        upstream_model: upstream_model.clone(),
-                        routing: RoutingTelemetry::default(),
-                        guardrail_blocked: true,
-                        usage_handled_by_stream: false,
-                        captured_content: match (&captured_prompt, content_cap) {
-                            (Some(prompt), Some(cap)) => {
-                                Some(CapturedContent::new(prompt, "", cap as usize))
-                            }
-                            _ => None,
-                        },
-                        output_redactions: crate::redact::RedactionCounts::new(),
-                        output_monitor_hits: Vec::new(),
-                    });
-                }
+            }
+            if !seal.excised.is_empty() {
+                tracing::warn!(
+                    guardrail_hook = "output",
+                    model = %model.display_name,
+                    frames = seal.excised.len(),
+                    dropped = seal.excised_bytes,
+                    "streaming /v1/responses carried SSE frames whose payload is not one \
+                     JSON document; dropping them rather than releasing them past the \
+                     output guardrail (their text is still scanned)",
+                );
+            }
+            // Nothing else arrived: the whole response was frames that
+            // could not be scanned. Dropping them silently would hand
+            // the caller an empty 200 with no signal, and there is no
+            // scanned content to release — refuse, the same shape the
+            // buffer-cap arm above and `/v1/messages` use. A buffer that
+            // was empty to begin with is an empty upstream response and
+            // is left alone.
+            if buf.is_empty() && seal.cut_anything() {
+                return Ok(ResponseDispatchSuccess {
+                    response: crate::error::guardrail_block_error(
+                        "response",
+                        None,
+                        Some(crate::error::TAG_UNSCANNABLE_BODY),
+                    )
+                    .into_response(),
+                    provider: provider_label,
+                    usage: Some(ResponseUsage {
+                        upstream_ttft_ms,
+                        ..Default::default()
+                    }),
+                    model_id: model_id.to_string(),
+                    provider_key_id: provider_key_id.clone(),
+                    upstream_model: upstream_model.clone(),
+                    routing: RoutingTelemetry::default(),
+                    guardrail_blocked: true,
+                    usage_handled_by_stream: false,
+                    captured_content: match (&captured_prompt, content_cap) {
+                        (Some(prompt), Some(cap)) => {
+                            Some(CapturedContent::new(prompt, "", cap as usize))
+                        }
+                        _ => None,
+                    },
+                    output_redactions: crate::redact::RedactionCounts::new(),
+                    output_monitor_hits: Vec::new(),
+                });
             }
             // #808: the whole SSE response is buffered here, so parse its
             // terminal event for usage and let the handler emit (the body is
@@ -1487,7 +1502,17 @@ async fn responses_to_target(
                     usage.usage_estimated = true;
                 }
             }
-            let out_text = responses_sse_output_text(&buf);
+            let mut out_text = responses_sse_output_text(&buf);
+            // #1100: an excised frame is not released, but a forbidden
+            // literal inside it must still block the response — the block
+            // pass reads raw text, so it can scan a payload nothing could
+            // parse.
+            for payload in &seal.excised {
+                if !out_text.is_empty() {
+                    out_text.push('\n');
+                }
+                out_text.push_str(payload);
+            }
             let synth = synth_chat_response(&upstream_model, out_text);
             let (verdict, hits) =
                 aisix_guardrails::Guardrail::check_output_non_segment_observed(chain, &synth).await;
@@ -2603,9 +2628,14 @@ fn has_complete_responses_sse_event(bytes: &[u8]) -> bool {
     let mut offset = 0;
     while let Some(end) = crate::messages::find_frame_end(&bytes[offset..]) {
         let frame = &bytes[offset..offset + end];
-        if crate::messages::extract_sse_data_line(frame)
-            .is_some_and(|data| data != b"[DONE]" && serde_json::from_slice::<Value>(data).is_ok())
-        {
+        // Whole payload, not the first `data:` line (#1100). Only COMPLETE
+        // frames count, so this walks them rather than taking the whole
+        // prefix: a partial frame can hold complete JSON without its
+        // terminator, and that must not stop the clock early.
+        if crate::redact::frame_payload(frame).is_some_and(|p| {
+            let p = p.trim();
+            p != "[DONE]" && serde_json::from_str::<Value>(p).is_ok()
+        }) {
             return true;
         }
         offset += end;
@@ -2618,13 +2648,13 @@ fn has_complete_responses_sse_event(bytes: &[u8]) -> bool {
 /// already holds the whole response. Returns `None` (skip emission, matching
 /// the non-streaming gate) when no terminal event carried a usage block.
 fn responses_sse_usage(bytes: &[u8]) -> Option<ResponseUsage> {
-    let text = String::from_utf8_lossy(bytes);
     let mut usage = None;
-    for line in text.lines() {
-        let data = match line.strip_prefix("data:") {
-            Some(d) => d.trim(),
-            None => continue,
-        };
+    // Per frame, like the scan and the redaction pass (#1100): a terminal
+    // event written over several `data:` lines parses only once they are
+    // joined, and reading one line at a time would bill it from the token
+    // estimator instead of the provider's own counters.
+    for payload in crate::redact::sse_frame_payloads(bytes) {
+        let data = payload.trim();
         if data.is_empty() || data == "[DONE]" {
             continue;
         }
@@ -2642,11 +2672,9 @@ fn responses_sse_usage(bytes: &[u8]) -> Option<ResponseUsage> {
 /// terminal frame reported no usage and therefore produced no
 /// [`ResponseUsage`] (AISIX-Cloud#1289).
 fn responses_sse_provider_request_id(bytes: &[u8]) -> String {
-    let text = String::from_utf8_lossy(bytes);
-    for line in text.lines() {
-        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
-            continue;
-        };
+    // Same framing as everything else that reads this buffer (#1100).
+    for payload in crate::redact::sse_frame_payloads(bytes) {
+        let data = payload.trim();
         if data.is_empty() || data == "[DONE]" {
             continue;
         }
@@ -3127,13 +3155,13 @@ fn responses_output_text(resp: &Value) -> String {
 /// `data:` JSON line drives the dispatch.
 /// <https://platform.openai.com/docs/api-reference/responses-streaming>
 fn responses_sse_output_text(bytes: &[u8]) -> String {
-    let text = String::from_utf8_lossy(bytes);
     let mut deltas = String::new();
-    for line in text.lines() {
-        let data = match line.strip_prefix("data:") {
-            Some(d) => d.trim(),
-            None => continue,
-        };
+    // Per FRAME, not per line: a frame's payload is all of its `data:`
+    // lines joined, so reading them one at a time both truncates such a
+    // payload and disagrees with the redaction pass about what the frame
+    // carries (#1100).
+    for payload in crate::redact::sse_frame_payloads(bytes) {
+        let data = payload.trim();
         if data.is_empty() || data == "[DONE]" {
             continue;
         }
