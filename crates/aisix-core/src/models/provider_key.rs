@@ -389,11 +389,15 @@ pub struct RequestOverrides {
     /// Two cases where a named header still does not reach the upstream:
     /// a `default_headers` entry of the same name wins it, since both are
     /// operator configuration and the static one is the more specific
-    /// choice; and on an AWS Bedrock provider the SigV4-signed names
-    /// (`authorization`, `x-amz-date`, `x-amz-content-sha256`,
-    /// `x-amz-security-token`) are refused from either source, because
-    /// the request signer derives them and a supplied value would break
-    /// the signature rather than authenticate anyone.
+    /// choice; and on an AWS Bedrock provider the request signer owns
+    /// `authorization`, `x-amz-date`, `x-amz-content-sha256`,
+    /// `x-amz-security-token`, `x-amz-target` and `x-amzn-bedrock-accept`,
+    /// and drops any supplied value. A value there would not authenticate
+    /// anyone: it either loses to the signer or breaks the signature.
+    ///
+    /// Naming a credential slot needs a data plane new enough to honor
+    /// it; an older one refuses those names outright, so the pattern has
+    /// no effect there rather than a different one.
     ///
     /// Headers whose forwarding would break the exchange rather than
     /// change who it comes from are never forwarded whatever the patterns

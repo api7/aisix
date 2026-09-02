@@ -720,8 +720,29 @@ async fn dispatch(
     // it is handed, but hyper honours a caller-set value verbatim instead,
     // so a relayed copy is a request-framing bug waiting for the first
     // body this route rewrites.
+    //
+    // The exact-name rule is per ROUTE here. `/v1/*` and MCP read the
+    // caller's credential out of `authorization` or `x-api-key`, both on
+    // the shared list, but a route names its own slots: under `auth_mode:
+    // header_key` the gateway credential arrives in `auth_header_name`,
+    // and `identity_header` is one the route promises to strip. Neither
+    // can be a name the shared list already covers in any way that helps:
+    // the route schema rejects most of them outright, and the two it
+    // permits are on that list anyway. So without this a `["x-*"]`
+    // pattern would relay the very header this gateway authenticated the
+    // caller with. Naming either in full still forwards it — the rule is
+    // unchanged, only its input.
+    //
+    // A fixed array rather than a collected `Vec`: there are at most two,
+    // on a per-request path. An unset slot stands as `""`, which matches
+    // nothing — a header name is never empty, on the wire or in the
+    // schema, so the empty entry needs no filtering out.
+    let route_slots = [
+        route.auth_header_name.as_deref().unwrap_or_default(),
+        route.identity_header.as_deref().unwrap_or_default(),
+    ];
     let forwards = |name: &str| {
-        aisix_core::forward_pattern_admits(&route.forward_client_headers, name)
+        aisix_core::forward_pattern_admits_with(&route.forward_client_headers, name, &route_slots)
             && !aisix_core::header_forward_blocked(name)
             && name != "content-length"
     };
@@ -3463,6 +3484,210 @@ mod tests {
             .iter()
             .collect();
         assert_eq!(rid.len(), 1);
+    }
+
+    /// A `header_key` route names the slot its gateway credential
+    /// arrives in, and the route schema forbids every name on the shared
+    /// credential list — so the shared list can never cover it. A glob
+    /// must not sweep it upstream, where the caller's AISIX key would be
+    /// replayable against this gateway.
+    #[tokio::test]
+    async fn a_glob_never_sweeps_the_route_s_own_auth_header() {
+        let (upstream, snap) = slot_route_fixture(serde_json::json!({
+            "auth_mode": "header_key",
+            "auth_header_name": "x-gw-key",
+            "forward_client_headers": ["x-*"]
+        }))
+        .await;
+
+        let resp = build_app(snap)
+            .oneshot(slot_request(&[("x-gw-key", "sk-caller")]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = &upstream.received_requests().await.unwrap()[0];
+        assert!(
+            received.headers.get("x-gw-key").is_none(),
+            "`x-*` must not relay the slot this route authenticated the caller with"
+        );
+        // The SAME `x-*` recovers a stripped header that is not a slot,
+        // so the assertion above is the rule firing rather than a pattern
+        // that was never asked.
+        assert_eq!(
+            received.headers.get("x-stripped-control").unwrap(),
+            "recovered"
+        );
+    }
+
+    /// Naming it in full is still consent — the rule narrows how a slot
+    /// is reached, never whether it can be.
+    #[tokio::test]
+    async fn the_route_s_own_auth_header_forwards_when_named_in_full() {
+        let (upstream, snap) = slot_route_fixture(serde_json::json!({
+            "auth_mode": "header_key",
+            "auth_header_name": "x-gw-key",
+            "forward_client_headers": ["x-gw-key"]
+        }))
+        .await;
+
+        let resp = build_app(snap)
+            .oneshot(slot_request(&[("x-gw-key", "sk-caller")]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = &upstream.received_requests().await.unwrap()[0];
+        assert_eq!(received.headers.get("x-gw-key").unwrap(), "sk-caller");
+    }
+
+    /// `identity_header`'s whole contract is that its value is recorded
+    /// on the usage event and stripped before forwarding — a glob that
+    /// put it back would make the promise false.
+    #[tokio::test]
+    async fn a_glob_never_sweeps_the_route_s_identity_header() {
+        let (upstream, snap) = slot_route_fixture(serde_json::json!({
+            "identity_header": "x-end-user",
+            "forward_client_headers": ["x-*"]
+        }))
+        .await;
+
+        let resp = build_app(snap)
+            .oneshot(slot_request(&[
+                ("authorization", "Bearer sk-caller"),
+                ("x-end-user", "alice@example.com"),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = &upstream.received_requests().await.unwrap()[0];
+        assert!(received.headers.get("x-end-user").is_none());
+        assert_eq!(
+            received.headers.get("x-stripped-control").unwrap(),
+            "recovered"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_route_s_identity_header_forwards_when_named_in_full() {
+        let (upstream, snap) = slot_route_fixture(serde_json::json!({
+            "identity_header": "x-end-user",
+            "forward_client_headers": ["x-end-user"]
+        }))
+        .await;
+
+        let resp = build_app(snap)
+            .oneshot(slot_request(&[
+                ("authorization", "Bearer sk-caller"),
+                ("x-end-user", "alice@example.com"),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = &upstream.received_requests().await.unwrap()[0];
+        assert_eq!(
+            received.headers.get("x-end-user").unwrap(),
+            "alice@example.com"
+        );
+    }
+
+    /// `gateway_key` names no slot of its own — the schema forbids
+    /// `auth_header_name` outside `header_key` — so nothing joins the
+    /// exact-name set and a glob keeps meaning exactly what it did.
+    /// (`anonymous` is the same shape and is covered end-to-end, where a
+    /// real peer address can satisfy its `source_cidrs` gate.)
+    #[tokio::test]
+    async fn a_gateway_key_route_keeps_the_shared_rule_and_nothing_more() {
+        let (upstream, snap) = slot_route_fixture(serde_json::json!({
+            "auth_mode": "gateway_key",
+            "forward_client_headers": ["x-*"]
+        }))
+        .await;
+
+        let resp = build_app(snap)
+            .oneshot(slot_request(&[
+                ("authorization", "Bearer sk-caller"),
+                ("x-gw-key", "not-a-slot-here"),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = &upstream.received_requests().await.unwrap()[0];
+        assert_eq!(
+            received.headers.get("x-stripped-control").unwrap(),
+            "recovered"
+        );
+        // `x-gw-key` is in this ProviderKey's strip set, so `forwards()`
+        // IS asked about it here — and answers yes, because THIS route
+        // declared no slot. That is what makes the narrowing per route
+        // rather than a name added to the shared list: widen it to a
+        // global and this assertion fails.
+        assert_eq!(received.headers.get("x-gw-key").unwrap(), "not-a-slot-here");
+        // And the shared rule is untouched: `x-*` never reached
+        // `authorization`, so the ProviderKey's credential still rides
+        // alone.
+        let auths: Vec<_> = received.headers.get_all("authorization").iter().collect();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths[0], "Bearer sk-upstream");
+    }
+
+    /// An `inject` route with the given overrides merged onto it. The
+    /// upstream always answers `/v1/models`, and every request through
+    /// [`slot_request`] carries an ordinary `x-other`, so each test above
+    /// can tell "the rule fired" from "the pattern never matched".
+    async fn slot_route_fixture(overrides: serde_json::Value) -> (MockServer, AisixSnapshot) {
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&upstream)
+            .await;
+
+        let mut json = serde_json::json!({
+            "name": "slot-route",
+            "path_prefix": "/passthrough/openai",
+            "target_url": upstream.uri(),
+            "provider_key_id": PK_ID
+        });
+        let map = json.as_object_mut().unwrap();
+        for (k, v) in overrides.as_object().unwrap() {
+            map.insert(k.clone(), v.clone());
+        }
+
+        // `strip_headers` names three `x-` headers, so `x-*` is asked
+        // about all three and the CONTROL below is a real observation of
+        // the glob firing. Without one in the strip set, a passthrough
+        // route forwards it by default whatever the patterns say — an
+        // assertion that proves nothing about this rule.
+        let pk_json = r#"{"display_name":"openai-up","secret":"sk-upstream",
+             "api_base":"http://unused","provider":"openai","adapter":"openai",
+             "strip_headers":["authorization","x-api-key","x-gw-key","x-end-user",
+                              "x-stripped-control"]}"#;
+        let pk: ProviderKey = serde_json::from_str(pk_json).unwrap();
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
+        snap.apikeys.insert(apikey_entry("sk-caller", Some(&["*"])));
+        snap.passthrough_routes
+            .insert(route_entry("route-slot", json));
+        (upstream, snap)
+    }
+
+    /// A caller request carrying `headers` plus the control header — an
+    /// `x-` name the ProviderKey strips, so only a live `x-*` pattern
+    /// puts it back on the wire.
+    fn slot_request(headers: &[(&str, &str)]) -> Request<axum::body::Body> {
+        let mut b = Request::builder()
+            .method("GET")
+            .uri("/passthrough/openai/v1/models")
+            .header("x-stripped-control", "recovered");
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        b.body(axum::body::Body::empty()).unwrap()
     }
 
     #[test]

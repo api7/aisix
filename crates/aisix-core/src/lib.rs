@@ -44,10 +44,10 @@ pub use error::{
     AdminError, AdminErrorEnvelope, BootstrapError, ProxyError, ProxyErrorEnvelope, RateLimitScope,
 };
 pub use forwarded_headers::{
-    client_header_forwardable, displaces_a_gateway_header, exact_match_only,
-    forward_pattern_admits, header_forward_blocked, resolve_forwarded_client_headers,
-    CREDENTIAL_SLOT_HEADERS, GATEWAY_HEADER_PREFIX, NEVER_FORWARD_FROM_CLIENT,
-    NEVER_FORWARD_FROM_CLIENT_PREFIXES, NON_FORWARDABLE_HEADERS,
+    client_header_forwardable, displaces_a_gateway_header, exact_match_only, exact_match_only_with,
+    forward_pattern_admits, forward_pattern_admits_with, header_forward_blocked,
+    resolve_forwarded_client_headers, CREDENTIAL_SLOT_HEADERS, GATEWAY_HEADER_PREFIX,
+    NEVER_FORWARD_FROM_CLIENT, NEVER_FORWARD_FROM_CLIENT_PREFIXES, NON_FORWARDABLE_HEADERS,
 };
 pub use header_template::{render_header_template, HeaderVars, HEADER_TEMPLATE_VARS};
 pub use models::{

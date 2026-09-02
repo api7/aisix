@@ -149,6 +149,14 @@ pub struct PassthroughRoute {
     /// party's telemetry, so a broad pattern overrides the rest of the
     /// strip set and leaves those alone.
     ///
+    /// This route's own `auth_header_name` and `identity_header` are read
+    /// the same way. Both are slots this route chose rather than ones the
+    /// gateway owns — under `auth_mode: header_key` the first carries the
+    /// gateway credential the caller authenticated with, and the second
+    /// carries an end-user identity this route records and strips — so a
+    /// glob does not sweep either, and a pattern that names one in full
+    /// forwards it.
+    ///
     /// Headers whose forwarding would break the exchange rather than
     /// change who it comes from are stripped whatever the patterns say:
     /// `host`, `content-length`, the hop-by-hop headers that describe the

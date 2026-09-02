@@ -46,7 +46,13 @@ const CALLER_KEY_HASH = createHash("sha256")
 
 interface RealtimeUpstream {
   port: number;
-  handshakes: { url: string; authorization: string; openaiBeta?: string }[];
+  handshakes: {
+    url: string;
+    authorization: string;
+    openaiBeta?: string;
+    /** Every header of the upstream handshake, for the forwarding case. */
+    headers: Record<string, string>;
+  }[];
   frames: string[];
   close(): Promise<void>;
 }
@@ -62,6 +68,12 @@ async function startRealtimeUpstream(): Promise<RealtimeUpstream> {
       url: req.url ?? "",
       authorization: (req.headers.authorization as string) ?? "",
       openaiBeta: req.headers["openai-beta"] as string | undefined,
+      headers: Object.fromEntries(
+        Object.entries(req.headers).map(([k, v]) => [
+          k.toLowerCase(),
+          Array.isArray(v) ? v.join(",") : String(v ?? ""),
+        ]),
+      ),
     });
     socket.on("message", (data) => {
       frames.push(data.toString());
@@ -128,6 +140,25 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
       provider: "openai",
       model_name: "gpt-realtime-mock",
       provider_key_id: pk.id,
+    });
+
+    // A second upstream binding on the SAME mock server whose ProviderKey
+    // opts into forwarding. `/v1/realtime` builds its handshake by hand
+    // rather than through the shared pipeline, so this is the only layer
+    // that proves the setting survives a real binary + etcd propagation.
+    const fwdPk = await seed.createProviderKey({
+      display_name: "realtime-e2e-fwd-pk",
+      secret: "sk-upstream-realtime",
+      api_base: `http://127.0.0.1:${upstream.port}/v1`,
+      request: {
+        forward_client_headers: ["x-user-jwt", "sec-websocket-protocol"],
+      },
+    });
+    await seed.createModel({
+      display_name: "realtime-e2e-fwd-model",
+      provider: "openai",
+      model_name: "gpt-realtime-mock",
+      provider_key_id: fwdPk.id,
     });
 
     // JWT identity resolving (via a claim mapping) to a key that may NOT
@@ -275,6 +306,53 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     const hs = upstream.handshakes[before];
     expect(hs).toBeDefined();
     expect(hs.openaiBeta).toBeUndefined();
+  });
+
+  test("forward_client_headers reaches the upstream handshake, minus the browser credential", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    const mark = upstream.handshakes.length;
+
+    // A server-side client, so headers can be set. The subprotocol list
+    // still carries the caller's own gateway key — the browser flow's
+    // credential channel — and the ProviderKey names
+    // `sec-websocket-protocol` EXACTLY, which on every other face would
+    // be consent. This face refuses it outright.
+    const wsUrl = `${app.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=realtime-e2e-fwd-model`;
+    const ws = new WsClient(wsUrl, [
+      "realtime",
+      `openai-insecure-api-key.${CALLER_PLAINTEXT}`,
+    ], {
+      headers: { "x-user-jwt": "caller.jwt.value" },
+    });
+    await new Promise<void>((resolve, reject) => {
+      ws.on("open", () => resolve());
+      ws.on("error", (e: Error) => reject(e));
+    });
+    // The gateway accepts the client upgrade before it dials upstream, so
+    // `open` alone proves nothing about the upstream handshake. Driving
+    // one frame and awaiting the answer is what forces it.
+    const answered = new Promise<string>((resolve) => {
+      ws.on("message", (data: Buffer) => resolve(data.toString()));
+    });
+    ws.send(JSON.stringify({ type: "session.update", session: {} }));
+    expect(JSON.parse(await answered).type).toBe("response.done");
+
+    const seen = upstream.handshakes.slice(mark);
+    expect(seen.length, "the upstream handshake must have happened").toBe(1);
+    expect(seen[0].headers["x-user-jwt"]).toBe("caller.jwt.value");
+    // Named exactly and still refused: relaying it would hand the
+    // provider the caller's own AISIX key, and would override the
+    // subprotocol the gateway negotiates.
+    expect(seen[0].headers["sec-websocket-protocol"] ?? "").not.toContain(
+      CALLER_PLAINTEXT,
+    );
+    // The gateway's own credential still authenticates the session.
+    expect(seen[0].authorization).toBe("Bearer sk-upstream-realtime");
+
+    ws.close();
   });
 
   test("a plain http GET answers the envelope, not a bare rejection", async (ctx) => {

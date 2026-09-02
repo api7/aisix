@@ -57,5 +57,28 @@ mod tests {
         // honest about Bedrock specifics, not just generic SigV4.
         let reserved = reserved_sigv4_headers();
         assert!(reserved.contains(&"x-amzn-bedrock-accept"));
+        assert!(reserved.contains(&"x-amz-target"));
+    }
+
+    /// The `request.forward_client_headers` description in
+    /// `cp-admin.yaml` and `schemas/resources/provider_key.schema.json`
+    /// SPELLS OUT this list — it is what a user reads to know which names
+    /// a Bedrock upstream will refuse. Prose is a second definition and
+    /// drifts silently: it named four of these for a release while the
+    /// code refused six. Adding or removing an entry here fails this
+    /// assertion, which is the reminder to re-word the description.
+    #[test]
+    fn the_reserved_list_is_the_one_the_public_description_spells_out() {
+        assert_eq!(
+            reserved_sigv4_headers(),
+            [
+                "authorization",
+                "x-amz-date",
+                "x-amz-content-sha256",
+                "x-amz-security-token",
+                "x-amz-target",
+                "x-amzn-bedrock-accept",
+            ]
+        );
     }
 }

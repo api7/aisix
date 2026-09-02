@@ -105,6 +105,11 @@ pub struct UpstreamHeaderContext<'a> {
     /// poll of an async job, a semantic-routing embedding lookup) — those
     /// requests forward nothing.
     pub client_headers: Option<&'a HeaderMap>,
+    /// Header names THIS surface owns, which the shared lists cannot know
+    /// about. `/v1/realtime` opens its own WebSocket, so the caller's
+    /// `sec-websocket-*` slots describe the connection the caller opened
+    /// and one of them carries the caller's own gateway key.
+    pub surface_blocked: &'a [&'a str],
 }
 
 impl<'a> UpstreamHeaderContext<'a> {
@@ -124,6 +129,13 @@ impl<'a> UpstreamHeaderContext<'a> {
 
     pub fn with_client_headers(mut self, headers: &'a HeaderMap) -> Self {
         self.client_headers = Some(headers);
+        self
+    }
+
+    /// Names this surface refuses on top of the shared lists — see
+    /// [`UpstreamHeaderContext::surface_blocked`].
+    pub fn with_surface_blocked(mut self, blocked: &'a [&'a str]) -> Self {
+        self.surface_blocked = blocked;
         self
     }
 }
@@ -221,7 +233,7 @@ impl ForwardedClientHeaders {
             entries: aisix_core::resolve_forwarded_client_headers(
                 &r.forward_client_headers,
                 client,
-                &[],
+                ctx.surface_blocked,
             ),
         }
     }
@@ -250,6 +262,26 @@ impl ForwardedClientHeaders {
     /// put two values on the wire and let the upstream pick between them,
     /// which on a credential slot is the #411 shape.
     ///
+    /// Drop the entries whose value is not ASCII, returning how many went.
+    ///
+    /// Only `/v1/realtime` calls this. Its WebSocket client writes the
+    /// upstream handshake as text and calls `HeaderValue::to_str` on every
+    /// header it was given, so a single obs-text byte (0x80-0xFF — legal
+    /// in a header value, and accepted on the way in) fails the whole
+    /// upstream connection rather than that one header. Every other face
+    /// hands the bytes to reqwest, which writes them out unexamined, so a
+    /// caller sending `x-user-name: José` is forwarded there and would
+    /// otherwise be unable to open a realtime session at all.
+    ///
+    /// Dropping rather than failing matches how this pipeline treats an
+    /// entry it cannot turn into a header anywhere else: the exchange goes
+    /// ahead without it.
+    pub fn drop_non_ascii_values(&mut self) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|(_, v)| v.to_str().is_ok());
+        before - self.entries.len()
+    }
+
     /// Every surface delivers through here, including the ones that
     /// resolve once and reuse across several round-trips (jobs, videos) —
     /// the precedence is a property of this type, not of each call site.

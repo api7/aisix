@@ -215,6 +215,9 @@ impl BridgeContext {
                 provider_key_name: Some(&self.provider_key.display_name),
             },
             client_headers: self.client_headers.as_deref(),
+            // A Bridge speaks HTTP to its upstream and owns no header
+            // name the shared lists do not already cover.
+            surface_blocked: &[],
         }
     }
 }
