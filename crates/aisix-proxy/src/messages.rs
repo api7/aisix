@@ -3757,23 +3757,40 @@ where
                     crate::model_echo::anthropic_message_model,
                 )
                 .unwrap_or(tail);
-                // #1091: seal the fragment before it joins `held`. Holding
-                // it unterminated made the block scan read it (it parses the
-                // text out line by line) while the redaction pass handed it
-                // back as `trailing` and appended it verbatim — so a
-                // maskable literal in this last frame went out unmasked.
-                // Sealed, it is an ordinary frame to both passes; an
-                // unparseable one is cut instead, because nothing can
-                // extract its text and releasing it WOULD be the bypass.
-                let mut tail = tail;
+                if held.len() + tail.len() > max_hold {
+                    tracing::warn!(
+                        guardrail_hook = "output",
+                        max_buffer_bytes = max_hold,
+                        "streaming /v1/messages passthrough exceeded hold-back cap on its \
+                         final frame; failing closed",
+                    );
+                    guard.usage().guardrail_blocked = true;
+                    yield Ok(Bytes::from(guardrail_block_frame(
+                        None,
+                        Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+                    )));
+                    return;
+                }
+                held.extend_from_slice(&tail);
+                // #1091: seal what will actually be released. Held
+                // unterminated, this fragment was read by the block scan
+                // (which parses text out line by line) but handed back by
+                // the redaction pass as `trailing` and appended verbatim —
+                // so a maskable literal in the last frame went out unmasked.
+                // Sealed, it is an ordinary frame to both passes. Sealing
+                // `held` rather than the fragment alone is deliberate: the
+                // frames already in it are what say which line ending this
+                // upstream writes.
                 if let crate::redact::SseTailSeal::Dropped { dropped } =
-                    crate::redact::seal_buffered_sse(&mut tail)
+                    crate::redact::seal_buffered_sse(&mut held)
                 {
+                    // Not one parseable frame — nothing can extract its
+                    // text, so releasing it WOULD be the bypass.
                     tracing::warn!(
                         guardrail_hook = "output",
                         dropped,
                         "streaming /v1/messages passthrough ended on an SSE frame that \
-                         could not be parsed; dropping it rather than releasing it past \
+                         could not be scanned; dropping it rather than releasing it past \
                          the output guardrail",
                     );
                     // When that fragment was the ENTIRE response, dropping it
@@ -3790,21 +3807,6 @@ where
                         return;
                     }
                 }
-                if held.len() + tail.len() > max_hold {
-                    tracing::warn!(
-                        guardrail_hook = "output",
-                        max_buffer_bytes = max_hold,
-                        "streaming /v1/messages passthrough exceeded hold-back cap on its \
-                         final frame; failing closed",
-                    );
-                    guard.usage().guardrail_blocked = true;
-                    yield Ok(Bytes::from(guardrail_block_frame(
-                        None,
-                        Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
-                    )));
-                    return;
-                }
-                held.extend_from_slice(&tail);
             } else {
                 // Restamp on the way out, for the same reason the `/v1/responses`
                 // relay does: the upstream has ended, so this is a final frame it

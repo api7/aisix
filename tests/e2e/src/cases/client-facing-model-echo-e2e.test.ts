@@ -577,12 +577,13 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
     expect(text.trimEnd().endsWith("data: [DONE]")).toBe(true);
   });
 
-  // The same hold-back policy on `/v1/messages`. Only COMPLETE frames feed
-  // the text the output guardrail scans, so an upstream that dies mid-frame
-  // leaves a tail nothing ever inspected. Releasing it after the scan would
-  // be a way around the very check hold-back exists to apply, so it is
-  // dropped — the client could not have parsed an unterminated frame anyway.
-  test("/v1/messages hold-back drops an unterminated tail instead of releasing it unscanned", async (ctx) => {
+  // The same hold-back policy on `/v1/messages`, with an upstream that dies
+  // mid-JSON. Nothing can extract that fragment's text, so no pass can scan
+  // it, and releasing it would be a way around the very check hold-back
+  // exists to apply — it is cut. (A fragment that PARSES is a different
+  // case: it is sealed and released, scanned and masked like any other
+  // frame. That one is two tests below.)
+  test("/v1/messages hold-back drops an unscannable tail instead of releasing it", async (ctx) => {
     if (!etcdReachable || !app || !seed) return void ctx.skip();
 
     const upstream = await startOpenAiUpstream({
@@ -642,7 +643,7 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
     // The scanned frames are delivered, with the alias restamped...
     expect(text).toContain('"model":"echo-tail"');
     expect(text).toContain('"text":"delivered text"');
-    // ...and the unterminated, never-scanned tail is not.
+    // ...and the unparseable, never-scanned tail is not.
     expect(text).not.toContain("NEVERSCANNEDTAIL");
   });
   // #1091. An upstream that ends mid-frame leaves a fragment behind, and the
