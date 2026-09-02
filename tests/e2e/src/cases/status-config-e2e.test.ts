@@ -82,6 +82,10 @@ function gaugeValue(scrapeText: string, metric: string): number | undefined {
   return undefined;
 }
 
+function configHashValue(scrapeText: string): string | undefined {
+  return scrapeText.match(/aisix_config_hash_info\{hash="([0-9a-f]{64})"\} 1/)?.[1];
+}
+
 describe("status/config: etcd watch source", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
@@ -309,10 +313,17 @@ describe("status/config: etcd watch source", () => {
     expect(cfg!.state).toBe("degraded");
     expect(rejection.resource_kind).toBe("guardrails");
     expect(rejection.last_error_kind).toBe("schema_failed");
-    expect(rejection.last_error).toContain("status-broken-script");
+    expect(rejection.last_error).toBe(
+      "guardrail runtime build failed: compile_failed at config.script",
+    );
+    const serializedStatus = JSON.stringify(cfg);
+    expect(serializedStatus).not.toContain("status-broken-script");
+    expect(serializedStatus).not.toContain("export function checkInput");
 
     const text = await scrape(app);
     expect(text).toMatch(/aisix_config_rejected_resources\{kind="guardrails"\} 1/);
+    expect(configHashValue(text)).toBe(cfg!.applied!.config_hash);
+    expect(configHashValue(text)).not.toBe(cfg!.source.source_hash);
 
     await seed.update("guardrails", guardrail.id, {
       name: "status-fixed-guardrail",
@@ -343,6 +354,9 @@ describe("status/config: etcd watch source", () => {
       return !cfg.rejected.some((r) => r.resource_id === guardrail.id);
     });
     expect(cfg!.state).toBe("synced");
+    const repairedMetrics = await scrape(app);
+    expect(configHashValue(repairedMetrics)).toBe(cfg!.applied!.config_hash);
+    expect(configHashValue(repairedMetrics)).toBe(cfg!.source.source_hash);
 
     await seed.delete("guardrail_attachments", attachment.id);
     await seed.delete("guardrails", guardrail.id);

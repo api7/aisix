@@ -2239,6 +2239,9 @@ mod tests {
             status.view().rejected[0].last_error,
             "guardrail runtime build failed: compile_failed at config.script"
         );
+        let public_status = serde_json::to_string(&status.view()).unwrap();
+        assert!(!public_status.contains("sensitive-name-do-not-expose"));
+        assert!(!public_status.contains("sensitive-script-do-not-expose"));
 
         let fixed = AisixSnapshot::new();
         fixed.guardrails.insert(entry(

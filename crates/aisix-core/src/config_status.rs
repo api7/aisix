@@ -53,8 +53,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-/// Maximum number of source + runtime rejections retained for status and
-/// heartbeat reporting. Bounds both memory and the managed heartbeat payload.
+/// Maximum number of source + runtime rejection details retained for status
+/// and heartbeat reporting. Aggregate counts and the runtime identity digest
+/// still cover every rejection.
 pub const MAX_CONFIG_REJECTIONS: usize = 256;
 
 const MAX_REJECTION_ERROR_CHARS: usize = 256;
@@ -310,11 +311,14 @@ struct ConfigStatusInner {
 
     // Retained rejections, keyed by source identity to keep first_seen stable.
     rejected: BTreeMap<String, RetainedRejection>,
+    rejected_counts: BTreeMap<String, usize>,
 
     // Rows accepted by the loader but rejected by a runtime builder. Kept
     // separate because `record_load` replaces only the loader's observation;
     // a watch event unrelated to the broken row must not clear its signal.
     build_rejected: BTreeMap<String, RetainedRejection>,
+    build_rejected_counts: BTreeMap<String, usize>,
+    build_rejected_identity_hash: Option<String>,
 
     // Partially compatible observations for the served snapshot (#871).
     // Replaced wholesale on every load; the load paths own the retention.
@@ -359,7 +363,10 @@ impl ConfigStatus {
                 last_reload_success_at: None,
                 last_failure: None,
                 rejected: BTreeMap::new(),
+                rejected_counts: BTreeMap::new(),
                 build_rejected: BTreeMap::new(),
+                build_rejected_counts: BTreeMap::new(),
+                build_rejected_identity_hash: None,
                 partially_compatible: Vec::new(),
                 partially_compatible_rows_by_kind: BTreeMap::new(),
                 stale_served_rows_by_kind: BTreeMap::new(),
@@ -391,17 +398,39 @@ impl ConfigStatus {
             inner.resource_counts = applied.resource_counts;
         }
 
-        // Merge rejections, preserving first_seen for identities still present.
+        // Keep aggregate state for every rejection while retaining only a
+        // bounded detail set for unauthenticated status and heartbeat output.
+        let mut all_rejected = BTreeMap::new();
+        for rejection in obs.rejected {
+            all_rejected.insert(rejection.identity.clone(), rejection);
+        }
+        let mut rejected_counts = BTreeMap::new();
+        for rejection in all_rejected.values() {
+            *rejected_counts
+                .entry(rejection.resource_kind.clone())
+                .or_insert(0) += 1;
+        }
+        let reload_reasons: BTreeMap<&'static str, ()> = all_rejected
+            .values()
+            .map(|r| {
+                (
+                    ReloadReason::from_error_kind(&r.last_error_kind).as_str(),
+                    (),
+                )
+            })
+            .collect();
+
+        // Merge details, preserving first_seen for identities still present.
         let mut merged: BTreeMap<String, RetainedRejection> = BTreeMap::new();
         let loader_limit = MAX_CONFIG_REJECTIONS.saturating_sub(inner.build_rejected.len());
-        for r in obs.rejected.into_iter().take(loader_limit) {
+        for (identity, r) in all_rejected.into_iter().take(loader_limit) {
             let first_seen_at = inner
                 .rejected
-                .get(&r.identity)
+                .get(&identity)
                 .map(|prev| prev.first_seen_at)
                 .unwrap_or(r.seen_at);
             merged.insert(
-                r.identity,
+                identity,
                 RetainedRejection {
                     resource_kind: r.resource_kind,
                     resource_id: r.resource_id,
@@ -414,6 +443,7 @@ impl ConfigStatus {
             );
         }
         inner.rejected = merged;
+        inner.rejected_counts = rejected_counts;
         inner.partially_compatible = obs.partially_compatible;
         inner.partially_compatible_rows_by_kind = obs.partially_compatible_rows_by_kind;
         inner.stale_served_rows_by_kind = obs.stale_served_rows_by_kind;
@@ -425,7 +455,7 @@ impl ConfigStatus {
             inner.applied_at = Some(now);
         }
 
-        let clean = inner.rejected.is_empty() && inner.build_rejected.is_empty();
+        let clean = !inner.has_rejections();
         inner.last_reload_successful = clean;
         inner.last_reload_at = Some(now);
         if clean {
@@ -447,14 +477,7 @@ impl ConfigStatus {
         if obs.is_reload {
             inner.reloads_total += 1;
             // One increment per reason category present in this reload.
-            let mut reasons: BTreeMap<&'static str, ()> = BTreeMap::new();
-            for r in inner.rejected.values() {
-                reasons.insert(
-                    ReloadReason::from_error_kind(&r.last_error_kind).as_str(),
-                    (),
-                );
-            }
-            for reason in reasons.keys() {
+            for reason in reload_reasons.keys() {
                 *inner.reload_failures.entry(reason).or_insert(0) += 1;
             }
         }
@@ -469,16 +492,36 @@ impl ConfigStatus {
         let now = Utc::now();
         let mut inner = self.inner.lock().unwrap();
         let previous_effective_hash = inner.effective_config_hash();
+        let mut all_rejected = BTreeMap::new();
+        for rejection in rejected {
+            all_rejected.insert(rejection.identity.clone(), rejection);
+        }
+        let mut counts = BTreeMap::new();
+        for rejection in all_rejected.values() {
+            *counts.entry(rejection.resource_kind.clone()).or_insert(0) += 1;
+        }
+        let identity_hash = if all_rejected.is_empty() {
+            None
+        } else {
+            let mut hasher = Sha256::new();
+            hasher.update(b"aisix-runtime-rejections-v1\0");
+            for identity in all_rejected.keys() {
+                hasher.update(identity.as_bytes());
+                hasher.update([b'\n']);
+            }
+            Some(hex(hasher.finalize().as_slice()))
+        };
+
         let mut merged = BTreeMap::new();
         let build_limit = MAX_CONFIG_REJECTIONS.saturating_sub(inner.rejected.len());
-        for r in rejected.into_iter().take(build_limit) {
+        for (identity, r) in all_rejected.into_iter().take(build_limit) {
             let first_seen_at = inner
                 .build_rejected
-                .get(&r.identity)
+                .get(&identity)
                 .map(|prev| prev.first_seen_at)
                 .unwrap_or(r.seen_at);
             merged.insert(
-                r.identity,
+                identity,
                 RetainedRejection {
                     resource_kind: r.resource_kind,
                     resource_id: r.resource_id,
@@ -491,6 +534,8 @@ impl ConfigStatus {
             );
         }
         inner.build_rejected = merged;
+        inner.build_rejected_counts = counts;
+        inner.build_rejected_identity_hash = identity_hash;
         if inner.ever_applied && previous_effective_hash != inner.effective_config_hash() {
             inner.apply_seq += 1;
             inner.applied_at = Some(now);
@@ -498,7 +543,7 @@ impl ConfigStatus {
 
         // A builder is constructed before the first source observation on a
         // cold start. Its empty result must not fabricate a successful reload.
-        let clean = inner.connected && inner.rejected.is_empty() && inner.build_rejected.is_empty();
+        let clean = inner.connected && !inner.has_rejections();
         inner.last_reload_successful = clean;
         if inner.connected {
             inner.last_reload_at = Some(now);
@@ -590,27 +635,28 @@ impl ConfigStatus {
 }
 
 impl ConfigStatusInner {
+    fn has_rejections(&self) -> bool {
+        !self.rejected_counts.is_empty() || !self.build_rejected_counts.is_empty()
+    }
+
     fn effective_config_hash(&self) -> Option<String> {
         let base = self.config_hash.as_ref()?;
-        if self.build_rejected.is_empty() {
+        let Some(identity_hash) = self.build_rejected_identity_hash.as_ref() else {
             return Some(base.clone());
-        }
+        };
         let mut hasher = Sha256::new();
         hasher.update(b"aisix-runtime-filtered-v1\0");
         hasher.update(base.as_bytes());
         hasher.update([0u8]);
-        for identity in self.build_rejected.keys() {
-            hasher.update(identity.as_bytes());
-            hasher.update([b'\n']);
-        }
+        hasher.update(identity_hash.as_bytes());
         Some(hex(hasher.finalize().as_slice()))
     }
 
     fn effective_resource_counts(&self) -> BTreeMap<String, usize> {
         let mut counts = self.resource_counts.clone();
-        for rejection in self.build_rejected.values() {
-            let count = counts.entry(rejection.resource_kind.clone()).or_default();
-            *count = count.saturating_sub(1);
+        for (kind, rejected) in &self.build_rejected_counts {
+            let count = counts.entry(kind.clone()).or_default();
+            *count = count.saturating_sub(*rejected);
         }
         counts
     }
@@ -627,7 +673,7 @@ impl ConfigStatusInner {
             return ConfigState::OutOfSync;
         }
         let total = self.applied_total();
-        if !self.rejected.is_empty() || !self.build_rejected.is_empty() {
+        if self.has_rejections() {
             // A whole-snapshot rejection that stored an empty snapshot still
             // reads as out-of-sync; a partial rejection is degraded.
             if total == 0 {
@@ -710,12 +756,9 @@ impl ConfigStatusInner {
 
     fn metrics(&self) -> ConfigMetricsView {
         let etcd = self.source_kind.is_etcd();
-        let mut rejected_by_kind: BTreeMap<String, usize> = BTreeMap::new();
-        for r in self.rejected.values() {
-            *rejected_by_kind.entry(r.resource_kind.clone()).or_insert(0) += 1;
-        }
-        for r in self.build_rejected.values() {
-            *rejected_by_kind.entry(r.resource_kind.clone()).or_insert(0) += 1;
+        let mut rejected_by_kind = self.rejected_counts.clone();
+        for (kind, count) in &self.build_rejected_counts {
+            *rejected_by_kind.entry(kind.clone()).or_insert(0) += count;
         }
         ConfigMetricsView {
             source_kind: self.source_kind,
@@ -728,7 +771,7 @@ impl ConfigStatusInner {
             stale_served_by_kind: self.stale_served_rows_by_kind.clone(),
             observed_revision: if etcd { self.observed_revision } else { None },
             applied_revision: if etcd { self.applied_revision } else { None },
-            config_hash: self.config_hash.clone(),
+            config_hash: self.effective_config_hash(),
             connected: etcd.then_some(self.connected),
         }
     }
@@ -1104,6 +1147,10 @@ mod tests {
             Some(effective.config_hash.as_str())
         );
         assert_eq!(
+            cs.metrics().config_hash.as_deref(),
+            Some(effective.config_hash.as_str())
+        );
+        assert_eq!(
             cs.rejection_snapshots()[0].key,
             "/aisix/runtime/guardrails/g-1"
         );
@@ -1144,8 +1191,8 @@ mod tests {
         cs.record_load(LoadObservation {
             source_hash: "src".into(),
             observed_revision: Some(1),
-            applied: Some(applied("src", &[("guardrails", 400)])),
-            rejected: (0..100)
+            applied: Some(applied("src", &[("guardrails", 300)])),
+            rejected: (0..300)
                 .map(|i| {
                     incoming(
                         &format!("/aisix/models/l-{i}"),
@@ -1182,6 +1229,13 @@ mod tests {
             .iter()
             .all(|row| row.last_error.chars().count() <= MAX_REJECTION_ERROR_CHARS));
         assert_eq!(cs.rejection_snapshots().len(), MAX_CONFIG_REJECTIONS);
+        let view = cs.view();
+        assert_eq!(view.applied.unwrap().resource_counts["guardrails"], 0);
+        assert_ne!(cs.applied_config_hash().as_deref(), Some("src"));
+        let metrics = cs.metrics();
+        assert_eq!(metrics.rejected_by_kind.get("models"), Some(&300));
+        assert_eq!(metrics.rejected_by_kind.get("guardrails"), Some(&300));
+        assert_eq!(metrics.config_hash, cs.applied_config_hash());
     }
 
     #[test]
