@@ -25,9 +25,7 @@
 name: cargo-cache-bench-2
 
 on:
-  push:
-    branches: ["ci-stress/**"]
-  workflow_dispatch:
+  workflow_dispatch:   # round 2 already ran; dispatch-only so a round-3 push does not re-run it
 
 permissions:
   contents: read

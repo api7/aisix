@@ -1,0 +1,147 @@
+# Round 3 - leg F: does passing the target dir as `--target-dir` (with
+# CARGO_TARGET_DIR UNSET) restore cross-worktree Rust cache hits?
+#
+# Round 2 established that varying CARGO_TARGET_DIR's path drops the Rust hit
+# rate from 100% to 0% while varying the source path only costs ~4%. The
+# carrier is that sccache hashes every CARGO_* variable in the wrapper's
+# environment against a 4-name exclusion list that does not include
+# CARGO_TARGET_DIR. A local probe (fake RUSTC_WRAPPER dumping its env) confirmed
+# both directions: with `--target-dir` and the variable unset, NO CARGO_* var
+# carries the target path; with it exported, the wrapper sees it verbatim.
+#
+# Incremental is left at cargo's dev-profile default (ON). CARGO_INCREMENTAL is
+# deliberately NOT set anywhere in this file: sccache hard-exits with
+# "incremental compilation is prohibited" if it sees CARGO_INCREMENTAL=1, which
+# would fail the build rather than degrade it. With the flag unset cargo instead
+# passes `-C incremental=<dir>` per invocation, and sccache marks just those
+# invocations non-cacheable - the workspace members - while registry deps stay
+# cacheable. The non-cacheable counter in each stats block is the check on that.
+name: cargo-cache-bench-3
+
+on:
+  push:
+    branches: ["ci-stress/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_NET_RETRY: 10
+  BENCH: /home/runner/bench
+
+jobs:
+  leg-f:
+    name: "F --target-dir flag (${{ matrix.scope }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scope: workspace
+            args: "--workspace"
+            tag: ws
+          - scope: all-targets
+            args: "--workspace --all-targets"
+            tag: at
+    env:
+      # Each scope gets its OWN sccache dir: --all-targets is a superset of
+      # --workspace, so a shared cache would pre-warm the other scope's F1.
+      SCCACHE_DIR: /home/runner/bench/sccache-${{ matrix.tag }}
+      SCCACHE_CACHE_SIZE: 60G
+      RUSTC_WRAPPER: sccache
+      BUILD_ARGS: ${{ matrix.args }}
+      TAG: ${{ matrix.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with: { path: tree-main }
+      - uses: actions/checkout@v6
+        with:
+          path: tree-feat
+          ref: feat/forward-client-headers-all-faces
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./tree-main/.github/actions/setup-protoc
+      - uses: taiki-e/install-action@v2
+        with: { tool: sccache }
+
+      - name: environment
+        run: |
+          set -uo pipefail
+          echo "nproc=$(nproc)  mem=$(free -g | awk '/Mem:/{print $2}')G"
+          df -h /
+          mkdir -p "$BENCH"
+          sccache --version
+          # prove the two knobs this leg depends on are in the state we think
+          echo "CARGO_TARGET_DIR in env: '${CARGO_TARGET_DIR:-<unset>}'"
+          echo "CARGO_INCREMENTAL in env: '${CARGO_INCREMENTAL:-<unset>}'"
+          (cd tree-main && cargo --version)
+
+      - name: prefetch deps (untimed)
+        run: |
+          set -uo pipefail
+          (cd tree-main && RUSTC_WRAPPER= cargo fetch --locked)
+          (cd tree-feat && RUSTC_WRAPPER= cargo fetch --locked)
+
+      - name: "F1 - warm the cache: tree-main, --target-dir flag, no env var"
+        working-directory: tree-main
+        run: |
+          set -uo pipefail
+          sccache --stop-server >/dev/null 2>&1 || true
+          rm -rf "$BENCH/f-a" "$SCCACHE_DIR"
+          sccache --start-server; sccache --zero-stats
+          rc=0
+          t0=$(date +%s%N)
+          env -u CARGO_TARGET_DIR -u CARGO_INCREMENTAL cargo build $BUILD_ARGS --target-dir "$BENCH/f-a" || rc=$?
+          t1=$(date +%s%N)
+          echo "F1.$TAG.wall_s=$(( (t1-t0)/1000000000 ))" | tee -a "$BENCH/results.txt"
+          echo "F1.$TAG.size.total=$(du -sb "$BENCH/f-a" | cut -f1)" | tee -a "$BENCH/results.txt"
+          { echo "--- F1.$TAG stats (cold, warming) ---"; sccache --show-stats; } | tee -a "$BENCH/results.txt"
+          df -h /
+          exit $rc
+
+      - name: "F2 - THE NUMBER: feature branch, separate checkout, --target-dir flag, no env var"
+        working-directory: tree-feat
+        run: |
+          set -uo pipefail
+          rm -rf "$BENCH/f-b"
+          sccache --zero-stats
+          rc=0
+          t0=$(date +%s%N)
+          env -u CARGO_TARGET_DIR -u CARGO_INCREMENTAL cargo build $BUILD_ARGS --target-dir "$BENCH/f-b" || rc=$?
+          t1=$(date +%s%N)
+          echo "F2.$TAG.wall_s=$(( (t1-t0)/1000000000 ))" | tee -a "$BENCH/results.txt"
+          echo "F2.$TAG.size.total=$(du -sb "$BENCH/f-b" | cut -f1)" | tee -a "$BENCH/results.txt"
+          for sub in debug/deps debug/incremental debug/build; do
+            s=0; [ -d "$BENCH/f-b/$sub" ] && s=$(du -sb "$BENCH/f-b/$sub" | cut -f1)
+            echo "F2.$TAG.size.$sub=$s" | tee -a "$BENCH/results.txt"
+          done
+          { echo "--- F2.$TAG stats (warm, flag mode) ---"; sccache --show-stats; } | tee -a "$BENCH/results.txt"
+          df -h /
+          exit $rc
+
+      - name: "F3 - CONTROL: same as F2 but with CARGO_TARGET_DIR exported"
+        working-directory: tree-feat
+        run: |
+          set -uo pipefail
+          rm -rf "$BENCH/f-c"
+          sccache --zero-stats
+          rc=0
+          t0=$(date +%s%N)
+          env -u CARGO_INCREMENTAL CARGO_TARGET_DIR="$BENCH/f-c" cargo build $BUILD_ARGS || rc=$?
+          t1=$(date +%s%N)
+          echo "F3.$TAG.wall_s=$(( (t1-t0)/1000000000 ))" | tee -a "$BENCH/results.txt"
+          { echo "--- F3.$TAG stats (control, env-var mode - must be 0% Rust) ---"; sccache --show-stats; } | tee -a "$BENCH/results.txt"
+          df -h /
+          exit $rc
+
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "### leg-f (${{ matrix.scope }})"
+            echo '```'
+            cat "$BENCH/results.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
