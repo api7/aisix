@@ -500,6 +500,16 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
       kind: "keyword",
       patterns: [{ kind: "literal", value: "ABSOLUTELYFORBIDDENWORD" }],
     });
+    // Mask-capable, for the #1091 cases below: a buffered response's last
+    // frame has to be masked as well as scanned, and those are two different
+    // passes over the same bytes. Masks nothing in the cases above.
+    await seed.createGuardrail({
+      name: "gr-model-echo-mask",
+      enabled: true,
+      hook_point: "output",
+      kind: "pii",
+      detectors: [{ type: "email", action: "mask" }],
+    });
   });
 
   afterAll(async () => {
@@ -634,5 +644,192 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
     expect(text).toContain('"text":"delivered text"');
     // ...and the unterminated, never-scanned tail is not.
     expect(text).not.toContain("NEVERSCANNEDTAIL");
+  });
+  // #1091. An upstream that ends mid-frame leaves a fragment behind, and the
+  // two passes a buffered response goes through used to read it differently:
+  // the block scan walks lines, the redactor walks terminator-delimited
+  // frames. Whichever pass missed it, something unscanned reached the caller.
+  // The three cases below are the shapes that produced, in order: a forbidden
+  // literal nobody scanned, and PII nobody masked — on both routes that
+  // buffer.
+
+  test("/v1/responses: a truncated final frame is dropped, not released past the block scan", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return void ctx.skip();
+
+    const upstream = await startOpenAiUpstream({
+      rawStreamFrames: [
+        `event: response.created\ndata: {"type":"response.created","response":{"id":"resp_cut","object":"response","status":"in_progress","model":"${UPSTREAM_REPORTED_MODEL}"}}\n\n`,
+        `event: response.output_text.delta\ndata: {"type":"response.output_text.delta","item_id":"m","delta":"perfectly fine text"}\n\n`,
+        // Cut mid-JSON. The scan reads `data:` lines and parses each one, so
+        // this frame's text is invisible to it — including the literal the
+        // guardrail blocks on.
+        `event: response.output_text.delta\ndata: {"type":"response.output_text.delta","item_id":"m","delta":"ABSOLUTELYFORBIDDENWORD`,
+      ],
+    });
+    upstreams.push(upstream);
+
+    const pk = await seed.createProviderKey({
+      display_name: "pk-echo-cut-tail",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "echo-cut-tail",
+      provider: "openai",
+      model_name: CONFIGURED_MODEL_NAME,
+      provider_key_id: pk.id,
+    });
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["*"],
+    });
+    await waitConfigPropagation(async () => {
+      const r = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: HEADERS.authorization },
+      });
+      if (r.status !== 200) {
+        await r.text();
+        return false;
+      }
+      const j = (await r.json()) as { data?: Array<{ id?: string }> };
+      return !!j.data?.some((m) => m.id === "echo-cut-tail");
+    });
+
+    const res = await fetch(`${app.proxyUrl}/v1/responses`, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify({
+        model: "echo-cut-tail",
+        input: "say something",
+        stream: true,
+      }),
+    });
+    // 200, not a 422: the scanned frames cleared, so the response is
+    // delivered — with the unscannable frame cut out of it. Asserting the
+    // status is what separates "dropped" from "blocked" here, since a block
+    // envelope would also not carry the literal.
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain('"delta":"perfectly fine text"');
+    expect(text).not.toContain("ABSOLUTELYFORBIDDENWORD");
+  });
+
+  test("/v1/responses: a final frame missing only its terminator is masked, not released raw", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return void ctx.skip();
+
+    const upstream = await startOpenAiUpstream({
+      rawStreamFrames: [
+        `event: response.created\ndata: {"type":"response.created","response":{"id":"resp_tail","object":"response","status":"in_progress","model":"${UPSTREAM_REPORTED_MODEL}"}}\n\n`,
+        `event: response.output_text.delta\ndata: {"type":"response.output_text.delta","item_id":"m","delta":"write to "}\n\n`,
+        // Complete JSON — only the blank line is missing. The block scan sees
+        // this one; the redactor did not, and appended it verbatim.
+        `event: response.output_text.delta\ndata: {"type":"response.output_text.delta","item_id":"m","delta":"tail@example.com"}`,
+      ],
+    });
+    upstreams.push(upstream);
+
+    const pk = await seed.createProviderKey({
+      display_name: "pk-echo-mask-tail",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "echo-mask-tail",
+      provider: "openai",
+      model_name: CONFIGURED_MODEL_NAME,
+      provider_key_id: pk.id,
+    });
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["*"],
+    });
+    await waitConfigPropagation(async () => {
+      const r = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: HEADERS.authorization },
+      });
+      if (r.status !== 200) {
+        await r.text();
+        return false;
+      }
+      const j = (await r.json()) as { data?: Array<{ id?: string }> };
+      return !!j.data?.some((m) => m.id === "echo-mask-tail");
+    });
+
+    const res = await fetch(`${app.proxyUrl}/v1/responses`, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify({
+        model: "echo-mask-tail",
+        input: "who do I write to",
+        stream: true,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain("tail@example.com");
+    // Kept and masked, not dropped: the frame parses, so it is scanned
+    // content like any other — and the caller gets a frame it can parse.
+    expect(text).toContain("[EMAIL_REDACTED]");
+    expect(text.endsWith("\n\n")).toBe(true);
+  });
+
+  test("/v1/messages hold-back: a final frame missing only its terminator is masked too", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return void ctx.skip();
+
+    const upstream = await startOpenAiUpstream({
+      rawStreamFrames: [
+        `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_mask_tail","type":"message","role":"assistant","model":"${UPSTREAM_REPORTED_MODEL}","content":[],"usage":{"input_tokens":4,"output_tokens":0}}}\n\n`,
+        `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"write to "}}\n\n`,
+        // Parseable, so the hold-back keeps it (#1086) — but it reached the
+        // released bytes without ever passing the redaction pass.
+        `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"tail@example.com"}}`,
+      ],
+    });
+    upstreams.push(upstream);
+
+    const pk = await seed.createProviderKey({
+      display_name: "pk-echo-mask-tail-anthropic",
+      secret: "sk-mock",
+      api_base: upstream.baseUrl,
+      provider: "anthropic",
+      adapter: "anthropic",
+    });
+    await seed.createModel({
+      display_name: "echo-mask-tail-anthropic",
+      provider: "anthropic",
+      model_name: CONFIGURED_MODEL_NAME,
+      provider_key_id: pk.id,
+    });
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["*"],
+    });
+    await waitConfigPropagation(async () => {
+      const r = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: HEADERS.authorization },
+      });
+      if (r.status !== 200) {
+        await r.text();
+        return false;
+      }
+      const j = (await r.json()) as { data?: Array<{ id?: string }> };
+      return !!j.data?.some((m) => m.id === "echo-mask-tail-anthropic");
+    });
+
+    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify({
+        model: "echo-mask-tail-anthropic",
+        max_tokens: 16,
+        stream: true,
+        messages: [{ role: "user", content: "who do I write to" }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain("tail@example.com");
+    expect(text).toContain("[EMAIL_REDACTED]");
+    expect(text.endsWith("\n\n")).toBe(true);
   });
 });

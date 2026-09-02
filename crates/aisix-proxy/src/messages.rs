@@ -3718,12 +3718,12 @@ where
         // than it was before this relay became frame-aligned, and truncating
         // a response over a missing terminator would be a regression.
         //
-        // Under a hold-back policy, DROP them. Only complete frames reach
-        // `drain_anthropic_sse_frames`, so an unterminated tail never fed
-        // `response_text` and was therefore never scanned — releasing it
-        // after the output check is exactly the bypass hold-back exists to
-        // prevent, and a client cannot parse a frame with no terminator
-        // anyway. Fail closed.
+        // Under a hold-back policy, SEAL them: a fragment that parses is
+        // completed with the terminator the upstream left off and held with
+        // the rest, so both the block scan and the redaction pass read it as
+        // an ordinary frame; one that does not parse is dropped, because
+        // nothing can extract its text and releasing it after the output
+        // check is exactly the bypass hold-back exists to prevent.
         if !buf.is_empty() {
             let tail = std::mem::take(&mut buf);
             // The upstream has ended, so this fragment is a final frame it
@@ -3734,48 +3734,19 @@ where
             // released, which is what keeps a provider that omits the last
             // terminator from losing its `message_stop` behind a guardrail.
             //
-            // `scannable` is false only when the fragment is not parseable —
-            // truncated mid-JSON. Nothing can extract its text, so releasing
-            // it WOULD be the bypass, and that case alone fails closed.
-            let scannable = match extract_sse_data_line(&tail) {
-                Some(data) => match serde_json::from_slice::<Value>(data) {
-                    Ok(json) => {
-                        update_anthropic_usage(
-                            guard.usage(),
-                            &json,
-                            attempt_started,
-                            &mut first_token_seen,
-                        );
-                        true
-                    }
-                    Err(_) => false,
-                },
-                // No `data:` line at all (a comment / keepalive): nothing to
-                // scan, so nothing to withhold.
-                None => true,
-            };
-            if hold_policy.is_some() && !scannable {
-                tracing::warn!(
-                    guardrail_hook = "output",
-                    dropped = tail.len(),
-                    "streaming /v1/messages passthrough ended on an SSE frame that \
-                     could not be parsed; dropping it rather than releasing it past \
-                     the output guardrail",
-                );
-                // When that fragment was the ENTIRE response, dropping it
-                // silently would hand the caller an empty 200 and no signal at
-                // all — and the scan is skipped too, since nothing ever
-                // reached `response_text`. Refuse explicitly instead, the same
-                // shape the frame-cap arm above uses.
-                if held.is_empty() {
-                    guard.usage().guardrail_blocked = true;
-                    yield Ok(Bytes::from(guardrail_block_frame(
-                        None,
-                        Some(crate::error::TAG_UNSCANNABLE_BODY),
-                    )));
-                    return;
+            // Its counts are as real as any other frame's, so read them
+            // whether or not the fragment survives the seal below.
+            if let Some(data) = extract_sse_data_line(&tail) {
+                if let Ok(json) = serde_json::from_slice::<Value>(data) {
+                    update_anthropic_usage(
+                        guard.usage(),
+                        &json,
+                        attempt_started,
+                        &mut first_token_seen,
+                    );
                 }
-            } else if let Some(max_hold) = hold_policy {
+            }
+            if let Some(max_hold) = hold_policy {
                 // Scanned like every other frame — hold it with them, but
                 // under the same size policy: this path reaches `held`
                 // outside the loop, so without this the last frame could
@@ -3786,6 +3757,39 @@ where
                     crate::model_echo::anthropic_message_model,
                 )
                 .unwrap_or(tail);
+                // #1091: seal the fragment before it joins `held`. Holding
+                // it unterminated made the block scan read it (it parses the
+                // text out line by line) while the redaction pass handed it
+                // back as `trailing` and appended it verbatim — so a
+                // maskable literal in this last frame went out unmasked.
+                // Sealed, it is an ordinary frame to both passes; an
+                // unparseable one is cut instead, because nothing can
+                // extract its text and releasing it WOULD be the bypass.
+                let mut tail = tail;
+                if let crate::redact::SseTailSeal::Dropped { dropped } =
+                    crate::redact::seal_buffered_sse(&mut tail)
+                {
+                    tracing::warn!(
+                        guardrail_hook = "output",
+                        dropped,
+                        "streaming /v1/messages passthrough ended on an SSE frame that \
+                         could not be parsed; dropping it rather than releasing it past \
+                         the output guardrail",
+                    );
+                    // When that fragment was the ENTIRE response, dropping it
+                    // silently would hand the caller an empty 200 and no signal at
+                    // all — and the scan is skipped too, since nothing ever
+                    // reached `response_text`. Refuse explicitly instead, the same
+                    // shape the frame-cap arm above uses.
+                    if held.is_empty() {
+                        guard.usage().guardrail_blocked = true;
+                        yield Ok(Bytes::from(guardrail_block_frame(
+                            None,
+                            Some(crate::error::TAG_UNSCANNABLE_BODY),
+                        )));
+                        return;
+                    }
+                }
                 if held.len() + tail.len() > max_hold {
                     tracing::warn!(
                         guardrail_hook = "output",

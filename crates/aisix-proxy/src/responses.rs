@@ -1401,6 +1401,58 @@ async fn responses_to_target(
                         attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                 }
             }
+            // #1091: an upstream that ends mid-frame leaves a fragment the
+            // two passes below read differently — the line-based scan sees
+            // it, the frame-based redactor appends it verbatim without ever
+            // masking it. Seal the buffer first, so both read the same
+            // frames: a parseable final frame gets the terminator its
+            // upstream left off, an unparseable one is cut.
+            if let crate::redact::SseTailSeal::Dropped { dropped } =
+                crate::redact::seal_buffered_sse(&mut buf)
+            {
+                tracing::warn!(
+                    guardrail_hook = "output",
+                    model = %model.display_name,
+                    dropped,
+                    "streaming /v1/responses ended on an SSE frame that could not be \
+                     parsed; dropping it rather than releasing it past the output \
+                     guardrail",
+                );
+                // Nothing else arrived: the whole response was that one
+                // unparseable frame. Dropping it silently would hand the
+                // caller an empty 200 with no signal, and there is no
+                // scanned content to release — refuse, the same shape the
+                // buffer-cap arm above and `/v1/messages` use.
+                if buf.is_empty() {
+                    return Ok(ResponseDispatchSuccess {
+                        response: crate::error::guardrail_block_error(
+                            "response",
+                            None,
+                            Some(crate::error::TAG_UNSCANNABLE_BODY),
+                        )
+                        .into_response(),
+                        provider: provider_label,
+                        usage: Some(ResponseUsage {
+                            upstream_ttft_ms,
+                            ..Default::default()
+                        }),
+                        model_id: model_id.to_string(),
+                        provider_key_id: provider_key_id.clone(),
+                        upstream_model: upstream_model.clone(),
+                        routing: RoutingTelemetry::default(),
+                        guardrail_blocked: true,
+                        usage_handled_by_stream: false,
+                        captured_content: match (&captured_prompt, content_cap) {
+                            (Some(prompt), Some(cap)) => {
+                                Some(CapturedContent::new(prompt, "", cap as usize))
+                            }
+                            _ => None,
+                        },
+                        output_redactions: crate::redact::RedactionCounts::new(),
+                        output_monitor_hits: Vec::new(),
+                    });
+                }
+            }
             // #808: the whole SSE response is buffered here, so parse its
             // terminal event for usage and let the handler emit (the body is
             // a single complete chunk now, not a live stream). Do this before
