@@ -236,7 +236,7 @@ impl GuardrailChain {
 fn classify_execution<'v>(
     verdict: &'v GuardrailVerdict,
     masked: bool,
-    hits: &[GuardrailMonitorHit],
+    hits: &'v [GuardrailMonitorHit],
 ) -> (&'static str, Option<&'v str>) {
     match verdict {
         GuardrailVerdict::Block { unavailable, .. } => ("blocked", unavailable.as_deref()),
@@ -245,7 +245,11 @@ fn classify_execution<'v>(
             if masked {
                 ("masked", None)
             } else if hits.iter().any(|h| h.action == "would_block") {
-                ("would_block", None)
+                let error_type = hits
+                    .iter()
+                    .find(|h| h.action == "would_block" && !h.error_type.is_empty())
+                    .map(|h| h.error_type.as_str());
+                ("would_block", error_type)
             } else if hits.iter().any(|h| h.action == "would_mask") {
                 ("would_mask", None)
             } else {
@@ -1582,6 +1586,33 @@ mod tests {
             kind: "keyword".to_owned(),
             hook: "both".to_owned(),
         }
+    }
+
+    #[test]
+    fn monitor_metric_keeps_a_later_failure_tag() {
+        let hits = vec![
+            GuardrailMonitorHit {
+                guardrail_name: "policy".to_owned(),
+                hook: "input".to_owned(),
+                action: "would_block".to_owned(),
+                reason: "keyword_would_block".to_owned(),
+                error_type: String::new(),
+                counts: Default::default(),
+            },
+            GuardrailMonitorHit {
+                guardrail_name: "runtime".to_owned(),
+                hook: "input".to_owned(),
+                action: "would_block".to_owned(),
+                reason: "custom_would_block:custom_timeout".to_owned(),
+                error_type: "custom_timeout".to_owned(),
+                counts: Default::default(),
+            },
+        ];
+
+        assert_eq!(
+            classify_execution(&GuardrailVerdict::Allow, false, &hits),
+            ("would_block", Some("custom_timeout")),
+        );
     }
 
     /// Every member consulted by a fold is recorded with its row name, the

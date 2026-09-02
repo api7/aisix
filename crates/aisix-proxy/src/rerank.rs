@@ -164,7 +164,13 @@ pub async fn rerank(
             // Skip on 200 without a recognisable usage field — avoids
             // attributing zero-everything noise rows when an
             // upstream returns a malformed / unsupported shape.
-            if let Some(usage) = success.usage {
+            let guardrail_attributed =
+                crate::usage_attr::has_guardrail_attribution(&audit, &success.monitor_hits);
+            if success.usage.is_some() || guardrail_attributed {
+                let usage = success
+                    .usage
+                    .as_ref()
+                    .unwrap_or(&RerankUsage { prompt_tokens: 0 });
                 emit_usage_event(
                     &state,
                     &snapshot,
@@ -178,7 +184,7 @@ pub async fn rerank(
                     &success.applied_guardrails,
                     status,
                     elapsed,
-                    &usage,
+                    usage,
                     &success.provider_request_id,
                     &client,
                     success.redactions.clone(),
@@ -1765,6 +1771,54 @@ mod tests {
                 ev.prompt_tokens,
             );
         }
+    }
+
+    #[tokio::test]
+    async fn no_usage_response_still_emits_guardrail_attribution() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/rerank"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "rerank-bare",
+                "results": []
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(openai_model("rerank-openai"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, masking_input_guardrail());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = tower::ServiceExt::oneshot(
+            crate::build_router(state),
+            make_req(serde_json::json!({
+                "model": "rerank-openai",
+                "query": "build version: 9.9.9",
+                "documents": ["clean"]
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a guardrail decision is not token-accounting noise")
+            .expect("usage sink remains open");
+        assert_eq!(ev.prompt_tokens, 0);
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "masked");
+        assert_eq!(ev.applied_guardrails.len(), 1);
     }
 
     /// Per #655 parity (was #405 negative pinning): an upstream 5xx now emits

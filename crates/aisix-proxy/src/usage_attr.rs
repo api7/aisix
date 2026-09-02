@@ -67,6 +67,23 @@ pub(crate) fn guardrail_scores(audit: &GuardrailAudit) -> Vec<aisix_core::Guardr
         .unwrap_or_default()
 }
 
+/// Whether a request has a guardrail decision worth preserving even when
+/// the handler has no token usage to report.
+///
+/// Merely having an attached guardrail is not enough: unsupported-provider
+/// and unparseable-usage paths historically suppress zero-value noise rows.
+/// A mask/block, monitor hit, or similarity score is an operator-visible
+/// security fact, so those paths must emit a zero-token event instead.
+pub(crate) fn has_guardrail_attribution(
+    audit: &GuardrailAudit,
+    monitor_hits: &[aisix_core::GuardrailMonitorHit],
+) -> bool {
+    !monitor_hits.is_empty()
+        || audit
+            .as_ref()
+            .is_some_and(|log| !log.snapshot().is_empty() || !log.score_snapshot().is_empty())
+}
+
 /// [`guardrail_scores`] for the retrying families — see
 /// [`terminal_enforced_hits`].
 pub(crate) fn terminal_guardrail_scores(
@@ -723,6 +740,25 @@ pub(crate) fn emit_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn similarity_score_alone_requires_a_zero_token_event() {
+        let log = Arc::new(aisix_guardrails::GuardrailAuditLog::new());
+        let audit = Some(Arc::clone(&log));
+        assert!(!has_guardrail_attribution(&audit, &[]));
+
+        log.record_score(aisix_core::GuardrailScore {
+            guardrail_name: "semantic-policy".into(),
+            hook: "input".into(),
+            direction: "deny".into(),
+            score: 0.7,
+            threshold: 0.8,
+            matched: false,
+            top_example_index: 0,
+            embedding_model: "embedder".into(),
+        });
+        assert!(has_guardrail_attribution(&audit, &[]));
+    }
 
     #[test]
     fn metric_model_label_three_outcomes() {

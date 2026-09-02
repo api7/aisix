@@ -1558,12 +1558,11 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                     // unscreened. It costs the `rejected[]` signal, which
                     // api7/aisix#1084 tracks. A scriptless `custom` row screens nothing
                     // either way, so relaxing it changes no enforcement and
-                    // costs the only structured signal there is — the loader
-                    // rejects it into `/status/config`'s `rejected[]`,
-                    // whereas a chain-build refusal is a warn line the
-                    // config status never learns about. Only a MISSING key
-                    // is caught here; a blank or uncompilable script clears
-                    // `minLength: 1` and is refused at build instead.
+                    // rejects it into `/status/config`'s `rejected[]` at load
+                    // time. Only a MISSING key is caught here; a
+                    // whitespace-only or uncompilable script clears
+                    // `minLength: 1` and is reported as a runtime build
+                    // rejection instead.
                     require_branch_property(b, "script");
                     if strict {
                         // The published contract must not advertise a value
@@ -5012,18 +5011,18 @@ mod tests {
         // vanishes", and it does not hold here: a scriptless `custom` row
         // screens nothing whether the loader skips it or the chain builder
         // refuses it. Relaxing the read path would therefore change no
-        // enforcement and lose the only structured signal — the loader
-        // rejects it into `/status/config`'s `rejected[]`, while a
-        // chain-build refusal is a warn line the config status never sees.
+        // enforcement. The loader rejects it into `/status/config`'s
+        // `rejected[]`; whitespace-only or uncompilable scripts are reported
+        // there as runtime build rejections instead.
         //
         // Asserted against BOTH sets, because reading one says a field is
         // required somewhere and can never say where it is NOT.
         //
-        // This covers a MISSING key only. A blank or uncompilable script
-        // passes both schemas — `minLength: 1` admits a single space, while
-        // the builder refuses on `trim().is_empty()` — and is refused when
-        // the chain is built, which `aisix validate` reports and a serving
-        // gateway logs.
+        // This covers a MISSING key only. A whitespace-only or uncompilable
+        // script passes both schemas — `minLength: 1` admits a single space,
+        // while the builder refuses on `trim().is_empty()` — and is refused
+        // when the chain is built, which `aisix validate` and a serving
+        // gateway report.
         let scriptless = json!({"name": "g", "kind": "custom"});
         assert!(
             validate_guardrail(&scriptless).is_err(),

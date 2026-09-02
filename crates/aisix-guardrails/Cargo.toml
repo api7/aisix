@@ -53,7 +53,7 @@ hex.workspace = true
 hmac.workspace = true
 sha1.workspace = true
 base64.workspace = true
-chrono = { workspace = true, optional = true }
+chrono.workspace = true
 uuid.workspace = true
 
 [features]
@@ -76,7 +76,7 @@ bedrock = [
     "aisix-gateway/aws",
 ]
 azure-content-safety = []
-aliyun-text-moderation = ["dep:chrono"]
+aliyun-text-moderation = []
 # kind=lakera / kind=openai_moderation / kind=presidio guardrails (#52).
 # Plain HTTP dispatchers over the shared reqwest client.
 lakera = []

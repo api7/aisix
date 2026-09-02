@@ -902,12 +902,11 @@ pub struct CustomConfig {
     /// either way, and rejecting it is what puts it in `/status/config`'s
     /// `rejected` list where an operator can see it.
     ///
-    /// A script that is present but blank or does not compile passes the
-    /// schema — `minLength` counts characters, and a whitespace-only value
-    /// is one — and is refused when the chain is built instead. `aisix
-    /// validate` reports that and exits non-zero; on a serving gateway it
-    /// is a warn line and the config status stays `synced`
-    /// (api7/aisix#1084).
+    /// A script that is whitespace-only or does not compile passes the
+    /// schema — `minLength` counts characters, so a whitespace-only value is
+    /// non-empty — and is refused when the chain is built instead. `aisix
+    /// validate` reports that and exits non-zero; a serving gateway reports
+    /// the runtime rejection through config status (api7/aisix#1084).
     #[serde(default)]
     #[schemars(length(min = 1))]
     pub script: String,
@@ -1088,8 +1087,11 @@ pub struct AppliedGuardrail {
 /// stage a policy, watch its hit rate in the dashboard, and only then flip
 /// it to `block`.
 ///
-/// `reason` and `counts` carry detector/entity/category NAMES only — never
-/// matched content (#153 no-leak criterion).
+/// `reason` is a code-owned kind/outcome summary, never the inner guardrail's
+/// dynamic reason. An availability failure may append its bounded, code-owned
+/// failure tag. Built-in mask `counts` carry detector/entity/category names;
+/// custom masks use the fixed key `custom` and count rewritten segments. No
+/// matched content enters this structure (#153 no-leak criterion).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuardrailMonitorHit {
     /// The configured (row) name of the monitor-mode guardrail that fired.
@@ -1099,10 +1101,16 @@ pub struct GuardrailMonitorHit {
     /// `would_block` (a Block verdict was downgraded) or `would_mask`
     /// (maskable spans were observed but not rewritten).
     pub action: String,
-    /// The suppressed Block's operator-facing reason (`would_block` only;
-    /// empty for `would_mask`).
+    /// Code-owned summary of the suppressed Block's kind and outcome
+    /// (`would_block` only; empty for `would_mask`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reason: String,
+    /// Bounded failure tag retained only until the execution metrics sink has
+    /// recorded this monitor hit. The public usage-event summary carries the
+    /// same tag in `reason`, so this internal copy must not change its shape.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub error_type: String,
     /// detector/entity name → span count the guardrail would have masked
     /// (`would_mask` only; empty for `would_block`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]

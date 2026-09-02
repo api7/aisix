@@ -82,6 +82,10 @@ function gaugeValue(scrapeText: string, metric: string): number | undefined {
   return undefined;
 }
 
+function configHashValue(scrapeText: string): string | undefined {
+  return scrapeText.match(/aisix_config_hash_info\{hash="([0-9a-f]{64})"\} 1/)?.[1];
+}
+
 describe("status/config: etcd watch source", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
@@ -258,6 +262,106 @@ describe("status/config: etcd watch source", () => {
     expect(text).not.toContain(SECRET);
 
     await etcd.delete(`${app.etcdPrefix}/provider_keys/${leakId}`);
+  });
+
+  test("a lazy guardrail build failure degrades status and clears after repair", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    const guardrail = await seed.createGuardrail(
+      {
+        name: "status-broken-script",
+        enabled: true,
+        hook_point: "input",
+        kind: "custom",
+        script: "export function checkInput( {",
+      },
+      { attach: false },
+    );
+    const attachment = await seed.attachGuardrailToEnv(guardrail.id);
+
+    const buildProbePlaintext = `sk-status-build-${randomUUID()}`;
+    const buildProbe = await seed.createApiKey({
+      key_hash: createHash("sha256").update(buildProbePlaintext).digest("hex"),
+      allowed_models: ["status-model"],
+    });
+    const proxy = new ProxyClient(app.proxyUrl, buildProbePlaintext);
+    await waitConfigPropagation(async () => {
+      return (await proxy.listModels()).status === 200;
+    });
+
+    // Index construction is lazy: the first request after the snapshot swap
+    // is what discovers the script the loader deliberately accepted cannot
+    // compile.
+    expect(
+      (
+        await proxy.chat({
+          model: "status-model",
+          messages: [{ role: "user", content: "trigger the lazy build" }],
+        })
+      ).status,
+    ).toBe(200);
+
+    let cfg: StatusConfig | undefined;
+    await waitConfigPropagation(async () => {
+      cfg = await getStatusConfig(app!);
+      return cfg.rejected.some((r) => r.resource_id === guardrail.id);
+    });
+    const rejection = cfg!.rejected.find((r) => r.resource_id === guardrail.id)!;
+    expect(cfg!.state).toBe("degraded");
+    expect(rejection.resource_kind).toBe("guardrails");
+    expect(rejection.last_error_kind).toBe("schema_failed");
+    expect(rejection.last_error).toBe(
+      "guardrail runtime build failed: compile_failed at config.script",
+    );
+    const serializedStatus = JSON.stringify(cfg);
+    expect(serializedStatus).not.toContain("status-broken-script");
+    expect(serializedStatus).not.toContain("export function checkInput");
+
+    const text = await scrape(app);
+    expect(text).toMatch(/aisix_config_rejected_resources\{kind="guardrails"\} 1/);
+    expect(configHashValue(text)).toBe(cfg!.applied!.config_hash);
+    expect(configHashValue(text)).not.toBe(cfg!.source.source_hash);
+
+    await seed.update("guardrails", guardrail.id, {
+      name: "status-fixed-guardrail",
+      enabled: true,
+      hook_point: "input",
+      kind: "keyword",
+      patterns: [{ kind: "literal", value: "NEVER-MATCH" }],
+    });
+    const repairProbePlaintext = `sk-status-repair-${randomUUID()}`;
+    const repairProbe = await seed.createApiKey({
+      key_hash: createHash("sha256").update(repairProbePlaintext).digest("hex"),
+      allowed_models: ["status-model"],
+    });
+    const repairProxy = new ProxyClient(app.proxyUrl, repairProbePlaintext);
+    await waitConfigPropagation(async () => {
+      return (await repairProxy.listModels()).status === 200;
+    });
+    expect(
+      (
+        await repairProxy.chat({
+          model: "status-model",
+          messages: [{ role: "user", content: "trigger the repaired build" }],
+        })
+      ).status,
+    ).toBe(200);
+    await waitConfigPropagation(async () => {
+      cfg = await getStatusConfig(app!);
+      return !cfg.rejected.some((r) => r.resource_id === guardrail.id);
+    });
+    expect(cfg!.state).toBe("synced");
+    const repairedMetrics = await scrape(app);
+    expect(configHashValue(repairedMetrics)).toBe(cfg!.applied!.config_hash);
+    expect(configHashValue(repairedMetrics)).toBe(cfg!.source.source_hash);
+
+    await seed.delete("guardrail_attachments", attachment.id);
+    await seed.delete("guardrails", guardrail.id);
+    await seed.delete("api_keys", buildProbe.id);
+    await seed.delete("api_keys", repairProbe.id);
   });
 });
 

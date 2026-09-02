@@ -11,6 +11,7 @@
 //! patterns are logged and skipped (the DP refuses to apply a rule
 //! it can't compile, so a typo doesn't silently disarm the policy).
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use aisix_core::models::{
@@ -18,7 +19,7 @@ use aisix_core::models::{
     GuardrailHookPoint, GuardrailKind, GuardrailMonitorHit, GuardrailScopeType, KeywordPattern,
 };
 use aisix_core::snapshot::ResourceTable;
-use aisix_core::SnapshotHandle;
+use aisix_core::{ConfigStatus, IncomingRejection, SnapshotHandle};
 use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 
@@ -80,12 +81,21 @@ pub fn build_chain_from_snapshot(
     bedrock_endpoint_url: Option<&str>,
     embedder: &GuardrailEmbedderSlot,
 ) -> GuardrailChain {
+    build_chain_from_snapshot_reported(table, bedrock_endpoint_url, embedder).0
+}
+
+fn build_chain_from_snapshot_reported(
+    table: &ResourceTable<DomainGuardrail>,
+    bedrock_endpoint_url: Option<&str>,
+    embedder: &GuardrailEmbedderSlot,
+) -> (GuardrailChain, Vec<GuardrailBuildRejection>) {
     let mut chain: Vec<(String, Arc<dyn Guardrail>)> = Vec::new();
     // `applied` mirrors `chain` 1:1 — the `{kind, hook}` of each member that
     // actually materialised, for applied-guardrail telemetry (#379). Pushed
     // only on the `Ok(Some)` path so inert/invalid rows (which never join the
     // chain) never show up as "governed this request".
     let mut applied: Vec<AppliedGuardrail> = Vec::new();
+    let mut rejected = Vec::new();
 
     let entries = sorted_guardrail_entries(table);
     for entry in entries.iter() {
@@ -110,11 +120,15 @@ pub fn build_chain_from_snapshot(
                     error = %err,
                     "skipping guardrail with invalid config",
                 );
+                rejected.push(GuardrailBuildRejection {
+                    id: entry.id.clone(),
+                    reason: err.status_reason(),
+                });
             }
         }
     }
 
-    GuardrailChain::new_with_applied(chain, applied)
+    (GuardrailChain::new_with_applied(chain, applied), rejected)
 }
 
 /// One enabled guardrail row that would not join the chain.
@@ -132,12 +146,10 @@ pub struct UnbuildableGuardrailRow {
 /// Report the enabled guardrail rows in `table` whose configuration does
 /// not build — [`build_chain_from_snapshot`]'s error arm, made returnable.
 ///
-/// The gateway logs those errors and keeps serving, which is right for a
-/// running node but wrong for anything checking a configuration before it
-/// is deployed: the row silently not existing IS the defect. A screening
-/// rule that never runs is indistinguishable from one that never matched,
-/// and nothing downstream says otherwise — the load itself succeeded, so
-/// the config status stays `synced` with an empty `rejected` list.
+/// The gateway logs those errors, reports them through config status, and
+/// keeps serving. A pre-deployment check still needs a synchronous report:
+/// the row silently not existing is the defect, even though the file itself
+/// loaded successfully.
 ///
 /// [`BuildError::EmbedderUnavailable`] is deliberately excluded. The
 /// embedding dispatcher is a runtime capability, not part of the
@@ -201,6 +213,7 @@ fn apply_enforcement_mode(row: &DomainGuardrail, inner: Arc<dyn Guardrail>) -> A
         "block" => inner,
         "monitor" => Arc::new(MonitorGuardrail {
             row_name: row.name.clone(),
+            kind: row.config.kind_str(),
             inner,
         }),
         other => {
@@ -230,6 +243,7 @@ fn build_one_inner(
                     KeywordPattern::Literal(s) => KeywordRule::literal(s.clone()),
                     KeywordPattern::Regex(s) => {
                         KeywordRule::regex(s).map_err(|e| BuildError::InvalidRegex {
+                            field: "patterns[].value",
                             pattern: s.clone(),
                             source: e,
                         })?
@@ -295,6 +309,7 @@ fn build_one_inner(
                 }
                 let rule = PiiRule::new(p.name.clone(), &p.regex, action, None)
                     .map_err(|e| BuildError::InvalidRegex {
+                        field: "custom_patterns[].regex",
                         pattern: p.regex.clone(),
                         source: e,
                     })?
@@ -529,9 +544,9 @@ fn build_one_inner(
             // Compiling here (rather than on the first request that hits
             // the row) keeps the refusal off the request path: it parses
             // only, so nothing the operator wrote runs on the config-apply
-            // path. The refusal itself is a warn line — `aisix validate` is
-            // what turns it into a report, and cp-api's own esbuild pass is
-            // what catches it at save time.
+            // path. The refusal is logged and published through config
+            // status; `aisix validate` reports it synchronously, and cp-api's
+            // own esbuild pass catches it at save time.
             let g = crate::custom::CustomGuardrail::new(
                 row.name.clone(),
                 cfg,
@@ -549,6 +564,7 @@ fn build_one_inner(
 enum BuildError {
     #[error("invalid regex {pattern:?}: {source}")]
     InvalidRegex {
+        field: &'static str,
         pattern: String,
         source: regex::Error,
     },
@@ -594,6 +610,24 @@ enum BuildError {
     ScriptCompile(crate::custom::CompileError),
 }
 
+impl BuildError {
+    /// Bounded, value-free diagnostic for unauthenticated status surfaces.
+    /// Detailed values remain in the local warning log and validation output.
+    fn status_reason(&self) -> String {
+        let (category, field) = match self {
+            Self::InvalidRegex { field, .. } => ("invalid_regex", *field),
+            Self::InvalidValue { field, .. } => ("invalid_value", *field),
+            Self::ReplacementOnBlock { .. } => {
+                ("incompatible_fields", "custom_patterns[].replacement")
+            }
+            Self::FeatureDisabled(_) => ("feature_disabled", "kind"),
+            Self::EmbedderUnavailable => ("runtime_unavailable", "embedding_model"),
+            Self::ScriptCompile(_) => ("compile_failed", "script"),
+        };
+        format!("guardrail runtime build failed: {category} at config.{field}")
+    }
+}
+
 /// `enforcement_mode: monitor` decorator. Runs the wrapped guardrail exactly
 /// as configured but never blocks: a `Block` verdict is logged (the operator's
 /// audit signal — "this rule WOULD have blocked") and downgraded to `Allow`.
@@ -608,6 +642,10 @@ enum BuildError {
 /// the strictest member).
 struct MonitorGuardrail {
     row_name: String,
+    /// Code-owned discriminator used to replace the inner Block reason in
+    /// usage telemetry. Inner reasons can contain operator patterns, remote
+    /// category names, or custom-script data and remain in ops logs only.
+    kind: &'static str,
     inner: Arc<dyn Guardrail>,
 }
 
@@ -641,12 +679,21 @@ impl MonitorGuardrail {
     }
 
     /// `would_block` telemetry hit for a downgraded Block (AISIX-Cloud#562).
-    fn would_block_hit(&self, hook: &'static str, reason: &str) -> GuardrailMonitorHit {
+    fn would_block_hit(
+        &self,
+        hook: &'static str,
+        unavailable: Option<&str>,
+    ) -> GuardrailMonitorHit {
+        let reason = match unavailable {
+            Some(tag) => format!("{} guardrail evaluation unavailable ({tag})", self.kind),
+            None => format!("{} guardrail policy matched", self.kind),
+        };
         GuardrailMonitorHit {
             guardrail_name: self.row_name.clone(),
             hook: hook.to_owned(),
             action: "would_block".to_owned(),
-            reason: reason.to_owned(),
+            reason,
+            error_type: unavailable.unwrap_or_default().to_owned(),
             counts: std::collections::BTreeMap::new(),
         }
     }
@@ -662,6 +709,7 @@ impl MonitorGuardrail {
             hook: hook.to_owned(),
             action: "would_mask".to_owned(),
             reason: String::new(),
+            error_type: String::new(),
             counts,
         }
     }
@@ -674,8 +722,11 @@ impl MonitorGuardrail {
         verdict: GuardrailVerdict,
         hits: &mut Vec<GuardrailMonitorHit>,
     ) -> GuardrailVerdict {
-        if let GuardrailVerdict::Block { ref reason, .. } = verdict {
-            hits.push(self.would_block_hit(hook, reason));
+        if let GuardrailVerdict::Block {
+            ref unavailable, ..
+        } = verdict
+        {
+            hits.push(self.would_block_hit(hook, unavailable.as_deref()));
         }
         self.observe(hook, verdict)
     }
@@ -817,6 +868,7 @@ impl Guardrail for MonitorGuardrail {
         self.inner.bind_score_log(log).map(|inner| {
             Arc::new(MonitorGuardrail {
                 row_name: self.row_name.clone(),
+                kind: self.kind,
                 inner,
             }) as Arc<dyn Guardrail>
         })
@@ -865,6 +917,7 @@ pub struct LiveGuardrailChain {
     snapshot: SnapshotHandle<AisixSnapshot>,
     bedrock_endpoint_url: Option<String>,
     embedder: GuardrailEmbedderSlot,
+    config_status: Option<ConfigStatus>,
     cache: Mutex<Cache>,
 }
 
@@ -879,23 +932,37 @@ impl LiveGuardrailChain {
         bedrock_endpoint_url: Option<String>,
         embedder: GuardrailEmbedderSlot,
     ) -> Arc<Self> {
+        Self::new_with_status(snapshot, bedrock_endpoint_url, embedder, None)
+    }
+
+    /// Construct the legacy whole-environment chain with configuration-build
+    /// reporting. Production uses [`LiveGuardrailIndex`], but this exported
+    /// adapter must preserve the same status contract for direct consumers.
+    pub fn new_with_status(
+        snapshot: SnapshotHandle<AisixSnapshot>,
+        bedrock_endpoint_url: Option<String>,
+        embedder: GuardrailEmbedderSlot,
+        config_status: Option<ConfigStatus>,
+    ) -> Arc<Self> {
         // Read version before load so that a concurrent store() between
         // the two reads causes current() to see a version bump and rebuild,
         // rather than caching stale data under the new version.
         let last_version = snapshot.version();
         let snap = snapshot.load();
-        let chain = Arc::new(build_chain_from_snapshot(
+        let (chain, rejected) = build_chain_from_snapshot_reported(
             &snap.guardrails,
             bedrock_endpoint_url.as_deref(),
             &embedder,
-        ));
+        );
+        publish_build_rejections(config_status.as_ref(), rejected);
         Arc::new(Self {
             snapshot,
             bedrock_endpoint_url,
             embedder,
+            config_status,
             cache: Mutex::new(Cache {
                 last_version,
-                chain,
+                chain: Arc::new(chain),
             }),
         })
     }
@@ -908,11 +975,13 @@ impl LiveGuardrailChain {
             .expect("LiveGuardrailChain mutex poisoned");
         if cache.last_version != cur_version {
             let snap = self.snapshot.load();
-            cache.chain = Arc::new(build_chain_from_snapshot(
+            let (chain, rejected) = build_chain_from_snapshot_reported(
                 &snap.guardrails,
                 self.bedrock_endpoint_url.as_deref(),
                 &self.embedder,
-            ));
+            );
+            publish_build_rejections(self.config_status.as_ref(), rejected);
+            cache.chain = Arc::new(chain);
             cache.last_version = cur_version;
         }
         Arc::clone(&cache.chain)
@@ -1002,7 +1071,26 @@ pub fn build_index_from_snapshot(
     bedrock_endpoint_url: Option<&str>,
     embedder: &GuardrailEmbedderSlot,
 ) -> GuardrailIndex {
+    build_index_from_snapshot_reported(guardrails, attachments, bedrock_endpoint_url, embedder).0
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GuardrailBuildRejection {
+    id: String,
+    reason: String,
+}
+
+/// Build the production index and retain one failure per guardrail row.
+/// Multiple attachments may reference the same row; reporting it once keeps
+/// `/status/config` row-oriented like loader rejections.
+fn build_index_from_snapshot_reported(
+    guardrails: &ResourceTable<DomainGuardrail>,
+    attachments: &ResourceTable<GuardrailAttachment>,
+    bedrock_endpoint_url: Option<&str>,
+    embedder: &GuardrailEmbedderSlot,
+) -> (GuardrailIndex, Vec<GuardrailBuildRejection>) {
     let mut entries = Vec::new();
+    let mut rejected = BTreeMap::<String, GuardrailBuildRejection>::new();
 
     // Deterministic attachment order: `GuardrailIndex::new` sorts by
     // (priority desc, scope-specificity desc) with a STABLE sort, so
@@ -1046,6 +1134,12 @@ pub fn build_index_from_snapshot(
                     error = %err,
                     "skipping guardrail with invalid config in index build",
                 );
+                rejected
+                    .entry(gid.clone())
+                    .or_insert_with(|| GuardrailBuildRejection {
+                        id: gid.clone(),
+                        reason: err.status_reason(),
+                    });
                 continue;
             }
         };
@@ -1070,7 +1164,38 @@ pub fn build_index_from_snapshot(
         ));
     }
 
-    GuardrailIndex::from_entries(entries)
+    (
+        GuardrailIndex::from_entries(entries),
+        rejected.into_values().collect(),
+    )
+}
+
+fn publish_build_rejections(
+    config_status: Option<&ConfigStatus>,
+    rejected: Vec<GuardrailBuildRejection>,
+) {
+    let Some(config_status) = config_status else {
+        return;
+    };
+    let seen_at = chrono::Utc::now();
+    config_status.record_build_rejections(
+        rejected
+            .into_iter()
+            .map(|row| IncomingRejection {
+                // Keep the synthetic identity in the heartbeat's kine-key
+                // shape so cp-api can still derive resource_kind/id. The
+                // non-UUID environment segment prevents collision with a
+                // real stored key.
+                identity: format!("/aisix/runtime/guardrails/{}", row.id),
+                resource_kind: "guardrails".to_string(),
+                resource_id: row.id,
+                last_error_kind: "schema_failed".to_string(),
+                last_error: row.reason,
+                seen_at,
+                serving_stale_since: None,
+            })
+            .collect(),
+    );
 }
 
 /// Ids of the enabled guardrails no attachment names — the rows that are
@@ -1337,6 +1462,10 @@ pub struct LiveGuardrailIndex {
     /// (AISIX-Cloud#1076). `None` (tests, standalone construction) records
     /// nothing; the server bootstrap wires the metrics layer's sink.
     metrics_sink: Option<Arc<dyn aisix_core::GuardrailMetricsSink>>,
+    /// Load-observability handle. Production supplies it so a row that
+    /// passes the lenient loader but fails runtime construction is visible on
+    /// `/status/config` and the managed heartbeat.
+    config_status: Option<ConfigStatus>,
     cache: Mutex<IndexCache>,
 }
 
@@ -1367,62 +1496,95 @@ impl LiveGuardrailIndex {
         metrics_sink: Option<Arc<dyn aisix_core::GuardrailMetricsSink>>,
         embedder: GuardrailEmbedderSlot,
     ) -> Arc<Self> {
+        Self::new_with_sink_and_status(snapshot, bedrock_endpoint_url, metrics_sink, embedder, None)
+    }
+
+    /// Production constructor: additionally reports lazy index-build
+    /// failures through the shared configuration status.
+    pub fn new_with_sink_and_status(
+        snapshot: SnapshotHandle<AisixSnapshot>,
+        bedrock_endpoint_url: Option<String>,
+        metrics_sink: Option<Arc<dyn aisix_core::GuardrailMetricsSink>>,
+        embedder: GuardrailEmbedderSlot,
+        config_status: Option<ConfigStatus>,
+    ) -> Arc<Self> {
         // Read version before load — same ordering discipline as LiveGuardrailChain.
         let last_version = snapshot.version();
         let snap = snapshot.load();
-        let index = Arc::new(build_index_from_snapshot(
+        let (index, rejected) = build_index_from_snapshot_reported(
             &snap.guardrails,
             &snap.guardrail_attachments,
             bedrock_endpoint_url.as_deref(),
             &embedder,
-        ));
+        );
+        publish_build_rejections(config_status.as_ref(), rejected);
         Arc::new(Self {
             snapshot,
             bedrock_endpoint_url,
             embedder,
             metrics_sink,
+            config_status,
             cache: Mutex::new(IndexCache {
                 last_version,
-                index,
+                index: Arc::new(index),
             }),
         })
     }
 
     fn current(&self) -> Arc<GuardrailIndex> {
-        let cur_version = self.snapshot.version();
+        loop {
+            let build_version = self.snapshot.version();
 
-        // Fast path: return cached index without building.
-        {
-            let cache = self
-                .cache
-                .lock()
-                .expect("LiveGuardrailIndex mutex poisoned");
-            if cache.last_version == cur_version {
-                return Arc::clone(&cache.index);
+            // Fast path: return cached index without building.
+            {
+                let cache = self
+                    .cache
+                    .lock()
+                    .expect("LiveGuardrailIndex mutex poisoned");
+                if cache.last_version >= build_version {
+                    return Arc::clone(&cache.index);
+                }
+            }
+
+            // Build outside the lock. A snapshot swap during this work makes
+            // the result obsolete; try_install_index rejects it and the loop
+            // retries from the newer version.
+            let snap = self.snapshot.load();
+            if self.snapshot.version() != build_version {
+                continue;
+            }
+            let (new_index, rejected) = build_index_from_snapshot_reported(
+                &snap.guardrails,
+                &snap.guardrail_attachments,
+                self.bedrock_endpoint_url.as_deref(),
+                &self.embedder,
+            );
+            if let Some(index) = self.try_install_index(build_version, new_index, rejected) {
+                return index;
             }
         }
+    }
 
-        // Build the new index OUTSIDE the lock so a panic (e.g. from a
-        // badly-behaved regex engine) does not poison the mutex.
-        let snap = self.snapshot.load();
-        let new_index = Arc::new(build_index_from_snapshot(
-            &snap.guardrails,
-            &snap.guardrail_attachments,
-            self.bedrock_endpoint_url.as_deref(),
-            &self.embedder,
-        ));
-
-        // Re-acquire and store. A concurrent rebuild (rare) is harmless —
-        // both produce equivalent indexes from the same snapshot version.
+    /// Install a completed build only when it is still the newest snapshot.
+    /// Publishing status while holding the same cache lock makes cache and
+    /// rejection state advance in one monotonic version order.
+    fn try_install_index(
+        &self,
+        build_version: u64,
+        new_index: GuardrailIndex,
+        rejected: Vec<GuardrailBuildRejection>,
+    ) -> Option<Arc<GuardrailIndex>> {
         let mut cache = self
             .cache
             .lock()
             .expect("LiveGuardrailIndex mutex poisoned");
-        if cache.last_version != cur_version {
-            cache.index = new_index;
-            cache.last_version = cur_version;
+        if cache.last_version >= build_version || self.snapshot.version() != build_version {
+            return None;
         }
-        Arc::clone(&cache.index)
+        cache.index = Arc::new(new_index);
+        cache.last_version = build_version;
+        publish_build_rejections(self.config_status.as_ref(), rejected);
+        Some(Arc::clone(&cache.index))
     }
 
     /// Resolve the guardrail chain applicable to `ctx`.
@@ -1609,22 +1771,194 @@ mod tests {
             "matched value must never ride a hit",
         );
 
-        // block-action detector match → would_block hit carrying the reason.
+        // block-action detector match → would_block hit carrying only a
+        // code-owned summary, not the detector or matched value.
         let (v, hits) = chain.check_input_observed(&req("ssn 123-45-6789")).await;
         assert_eq!(v, GuardrailVerdict::Allow);
         assert_eq!(hits.len(), 1, "hits: {hits:?}");
         assert_eq!(hits[0].action, "would_block");
-        assert!(
-            hits[0].reason.contains("us_ssn"),
-            "reason: {}",
-            hits[0].reason
-        );
+        assert_eq!(hits[0].reason, "pii guardrail policy matched");
+        assert!(!hits[0].reason.contains("us_ssn"));
         assert!(!hits[0].reason.contains("123-45-6789"));
 
         // clean input → no hits.
         let (v, hits) = chain.check_input_observed(&req("all fine")).await;
         assert_eq!(v, GuardrailVerdict::Allow);
         assert!(hits.is_empty(), "hits: {hits:?}");
+    }
+
+    #[tokio::test]
+    async fn custom_monitor_reason_cannot_enter_usage_telemetry() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "custom-monitor",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "custom-monitor",
+                    "enforcement_mode": "monitor",
+                    "kind": "custom",
+                    "secrets": {"TOKEN": "telemetry-secret"},
+                    "script": "export function checkInput(ctx) { return { action: 'block', reason: ctx.secrets.TOKEN + ':' + ctx.text }; }"
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+
+        let (verdict, hits) = chain
+            .check_input_observed(&req("customer-private-text"))
+            .await;
+        assert_eq!(verdict, GuardrailVerdict::Allow);
+        assert_eq!(hits.len(), 1, "hits: {hits:?}");
+        assert_eq!(hits[0].action, "would_block");
+        assert_eq!(hits[0].reason, "custom guardrail policy matched");
+        let wire = serde_json::to_string(&hits).unwrap();
+        assert!(!wire.contains("telemetry-secret"), "{wire}");
+        assert!(!wire.contains("customer-private-text"), "{wire}");
+    }
+
+    #[tokio::test]
+    async fn custom_monitor_preserves_each_safe_failure_tag() {
+        #[derive(Default)]
+        struct ErrorTypes(std::sync::Mutex<Vec<Option<String>>>);
+
+        impl aisix_core::GuardrailMetricsSink for ErrorTypes {
+            fn record_guardrail_execution(&self, exec: &aisix_core::GuardrailExecution<'_>) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(exec.error_type.map(str::to_owned));
+            }
+        }
+
+        for (script, tag) in [
+            (
+                "export function checkInput() { return { action: 'maybe' }; }",
+                "custom_unknown_action",
+            ),
+            (
+                "export function checkInput() { return {}; }",
+                "custom_no_verdict",
+            ),
+        ] {
+            let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+            table.insert(entry(
+                "custom-monitor",
+                "g-1",
+                serde_json::from_value(serde_json::json!({
+                    "name": "custom-monitor",
+                    "enforcement_mode": "monitor",
+                    "kind": "custom",
+                    "script": script,
+                }))
+                .unwrap(),
+            ));
+            let sink = Arc::new(ErrorTypes::default());
+            let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none())
+                .with_metrics_sink(Some(sink.clone()));
+
+            let (verdict, hits) = chain.check_input_observed(&req("anything")).await;
+            assert_eq!(verdict, GuardrailVerdict::Allow);
+            assert_eq!(hits.len(), 1, "{tag}: {hits:?}");
+            assert_eq!(hits[0].error_type, tag);
+            assert_eq!(
+                hits[0].reason,
+                format!("custom guardrail evaluation unavailable ({tag})")
+            );
+            let wire = serde_json::to_string(&hits).unwrap();
+            assert!(wire.contains(tag), "{wire}");
+            assert!(!wire.contains("error_type"), "{wire}");
+            assert_eq!(
+                *sink.0.lock().unwrap(),
+                vec![Some(tag.to_owned())],
+                "{tag} must reach the histogram label",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn keyword_monitor_reason_cannot_enter_usage_telemetry() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "keyword-monitor",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "keyword-monitor",
+                    "enforcement_mode": "monitor",
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "customer-private-pattern" }]
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+
+        let (verdict, hits) = chain
+            .check_input_observed(&req("prefix customer-private-pattern suffix"))
+            .await;
+        assert_eq!(verdict, GuardrailVerdict::Allow);
+        assert_eq!(hits.len(), 1, "hits: {hits:?}");
+        assert_eq!(hits[0].reason, "keyword guardrail policy matched");
+        let wire = serde_json::to_string(&hits).unwrap();
+        assert!(!wire.contains("customer-private-pattern"), "{wire}");
+        assert!(!wire.contains("prefix"), "{wire}");
+    }
+
+    fn custom_mask_table(enforcement_mode: &str) -> ResourceTable<DomainGuardrail> {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "custom-mask",
+            "g-1",
+            parse(&format!(
+                r#"{{
+                    "name": "custom-mask",
+                    "enforcement_mode": "{enforcement_mode}",
+                    "kind": "custom",
+                    "secrets": {{"TOKEN": "telemetry-secret"}},
+                    "script": "export function checkInput(ctx) {{ const key = ctx.secrets.TOKEN + ':' + ctx.text; return {{ action: 'mask', segments: ctx.segments.map(() => '***'), counts: {{ [key]: 4294967295 }} }}; }}"
+                }}"#,
+            )),
+        ));
+        table
+    }
+
+    #[tokio::test]
+    async fn custom_monitor_mask_uses_code_owned_counts() {
+        let table = custom_mask_table("monitor");
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let original = vec!["customer-private-text".to_owned()];
+
+        let outcome = chain.moderate_input_segments(&original).await;
+        assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
+        assert_eq!(outcome.masked, None, "monitor mode must not rewrite");
+        assert!(outcome.counts.is_empty(), "monitor counts are not applied");
+        assert_eq!(outcome.monitor_hits.len(), 1, "{outcome:?}");
+        assert_eq!(outcome.monitor_hits[0].action, "would_mask");
+        assert_eq!(outcome.monitor_hits[0].counts.get("custom"), Some(&1));
+        let wire = serde_json::to_string(&outcome.monitor_hits).unwrap();
+        assert!(!wire.contains("telemetry-secret"), "{wire}");
+        assert!(!wire.contains("customer-private-text"), "{wire}");
+        assert!(!wire.contains("4294967295"), "{wire}");
+    }
+
+    #[tokio::test]
+    async fn custom_enforced_mask_uses_code_owned_counts() {
+        let table = custom_mask_table("block");
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none())
+            .with_audit_log(Some(Arc::new(crate::GuardrailAuditLog::new())));
+        let original = vec!["customer-private-text".to_owned()];
+
+        let outcome = chain.moderate_input_segments(&original).await;
+        assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
+        assert_eq!(outcome.masked, Some(vec!["***".to_owned()]));
+        assert_eq!(outcome.counts.get("custom"), Some(&1));
+        let hits = chain.enforced_hits();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].counts.get("custom"), Some(&1));
+        let wire = serde_json::to_string(&(outcome.counts, hits)).unwrap();
+        assert!(!wire.contains("telemetry-secret"), "{wire}");
+        assert!(!wire.contains("customer-private-text"), "{wire}");
+        assert!(!wire.contains("4294967295"), "{wire}");
     }
 
     /// An ENFORCING (block-mode) guardrail must not produce monitor hits —
@@ -1868,6 +2202,11 @@ mod tests {
         assert_eq!(verdict, GuardrailVerdict::Allow, "monitor downgrades it");
         assert_eq!(hits.len(), 1, "the suppression is still reported");
         assert_eq!(hits[0].action, "would_block");
+        assert_eq!(
+            hits[0].reason,
+            "aliyun_text_moderation guardrail evaluation unavailable (aliyun_5xx)"
+        );
+        assert_eq!(hits[0].error_type, "aliyun_5xx");
     }
 
     /// Monitor mode is unconditional: a provider outage is still only
@@ -2067,6 +2406,88 @@ mod tests {
         handle.store(next);
 
         assert!(live.check_input(&req("AKIA-EXAMPLE")).await.is_block());
+    }
+
+    #[tokio::test]
+    async fn live_chain_reports_and_clears_build_rejections() {
+        let broken = AisixSnapshot::new();
+        broken.guardrails.insert(entry(
+            "broken",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "sensitive-name-do-not-expose",
+                    "kind": "custom",
+                    "script": "sensitive-script-do-not-expose export function checkInput( {"
+                }"#,
+            ),
+        ));
+        let handle = SnapshotHandle::new(broken);
+        let status = ConfigStatus::new(aisix_core::SourceKind::Etcd);
+        let live = LiveGuardrailChain::new_with_status(
+            handle.clone(),
+            None,
+            GuardrailEmbedderSlot::none(),
+            Some(status.clone()),
+        );
+        assert_eq!(status.view().rejected.len(), 1);
+        assert_eq!(
+            status.view().rejected[0].last_error,
+            "guardrail runtime build failed: compile_failed at config.script"
+        );
+        let public_status = serde_json::to_string(&status.view()).unwrap();
+        assert!(!public_status.contains("sensitive-name-do-not-expose"));
+        assert!(!public_status.contains("sensitive-script-do-not-expose"));
+
+        let fixed = AisixSnapshot::new();
+        fixed.guardrails.insert(entry(
+            "fixed",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "fixed",
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+        handle.store(fixed);
+        assert!(live.check_input(&req("AKIA")).await.is_block());
+        assert!(status.view().rejected.is_empty());
+    }
+
+    #[test]
+    fn runtime_status_redacts_invalid_regex_values() {
+        let broken = AisixSnapshot::new();
+        broken.guardrails.insert(entry(
+            "private-name-do-not-expose",
+            "g-private",
+            parse(
+                r#"{
+                    "name": "private-name-do-not-expose",
+                    "kind": "keyword",
+                    "patterns": [{"kind":"regex","value":"private-pattern-do-not-expose[("}]
+                }"#,
+            ),
+        ));
+        let status = ConfigStatus::new(aisix_core::SourceKind::Etcd);
+        let _live = LiveGuardrailChain::new_with_status(
+            SnapshotHandle::new(broken),
+            None,
+            GuardrailEmbedderSlot::none(),
+            Some(status.clone()),
+        );
+
+        let body = serde_json::to_string(&status.view()).unwrap();
+        assert!(body.contains("invalid_regex at config.patterns[].value"));
+        assert!(!body.contains("private-pattern-do-not-expose"));
+        assert!(!body.contains("private-name-do-not-expose"));
+        let heartbeat = status.rejection_snapshots();
+        assert_eq!(heartbeat.len(), 1);
+        assert_eq!(
+            heartbeat[0].error,
+            "guardrail runtime build failed: invalid_regex at config.patterns[].value"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2962,6 +3383,270 @@ mod tests {
             .await
             .is_block());
         assert!(!live.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_index_reports_and_clears_lazy_build_rejections() {
+        let broken = AisixSnapshot::new();
+        broken.guardrails.insert(entry(
+            "broken",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "broken-script",
+                    "kind": "custom",
+                    "script": " "
+                }"#,
+            ),
+        ));
+        broken.guardrail_attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(
+                r#"{
+                    "guardrail_id": "g-1",
+                    "scope_type": "env",
+                    "priority": 50
+                }"#,
+            ),
+        ));
+        // A blank semantic model is deliberately valid on the lenient read
+        // path: the built guardrail fails closed at request time. It must not
+        // be reclassified as a build rejection, which would drop the row and
+        // admit traffic instead.
+        broken.guardrails.insert(entry(
+            "semantic-empty-model",
+            "g-2",
+            parse(
+                r#"{
+                    "name": "semantic-empty-model",
+                    "kind": "semantic",
+                    "embedding_model": "",
+                    "deny_examples": ["forbidden"],
+                    "deny_threshold": 0.75
+                }"#,
+            ),
+        ));
+        broken.guardrail_attachments.insert(attachment_entry(
+            "a-2",
+            parse_attachment(
+                r#"{
+                    "guardrail_id": "g-2",
+                    "scope_type": "env",
+                    "priority": 40
+                }"#,
+            ),
+        ));
+        let handle = SnapshotHandle::new(broken);
+        let status = ConfigStatus::new(aisix_core::SourceKind::Etcd);
+        status.record_load(aisix_core::LoadObservation {
+            source_hash: "broken".into(),
+            observed_revision: Some(1),
+            applied: Some(aisix_core::AppliedSnapshot {
+                config_hash: "broken".into(),
+                revision: Some(1),
+                resource_counts: [("guardrails".to_string(), 2)].into_iter().collect(),
+            }),
+            rejected: vec![],
+            partially_compatible: vec![],
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: true,
+            wholly_rejected: false,
+        });
+        let live = LiveGuardrailIndex::new_with_sink_and_status(
+            handle.clone(),
+            None,
+            None,
+            GuardrailEmbedderSlot::new(Arc::new(IdenticalEmbedder)),
+            Some(status.clone()),
+        );
+
+        let rejected = status.view();
+        assert_eq!(rejected.state, aisix_core::ConfigState::Degraded);
+        assert_eq!(rejected.rejected.len(), 1, "{rejected:?}");
+        let custom = rejected
+            .rejected
+            .iter()
+            .find(|row| row.resource_id == "g-1")
+            .expect("custom rejection");
+        assert_eq!(custom.resource_kind, "guardrails");
+        assert_eq!(
+            custom.last_error,
+            "guardrail runtime build failed: invalid_value at config.script"
+        );
+        let applied = rejected.applied.as_ref().unwrap();
+        assert_eq!(applied.resource_counts["guardrails"], 1);
+        assert_ne!(
+            applied.config_hash.as_str(),
+            rejected.source.source_hash.as_deref().unwrap()
+        );
+        assert_eq!(
+            status
+                .rejection_snapshots()
+                .into_iter()
+                .map(|row| row.key)
+                .collect::<Vec<_>>(),
+            vec!["/aisix/runtime/guardrails/g-1".to_string()],
+            "heartbeat keys must retain the kine shape cp-api parses"
+        );
+        assert!(live
+            .resolve(&any_ctx())
+            .check_input(&req("anything"))
+            .await
+            .is_block());
+
+        let fixed = AisixSnapshot::new();
+        fixed.guardrails.insert(entry(
+            "fixed",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "fixed",
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+        fixed.guardrail_attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(
+                r#"{
+                    "guardrail_id": "g-1",
+                    "scope_type": "env",
+                    "priority": 50
+                }"#,
+            ),
+        ));
+        handle.store(fixed);
+        status.record_load(aisix_core::LoadObservation {
+            source_hash: "fixed".into(),
+            observed_revision: Some(2),
+            applied: Some(aisix_core::AppliedSnapshot {
+                config_hash: "fixed".into(),
+                revision: Some(2),
+                resource_counts: [("guardrails".to_string(), 1)].into_iter().collect(),
+            }),
+            rejected: vec![],
+            partially_compatible: vec![],
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: false,
+            wholly_rejected: false,
+        });
+        // Rebuilds are deliberately lazy, so the previous signal remains
+        // until the first request observes the new snapshot.
+        assert_eq!(status.view().rejected.len(), 1);
+        let _ = live.resolve(&any_ctx());
+        assert!(status.view().rejected.is_empty());
+        let repaired = status.view();
+        assert_eq!(repaired.state, aisix_core::ConfigState::Synced);
+        assert_eq!(repaired.applied.unwrap().resource_counts["guardrails"], 1);
+    }
+
+    #[test]
+    fn older_index_build_cannot_restore_a_superseded_rejection() {
+        let broken = AisixSnapshot::new();
+        broken.guardrails.insert(entry(
+            "broken",
+            "g-1",
+            parse(r#"{"name":"broken","kind":"custom","script":" "}"#),
+        ));
+        broken.guardrail_attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(r#"{"guardrail_id":"g-1","scope_type":"env","priority":0}"#),
+        ));
+        let handle = SnapshotHandle::new(broken);
+        let old_version = handle.version();
+        let status = ConfigStatus::new(aisix_core::SourceKind::Etcd);
+        status.record_load(aisix_core::LoadObservation {
+            source_hash: "old".into(),
+            observed_revision: Some(1),
+            applied: Some(aisix_core::AppliedSnapshot {
+                config_hash: "old".into(),
+                revision: Some(1),
+                resource_counts: [("guardrails".to_string(), 1)].into_iter().collect(),
+            }),
+            rejected: vec![],
+            partially_compatible: vec![],
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: true,
+            wholly_rejected: false,
+        });
+        let live = LiveGuardrailIndex::new_with_sink_and_status(
+            handle.clone(),
+            None,
+            None,
+            GuardrailEmbedderSlot::none(),
+            Some(status.clone()),
+        );
+        assert_eq!(status.view().rejected.len(), 1);
+
+        let fixed = AisixSnapshot::new();
+        fixed.guardrails.insert(entry(
+            "fixed",
+            "g-1",
+            parse(
+                r#"{"name":"fixed","kind":"keyword","patterns":[{"kind":"literal","value":"AKIA"}]}"#,
+            ),
+        ));
+        fixed.guardrail_attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(r#"{"guardrail_id":"g-1","scope_type":"env","priority":0}"#),
+        ));
+        handle.store(fixed);
+        let new_version = handle.version();
+        status.record_load(aisix_core::LoadObservation {
+            source_hash: "new".into(),
+            observed_revision: Some(2),
+            applied: Some(aisix_core::AppliedSnapshot {
+                config_hash: "new".into(),
+                revision: Some(2),
+                resource_counts: [("guardrails".to_string(), 1)].into_iter().collect(),
+            }),
+            rejected: vec![],
+            partially_compatible: vec![],
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: false,
+            wholly_rejected: false,
+        });
+
+        // Hold the old result until the newer build has installed, then let
+        // it race the cache/status publication in the previously-buggy order.
+        let (release_old, wait_old) = std::sync::mpsc::channel();
+        let old_live = Arc::clone(&live);
+        let old = std::thread::spawn(move || {
+            wait_old.recv().unwrap();
+            old_live.try_install_index(
+                old_version,
+                GuardrailIndex::from_entries(Vec::new()),
+                vec![GuardrailBuildRejection {
+                    id: "g-1".into(),
+                    reason: "obsolete rejection".into(),
+                }],
+            )
+        });
+
+        let snap = handle.load();
+        let (new_index, new_rejected) = build_index_from_snapshot_reported(
+            &snap.guardrails,
+            &snap.guardrail_attachments,
+            None,
+            &GuardrailEmbedderSlot::none(),
+        );
+        assert!(live
+            .try_install_index(new_version, new_index, new_rejected)
+            .is_some());
+        release_old.send(()).unwrap();
+        assert!(old.join().unwrap().is_none());
+
+        let view = status.view();
+        assert!(
+            view.rejected.is_empty(),
+            "obsolete result restored: {view:?}"
+        );
+        assert_eq!(view.applied.unwrap().config_hash, "new");
     }
 
     #[tokio::test]

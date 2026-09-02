@@ -175,6 +175,7 @@ pub async fn image_edits(
                 success.monitor_hits.clone(),
                 success.captured_content.as_ref(),
                 &audit,
+                true,
             );
             success.response
         }

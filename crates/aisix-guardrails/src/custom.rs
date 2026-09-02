@@ -15,9 +15,9 @@
 //! `ctx` carries `{ hook, text, segments, messages, model, secrets }`. A
 //! verdict is `{ action: "none" }` (or the synonym `{ action: "allow" }`),
 //! `{ action: "block", reason, reason_code }`, or `{ action: "mask",
-//! segments, counts }` where `segments` is positionally aligned with
-//! `ctx.segments`. A hook whose function the module does not export is an
-//! Allow, so one script may cover one direction.
+//! segments }` where `segments` is positionally aligned with `ctx.segments`.
+//! A hook whose function the module does not export is an Allow, so one
+//! script may cover one direction.
 //!
 //! The vocabulary is CLOSED — [`ACTION_VOCABULARY`] is all of it. A hook
 //! that returns anything else, or returns nothing, has not screened the
@@ -58,22 +58,15 @@
 //! ([`validate`]) — one parse per chain build rather than one per request,
 //! and no operator code runs on the config-apply path.
 //!
-//! Where the failure surfaces depends on the ENTRY POINT, not the source,
-//! and it is never `rejected_resources`: that list is written by the
-//! loader, which never sees a build failure. `aisix validate` reports the
-//! row through `unbuildable_guardrail_rows` and exits non-zero. A serving
-//! gateway only warns — in the boot log for a `resources_file` node, and
-//! for an etcd one on the first request after the snapshot version moves,
-//! because `LiveGuardrailIndex` rebuilds lazily rather than when the row
-//! lands. Its constructor does build once, though, over whatever the
-//! handle already holds — so a row present before the index is built warns
-//! in the boot log instead. That is guaranteed for a managed node
-//! restarting onto a populated snapshot cache (`restore_from_cache` is
-//! synchronous and precedes the index); on a cold etcd node it happens
-//! whenever the watch task's first load wins the race against the rest of
-//! boot, so "first request" is the worst case rather than the only one. The
-//! config status stays `synced` in every case. cp-api's own esbuild pass is
-//! what catches the common case at save time.
+//! Where the failure first surfaces depends on the entry point, not the
+//! source. `aisix validate` reports the row through
+//! `unbuildable_guardrail_rows` and exits non-zero. A serving gateway logs
+//! it and publishes a runtime rejection to `/status/config`, metrics, and
+//! managed-mode heartbeats. For an etcd node this may happen on the first
+//! request after the snapshot version moves because `LiveGuardrailIndex`
+//! rebuilds lazily; its constructor also builds once over the snapshot it
+//! already holds. cp-api's own esbuild pass catches the common case at save
+//! time.
 //!
 //! Each invocation gets a brand-new runtime and context (~215µs), so no
 //! state survives between requests and the memory ceiling applies per call.
@@ -345,7 +338,7 @@ impl CustomGuardrail {
             Err(failure) => SegmentsOutcome::from_verdict(self.handle_failure(failure, fail_open)),
             Ok(ScriptOutcome::NotExported | ScriptOutcome::Allow) => SegmentsOutcome::allow(),
             Ok(ScriptOutcome::Block(verdict)) => SegmentsOutcome::from_verdict(verdict),
-            Ok(ScriptOutcome::Mask { segments, counts }) => {
+            Ok(ScriptOutcome::Mask { segments }) => {
                 // Positional substitution is the whole contract; a script
                 // that returns a different number of slots would silently
                 // shift content from one message onto another.
@@ -358,6 +351,21 @@ impl CustomGuardrail {
                     );
                     return SegmentsOutcome::from_verdict(
                         self.handle_failure(ScriptFailure::BadVerdict, fail_open),
+                    );
+                }
+                // Custom code must not choose persistent telemetry keys or
+                // values from `ctx.text`/`ctx.secrets`. Report only the
+                // code-owned kind and the number of slots actually changed.
+                let changed = segments
+                    .iter()
+                    .zip(texts)
+                    .filter(|(masked, original)| masked != original)
+                    .count();
+                let mut counts = BTreeMap::new();
+                if changed != 0 {
+                    counts.insert(
+                        "custom".to_owned(),
+                        u32::try_from(changed).unwrap_or(u32::MAX),
                     );
                 }
                 SegmentsOutcome {
@@ -520,10 +528,7 @@ impl CustomGuardrail {
                     );
                     return Err(ScriptFailure::BadVerdict);
                 };
-                Ok(ScriptOutcome::Mask {
-                    segments,
-                    counts: parsed.counts.unwrap_or_default(),
-                })
+                Ok(ScriptOutcome::Mask { segments })
             }
             other => {
                 tracing::warn!(
@@ -715,7 +720,7 @@ impl Guardrail for CustomGuardrail {
 /// Declaring a module parses it without evaluating it, so validation never
 /// runs a line the operator wrote. Used by the chain builder to refuse a
 /// script that does not compile; see the module docs for where that refusal
-/// is visible (it is not `rejected_resources`).
+/// is reported.
 pub fn validate(script: &str) -> Result<(), CompileError> {
     let runtime = rquickjs::Runtime::new().map_err(|e| CompileError::Engine(e.to_string()))?;
     let context =
@@ -1147,10 +1152,6 @@ struct ScriptVerdict {
     /// caller can substitute slot for slot.
     #[serde(default)]
     segments: Option<Vec<String>>,
-    /// What the script detected, by name, for the usage event. Names only —
-    /// never matched content (#153).
-    #[serde(default)]
-    counts: Option<BTreeMap<String, u32>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1199,7 +1200,6 @@ enum ScriptOutcome {
     /// back can honor this; the others turn it into a Block.
     Mask {
         segments: Vec<String>,
-        counts: BTreeMap<String, u32>,
     },
 }
 
@@ -1716,7 +1716,8 @@ mod tests {
             outcome.masked.as_deref(),
             Some(["my ssn is <SSN>".to_owned(), "hello".to_owned()].as_slice()),
         );
-        assert_eq!(outcome.counts.get("US_SSN"), Some(&1));
+        assert_eq!(outcome.counts.get("custom"), Some(&1));
+        assert!(!outcome.counts.contains_key("US_SSN"));
     }
 
     #[tokio::test]

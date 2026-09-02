@@ -31,7 +31,8 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
-use aisix_etcd::loader::{PartialCompatEntry, RejectedEntry};
+use aisix_core::ConfigRejectionSnapshot;
+use aisix_etcd::loader::PartialCompatEntry;
 use aisix_obs::SinkStatsSnapshot;
 use anyhow::{anyhow, Context};
 use serde::Serialize;
@@ -65,7 +66,7 @@ fn format_build_version(pkg_version: &str, build_sha: Option<&str>) -> String {
 /// Pre-fix the loader logged a warning and silently moved on. Customers
 /// who saved an invalid resource in the dashboard saw "Saved" but the
 /// DP dropped the row — no signal back. See issue #115.
-pub type RejectionFetcher = Arc<dyn Fn() -> Vec<RejectedEntry> + Send + Sync>;
+pub type RejectionFetcher = Arc<dyn Fn() -> Vec<ConfigRejectionSnapshot> + Send + Sync>;
 
 /// Per-tick source of the highest etcd/kine revision the watch
 /// supervisor has applied to its snapshot (`WatchStatus.revision`).
@@ -403,15 +404,15 @@ impl ExporterHealthWire {
 }
 
 /// On-the-wire shape for one rejection. Kept as a separate type from
-/// `aisix_etcd::loader::RejectedEntry` so the loader's internal
-/// representation can evolve without forcing a wire bump. The two
-/// converge today; `kind` is serialised as a string ("bad_key",
+/// [`ConfigRejectionSnapshot`] so the status subsystem's internal
+/// representation can evolve without forcing a wire bump. `kind` is
+/// serialised as a string ("bad_key",
 /// "non_json", "schema_failed", "parse_failed", "unknown_kind") so
 /// cp-api can match without depending on Rust enum repr.
 #[derive(Debug, Serialize)]
 struct RejectedResourceWire {
     key: String,
-    kind: &'static str,
+    kind: String,
     error: String,
     timestamp_unix_secs: u64,
     /// Unix seconds since when this key has been serving its last known
@@ -424,11 +425,11 @@ struct RejectedResourceWire {
     stale_serving_since_unix_secs: Option<u64>,
 }
 
-impl From<&RejectedEntry> for RejectedResourceWire {
-    fn from(r: &RejectedEntry) -> Self {
+impl From<&ConfigRejectionSnapshot> for RejectedResourceWire {
+    fn from(r: &ConfigRejectionSnapshot) -> Self {
         Self {
             key: r.key.clone(),
-            kind: r.kind.as_str(),
+            kind: r.kind.clone(),
             error: r.error.clone(),
             timestamp_unix_secs: r.timestamp_unix_secs,
             stale_serving_since_unix_secs: r.stale_serving_since_unix_secs,
@@ -815,16 +816,16 @@ mod tests {
         let cfg = cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls)
             .with_rejection_fetcher(Arc::new(|| {
                 vec![
-                    RejectedEntry {
+                    ConfigRejectionSnapshot {
                         key: "/aisix/models/stale-served".into(),
-                        kind: aisix_etcd::loader::RejectionKind::SchemaFailed,
+                        kind: "schema_failed".into(),
                         error: "schema validation failed".into(),
                         timestamp_unix_secs: 1_770_000_100,
                         stale_serving_since_unix_secs: Some(1_770_000_000),
                     },
-                    RejectedEntry {
+                    ConfigRejectionSnapshot {
                         key: "/aisix/models/never-loaded".into(),
-                        kind: aisix_etcd::loader::RejectionKind::SchemaFailed,
+                        kind: "schema_failed".into(),
                         error: "schema validation failed".into(),
                         timestamp_unix_secs: 1_770_000_100,
                         stale_serving_since_unix_secs: None,
