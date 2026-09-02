@@ -55,6 +55,16 @@ jobs:
             echo "code=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # The files endpoint caps at 3000 entries, so a larger PR comes back
+          # truncated. A truncation that cut off the code files would classify
+          # a code PR as documentation — the one direction this must not fail in.
+          listed=$(printf '%s\n' "$files" | grep -c . || true)
+          expected='${{ github.event.pull_request.changed_files }}'
+          if [ -n "$expected" ] && [ "$listed" -lt "$expected" ]; then
+            echo "::warning::listed $listed of $expected files — truncated, defaulting to code=true"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           echo "changed files:"; echo "$files"
           code=false
           while IFS= read -r f; do
@@ -482,7 +492,12 @@ jobs:
             if [ "$res" = success ]; then
               continue
             fi
-            if [ "$res" = skipped ] && [ "$CODE" != true ]; then
+            # `= false`, not `!= true`: an empty CODE means the classifier
+            # did not report — cancelled, or its output failed to propagate —
+            # and the legs it gates skip along with it. Treating that as a
+            # docs-only PR would pass the one required check that still runs
+            # with nothing behind it.
+            if [ "$res" = skipped ] && [ "$CODE" = false ]; then
               echo "$job skipped: this pull request changes no code"
               continue
             fi
