@@ -523,12 +523,61 @@ describe("sse frames + reasoning scope e2e (#1103/#1104)", () => {
       signature: "sig-out",
     });
     // …while everything the output scan and mask DO cover still works:
-    // the text block is masked, and tool-use arguments are still scanned.
+    // the text block is masked.
     expect(parsed.content[1]).toEqual({
       type: "text",
       text: `you can reach us at ${MASKED}`,
     });
     expect(body).toContain("argument text");
+  });
+
+  /// The raw-array dump this change filters is the one #448 added so
+  /// tool-use arguments reach the output scan. Dropping the reasoning
+  /// blocks must not drop that: a blocked literal inside `tool_use.input`
+  /// still has to refuse the response. Asserting the argument text merely
+  /// ARRIVES proves nothing — it is part of the upstream body and is
+  /// delivered verbatim whether or not the dump still feeds the scan.
+  test("/v1/messages buffered: tool-use arguments are still scanned after the reasoning filter", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return void ctx.skip();
+
+    const upstream = await upstreamWith({
+      nonStreamBody: {
+        id: "msg_out_tooluse",
+        type: "message",
+        role: "assistant",
+        model: "upstream-model-x",
+        content: [
+          {
+            type: "thinking",
+            thinking: "nothing interesting in here",
+            signature: "sig-out",
+          },
+          { type: "text", text: "calling the tool" },
+          {
+            type: "tool_use",
+            id: "t1",
+            name: "lookup",
+            input: { q: `argument carrying ${BLOCKED}` },
+          },
+        ],
+        usage: { input_tokens: 3, output_tokens: 9 },
+      },
+    });
+    await seedScenario("tooluse-output-scan", upstream, "anthropic", [blockGuardrailId]);
+
+    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify({
+        model: "tooluse-output-scan",
+        max_tokens: 16,
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+    expect(res.status).toBe(422);
+    const body = await res.text();
+    expect(body).not.toContain(BLOCKED);
+    expect(body).not.toContain("argument carrying");
   });
 
   test("/v1/messages streaming: generated thinking deltas are neither scanned nor masked", async (ctx) => {
@@ -566,8 +615,12 @@ describe("sse frames + reasoning scope e2e (#1103/#1104)", () => {
     const text = await r.text();
 
     // The block rule never sees the thinking delta, so the stream is not
-    // terminated with an error frame…
-    expect(text).not.toContain("content_filter");
+    // terminated with an error frame. Assert the shape this endpoint
+    // ACTUALLY emits: since the terminal frame moved to
+    // `invalid_request_error`, a `content_filter` assertion here could never
+    // go red no matter what the guardrail did.
+    expect(text).not.toContain("event: error");
+    expect(text).not.toContain('"type":"invalid_request_error"');
     // …the thinking delta reaches the caller unrewritten…
     expect(text).toContain(`considering ${BLOCKED} and ${EMAIL}`);
     // …and the text delta beside it is masked, which is what proves the
@@ -609,8 +662,12 @@ describe("sse frames + reasoning scope e2e (#1103/#1104)", () => {
     expect(r.status).toBe(200);
     const text = await r.text();
 
-    // Not blocked by the literal that appears only inside reasoning…
-    expect(text).not.toContain("content_filter");
+    // Not blocked by the literal that appears only inside reasoning. This
+    // surface refuses with an HTTP 422 rather than an in-band frame, so the
+    // `r.status` assertion above is the real check — a `content_filter`
+    // substring assertion here could never go red, because `responses.rs`
+    // has no error-frame producer at all on the verbatim hold-back path.
+    expect(text).not.toContain("guardrail");
     // …the reasoning summary and content survive the output mask…
     expect(text).toContain(`considering ${BLOCKED} and ${EMAIL}`);
     expect(text).toContain(`also ${BLOCKED} and ${EMAIL}`);

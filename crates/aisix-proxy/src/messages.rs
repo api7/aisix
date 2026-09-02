@@ -1329,6 +1329,12 @@ async fn anthropic_passthrough_dispatch(
     // request's `stream` flag — see `dispatch::upstream_body_is_sse`. A
     // JSON document answering `stream: true` takes the non-streaming
     // buffered scan+mask path below.
+    //
+    // That body needs its own deadline: the request-level timeout above was
+    // deliberately NOT attached for a streaming request, and the per-chunk
+    // read timeout lives on the SSE branch this response no longer takes,
+    // so without one a stalled JSON body would be held with no bound at all.
+    let buffered_body_deadline = if is_stream { timeouts.stream } else { None };
     let is_stream = is_stream && crate::dispatch::upstream_body_is_sse(upstream_resp.headers());
 
     if is_stream {
@@ -1648,18 +1654,18 @@ async fn anthropic_passthrough_dispatch(
         // failures cool down the target — a body the bridge can't
         // parse is a real upstream problem worth taking out of
         // rotation, not a caller bug.
-        let mut json_body: Value = upstream_resp
-            .json()
-            .await
-            .map_err(|e| {
-                crate::cooldown::note_failure(
-                    &state.runtime_status,
-                    model_id,
-                    model.cooldown.as_ref(),
-                    aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
-                )
-            })
-            .map_err(ProxyError::Bridge)?;
+        let mut json_body: Value =
+            crate::dispatch::json_body_within(upstream_resp, buffered_body_deadline)
+                .await
+                .map_err(|be| {
+                    crate::cooldown::note_failure(
+                        &state.runtime_status,
+                        model_id,
+                        model.cooldown.as_ref(),
+                        be,
+                    )
+                })
+                .map_err(ProxyError::Bridge)?;
 
         let mut metrics = anthropic_metrics_from_response_json(&json_body);
         // Token-estimation fallback (AISIX-Cloud#1074): an

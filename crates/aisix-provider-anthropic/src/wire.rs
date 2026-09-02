@@ -1532,7 +1532,7 @@ pub fn parse_inbound_request(
 /// carries only the provider's encrypted `data` blob — there is no
 /// plaintext in it for a scan to read, so it contributes nothing here (a
 /// Mask rule that would rewrite either block is refused outright rather
-/// than applied — see `redact::anthropic_masks_signed_reasoning`).
+/// than applied — see `redact::anthropic_request_masks_signed_reasoning`).
 pub fn parse_inbound_request_for_scan(
     body: &serde_json::Value,
 ) -> Result<ChatFormat, AnthropicInboundError> {

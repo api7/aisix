@@ -608,6 +608,37 @@ pub(crate) fn upstream_body_is_sse(headers: &axum::http::HeaderMap) -> bool {
     !(essence == "application/json" || essence.ends_with("+json"))
 }
 
+/// Buffer a JSON response body under an optional deadline.
+///
+/// The relays attach reqwest's request-level timeout only when the REQUEST
+/// did not ask to stream, because that timeout bounds the body read too and
+/// would cut a real stream off mid-response. So when a `stream: true`
+/// request is answered with a JSON document — the case
+/// [`upstream_body_is_sse`] exists to detect — the buffered read it now
+/// takes has no deadline from that source, and the per-chunk read timeout
+/// that used to bound it lives only on the SSE branch. Pass the streaming
+/// budget here for that case; `None` where the request-level timeout is
+/// already in force.
+pub(crate) async fn json_body_within(
+    resp: reqwest::Response,
+    deadline: Option<std::time::Duration>,
+) -> Result<serde_json::Value, BridgeError> {
+    let read = resp.json::<serde_json::Value>();
+    match deadline {
+        Some(d) => tokio::time::timeout(d, read)
+            .await
+            .map_err(|_| BridgeError::Timeout {
+                elapsed_ms: d.as_millis() as u64,
+                cause: "upstream answered a streaming request with a JSON body that stalled"
+                    .to_string(),
+            })?
+            .map_err(|e| BridgeError::UpstreamDecode(e.to_string())),
+        None => read
+            .await
+            .map_err(|e| BridgeError::UpstreamDecode(e.to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -613,8 +613,16 @@ fn redact_responses_item(
         // match still in it — the mask has to reach the same slots the scan
         // does. Neither slot carries a provider signature, so rewriting one
         // is not replay-breaking; the Anthropic `thinking` block is the
-        // signed case and is refused instead (`anthropic_masks_signed_
-        // reasoning`).
+        // signed case and is refused instead
+        // (`anthropic_request_masks_signed_reasoning`).
+        //
+        // NOT closed here: a reasoning item's `encrypted_content` is
+        // forwarded verbatim and is neither scanned nor rewritten, so on a
+        // request that replays one the masked `text` is a readable copy
+        // while the provider still receives the original. Masking it is not
+        // possible (it is provider ciphertext) and refusing on it is the
+        // open question this arm's Anthropic sibling raises — do not read
+        // this arm as closing the `/v1/responses` side.
         //
         // Input only. Reasoning the model GENERATES is out of
         // output-guardrail scope, so this arm must not fire on

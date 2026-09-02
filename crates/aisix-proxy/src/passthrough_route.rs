@@ -1231,12 +1231,17 @@ fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String 
             })
             .unwrap_or_default(),
         // Responses API: `input` is either a bare string or an array of
-        // items whose `content` parts carry the text.
+        // items whose `content` parts carry the text. `summary` rides
+        // alongside on a replayed `reasoning` item — caller-supplied text on
+        // the request side, and read by the typed route's scan
+        // (`responses::responses_item_text`), so it is read here too.
         PassthroughProtocol::OpenaiResponses => match v.get("input") {
             Some(serde_json::Value::String(t)) => t.clone(),
             Some(serde_json::Value::Array(items)) => items
                 .iter()
-                .filter_map(|i| i.get("content").map(content_text))
+                .flat_map(|i| [i.get("content"), i.get("summary")])
+                .flatten()
+                .map(content_text)
                 .filter(|t| !t.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -1284,6 +1289,15 @@ fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String
             .map(|items| {
                 items
                     .iter()
+                    // Generated reasoning is out of the output-guardrail
+                    // scope, and a `reasoning` item DOES carry `content[]`
+                    // with `text` parts — so reading `content` off every
+                    // item regardless of type sweeps it in. The typed
+                    // `/v1/responses` handler skips it for the same reason
+                    // (`responses::responses_output_text`); without this a
+                    // block rule matching only inside reasoning would refuse
+                    // a response here that the typed route allows.
+                    .filter(|i| i.get("type").and_then(|t| t.as_str()) != Some("reasoning"))
                     .filter_map(|i| i.get("content").map(content_text))
                     .filter(|t| !t.is_empty())
                     .collect::<Vec<_>>()
@@ -1640,9 +1654,16 @@ fn frame_delta(protocol: PassthroughProtocol, frame: &[u8]) -> (String, Option<P
             break 'payload;
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
-            if matches!(protocol, PassthroughProtocol::Raw) {
-                text.push_str(payload);
-            }
+            // Unparseable joined payload — a non-conformant upstream that
+            // put two independent JSON documents on two `data:` lines, say.
+            // The frame is still FORWARDED, so scanning nothing here is a
+            // way past an output block rule. Fall back to the raw payload
+            // text on every protocol, not just `Raw`: over-scanning can only
+            // produce a false positive, while under-scanning a frame the
+            // client receives is the bypass. (Per-line parsing used to catch
+            // the two-document case incidentally; this covers it and every
+            // other shape that does not parse.)
+            text.push_str(payload);
             break 'payload;
         };
         if let Some(u) = v.get("usage").and_then(usage_of) {
@@ -2984,6 +3005,30 @@ mod tests {
         }
     }
 
+    /// A frame whose joined payload does not parse is still FORWARDED to
+    /// the client, so producing no scan text for it is a way past an output
+    /// block rule. Every protocol falls back to the raw payload text — the
+    /// worst case is a false positive, while the alternative is a bypass.
+    #[test]
+    fn an_unparseable_payload_still_yields_scan_text_on_every_protocol() {
+        // Two independent JSON documents on two `data:` lines: joined per
+        // the SSE spec this is one unparseable payload, and per-line parsing
+        // used to catch it only incidentally.
+        let frame = b"data: {\"choices\":[{\"delta\":{\"content\":\"BLOCKME\"}}]}\ndata: {\"choices\":[]}\n\n";
+        for protocol in [
+            PassthroughProtocol::Raw,
+            PassthroughProtocol::OpenaiChat,
+            PassthroughProtocol::OpenaiCompletions,
+            PassthroughProtocol::OpenaiResponses,
+        ] {
+            let (text, _) = frame_delta(protocol, frame);
+            assert!(
+                text.contains("BLOCKME"),
+                "{protocol:?} must still offer the forwarded bytes to the scan, got {text:?}",
+            );
+        }
+    }
+
     /// The `[DONE]` sentinel is not content, on either framing. A stream
     /// that omits it entirely — OpenAI's Responses API sends none — is the
     /// ordinary case, so nothing may depend on having seen one.
@@ -3126,6 +3171,57 @@ mod tests {
         let name = body_model_name(PassthroughProtocol::OpenaiResponses, hostile.as_bytes());
         assert_eq!(name.chars().count(), REQUESTED_MODEL_CAP);
         assert!(!name.contains('\0'));
+    }
+
+    /// The passthrough route reads the SAME Responses shapes the typed
+    /// `/v1/responses` handler does, in the same directions. Request:
+    /// a replayed `reasoning` item's `content` AND `summary` are
+    /// caller-supplied text and are scanned. Response: a generated
+    /// `reasoning` item is out of the output scope and must not be —
+    /// the walk reads `content` off every item regardless of type, so
+    /// without an explicit skip a block rule matching only inside
+    /// reasoning refuses a response the typed route allows.
+    #[test]
+    fn responses_passthrough_scans_replayed_reasoning_but_not_generated_reasoning() {
+        let request = serde_json::json!({
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "VISIBLE"}]},
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "SUMMARYSECRET"}],
+                    "content": [{"type": "reasoning_text", "text": "REASONINGSECRET"}]
+                }
+            ]
+        })
+        .to_string();
+        let scanned =
+            request_guardrail_text(PassthroughProtocol::OpenaiResponses, request.as_bytes());
+        assert!(scanned.contains("VISIBLE"), "got {scanned:?}");
+        assert!(scanned.contains("REASONINGSECRET"), "got {scanned:?}");
+        assert!(scanned.contains("SUMMARYSECRET"), "got {scanned:?}");
+
+        let response = serde_json::json!({
+            "output": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "SUMMARYSECRET"}],
+                    "content": [{"type": "reasoning_text", "text": "REASONINGSECRET"}]
+                },
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "the visible answer"}]
+                }
+            ]
+        })
+        .to_string();
+        let scanned =
+            response_guardrail_text(PassthroughProtocol::OpenaiResponses, response.as_bytes());
+        assert!(scanned.contains("the visible answer"), "got {scanned:?}");
+        assert!(!scanned.contains("REASONINGSECRET"), "got {scanned:?}");
+        // Not a raw-body fallback: the message item yielded text, so a
+        // green above means the reasoning item was skipped rather than the
+        // whole walk having come back empty.
+        assert!(!scanned.contains("\"output\""), "got {scanned:?}");
     }
 
     #[test]
