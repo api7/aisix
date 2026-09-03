@@ -373,7 +373,9 @@ pub struct RequestOverrides {
     /// A header named here reaches the upstream whatever the gateway would
     /// otherwise do with it. Naming a credential slot — `authorization`,
     /// `proxy-authorization`, `x-api-key`, `api-key`, `x-goog-api-key`,
-    /// `cookie` — hands the upstream the caller's own credential in place of the
+    /// `cookie`, and the AWS SigV4 trio `x-amz-security-token` /
+    /// `x-amz-date` / `x-amz-content-sha256` — hands the upstream the
+    /// caller's own credential in place of the
     /// one this ProviderKey would inject there, never both. That is what lets an
     /// internal service that already authorizes on the end user's
     /// `Authorization` keep doing so unchanged. Any OTHER header the

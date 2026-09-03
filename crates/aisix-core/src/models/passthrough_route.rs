@@ -141,7 +141,9 @@ pub struct PassthroughRoute {
     /// keep doing so unchanged.
     ///
     /// A credential slot — `authorization`, `proxy-authorization`,
-    /// `x-api-key`, `api-key`, `x-goog-api-key`, `cookie` — and
+    /// `x-api-key`, `api-key`, `x-goog-api-key`, `cookie`, and the AWS
+    /// SigV4 trio `x-amz-security-token` / `x-amz-date` /
+    /// `x-amz-content-sha256` — and
     /// `traceparent` / `tracestate` are forwarded only when a pattern
     /// names them exactly. A glob such as `"*"` or `"x-*"` is a statement
     /// about the operator's own headers, not consent to hand a third party

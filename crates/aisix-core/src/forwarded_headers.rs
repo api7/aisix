@@ -97,20 +97,32 @@ pub const NEVER_FORWARD_FROM_CLIENT: &[&str] = &[
 /// for the same reason.
 pub const NEVER_FORWARD_FROM_CLIENT_PREFIXES: &[&str] = &["x-stainless-"];
 
-/// Headers whose value is, or stands in for, a caller credential.
+/// Headers whose value is, or travels as part of, a caller credential.
 ///
 /// Forwardable — an internal upstream reading the end user's own
 /// credential in the slot it already reads is what this capability is for
 /// — and the one set a forwarded value may DISPLACE a gateway-injected
 /// header in. Everything else the gateway put on the request it put there
 /// to make the exchange work, so a forward leaves it alone.
+///
+/// The `x-amz-*` trio is SigV4 material rather than a bearer token on its
+/// own: `x-amz-security-token` IS a credential, and the other two are the
+/// timestamp and body hash the signature is computed over, which is why
+/// they belong to the same request's identity and are listed together.
+/// A Bedrock upstream never sees a forwarded copy — its signer owns all
+/// three and drops any supplied value — so what this entry governs is
+/// every OTHER upstream, where relaying the caller's AWS session token
+/// under a `"x-*"` glob would hand a third party a live AWS credential.
 pub const CREDENTIAL_SLOT_HEADERS: &[&str] = &[
-    "api-key",             // Azure OpenAI key
-    "authorization",       // OpenAI / Anthropic / Vertex Bearer
-    "cookie",              // session credential
-    "proxy-authorization", // proxy auth
-    "x-api-key",           // Anthropic raw, also OpenAI legacy proxies
-    "x-goog-api-key",      // Gemini API key
+    "api-key",              // Azure OpenAI key
+    "authorization",        // OpenAI / Anthropic / Vertex Bearer
+    "cookie",               // session credential
+    "proxy-authorization",  // proxy auth
+    "x-amz-content-sha256", // AWS SigV4 body hash
+    "x-amz-date",           // AWS SigV4 timestamp
+    "x-amz-security-token", // AWS SigV4 session token
+    "x-api-key",            // Anthropic raw, also OpenAI legacy proxies
+    "x-goog-api-key",       // Gemini API key
 ];
 
 /// Trace-context headers, which a glob never sweeps in.
@@ -296,6 +308,36 @@ mod tests {
             // relaying it to a third party on upgrade.
             assert!(!forward_pattern_admits(&["*".into()], name), "{name}");
             assert!(!forward_pattern_admits(&["x-*".into()], name), "{name}");
+        }
+    }
+
+    /// The loop above iterates the list, so it can only ever confirm that
+    /// whatever is IN the list behaves — it can never notice a name that
+    /// dropped out. These three did: `x-amz-security-token`, `x-amz-date`
+    /// and `x-amz-content-sha256` were blocked outright before the
+    /// forwarding rules moved into this module, and came out of the split
+    /// naming no list at all, which left a `["x-*"]` pattern relaying the
+    /// caller's AWS session token to any non-Bedrock upstream.
+    ///
+    /// Spelling them out is the point: this assertion goes red if one is
+    /// removed again, and the loop above would not.
+    #[test]
+    fn the_aws_sigv4_trio_is_a_credential_slot() {
+        for name in ["x-amz-security-token", "x-amz-date", "x-amz-content-sha256"] {
+            assert!(
+                exact_match_only(name),
+                "{name} must need its own name — a glob reaching it hands a \
+                 third-party upstream the caller's AWS credential",
+            );
+            assert!(!forward_pattern_admits(&["*".into()], name), "{name}");
+            assert!(!forward_pattern_admits(&["x-*".into()], name), "{name}");
+            assert!(!forward_pattern_admits(&["x-amz-*".into()], name), "{name}");
+            // Still a credential SLOT, not an absolute block: an operator
+            // who names one exactly is opting the header in, the same way
+            // the other six behave.
+            assert!(forward_pattern_admits(&[name.to_string()], name), "{name}");
+            assert!(client_header_forwardable(name), "{name}");
+            assert!(!header_forward_blocked(name), "{name}");
         }
     }
 
