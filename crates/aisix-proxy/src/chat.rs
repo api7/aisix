@@ -1854,12 +1854,12 @@ async fn dispatch(
                             },
                         );
                         let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
-                        tracing::warn!(
-                            target_model = %model.display_name,
-                            target_attempt = attempt_idx + 1,
-                            error = %err,
+                        crate::routing::log_attempt_failure(
+                            &model.display_name,
+                            attempt_idx + 1,
+                            &err,
                             retryable,
-                            "streaming routing target attempt failed",
+                            fallback_statuses,
                         );
                         if retryable {
                             state.health.record_failure(&model.display_name);
@@ -2953,12 +2953,12 @@ async fn dispatch(
                         },
                     );
                     let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
-                    tracing::warn!(
-                        target_model = %model.display_name,
-                        target_attempt = attempt_idx + 1,
-                        error = %err,
+                    crate::routing::log_attempt_failure(
+                        &model.display_name,
+                        attempt_idx + 1,
+                        &err,
                         retryable,
-                        "routing target attempt failed",
+                        fallback_statuses,
                     );
                     if retryable {
                         state.health.record_failure(&model.display_name);
