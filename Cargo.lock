@@ -305,6 +305,7 @@ dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
+ "futures",
  "http 1.4.0",
  "serde",
  "serde_json",

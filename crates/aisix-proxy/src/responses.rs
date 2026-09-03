@@ -1116,7 +1116,7 @@ async fn responses_to_target(
             .map(|e| &e.value),
     );
     let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
-    let mut body = body.clone();
+    let mut body = crate::effort_mapping::responses_request(body, model).into_owned();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     // Resolved PK id for per-PK telemetry attribution on the emitted
     // UsageEvent (AISIX-Cloud#867).
@@ -2128,7 +2128,9 @@ async fn responses_cross_provider_to_target(
     // Faithful Responses → ChatFormat transform; `chat.model` stays the
     // operator-facing name so the bridge re-resolves the upstream id via
     // `ctx.model.upstream_model()` exactly like chat.rs.
-    let chat = crate::responses_bridge::responses_request_to_chat(requested_model, body);
+    let outbound_body = crate::effort_mapping::responses_request(body, model);
+    let chat =
+        crate::responses_bridge::responses_request_to_chat(requested_model, outbound_body.as_ref());
 
     let is_stream = chat.is_streaming();
     let mut ctx = crate::dispatch::bridge_ctx(

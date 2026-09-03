@@ -12,12 +12,11 @@
 //!
 //! Only the Responses fields that map cleanly onto chat completions are
 //! carried (`instructions`, `input`, `tools`, `tool_choice`,
-//! `temperature`, `top_p`, `max_output_tokens`, `stream`). OpenAI-only
-//! knobs (`reasoning`, `store`, `previous_response_id`, `text`, …) are
-//! dropped rather than forwarded — the downstream provider bridges flatten
-//! unknown `extra` fields onto the upstream wire, where an OpenAI-only key
-//! would 400 (e.g. Anthropic). Reasoning/thinking has no canonical bridge
-//! mapping today, so it is intentionally not translated.
+//! `temperature`, `top_p`, `max_output_tokens`, `stream`, and
+//! `reasoning.effort`). Other OpenAI-only knobs (`store`,
+//! `previous_response_id`, `text`, …) are dropped rather than forwarded —
+//! the downstream provider bridges flatten unknown `extra` fields onto the
+//! upstream wire, where an OpenAI-only key would 400 (e.g. Anthropic).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -86,6 +85,10 @@ pub fn responses_request_to_chat(model: &str, body: &Value) -> ChatFormat {
         .and_then(responses_tool_choice_to_chat)
     {
         chat.extra.insert("tool_choice".to_string(), tc);
+    }
+    if let Some(effort) = body.pointer("/reasoning/effort").and_then(Value::as_str) {
+        chat.extra
+            .insert("reasoning_effort".to_string(), effort.into());
     }
     chat
 }
@@ -1515,8 +1518,9 @@ mod tests {
             "stream": true,
             "tools": [{"type": "function", "name": "get_weather", "description": "d", "parameters": {"type": "object"}}],
             "tool_choice": {"type": "function", "name": "get_weather"},
-            // OpenAI-only knobs must NOT leak into chat.extra (they'd 400 Anthropic).
-            "reasoning": {"effort": "high"},
+            // Only the portable effort value is translated; the Responses
+            // carrier object itself must not leak to another protocol.
+            "reasoning": {"effort": "high", "summary": "auto"},
             "store": false,
         });
         let chat = responses_request_to_chat("m", &body);
@@ -1530,6 +1534,7 @@ mod tests {
             chat.extra.get("tool_choice").unwrap()["function"]["name"],
             "get_weather"
         );
+        assert_eq!(chat.extra.get("reasoning_effort"), Some(&json!("high")));
         assert!(!chat.extra.contains_key("reasoning"));
         assert!(!chat.extra.contains_key("store"));
     }

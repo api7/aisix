@@ -1626,6 +1626,7 @@ async fn dispatch(
 
         'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
             let model = &attempt.model;
+            let upstream_req = crate::effort_mapping::chat_request(req, model);
             let Ok(provider) = crate::dispatch::require_provider(model) else {
                 last_reserve_reject = None;
                 last_err = Some(BridgeError::Config("model has no provider".into()));
@@ -1769,7 +1770,7 @@ async fn dispatch(
                 // heartbeats cover the wait for the first token. The
                 // read-timeout wrapper is a no-op when the budget is None.
                 let attempt_stream: Result<aisix_gateway::ChatChunkStream, BridgeError> =
-                    match bridge.chat_stream(req, &ctx).await {
+                    match bridge.chat_stream(upstream_req.as_ref(), &ctx).await {
                         Err(e) => Err(e),
                         Ok(up) => {
                             let up = crate::stream_timeout::with_read_timeout(up, stream_budget);
@@ -2756,6 +2757,7 @@ async fn dispatch(
 
     'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
         let model = &attempt.model;
+        let upstream_req = crate::effort_mapping::chat_request(req, model);
         let Some(provider) = model.provider.as_deref() else {
             last_reserve_reject = None;
             last_err = Some(BridgeError::Config("model has no provider".into()));
@@ -2898,7 +2900,7 @@ async fn dispatch(
             // once `bridge.chat` returns; the guard drops at the end of this
             // attempt's scope on both the success-break and failure paths.
             let _in_flight = state.runtime_status.begin_in_flight(&attempt.id);
-            let result = bridge.chat(req, &ctx).await;
+            let result = bridge.chat(upstream_req.as_ref(), &ctx).await;
             let attempt_latency_ms =
                 attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
             match result {
@@ -3583,6 +3585,7 @@ async fn dispatch_ensemble(
             ));
         };
         let judge_model = &judge_entry.value;
+        let judge_req = crate::effort_mapping::chat_request(&judge_req, judge_model);
         let judge_pk = match crate::dispatch::resolve_provider_key(snapshot, judge_model) {
             Ok(pk) => pk,
             Err(e) => {
@@ -3659,7 +3662,10 @@ async fn dispatch_ensemble(
         // what `upstream_ttft_ms` should be measured against — `started`
         // additionally covers the whole panel that ran before it.
         let judge_started = Instant::now();
-        let judge_stream = match judge_bridge.chat_stream(&judge_req, &judge_ctx).await {
+        let judge_stream = match judge_bridge
+            .chat_stream(judge_req.as_ref(), &judge_ctx)
+            .await
+        {
             Ok(s) => s,
             // Judge connect failed AFTER the panel round-tripped: bill the
             // panel (same invariant as the non-streaming judge-failure path),
@@ -3783,7 +3789,7 @@ async fn dispatch_ensemble(
         // their usage separately).
         let judge_estimator = crate::token_estimate::Estimator::new(
             judge_model.upstream_model().unwrap_or("unknown"),
-            crate::token_estimate::PromptInput::Chat(Box::new(judge_req)),
+            crate::token_estimate::PromptInput::Chat(Box::new(judge_req.into_owned())),
         );
         let sse_stream = build_sse_stream(
             judge_stream,

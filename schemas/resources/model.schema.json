@@ -801,6 +801,11 @@
             "required": [
               "cost"
             ]
+          },
+          {
+            "required": [
+              "effort_mapping"
+            ]
           }
         ]
       },
@@ -824,6 +829,12 @@
           {
             "required": [
               "semantic"
+            ]
+          },
+          {
+            "required": [
+              "embedding",
+              "effort_mapping"
             ]
           }
         ]
@@ -901,6 +912,11 @@
             "required": [
               "cost"
             ]
+          },
+          {
+            "required": [
+              "effort_mapping"
+            ]
           }
         ]
       },
@@ -960,6 +976,11 @@
             "required": [
               "cost"
             ]
+          },
+          {
+            "required": [
+              "effort_mapping"
+            ]
           }
         ]
       },
@@ -1013,6 +1034,13 @@
       "description": "Operator-facing unique label. Surfaces on `/v1/models`, `req.model` on chat completions, `ApiKey.allowed_models`, and the dashboard model list. `Resource::name()` returns this.",
       "minLength": 1,
       "type": "string"
+    },
+    "effort_mapping": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Direct-model-only mapping from a client-requested reasoning effort to the value sent upstream. The gateway applies one exact lookup after resolving the final target; unlisted values pass through unchanged.",
+      "type": "object"
     },
     "embedding": {
       "allOf": [
