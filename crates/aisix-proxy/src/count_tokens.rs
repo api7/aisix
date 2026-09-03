@@ -1134,7 +1134,7 @@ mod tests {
     }
 
     /// `fail_open: true` opts the row out of the refusal — same grounds as
-    /// `/v1/files` and `/v1/messages`. Fails on `8955d6ab` with 422.
+    /// `/v1/messages`. Fails on `8955d6ab` with 422.
     #[tokio::test]
     async fn unparseable_body_with_a_fail_open_guardrail_is_forwarded() {
         let upstream = MockServer::start().await;

@@ -2737,7 +2737,7 @@ mod tests {
         );
     }
 
-    /// The mirror of the `/v1/files` gate on the response side: `/mcp`
+    /// The mirror of the `/v1/messages` gate on the response side: `/mcp`
     /// resolves ONE chain for both directions, so a tool call screened on
     /// the request side alone still arrives here with a non-empty chain.
     /// An unparseable tool result must not be refused on the strength of a

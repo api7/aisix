@@ -50,6 +50,11 @@ pub(crate) enum Posture {
     /// Nothing a caller authored reaches an upstream, so there is nothing
     /// for an input hook to screen. Carries why.
     NoUpstreamContent(&'static str),
+    /// Caller-authored content DOES reach an upstream here and the chain
+    /// does not run over it. Carries why, and where the screening this
+    /// surface needs is tracked. An operator reading the census must be
+    /// able to see this without reading the handler.
+    Unscreened(&'static str),
 }
 
 /// Every surface `build_router` mounts, and its posture. The set of keys is
@@ -73,7 +78,9 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
     ),
     (
         "/a2a/:agent/.well-known/agent-card.json",
-        Posture::NoUpstreamContent("serves the agent's card with the URL rewritten; no caller body"),
+        Posture::NoUpstreamContent(
+            "serves the agent's card with the URL rewritten; no caller body",
+        ),
     ),
     // --- reads of a job/asset the caller already created ----------------
     (
@@ -135,10 +142,10 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
     ),
     (
         "/v1/files",
-        Posture::EnforcedNotDrivableInCrate(
-            "`jobs::scan_input_blob` screens the uploaded blob, but reaching it needs a resolvable \
-             job target plus a multipart upload the mock upstream must accept. Covered by the jobs \
-             e2e suite.",
+        Posture::Unscreened(
+            "an uploaded file is a batch of independent requests, not one message: a whole-blob \
+             scan answers with a single verdict over decoded JSON syntax and can rewrite nothing. \
+             Screening it per record, through the ordinary request chain, is #1120.",
         ),
     ),
     (
@@ -238,9 +245,9 @@ fn posture_covers_every_mounted_surface() {
     for (surface, posture) in POSTURE {
         let reason = match posture {
             Posture::Enforced => continue,
-            Posture::EnforcedNotDrivableInCrate(reason) | Posture::NoUpstreamContent(reason) => {
-                reason
-            }
+            Posture::EnforcedNotDrivableInCrate(reason)
+            | Posture::NoUpstreamContent(reason)
+            | Posture::Unscreened(reason) => reason,
         };
         assert!(
             !reason.trim().is_empty(),
