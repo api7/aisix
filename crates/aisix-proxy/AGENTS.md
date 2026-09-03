@@ -154,14 +154,12 @@ unscannable sites as the full set: the places that scan a mangled copy
 unconditionally, with no failure policy involved. `jobs::scan_output_blob`
 scans `String::from_utf8_lossy` of a batch or fine-tuning response and, where
 the verdict lets it through, relays the original bytes whatever the row's
-failure policy says; `passthrough_route` scans the lossy body; `audio.rs`'s
-`transcription_output_text` falls back to the lossy body for the plain-text
-transcript formats (`text` / `srt` / `vtt`). None of these consults
-`refuses_unevaluable_*`, so a fail-CLOSED row does not refuse there either —
-not something telemetry can paper over, and making them refuse is a behaviour
-change rather than an observability one. Tagging them instead
-would fire the field on every job response, every passthrough body and every
-plain-text transcript, which destroys the negative answer just as thoroughly.
+failure policy says; `passthrough_route` scans the lossy body. Neither
+consults `refuses_unevaluable_*`, so a fail-CLOSED row does not refuse there
+either — not something telemetry can paper over, and making them refuse is a
+behaviour change rather than an observability one. Tagging them instead
+would fire the field on every job response and every passthrough body, which
+destroys the negative answer just as thoroughly.
 Note that `record_unevaluable_*` is the wrong helper at such a site: its
 predicate assumes the fail-closed case was already refused, so at a site that
 never refuses it would silently drop exactly the case worth reporting.
@@ -171,8 +169,20 @@ What is no longer in that set is the multipart `prompt` on `audio.rs` and
 `dispatch::require_utf8_prompt_fields` after model resolution and before the
 chain runs, so an undecodable `prompt` part is answered 400 and the
 `filter_map` in their scan builders can no longer be reached by one. Do not
-describe those surfaces as silently dropping non-UTF-8 prompt parts — audio's
-transcript OUTPUT scan, listed above, is a separate site and still lossy.
+describe those surfaces as silently dropping non-UTF-8 prompt parts. Audio's
+transcript OUTPUT scan is a separate site and is gated rather than dropped:
+`transcription_output_text` reports whether the plain-text fallback (`text` /
+`srt` / `vtt`) had to decode lossily, and its caller runs the same gate as
+`/mcp`'s tool-result arm — refuse under `refuses_unevaluable_output`, record
+the bypass otherwise. Those two are the crate's only `refuses_unevaluable_output`
+call sites: `/v1/messages` and `/v1/messages/count_tokens` gate the INPUT side
+with the mirror predicate, and their response-side `unscannable_body` arms are
+the held-back-stream ones listed above as deliberately ungated. Audio differs
+from `/mcp` in still scanning the lossy text when it does not refuse, because a
+transcript is prose the caller reads: only the bytes `from_utf8_lossy` replaced
+go unread. The flag it gates on reports a failed DECODE, not scan coverage — a
+JSON body with no transcript field scans nothing and reports no bypass, the same
+as the empty transcript a silent recording returns.
 
 Values come from the guardrail kind's own `bypass_tag()` — the same bounded
 vocabulary `GuardrailVerdict::block_unavailable` carries, so one outage reads
