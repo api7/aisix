@@ -1902,6 +1902,27 @@ fn map_tool_choice(choice: &serde_json::Value) -> Option<ToolChoice> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
+
+    async fn consume_invalid_mock_stream(result: Result<ChatChunkStream, BridgeError>) {
+        match result {
+            Err(BridgeError::Transport(message)) => {
+                assert!(
+                    !message.is_empty(),
+                    "transport error must explain the failure"
+                );
+            }
+            Err(other) => panic!("unexpected mock stream error: {other:?}"),
+            Ok(mut stream) => {
+                while let Some(chunk) = stream.next().await {
+                    assert!(
+                        chunk.is_err(),
+                        "a non-eventstream mock must not yield a valid chat chunk"
+                    );
+                }
+            }
+        }
+    }
 
     // ─── Mid-stream event errors (AISIX-Cloud#1222) ──────────────────
 
@@ -2632,7 +2653,7 @@ mod tests {
             .insert("reasoning_effort".to_string(), serde_json::json!("high"));
 
         bridge.chat(&req, &ctx).await.unwrap();
-        let _ = bridge.chat_stream(&req, &ctx).await;
+        consume_invalid_mock_stream(bridge.chat_stream(&req, &ctx).await).await;
 
         let invoke_body = invoke.captured_body.lock().unwrap().clone().unwrap();
         assert_eq!(
@@ -3197,7 +3218,7 @@ mod tests {
         // valid eventstream) OR returns Err directly from the SDK.
         // Both prove the dispatch reached wiremock — wiremock's
         // `.expect(1)` enforces this on drop.
-        let _ = bridge.chat_stream(&req, &ctx).await;
+        consume_invalid_mock_stream(bridge.chat_stream(&req, &ctx).await).await;
     }
 
     #[tokio::test]
@@ -3222,7 +3243,7 @@ mod tests {
             sample_pk_with_secret(valid_secret_json()),
         );
         let req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
-        let _ = bridge.chat_stream(&req, &ctx).await;
+        consume_invalid_mock_stream(bridge.chat_stream(&req, &ctx).await).await;
     }
 
     /// Audit HIGH-1+HIGH-2 (PR #389): Converse 4xx must preserve
@@ -4636,7 +4657,7 @@ mod tests {
                 "param_constraints": { "temperature_max": 1.0 }
             })),
         );
-        let _ = bridge.chat_stream(&req, &ctx).await;
+        consume_invalid_mock_stream(bridge.chat_stream(&req, &ctx).await).await;
 
         let body = responder.captured_body.lock().unwrap().clone().unwrap();
         let cfg = body
