@@ -302,6 +302,10 @@ pub struct PiiGuardrail {
     check_output_enabled: bool,
     max_buffer_bytes: usize,
     on_buffer_exceeded_fail_open: bool,
+    /// The row's `fail_open` — see the same field on `KeywordBlocklist`.
+    /// `on_buffer_exceeded_fail_open` is a different, narrower knob: it
+    /// governs an oversized streamed response, not an unreadable body.
+    fail_open: bool,
 }
 
 impl PiiGuardrail {
@@ -318,7 +322,15 @@ impl PiiGuardrail {
             check_output_enabled: matches!(hook_point, HP::Output | HP::Both),
             max_buffer_bytes,
             on_buffer_exceeded_fail_open,
+            fail_open: false,
         }
+    }
+
+    /// Apply the row's `fail_open` policy. This kind has no per-hook
+    /// split, so the one value governs both.
+    pub fn with_fail_open(mut self, fail_open: bool) -> Self {
+        self.fail_open = fail_open;
+        self
     }
 
     /// First block-action rule that detects in `text`, for the verdict
@@ -364,6 +376,22 @@ impl Guardrail for PiiGuardrail {
 
     fn runs_on_output(&self) -> bool {
         self.check_output_enabled
+    }
+
+    fn runs_on_input(&self) -> bool {
+        self.check_input_enabled
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        !self.fail_open
+    }
+
+    /// This kind has no `output_fail_open` of its own — the remote kinds
+    /// split the policy per hook because only they can have a provider
+    /// fail on one side. Here the row-level `fail_open` is the only policy
+    /// the operator can express, so it governs both hooks.
+    fn fails_closed_on_output(&self) -> bool {
+        !self.fail_open
     }
 
     /// Masking a streamed response requires the whole response held back —

@@ -69,6 +69,42 @@ mock upstream that trickles its response over ~1s, and a client read loop that
 counts chunks and measures first-byte against last-byte
 (`audio-stream-relay-e2e.test.ts`).
 
+## A guardrail-raised refusal is gated on the direction, not on `is_empty()`
+
+`GuardrailIndex::resolve` matches on SCOPE only — env / model / mcp_server /
+api_key / team. It does not filter by `hook_point`, so a chain resolved for a
+request is non-empty whenever any attachment is in scope, including one attached
+on the output hook alone. Each guardrail then no-ops on the hook it is not
+configured for, which makes `!chain.is_empty()` a safe gate for *running* the
+checks and a wrong gate for *refusing*: a refusal the proxy raises itself —
+`unscannable_body`, and anything else the code decides rather than a verdict —
+is only justified when something would have read that side of the exchange.
+
+Gate the refusal on `Guardrail::refuses_unevaluable_input(&chain)` for a
+request-side one and `refuses_unevaluable_output(&chain)` for a response-side
+one. Those fold TWO conditions per member — the member reads that side, and its
+failure policy is fail-closed — and a chain is `any` over its members. Both
+halves must hold on the SAME member, which is why there is a combined predicate
+rather than two you could `&&` together: a chain of [output-only fail-closed,
+input-only fail-open] reads the request and contains a fail-closed row, yet
+nothing in it justifies refusing a request.
+
+The failure policy is per hook: the row's `fail_open` governs the input hook,
+and each remote kind's own `<Kind>Config::output_fail_open` governs the output
+hook. `keyword` and `pii` have no `output_fail_open` — they never call out — so
+their row-level `fail_open` governs both of their hooks.
+
+`/mcp` is the sharp case for the direction half: it resolves ONE chain and uses
+it in both directions, so an input-only row reaches the output arm and vice
+versa. Note also that `hook_point` defaults to `both` and `fail_open` to
+`false`, so this only bites a deployment that set one of them explicitly.
+
+Not gated, deliberately: the refusals that need a HELD-BACK stream
+(`output_buffer_exceeded`, `mask_writeback_failed`, and `unscannable_body` on a
+buffered SSE body). Honouring `fail_open` there does not mean skipping a
+refusal, it means releasing already-buffered bytes that were never scanned —
+a different decision, and one nobody has taken.
+
 ## Every terminal path emits the access log — including the ones that give up early
 
 The access log and `request_metrics::record` are emitted **by the handler**, at

@@ -601,6 +601,18 @@ impl Guardrail for CustomGuardrail {
         self.hook_enabled(GuardrailHookPoint::Output)
     }
 
+    fn runs_on_input(&self) -> bool {
+        self.hook_enabled(GuardrailHookPoint::Input)
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        !self.fail_open
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        !self.output_fail_open
+    }
+
     /// Detection-only, so a streamed response does not have to be held whole
     /// the way a masking kind does: the sliding window is the default, and
     /// content is released as each window scans clean.

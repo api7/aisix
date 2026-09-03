@@ -690,6 +690,49 @@ pub trait Guardrail: Send + Sync + 'static {
         true
     }
 
+    /// Whether this guardrail actually inspects the INPUT hook — the mirror
+    /// of [`Self::runs_on_output`]. Callers use it to decide whether a
+    /// request-side decision is one this guardrail has any say in: a
+    /// proxy-raised refusal of a body the scanner cannot read is only
+    /// justified when something would have read it, so an output-only
+    /// attachment must not cause a request to be refused (#1113 / #1114).
+    /// Default: `true` (assume input-relevant, secure-leaning); impls that
+    /// carry a hook point override to gate on it.
+    fn runs_on_input(&self) -> bool {
+        true
+    }
+
+    /// Whether an evaluation this guardrail cannot perform on the INPUT
+    /// hook is a refusal rather than a pass — the row's `fail_open`,
+    /// inverted. Default `true` (fail-closed), matching the row default.
+    fn fails_closed_on_input(&self) -> bool {
+        true
+    }
+
+    /// Output-hook counterpart, governed by the kind's own
+    /// `output_fail_open` where it has one. A kind with no configurable
+    /// output policy keeps the fail-closed default.
+    fn fails_closed_on_output(&self) -> bool {
+        true
+    }
+
+    /// Whether this guardrail turns a REQUEST the gateway could not give
+    /// it into a refusal: it reads the request, and its input failure
+    /// policy is fail-closed. This is the gate on the `unscannable_body`
+    /// refusals the proxy raises on the chain's behalf — a guardrail that
+    /// would not have read the body cannot be the reason it is refused,
+    /// and neither can one whose operator asked for `fail_open: true`,
+    /// since the refusal reports itself as `guardrail_unavailable` and
+    /// that is precisely what the setting governs.
+    fn refuses_unevaluable_input(&self) -> bool {
+        self.runs_on_input() && self.fails_closed_on_input()
+    }
+
+    /// Response-side counterpart of [`Self::refuses_unevaluable_input`].
+    fn refuses_unevaluable_output(&self) -> bool {
+        self.runs_on_output() && self.fails_closed_on_output()
+    }
+
     // --- redaction (#932) -------------------------------------------------
     //
     // Redaction is a separate, synchronous, text→text capability rather

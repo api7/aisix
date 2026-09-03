@@ -468,6 +468,21 @@ impl Guardrail for PresidioGuardrail {
         )
     }
 
+    fn runs_on_input(&self) -> bool {
+        matches!(
+            self.hook_point,
+            GuardrailHookPoint::Input | GuardrailHookPoint::Both
+        )
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        !self.fail_open
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        !self.output_fail_open
+    }
+
     /// Masking a streamed response requires the whole response held back —
     /// a masked span can cross any chunk boundary. Cap + overflow policy
     /// come from the row config, like kind=pii.

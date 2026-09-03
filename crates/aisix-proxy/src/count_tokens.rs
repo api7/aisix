@@ -281,10 +281,21 @@ async fn screen_input(
         return Ok(());
     }
     // Fail closed on a body the scanner cannot read — see the same arm in
-    // `messages.rs`.
+    // `messages.rs`. Only when some guardrail would both read the request
+    // and refuse when it cannot evaluate it.
     let chat = match aisix_provider_anthropic::parse_inbound_request_for_scan(body) {
         Ok(chat) => chat,
         Err(err) => {
+            if !aisix_guardrails::Guardrail::refuses_unevaluable_input(&chain) {
+                tracing::debug!(
+                    guardrail_hook = "input",
+                    model = %model_name,
+                    error = %err,
+                    "cannot scan /v1/messages/count_tokens body for guardrails; \
+                     nothing attached both reads the request and fails closed",
+                );
+                return Ok(());
+            }
             tracing::warn!(
                 guardrail_hook = "input",
                 model = %model_name,
@@ -1047,6 +1058,187 @@ mod tests {
             event.redacted_entity_counts.get("eda_version").copied(),
             Some(1),
             "the mask this route applied is missing from its own row: {event:?}",
+        );
+    }
+
+    /// Same gate as `/v1/messages`: a body the scan parser rejects is
+    /// refused only when a guardrail would have read it. An output-hook-only
+    /// row resolves into the chain but never sees the request, so the body
+    /// goes upstream. Fails on `a456ab71` with 422.
+    #[tokio::test]
+    async fn unparseable_body_with_an_output_only_guardrail_is_forwarded() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 7})),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(anthropic_model("ct-out"));
+        snap.apikeys.insert(apikey_entry(&["ct-out"]));
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"out-only","kind":"keyword","hook_point":"output","patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-out", row, 1));
+
+        // The premise, asserted rather than assumed: the seeded row IS in
+        // the chain this request resolves, and it is not an input-side
+        // one. Without this the forwarding assertion below is the same
+        // observation as the no-guardrail case, and would pass just as
+        // well if the row had never been indexed at all.
+        let probe =
+            aisix_guardrails::LiveGuardrailIndex::new(SnapshotHandle::new(snap.clone()), None)
+                .resolve(&aisix_guardrails::RequestContext {
+                    passthrough_route_id: "",
+                    model_id: "",
+                    mcp_server_id: "",
+                    api_key_id: "",
+                    team_id: None,
+                });
+        assert!(!probe.is_empty(), "the seeded row must reach the chain");
+        assert!(
+            !aisix_guardrails::Guardrail::runs_on_input(&probe),
+            "and it must be output-side only"
+        );
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized(
+            "anthropic",
+            Arc::new(aisix_provider_anthropic::AnthropicBridge::new()),
+        );
+        let handle = SnapshotHandle::new(snap);
+        let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone(), None);
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, hub, &cfg())
+                .without_cache()
+                .with_guardrail_index(index),
+        );
+
+        // No `messages` key: the scan parser rejects it.
+        let res = app
+            .oneshot(make_req(serde_json::json!({ "model": "ct-out" })))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// `fail_open: true` opts the row out of the refusal — same grounds as
+    /// `/v1/files` and `/v1/messages`. Fails on `8955d6ab` with 422.
+    #[tokio::test]
+    async fn unparseable_body_with_a_fail_open_guardrail_is_forwarded() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 7})),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(anthropic_model("ct-open"));
+        snap.apikeys.insert(apikey_entry(&["ct-open"]));
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"in-open","kind":"keyword","hook_point":"input","fail_open":true,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-open", row, 1));
+
+        // Premise: the row IS in the chain and DOES read the request; it
+        // simply must not refuse. Without this, a row that never arrived
+        // would forward for an entirely different reason.
+        let probe =
+            aisix_guardrails::LiveGuardrailIndex::new(SnapshotHandle::new(snap.clone()), None)
+                .resolve(&aisix_guardrails::RequestContext {
+                    passthrough_route_id: "",
+                    model_id: "",
+                    mcp_server_id: "",
+                    api_key_id: "",
+                    team_id: None,
+                });
+        assert!(aisix_guardrails::Guardrail::runs_on_input(&probe));
+        assert!(!aisix_guardrails::Guardrail::refuses_unevaluable_input(
+            &probe
+        ));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized(
+            "anthropic",
+            Arc::new(aisix_provider_anthropic::AnthropicBridge::new()),
+        );
+        let handle = SnapshotHandle::new(snap);
+        let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone(), None);
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, hub, &cfg())
+                .without_cache()
+                .with_guardrail_index(index),
+        );
+
+        let res = app
+            .oneshot(make_req(serde_json::json!({ "model": "ct-open" })))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// The same body with an INPUT-hook row keeps the fail-closed refusal.
+    #[tokio::test]
+    async fn unparseable_body_with_an_input_guardrail_is_refused() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 7})),
+            )
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(anthropic_model("ct-in"));
+        snap.apikeys.insert(apikey_entry(&["ct-in"]));
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"in-only","kind":"keyword","hook_point":"input","patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-in", row, 1));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized(
+            "anthropic",
+            Arc::new(aisix_provider_anthropic::AnthropicBridge::new()),
+        );
+        let handle = SnapshotHandle::new(snap);
+        let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone(), None);
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, hub, &cfg())
+                .without_cache()
+                .with_guardrail_index(index),
+        );
+
+        let res = app
+            .oneshot(make_req(serde_json::json!({ "model": "ct-in" })))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(res.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(crate::error::TAG_UNSCANNABLE_BODY),
+            "{v}"
         );
     }
 

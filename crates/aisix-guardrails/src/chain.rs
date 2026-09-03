@@ -402,6 +402,44 @@ impl Guardrail for GuardrailChain {
         self.members.iter().any(|m| m.guardrail.runs_on_output())
     }
 
+    /// `true` when at least one member inspects the request. An empty
+    /// chain — and a chain whose every member is attached on the output
+    /// hook alone — reports `false`, so a caller can tell "guardrails are
+    /// attached" apart from "a guardrail will read this request".
+    fn runs_on_input(&self) -> bool {
+        self.members.iter().any(|m| m.guardrail.runs_on_input())
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        self.members
+            .iter()
+            .any(|m| m.guardrail.fails_closed_on_input())
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        self.members
+            .iter()
+            .any(|m| m.guardrail.fails_closed_on_output())
+    }
+
+    /// The strictest member decides — but both halves must hold on the
+    /// SAME member. A chain of [output-only fail-closed, input-only
+    /// fail-open] reads the request and contains a fail-closed row, yet
+    /// no single member both reads the request AND refuses when it
+    /// cannot, so nothing there justifies refusing one. Folding the two
+    /// predicates separately would get that case wrong.
+    fn refuses_unevaluable_input(&self) -> bool {
+        self.members
+            .iter()
+            .any(|m| m.guardrail.refuses_unevaluable_input())
+    }
+
+    fn refuses_unevaluable_output(&self) -> bool {
+        self.members
+            .iter()
+            .any(|m| m.guardrail.refuses_unevaluable_output())
+    }
+
     /// A nested chain binds its own members and answers `Some` only when
     /// one of them took the bind — so an outer chain replaces this member
     /// exactly when doing so changes anything.
@@ -1364,6 +1402,99 @@ mod tests {
         let empty = GuardrailChain::new(vec![]);
         assert!(!empty.runs_on_output());
         assert!(!empty.stream_output_policy().holds_back());
+    }
+
+    /// `runs_on_input` is the mirror of `runs_on_output`, and callers that
+    /// refuse a request the scanner cannot read key on it: "a guardrail is
+    /// attached" is not the same question as "a guardrail will read this
+    /// request" (#1113 / #1114 follow-up).
+    #[test]
+    fn runs_on_input_reports_only_input_side_members() {
+        let output_only = GuardrailChain::new(vec![Arc::new(KeywordBlocklist::output_only(vec![
+            KeywordRule::literal("x"),
+        ]))]);
+        assert!(
+            !output_only.runs_on_input(),
+            "an output-only chain never reads the request"
+        );
+        assert!(output_only.runs_on_output());
+        // The distinction the gate needs: non-empty, yet nothing reads input.
+        assert!(!output_only.is_empty());
+
+        let input_only = GuardrailChain::new(vec![Arc::new(KeywordBlocklist::input_only(vec![
+            KeywordRule::literal("x"),
+        ]))]);
+        assert!(input_only.runs_on_input());
+
+        let both = GuardrailChain::new(vec![Arc::new(KeywordBlocklist::new(vec![
+            KeywordRule::literal("x"),
+        ]))]);
+        assert!(both.runs_on_input());
+        assert!(both.runs_on_output());
+
+        let mixed = GuardrailChain::new(vec![
+            Arc::new(KeywordBlocklist::output_only(vec![KeywordRule::literal(
+                "x",
+            )])),
+            Arc::new(KeywordBlocklist::input_only(vec![KeywordRule::literal(
+                "y",
+            )])),
+        ]);
+        assert!(mixed.runs_on_input(), "one input-side member is enough");
+
+        assert!(!GuardrailChain::new(vec![]).runs_on_input());
+    }
+
+    /// The gate on the proxy-raised `unscannable_body` refusals: a member
+    /// must BOTH read that side and fail closed. The cross case in the
+    /// middle is the one that separates this from folding the two halves
+    /// independently — that chain reads the request and contains a
+    /// fail-closed row, but not in the same member.
+    #[test]
+    fn refuses_unevaluable_needs_both_halves_on_one_member() {
+        let rule = || vec![KeywordRule::literal("x")];
+
+        let closed_in = GuardrailChain::new(vec![Arc::new(KeywordBlocklist::input_only(rule()))]);
+        assert!(closed_in.refuses_unevaluable_input());
+        assert!(!closed_in.refuses_unevaluable_output());
+
+        // `fail_open: true` opts the row out of the refusal entirely.
+        let open_in = GuardrailChain::new(vec![Arc::new(
+            KeywordBlocklist::input_only(rule()).with_fail_open(true),
+        )]);
+        assert!(open_in.runs_on_input(), "it still SCANS");
+        assert!(
+            !open_in.refuses_unevaluable_input(),
+            "but it must not refuse a body it could not be given"
+        );
+
+        // The cross case: reads the request (member 2), has a fail-closed
+        // row (member 1), yet neither member is both.
+        let cross = GuardrailChain::new(vec![
+            Arc::new(KeywordBlocklist::output_only(rule())),
+            Arc::new(KeywordBlocklist::input_only(rule()).with_fail_open(true)),
+        ]);
+        assert!(cross.runs_on_input());
+        assert!(cross.fails_closed_on_input());
+        assert!(
+            !cross.refuses_unevaluable_input(),
+            "folding the two predicates separately would refuse here"
+        );
+        assert!(
+            cross.refuses_unevaluable_output(),
+            "the output-only row left fail_open at its default"
+        );
+
+        // Strictest wins among members that DO read the request.
+        let mixed = GuardrailChain::new(vec![
+            Arc::new(KeywordBlocklist::input_only(rule()).with_fail_open(true)),
+            Arc::new(KeywordBlocklist::input_only(rule())),
+        ]);
+        assert!(mixed.refuses_unevaluable_input());
+
+        let empty = GuardrailChain::new(vec![]);
+        assert!(!empty.refuses_unevaluable_input());
+        assert!(!empty.refuses_unevaluable_output());
     }
 
     // --- segment moderation folds (#932 bedrock follow-up) ---------------

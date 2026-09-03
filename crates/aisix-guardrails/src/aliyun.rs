@@ -680,6 +680,21 @@ impl Guardrail for AliyunTextModerationGuardrail {
         )
     }
 
+    fn runs_on_input(&self) -> bool {
+        matches!(
+            self.hook_point,
+            GuardrailHookPoint::Input | GuardrailHookPoint::Both
+        )
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        !self.fail_open
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        !self.output_fail_open
+    }
+
     fn stream_output_policy(&self) -> StreamOutputPolicy {
         match self.stream_processing_mode.as_str() {
             "buffer_full" => StreamOutputPolicy::BufferFull {

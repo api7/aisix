@@ -260,7 +260,7 @@ fn build_one_inner(
                 GuardrailHookPoint::Output => KeywordBlocklist::output_only(rules),
                 GuardrailHookPoint::Both => KeywordBlocklist::new(rules),
             };
-            Ok(Some(Arc::new(blocklist)))
+            Ok(Some(Arc::new(blocklist.with_fail_open(row.fail_open))))
         }
         GuardrailKind::Pii(cfg) => {
             if cfg.detectors.is_empty() && cfg.custom_patterns.is_empty() {
@@ -322,7 +322,8 @@ fn build_one_inner(
                 row.hook_point,
                 usize::try_from(cfg.max_buffer_bytes).unwrap_or(usize::MAX),
                 on_exceeded_fail_open,
-            );
+            )
+            .with_fail_open(row.fail_open);
             Ok(Some(Arc::new(g)))
         }
         #[cfg(feature = "bedrock")]
@@ -861,6 +862,25 @@ impl Guardrail for MonitorGuardrail {
         self.inner.runs_on_output()
     }
 
+    /// Forwarded, NOT forced false. A monitor row still participates in
+    /// the proxy-raised `unscannable_body` refusals — that is a settled
+    /// product decision, not an oversight (monitor mode downgrades a
+    /// guardrail's own verdict, and these refusals have none). Forcing
+    /// either hook predicate to `false` here would also disable
+    /// end-of-stream OBSERVATION, which `responses.rs` gates on
+    /// `runs_on_output`; a monitor row exists precisely to observe.
+    fn runs_on_input(&self) -> bool {
+        self.inner.runs_on_input()
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        self.inner.fails_closed_on_input()
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        self.inner.fails_closed_on_output()
+    }
+
     /// Forward the bind and re-wrap. A monitor-mode row is the one an
     /// operator is actively tuning, so it is the LAST place scores may go
     /// missing.
@@ -1014,6 +1034,26 @@ impl Guardrail for LiveGuardrailChain {
 
     fn runs_on_output(&self) -> bool {
         self.current().runs_on_output()
+    }
+
+    fn runs_on_input(&self) -> bool {
+        self.current().runs_on_input()
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        self.current().fails_closed_on_input()
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        self.current().fails_closed_on_output()
+    }
+
+    fn refuses_unevaluable_input(&self) -> bool {
+        self.current().refuses_unevaluable_input()
+    }
+
+    fn refuses_unevaluable_output(&self) -> bool {
+        self.current().refuses_unevaluable_output()
     }
 
     fn redacts_input(&self) -> bool {
@@ -2162,6 +2202,97 @@ mod tests {
     /// as a `Block` from the inner guardrail; the monitor wrapper must
     /// downgrade it. Composed through `build_one` so the decorator
     /// ordering itself is what's pinned.
+    /// Every kind that splits its failure policy per hook must report the
+    /// SAME split through `fails_closed_on_*`. Built with the two values
+    /// deliberately asymmetric — `fail_open: true` on the row (input),
+    /// `output_fail_open: false` in the kind config (output) — so a
+    /// swapped pair cannot pass: it would have to claim the input hook
+    /// fails closed and the output hook fails open, which is the exact
+    /// inverse of what is configured.
+    ///
+    /// The table is the guard against a per-kind override drifting from
+    /// the field that kind actually consults on that hook. `keyword` and
+    /// `pii` are absent on purpose: they have no `output_fail_open`, so
+    /// there is no pair to swap.
+    #[test]
+    fn every_split_kind_reports_its_policy_on_the_matching_hook() {
+        // `fail_open` sits on the row, `output_fail_open` inside the
+        // kind's own flattened config — the shape cp-api projects.
+        const ASYMMETRIC: &str = r#""fail_open": true, "output_fail_open": false"#;
+        let rows: Vec<(&str, String)> = vec![
+            (
+                "azure_content_safety",
+                format!(
+                    r#"{{"name":"n","kind":"azure_content_safety","endpoint":"https://e","api_key":"k",{ASYMMETRIC}}}"#
+                ),
+            ),
+            (
+                "azure_content_safety_text_moderation",
+                format!(
+                    r#"{{"name":"n","kind":"azure_content_safety_text_moderation","endpoint":"https://e","api_key":"k",{ASYMMETRIC}}}"#
+                ),
+            ),
+            (
+                "aliyun_text_moderation",
+                format!(
+                    r#"{{"name":"n","kind":"aliyun_text_moderation","region":"cn-shanghai","access_key_id":"ak","access_key_secret":"sk",{ASYMMETRIC}}}"#
+                ),
+            ),
+            (
+                "aliyun_ai_guardrail",
+                format!(
+                    r#"{{"name":"n","kind":"aliyun_ai_guardrail","region":"cn-shanghai","access_key_id":"ak","access_key_secret":"sk",{ASYMMETRIC}}}"#
+                ),
+            ),
+            (
+                "lakera",
+                format!(r#"{{"name":"n","kind":"lakera","api_key":"k",{ASYMMETRIC}}}"#),
+            ),
+            (
+                "openai_moderation",
+                format!(r#"{{"name":"n","kind":"openai_moderation","api_key":"k",{ASYMMETRIC}}}"#),
+            ),
+            (
+                "presidio",
+                format!(
+                    r#"{{"name":"n","kind":"presidio","analyzer_url":"http://a","anonymizer_url":"http://b",{ASYMMETRIC}}}"#
+                ),
+            ),
+            (
+                "custom",
+                format!(
+                    r#"{{"name":"n","kind":"custom","script":"export function checkInput() {{ return {{ action: \"allow\" }}; }}",{ASYMMETRIC}}}"#
+                ),
+            ),
+            #[cfg(feature = "bedrock")]
+            (
+                "bedrock",
+                format!(
+                    r#"{{"name":"n","kind":"bedrock","guardrail_id":"abcdefgh1234","guardrail_version":"DRAFT","region":"us-east-1","aws_credentials":{{"kind":"static","access_key_id":"AKIA","secret_access_key":"s"}},"latency_mode":{{"kind":"serial"}},{ASYMMETRIC}}}"#
+                ),
+            ),
+        ];
+
+        for (kind, json) in &rows {
+            let row = parse(json);
+            let g = build_one(&row, None, &GuardrailEmbedderSlot::none())
+                .unwrap_or_else(|e| panic!("{kind} row must build: {e}"))
+                .unwrap_or_else(|| panic!("{kind} row must not be inert"));
+            assert!(
+                !g.fails_closed_on_input(),
+                "{kind}: the row set fail_open, so the INPUT hook must fail open"
+            );
+            assert!(
+                g.fails_closed_on_output(),
+                "{kind}: output_fail_open is false, so the OUTPUT hook must fail closed"
+            );
+        }
+        assert!(
+            rows.len() >= 8,
+            "the table must not silently shrink to nothing"
+        );
+    }
+
     #[tokio::test]
     async fn monitor_downgrades_provider_failure_block() {
         use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
