@@ -95,14 +95,23 @@ pub(crate) fn guardrail_scores(audit: &GuardrailAudit) -> Vec<aisix_core::Guardr
 /// and unparseable-usage paths historically suppress zero-value noise rows.
 /// A mask/block, monitor hit, or similarity score is an operator-visible
 /// security fact, so those paths must emit a zero-token event instead.
+///
+/// A BYPASS is one too, and it needs saying separately because it leaves no
+/// enforced hit and no score — a bypass is precisely the outcome where no
+/// policy acted. Without this arm a fail-open request whose upstream
+/// reported no parseable usage has its whole event suppressed, so the
+/// reason is written onto an event nobody ever receives: the same silence
+/// this field exists to break, one layer further out.
 pub(crate) fn has_guardrail_attribution(
     audit: &GuardrailAudit,
     monitor_hits: &[aisix_core::GuardrailMonitorHit],
 ) -> bool {
     !monitor_hits.is_empty()
-        || audit
-            .as_ref()
-            .is_some_and(|log| !log.snapshot().is_empty() || !log.score_snapshot().is_empty())
+        || audit.as_ref().is_some_and(|log| {
+            !log.snapshot().is_empty()
+                || !log.score_snapshot().is_empty()
+                || log.bypass_reason().is_some()
+        })
 }
 
 /// [`guardrail_scores`] for the retrying families — see
@@ -787,6 +796,27 @@ mod tests {
             top_example_index: 0,
             embedding_model: "embedder".into(),
         });
+        assert!(has_guardrail_attribution(&audit, &[]));
+    }
+
+    /// A bypass leaves no enforced hit and no score — it is the outcome
+    /// where no policy acted — so it has to be named here explicitly.
+    /// Without it, the unbilled paths that consult this gate
+    /// (`/v1/completions`, `/v1/embeddings`, `/v1/images/*`, `/v1/rerank`)
+    /// suppress the whole event, and the reason lands on a row nobody
+    /// receives.
+    #[test]
+    fn a_bypass_alone_requires_a_zero_token_event() {
+        let log = Arc::new(aisix_guardrails::GuardrailAuditLog::new());
+        let audit = Some(Arc::clone(&log));
+        assert!(!has_guardrail_attribution(&audit, &[]));
+
+        log.record_bypass("lakera_timeout");
+        assert!(
+            log.snapshot().is_empty() && log.score_snapshot().is_empty(),
+            "premise: a bypass is not an enforced hit and not a score, so the \
+             other two arms of this gate cannot be what carries it",
+        );
         assert!(has_guardrail_attribution(&audit, &[]));
     }
 
