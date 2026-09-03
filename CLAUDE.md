@@ -195,6 +195,12 @@ Anchor on a release that has **already shipped**, never on a guess at the next v
 
 `crates/aisix-core/tests/compat_debt.rs` is the gate. It runs in the required `rust unit + coverage` job on every PR, and fails once a stable tag with a higher `MAJOR.MINOR` than the anchor exists; release candidates never count as shipped, and a patch on the anchor's own line does not come due. When it fires, either remove the code and its marker and close the tracking issue, or re-anchor deliberately to the newest release and say why in the issue. Full rules, including how a `release/X.Y` maintenance line is scoped, live in that file's module docs.
 
+## An Absent Config Block Means Off
+
+**Never give an absent optional block a default that switches on user-visible behaviour.** The operator who omitted it did not ask for the feature, the console has no field showing it is on, and nothing in the request path reveals it — so the first sign is the behaviour itself. Defaults for the knobs INSIDE a block the operator did enable are a different thing and stay.
+
+When you add such a block, its schema description must say what omitting it means; that sentence is what the published reference shows. (Precedent: `cooldown` — AISIX-Cloud#1499.)
+
 ## A Retired Startup-Config Key Is Tombstoned, Never Deleted
 
 **`Config` and its blocks are `deny_unknown_fields`, so deleting a startup-config field stops every gateway whose `config.yaml` still carries it from booting** — including everyone who copied it out of `config.example.yaml` and never turned it on. Removing the key is a far larger break than the dead setting ever was.
