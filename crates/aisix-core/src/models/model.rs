@@ -12,6 +12,8 @@
 //!
 //! etcd path: `{prefix}/models/{uuid}`. Secondary index on `display_name`.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -315,6 +317,12 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_prompt_caching: Option<AutoPromptCaching>,
 
+    /// Direct-model-only mapping from a client-requested reasoning effort to
+    /// the value sent upstream. The gateway applies one exact lookup after
+    /// resolving the final target; unlisted values pass through unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_mapping: Option<BTreeMap<String, String>>,
+
     /// Non-schema runtime id. Not part of the JSON payload — filled in by
     /// the snapshot loader from the etcd key path. Kept here so `Resource`
     /// can return a `&str` id.
@@ -361,6 +369,9 @@ impl Model {
     /// never resolved.
     pub fn strip_kind_inapplicable(&mut self) -> Vec<&'static str> {
         let mut stripped = Vec::new();
+        if self.is_embedding() && self.effort_mapping.take().is_some() {
+            stripped.push("effort_mapping");
+        }
         if !(self.is_routing() || self.is_ensemble() || self.is_semantic()) {
             return stripped;
         }
@@ -369,6 +380,9 @@ impl Model {
         }
         if self.cost.take().is_some() {
             stripped.push("cost");
+        }
+        if self.effort_mapping.take().is_some() {
+            stripped.push("effort_mapping");
         }
         if (self.is_routing() || self.is_ensemble()) && self.retries.take().is_some() {
             stripped.push("retries");
@@ -385,6 +399,16 @@ impl Model {
             }
         }
         stripped
+    }
+
+    /// Return the configured upstream effort for one caller-supplied
+    /// value. This is deliberately a single exact lookup: a map such as
+    /// `low -> high, high -> max` rewrites `low` to `high`, never `max`.
+    pub fn mapped_effort<'a>(&'a self, effort: &str) -> Option<&'a str> {
+        self.effort_mapping
+            .as_ref()?
+            .get(effort)
+            .map(String::as_str)
     }
 
     /// This resource's own non-streaming deadline, as one level of the
@@ -471,8 +495,17 @@ fn model_one_of_variant(strict: bool) -> Value {
         // routing: the group slot for timeouts is the top-level pair
         // (api7/aisix#844); retries' group slot is `routing.retries`, so a
         // top-level value is dead — as are the model-specific knobs.
-        extend(&mut arr[0], &["retries", "auto_prompt_caching", "cost"]);
-        // direct (arr[1]): every knob is live.
+        extend(
+            &mut arr[0],
+            &["retries", "auto_prompt_caching", "cost", "effort_mapping"],
+        );
+        // The direct-shaped branch also carries embedding models. They do
+        // not accept generation effort, so forbid the mapping only when the
+        // embedding marker is present; ordinary direct models keep it.
+        arr[1]["not"]["anyOf"]
+            .as_array_mut()
+            .expect("direct not.anyOf array")
+            .push(json!({ "required": ["embedding", "effort_mapping"] }));
         // ensemble: sub-calls resolve member-level knobs only; the
         // parent-level deadline is `ensemble.timeout_ms`.
         extend(
@@ -483,12 +516,16 @@ fn model_one_of_variant(strict: bool) -> Value {
                 "retries",
                 "auto_prompt_caching",
                 "cost",
+                "effort_mapping",
             ],
         );
         // semantic: top-level timeout/stream_timeout/retries ARE the group
         // slots (no routing block to carry them); the model-specific knobs
         // stay direct-only.
-        extend(&mut arr[3], &["auto_prompt_caching", "cost"]);
+        extend(
+            &mut arr[3],
+            &["auto_prompt_caching", "cost", "effort_mapping"],
+        );
     }
     variants
 }
@@ -766,6 +803,25 @@ mod tests {
         .unwrap();
         assert!(none.allowed_cidrs.is_none());
         assert!(none.ip_allowed("203.0.113.7"));
+    }
+
+    #[test]
+    fn effort_mapping_is_a_single_exact_lookup() {
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "glm",
+            "provider": "openai",
+            "model_name": "glm-5.3",
+            "provider_key_id": "pk-1",
+            "effort_mapping": {
+                "medium": "high",
+                "high": "max"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(model.mapped_effort("medium"), Some("high"));
+        assert_eq!(model.mapped_effort("high"), Some("max"));
+        assert_eq!(model.mapped_effort("low"), None);
     }
 
     #[test]

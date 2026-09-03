@@ -192,8 +192,9 @@ impl ModelCaller for ProxyModelCaller<'_> {
         // `ctx`'s deadline is per attempt while the ensemble's own
         // `config.timeout()` — applied by the caller — remains the ceiling on
         // the whole attempt sequence.
+        let upstream_req = crate::effort_mapping::chat_request(req, model);
         let response = crate::routing::retrying_dispatch(self.state, model, "ensemble", || {
-            bridge.chat(req, &ctx)
+            bridge.chat(upstream_req.as_ref(), &ctx)
         })
         .await?;
         let effective = crate::chat::effective_subcall_usage(

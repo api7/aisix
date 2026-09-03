@@ -2725,6 +2725,52 @@ mod tests {
     }
 
     #[test]
+    fn effort_mapping_is_direct_only_on_strict_writes() {
+        let direct = json!({
+            "display_name": "glm",
+            "provider": "openai",
+            "model_name": "glm-5.3",
+            "provider_key_id": "pk-1",
+            "effort_mapping": {"medium": "high"}
+        });
+        validate_model(&direct).unwrap();
+
+        for virtual_model in [
+            json!({
+                "display_name": "group",
+                "routing": {"targets": [{"model": "glm"}]},
+                "effort_mapping": {"medium": "high"}
+            }),
+            json!({
+                "display_name": "ensemble",
+                "ensemble": {"panel": [{"model": "glm"}], "judge": {"model": "glm"}},
+                "effort_mapping": {"medium": "high"}
+            }),
+            json!({
+                "display_name": "semantic",
+                "semantic": {
+                    "embedding_model": "embed",
+                    "routes": [{"name": "default", "target": "glm", "examples": ["hello"]}],
+                    "default": "glm",
+                    "match": {"threshold": 0.5}
+                },
+                "effort_mapping": {"medium": "high"}
+            }),
+            json!({
+                "display_name": "embed",
+                "provider": "openai",
+                "model_name": "text-embedding-3-small",
+                "provider_key_id": "pk-1",
+                "embedding": {"dimensions": 1536},
+                "effort_mapping": {"medium": "high"}
+            }),
+        ] {
+            assert!(validate_model(&virtual_model).is_err());
+            validate_model_lenient(&virtual_model).unwrap();
+        }
+    }
+
+    #[test]
     fn routing_fallback_on_statuses_range_is_enforced() {
         // AISIX-Cloud#1012: entries outside 400-599 are rejected by the
         // same committed-schema validation the admin API and etcd watch

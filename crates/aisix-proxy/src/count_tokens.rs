@@ -601,7 +601,7 @@ async fn count_tokens_to_target(
     client: &ClientContext,
 ) -> Result<CountTokensSuccess, ProxyError> {
     let attempt_started = Instant::now();
-    let mut body = body.clone();
+    let mut body = crate::effort_mapping::anthropic_request(body, model).into_owned();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
