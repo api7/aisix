@@ -96,6 +96,9 @@ describe("runtime status e2e", () => {
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: flakyPk.id,
+      // Cooldown is opt-in; this suite's subject is the cooldown row on
+      // /status/models.
+      cooldown: { enabled: true },
     });
     flakyModelID = flakyModel.id;
     const stableModel = await seed.createModel({

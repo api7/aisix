@@ -1854,12 +1854,12 @@ async fn dispatch(
                             },
                         );
                         let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
-                        tracing::warn!(
-                            target_model = %model.display_name,
-                            target_attempt = attempt_idx + 1,
-                            error = %err,
+                        crate::routing::log_attempt_failure(
+                            &model.display_name,
+                            attempt_idx + 1,
+                            &err,
                             retryable,
-                            "streaming routing target attempt failed",
+                            fallback_statuses,
                         );
                         if retryable {
                             state.health.record_failure(&model.display_name);
@@ -2953,12 +2953,12 @@ async fn dispatch(
                         },
                     );
                     let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
-                    tracing::warn!(
-                        target_model = %model.display_name,
-                        target_attempt = attempt_idx + 1,
-                        error = %err,
+                    crate::routing::log_attempt_failure(
+                        &model.display_name,
+                        attempt_idx + 1,
+                        &err,
                         retryable,
-                        "routing target attempt failed",
+                        fallback_statuses,
                     );
                     if retryable {
                         state.health.record_failure(&model.display_name);
@@ -5938,9 +5938,51 @@ mod cooldown_tests {
         )
     }
 
+    /// The minimum an operator has to write to turn cooldown on. Every
+    /// default-knob test below runs against it, because an absent
+    /// `enabled` is now "off" and would make them all vacuously pass.
+    fn enabled() -> CooldownConfig {
+        CooldownConfig {
+            enabled: Some(true),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_cooldown_config_never_cools_down() {
+        // AISIX-Cloud#1499: a model whose operator never configured
+        // cooldown stays in rotation, whatever the upstream returns.
+        // Every status in the old built-in trigger list, plus the
+        // transport categories that used to fire on the same default.
+        for status in [401, 408, 429, 500, 502, 503, 504] {
+            assert!(
+                decide_cooldown(&upstream(status), None).is_none(),
+                "status={status} cooled down a model with no cooldown config"
+            );
+        }
+        assert!(decide_cooldown(&BridgeError::Transport("conn refused".into()), None).is_none());
+        assert!(decide_cooldown(&BridgeError::StreamAborted, None).is_none());
+        assert!(decide_cooldown(
+            &BridgeError::Timeout {
+                cause: String::new(),
+                elapsed_ms: 30_000
+            },
+            None
+        )
+        .is_none());
+        // A present block that never says `enabled: true` is the same
+        // "not asked for" — this is the shape the console writes when
+        // the operator only touched another knob.
+        let tuned = CooldownConfig {
+            default_seconds: Some(90),
+            ..Default::default()
+        };
+        assert!(decide_cooldown(&upstream(429), Some(&tuned)).is_none());
+    }
+
     #[test]
     fn default_config_cooldowns_429() {
-        let (ttl, reason) = decide_cooldown(&upstream(429), None).unwrap();
+        let (ttl, reason) = decide_cooldown(&upstream(429), Some(&enabled())).unwrap();
         assert_eq!(ttl, StdDuration::from_secs(30));
         assert_eq!(reason, "upstream_rate_limited");
     }
@@ -5951,21 +5993,21 @@ mod cooldown_tests {
         // (auth failure) should still take the target out of rotation,
         // because the same key will keep failing on subsequent
         // requests. The retry-vs-cooldown split is the whole point.
-        let (ttl, reason) = decide_cooldown(&upstream(401), None).unwrap();
+        let (ttl, reason) = decide_cooldown(&upstream(401), Some(&enabled())).unwrap();
         assert_eq!(ttl, StdDuration::from_secs(30));
         assert_eq!(reason, "upstream_auth_failure");
     }
 
     #[test]
     fn default_config_cooldowns_408() {
-        let (_, reason) = decide_cooldown(&upstream(408), None).unwrap();
+        let (_, reason) = decide_cooldown(&upstream(408), Some(&enabled())).unwrap();
         assert_eq!(reason, "upstream_request_timeout");
     }
 
     #[test]
     fn default_config_cooldowns_5xx() {
         for status in [500, 502, 503, 504] {
-            let (_, reason) = decide_cooldown(&upstream(status), None).unwrap();
+            let (_, reason) = decide_cooldown(&upstream(status), Some(&enabled())).unwrap();
             assert_eq!(reason, "upstream_server_error", "status={status}");
         }
     }
@@ -5974,9 +6016,9 @@ mod cooldown_tests {
     fn default_config_skips_400_and_other_4xx() {
         // Caller bugs (400, 403, 422) are not cooldown signals — the
         // model didn't fail, the request did.
-        assert!(decide_cooldown(&upstream(400), None).is_none());
-        assert!(decide_cooldown(&upstream(403), None).is_none());
-        assert!(decide_cooldown(&upstream(422), None).is_none());
+        assert!(decide_cooldown(&upstream(400), Some(&enabled())).is_none());
+        assert!(decide_cooldown(&upstream(403), Some(&enabled())).is_none());
+        assert!(decide_cooldown(&upstream(422), Some(&enabled())).is_none());
     }
 
     #[test]
@@ -5986,12 +6028,20 @@ mod cooldown_tests {
                 cause: String::new(),
                 elapsed_ms: 30_000
             },
-            None
+            Some(&enabled())
         )
         .is_some());
-        assert!(decide_cooldown(&BridgeError::Transport("conn refused".into()), None).is_some());
-        assert!(decide_cooldown(&BridgeError::StreamAborted, None).is_some());
-        assert!(decide_cooldown(&BridgeError::UpstreamDecode("bad json".into()), None).is_some());
+        assert!(decide_cooldown(
+            &BridgeError::Transport("conn refused".into()),
+            Some(&enabled())
+        )
+        .is_some());
+        assert!(decide_cooldown(&BridgeError::StreamAborted, Some(&enabled())).is_some());
+        assert!(decide_cooldown(
+            &BridgeError::UpstreamDecode("bad json".into()),
+            Some(&enabled())
+        )
+        .is_some());
     }
 
     #[test]
@@ -6010,7 +6060,7 @@ mod cooldown_tests {
         // already handles burst). 500s still cool down.
         let cfg = CooldownConfig {
             trigger_statuses: Some(vec![500, 502, 503]),
-            ..Default::default()
+            ..enabled()
         };
         assert!(decide_cooldown(&upstream(429), Some(&cfg)).is_none());
         assert!(decide_cooldown(&upstream(503), Some(&cfg)).is_some());
@@ -6018,7 +6068,8 @@ mod cooldown_tests {
 
     #[test]
     fn honor_retry_after_uses_upstream_hint() {
-        let (ttl, _) = decide_cooldown(&upstream_with_retry_after(429, 75), None).unwrap();
+        let (ttl, _) =
+            decide_cooldown(&upstream_with_retry_after(429, 75), Some(&enabled())).unwrap();
         assert_eq!(ttl, StdDuration::from_secs(75));
     }
 
@@ -6028,7 +6079,7 @@ mod cooldown_tests {
         // configured max so we don't lose the target for hours.
         let cfg = CooldownConfig {
             max_seconds: Some(60),
-            ..Default::default()
+            ..enabled()
         };
         let (ttl, _) =
             decide_cooldown(&upstream_with_retry_after(429, 100_000), Some(&cfg)).unwrap();
@@ -6040,7 +6091,7 @@ mod cooldown_tests {
         let cfg = CooldownConfig {
             honor_retry_after: Some(false),
             default_seconds: Some(45),
-            ..Default::default()
+            ..enabled()
         };
         let (ttl, _) = decide_cooldown(&upstream_with_retry_after(429, 5), Some(&cfg)).unwrap();
         assert_eq!(ttl, StdDuration::from_secs(45));
@@ -6050,7 +6101,7 @@ mod cooldown_tests {
     fn trigger_on_timeout_false_disables_timeout_cooldown() {
         let cfg = CooldownConfig {
             trigger_on_timeout: Some(false),
-            ..Default::default()
+            ..enabled()
         };
         assert!(decide_cooldown(
             &BridgeError::Timeout {
@@ -6065,7 +6116,9 @@ mod cooldown_tests {
     #[test]
     fn config_error_never_cools_down() {
         // Misconfig = WE are wrong; cooling down doesn't help.
-        assert!(decide_cooldown(&BridgeError::Config("bad key".into()), None).is_none());
+        assert!(
+            decide_cooldown(&BridgeError::Config("bad key".into()), Some(&enabled())).is_none()
+        );
     }
 }
 

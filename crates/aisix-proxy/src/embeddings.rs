@@ -1939,7 +1939,15 @@ mod tests {
             .await;
 
         let snap = new_snap(&upstream.uri());
-        snap.models.insert(model_entry("embed-model"));
+        // Cooldown is opt-in (AISIX-Cloud#1499). The subject here is that
+        // this handler routes its failures through the cooldown
+        // chokepoint at all, so the model has to ask for cooldown.
+        let mut entry = model_entry("embed-model");
+        entry.value.cooldown = Some(aisix_core::CooldownConfig {
+            enabled: Some(true),
+            ..Default::default()
+        });
+        snap.models.insert(entry);
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let hub = Arc::new(Hub::new());

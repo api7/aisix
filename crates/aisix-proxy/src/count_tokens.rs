@@ -543,6 +543,13 @@ async fn dispatch(
                         &e,
                         ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
                     );
+                    crate::routing::log_attempt_failure(
+                        &target.model.display_name,
+                        attempt_idx + 1,
+                        &e,
+                        retryable,
+                        fallback_statuses,
+                    );
                     // See `RetryBudget::covers`: a default budget skips
                     // same-target retries for timeouts; fail-over is
                     // unaffected (the outer loop still moves on).

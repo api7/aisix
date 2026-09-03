@@ -103,7 +103,7 @@
     },
     "CooldownConfig": {
       "additionalProperties": false,
-      "description": "Request-path cooldown settings for a direct model after retryable upstream failures.",
+      "description": "Request-path cooldown settings for a direct model after retryable upstream failures. Cooldown is opt-in: it runs only when `enabled` is `true`.",
       "properties": {
         "default_seconds": {
           "description": "Cooldown TTL in seconds when the upstream did not supply a `Retry-After` header or `honor_retry_after` is `false`.",
@@ -112,7 +112,7 @@
           "type": "integer"
         },
         "enabled": {
-          "description": "Whether cooldown is active for this model. Set to `false` to keep the model in rotation regardless of upstream failures.",
+          "description": "Whether cooldown is active for this model. Cooldown is off unless this is set to `true`, so a model that omits it stays in rotation regardless of upstream failures.",
           "type": "boolean"
         },
         "honor_retry_after": {
@@ -999,7 +999,7 @@
           "$ref": "#/definitions/CooldownConfig"
         }
       ],
-      "description": "Direct-model-only request-path cooldown configuration. Omit this field to use the built-in cooldown behavior."
+      "description": "Direct-model-only request-path cooldown configuration. Cooldown is opt-in: omit this field, or leave `enabled` unset, and the model is never taken out of rotation by request-path failures."
     },
     "cost": {
       "allOf": [

@@ -119,6 +119,9 @@ describe("runtime mixed filtering e2e", () => {
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: cooldownPk.id,
+      // Cooldown is opt-in; this target's whole role is to BE the
+      // cooling one.
+      cooldown: { enabled: true },
     });
     await seed.createModel({
       display_name: "mixed-healthy",

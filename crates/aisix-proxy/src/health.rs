@@ -17,7 +17,7 @@ use dashmap::DashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, RoutingStrategy};
@@ -507,6 +507,14 @@ pub struct HealthTracker {
 /// jitter, roughly matching LiteLLM's last-10-samples moving average.
 const LATENCY_EWMA_ALPHA: f64 = 0.3;
 
+/// Minimum gap between two `routing candidate excluded` lines for the same
+/// (target, reason). The exclusion happens on the per-request routing path,
+/// so an unthrottled line would be one log per request for as long as a
+/// target stays out of rotation — on a busy gateway that is a flood, and a
+/// flood is what gets a diagnostic turned off before the incident that
+/// needs it.
+const EXCLUSION_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
 #[derive(Default, Debug)]
 pub struct ModelRuntimeStatusTracker {
     entries: DashMap<String, RuntimeEntry>,
@@ -527,6 +535,15 @@ pub struct ModelRuntimeStatusTracker {
     /// every method runs its historical write path. See
     /// [`BookkeepingFlags`].
     flags: Option<Arc<BookkeepingFlags>>,
+    /// When the last `routing candidate excluded` line was written, per
+    /// (routing group, target, reason). See
+    /// [`ModelRuntimeStatusTracker::should_log_exclusion`] for why the
+    /// group is part of the key and not just the target.
+    ///
+    /// Bounded by the configured groups times their members times the two
+    /// reasons; entries for a group or target the operator has since
+    /// deleted are never revisited and cost one key each.
+    exclusion_log: DashMap<(String, String, &'static str), Instant>,
 }
 
 /// RAII guard that decrements a target's in-flight counter when dropped.
@@ -639,11 +656,46 @@ impl ModelRuntimeStatusTracker {
             metrics: Some(metrics),
             snapshot: Some(snapshot),
             flags: Some(flags),
+            exclusion_log: DashMap::new(),
         }
     }
 
     fn bookkeeping_active(&self) -> bool {
         self.flags.as_ref().is_none_or(|f| f.any_active())
+    }
+
+    /// Rate gate for the `routing candidate excluded` line: true at most
+    /// once per [`EXCLUSION_LOG_INTERVAL`] for a given (routing group,
+    /// target, reason).
+    ///
+    /// The **group** is in the key because the line names one, and the
+    /// operator reads it per group. One direct model is routinely a
+    /// target of several groups; keyed on the target alone, a busy group
+    /// would win the window almost every time it opened and a quiet group
+    /// sharing that target would print nothing at all — leaving exactly
+    /// the "one attempt, no explanation" trace this line exists to
+    /// remove. It also decides `candidates`, which differs per group.
+    ///
+    /// A change of reason logs immediately rather than waiting out the
+    /// previous window, so a target that goes from cooling to
+    /// background-unhealthy is not hidden behind the cooling line. Only
+    /// excluded candidates reach here, so the steady state of a healthy
+    /// group takes no write lock at all.
+    pub(crate) fn should_log_exclusion(
+        &self,
+        virtual_name: &str,
+        model_id: &str,
+        reason: &'static str,
+    ) -> bool {
+        let now = Instant::now();
+        let key = (virtual_name.to_string(), model_id.to_string(), reason);
+        match self.exclusion_log.get(&key) {
+            Some(at) if now.duration_since(*at) < EXCLUSION_LOG_INTERVAL => false,
+            _ => {
+                self.exclusion_log.insert(key, now);
+                true
+            }
+        }
     }
 
     pub fn mark_cooldown(&self, model_id: &str, ttl: Duration, reason: impl Into<String>) {
@@ -1053,6 +1105,7 @@ mod tests {
             metrics: None,
             snapshot: None,
             flags: Some(flags),
+            ..Default::default()
         };
         (handle, t)
     }
@@ -1490,6 +1543,26 @@ mod tests {
         assert_eq!(s.status, RuntimeStatus::Healthy);
         assert_eq!(s.last_check_status, Some(429));
         assert_eq!(s.status_reason.as_deref(), Some("ignored_transient_error"));
+    }
+
+    #[test]
+    fn exclusion_log_gate_throttles_a_repeat_and_lets_a_new_reason_through() {
+        // The gate is what keeps the `routing candidate excluded` WARN
+        // off the per-request hot path. Its two obligations: never write
+        // the same (target, reason) twice inside the window, and never
+        // let the window hide a target whose reason has changed.
+        let t = ModelRuntimeStatusTracker::new();
+        assert!(t.should_log_exclusion("g-1", "m-1", "cooling"));
+        assert!(!t.should_log_exclusion("g-1", "m-1", "cooling"));
+        assert!(t.should_log_exclusion("g-1", "m-1", "unhealthy"));
+        assert!(!t.should_log_exclusion("g-1", "m-1", "unhealthy"));
+        // Throttling is per target, not global.
+        assert!(t.should_log_exclusion("g-1", "m-2", "cooling"));
+        // …and per routing group: a second group that shares `m-1` still
+        // gets its own line, because it has its own `candidates` count and
+        // its own operator reading it.
+        assert!(t.should_log_exclusion("g-2", "m-1", "cooling"));
+        assert!(!t.should_log_exclusion("g-2", "m-1", "cooling"));
     }
 
     #[test]

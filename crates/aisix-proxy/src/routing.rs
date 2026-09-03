@@ -118,6 +118,38 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
     }
 }
 
+/// One WARN per failed routing-target attempt, naming the target, the
+/// error, whether the loop will move on, and the `fallback_on_statuses`
+/// list that answer was computed against.
+///
+/// Kept in one place because the endpoint family had already drifted:
+/// `/v1/chat/completions` wrote this line on both its branches while
+/// `/v1/messages`, `/v1/responses` and `/v1/messages/count_tokens`
+/// emitted nothing at all on a failed attempt, at any level.
+///
+/// The status list is on the line because the retry/failover decision is
+/// not reconstructable without it. A group configured to fail over on an
+/// upstream 400, whose projected snapshot never carried the list, refuses
+/// to fail over and leaves exactly the trace a group with one reachable
+/// candidate leaves — one attempt, error class `upstream_status`
+/// (AISIX-Cloud#1499).
+pub(crate) fn log_attempt_failure(
+    target_model: &str,
+    attempt_number: usize,
+    err: &dyn std::fmt::Display,
+    retryable: bool,
+    fallback_on_statuses: &[u16],
+) {
+    tracing::warn!(
+        target_model = %target_model,
+        target_attempt = attempt_number,
+        error = %err,
+        retryable,
+        ?fallback_on_statuses,
+        "routing target attempt failed",
+    );
+}
+
 /// Base delay before the first same-target retry. Each subsequent retry
 /// doubles it, capped at [`RETRY_BACKOFF_MAX_MS`].
 const RETRY_BACKOFF_BASE_MS: u64 = 250;
@@ -941,20 +973,62 @@ pub(crate) struct AttemptModel {
     pub weight: u32,
 }
 
+/// A candidate the health/cooldown filter dropped, kept so the caller can
+/// say WHICH target went and WHY.
+///
+/// Without it the exclusion is invisible: the request records one attempt
+/// against the surviving target and nothing anywhere names the one that was
+/// never tried, so "the group failed over to nobody" and "the group only
+/// ever had one candidate" produce the identical trace
+/// (AISIX-Cloud#1499).
+pub(crate) struct ExcludedCandidate {
+    /// Snapshot id of the dropped target — the key health/cooldown state
+    /// is tracked under.
+    pub id: String,
+    /// The target's configured `display_name`, i.e. the name the operator
+    /// wrote in `routing.targets`.
+    pub model: String,
+    pub reason: &'static str,
+}
+
+/// `reason` on an [`ExcludedCandidate`] dropped for an unexpired
+/// request-path cooldown.
+pub(crate) const EXCLUDED_COOLING: &str = "cooling";
+/// `reason` on an [`ExcludedCandidate`] dropped because its background
+/// health check has it marked down.
+pub(crate) const EXCLUDED_UNHEALTHY: &str = "unhealthy";
+
 /// Outcome of routing-candidate filtering. Lifts the "all candidates
 /// excluded" case out into a typed result so the dispatch loop can
 /// short-circuit to a 503 + Retry-After instead of sending traffic to
 /// a target we just confirmed is bad.
 pub(crate) enum FilterOutcome {
-    /// At least one candidate survived the filter. The returned vector
-    /// is the filtered attempt list, in the original strategy order
-    /// minus the excluded entries.
-    Selected(Vec<AttemptModel>),
+    /// At least one candidate survived the filter. `attempts` is the
+    /// filtered list, in the original strategy order minus the excluded
+    /// entries; `excluded` names what was dropped to get there.
+    Selected {
+        attempts: Vec<AttemptModel>,
+        excluded: Vec<ExcludedCandidate>,
+    },
     /// Every candidate is currently background-unhealthy and the
     /// routing model is configured with `when_all_unavailable: fail`. The
     /// caller should surface a 503 with the supplied Retry-After hint
     /// (in seconds), if any.
-    AllUnhealthy { retry_after_secs: Option<u64> },
+    AllUnhealthy {
+        retry_after_secs: Option<u64>,
+        excluded: Vec<ExcludedCandidate>,
+    },
+}
+
+fn excluded(attempts: &[AttemptModel], reason: &'static str) -> Vec<ExcludedCandidate> {
+    attempts
+        .iter()
+        .map(|a| ExcludedCandidate {
+            id: a.id.clone(),
+            model: a.model.display_name.clone(),
+            reason,
+        })
+        .collect()
 }
 
 pub(crate) fn filter_attempt_models(
@@ -964,7 +1038,7 @@ pub(crate) fn filter_attempt_models(
 ) -> FilterOutcome {
     let mut healthy = Vec::new();
     let mut cooldown_only = Vec::new();
-    let mut unhealthy_count = 0usize;
+    let mut unhealthy = Vec::new();
 
     for attempt in attempts.iter().cloned() {
         let stale_after = attempt
@@ -974,7 +1048,7 @@ pub(crate) fn filter_attempt_models(
             .map(|cfg| Duration::from_secs(cfg.stale_after_seconds));
         let snapshot = runtime_status.status_with_stale(&attempt.id, stale_after);
         match snapshot.status {
-            crate::RuntimeStatus::Unhealthy => unhealthy_count += 1,
+            crate::RuntimeStatus::Unhealthy => unhealthy.push(attempt),
             crate::RuntimeStatus::Cooldown => cooldown_only.push(attempt),
             crate::RuntimeStatus::Healthy | crate::RuntimeStatus::NotApplicable => {
                 healthy.push(attempt)
@@ -983,7 +1057,12 @@ pub(crate) fn filter_attempt_models(
     }
 
     if !healthy.is_empty() {
-        return FilterOutcome::Selected(healthy);
+        let mut dropped = excluded(&cooldown_only, EXCLUDED_COOLING);
+        dropped.extend(excluded(&unhealthy, EXCLUDED_UNHEALTHY));
+        return FilterOutcome::Selected {
+            attempts: healthy,
+            excluded: dropped,
+        };
     }
     // No healthy candidates — prefer cooldown over unhealthy when
     // some non-unhealthy candidates exist. Sending to a target whose
@@ -997,8 +1076,11 @@ pub(crate) fn filter_attempt_models(
     // race window — a candidate flipping to unhealthy between the two
     // reads could yield an empty `Selected`, which streaming callers
     // turn into a panic by indexing `attempt_models[0]`.
-    if unhealthy_count < attempts.len() && !cooldown_only.is_empty() {
-        return FilterOutcome::Selected(cooldown_only);
+    if !cooldown_only.is_empty() {
+        return FilterOutcome::Selected {
+            excluded: excluded(&unhealthy, EXCLUDED_UNHEALTHY),
+            attempts: cooldown_only,
+        };
     }
     // All candidates are excluded. Policy decides.
     //
@@ -1012,8 +1094,14 @@ pub(crate) fn filter_attempt_models(
     match policy {
         WhenAllUnavailablePolicy::Fail => FilterOutcome::AllUnhealthy {
             retry_after_secs: Some(FALLBACK_ALL_UNHEALTHY_RETRY_AFTER.as_secs()),
+            excluded: excluded(&unhealthy, EXCLUDED_UNHEALTHY),
         },
-        WhenAllUnavailablePolicy::TryAnyway => FilterOutcome::Selected(attempts),
+        // `try_anyway` dispatches the unfiltered list, so nothing was
+        // dropped and there is no exclusion to report.
+        WhenAllUnavailablePolicy::TryAnyway => FilterOutcome::Selected {
+            attempts,
+            excluded: Vec::new(),
+        },
     }
 }
 
@@ -1164,8 +1252,15 @@ pub(crate) fn resolve_attempt_models(
         resolved,
         routing.when_all_unavailable_or_default(),
     ) {
-        FilterOutcome::Selected(list) => Ok(list),
-        FilterOutcome::AllUnhealthy { retry_after_secs } => {
+        FilterOutcome::Selected { attempts, excluded } => {
+            log_candidate_exclusions(runtime_status, virtual_name, attempts.len(), &excluded);
+            Ok(attempts)
+        }
+        FilterOutcome::AllUnhealthy {
+            retry_after_secs,
+            excluded,
+        } => {
+            log_candidate_exclusions(runtime_status, virtual_name, 0, &excluded);
             tracing::warn!(
                 virtual_model = %virtual_name,
                 retry_after_secs,
@@ -1173,6 +1268,37 @@ pub(crate) fn resolve_attempt_models(
             );
             Err(ProxyError::AllCandidatesUnavailable { retry_after_secs })
         }
+    }
+}
+
+/// Name every target the health/cooldown filter dropped, and how many
+/// candidates the dispatch loop is left with.
+///
+/// At WARN, because a group running on fewer targets than the operator
+/// configured is a degraded state they want to see without having raised
+/// verbosity first — an incident is diagnosed from the log level the
+/// gateway was already running at, and `info` is the default. Throttled per
+/// (target, reason) by
+/// [`crate::ModelRuntimeStatusTracker::should_log_exclusion`] so a cooling
+/// target in a busy group produces one line a minute rather than one per
+/// request.
+fn log_candidate_exclusions(
+    runtime_status: &crate::ModelRuntimeStatusTracker,
+    virtual_name: &str,
+    candidates: usize,
+    excluded: &[ExcludedCandidate],
+) {
+    for ex in excluded {
+        if !runtime_status.should_log_exclusion(virtual_name, &ex.id, ex.reason) {
+            continue;
+        }
+        tracing::warn!(
+            virtual_model = %virtual_name,
+            target_model = %ex.model,
+            reason = ex.reason,
+            candidates,
+            "routing candidate excluded before dispatch",
+        );
     }
 }
 
@@ -2477,8 +2603,9 @@ mod tests {
         let t = crate::ModelRuntimeStatusTracker::new();
         let attempts = vec![am("a"), am("b")];
         match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::Fail) {
-            FilterOutcome::Selected(list) => {
-                assert_eq!(list.len(), 2);
+            FilterOutcome::Selected { attempts, excluded } => {
+                assert_eq!(attempts.len(), 2);
+                assert!(excluded.is_empty());
             }
             other => panic!(
                 "expected Selected, got {:?}",
@@ -2493,9 +2620,43 @@ mod tests {
         t.mark_cooldown("a", Duration::from_secs(30), "retryable_failure");
         let attempts = vec![am("a"), am("b")];
         match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::Fail) {
-            FilterOutcome::Selected(list) => {
-                assert_eq!(list.len(), 1);
-                assert_eq!(list[0].id, "b");
+            FilterOutcome::Selected { attempts, excluded } => {
+                assert_eq!(attempts.len(), 1);
+                assert_eq!(attempts[0].id, "b");
+                // The dropped target is named, with why — the record the
+                // dispatch loop turns into the WARN line.
+                assert_eq!(excluded.len(), 1);
+                assert_eq!(excluded[0].id, "a");
+                assert_eq!(excluded[0].model, "a");
+                assert_eq!(excluded[0].reason, EXCLUDED_COOLING);
+            }
+            _ => panic!("expected Selected"),
+        }
+    }
+
+    #[test]
+    fn healthy_survivor_reports_both_cooling_and_unhealthy_drops() {
+        // The three-or-more-target group, which is the common production
+        // shape: one healthy survivor, one cooling, one background-dead.
+        // Without this case the `extend` that appends the unhealthy
+        // drops could be deleted outright and every other filter test
+        // would still pass — the group would quietly lose a target with
+        // nothing naming it, which is the whole failure this record
+        // exists to remove.
+        let t = crate::ModelRuntimeStatusTracker::new();
+        t.mark_cooldown("b", Duration::from_secs(30), "x");
+        t.mark_unhealthy("c", Some(503), "background_check_failed");
+        let attempts = vec![am("a"), am("b"), am("c")];
+        match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::Fail) {
+            FilterOutcome::Selected { attempts, excluded } => {
+                assert_eq!(attempts.len(), 1);
+                assert_eq!(attempts[0].id, "a");
+                let mut got: Vec<(&str, &str)> = excluded
+                    .iter()
+                    .map(|e| (e.model.as_str(), e.reason))
+                    .collect();
+                got.sort_unstable();
+                assert_eq!(got, [("b", EXCLUDED_COOLING), ("c", EXCLUDED_UNHEALTHY)]);
             }
             _ => panic!("expected Selected"),
         }
@@ -2512,8 +2673,15 @@ mod tests {
         t.mark_unhealthy("b", Some(503), "background_check_failed");
         let attempts = vec![am("a"), am("b")];
         match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::Fail) {
-            FilterOutcome::AllUnhealthy { retry_after_secs } => {
+            FilterOutcome::AllUnhealthy {
+                retry_after_secs,
+                excluded,
+            } => {
                 assert_eq!(retry_after_secs, Some(30));
+                let mut names: Vec<&str> = excluded.iter().map(|e| e.model.as_str()).collect();
+                names.sort_unstable();
+                assert_eq!(names, ["a", "b"]);
+                assert!(excluded.iter().all(|e| e.reason == EXCLUDED_UNHEALTHY));
             }
             _ => panic!("expected AllUnhealthy"),
         }
@@ -2530,9 +2698,16 @@ mod tests {
         t.mark_cooldown("c", Duration::from_secs(30), "x");
         let attempts = vec![am("a"), am("b"), am("c")];
         match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::Fail) {
-            FilterOutcome::Selected(list) => {
-                assert_eq!(list.len(), 1);
-                assert_eq!(list[0].id, "c");
+            FilterOutcome::Selected { attempts, excluded } => {
+                assert_eq!(attempts.len(), 1);
+                assert_eq!(attempts[0].id, "c");
+                // `c` was dispatched, so only the two unhealthy targets
+                // count as excluded — a candidate that gets used is not
+                // reported as dropped.
+                let mut names: Vec<&str> = excluded.iter().map(|e| e.model.as_str()).collect();
+                names.sort_unstable();
+                assert_eq!(names, ["a", "b"]);
+                assert!(excluded.iter().all(|e| e.reason == EXCLUDED_UNHEALTHY));
             }
             _ => panic!("expected Selected with cooldown candidate"),
         }
@@ -2546,8 +2721,11 @@ mod tests {
         t.mark_unhealthy("b", Some(503), "background_check_failed");
         let attempts = vec![am("a"), am("b")];
         match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::TryAnyway) {
-            FilterOutcome::Selected(list) => {
-                assert_eq!(list.len(), 2);
+            FilterOutcome::Selected { attempts, excluded } => {
+                assert_eq!(attempts.len(), 2);
+                // Nothing was dropped: `try_anyway` dispatches the whole
+                // list, so reporting an exclusion here would be a lie.
+                assert!(excluded.is_empty());
             }
             _ => panic!("expected Selected under TryAnyway policy"),
         }
@@ -2563,8 +2741,9 @@ mod tests {
         t.mark_cooldown("b", Duration::from_secs(30), "x");
         let attempts = vec![am("a"), am("b")];
         match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::Fail) {
-            FilterOutcome::Selected(list) => {
-                assert_eq!(list.len(), 2);
+            FilterOutcome::Selected { attempts, excluded } => {
+                assert_eq!(attempts.len(), 2);
+                assert!(excluded.is_empty());
             }
             _ => panic!("expected Selected for cooldown-only"),
         }

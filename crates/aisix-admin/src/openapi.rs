@@ -2344,7 +2344,7 @@ fn add_schema_defaults(doc: &mut Value) {
         ),
         (
             "/components/schemas/CooldownConfig/properties/enabled",
-            serde_json::json!(true),
+            serde_json::json!(false),
         ),
         (
             "/components/schemas/CooldownConfig/properties/honor_retry_after",
@@ -2978,6 +2978,13 @@ mod tests {
             schemas["CooldownConfig"]["properties"]["trigger_statuses"]["default"],
             serde_json::json!([401, 408, 429, 500, 502, 503, 504]),
             "runtime default cooldown trigger statuses should be visible in OpenAPI"
+        );
+        // Cooldown is opt-in (AISIX-Cloud#1499): the reference must not
+        // advertise a feature the gateway does not switch on by itself.
+        assert_eq!(
+            schemas["CooldownConfig"]["properties"]["enabled"]["default"],
+            serde_json::json!(false),
+            "cooldown must be documented as off unless the operator enables it"
         );
         assert_eq!(
             schemas["Routing"]["properties"]["when_all_unavailable"]["default"],
