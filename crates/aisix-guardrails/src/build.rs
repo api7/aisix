@@ -1869,6 +1869,7 @@ mod tests {
                     .unwrap()
                     .push(exec.error_type.map(str::to_owned));
             }
+            fn record_guardrail_bypass(&self, _reason: &str) {}
         }
 
         for (script, tag) in [
@@ -3814,6 +3815,7 @@ mod tests {
                 exec.result,
             ));
         }
+        fn record_guardrail_bypass(&self, _reason: &str) {}
     }
 
     /// A sink attached via `LiveGuardrailIndex::new_with_sink` reaches every

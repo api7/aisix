@@ -208,11 +208,20 @@ pub const M_USAGE_EVENT_DROPS_TOTAL: &str = "aisix_usage_event_drops_total";
 /// Guardrail outcomes (#379 observability). `aisix_guardrail_blocks_total`
 /// counts requests rejected by guardrail enforcement, including fail-closed
 /// paths such as a streaming buffer overflow that happen before a guardrail
-/// member executes. `aisix_guardrail_bypasses_total` counts fail-open
-/// executions — a remote-API guardrail's upstream was unreachable but
-/// `fail_open` let the request through — sliced by the bounded DP-internal
-/// `reason` (e.g. `bedrock_5xx` / `bedrock_timeout` /
-/// `bedrock_throttled`).
+/// member executes. `aisix_guardrail_bypasses_total` is its fail-OPEN
+/// counterpart and covers the same two shapes: a member that executed and
+/// was bypassed — a remote-API guardrail's upstream was unreachable but
+/// `fail_open` let the request through — and a bypass that happens before
+/// any member executes, a body the gateway could not give the guardrails
+/// at all (`unscannable_body`, #1115). Both are sliced by the bounded
+/// DP-internal `reason` (e.g. `bedrock_5xx` / `bedrock_timeout` /
+/// `bedrock_throttled` / `unscannable_body`).
+///
+/// The two counters cover the pre-execution case symmetrically on
+/// purpose: one situation — the body could not be scanned — is a block
+/// when the chain fails closed and a bypass when it fails open, and an
+/// operator reads `bypasses_total` to size how much unscreened traffic
+/// got through.
 pub const M_GUARDRAIL_BLOCKS_TOTAL: &str = "aisix_guardrail_blocks_total";
 pub const M_GUARDRAIL_BYPASSES_TOTAL: &str = "aisix_guardrail_bypasses_total";
 
@@ -1336,7 +1345,11 @@ impl Metrics {
         );
     }
 
-    fn record_guardrail_bypass_execution(&self, reason: &str) {
+    /// Bump `aisix_guardrail_bypasses_total` for one bypass under
+    /// `reason`. Reached from both producers: a bypassed member execution
+    /// (below) and the proxy's pre-execution bypass (the
+    /// `GuardrailMetricsSink` impl).
+    fn count_guardrail_bypass(&self, reason: &str) {
         self.cached_counter(
             M_GUARDRAIL_BYPASSES_TOTAL,
             1,
@@ -1380,7 +1393,7 @@ impl Metrics {
             },
         );
         if let ("bypassed", Some(reason)) = (exec.result, exec.error_type) {
-            self.record_guardrail_bypass_execution(reason);
+            self.count_guardrail_bypass(reason);
         }
     }
 
@@ -2529,6 +2542,10 @@ impl Metrics {
 impl aisix_core::GuardrailMetricsSink for Metrics {
     fn record_guardrail_execution(&self, exec: &aisix_core::GuardrailExecution<'_>) {
         Metrics::record_guardrail_execution(self, exec);
+    }
+
+    fn record_guardrail_bypass(&self, reason: &str) {
+        self.count_guardrail_bypass(reason);
     }
 }
 
