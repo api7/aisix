@@ -98,6 +98,7 @@ describe("direct-model effort mapping", () => {
   let anthropic: OpenAiUpstream | undefined;
   let openaiStream: OpenAiUpstream | undefined;
   let anthropicStream: OpenAiUpstream | undefined;
+  let ensembleStream: OpenAiUpstream | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -119,6 +120,12 @@ describe("direct-model effort mapping", () => {
     });
     anthropicStream = await startOpenAiUpstream({
       streamEvents: anthropicStreamEvents,
+    });
+    ensembleStream = await startOpenAiUpstream({
+      scriptedResponses: [
+        { nonStreamBody: chatResponse },
+        { streamEvents: openaiStreamEvents },
+      ],
     });
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
@@ -146,6 +153,11 @@ describe("direct-model effort mapping", () => {
       adapter: "anthropic",
       secret: "sk-anthropic-stream-mock",
       api_base: anthropicStream.baseUrl,
+    });
+    const ensembleStreamKey = await seed.createProviderKey({
+      display_name: "effort-map-ensemble-stream-key",
+      secret: "sk-ensemble-stream-mock",
+      api_base: `${ensembleStream.baseUrl}/v1`,
     });
 
     const mapping = { medium: "high", high: "max" };
@@ -178,6 +190,50 @@ describe("direct-model effort mapping", () => {
       effort_mapping: mapping,
     });
     await seed.createModel({
+      display_name: "effort-map-ensemble-panel",
+      provider: "openai",
+      model_name: "glm-ensemble-panel-wire",
+      provider_key_id: openaiKey.id,
+      effort_mapping: mapping,
+    });
+    await seed.createModel({
+      display_name: "effort-map-ensemble-judge",
+      provider: "openai",
+      model_name: "glm-ensemble-judge-wire",
+      provider_key_id: openaiKey.id,
+      effort_mapping: { medium: "max" },
+    });
+    await seed.createModel({
+      display_name: "effort-map-ensemble",
+      ensemble: {
+        panel: [{ model: "effort-map-ensemble-panel" }],
+        judge: { model: "effort-map-ensemble-judge" },
+        min_responses: 1,
+      },
+    });
+    await seed.createModel({
+      display_name: "effort-map-ensemble-stream-panel",
+      provider: "openai",
+      model_name: "glm-ensemble-stream-panel-wire",
+      provider_key_id: ensembleStreamKey.id,
+      effort_mapping: mapping,
+    });
+    await seed.createModel({
+      display_name: "effort-map-ensemble-stream-judge",
+      provider: "openai",
+      model_name: "glm-ensemble-stream-judge-wire",
+      provider_key_id: ensembleStreamKey.id,
+      effort_mapping: { medium: "max" },
+    });
+    await seed.createModel({
+      display_name: "effort-map-ensemble-stream",
+      ensemble: {
+        panel: [{ model: "effort-map-ensemble-stream-panel" }],
+        judge: { model: "effort-map-ensemble-stream-judge" },
+        min_responses: 1,
+      },
+    });
+    await seed.createModel({
       display_name: "effort-map-group",
       routing: {
         strategy: "failover",
@@ -194,6 +250,8 @@ describe("direct-model effort mapping", () => {
         "effort-map-anthropic",
         "effort-map-openai-stream",
         "effort-map-anthropic-stream",
+        "effort-map-ensemble",
+        "effort-map-ensemble-stream",
         "effort-map-group",
       ],
     });
@@ -209,6 +267,7 @@ describe("direct-model effort mapping", () => {
     await anthropic?.close();
     await openaiStream?.close();
     await anthropicStream?.close();
+    await ensembleStream?.close();
   });
 
   async function post(
@@ -244,6 +303,16 @@ describe("direct-model effort mapping", () => {
       .find((candidate) => candidate.path === path);
     expect(request).toBeDefined();
     return JSON.parse(request!.body) as Record<string, unknown>;
+  }
+
+  function chatRequestsSince(
+    upstream: OpenAiUpstream,
+    baseline: number,
+  ): Record<string, unknown>[] {
+    return upstream.receivedRequests
+      .slice(baseline)
+      .filter((request) => request.path === "/v1/chat/completions")
+      .map((request) => JSON.parse(request.body) as Record<string, unknown>);
   }
 
   test("maps every supported request shape on native and translated paths", async (ctx) => {
@@ -370,10 +439,34 @@ describe("direct-model effort mapping", () => {
       receivedSince(openai, baseline, "/v1/chat/completions")
         .reasoning_effort,
     ).toBe("low");
+
+    baseline = openai.receivedRequests.length;
+    await post("/v1/chat/completions", {
+      model: "effort-map-ensemble",
+      messages: [{ role: "user", content: "hello" }],
+      reasoning_effort: "medium",
+    });
+    const ensembleRequests = chatRequestsSince(openai, baseline);
+    expect(
+      ensembleRequests.find(
+        (request) => request.model === "glm-ensemble-panel-wire",
+      )?.reasoning_effort,
+    ).toBe("high");
+    expect(
+      ensembleRequests.find(
+        (request) => request.model === "glm-ensemble-judge-wire",
+      )?.reasoning_effort,
+    ).toBe("max");
   });
 
   test("maps native and translated streaming requests", async (ctx) => {
-    if (!etcdReachable || !app || !openaiStream || !anthropicStream) {
+    if (
+      !etcdReachable ||
+      !app ||
+      !openaiStream ||
+      !anthropicStream ||
+      !ensembleStream
+    ) {
       ctx.skip();
       return;
     }
@@ -405,5 +498,26 @@ describe("direct-model effort mapping", () => {
       receivedSince(anthropicStream, baseline, "/v1/messages")
         .output_config,
     ).toEqual({ effort: "high" });
+
+    baseline = ensembleStream.receivedRequests.length;
+    const ensembleResponse = await post("/v1/chat/completions", {
+      model: "effort-map-ensemble-stream",
+      messages: [{ role: "user", content: "hello" }],
+      reasoning_effort: "medium",
+      stream: true,
+    });
+    expect(ensembleResponse.contentType).toContain("text/event-stream");
+    expect(ensembleResponse.body).toContain("data:");
+    const ensembleRequests = chatRequestsSince(ensembleStream, baseline);
+    expect(
+      ensembleRequests.find(
+        (request) => request.model === "glm-ensemble-stream-panel-wire",
+      )?.reasoning_effort,
+    ).toBe("high");
+    expect(
+      ensembleRequests.find(
+        (request) => request.model === "glm-ensemble-stream-judge-wire",
+      )?.reasoning_effort,
+    ).toBe("max");
   });
 });
