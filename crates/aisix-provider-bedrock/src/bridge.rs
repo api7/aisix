@@ -4773,6 +4773,24 @@ mod forwarded_header_tests {
         );
     }
 
+    /// A credential slot is the one name the forward takes from the static
+    /// entry, here as on every other face. The signer-owned slots are
+    /// dropped from this list entirely (below), so the names this actually
+    /// reaches are the ones a Bedrock-compatible endpoint reads for itself.
+    #[test]
+    fn a_forwarded_credential_outranks_a_static_operator_one() {
+        for slot in ["x-api-key", "cookie", "api-key"] {
+            let r = overrides(&[(slot, "operator-static")], &[slot]);
+            let inbound = header_map(&[(slot, "callers-own")]);
+            let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
+            assert_eq!(
+                filtered_extra_headers(&ctx),
+                vec![(slot.to_string(), "callers-own".to_string())],
+                "{slot}"
+            );
+        }
+    }
+
     /// The SigV4 filter is this bridge's own, narrower rule: the signer
     /// DERIVES these headers, so a configured value cannot authenticate
     /// anyone here — unlike every other upstream, where naming a credential

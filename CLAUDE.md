@@ -101,6 +101,12 @@ Output HIGH/MEDIUM/LOW per finding with **concrete suggested code**, not vague "
 
 This repo is developed end-to-end by agents — no human reviewer needs small review units — and CodeRabbit bills and rate-limits **per PR**. Fanning one effort into many small PRs burns review quota and stalls the session on throttled bot reviews. Keep ONE open PR per session and push follow-up and related work to it as additional commits (rule and doc riders included) instead of opening another. Split only when a fix must merge independently ahead of the batch, or when the user asks for separate delivery.
 
+## A Behavior Change Is Stated in the PR Description
+
+**Release notes are assembled at release time from what the release contains, read as PR bodies rather than commit subjects — so a behavior change written nowhere but the diff never reaches users.** State it plainly in the description: what changed, what an existing configuration or caller experiences after upgrading, and whether anything has to be edited.
+
+This covers a validation that got stricter (an existing resource that no longer saves), a filter that got wider (a configured value that silently stops taking effect), a moved default, and any wire or schema reshape. Do not open a separate tracker for it — the PR body is the record.
+
 ## Handler Families Stay in Lockstep — Fix the Whole Class
 
 **The client-facing endpoint handlers come in families that share dispatch, auth, routing, telemetry, and guardrail logic — `/v1/chat/completions`, `/v1/messages` (+`count_tokens`), `/v1/responses`, plus embeddings/rerank/audio/images and the jobs surface (files/batches/fine-tuning). A bug or feature landed on one almost always applies to the others, and a gap on the unfixed siblings is SILENT: nothing errors, the behavior just quietly degrades.**
