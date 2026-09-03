@@ -7236,8 +7236,15 @@ data: [DONE]\n\n";
             .insert(pk_entry_with_id("pk-flaky", &flaky_upstream.uri()));
         snap.provider_keys
             .insert(pk_entry_with_id("pk-stable", &stable_upstream.uri()));
-        snap.models
-            .insert(model_entry_with_id("m-flaky", "primary", "pk-flaky"));
+        // Cooldown is opt-in (AISIX-Cloud#1499): the primary has to ask
+        // to be taken out of rotation. The subject is that a retryable
+        // failure on request 1 keeps it out on request 2.
+        let mut flaky = model_entry_with_id("m-flaky", "primary", "pk-flaky");
+        flaky.value.cooldown = Some(aisix_core::CooldownConfig {
+            enabled: Some(true),
+            ..Default::default()
+        });
+        snap.models.insert(flaky);
         snap.models
             .insert(model_entry_with_id("m-stable", "secondary", "pk-stable"));
         snap.models.insert(routing_entry(

@@ -112,10 +112,10 @@ pub struct BackgroundModelCheck {
     pub stale_after_seconds: u64,
 }
 
-/// Request-path cooldown settings for a direct model after retryable upstream failures.
+/// Request-path cooldown settings for a direct model after retryable upstream failures. Cooldown is opt-in: it runs only when `enabled` is `true`.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, Default)]
 pub struct CooldownConfig {
-    /// Whether cooldown is active for this model. Set to `false` to keep the model in rotation regardless of upstream failures.
+    /// Whether cooldown is active for this model. Cooldown is off unless this is set to `true`, so a model that omits it stays in rotation regardless of upstream failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     /// Cooldown TTL in seconds when the upstream did not supply a `Retry-After` header or `honor_retry_after` is `false`.
@@ -148,8 +148,13 @@ const DEFAULT_COOLDOWN_SECONDS: u64 = 30;
 const DEFAULT_COOLDOWN_MAX_SECONDS: u64 = 600;
 
 impl CooldownConfig {
-    pub fn enabled_or_default(&self) -> bool {
-        self.enabled.unwrap_or(true)
+    /// Cooldown is opt-in, so an absent `enabled` reads as `false` — the
+    /// same answer a model with no `cooldown` block at all gets. Taking a
+    /// direct model out of rotation is a user-visible availability
+    /// decision, and the gateway does not make it for an operator who
+    /// never asked (AISIX-Cloud#1499).
+    pub fn is_enabled(&self) -> bool {
+        self.enabled == Some(true)
     }
 
     pub fn default_seconds_or_default(&self) -> u64 {
@@ -302,7 +307,7 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_model_check: Option<BackgroundModelCheck>,
 
-    /// Direct-model-only request-path cooldown configuration. Omit this field to use the built-in cooldown behavior.
+    /// Direct-model-only request-path cooldown configuration. Cooldown is opt-in: omit this field, or leave `enabled` unset, and the model is never taken out of rotation by request-path failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown: Option<CooldownConfig>,
 
@@ -812,7 +817,10 @@ mod tests {
     #[test]
     fn cooldown_config_defaults_via_helpers() {
         let cfg = CooldownConfig::default();
-        assert!(cfg.enabled_or_default());
+        // Cooldown itself is opt-in; the knobs inside it keep their
+        // defaults, because those are parameters of a feature the
+        // operator turned on.
+        assert!(!cfg.is_enabled());
         assert_eq!(cfg.default_seconds_or_default(), 30);
         assert_eq!(cfg.max_seconds_or_default(), 600);
         assert!(cfg.honor_retry_after_or_default());
@@ -839,15 +847,22 @@ mod tests {
         let cfg: CooldownConfig = serde_json::from_str(r#"{"default_seconds": 90}"#).unwrap();
         assert_eq!(cfg.default_seconds_or_default(), 90);
         // Other fields fall back to defaults.
-        assert!(cfg.enabled_or_default());
         assert_eq!(cfg.max_seconds_or_default(), 600);
         assert!(cfg.honor_retry_after_or_default());
+        // …but tuning a knob is not enabling the feature: a block that
+        // never says `enabled: true` leaves cooldown off.
+        assert!(!cfg.is_enabled());
     }
 
     #[test]
-    fn cooldown_config_disable_via_enabled_false() {
-        let cfg: CooldownConfig = serde_json::from_str(r#"{"enabled": false}"#).unwrap();
-        assert!(!cfg.enabled_or_default());
+    fn cooldown_runs_only_when_the_operator_enables_it() {
+        // AISIX-Cloud#1499. Three ways to say "not asked for", one answer.
+        let absent: CooldownConfig = serde_json::from_str("{}").unwrap();
+        assert!(!absent.is_enabled());
+        let off: CooldownConfig = serde_json::from_str(r#"{"enabled": false}"#).unwrap();
+        assert!(!off.is_enabled());
+        let on: CooldownConfig = serde_json::from_str(r#"{"enabled": true}"#).unwrap();
+        assert!(on.is_enabled());
     }
 
     #[test]
@@ -873,9 +888,31 @@ mod tests {
         )
         .unwrap();
         let cooldown = m.cooldown.unwrap();
-        assert!(cooldown.enabled_or_default());
+        assert!(cooldown.is_enabled());
         assert_eq!(cooldown.default_seconds_or_default(), 45);
         assert_eq!(cooldown.effective_trigger_statuses().as_ref(), &[429, 503]);
+    }
+
+    #[test]
+    fn partial_cooldown_block_still_loads_the_row() {
+        // AISIX-Cloud#1499 turned an absent `enabled` from ON into OFF.
+        // That is a semantic change only: a stored row carrying a
+        // cooldown block written before the change must still
+        // deserialize, because a model row the loader cannot parse is
+        // skipped whole.
+        let m: Model = serde_json::from_str(
+            r#"{
+              "display_name": "my-gpt4",
+              "provider": "openai",
+              "model_name": "gpt-4o",
+              "provider_key_id": "11111111-1111-1111-1111-111111111111",
+              "cooldown": {"default_seconds": 60}
+            }"#,
+        )
+        .expect("a cooldown block without `enabled` must still load");
+        let cooldown = m.cooldown.expect("cooldown block preserved");
+        assert_eq!(cooldown.default_seconds_or_default(), 60);
+        assert!(!cooldown.is_enabled());
     }
 
     #[test]

@@ -224,7 +224,7 @@ describe("semantic router member gates e2e", () => {
     });
     await directModel("smg-open", await chatUpstream("served-open"));
     await directModel("smg-flaky", await chatUpstream("unused", { status: 500 }), {
-      cooldown: { default_seconds: 120 },
+      cooldown: { enabled: true, default_seconds: 120 },
     });
     await directModel("smg-t4-code", await chatUpstream("served-t4-code"));
     await directModel("smg-t4-default", await chatUpstream("served-t4-default"));

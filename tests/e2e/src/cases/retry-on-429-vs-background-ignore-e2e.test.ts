@@ -86,6 +86,8 @@ describe("retry_on_429 vs background ignore e2e", () => {
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: primaryPk.id,
+      // Cooldown is opt-in; the assertion below is on the cooldown row.
+      cooldown: { enabled: true },
       background_model_check: {
         enabled: true,
         interval_seconds: 5,
