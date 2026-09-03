@@ -1450,11 +1450,13 @@ async fn multipart_dispatch(
         // A response the gateway cannot decode is scanned as a lossy copy,
         // so the bytes `from_utf8_lossy` replaced reach the caller having
         // been read by nothing. Refuse when a member of the chain both
-        // reads the response AND fails closed on it — the same gate, and
-        // the same tag, the `/v1/messages` and `/mcp` output arms use.
-        // Otherwise the transcript is released unscreened in part, which is
-        // a bypass and is recorded as one; the decodable text is still
-        // scanned below, so only the undecodable bytes go unread.
+        // reads the response AND fails closed on it — the predicate and
+        // tag `/mcp`'s tool-result arm uses, and the response-side mirror
+        // of the one `/v1/messages` and `/v1/messages/count_tokens` apply
+        // to a request body they cannot parse. Otherwise the transcript is
+        // released unscreened in part, which is a bypass and is recorded
+        // as one; the decodable text is still scanned below, so only the
+        // undecodable bytes go unread.
         if scan.undecodable {
             if aisix_guardrails::Guardrail::refuses_unevaluable_output(&resolved_chain) {
                 tracing::warn!(
@@ -1564,8 +1566,8 @@ async fn multipart_dispatch(
     })
 }
 
-/// What the output guardrail chain gets to read, and whether that covers
-/// every byte the caller receives.
+/// What the output guardrail chain gets to read, and whether the
+/// plain-text fallback had to decode lossily to produce it.
 struct TranscriptScan {
     /// The caller-visible transcript text.
     text: String,
@@ -1573,6 +1575,12 @@ struct TranscriptScan {
     /// the bytes it replaced are relayed to the caller without any scan
     /// having seen them. The caller of this function decides what that
     /// costs — see the `refuses_unevaluable_output` gate above.
+    ///
+    /// This is narrower than "the scan covered every byte", and must not
+    /// be read as that invariant. A JSON body carrying neither `text` nor
+    /// `segments[].text` yields an empty transcript and reports `false`,
+    /// because nothing failed to decode — and here that is indistinguishable
+    /// from the empty transcript a silent recording legitimately returns.
     undecodable: bool,
 }
 
@@ -3856,8 +3864,8 @@ mod tests {
     /// A transcript the gateway cannot decode is scanned as a lossy copy,
     /// so the bytes `from_utf8_lossy` replaced would reach the caller read
     /// by nothing. With a guardrail on the response side that fails closed,
-    /// that is a refusal — the same gate `/v1/messages` and `/mcp` apply,
-    /// and the same `unscannable_body` tag.
+    /// that is a refusal, under `/mcp`'s predicate and the same
+    /// `unscannable_body` tag.
     #[tokio::test]
     async fn undecodable_transcript_is_refused_under_a_fail_closed_output_row() {
         let mut body = b"the transcript ends here: ".to_vec();
