@@ -783,9 +783,10 @@ pub struct SemanticConfig {
     /// traffic: a request that emits a usage event reports what it scored
     /// in `guardrail_scores`, including the requests this guardrail
     /// allowed. Not every surface can produce that sample. `/a2a`,
-    /// `rerank`, `/v1/embeddings`, `/v1/images/*`, `/v1/videos` and
-    /// `/v1/messages/count_tokens` run the INPUT hook only, so an
-    /// output-hook row scores nothing on them; `/a2a` also resolves no
+    /// `rerank`, `/v1/embeddings`, `/v1/images/*`, `/v1/videos`,
+    /// `/v1/audio/speech` and `/v1/messages/count_tokens` run the INPUT
+    /// hook only, so an output-hook row scores nothing on them (audio
+    /// transcription and translation do run both); `/a2a` also resolves no
     /// model and no MCP server, so only a row attached at the
     /// environment, API-key or team scope reaches it at all.
     // Defaulted at the TYPE level and required by the strict write schema
