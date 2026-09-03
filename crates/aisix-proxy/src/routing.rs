@@ -64,38 +64,6 @@ const FALLBACK_ALL_UNHEALTHY_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// conditions (overload, queue full, quota): a status in the list is
 /// retryable regardless of the default classification. Empty by default,
 /// which preserves the historical behavior exactly.
-/// One WARN per failed routing-target attempt, naming the target, the
-/// error, whether the loop will move on, and the `fallback_on_statuses`
-/// list that answer was computed against.
-///
-/// Kept in one place because the endpoint family had already drifted:
-/// `/v1/chat/completions` wrote this line on both its branches while
-/// `/v1/messages`, `/v1/responses` and `/v1/messages/count_tokens`
-/// emitted nothing at all on a failed attempt, at any level.
-///
-/// The status list is on the line because the retry/failover decision is
-/// not reconstructable without it. A group configured to fail over on an
-/// upstream 400, whose projected snapshot never carried the list, refuses
-/// to fail over and leaves exactly the trace a group with one reachable
-/// candidate leaves — one attempt, error class `upstream_status`
-/// (AISIX-Cloud#1499).
-pub(crate) fn log_attempt_failure(
-    target_model: &str,
-    attempt_number: usize,
-    err: &dyn std::fmt::Display,
-    retryable: bool,
-    fallback_on_statuses: &[u16],
-) {
-    tracing::warn!(
-        target_model = %target_model,
-        target_attempt = attempt_number,
-        error = %err,
-        retryable,
-        ?fallback_on_statuses,
-        "routing target attempt failed",
-    );
-}
-
 pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses: &[u16]) -> bool {
     match err {
         BridgeError::UpstreamStatus { status, .. } => {
@@ -148,6 +116,38 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
         | BridgeError::Config(_)
         | BridgeError::StreamAborted => true,
     }
+}
+
+/// One WARN per failed routing-target attempt, naming the target, the
+/// error, whether the loop will move on, and the `fallback_on_statuses`
+/// list that answer was computed against.
+///
+/// Kept in one place because the endpoint family had already drifted:
+/// `/v1/chat/completions` wrote this line on both its branches while
+/// `/v1/messages`, `/v1/responses` and `/v1/messages/count_tokens`
+/// emitted nothing at all on a failed attempt, at any level.
+///
+/// The status list is on the line because the retry/failover decision is
+/// not reconstructable without it. A group configured to fail over on an
+/// upstream 400, whose projected snapshot never carried the list, refuses
+/// to fail over and leaves exactly the trace a group with one reachable
+/// candidate leaves — one attempt, error class `upstream_status`
+/// (AISIX-Cloud#1499).
+pub(crate) fn log_attempt_failure(
+    target_model: &str,
+    attempt_number: usize,
+    err: &dyn std::fmt::Display,
+    retryable: bool,
+    fallback_on_statuses: &[u16],
+) {
+    tracing::warn!(
+        target_model = %target_model,
+        target_attempt = attempt_number,
+        error = %err,
+        retryable,
+        ?fallback_on_statuses,
+        "routing target attempt failed",
+    );
 }
 
 /// Base delay before the first same-target retry. Each subsequent retry
@@ -1289,7 +1289,7 @@ fn log_candidate_exclusions(
     excluded: &[ExcludedCandidate],
 ) {
     for ex in excluded {
-        if !runtime_status.should_log_exclusion(&ex.id, ex.reason) {
+        if !runtime_status.should_log_exclusion(virtual_name, &ex.id, ex.reason) {
             continue;
         }
         tracing::warn!(
@@ -2629,6 +2629,34 @@ mod tests {
                 assert_eq!(excluded[0].id, "a");
                 assert_eq!(excluded[0].model, "a");
                 assert_eq!(excluded[0].reason, EXCLUDED_COOLING);
+            }
+            _ => panic!("expected Selected"),
+        }
+    }
+
+    #[test]
+    fn healthy_survivor_reports_both_cooling_and_unhealthy_drops() {
+        // The three-or-more-target group, which is the common production
+        // shape: one healthy survivor, one cooling, one background-dead.
+        // Without this case the `extend` that appends the unhealthy
+        // drops could be deleted outright and every other filter test
+        // would still pass — the group would quietly lose a target with
+        // nothing naming it, which is the whole failure this record
+        // exists to remove.
+        let t = crate::ModelRuntimeStatusTracker::new();
+        t.mark_cooldown("b", Duration::from_secs(30), "x");
+        t.mark_unhealthy("c", Some(503), "background_check_failed");
+        let attempts = vec![am("a"), am("b"), am("c")];
+        match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::Fail) {
+            FilterOutcome::Selected { attempts, excluded } => {
+                assert_eq!(attempts.len(), 1);
+                assert_eq!(attempts[0].id, "a");
+                let mut got: Vec<(&str, &str)> = excluded
+                    .iter()
+                    .map(|e| (e.model.as_str(), e.reason))
+                    .collect();
+                got.sort_unstable();
+                assert_eq!(got, [("b", EXCLUDED_COOLING), ("c", EXCLUDED_UNHEALTHY)]);
             }
             _ => panic!("expected Selected"),
         }

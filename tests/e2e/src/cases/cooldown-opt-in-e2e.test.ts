@@ -182,10 +182,13 @@ describe("an enabled cooldown records the exclusion it causes", () => {
     });
     stable = await startOpenAiUpstream({ nonStreamBody: okBody("survivor-served") });
 
-    // Spawned at the harness default level. The lines asserted below
-    // have to be visible without an operator having raised verbosity in
-    // advance — nobody turns on debug before the incident.
-    app = await spawnApp({ admin: false });
+    // Pinned to the gateway's own production default
+    // (`observability.log_level: info`) rather than the harness default
+    // of `warn`, because the claim under test is that these lines are
+    // visible without an operator having raised verbosity in advance —
+    // nobody turns on debug before the incident. Passing it explicitly
+    // also keeps an ambient `RUST_LOG` from deciding the outcome.
+    app = await spawnApp({ admin: false, logLevel: "info" });
     admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
@@ -327,7 +330,7 @@ describe("every routing endpoint records a failed target attempt", () => {
       errorBody: { error: { message: "upstream down", type: "server_error" } },
     });
 
-    app = await spawnApp({ admin: false });
+    app = await spawnApp({ admin: false, logLevel: "info" });
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const openaiPk = await seed.createProviderKey({
@@ -356,6 +359,16 @@ describe("every routing endpoint records a failed target attempt", () => {
       model_name: "claude-3-5-haiku-20241022",
       provider_key_id: anthropicPk.id,
     });
+    // count_tokens gets a target of its own. Sharing one with
+    // /v1/messages would let either endpoint's line satisfy the
+    // assertion for both, and the endpoint whose emitter is not pinned
+    // alone is the one free to drift out again.
+    await seed.createModel({
+      display_name: "fam-count-tokens-target",
+      provider: "anthropic",
+      model_name: "claude-3-5-haiku-20241022",
+      provider_key_id: anthropicPk.id,
+    });
     await seed.createModel({
       display_name: "fam-openai-router",
       routing: {
@@ -372,9 +385,21 @@ describe("every routing endpoint records a failed target attempt", () => {
         max_fallbacks: 0,
       },
     });
+    await seed.createModel({
+      display_name: "fam-count-tokens-router",
+      routing: {
+        strategy: "failover",
+        targets: [{ model: "fam-count-tokens-target" }],
+        max_fallbacks: 0,
+      },
+    });
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
-      allowed_models: ["fam-openai-router", "fam-anthropic-router"],
+      allowed_models: [
+        "fam-openai-router",
+        "fam-anthropic-router",
+        "fam-count-tokens-router",
+      ],
     });
   });
 
@@ -407,7 +432,7 @@ describe("every routing endpoint records a failed target attempt", () => {
       messages: [{ role: "user", content: "hello" }],
     });
     await post("/v1/messages/count_tokens", {
-      model: "fam-anthropic-router",
+      model: "fam-count-tokens-router",
       messages: [{ role: "user", content: "hello" }],
     });
     await post("/v1/responses", {
@@ -419,15 +444,18 @@ describe("every routing endpoint records a failed target attempt", () => {
       .output()
       .split("\n")
       .filter((l) => l.includes("routing target attempt failed"));
-    // Each of the three requests failed on its group's only target, so
-    // each owes at least one line naming it.
-    expect(
-      failures.filter((l) => l.includes("fam-anthropic-target")).length,
-      `no attempt-failure line for the Anthropic-shape endpoints:\n${app.output()}`,
-    ).toBeGreaterThan(0);
-    expect(
-      failures.filter((l) => l.includes("fam-openai-target")).length,
-      `no attempt-failure line for /v1/responses:\n${app.output()}`,
-    ).toBeGreaterThan(0);
+    // Each of the three requests failed on its group's only target, and
+    // each target is addressed by exactly one endpoint — so every one of
+    // the three emitters is pinned on its own.
+    for (const [endpoint, target] of [
+      ["/v1/messages", "fam-anthropic-target"],
+      ["/v1/messages/count_tokens", "fam-count-tokens-target"],
+      ["/v1/responses", "fam-openai-target"],
+    ] as const) {
+      expect(
+        failures.filter((l) => l.includes(target)).length,
+        `no attempt-failure line for ${endpoint}:\n${app.output()}`,
+      ).toBeGreaterThan(0);
+    }
   });
 });
