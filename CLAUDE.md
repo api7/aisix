@@ -195,6 +195,14 @@ Anchor on a release that has **already shipped**, never on a guess at the next v
 
 `crates/aisix-core/tests/compat_debt.rs` is the gate. It runs in the required `rust unit + coverage` job on every PR, and fails once a stable tag with a higher `MAJOR.MINOR` than the anchor exists; release candidates never count as shipped, and a patch on the anchor's own line does not come due. When it fires, either remove the code and its marker and close the tracking issue, or re-anchor deliberately to the newest release and say why in the issue. Full rules, including how a `release/X.Y` maintenance line is scoped, live in that file's module docs.
 
+## An Absent Config Block Means Off
+
+**An optional block on a projected resource must resolve, when absent, to the feature being off — and so must the block's own `enabled` flag when the operator wrote the block and omitted the flag.** A default that switches behavior on instead is not visible from either end: the console renders the block from the stored document and shows a block nobody wrote as disabled, so the first sign is the behavior.
+
+Three things this does not govern. The other knobs inside a block whose `enabled` was set. A resource ROW's own `enabled`, which every collection defaults to `true` — creating the row is the opt-in. And a fail-closed default, which restricts rather than enables. The startup `Config` is a separate contract: an absent `observability:` block still binds the metrics listener, deliberately.
+
+Say what omitting the block means in `cp-admin.yaml` — the spec the published API reference renders, and the one artifact both planes read. (Precedent: `cooldown` — AISIX-Cloud#1499.)
+
 ## A Retired Startup-Config Key Is Tombstoned, Never Deleted
 
 **`Config` and its blocks are `deny_unknown_fields`, so deleting a startup-config field stops every gateway whose `config.yaml` still carries it from booting** — including everyone who copied it out of `config.example.yaml` and never turned it on. Removing the key is a far larger break than the dead setting ever was.
