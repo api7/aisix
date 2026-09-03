@@ -317,13 +317,17 @@ describe("files: an unscannable upload is refused, not forwarded", () => {
     // still blocks. This is the leg that fails if someone "fixes" the
     // regression by skipping the chain for non-text purposes instead of
     // narrowing the refusal.
+    //
+    // The term sits AFTER the invalid bytes on purpose: scanning only the
+    // valid UTF-8 prefix would miss it, and that is the shape a real
+    // evasion takes — a few bad bytes up front, the payload behind them.
     const before = guarded.upstream.uploads.length;
     const res = await upload(
       guarded,
       Buffer.concat([
-        Buffer.from(`{"note":"${BLOCKED_TERM}","x":"`, "utf8"),
+        Buffer.from('{"x":"', "utf8"),
         Buffer.from([0xc4, 0xe3, 0xba, 0xc3]),
-        Buffer.from('"}\n', "utf8"),
+        Buffer.from(`","note":"${BLOCKED_TERM}"}\n`, "utf8"),
       ]),
       "assistants",
     );

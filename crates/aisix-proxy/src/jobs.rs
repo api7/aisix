@@ -450,8 +450,10 @@ async fn send_upstream(
 /// Purposes whose uploaded payload is contractually UTF-8 text, and so the
 /// only ones under which a blob the scanner cannot decode is refused.
 ///
-/// `batch` and `fine-tune` take JSONL; an eval data set referenced by file
-/// id is a JSONL source too. The remaining upload purposes — `assistants`,
+/// `batch` and `fine-tune` take JSONL, and so does an eval data set: every
+/// eval run data source that accepts a file id declares that file to be a
+/// JSONL source, with no binary variant. The remaining upload purposes of
+/// the six a caller may declare — `assistants`,
 /// `vision`, `user_data` — legitimately carry binary (a PDF, an image, or
 /// "any purpose" respectively), so an undecodable blob there is a normal
 /// upload rather than an evasion. This route never validates `purpose`:
@@ -1828,7 +1830,9 @@ async fn forward_simple(
                 &auth,
                 &target,
                 body,
-                // As above: `spec.body` is a re-serialised JSON body.
+                // No caller sets `spec.body` today, so this is unreachable
+                // too; if one ever does it will be a re-serialised JSON
+                // body, which makes text the right posture for it.
                 Undecodable::Refuse,
                 &mut monitor_hits,
                 &mut enforced_hits,
@@ -3238,8 +3242,12 @@ mod tests {
         let app = build_app(snap);
 
         // The term is ASCII, so it survives `from_utf8_lossy` intact even
-        // though the blob as a whole does not decode.
-        let blob: &[u8] = b"forbidden-term \xc4\xe3\xba\xc3 trailing";
+        // though the blob as a whole does not decode. It sits AFTER the
+        // invalid bytes deliberately: scanning only the valid prefix (a
+        // natural-looking "optimisation" of the lossy decode) would miss
+        // it, and that is the shape a real evasion takes — a few bad bytes
+        // up front, the payload behind them.
+        let blob: &[u8] = b"leading \xc4\xe3\xba\xc3 forbidden-term trailing";
         let resp = app
             .oneshot(upload_request_with_purpose(
                 "XBOUNDARYX",
