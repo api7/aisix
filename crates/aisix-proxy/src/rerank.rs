@@ -562,12 +562,14 @@ async fn dispatch(
     // forward raw bytes downstream — preserves any provider-specific
     // fields (Cohere `meta.api_version`, Jina-specific fields, etc.)
     // that the JSON round-trip would otherwise re-format. A parse
-    // failure here is non-fatal: we just skip emission rather than
-    // failing the request. Audit HIGH: log the parse failure so a
-    // silent billing gap is visible in operator dashboards (the
-    // upstream returned 200 + claimed JSON but the body was
-    // unparseable — this is upstream-malformed, not gateway-bug,
-    // but operators need to see it).
+    // failure here is non-fatal: the request still succeeds, and it
+    // still leaves a usage event whenever a guardrail attributed the
+    // request — only an unattributed one goes unrecorded, which is what
+    // keeps a zero-everything noise row off the ledger. Audit HIGH: log
+    // the parse failure so a silent billing gap is visible in operator
+    // dashboards (the upstream returned 200 + claimed JSON but the body
+    // was unparseable — this is upstream-malformed, not gateway-bug, but
+    // operators need to see it).
     let (usage, provider_request_id) = match serde_json::from_slice::<Value>(&body_bytes) {
         Ok(v) => (
             extract_rerank_usage(&v),
@@ -578,7 +580,7 @@ async fn dispatch(
                 request_id = %request_id,
                 model = %model_name,
                 error = %e,
-                "rerank: upstream body parse failed; skipping UsageEvent emission"
+                "rerank: upstream body parse failed; no usage counts to attribute"
             );
             (None, String::new())
         }

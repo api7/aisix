@@ -1443,12 +1443,35 @@ async fn multipart_dispatch(
     // above), so a block returns the redacted 422 while keeping the billed
     // usage marked `guardrail_blocked` — same as completions #911 [23].
     if aisix_guardrails::Guardrail::runs_on_output(&resolved_chain) {
-        let transcript = transcription_output_text(&body_bytes);
-        if !transcript.is_empty() {
+        let scan = transcription_output_text(&body_bytes);
+        // `(guardrail_name, unavailable)` for the refusal to answer with,
+        // set by either arm below so the two share one exit.
+        let mut refusal: Option<(Option<String>, Option<String>)> = None;
+        // A response the gateway cannot decode is scanned as a lossy copy,
+        // so the bytes `from_utf8_lossy` replaced reach the caller having
+        // been read by nothing. Refuse when a member of the chain both
+        // reads the response AND fails closed on it — the same gate, and
+        // the same tag, the `/v1/messages` and `/mcp` output arms use.
+        // Otherwise the transcript is released unscreened in part, which is
+        // a bypass and is recorded as one; the decodable text is still
+        // scanned below, so only the undecodable bytes go unread.
+        if scan.undecodable {
+            if aisix_guardrails::Guardrail::refuses_unevaluable_output(&resolved_chain) {
+                tracing::warn!(
+                    guardrail_hook = "output",
+                    model = %model_name,
+                    "cannot decode audio transcript response for guardrails; blocking",
+                );
+                refusal = Some((None, Some(crate::error::TAG_UNSCANNABLE_BODY.to_owned())));
+            } else {
+                resolved_chain.record_unevaluable_output_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+            }
+        }
+        if refusal.is_none() && !scan.text.is_empty() {
             let synth = ChatResponse {
                 id: String::new(),
                 model: model_name.clone(),
-                message: ChatMessage::assistant(transcript),
+                message: ChatMessage::assistant(scan.text),
                 finish_reason: FinishReason::Stop,
                 usage: UsageStats::default(),
             };
@@ -1468,30 +1491,33 @@ async fn multipart_dispatch(
                     reason = %reason,
                     "guardrail blocked audio transcript response",
                 );
-                return Ok(AudioDispatchSuccess {
-                    usage_handled_by_stream: false,
-                    response: crate::error::guardrail_block_error(
-                        "response",
-                        guardrail_name.as_deref(),
-                        unavailable.as_deref(),
-                    )
-                    .into_response(),
-                    model_name,
-                    provider: provider_label,
-                    model_id: model_entry.id.to_string(),
-                    provider_key_id: pk_entry.id.to_string(),
-                    upstream_model: upstream_model.clone(),
-                    usage,
-                    duration_seconds,
-                    applied_guardrails,
-                    redactions,
-                    monitor_hits: monitor_hits.clone(),
-                    guardrail_blocked: true,
-                    // The blocked transcript never reached the client — no
-                    // content capture, matching the chat surface.
-                    captured_content: None,
-                });
+                refusal = Some((guardrail_name, unavailable));
             }
+        }
+        if let Some((guardrail_name, unavailable)) = refusal {
+            return Ok(AudioDispatchSuccess {
+                usage_handled_by_stream: false,
+                response: crate::error::guardrail_block_error(
+                    "response",
+                    guardrail_name.as_deref(),
+                    unavailable.as_deref(),
+                )
+                .into_response(),
+                model_name,
+                provider: provider_label,
+                model_id: model_entry.id.to_string(),
+                provider_key_id: pk_entry.id.to_string(),
+                upstream_model: upstream_model.clone(),
+                usage,
+                duration_seconds,
+                applied_guardrails,
+                redactions,
+                monitor_hits: monitor_hits.clone(),
+                guardrail_blocked: true,
+                // The blocked transcript never reached the client — no
+                // content capture, matching the chat surface.
+                captured_content: None,
+            });
         }
     }
 
@@ -1538,12 +1564,27 @@ async fn multipart_dispatch(
     })
 }
 
+/// What the output guardrail chain gets to read, and whether that covers
+/// every byte the caller receives.
+struct TranscriptScan {
+    /// The caller-visible transcript text.
+    text: String,
+    /// The response is not valid UTF-8, so `text` is a lossy rendering:
+    /// the bytes it replaced are relayed to the caller without any scan
+    /// having seen them. The caller of this function decides what that
+    /// costs — see the `refuses_unevaluable_output` gate above.
+    undecodable: bool,
+}
+
 /// The caller-visible transcript text for output-guardrail scanning (#696):
 /// the JSON `text` field plus `segments[].text` (`json` / `verbose_json`
 /// response formats — segments are scanned too so a response carrying text
 /// only in segments can't bypass the check), or the raw body for the
 /// plain-text formats (`text` / `srt` / `vtt`).
-fn transcription_output_text(body: &[u8]) -> String {
+///
+/// A JSON body is decodable by construction — `serde_json` produced the
+/// strings — so only the plain-text fallback can report otherwise.
+fn transcription_output_text(body: &[u8]) -> TranscriptScan {
     if let Ok(json) = serde_json::from_slice::<Value>(body) {
         let mut parts: Vec<&str> = Vec::new();
         if let Some(t) = json.get("text").and_then(|t| t.as_str()) {
@@ -1556,9 +1597,21 @@ fn transcription_output_text(body: &[u8]) -> String {
                     .filter_map(|s| s.get("text").and_then(|t| t.as_str())),
             );
         }
-        return parts.join("\n");
+        return TranscriptScan {
+            text: parts.join("\n"),
+            undecodable: false,
+        };
     }
-    String::from_utf8_lossy(body).into_owned()
+    match std::str::from_utf8(body) {
+        Ok(text) => TranscriptScan {
+            text: text.to_owned(),
+            undecodable: false,
+        },
+        Err(_) => TranscriptScan {
+            text: String::from_utf8_lossy(body).into_owned(),
+            undecodable: true,
+        },
+    }
 }
 
 /// JSON passthrough for `/v1/audio/speech` — returns binary audio bytes.
@@ -3732,6 +3785,174 @@ mod tests {
         assert!(event.guardrail_blocked, "event must be marked blocked");
         assert_eq!(event.prompt_tokens, 21, "billed tokens must be kept");
         assert_eq!(event.completion_tokens, 7);
+    }
+
+    fn keyword_output_guardrail_fail_open(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {
+        let json = format!(
+            r#"{{"name":"t-out-open","enabled":true,"hook_point":"output","fail_open":true,"kind":"keyword","patterns":[{{"kind":"literal","value":"{literal}"}}]}}"#
+        );
+        let g: aisix_core::Guardrail = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("g-out-open", g, 1)
+    }
+
+    /// `response_format=text`, i.e. the transcription shape whose response
+    /// is a bare transcript rather than JSON.
+    fn transcription_multipart_text_format(model: &str) -> (String, axum::body::Body) {
+        let body = format!(
+            "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\ntext\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\
+             Content-Type: audio/mpeg\r\n\r\nID3fakeaudio\r\n--b--\r\n"
+        );
+        (
+            "multipart/form-data; boundary=b".to_string(),
+            axum::body::Body::from(body),
+        )
+    }
+
+    /// Drive one `response_format=text` transcription whose upstream answers
+    /// with `body`, under `guardrail`. Returns the response status, the
+    /// relayed bytes and the UsageEvent.
+    async fn plain_text_transcript_case(
+        body: Vec<u8>,
+        guardrail: ResourceEntry<aisix_core::Guardrail>,
+    ) -> (StatusCode, axum::body::Bytes, aisix_obs::UsageEvent) {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_bytes(body),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-whisper"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, guardrail);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, form) = transcription_multipart_text_format("my-whisper");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(form)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a transcription always emits a UsageEvent")
+            .expect("usage_sink sender dropped");
+        (status, bytes, event)
+    }
+
+    /// A transcript the gateway cannot decode is scanned as a lossy copy,
+    /// so the bytes `from_utf8_lossy` replaced would reach the caller read
+    /// by nothing. With a guardrail on the response side that fails closed,
+    /// that is a refusal — the same gate `/v1/messages` and `/mcp` apply,
+    /// and the same `unscannable_body` tag.
+    #[tokio::test]
+    async fn undecodable_transcript_is_refused_under_a_fail_closed_output_row() {
+        let mut body = b"the transcript ends here: ".to_vec();
+        body.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+        let (status, bytes, event) =
+            plain_text_transcript_case(body.clone(), keyword_output_guardrail("NOMATCH")).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+        assert_eq!(v["error"]["code"], "guardrail_unavailable");
+        assert_eq!(
+            v["error"]["message"],
+            format!(
+                "response rejected: a guardrail could not evaluate it ({})",
+                crate::error::TAG_UNSCANNABLE_BODY
+            )
+        );
+        assert!(
+            !bytes.starts_with(b"the transcript ends here"),
+            "the unscanned transcript must not be relayed"
+        );
+        assert!(event.guardrail_blocked, "the refusal is a guardrail block");
+        assert_eq!(
+            event.guardrail_bypassed_reason, "",
+            "a refusal is not a bypass"
+        );
+    }
+
+    /// The same body under a row that fails OPEN on the response side: the
+    /// operator asked to be served rather than screened, so the transcript
+    /// is relayed byte-for-byte — and the fact that part of it went unread
+    /// is recorded, under the tag the fail-closed direction refuses with.
+    #[tokio::test]
+    async fn undecodable_transcript_under_a_fail_open_output_row_records_the_bypass() {
+        let mut body = b"the transcript ends here: ".to_vec();
+        body.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+        let (status, bytes, event) =
+            plain_text_transcript_case(body.clone(), keyword_output_guardrail_fail_open("NOMATCH"))
+                .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            bytes.as_ref(),
+            body.as_slice(),
+            "a fail-open row relays the upstream bytes unchanged"
+        );
+        assert!(!event.guardrail_blocked);
+        assert_eq!(
+            event.guardrail_bypassed_reason,
+            crate::error::TAG_UNSCANNABLE_BODY,
+            "releasing a partly unread transcript is a bypass and must say so"
+        );
+    }
+
+    /// A `response_format=text` transcript that IS valid UTF-8 is fully
+    /// scannable, so the gate must not fire on it: it is scanned, allowed
+    /// and relayed with nothing recorded as bypassed, even under the
+    /// fail-closed row that refuses the undecodable one.
+    #[tokio::test]
+    async fn decodable_plain_text_transcript_is_scanned_and_relayed() {
+        let body = b"the transcript ends here, in full".to_vec();
+        let (status, bytes, event) =
+            plain_text_transcript_case(body.clone(), keyword_output_guardrail("NOMATCH")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bytes.as_ref(), body.as_slice());
+        assert!(!event.guardrail_blocked);
+        assert_eq!(
+            event.guardrail_bypassed_reason, "",
+            "a body the guardrail could read is not a bypass"
+        );
+    }
+
+    /// Failing open on what could not be read is not failing open on what
+    /// could: the lossy text is still scanned, so a fail-open row blocks on
+    /// a literal in the decodable part rather than releasing it. The bypass
+    /// is recorded alongside the block, because the undecodable tail went
+    /// unread either way.
+    #[tokio::test]
+    async fn fail_open_row_still_blocks_on_the_decodable_part() {
+        let mut body = b"the secret word is BLOCKME".to_vec();
+        body.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+        let (status, bytes, event) =
+            plain_text_transcript_case(body, keyword_output_guardrail_fail_open("BLOCKME")).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+        assert!(event.guardrail_blocked);
+        assert_eq!(
+            event.guardrail_bypassed_reason,
+            crate::error::TAG_UNSCANNABLE_BODY,
+            "the undecodable tail went unread even though the rest blocked"
+        );
     }
 
     /// #998: `stream=true` must not become a way around the output
