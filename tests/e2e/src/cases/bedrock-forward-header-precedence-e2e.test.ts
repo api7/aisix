@@ -134,7 +134,10 @@ describe("bedrock header precedence e2e", () => {
       const res = await fetch(`${app!.proxyUrl}/v1/models`, {
         headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
       });
-      if (res.status !== 200) return false;
+      if (res.status !== 200) {
+        await res.text();
+        return false;
+      }
       const body = (await res.json()) as { data?: Array<{ id?: string }> };
       return (body.data ?? []).some((m) => m.id === MODEL);
     });
@@ -166,7 +169,14 @@ describe("bedrock header precedence e2e", () => {
     const invoke = bedrock.received.find((r) =>
       r.path.includes("/model/amazon.titan-embed-text-v1/invoke"),
     );
-    expect(invoke, `no invoke recorded: ${JSON.stringify(bedrock.received)}`).toBeDefined();
+    // Names, not values: the recorded headers carry the SigV4 signature
+    // and the forwarded credential slot, and a failure message is enough
+    // to diagnose a missing invoke without either.
+    const recorded = bedrock.received.map((r) => ({
+      path: r.path,
+      headerNames: Object.keys(r.headers).sort(),
+    }));
+    expect(invoke, `no invoke recorded: ${JSON.stringify(recorded)}`).toBeDefined();
 
     // The slot the operator opted in: the caller's own value, alone.
     expect(invoke!.headers[CREDENTIAL_SLOT]).toBe("session=callers-own");
