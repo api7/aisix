@@ -982,7 +982,13 @@ pub(crate) async fn create_file(
         let mut file_bytes: Option<Bytes> = None;
         // Read but not consumed: `purpose` forwards verbatim like any other
         // text field, and only classifies the blob for the scan below.
-        let mut purpose: Option<String> = None;
+        //
+        // Folded rather than overwritten, so a body declaring `purpose`
+        // more than once takes the STRICTER reading. Such a body is
+        // malformed and the provider picks whichever part it picks; taking
+        // the last one would let a caller append a binary purpose after a
+        // text one to pick the looser reading for us.
+        let mut undecodable = Undecodable::ScanLossily;
 
         while let Some(field) = multipart.next_field().await.map_err(|e| {
             crate::error::proxy_error_from_multipart(
@@ -1032,8 +1038,8 @@ pub(crate) async fn create_file(
                     "malformed multipart field",
                 )
             })?;
-            if name == "purpose" {
-                purpose = Some(v.clone());
+            if name == "purpose" && undecodable_posture(Some(v.as_str())) == Undecodable::Refuse {
+                undecodable = Undecodable::Refuse;
             }
             form = form.text(name, v);
         }
@@ -1054,7 +1060,7 @@ pub(crate) async fn create_file(
             &auth,
             &target,
             &file_bytes,
-            undecodable_posture(purpose.as_deref()),
+            undecodable,
             &mut monitor_hits,
             &mut enforced_hits,
             &mut scores,
@@ -3124,6 +3130,60 @@ mod tests {
                 .windows(NON_UTF8_UPLOAD.len())
                 .any(|w| w == NON_UTF8_UPLOAD),
             "a binary-purpose upload must still forward byte-for-byte"
+        );
+    }
+
+    /// A body declaring `purpose` more than once is malformed, and the
+    /// provider picks whichever part it picks — so the classification takes
+    /// the stricter reading rather than the last one written. Ordered
+    /// text-then-binary, which is the order that would pick `ScanLossily`
+    /// if the field were simply overwritten.
+    #[tokio::test]
+    async fn duplicate_purpose_fields_take_the_stricter_reading() {
+        let upstream = MockServer::start().await;
+        files_upstream_mock().expect(0).mount(&upstream).await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        seed_never_matching_guardrail(&snap);
+        let app = build_app(snap);
+
+        let boundary = "XBOUNDARYX";
+        let mut body =
+            multipart_body_with_purpose(boundary, Some("jobs-a"), Some("batch"), NON_UTF8_UPLOAD);
+        // Splice a second, binary `purpose` part in after the first: the
+        // closing delimiter is rewritten into another part.
+        let closing = format!("--{boundary}--\r\n");
+        let extra = format!(
+            "--{boundary}\r\ncontent-disposition: form-data; \
+             name=\"purpose\"\r\n\r\nassistants\r\n--{boundary}--\r\n"
+        );
+        let at = body.len() - closing.len();
+        body.truncate(at);
+        body.extend_from_slice(extra.as_bytes());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/files")
+            .header("authorization", "Bearer sk-caller")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(crate::error::TAG_UNSCANNABLE_BODY),
+            "{v}"
         );
     }
 
