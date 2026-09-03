@@ -197,9 +197,11 @@ Anchor on a release that has **already shipped**, never on a guess at the next v
 
 ## An Absent Config Block Means Off
 
-**An optional block's absence must mean the feature is off — including the block's own `enabled` flag, when the operator wrote the block and omitted the flag.** Neither the console nor the request path reveals a default that switches user-visible behavior on, so the first sign of one is the behavior. The block's other knobs keep their defaults, and a security control still defaults fail-closed: restricting is not enabling.
+**An optional block on a projected resource must resolve, when absent, to the feature being off — and so must the block's own `enabled` flag when the operator wrote the block and omitted the flag.** A default that switches behavior on instead is not visible from either end: the console renders the block from the stored document and shows a block nobody wrote as disabled, so the first sign is the behavior.
 
-State what omitting the block means in the field's own description and in `cp-admin.yaml`. (Precedent: `cooldown` — AISIX-Cloud#1499.)
+Three things this does not govern. The other knobs inside a block whose `enabled` was set. A resource ROW's own `enabled`, which every collection defaults to `true` — creating the row is the opt-in. And a fail-closed default, which restricts rather than enables. The startup `Config` is a separate contract: an absent `observability:` block still binds the metrics listener, deliberately.
+
+Say what omitting the block means in `cp-admin.yaml` — the spec the published API reference renders, and the one artifact both planes read. (Precedent: `cooldown` — AISIX-Cloud#1499.)
 
 ## A Retired Startup-Config Key Is Tombstoned, Never Deleted
 
