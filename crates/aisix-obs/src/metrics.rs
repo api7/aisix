@@ -206,22 +206,37 @@ pub const M_BUDGET_DETAILS_PRESENT: &str = "aisix_budget_details_present";
 pub const M_REDIS_FAILURES_TOTAL: &str = "aisix_redis_failures_total";
 pub const M_USAGE_EVENT_DROPS_TOTAL: &str = "aisix_usage_event_drops_total";
 /// Guardrail outcomes (#379 observability). `aisix_guardrail_blocks_total`
-/// counts requests rejected by guardrail enforcement, including fail-closed
+/// counts REQUESTS rejected by guardrail enforcement, including fail-closed
 /// paths such as a streaming buffer overflow that happen before a guardrail
-/// member executes. `aisix_guardrail_bypasses_total` is its fail-OPEN
-/// counterpart and covers the same two shapes: a member that executed and
-/// was bypassed — a remote-API guardrail's upstream was unreachable but
-/// `fail_open` let the request through — and a bypass that happens before
-/// any member executes, a body the gateway could not give the guardrails
-/// at all (`unscannable_body`, #1115). Both are sliced by the bounded
-/// DP-internal `reason` (e.g. `bedrock_5xx` / `bedrock_timeout` /
-/// `bedrock_throttled` / `unscannable_body`).
+/// member executes.
 ///
-/// The two counters cover the pre-execution case symmetrically on
-/// purpose: one situation — the body could not be scanned — is a block
-/// when the chain fails closed and a bypass when it fails open, and an
-/// operator reads `bypasses_total` to size how much unscreened traffic
-/// got through.
+/// `aisix_guardrail_bypasses_total` counts fail-OPEN EVENTS, sliced by the
+/// bounded DP-internal `reason` (e.g. `bedrock_5xx` / `bedrock_timeout` /
+/// `bedrock_throttled` / `unscannable_body`). Two producers reach it: a
+/// member that executed and was bypassed — a remote-API guardrail's
+/// upstream was unreachable but `fail_open` let the request through — and
+/// a bypass the proxy records with no member execution behind it, an
+/// unscannable body a fail-open chain let through (#1115). The second
+/// producer reaches THIS counter only: with no execution there is no
+/// `aisix_guardrail_latency_seconds` row, so that family's
+/// `result="bypassed"` slice stays execution-only and the two no longer
+/// agree on a total.
+///
+/// The two are NOT the same unit and must not be compared or summed.
+/// `blocks_total` fires once per request, off the terminal usage event;
+/// `bypasses_total` fires once per bypass event, so one outage on a chain
+/// with two fail-open members attached to both hooks adds 4 for a single
+/// request. Read it as "how many screenings were skipped", never as a
+/// count of requests that went unscreened.
+///
+/// The pre-execution case is deliberately symmetric across the two: the
+/// same unscannable body is a block when the chain fails closed and a
+/// bypass when it fails open. It is not the whole of "the gateway could
+/// not scan this", though — the sites that scan a lossy copy
+/// unconditionally, with no failure policy involved
+/// (`jobs::scan_output_blob`, `passthrough_route`), record nothing by
+/// design, so a zero here is not proof that nothing went unread. The set
+/// and its rationale live in `crates/aisix-proxy/AGENTS.md`.
 pub const M_GUARDRAIL_BLOCKS_TOTAL: &str = "aisix_guardrail_blocks_total";
 pub const M_GUARDRAIL_BYPASSES_TOTAL: &str = "aisix_guardrail_bypasses_total";
 

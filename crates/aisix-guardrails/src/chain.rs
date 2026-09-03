@@ -186,9 +186,16 @@ impl GuardrailChain {
     /// The audit log keeps the first tag only — it feeds a single
     /// per-request field. The metrics sink counts every call, matching
     /// `aisix_guardrail_bypasses_total`'s per-event meaning on the
-    /// execution-driven path. The two cannot double-count: a bypass
-    /// recorded here had no execution to report, and `record_execution`
-    /// reaches the counter through the sink's execution method instead.
+    /// execution-driven path, where a chain with three bypassed members
+    /// already increments three times.
+    ///
+    /// No event is counted twice: a bypass recorded here had no execution
+    /// to report, and `record_execution` reaches the counter through the
+    /// sink's execution method instead. One REQUEST can still produce
+    /// both, and legitimately — `audio.rs` records an undecodable
+    /// transcript tail here and then scans the decodable remainder, whose
+    /// members may themselves fail open. Those are two things that went
+    /// unscreened, not one counted twice.
     ///
     /// Counting here rather than only auditing is what keeps
     /// `aisix_guardrail_bypasses_total` symmetric with
