@@ -154,17 +154,22 @@ unscannable sites as the full set: the places that scan a mangled copy
 unconditionally, with no failure policy involved. `jobs::scan_output_blob`
 and the binary-purpose arm of `scan_input_blob` scan
 `String::from_utf8_lossy` and relay the original bytes whatever the row
-says; `audio.rs` and `images_edits.rs` drop non-UTF-8 multipart prompt
-parts with `filter_map`; `passthrough_route` scans the lossy body. None of
-these consults `refuses_unevaluable_*`, so a fail-CLOSED row does not
-refuse there either — that asymmetry is #1022's open product decision, not
-something telemetry can paper over, and making them refuse is a behaviour
-change rather than an observability one. Tagging them instead would fire
-the field on every binary upload and download, which destroys the negative
-answer just as thoroughly. Note that `record_unevaluable_*` is the wrong
-helper at such a site: its predicate assumes the fail-closed case was
-already refused, so at a site that never refuses it would silently drop
-exactly the case worth reporting.
+says; `passthrough_route` scans the lossy body. None of these consults
+`refuses_unevaluable_*`, so a fail-CLOSED row does not refuse there either
+— that asymmetry is settled rather than pending (the section below rules on
+the download side), and making them refuse would be a behaviour change, not
+an observability one. Tagging them instead would fire the field on every
+binary upload and download, which destroys the negative answer just as
+thoroughly. Note that `record_unevaluable_*` is the wrong helper at such a
+site: its predicate assumes the fail-closed case was already refused, so at
+a site that never refuses it would silently drop exactly the case worth
+reporting.
+
+`audio.rs` and `images_edits.rs` are NOT in that set: since #1016 both call
+`dispatch::require_utf8_prompt_fields` after model resolution and before the
+chain runs, so an undecodable `prompt` part is answered 400 and the
+`filter_map` in their scan builders can no longer be reached by one. Do not
+describe those surfaces as silently dropping non-UTF-8 prompt parts.
 
 Values come from the guardrail kind's own `bypass_tag()` — the same bounded
 vocabulary `GuardrailVerdict::block_unavailable` carries, so one outage reads
@@ -172,6 +177,20 @@ the same whichever way the row is configured — plus `unscannable_body` for
 the proxy-raised pass. The audit log clamps whatever it is given through
 `bounded_failure_tag`, because the value lands on an unsanitized metric
 label and on a wire field the control plane stores as `varchar(64)`.
+
+## The `/v1/files` download blob is scanned lossily and never refused, by decision
+
+`jobs::scan_output_blob` decodes the downloaded blob with
+`String::from_utf8_lossy`, relays the provider's bytes verbatim, and does not
+consult `refuses_unevaluable_output` — so no row, fail-closed or not, makes it
+refuse. That is deliberate, not an oversight: a download carries arbitrary
+provider-side bytes the caller did not choose the content of, so refusing an
+undecodable body would reject legitimate downloads. The upload side does refuse
+(#1113/#1114/#1115) because those are the caller's own bytes and its text
+purposes are contractually UTF-8.
+
+Do not mirror the input-side `match` here, and do not report the asymmetry as a
+finding or file an issue for it.
 
 ## Every terminal path emits the access log — including the ones that give up early
 
