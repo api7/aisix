@@ -27,7 +27,10 @@ import {
 const KEY = "sk-files-guardrail-scope";
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
-/** The term the attached row blocks on. It is in every fixture below. */
+/** The one term the attached row blocks on. It is in every fixture below,
+ *  and the `/v1/batches` leg is what proves it still matches — without that
+ *  the forwarding legs would pass just as well against a pattern that had
+ *  quietly stopped matching anything. */
 const BLOCKED_TERM = "zzz-blocked-term-zzz";
 
 /** A blob that is both a policy hit and undecodable: `0xC4` opens a
@@ -51,12 +54,7 @@ const guardrail = {
   hook_point: "both",
   fail_open: false,
   kind: "keyword",
-  patterns: [
-    { kind: "literal", value: BLOCKED_TERM },
-    // Present in the outbound `/v1/batches` body, which is what the last
-    // leg refuses on.
-    { kind: "literal", value: "completion_window" },
-  ],
+  patterns: [{ kind: "literal", value: BLOCKED_TERM }],
 };
 
 interface JobsUpstream {
@@ -278,6 +276,7 @@ describe("files: the surface is not guardrail-screened", () => {
         input_file_id: uploaded.id,
         endpoint: "/v1/chat/completions",
         completion_window: "24h",
+        metadata: { note: BLOCKED_TERM },
       }),
     });
     expect(res.status).toBe(422);

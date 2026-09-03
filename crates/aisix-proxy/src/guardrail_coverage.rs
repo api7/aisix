@@ -52,8 +52,8 @@ pub(crate) enum Posture {
     NoUpstreamContent(&'static str),
     /// Caller-authored content DOES reach an upstream here and the chain
     /// does not run over it. Carries why, and where the screening this
-    /// surface needs is tracked. An operator reading the census must be
-    /// able to see this without reading the handler.
+    /// surface needs is tracked, so the next person reading the census can
+    /// tell a deliberate gap from an oversight without reading the handler.
     Unscreened(&'static str),
 }
 
@@ -148,20 +148,8 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
              Screening it per record, through the ordinary request chain, is #1120.",
         ),
     ),
-    (
-        "/v1/batches",
-        Posture::EnforcedNotDrivableInCrate(
-            "same `jobs::scan_input_blob` gate; POST needs an `input_file_id` that resolves \
-             through a prior upload.",
-        ),
-    ),
-    (
-        "/v1/fine_tuning/jobs",
-        Posture::EnforcedNotDrivableInCrate(
-            "same `jobs::scan_input_blob` gate; POST needs a `training_file` that resolves \
-             through a prior upload.",
-        ),
-    ),
+    ("/v1/batches", Posture::Enforced),
+    ("/v1/fine_tuning/jobs", Posture::Enforced),
     (
         FALLBACK_SURFACE,
         Posture::EnforcedNotDrivableInCrate(
@@ -610,6 +598,24 @@ pub(crate) fn fixture(surface: &str) -> Option<Request<Body>> {
                 "id": 1,
                 "method": "tools/call",
                 "params": { "name": "tool", "arguments": {} },
+            }),
+        ),
+        // The jobs surfaces that still screen: both send a re-serialised
+        // JSON request body, and both route off the encoded file id rather
+        // than a `model` field, so neither needs a prior upload to drive.
+        "/v1/batches" => json(
+            surface,
+            serde_json::json!({
+                "input_file_id": crate::jobs::encode_routed_id("file-census", "census-openai"),
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h",
+            }),
+        ),
+        "/v1/fine_tuning/jobs" => json(
+            surface,
+            serde_json::json!({
+                "model": "gpt-4o-mini-2024-07-18",
+                "training_file": crate::jobs::encode_routed_id("file-census", "census-openai"),
             }),
         ),
         // `tasks/get` carries no message at all.

@@ -2021,9 +2021,7 @@ async fn attribute_batch_usage(
         let mut event = UsageEvent {
             // NO-GUARDRAIL-CHAIN: a retroactive billing row for work the
             // provider did inside a batch. There is no request here, so no
-            // chain was ever resolved and nothing could have been bypassed;
-            // the upload that created the batch was screened at its own
-            // time, and carries its own event.
+            // chain was ever resolved and nothing could have been bypassed.
             request_id,
             occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             model_id: model_id.to_string(),
@@ -2753,12 +2751,14 @@ mod tests {
     /// could stop it.
     const BLOB_UPLOAD: &[u8] = b"{\"custom_id\":\"r1\",\"note\":\"\xc4\xe3\xba\xc3\"}";
 
-    /// A fail-closed input row that matches the fixtures above. The
-    /// files surface must forward regardless; the batch and fine-tuning
-    /// surfaces must still refuse.
+    /// A fail-closed input row matching `custom_id`, which every request
+    /// fixture below carries. The files surface must forward regardless;
+    /// `a_batch_create_is_still_screened` is what proves the literal still
+    /// matches, so a pattern that quietly stopped matching cannot turn the
+    /// forwarding assertions into tautologies.
     fn seed_blocking_input_guardrail(snap: &AisixSnapshot) {
         let g: aisix_core::Guardrail = serde_json::from_str(
-            r#"{"name":"blocks-a-term","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"custom_id"},{"kind":"literal","value":"completion_window"}]}"#,
+            r#"{"name":"blocks-a-term","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"custom_id"}]}"#,
         )
         .unwrap();
         crate::seed_env_scoped_guardrail(
@@ -2767,12 +2767,12 @@ mod tests {
         );
     }
 
-    /// The response-side counterpart: it matches `input.jsonl`, which the
-    /// upload response echoes as `filename`, and `forbidden-term`, which
-    /// the download and fine-tuning fixtures carry.
+    /// The response-side counterpart, matching `forbidden-term`, which
+    /// every response fixture below carries.
+    /// `a_fine_tuning_job_read_is_still_screened` pins that it matches.
     fn seed_blocking_output_guardrail(snap: &AisixSnapshot) {
         let g: aisix_core::Guardrail = serde_json::from_str(
-            r#"{"name":"blocks-a-term","enabled":true,"hook_point":"output","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"input.jsonl"},{"kind":"literal","value":"forbidden-term"}]}"#,
+            r#"{"name":"blocks-a-term","enabled":true,"hook_point":"output","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"forbidden-term"}]}"#,
         )
         .unwrap();
         crate::seed_env_scoped_guardrail(
@@ -2810,7 +2810,7 @@ mod tests {
                 "id": "file-abc",
                 "object": "file",
                 "purpose": "batch",
-                "filename": "input.jsonl"
+                "filename": "forbidden-term.jsonl"
             })))
     }
 
@@ -2897,7 +2897,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["filename"], "input.jsonl");
+        assert_eq!(v["filename"], "forbidden-term.jsonl");
     }
 
     /// And a download: `GET /v1/files/{id}/content` relays the provider's
@@ -2960,7 +2960,8 @@ mod tests {
         let body = serde_json::json!({
             "input_file_id": encode_routed_id("file-real", "jobs-a"),
             "endpoint": "/v1/chat/completions",
-            "completion_window": "24h"
+            "completion_window": "24h",
+            "metadata": { "note": "custom_id" }
         });
         let req = Request::builder()
             .method("POST")

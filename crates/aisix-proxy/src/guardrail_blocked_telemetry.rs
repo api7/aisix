@@ -313,11 +313,14 @@ fn fixture(surface: &str, text: &str) -> Request<Body> {
 /// one that carries caller-authored text in a JSON field.
 ///
 /// The multipart surfaces (`/v1/audio/transcriptions`, `/v1/images/edits`)
-/// and the blob-scanning job surfaces are deliberately absent: their
-/// screened text is an uploaded file, so a keyword fixture would assert
-/// nothing they don't already share with `/v1/audio/speech` — all four go
-/// through the same `usage_attr::build_error_usage_event` emitter this
-/// list already covers three times over.
+/// and the jobs surfaces are deliberately absent: the multipart ones screen
+/// a prompt part rather than a JSON field, `/v1/batches` and
+/// `/v1/fine_tuning/jobs` screen a re-serialised request envelope rather
+/// than caller prose, and `/v1/files` is not screened at all. A keyword
+/// fixture there would assert nothing they don't already share with
+/// `/v1/audio/speech` — they all go through the same
+/// `usage_attr::build_error_usage_event` emitter this list already covers
+/// three times over.
 const SURFACES: &[&str] = &[
     "/v1/chat/completions",
     "/v1/completions",
