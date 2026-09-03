@@ -39,10 +39,65 @@ const anthropicResponse = {
   usage: { input_tokens: 2, output_tokens: 1 },
 };
 
+const openaiStreamEvents = [
+  JSON.stringify({
+    id: "chatcmpl-effort-stream",
+    object: "chat.completion.chunk",
+    model: "upstream-model",
+    choices: [
+      {
+        index: 0,
+        delta: { role: "assistant", content: "ok" },
+        finish_reason: null,
+      },
+    ],
+  }),
+  JSON.stringify({
+    id: "chatcmpl-effort-stream",
+    object: "chat.completion.chunk",
+    model: "upstream-model",
+    choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+  }),
+  "[DONE]",
+];
+
+const anthropicStreamEvents = [
+  JSON.stringify({
+    type: "message_start",
+    message: {
+      id: "msg_effort_stream",
+      role: "assistant",
+      content: [],
+      model: "upstream-model",
+      stop_reason: null,
+      usage: { input_tokens: 2, output_tokens: 1 },
+    },
+  }),
+  JSON.stringify({
+    type: "content_block_start",
+    index: 0,
+    content_block: { type: "text", text: "" },
+  }),
+  JSON.stringify({
+    type: "content_block_delta",
+    index: 0,
+    delta: { type: "text_delta", text: "ok" },
+  }),
+  JSON.stringify({ type: "content_block_stop", index: 0 }),
+  JSON.stringify({
+    type: "message_delta",
+    delta: { stop_reason: "end_turn" },
+    usage: { output_tokens: 1 },
+  }),
+  JSON.stringify({ type: "message_stop" }),
+];
+
 describe("direct-model effort mapping", () => {
   let app: SpawnedApp | undefined;
   let openai: OpenAiUpstream | undefined;
   let anthropic: OpenAiUpstream | undefined;
+  let openaiStream: OpenAiUpstream | undefined;
+  let anthropicStream: OpenAiUpstream | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -59,6 +114,12 @@ describe("direct-model effort mapping", () => {
         { nonStreamBody: { input_tokens: 3 } },
       ],
     });
+    openaiStream = await startOpenAiUpstream({
+      streamEvents: openaiStreamEvents,
+    });
+    anthropicStream = await startOpenAiUpstream({
+      streamEvents: anthropicStreamEvents,
+    });
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
@@ -74,6 +135,18 @@ describe("direct-model effort mapping", () => {
       secret: "sk-anthropic-mock",
       api_base: anthropic.baseUrl,
     });
+    const openaiStreamKey = await seed.createProviderKey({
+      display_name: "effort-map-openai-stream-key",
+      secret: "sk-openai-stream-mock",
+      api_base: `${openaiStream.baseUrl}/v1`,
+    });
+    const anthropicStreamKey = await seed.createProviderKey({
+      display_name: "effort-map-anthropic-stream-key",
+      provider: "anthropic",
+      adapter: "anthropic",
+      secret: "sk-anthropic-stream-mock",
+      api_base: anthropicStream.baseUrl,
+    });
 
     const mapping = { medium: "high", high: "max" };
     await seed.createModel({
@@ -81,6 +154,20 @@ describe("direct-model effort mapping", () => {
       provider: "openai",
       model_name: "glm-openai-wire",
       provider_key_id: openaiKey.id,
+      effort_mapping: mapping,
+    });
+    await seed.createModel({
+      display_name: "effort-map-openai-stream",
+      provider: "openai",
+      model_name: "glm-openai-stream-wire",
+      provider_key_id: openaiStreamKey.id,
+      effort_mapping: mapping,
+    });
+    await seed.createModel({
+      display_name: "effort-map-anthropic-stream",
+      provider: "anthropic",
+      model_name: "glm-anthropic-stream-wire",
+      provider_key_id: anthropicStreamKey.id,
       effort_mapping: mapping,
     });
     await seed.createModel({
@@ -105,6 +192,8 @@ describe("direct-model effort mapping", () => {
       allowed_models: [
         "effort-map-openai",
         "effort-map-anthropic",
+        "effort-map-openai-stream",
+        "effort-map-anthropic-stream",
         "effort-map-group",
       ],
     });
@@ -118,13 +207,15 @@ describe("direct-model effort mapping", () => {
     await app?.exit();
     await openai?.close();
     await anthropic?.close();
+    await openaiStream?.close();
+    await anthropicStream?.close();
   });
 
   async function post(
     path: string,
     body: Record<string, unknown>,
     auth: "openai" | "anthropic" = "openai",
-  ) {
+  ): Promise<{ body: string; contentType: string | null }> {
     const response = await fetch(`${app!.proxyUrl}${path}`, {
       method: "POST",
       headers: {
@@ -135,7 +226,12 @@ describe("direct-model effort mapping", () => {
       },
       body: JSON.stringify(body),
     });
-    expect(response.ok, await response.text()).toBe(true);
+    const responseBody = await response.text();
+    expect(response.ok, responseBody).toBe(true);
+    return {
+      body: responseBody,
+      contentType: response.headers.get("content-type"),
+    };
   }
 
   function receivedSince(
@@ -274,5 +370,40 @@ describe("direct-model effort mapping", () => {
       receivedSince(openai, baseline, "/v1/chat/completions")
         .reasoning_effort,
     ).toBe("low");
+  });
+
+  test("maps native and translated streaming requests", async (ctx) => {
+    if (!etcdReachable || !app || !openaiStream || !anthropicStream) {
+      ctx.skip();
+      return;
+    }
+
+    let baseline = openaiStream.receivedRequests.length;
+    const openaiResponse = await post("/v1/chat/completions", {
+      model: "effort-map-openai-stream",
+      messages: [{ role: "user", content: "hello" }],
+      reasoning_effort: "high",
+      stream: true,
+    });
+    expect(openaiResponse.contentType).toContain("text/event-stream");
+    expect(openaiResponse.body).toContain("data:");
+    expect(
+      receivedSince(openaiStream, baseline, "/v1/chat/completions")
+        .reasoning_effort,
+    ).toBe("max");
+
+    baseline = anthropicStream.receivedRequests.length;
+    const translatedResponse = await post("/v1/chat/completions", {
+      model: "effort-map-anthropic-stream",
+      messages: [{ role: "user", content: "hello" }],
+      reasoning_effort: "medium",
+      stream: true,
+    });
+    expect(translatedResponse.contentType).toContain("text/event-stream");
+    expect(translatedResponse.body).toContain("data:");
+    expect(
+      receivedSince(anthropicStream, baseline, "/v1/messages")
+        .output_config,
+    ).toEqual({ effort: "high" });
   });
 });
