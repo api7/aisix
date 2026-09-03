@@ -21,9 +21,11 @@
 //! caller's own `Authorization` in place of the gateway's is the whole
 //! reason the field exists. `insert` rather than `append`, so exactly one
 //! credential reaches the wire and the upstream never picks between two
-//! (the #411 shape). Within this module `default_headers` still resolves
-//! first, so an operator's static header beats a client header of the same
-//! name.
+//! (the #411 shape). Between the two operator features, `default_headers`
+//! resolves first, so an operator's static header beats a client header of
+//! the same name — everywhere but a credential slot, where the forward is
+//! the whole reason the field exists and takes the slot from the static
+//! entry too.
 //!
 //! What can never be forwarded is narrow and lives in
 //! `aisix_core::forwarded_headers`: the transport slots whose forwarding
@@ -143,24 +145,34 @@ impl<'a> UpstreamHeaderContext<'a> {
 /// Resolve the operator-configured headers for one upstream call: rendered
 /// `default_headers` first, then the client headers the allowlist admits.
 ///
-/// Names are returned lowercase and de-duplicated (first wins, so a
-/// `default_headers` entry shadows a client header of the same name).
-/// Entries whose name or value will not parse as HTTP are skipped rather
-/// than failing the request — an unparseable entry is a config error one
-/// layer up, which cp-api rejects at write time.
+/// Names are returned lowercase and de-duplicated, under the same
+/// precedence [`apply_request_headers`] delivers: a `default_headers`
+/// entry shadows a client header of the same name, except in a credential
+/// slot, where the forwarded value takes it. Entries whose name or value
+/// will not parse as HTTP are skipped rather than failing the request — an
+/// unparseable entry is a config error one layer up, which cp-api rejects
+/// at write time.
 ///
 /// Callers that build a [`HeaderMap`] should use [`apply_request_headers`];
 /// this lower-level form exists for the Bedrock path, whose headers have to
-/// be handed to the AWS SDK's pre-signing interceptor instead. Note that it
-/// FLATTENS the two features into one list and so loses the distinction
-/// [`apply_request_headers`] draws between them — that is correct for
-/// Bedrock, whose interceptor is first-wins and which resolves the
-/// credential collision by clearing the slot up front instead.
+/// be handed to the AWS SDK's pre-signing interceptor instead. That
+/// interceptor is first-wins and cannot let a later entry displace an
+/// earlier one the way a `HeaderMap` merge can, so the precedence has to be
+/// settled HERE — which is why this function resolves it rather than just
+/// concatenating. Signer-owned names are a separate, narrower rule the
+/// Bedrock bridge applies to the returned list.
 pub fn resolve_extra_headers(ctx: &UpstreamHeaderContext<'_>) -> Vec<(HeaderName, HeaderValue)> {
+    let forwarded = ForwardedClientHeaders::resolve(ctx);
     let mut out = resolve_default_headers(ctx);
+    // Same predicate the `HeaderMap` merge uses, so the two faces cannot
+    // answer the credential-slot question differently as the slot list
+    // grows.
+    out.retain(|(name, _)| {
+        !(aisix_core::displaces_a_gateway_header(name.as_str()) && forwarded.claims(name.as_str()))
+    });
     let taken: HashSet<HeaderName> = out.iter().map(|(name, _)| name.clone()).collect();
     out.extend(
-        ForwardedClientHeaders::resolve(ctx)
+        forwarded
             .entries
             .into_iter()
             .filter(|(name, _)| !taken.contains(name)),
@@ -420,6 +432,51 @@ mod tests {
         let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
         apply_request_headers(&mut headers, &ctx);
         assert_eq!(headers["authorization"], "Bearer callers-own");
+    }
+
+    #[test]
+    fn a_forwarded_credential_takes_the_slot_from_a_static_operator_one() {
+        // The sibling of the test above, for the slot the gateway had not
+        // filled: `default_headers` outranks the forward for every name
+        // except a credential one, where the forward is the whole reason
+        // the operator named it on this upstream.
+        let r = overrides(&[("x-api-key", "operator-static")], &["x-api-key"]);
+        let inbound = client(&[("x-api-key", "callers-own")]);
+        let mut headers = HeaderMap::new();
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
+        apply_request_headers(&mut headers, &ctx);
+        assert_eq!(headers["x-api-key"], "callers-own");
+        assert_eq!(headers.get_all("x-api-key").iter().count(), 1);
+    }
+
+    #[test]
+    fn the_flattened_form_resolves_the_same_precedence() {
+        // `resolve_extra_headers` hands its list to a first-wins consumer,
+        // so it has to settle the precedence itself — and settle it the way
+        // the `HeaderMap` merge does, or a Bedrock upstream answers the
+        // credential-slot question backwards from every other face.
+        let r = overrides(
+            &[("x-api-key", "operator-static"), ("x-team", "operator")],
+            &["x-api-key", "x-team"],
+        );
+        let inbound = client(&[("x-api-key", "callers-own"), ("x-team", "client-claimed")]);
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
+
+        let resolved = resolve_extra_headers(&ctx);
+        let value = |name: &str| {
+            let mut found = resolved.iter().filter(|(n, _)| n.as_str() == name);
+            let (_, v) = found.next().unwrap_or_else(|| panic!("missing {name}"));
+            assert!(found.next().is_none(), "{name} listed twice");
+            v.to_str().unwrap()
+        };
+        assert_eq!(value("x-api-key"), "callers-own");
+        assert_eq!(value("x-team"), "operator");
+
+        // And the merge form agrees, name for name.
+        let mut headers = HeaderMap::new();
+        apply_request_headers(&mut headers, &ctx);
+        assert_eq!(headers["x-api-key"], "callers-own");
+        assert_eq!(headers["x-team"], "operator");
     }
 
     #[test]

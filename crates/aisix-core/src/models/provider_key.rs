@@ -386,14 +386,17 @@ pub struct RequestOverrides {
     /// consent to hand a third party the caller's credential or to graft
     /// the caller's trace onto that party's telemetry.
     ///
-    /// Two cases where a named header still does not reach the upstream:
-    /// a `default_headers` entry of the same name wins it, since both are
-    /// operator configuration and the static one is the more specific
-    /// choice; and on an AWS Bedrock provider the request signer owns
-    /// `authorization`, `x-amz-date`, `x-amz-content-sha256`,
-    /// `x-amz-security-token`, `x-amz-target` and `x-amzn-bedrock-accept`,
-    /// and drops any supplied value. A value there would not authenticate
-    /// anyone: it either loses to the signer or breaks the signature.
+    /// Two cases where a named header still does not reach the upstream. A
+    /// `default_headers` entry of the same name wins it for every name
+    /// except a credential slot: both are operator configuration and the
+    /// static one is the more specific choice, but in a credential slot the
+    /// forwarded value is precisely the one that was asked for, so it takes
+    /// the slot from the static entry. And on an AWS Bedrock provider the
+    /// request signer owns `authorization`, `x-amz-date`,
+    /// `x-amz-content-sha256`, `x-amz-security-token`, `x-amz-target` and
+    /// `x-amzn-bedrock-accept`, and drops any supplied value — a value
+    /// there would not authenticate anyone: it either loses to the signer
+    /// or breaks the signature.
     ///
     /// Naming a credential slot needs a data plane new enough to honor
     /// it; an older one refuses those names outright, so the pattern has
