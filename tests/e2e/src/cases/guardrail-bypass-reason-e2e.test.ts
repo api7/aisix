@@ -4,6 +4,8 @@ import {
   EtcdClient,
   ProxyClient,
   SeedClient,
+  metricDelta,
+  scrapeMetrics,
   spawnApp,
   startMockSls,
   startOpenAiUpstream,
@@ -262,9 +264,30 @@ describe("guardrail bypass reason across the handler family", () => {
     // the tag has to say. A different tag from the case above on purpose:
     // "the guardrail broke" and "we could not give it the body" are
     // different outages with different fixes.
+    const before = await scrapeMetrics(app.metricsUrl);
     const res = await post("/v1/messages", { model: "bypass-unscannable", max_tokens: 64 }, true);
     expect(res.status).toBe(200);
 
     await expectBypassReason("bypass-unscannable", UNSCANNABLE_TAG);
+
+    // The same pass-through has to show up in the scrape, not only in the
+    // usage row. No member executed, so the per-execution path that feeds
+    // this counter for a provider outage never fires here — an operator
+    // sizing "how much unscreened traffic got through" from
+    // `aisix_guardrail_bypasses_total` would otherwise read zero for the
+    // one cause the counter exists to expose. Scraped after the terminal
+    // event so the request is provably finished.
+    //
+    // Only the positive direction is driven here: which pass-throughs are
+    // bypasses at all is decided by the chain's member set, and that
+    // discrimination is pinned in aisix-guardrails' chain unit test, where
+    // an output-only chain can be built without a second seeded route.
+    const after = await scrapeMetrics(app.metricsUrl);
+    expect(
+      metricDelta(before, after, "aisix_guardrail_bypasses_total", {
+        reason: UNSCANNABLE_TAG,
+      }),
+      "an unscannable body a fail-open chain let through did not reach the bypass counter",
+    ).toBe(1);
   });
 });

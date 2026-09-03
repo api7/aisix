@@ -182,11 +182,44 @@ impl GuardrailChain {
     /// member can report it, yet the request was screened by nothing —
     /// exactly what the field is read to rule out.
     ///
-    /// A no-op when the chain carries no log; first-wins is
-    /// [`GuardrailAuditLog::record_bypass`]'s rule.
+    /// Reported to BOTH receivers, and they answer different questions.
+    /// The audit log keeps the first tag only — it feeds a single
+    /// per-request field. The metrics sink counts every call, matching
+    /// `aisix_guardrail_bypasses_total`'s per-event meaning on the
+    /// execution-driven path, where a chain with three bypassed members
+    /// already increments three times.
+    ///
+    /// No event is counted twice: a bypass recorded here had no execution
+    /// to report, and `record_execution` reaches the counter through the
+    /// sink's execution method instead. One REQUEST can still produce
+    /// both, and legitimately — `audio.rs` records an undecodable
+    /// transcript tail here and then scans the decodable remainder, whose
+    /// members may themselves fail open. Those are two things that went
+    /// unscreened, not one counted twice.
+    ///
+    /// Counting here rather than only auditing is what keeps
+    /// `aisix_guardrail_bypasses_total` symmetric with
+    /// `aisix_guardrail_blocks_total`, which already counts the
+    /// pre-execution refusals. Without it the SAME unscannable body was
+    /// counted when the chain refused and counted nowhere when it let the
+    /// request through — the direction an operator is reading the counter
+    /// to find.
+    ///
+    /// The tag is clamped once here so both receivers carry the identical
+    /// value; [`GuardrailAuditLog::record_bypass`] clamps too, and the
+    /// clamp is idempotent.
+    ///
+    /// A no-op for whichever receiver the chain does not carry.
     pub fn record_bypass(&self, reason: &str) {
+        if self.audit.is_none() && self.sink.is_none() {
+            return;
+        }
+        let tag = crate::bounded_failure_tag(reason);
         if let Some(audit) = self.audit.as_ref() {
-            audit.record_bypass(reason);
+            audit.record_bypass(&tag);
+        }
+        if let Some(sink) = self.sink.as_ref() {
+            sink.record_guardrail_bypass(&tag);
         }
     }
 
@@ -1203,38 +1236,60 @@ mod tests {
     /// bypass only when something would have read that side. An output-only
     /// chain never offered to screen the request, so tagging it would fire
     /// the field on requests that were never going to be screened.
+    ///
+    /// Both sinks are asserted from the one member-set decision:
+    /// `guardrail_bypassed_reason` on the usage event and the
+    /// `aisix_guardrail_bypasses_total` increment must agree about which
+    /// pass-through was a bypass, which is only true while they read the
+    /// same predicate rather than each deriving its own.
     #[test]
     fn an_unevaluable_pass_is_a_bypass_only_when_a_member_reads_that_side() {
         let rule = || vec![KeywordRule::literal("x")];
         let log = || Some(Arc::new(GuardrailAuditLog::new()));
+        let sinked = |g: Arc<dyn Guardrail>| {
+            let sink = Arc::new(RecordingSink::default());
+            let chain = GuardrailChain::new(vec![g])
+                .with_audit_log(log())
+                .with_metrics_sink(Some(Arc::clone(&sink) as Arc<dyn GuardrailMetricsSink>));
+            (chain, sink)
+        };
 
-        let open_in = GuardrailChain::new(vec![Arc::new(
+        let (open_in, open_in_sink) = sinked(Arc::new(
             KeywordBlocklist::input_only(rule()).with_fail_open(true),
-        )])
-        .with_audit_log(log());
+        ));
         open_in.record_unevaluable_input_bypass("unscannable_body");
         assert_eq!(
             open_in.bypass_reason().as_deref(),
             Some("unscannable_body"),
             "a fail-open row that reads the request WAS bypassed",
         );
+        assert_eq!(
+            open_in_sink.bypasses(),
+            ["unscannable_body"],
+            "the same bypass has to reach the counter: no member executed, \
+             so nothing else will count it",
+        );
 
-        let output_only =
-            GuardrailChain::new(vec![Arc::new(KeywordBlocklist::output_only(rule()))])
-                .with_audit_log(log());
+        let (output_only, output_only_sink) =
+            sinked(Arc::new(KeywordBlocklist::output_only(rule())));
         output_only.record_unevaluable_input_bypass("unscannable_body");
         assert_eq!(
             output_only.bypass_reason(),
             None,
             "nothing here reads the request, so nothing was bypassed",
         );
+        assert!(
+            output_only_sink.bypasses().is_empty(),
+            "counting this would make the counter fire on requests that were \
+             never going to be screened",
+        );
 
         // The fail-closed direction never reaches the call at all, but the
         // predicate must agree with the refusal gate if it ever does.
-        let closed_in = GuardrailChain::new(vec![Arc::new(KeywordBlocklist::input_only(rule()))])
-            .with_audit_log(log());
+        let (closed_in, closed_in_sink) = sinked(Arc::new(KeywordBlocklist::input_only(rule())));
         closed_in.record_unevaluable_input_bypass("unscannable_body");
         assert_eq!(closed_in.bypass_reason(), None);
+        assert!(closed_in_sink.bypasses().is_empty());
     }
 
     /// AISIX-Cloud#1365: a fail-CLOSED refusal is an outage, not a policy
@@ -1315,6 +1370,7 @@ mod tests {
                     exec.error_type.unwrap_or("none").to_owned(),
                 ));
             }
+            fn record_guardrail_bypass(&self, _reason: &str) {}
         }
         struct Unavailable;
         #[async_trait]
@@ -1886,11 +1942,16 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RecordingSink(std::sync::Mutex<Vec<Recorded>>);
+    struct RecordingSink {
+        execs: std::sync::Mutex<Vec<Recorded>>,
+        /// Pre-execution bypasses, the `aisix_guardrail_bypasses_total`
+        /// increments that carry no execution record.
+        bypasses: std::sync::Mutex<Vec<String>>,
+    }
 
     impl GuardrailMetricsSink for RecordingSink {
         fn record_guardrail_execution(&self, exec: &GuardrailExecution<'_>) {
-            self.0.lock().unwrap().push(Recorded {
+            self.execs.lock().unwrap().push(Recorded {
                 guardrail: exec.guardrail_name.to_owned(),
                 kind: exec.kind.to_owned(),
                 phase: exec.phase,
@@ -1898,11 +1959,18 @@ mod tests {
                 error_type: exec.error_type.map(str::to_owned),
             });
         }
+        fn record_guardrail_bypass(&self, reason: &str) {
+            self.bypasses.lock().unwrap().push(reason.to_owned());
+        }
     }
 
     impl RecordingSink {
         fn take(&self) -> Vec<Recorded> {
-            std::mem::take(&mut self.0.lock().unwrap())
+            std::mem::take(&mut self.execs.lock().unwrap())
+        }
+
+        fn bypasses(&self) -> Vec<String> {
+            self.bypasses.lock().unwrap().clone()
         }
     }
 

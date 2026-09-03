@@ -5,17 +5,20 @@ name: docker-image
 # Tag strategy. Every push always carries a :sha-<shortsha> tag for
 # traceability; the other tags layer on top based on the trigger:
 #   - push to main              → :dev + :sha-<shortsha>
-#   - push tag vX.Y.Z           → :X.Y.Z + :X.Y + :X + :latest
-#                                 + :sha-<shortsha>
-#   - push tag vX.Y.Z-rc.N      → :X.Y.Z-rc.N + :sha-<shortsha>  (NO rolling tags)
+#   - push tag vX.Y.Z           → :X.Y.Z + :latest + :sha-<shortsha>
+#   - push tag vX.Y.Z-rc.N      → :X.Y.Z-rc.N + :sha-<shortsha>  (NO :latest)
 #   - pull request              → build-only (no push), sanity check
 #   - workflow_dispatch         → :sha-<shortsha> + optional tag input
+#
+# A version tag is published in full only — there is no :X.Y or :X
+# abbreviation. An abbreviation freezes the moment the next release ships:
+# whoever pinned it keeps the old image while the tag reads like the line.
+# :latest and :dev are the only moving pointers.
 #
 # Pre-release tags exist so a release candidate can be QA'd on the artifacts
 # customers receive before anything points at it — bar the PGO difference
 # noted at "Decide PGO build mode" below. They must move no rolling
-# pointer: docker/metadata-action already skips :X.Y and :X for
-# pre-release semver, and the guards below keep :latest and the published
+# pointer: the guards below keep :latest and the published
 # `openapi-latest.json` on the last stable release.
 
 on:
@@ -157,16 +160,15 @@ jobs:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
             ${{ startsWith(github.ref, 'refs/tags/v') && format('{0}/{1}', secrets.DOCKER_REGISTRY, env.IMAGE_NAME) || '' }}
-          # `latest` is guarded on `!contains(ref_name, '-')` so a `-rc.N` tag
-          # cannot move it; metadata-action already skips {{major}}.{{minor}}
-          # and {{major}} for pre-release semver.
+          # A version tag publishes the full version only — no
+          # {{major}}.{{minor}} / {{major}} abbreviations, see the tag strategy
+          # at the top. `latest` is guarded on `!contains(ref_name, '-')` so a
+          # `-rc.N` tag cannot move it.
           tags: |
             type=raw,value=dev,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
             type=ref,event=pr
             type=sha,prefix=sha-,format=short
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' }}
           labels: |

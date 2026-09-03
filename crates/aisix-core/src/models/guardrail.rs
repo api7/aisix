@@ -1295,6 +1295,20 @@ pub struct GuardrailExecution<'a> {
 /// build time, so aisix-guardrails stays free of a metrics dependency.
 pub trait GuardrailMetricsSink: Send + Sync + 'static {
     fn record_guardrail_execution(&self, exec: &GuardrailExecution<'_>);
+
+    /// Count one bypass the PROXY performed on the chain's behalf, with
+    /// no member execution to carry it: a body the gateway could not give
+    /// the guardrails at all, which a fail-open chain lets through (#1115).
+    ///
+    /// The execution-driven bypasses reach the same counter through
+    /// [`Self::record_guardrail_execution`], which is why this is a second
+    /// method rather than a synthetic execution — there is no member, no
+    /// kind and no duration to report, and inventing them would put a
+    /// phantom row in the per-execution latency histogram.
+    ///
+    /// Required rather than defaulted: a sink that silently dropped these
+    /// would under-report exactly the traffic the counter is read to find.
+    fn record_guardrail_bypass(&self, reason: &str);
 }
 
 /// Content policy evaluated before or after upstream calls.

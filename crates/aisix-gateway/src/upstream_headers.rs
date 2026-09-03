@@ -676,6 +676,45 @@ mod tests {
         assert!(!headers.contains_key("x-goog-api-key"), "got: {headers:?}");
     }
 
+    /// The AWS SigV4 headers are credential slots on a NON-Bedrock
+    /// upstream, where nothing else stops them. A Bedrock provider's
+    /// signer owns all three and drops any supplied value, so this rule is
+    /// the only thing standing between a `["x-*"]` pattern and the
+    /// caller's live AWS session token arriving at some other provider.
+    #[test]
+    fn the_aws_sigv4_trio_needs_its_own_name_not_a_glob() {
+        let inbound = client(&[
+            ("x-amz-security-token", "FQoGZXIvYXdzE-caller-session"),
+            ("x-amz-date", "20260903T120000Z"),
+            ("x-amz-content-sha256", "e3b0c44298fc1c14"),
+            ("x-trace-id", "operator-own-header"),
+        ]);
+
+        // A glob reaches the operator's own header and none of the three.
+        let r = overrides(&[], &["x-*"]);
+        let mut headers = HeaderMap::new();
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
+        apply_request_headers(&mut headers, &ctx);
+        assert_eq!(headers["x-trace-id"], "operator-own-header");
+        for name in ["x-amz-security-token", "x-amz-date", "x-amz-content-sha256"] {
+            assert!(!headers.contains_key(name), "{name} leaked: {headers:?}");
+        }
+
+        // Naming one exactly IS the operator's consent, and is honoured —
+        // this stays a credential slot, not the absolute block it used to
+        // be, so an upstream that genuinely reads the caller's SigV4
+        // headers can still be opted in.
+        let r = overrides(&[], &["x-amz-security-token"]);
+        let mut headers = HeaderMap::new();
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
+        apply_request_headers(&mut headers, &ctx);
+        assert_eq!(
+            headers["x-amz-security-token"], "FQoGZXIvYXdzE-caller-session",
+            "an exactly-named credential slot must still forward",
+        );
+        assert!(!headers.contains_key("x-amz-date"), "got: {headers:?}");
+    }
+
     #[test]
     fn transport_and_gateway_namespaces_are_never_forwarded() {
         let r = overrides(&[], &["*"]);

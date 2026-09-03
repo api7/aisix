@@ -681,11 +681,14 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
 
     await chat(FORWARD_MODEL, {
       // Every one of these MATCHES a configured pattern — `x-*` the
-      // first three, `trace*` the last — so what stops them is the rule
-      // under test, not a pattern that failed to fire.
+      // first three and the SigV4 trio, `trace*` the last — so what stops
+      // them is the rule under test, not a pattern that failed to fire.
       "x-aisix-routing-tags": "spoofed-by-caller",
       "x-stainless-lang": "js",
       "x-allowed": "yes",
+      "x-amz-security-token": "FQoGZXIvYXdzE-caller-session",
+      "x-amz-date": "20260903T120000Z",
+      "x-amz-content-sha256": "e3b0c44298fc1c14",
       traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
     }).then((r) => bodyOf(r, "the glob case"));
 
@@ -697,5 +700,12 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
     // Trace context needs its own name: a glob is not consent to graft the
     // caller's trace onto the provider's telemetry.
     expect(seen.headers.traceparent).toBeUndefined();
+    // A credential slot needs its own name for the same reason, and this
+    // is the shape the bug actually took: the caller's live AWS session
+    // token arriving at an upstream that has no business holding one.
+    // This upstream is not Bedrock, so nothing downstream would strip it.
+    for (const name of ["x-amz-security-token", "x-amz-date", "x-amz-content-sha256"]) {
+      expect(seen.headers[name], `${name} reached the upstream under a glob`).toBeUndefined();
+    }
   });
 });
