@@ -327,11 +327,16 @@ struct Recorders<'a> {
 /// per-entity mask counts, and only the segment pass has any — the check
 /// folds pass `None`.
 ///
-/// The audit log takes only the two ENFORCED outcomes it exists to
-/// record: `masked` and `blocked`. `allowed` is not an event, `bypassed`
-/// is already carried by `guardrail_bypassed_reason`, and the two
-/// `would_*` results belong to `guardrail_monitor_hits` — routing them
-/// here would make an enforcing hit indistinguishable from a staged one.
+/// [`GuardrailAuditLog::record`] takes only the two ENFORCED outcomes the
+/// hit array exists to record: `masked` and `blocked`. `allowed` is not an
+/// event, and the two `would_*` results belong to
+/// `guardrail_monitor_hits` — routing them here would make an enforcing
+/// hit indistinguishable from a staged one.
+///
+/// `bypassed` is recorded too, but onto the log's separate `bypass` slot
+/// rather than as a hit: it is what `guardrail_bypassed_reason` is built
+/// from, and a bypass enforced nothing, so folding it into an array whose
+/// whole meaning is "a policy acted here" would widen that field silently.
 ///
 /// The two are told apart on the audit event (AISIX-Cloud#1365): a member
 /// with `fail_open: false` whose upstream is
@@ -1131,6 +1136,66 @@ mod tests {
         assert!(
             chain.enforced_hits().is_empty(),
             "a bypass enforced nothing, so it must not appear as an enforced hit",
+        );
+    }
+
+    /// A refusal by one member does not erase another member's bypass.
+    ///
+    /// The fold does not short-circuit on `Bypass`, so a chain of
+    /// [fail-open remote row, blocking row] refuses the request while the
+    /// first row screened nothing. Both facts ride the event: this is the
+    /// same pair `chat.rs` has always emitted on a billed-then-blocked
+    /// response, where an input hook failed open on a prompt the provider
+    /// had already answered. Suppressing the tag whenever
+    /// `guardrail_blocked` is set would discard exactly that case, which is
+    /// the more compliance-relevant of the two.
+    #[tokio::test]
+    async fn a_block_by_one_member_does_not_erase_another_member_bypass() {
+        struct FailsOpen;
+        #[async_trait]
+        impl Guardrail for FailsOpen {
+            fn name(&self) -> &'static str {
+                "fails-open"
+            }
+            async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
+                GuardrailVerdict::Bypass {
+                    reason: "lakera_timeout".to_owned(),
+                }
+            }
+        }
+
+        let audit = Arc::new(GuardrailAuditLog::new());
+        let chain = GuardrailChain::new_with_applied(
+            vec![
+                (
+                    "open-row".to_owned(),
+                    Arc::new(FailsOpen) as Arc<dyn Guardrail>,
+                ),
+                (
+                    "deny-secrets".to_owned(),
+                    Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("nope")]))
+                        as Arc<dyn Guardrail>,
+                ),
+            ],
+            vec![
+                AppliedGuardrail {
+                    kind: "lakera".to_owned(),
+                    hook: "input".to_owned(),
+                },
+                AppliedGuardrail {
+                    kind: "keyword".to_owned(),
+                    hook: "input".to_owned(),
+                },
+            ],
+        )
+        .with_audit_log(Some(Arc::clone(&audit)));
+
+        // The refusal still happens — recording must not weaken it.
+        assert!(chain.check_input(&req("nope")).await.is_block());
+        assert_eq!(
+            chain.bypass_reason().as_deref(),
+            Some("lakera_timeout"),
+            "the first row screened nothing; the second one refusing does not change that",
         );
     }
 

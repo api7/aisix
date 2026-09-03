@@ -1060,27 +1060,37 @@ mod tests {
         let mut blocks = 0usize;
         let mut missing = Vec::new();
 
-        let mut files: Vec<_> = std::fs::read_dir(&src_dir)
-            .expect("the crate's own src/ must be readable")
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|e| e == "rs"))
-            .collect();
+        // Recursive: `src/` is flat today, and a refactor that moved a
+        // handler into a subdirectory would otherwise take its emitter out
+        // of scope while this still reported green.
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let entries = std::fs::read_dir(dir).expect("the crate's own src/ must be readable");
+            for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        rs_files(&src_dir, &mut files);
         files.sort();
 
         for path in files {
             let src = std::fs::read_to_string(&path).expect("source must read");
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let name = path
+                .strip_prefix(&src_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            let code = code_mask(&src);
             for (idx, _) in src.match_indices("UsageEvent {") {
-                // This file writes the token it searches for, in a string
-                // literal and in a doc comment, and both would be counted
-                // as emitters — a check that inflates its own coverage.
-                // Judged from the line prefix rather than the whole file:
-                // none of these matches sits inside a multi-line construct,
-                // and a whole-file string scanner would have to model raw
-                // strings to be worth more.
-                let line_start = src[..idx].rfind('\n').map_or(0, |n| n + 1);
-                let prefix = &src[line_start..idx];
-                if prefix.contains("//") || prefix.matches('"').count() % 2 == 1 {
+                // Skip anything that is not Rust code: this file writes the
+                // token it searches for in a string literal and in a
+                // comment, and both would otherwise be counted as emitters
+                // — a check inflating its own coverage.
+                if !code[idx] {
                     continue;
                 }
                 // `-> UsageEvent {` (optionally path-qualified) is a
@@ -1093,11 +1103,11 @@ mod tests {
                     continue;
                 }
                 let open = idx + "UsageEvent ".len();
-                let Some(block) = braced_block(&src[open..]) else {
+                let Some(block) = braced_block(&src, &code, open) else {
                     panic!("{name}: unbalanced UsageEvent literal at byte {idx}");
                 };
                 blocks += 1;
-                if !block.contains("guardrail_bypassed_reason") && !block.contains(EXEMPT) {
+                if !sets_bypass_reason(block) && !block.contains(EXEMPT) {
                     let line = src[..idx].lines().count();
                     missing.push(format!("{name}:{line}"));
                 }
@@ -1106,8 +1116,12 @@ mod tests {
 
         // The parse must actually find the emitters, not silently yield an
         // empty set that makes the assertion below vacuous.
+        // The crate's real count. A floor rather than an equality so
+        // adding an emitter does not fail here (the `missing` check
+        // already governs a new one) — but losing four to a parse that
+        // quietly stopped matching is the drift this exists to catch.
         assert!(
-            blocks >= 15,
+            blocks >= 18,
             "the UsageEvent literal scan found only {blocks} — it has stopped tracking the \
              emitter family",
         );
@@ -1120,36 +1134,200 @@ mod tests {
         );
     }
 
-    /// The `{ … }` starting at `src`, string-literal aware so a brace
-    /// inside a quoted value cannot end the block early.
-    fn braced_block(src: &str) -> Option<&str> {
-        let bytes = src.as_bytes();
-        assert_eq!(bytes[0], b'{');
-        let mut depth = 0usize;
-        let mut in_str = false;
-        let mut escaped = false;
-        for (i, b) in bytes.iter().enumerate() {
-            if in_str {
-                match b {
-                    _ if escaped => escaped = false,
-                    b'\\' => escaped = true,
-                    b'"' => in_str = false,
-                    _ => {}
+    /// A byte mask over `src` marking the bytes that are Rust CODE —
+    /// false inside string literals (raw ones included), char literals,
+    /// line comments and nestable block comments.
+    ///
+    /// A real lexer pass rather than a per-line heuristic. The heuristic
+    /// this replaces judged a match by whether its line prefix held a `//`
+    /// or an odd number of quotes, which gets two things wrong that occur
+    /// in ordinary code: a literal after a completed string on the same
+    /// line (`let u = "https://x"; ... UsageEvent {`) reads as commented
+    /// out, and an escaped quote miscounts the parity.
+    fn code_mask(src: &str) -> Vec<bool> {
+        #[derive(Clone, Copy)]
+        enum St {
+            Code,
+            Str,
+            Raw(usize),
+            Char,
+            Line,
+            Block(usize),
+        }
+        let b = src.as_bytes();
+        let mut mask = vec![false; b.len()];
+        let mut st = St::Code;
+        let mut i = 0;
+        while i < b.len() {
+            match st {
+                St::Code => {
+                    mask[i] = true;
+                    match b[i] {
+                        b'/' if b.get(i + 1) == Some(&b'/') => {
+                            st = St::Line;
+                            mask[i] = false;
+                        }
+                        b'/' if b.get(i + 1) == Some(&b'*') => {
+                            st = St::Block(1);
+                            mask[i] = false;
+                            i += 2;
+                            continue;
+                        }
+                        b'"' => st = St::Str,
+                        // A char literal is `'x'` or `'\\n'`; anything
+                        // else starting with a quote is a LIFETIME
+                        // (`&'a str`), and treating one as a literal
+                        // swallows every byte up to the next apostrophe.
+                        b'\'' if b.get(i + 1) == Some(&b'\\') || b.get(i + 2) == Some(&b'\'') => {
+                            st = St::Char
+                        }
+                        b'r' => {
+                            // `r"…"` / `r#"…"#`, but not an identifier
+                            // ending in `r`, and not a lifetime.
+                            let prev_ident =
+                                i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+                            let mut j = i + 1;
+                            while b.get(j) == Some(&b'#') {
+                                j += 1;
+                            }
+                            if !prev_ident && b.get(j) == Some(&b'"') {
+                                st = St::Raw(j - i - 1);
+                                i = j + 1;
+                                continue;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
+                St::Str => {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'"' {
+                        st = St::Code;
+                    }
+                }
+                St::Raw(hashes) => {
+                    if b[i] == b'"' && b[i + 1..].iter().take(hashes).all(|c| *c == b'#') {
+                        st = St::Code;
+                        i += hashes + 1;
+                        continue;
+                    }
+                }
+                St::Char => {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'\'' {
+                        st = St::Code;
+                    }
+                }
+                St::Line => {
+                    if b[i] == b'\n' {
+                        st = St::Code;
+                    }
+                }
+                St::Block(depth) => {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        st = St::Block(depth + 1);
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        st = if depth == 1 {
+                            St::Code
+                        } else {
+                            St::Block(depth - 1)
+                        };
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+        mask
+    }
+
+    /// Whether an emitter block ASSIGNS the field, rather than merely
+    /// mentioning it.
+    ///
+    /// `block.contains("guardrail_bypassed_reason")` would be satisfied by
+    /// a comment, and by `guardrail_bypassed_reason: String::new()` — which
+    /// is exactly the shape of a reverted fix, so the check would have been
+    /// unfalsifiable in the one dimension it is here to guard.
+    fn sets_bypass_reason(block: &str) -> bool {
+        let Some(at) = block.find("guardrail_bypassed_reason") else {
+            return false;
+        };
+        let rest = &block[at + "guardrail_bypassed_reason".len()..];
+        // Field-init shorthand (`guardrail_bypassed_reason,`) takes its
+        // value from a binding, which cannot be an inline empty literal.
+        let Some(rest) = rest.strip_prefix(':') else {
+            return rest.starts_with(',');
+        };
+        // Values run to the end of their line, except the one that wraps
+        // onto continuation lines — whose first line is a receiver, which
+        // is non-empty and passes for the right reason.
+        let value = rest
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(',')
+            .trim();
+        !matches!(
+            value,
+            "" | "\"\"" | "String::new()" | "String::default()" | "Default::default()"
+        )
+    }
+
+    /// The `{ … }` at `open`, skipping braces the mask says are not code.
+    fn braced_block<'a>(src: &'a str, code: &[bool], open: usize) -> Option<&'a str> {
+        let b = src.as_bytes();
+        assert_eq!(b[open], b'{');
+        let mut depth = 0usize;
+        for i in open..b.len() {
+            if !code[i] {
                 continue;
             }
-            match b {
-                b'"' => in_str = true,
+            match b[i] {
                 b'{' => depth += 1,
                 b'}' => {
                     depth -= 1;
                     if depth == 0 {
-                        return Some(&src[..=i]);
+                        return Some(&src[open..=i]);
                     }
                 }
                 _ => {}
             }
         }
         None
+    }
+
+    /// The mask is load-bearing for the guard above, so it is pinned
+    /// directly: every one of these would be a false positive or a false
+    /// negative under the line-prefix heuristic it replaces.
+    #[test]
+    fn the_code_mask_excludes_strings_comments_and_raw_strings() {
+        let at = |src: &str, needle: &str| {
+            let m = code_mask(src);
+            m[src.find(needle).expect("needle must appear")]
+        };
+        assert!(at("let x = 1; UsageEvent {}", "UsageEvent"));
+        assert!(!at("let s = \"UsageEvent {\";", "UsageEvent"));
+        assert!(!at("// UsageEvent {", "UsageEvent"));
+        assert!(!at("/* a /* b */ UsageEvent */", "UsageEvent"));
+        assert!(!at("let s = r#\"UsageEvent {\"#;", "UsageEvent"));
+        // The two the heuristic got wrong: a completed string earlier on
+        // the line, and an escaped quote inside one.
+        assert!(at("let u = \"https://x\"; UsageEvent {}", "UsageEvent"));
+        assert!(at("let e = \"a\\\"b\"; UsageEvent {}", "UsageEvent"));
+        // A char literal must not open a string, and an identifier ending
+        // in `r` must not open a raw string.
+        assert!(at("let c = '\"'; UsageEvent {}", "UsageEvent"));
+        assert!(at("let var = 1; UsageEvent {}", "UsageEvent"));
     }
 }

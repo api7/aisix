@@ -107,11 +107,22 @@ a different decision, and one nobody has taken.
 
 ## The bypass reason rides the audit log, and every emitter must set it
 
-`usage_events.guardrail_bypassed_reason` is the only record that a request
-went upstream with nothing screening it. Its failure mode is silent in both
-directions: the caller gets a normal 200, and an emitter that leaves the
-field at its `String::default()` reports "nothing was bypassed" for a
-request that was — indistinguishable from a screened one.
+`usage_events.guardrail_bypassed_reason` is the record that a guardrail on
+this request did not evaluate and its failure policy let the request past
+it. Its failure mode is silent in both directions: the caller gets a normal
+200, and an emitter that leaves the field at its `String::default()`
+reports "nothing was bypassed" for a request that was — indistinguishable
+from a screened one.
+
+**It is not mutually exclusive with `guardrail_blocked`, and must not be
+suppressed when that is set.** A chain can fail open on one member and be
+refused by another, and an input hook can fail open on a prompt the
+provider already answered before the output hook refused it. Both are
+requests where something really did go unscreened, and the second is the
+more compliance-relevant of the two — `chat.rs` has always carried the
+input bypass onto the billed-then-blocked event through `UpstreamCharge`.
+"Reached a provider unscreened" is the two fields read together, never this
+one alone.
 
 So it is not threaded per handler. The chain folds record the first `Bypass`
 they see onto the request's `GuardrailAuditLog`, which every handler already
@@ -137,6 +148,23 @@ Two rules follow, and both are enforced mechanically rather than by review:
   never offered to screen it. Tagging the second would fire the field on
   requests that were never going to be screened, which breaks the negative
   answer just as thoroughly as dropping the first.
+
+Deliberately NOT recorded, so the next person does not read the four
+unscannable sites as the full set: the places that scan a mangled copy
+unconditionally, with no failure policy involved. `jobs::scan_output_blob`
+and the binary-purpose arm of `scan_input_blob` scan
+`String::from_utf8_lossy` and relay the original bytes whatever the row
+says; `audio.rs` and `images_edits.rs` drop non-UTF-8 multipart prompt
+parts with `filter_map`; `passthrough_route` scans the lossy body. None of
+these consults `refuses_unevaluable_*`, so a fail-CLOSED row does not
+refuse there either — that asymmetry is #1022's open product decision, not
+something telemetry can paper over, and making them refuse is a behaviour
+change rather than an observability one. Tagging them instead would fire
+the field on every binary upload and download, which destroys the negative
+answer just as thoroughly. Note that `record_unevaluable_*` is the wrong
+helper at such a site: its predicate assumes the fail-closed case was
+already refused, so at a site that never refuses it would silently drop
+exactly the case worth reporting.
 
 Values come from the guardrail kind's own `bypass_tag()` — the same bounded
 vocabulary `GuardrailVerdict::block_unavailable` carries, so one outage reads

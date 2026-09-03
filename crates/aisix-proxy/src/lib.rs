@@ -4016,6 +4016,115 @@ data: [DONE]\n\n"
         ResourceEntry::new("model-id-1", model, 1)
     }
 
+    /// A request that failed OPEN and then died before any attempt still
+    /// has to report the bypass.
+    ///
+    /// This is `chat.rs`'s `routing.attempts.is_empty()` terminal arm, and
+    /// it is not reachable from the router-derived census in
+    /// `guardrail_coverage`: that fixture's upstream refuses the
+    /// connection, so an attempt is always recorded and the failed-attempt
+    /// emitter runs instead. The arm is live in production — a quota
+    /// refusal, a budget refusal, or a pre-dispatch resolution failure all
+    /// land here — and the guardrail chain has already run and already
+    /// failed open by then.
+    ///
+    /// Driven with `rpm: 1`: the first request goes upstream unscreened,
+    /// the second is refused before dispatch. Both events must name the
+    /// bypass; the refusal is not what stopped the FIRST one from leaving.
+    #[tokio::test]
+    async fn a_pre_dispatch_failure_after_a_fail_open_still_reports_the_bypass() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-1",
+                "object": "chat.completion",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry_with_rate_limit(
+            "rl-open",
+            serde_json::json!({"rpm": 1}),
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["rl-open"]));
+        // Faults instead of deciding. Input hook only: `custom` reads its
+        // output policy from `output_fail_open`, which fails CLOSED by
+        // default, and a refused response would not be a bypass.
+        let row: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+            "name": "rl-fail-open",
+            "enabled": true,
+            "kind": "custom",
+            "hook_point": "input",
+            "fail_open": true,
+            "script": "export function checkInput() { throw new Error('x'); }",
+            "timeout_ms": 5000,
+        }))
+        .unwrap();
+        seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-rl-open", row, 1));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"rl-open","messages":[{"role":"user","content":"go"}]}"#,
+                ))
+                .unwrap()
+        };
+
+        let first = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(
+            first.status(),
+            StatusCode::OK,
+            "premise: a fail-open row must not refuse",
+        );
+        let second = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "premise: the second request must die BEFORE any attempt",
+        );
+
+        let mut events = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await
+        {
+            events.push(event);
+        }
+        assert_eq!(events.len(), 2, "{events:?}");
+        for event in &events {
+            assert_eq!(
+                event.guardrail_bypassed_reason, "custom_script_error",
+                "{event:?}",
+            );
+        }
+        // The one that pins the arm: the refused request recorded no
+        // attempt, so its event came from the pre-dispatch emitter.
+        let refused = events
+            .iter()
+            .find(|e| e.status_code == 429)
+            .expect("the refusal must emit its own event");
+        assert_eq!(refused.attempt_kind, "initial", "{refused:?}");
+    }
+
     #[tokio::test]
     async fn passthrough_enforces_model_rate_limit_from_body_model_field() {
         let upstream = MockServer::start().await;

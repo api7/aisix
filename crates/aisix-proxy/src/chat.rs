@@ -705,7 +705,12 @@ struct Success {
     /// guardrail upstream unreachable + `fail_open=true`). The first
     /// bypass reason wins. Goes onto `usage_events.guardrail_bypassed_reason`
     /// so a compliance audit can see what slipped past during a Bedrock
-    /// outage. None for the normal Allow / Block paths.
+    /// outage. `None` when nothing was bypassed.
+    ///
+    /// A Block does not clear it: an input hook that failed open on a
+    /// prompt the provider then answered is still a bypass, whatever the
+    /// output hook went on to decide — which is why the billed-then-blocked
+    /// event carries this through `UpstreamCharge`.
     ///
     /// Threaded here rather than read back off the audit handle — which is
     /// where every other handler gets it — because the per-attempt and
