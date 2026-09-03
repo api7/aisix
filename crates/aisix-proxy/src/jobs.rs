@@ -615,9 +615,8 @@ async fn scan_input_blob(
 /// caller never chose (whatever the provider holds under a file id), and it
 /// has no `purpose` to classify it by — the upload's `purpose` is what lets
 /// the input side tell a JSONL payload from a lawful PDF. Failing closed
-/// here would refuse lawful downloads, so this side stays lossy and
-/// unrefused by decision (#1022, closed): do not mirror the input-side
-/// `match` here, and do not re-file the asymmetry as a finding.
+/// here would refuse lawful downloads, so the direction needs a product
+/// decision rather than a mirrored `match`. Tracked in #1022.
 #[allow(clippy::too_many_arguments)]
 async fn scan_output_blob(
     state: &ProxyState,
