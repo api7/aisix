@@ -498,6 +498,14 @@ impl Guardrail for LakeraGuardrail {
         )
     }
 
+    fn fails_closed_on_input(&self) -> bool {
+        !self.fail_open
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        !self.output_fail_open
+    }
+
     /// Masking a streamed response requires the whole response held back —
     /// a masked span can cross any chunk boundary. Cap + overflow policy
     /// come from the row config, like kind=pii.

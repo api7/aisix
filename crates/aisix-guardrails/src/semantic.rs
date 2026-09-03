@@ -400,6 +400,14 @@ impl Guardrail for SemanticGuardrail {
         )
     }
 
+    fn fails_closed_on_input(&self) -> bool {
+        !self.cfg.fail_open
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        !self.cfg.output_fail_open
+    }
+
     /// This kind reports similarity scores, so it takes a per-request bind.
     fn bind_score_log(&self, log: &Arc<GuardrailAuditLog>) -> Option<Arc<dyn Guardrail>> {
         Some(Arc::new(Self {

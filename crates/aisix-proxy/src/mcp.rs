@@ -968,14 +968,16 @@ async fn apply_output_guardrails(
     // regressed to SSE framing) must not slip an unscanned tool result past the
     // guardrail — block rather than allow.
     //
-    // Only when a guardrail would have READ the result, though. The chain is
-    // resolved once for both directions, so it is non-empty for a tool call
-    // screened on the request side alone; refusing the RESULT on the strength
-    // of an input-hook attachment would refuse a body that attachment was
-    // never going to inspect.
+    // Only when a guardrail would have READ the result and refuses when it
+    // cannot evaluate, though. The chain is resolved once for both
+    // directions, so it is non-empty for a tool call screened on the request
+    // side alone; refusing the RESULT on the strength of an input-hook
+    // attachment would refuse a body that attachment was never going to
+    // inspect. `output_fail_open: true` opts out on the same grounds the
+    // input side honours `fail_open`.
     let value: serde_json::Value = match serde_json::from_slice(response_bytes) {
         Ok(value) => value,
-        Err(_) if !aisix_guardrails::Guardrail::runs_on_output(chain) => {
+        Err(_) if !aisix_guardrails::Guardrail::refuses_unevaluable_output(chain) => {
             return ToolResultOutcome::Allow(None)
         }
         Err(_) => {
@@ -2749,6 +2751,19 @@ mod tests {
                 .await
                 .is_none(),
             "an input-hook row never reads the tool result, so it cannot refuse it"
+        );
+
+        // An output row that asked to fail open is likewise not a reason to
+        // refuse. `kind: keyword` has no `output_fail_open` of its own, so
+        // the row-level `fail_open` governs both of its hooks.
+        const OUTPUT_OPEN_GUARD: &str = r#"{"name":"mcp-output-open","kind":"keyword","hook_point":"output","fail_open":true,"patterns":[{"kind":"literal","value":"forbidden-token"}]}"#;
+        let output_open = env_chain_with(OUTPUT_OPEN_GUARD);
+        assert!(!output_open.is_empty(), "the chain must be non-empty");
+        assert!(
+            output_guardrail_block(&output_open, sse_body, "echo", &mut Vec::new())
+                .await
+                .is_none(),
+            "a row that asked to fail open must not refuse an unparseable result"
         );
 
         // The output-hook row still fails closed on the same bytes.

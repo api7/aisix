@@ -260,7 +260,7 @@ fn build_one_inner(
                 GuardrailHookPoint::Output => KeywordBlocklist::output_only(rules),
                 GuardrailHookPoint::Both => KeywordBlocklist::new(rules),
             };
-            Ok(Some(Arc::new(blocklist)))
+            Ok(Some(Arc::new(blocklist.with_fail_open(row.fail_open))))
         }
         GuardrailKind::Pii(cfg) => {
             if cfg.detectors.is_empty() && cfg.custom_patterns.is_empty() {
@@ -322,7 +322,8 @@ fn build_one_inner(
                 row.hook_point,
                 usize::try_from(cfg.max_buffer_bytes).unwrap_or(usize::MAX),
                 on_exceeded_fail_open,
-            );
+            )
+            .with_fail_open(row.fail_open);
             Ok(Some(Arc::new(g)))
         }
         #[cfg(feature = "bedrock")]
@@ -861,8 +862,23 @@ impl Guardrail for MonitorGuardrail {
         self.inner.runs_on_output()
     }
 
+    /// Forwarded, NOT forced false. A monitor row still participates in
+    /// the proxy-raised `unscannable_body` refusals — that is a settled
+    /// product decision, not an oversight (monitor mode downgrades a
+    /// guardrail's own verdict, and these refusals have none). Forcing
+    /// either hook predicate to `false` here would also disable
+    /// end-of-stream OBSERVATION, which `responses.rs` gates on
+    /// `runs_on_output`; a monitor row exists precisely to observe.
     fn runs_on_input(&self) -> bool {
         self.inner.runs_on_input()
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        self.inner.fails_closed_on_input()
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        self.inner.fails_closed_on_output()
     }
 
     /// Forward the bind and re-wrap. A monitor-mode row is the one an
@@ -1022,6 +1038,22 @@ impl Guardrail for LiveGuardrailChain {
 
     fn runs_on_input(&self) -> bool {
         self.current().runs_on_input()
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        self.current().fails_closed_on_input()
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        self.current().fails_closed_on_output()
+    }
+
+    fn refuses_unevaluable_input(&self) -> bool {
+        self.current().refuses_unevaluable_input()
+    }
+
+    fn refuses_unevaluable_output(&self) -> bool {
+        self.current().refuses_unevaluable_output()
     }
 
     fn redacts_input(&self) -> bool {

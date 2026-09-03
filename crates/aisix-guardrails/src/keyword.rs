@@ -57,6 +57,13 @@ pub struct KeywordBlocklist {
     pub check_input_enabled: bool,
     /// Apply on output content.
     pub check_output_enabled: bool,
+    /// The row's `fail_open`, governing BOTH hooks — see
+    /// `fails_closed_on_output`. A local rule never calls out, so it has
+    /// no provider outage to survive; but it still cannot evaluate a body
+    /// the gateway could not decode, and this says what the operator
+    /// wants done about that. Defaults to the row default (fail-closed);
+    /// `with_fail_open` is how the snapshot build sets it.
+    fail_open: bool,
 }
 
 impl KeywordBlocklist {
@@ -65,7 +72,15 @@ impl KeywordBlocklist {
             rules,
             check_input_enabled: true,
             check_output_enabled: true,
+            fail_open: false,
         }
+    }
+
+    /// Apply the row's `fail_open` policy. This kind has no per-hook
+    /// split, so the one value governs both.
+    pub fn with_fail_open(mut self, fail_open: bool) -> Self {
+        self.fail_open = fail_open;
+        self
     }
 
     pub fn input_only(rules: Vec<KeywordRule>) -> Self {
@@ -73,6 +88,7 @@ impl KeywordBlocklist {
             rules,
             check_input_enabled: true,
             check_output_enabled: false,
+            fail_open: false,
         }
     }
 
@@ -81,6 +97,7 @@ impl KeywordBlocklist {
             rules,
             check_input_enabled: false,
             check_output_enabled: true,
+            fail_open: false,
         }
     }
 
@@ -103,6 +120,18 @@ impl Guardrail for KeywordBlocklist {
 
     fn runs_on_input(&self) -> bool {
         self.check_input_enabled
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        !self.fail_open
+    }
+
+    /// This kind has no `output_fail_open` of its own — the remote kinds
+    /// split the policy per hook because only they can have a provider
+    /// fail on one side. Here the row-level `fail_open` is the only policy
+    /// the operator can express, so it governs both hooks.
+    fn fails_closed_on_output(&self) -> bool {
+        !self.fail_open
     }
 
     async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {

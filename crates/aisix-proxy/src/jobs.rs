@@ -523,16 +523,20 @@ async fn scan_input_blob(
     // deliberate — refusing it would break lawful PDF/image uploads, which
     // is a product decision, not a guardrail one.
     //
-    // Reached only once a guardrail that reads the REQUEST is attached,
-    // which is also deliberate. An upload nobody screens keeps forwarding
-    // whatever it forwards today; this is a guardrail refusal, not a
-    // structural check on the file. A chain resolved from output-hook
-    // attachments alone would never have been offered this payload, so it
-    // cannot be the reason the payload is refused — it falls through to the
-    // lossy scan the same way an unconfigured deployment does.
+    // Reached only once some guardrail would BOTH read the request and
+    // refuse when it cannot evaluate, which is also deliberate. An upload
+    // nobody screens keeps forwarding whatever it forwards today; this is a
+    // guardrail refusal, not a structural check on the file. Two ways to be
+    // outside it: a chain resolved from output-hook attachments alone is
+    // never offered this payload, and a row set `fail_open: true` has asked
+    // for exactly the opposite disposition — the refusal reports itself as
+    // `guardrail_unavailable`, which is the condition that setting governs.
+    // Both fall through to the lossy scan an unconfigured deployment gets.
     let text = match (std::str::from_utf8(blob), undecodable) {
         (Ok(text), _) => std::borrow::Cow::Borrowed(text),
-        (Err(err), Undecodable::Refuse) if aisix_guardrails::Guardrail::runs_on_input(&chain) => {
+        (Err(err), Undecodable::Refuse)
+            if aisix_guardrails::Guardrail::refuses_unevaluable_input(&chain) =>
+        {
             tracing::warn!(
                 guardrail_hook = "input",
                 model = %target.display_name(),
@@ -3006,6 +3010,19 @@ mod tests {
         );
     }
 
+    /// An input-hook row that asked to fail OPEN. It still scans; it just
+    /// must not turn a body the gateway could not decode into a refusal.
+    fn seed_fail_open_input_guardrail(snap: &AisixSnapshot) {
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"never-matches-open","enabled":true,"hook_point":"input","fail_open":true,"kind":"keyword","patterns":[{"kind":"literal","value":"zzz-no-such-term-zzz"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(
+            snap,
+            aisix_core::resource::ResourceEntry::new("g-open", g, 1),
+        );
+    }
+
     /// The premise of the output-only tests, asserted rather than assumed:
     /// the seeded row IS in the chain this request resolves, and it is not
     /// an input-side one. Without this the forwarding assertion below is
@@ -3026,6 +3043,86 @@ mod tests {
             !aisix_guardrails::Guardrail::runs_on_input(&chain),
             "and it must be output-side only"
         );
+    }
+
+    /// `fail_open: true` opts the row out of the refusal. The refusal
+    /// reports itself as `guardrail_unavailable`, and that is exactly the
+    /// condition this setting governs — a row that asked to fail open must
+    /// not be the reason an upload is refused. Fails on `8955d6ab` with 422.
+    #[tokio::test]
+    async fn non_utf8_upload_with_a_fail_open_guardrail_is_forwarded() {
+        let upstream = MockServer::start().await;
+        files_upstream_mock().expect(1).mount(&upstream).await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        seed_fail_open_input_guardrail(&snap);
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(upload_request("XBOUNDARYX", NON_UTF8_UPLOAD))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert!(
+            received[0]
+                .body
+                .windows(NON_UTF8_UPLOAD.len())
+                .any(|w| w == NON_UTF8_UPLOAD),
+            "the original bytes must still forward byte-for-byte"
+        );
+    }
+
+    /// A mixed chain folds to the strictest: one fail-CLOSED input row is
+    /// enough, whatever else is attached.
+    #[tokio::test]
+    async fn non_utf8_upload_with_one_fail_closed_row_is_still_refused() {
+        let upstream = MockServer::start().await;
+        files_upstream_mock().expect(0).mount(&upstream).await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        seed_fail_open_input_guardrail(&snap);
+        seed_never_matching_guardrail(&snap);
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(upload_request("XBOUNDARYX", NON_UTF8_UPLOAD))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// The case a naive fold gets wrong: the chain reads the request (the
+    /// fail-open input row) and contains a fail-closed row (the output-only
+    /// one), but neither member is both — so nothing here justifies
+    /// refusing a request.
+    #[tokio::test]
+    async fn non_utf8_upload_with_the_two_halves_on_different_rows_is_forwarded() {
+        let upstream = MockServer::start().await;
+        files_upstream_mock().expect(1).mount(&upstream).await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        seed_fail_open_input_guardrail(&snap);
+        seed_never_matching_output_guardrail(&snap);
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(upload_request("XBOUNDARYX", NON_UTF8_UPLOAD))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     }
 
     /// The gate is "a guardrail would read this upload", not "a guardrail

@@ -281,19 +281,18 @@ async fn screen_input(
         return Ok(());
     }
     // Fail closed on a body the scanner cannot read — see the same arm in
-    // `messages.rs`. Only when a guardrail would have read the request:
-    // a chain of output-hook attachments alone never sees this body, so it
-    // cannot be the reason the body is refused.
+    // `messages.rs`. Only when some guardrail would both read the request
+    // and refuse when it cannot evaluate it.
     let chat = match aisix_provider_anthropic::parse_inbound_request_for_scan(body) {
         Ok(chat) => chat,
         Err(err) => {
-            if !aisix_guardrails::Guardrail::runs_on_input(&chain) {
+            if !aisix_guardrails::Guardrail::refuses_unevaluable_input(&chain) {
                 tracing::debug!(
                     guardrail_hook = "input",
                     model = %model_name,
                     error = %err,
-                    "cannot scan /v1/messages/count_tokens body for guardrails; no \
-                     input-hook guardrail is attached, so nothing is skipped",
+                    "cannot scan /v1/messages/count_tokens body for guardrails; \
+                     nothing attached both reads the request and fails closed",
                 );
                 return Ok(());
             }
@@ -1123,6 +1122,50 @@ mod tests {
         // No `messages` key: the scan parser rejects it.
         let res = app
             .oneshot(make_req(serde_json::json!({ "model": "ct-out" })))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// `fail_open: true` opts the row out of the refusal — same grounds as
+    /// `/v1/files` and `/v1/messages`. Fails on `8955d6ab` with 422.
+    #[tokio::test]
+    async fn unparseable_body_with_a_fail_open_guardrail_is_forwarded() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 7})),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(anthropic_model("ct-open"));
+        snap.apikeys.insert(apikey_entry(&["ct-open"]));
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"in-open","kind":"keyword","hook_point":"input","fail_open":true,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-open", row, 1));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized(
+            "anthropic",
+            Arc::new(aisix_provider_anthropic::AnthropicBridge::new()),
+        );
+        let handle = SnapshotHandle::new(snap);
+        let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone(), None);
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, hub, &cfg())
+                .without_cache()
+                .with_guardrail_index(index),
+        );
+
+        let res = app
+            .oneshot(make_req(serde_json::json!({ "model": "ct-open" })))
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);

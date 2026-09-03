@@ -816,6 +816,14 @@ impl Guardrail for BedrockGuardrail {
         )
     }
 
+    fn fails_closed_on_input(&self) -> bool {
+        !self.fail_open
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        !self.output_fail_open
+    }
+
     fn name(&self) -> &'static str {
         // Static name keeps metric cardinality bounded; the row's
         // own name is logged via tracing fields when we hit a

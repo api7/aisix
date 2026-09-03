@@ -34,6 +34,7 @@ const GUARDED_KEY = "sk-files-unscannable-guarded";
 const UNGUARDED_KEY = "sk-files-unscannable-open";
 const OUTPUT_ONLY_KEY = "sk-files-unscannable-output";
 const BOTH_HOOKS_KEY = "sk-files-unscannable-both";
+const FAIL_OPEN_KEY = "sk-files-unscannable-failopen";
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
 /** GBK bytes for 你好: `0xC4` opens a two-byte sequence and `0xE3` is not
@@ -52,11 +53,11 @@ const CLEAN_LINE = Buffer.from('{"custom_id":"r1","note":"你好"}\n', "utf8");
  *  than from a hit — a fix that simply started blocking every upload fails
  *  the forwarding legs. The second pattern appears in exactly one fixture,
  *  the one that proves a binary-purpose upload is still scanned. */
-const guardrail = (hook: string) => ({
-  name: `files-unscannable-e2e-${hook}`,
+const guardrail = ({ hook, failOpen = false }: Row) => ({
+  name: `files-unscannable-e2e-${hook}-${failOpen}`,
   enabled: true,
   hook_point: hook,
-  fail_open: false,
+  fail_open: failOpen,
   kind: "keyword",
   patterns: [
     { kind: "literal", value: "zzz-no-such-term-zzz" },
@@ -153,15 +154,23 @@ interface Env {
   model: string;
 }
 
-/** `hooks` names the `hook_point` of every guardrail row this environment
- *  attaches — `[]` for a deployment running none. The refusal keys on
- *  whether one of them READS the request, not on whether any is attached,
- *  so `["output"]` is a non-empty chain that must still forward. */
+/** One guardrail row this environment attaches: which hook it is on, and
+ *  whether it asked to fail open. */
+interface Row {
+  hook: string;
+  failOpen?: boolean;
+}
+
+/** `rows` is every guardrail row this environment attaches — `[]` for a
+ *  deployment running none. The refusal keys on whether one of them both
+ *  READS the request and fails CLOSED, not on whether any is attached, so
+ *  an output-only row and a `fail_open: true` row are each a non-empty
+ *  chain that must still forward. */
 const startEnv = async (
   etcd: EtcdClient,
   key: string,
   model: string,
-  hooks: string[],
+  rows: Row[],
 ): Promise<Env> => {
   const upstream = await startFilesUpstream();
   const app = await spawnApp();
@@ -178,8 +187,8 @@ const startEnv = async (
     model_name: "gpt-4o",
     provider_key_id: pk.id,
   });
-  for (const hook of hooks) {
-    await seed.createGuardrail(guardrail(hook));
+  for (const row of rows) {
+    await seed.createGuardrail(guardrail(row));
   }
   // Written LAST: the key authenticating implies every row above it
   // landed (etcd applies in revision order).
@@ -224,25 +233,31 @@ describe("files: an unscannable upload is refused, not forwarded", () => {
   let open: Env | undefined;
   let outputOnly: Env | undefined;
   let bothHooks: Env | undefined;
+  let failOpen: Env | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
-    guarded = await startEnv(etcd, GUARDED_KEY, "files-guarded", ["input"]);
+    guarded = await startEnv(etcd, GUARDED_KEY, "files-guarded", [
+      { hook: "input" },
+    ]);
     open = await startEnv(etcd, UNGUARDED_KEY, "files-open", []);
     outputOnly = await startEnv(etcd, OUTPUT_ONLY_KEY, "files-output", [
-      "output",
+      { hook: "output" },
     ]);
     bothHooks = await startEnv(etcd, BOTH_HOOKS_KEY, "files-both", [
-      "input",
-      "output",
+      { hook: "input" },
+      { hook: "output" },
+    ]);
+    failOpen = await startEnv(etcd, FAIL_OPEN_KEY, "files-failopen", [
+      { hook: "input", failOpen: true },
     ]);
   });
 
   afterAll(async () => {
-    for (const env of [guarded, open, outputOnly, bothHooks]) {
+    for (const env of [guarded, open, outputOnly, bothHooks, failOpen]) {
       await env?.app.exit();
       await env?.upstream.close();
     }
@@ -308,6 +323,44 @@ describe("files: an unscannable upload is refused, not forwarded", () => {
     expect(body.error?.message).not.toContain("unscannable_body");
     // The upload itself was forwarded — the block happened on the way back.
     expect(outputOnly.upstream.uploads).toHaveLength(before + 1);
+  });
+
+  // The second way out of the refusal: the row reads the request, but its
+  // operator set `fail_open: true`. The refusal reports itself as
+  // `guardrail_unavailable`, and that is the condition this setting
+  // governs, so it must not fire here either.
+  test("a guardrail with fail_open: true does not refuse the upload", async (ctx) => {
+    if (!etcdReachable || !failOpen) {
+      ctx.skip();
+      return;
+    }
+    const res = await upload(failOpen, NON_UTF8_LINE);
+    expect(res.status).toBe(200);
+    expect(failOpen.upstream.uploads).toHaveLength(1);
+    expect(failOpen.upstream.uploads[0].includes(NON_UTF8_LINE)).toBe(true);
+  });
+
+  // ...and that row is still SCANNING. `fail_open` changes what happens
+  // when it cannot evaluate, not whether it runs, so a term that survives
+  // the lossy decode still blocks with an ordinary policy 422.
+  test("the fail_open guardrail is attached and still scans", async (ctx) => {
+    if (!etcdReachable || !failOpen) {
+      ctx.skip();
+      return;
+    }
+    const before = failOpen.upstream.uploads.length;
+    const res = await upload(
+      failOpen,
+      Buffer.from(`{"custom_id":"r1","note":"${BLOCKED_TERM}"}\n`, "utf8"),
+    );
+    expect(res.status).toBe(422);
+    const body = (await res.json()) as {
+      error?: { type?: string; message?: string };
+    };
+    expect(body.error?.type).toBe("content_filter");
+    // A policy hit, not the unscannable-body refusal.
+    expect(body.error?.message).not.toContain("unscannable_body");
+    expect(failOpen.upstream.uploads).toHaveLength(before);
   });
 
   // ...and one input-hook row is enough: adding the output-only row must

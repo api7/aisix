@@ -641,18 +641,23 @@ async fn dispatch(
         // body; this is the same rule on the LLM side.
         let chat = match aisix_provider_anthropic::parse_inbound_request_for_scan(body) {
             Ok(chat) => chat,
-            // ...but only a chain that would have READ the request can be
-            // the reason it is refused. A chain resolved from output-hook
-            // attachments alone is never offered this body, so an
-            // unparseable one leaves exactly as it would with no guardrail
-            // configured at all.
-            Err(err) if !aisix_guardrails::Guardrail::runs_on_input(resolved_chain.as_ref()) => {
+            // ...but only a guardrail that would have READ the request AND
+            // refuses when it cannot evaluate can be the reason it is
+            // refused. An output-hook-only chain is never offered this
+            // body, and a `fail_open: true` row asked for the opposite
+            // disposition; either way the body leaves exactly as it would
+            // with no guardrail configured at all.
+            Err(err)
+                if !aisix_guardrails::Guardrail::refuses_unevaluable_input(
+                    resolved_chain.as_ref(),
+                ) =>
+            {
                 tracing::debug!(
                     guardrail_hook = "input",
                     model = %model_name,
                     error = %err,
-                    "cannot scan /v1/messages body for guardrails; no input-hook \
-                     guardrail is attached, so no check is being skipped",
+                    "cannot scan /v1/messages body for guardrails; nothing \
+                     attached both reads the request and fails closed",
                 );
                 break 'input_screen;
             }
@@ -6541,6 +6546,51 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
 
         // No `messages` key: the scan parser rejects it, the provider is the
         // one entitled to judge the shape.
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "my-claude",
+                "max_tokens": 100,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// `fail_open: true` opts an input-hook row out of the refusal, on the
+    /// same grounds: it reports itself as `guardrail_unavailable`, which is
+    /// the condition that setting governs. Fails on `8955d6ab` with 422.
+    #[tokio::test]
+    async fn unparseable_body_with_a_fail_open_guardrail_is_forwarded() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-3",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("my-claude"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"in-open","enabled":true,"kind":"keyword","hook_point":"input","fail_open":true,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-open", row, 1));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+
         let resp = crate::build_router(state)
             .oneshot(make_req(serde_json::json!({
                 "model": "my-claude",
