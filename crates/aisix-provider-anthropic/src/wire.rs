@@ -482,7 +482,7 @@ pub fn build_request<'a>(
 /// specifically, not the presence of an `output_config`: the object also
 /// carries `format` and `task_budget`, and treating it as an effort
 /// declaration would drop the tier of any request that sent one of those.
-fn translate_reasoning_effort_to_anthropic(
+pub fn translate_reasoning_effort_to_anthropic(
     extras: &mut serde_json::Map<String, serde_json::Value>,
 ) {
     let Some(effort) = extras.remove("reasoning_effort") else {

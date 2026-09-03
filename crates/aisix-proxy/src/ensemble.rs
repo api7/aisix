@@ -192,8 +192,9 @@ impl ModelCaller for ProxyModelCaller<'_> {
         // `ctx`'s deadline is per attempt while the ensemble's own
         // `config.timeout()` — applied by the caller — remains the ceiling on
         // the whole attempt sequence.
+        let upstream_req = crate::effort_mapping::chat_request(req, model);
         let response = crate::routing::retrying_dispatch(self.state, model, "ensemble", || {
-            bridge.chat(req, &ctx)
+            bridge.chat(upstream_req.as_ref(), &ctx)
         })
         .await?;
         let effective = crate::chat::effective_subcall_usage(
@@ -415,6 +416,10 @@ fn judge_request(req: &ChatFormat, judge: &Judge, candidates: &[ChatResponse]) -
         .replace("{labeled_candidates}", &label_candidates(candidates));
 
     let mut out = ChatFormat::new(judge.model.clone(), vec![ChatMessage::user(prompt)]);
+    if let Some(effort) = req.extra.get("reasoning_effort") {
+        out.extra
+            .insert("reasoning_effort".to_string(), effort.clone());
+    }
     out.temperature = Some(JUDGE_TEMPERATURE);
     out.stream = Some(false);
     out
@@ -585,9 +590,10 @@ mod tests {
         let cfg =
             config(r#"{"panel":[{"model":"gpt"},{"model":"claude"}],"judge":{"model":"judge"}}"#);
 
-        let out = run_ensemble(&user_request("what is 2+2?"), &cfg, &caller)
-            .await
-            .unwrap();
+        let mut req = user_request("what is 2+2?");
+        req.extra
+            .insert("reasoning_effort".to_string(), "medium".into());
+        let out = run_ensemble(&req, &cfg, &caller).await.unwrap();
 
         assert_eq!(out.response.message.content_str(), "synthesized answer");
         assert_eq!(out.panel.len(), 2);
@@ -603,6 +609,10 @@ mod tests {
         assert!(judge_prompt.contains("answer from gpt"));
         assert!(judge_prompt.contains("answer from claude"));
         assert!(judge_prompt.contains("what is 2+2?"));
+        assert_eq!(
+            caller.calls_to("judge")[0].extra["reasoning_effort"],
+            "medium"
+        );
     }
 
     #[tokio::test]

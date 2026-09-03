@@ -1084,6 +1084,8 @@ async fn dispatch_to_target(
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<DispatchOutcome, ProxyError> {
     let model = &target.model;
+    let body = crate::effort_mapping::anthropic_request(body, model);
+    let body = body.as_ref();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
 
     if !crate::dispatch::speaks_anthropic(snapshot, model) {

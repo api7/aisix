@@ -38,6 +38,7 @@ pub(crate) mod cooldown;
 mod count_tokens;
 mod dispatch;
 mod ebml;
+mod effort_mapping;
 mod embeddings;
 mod ensemble;
 mod error;
