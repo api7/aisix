@@ -282,6 +282,7 @@ pub async fn completions(
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
                 crate::usage_attr::guardrail_scores(&audit),
+                crate::usage_attr::bypass_reason(&audit),
             );
             err.into_response()
         }
@@ -820,6 +821,7 @@ fn emit_usage_event(
         guardrail_monitor_hits,
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(audit),
         guardrail_scores: crate::usage_attr::guardrail_scores(audit),
+        guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);

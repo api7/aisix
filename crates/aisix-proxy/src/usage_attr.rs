@@ -55,6 +55,27 @@ pub(crate) fn enforced_hits(audit: &GuardrailAudit) -> Vec<aisix_core::Guardrail
     audit.as_ref().map(|a| a.snapshot()).unwrap_or_default()
 }
 
+/// Snapshot `audit` into a `UsageEvent`'s `guardrail_bypassed_reason`:
+/// the bounded tag of the first guardrail this request failed OPEN on,
+/// empty when none did.
+///
+/// Not terminal-only, unlike [`enforced_hits`]. A bypass says the request
+/// went upstream unscreened, which is true of every attempt the request
+/// made, and `chat.rs` has stamped it on its per-attempt events since the
+/// field existed — a retry that dropped it would read as a screened
+/// attempt.
+///
+/// `chat.rs` keeps threading its own copy instead of calling this: it
+/// hands the value to per-attempt and ensemble sub-call emitters at
+/// points where the value is deliberately the one captured EARLIER in the
+/// request, which a request-scoped snapshot cannot express.
+pub(crate) fn bypass_reason(audit: &GuardrailAudit) -> String {
+    audit
+        .as_ref()
+        .and_then(|a| a.bypass_reason())
+        .unwrap_or_default()
+}
+
 /// Snapshot `audit` into a terminal `UsageEvent`'s `guardrail_scores`
 /// (AISIX-Cloud#1467). Same handle, same terminal-only rule and same
 /// non-destructive read as [`enforced_hits`] — a scoring guardrail runs
@@ -537,6 +558,11 @@ pub(crate) fn emit_error_usage_event(
     // operator is certain to look at — as the only execution with no
     // number attached.
     scores: Vec<aisix_core::GuardrailScore>,
+    // The request's fail-open bypass tag, drained the same way. A request
+    // that went upstream unscreened and THEN failed is still a request
+    // that went upstream unscreened, so dropping the tag here would make
+    // the field answerable only for the requests that succeeded.
+    bypass: String,
 ) {
     let event = build_error_usage_event(
         inbound_protocol,
@@ -549,6 +575,7 @@ pub(crate) fn emit_error_usage_event(
         client,
         enforced,
         scores,
+        bypass,
     );
     // The failed request's own attribution, off the same cell
     // `request_metrics::LastTarget` reads — so the usage-event counters and
@@ -583,6 +610,8 @@ pub(crate) fn build_error_usage_event(
     client: &ClientContext,
     enforced: Vec<aisix_core::GuardrailEnforcedHit>,
     scores: Vec<aisix_core::GuardrailScore>,
+    // See [`emit_error_usage_event`].
+    bypass: String,
 ) -> UsageEvent {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -597,6 +626,7 @@ pub(crate) fn build_error_usage_event(
         guardrail_blocked,
         guardrail_enforced_hits: enforced,
         guardrail_scores: scores,
+        guardrail_bypassed_reason: bypass,
         ..Default::default()
     };
     apply_caller_identity(
@@ -1002,5 +1032,112 @@ mod tests {
 
         let snap = snap_with_pk("\u{1}\u{2}", "");
         assert_eq!(ResolvedPk::resolve(&snap, PK_ID).labels().name, "unknown");
+    }
+
+    /// Every `UsageEvent` this crate builds must set
+    /// `guardrail_bypassed_reason`, and an emitter that genuinely has no
+    /// chain behind it must say so where it is written.
+    ///
+    /// The field defaults to empty, so an emitter that forgets it reports
+    /// "nothing was bypassed" for a request that went upstream unscreened —
+    /// and no behavioural test can see the omission, because an unset field
+    /// and a screened request produce the same row. That is exactly how the
+    /// field spent its whole life written on `/v1/chat/completions` and
+    /// nowhere else.
+    ///
+    /// A parse of the source rather than a list of emitters, for the reason
+    /// `guardrail_coverage` parses the router instead of listing routes: a
+    /// hand-written list nobody updates agrees with itself forever, and the
+    /// emitter family here has sixteen members that keep gaining a
+    /// seventeenth.
+    #[test]
+    fn every_usage_event_this_crate_builds_answers_the_bypass_question() {
+        /// Written inside an emitter that has no guardrail chain behind it
+        /// at all, followed by why.
+        const EXEMPT: &str = "NO-GUARDRAIL-CHAIN:";
+
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut blocks = 0usize;
+        let mut missing = Vec::new();
+
+        let mut files: Vec<_> = std::fs::read_dir(&src_dir)
+            .expect("the crate's own src/ must be readable")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+            .collect();
+        files.sort();
+
+        for path in files {
+            let src = std::fs::read_to_string(&path).expect("source must read");
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            for (idx, _) in src.match_indices("UsageEvent {") {
+                // `-> UsageEvent {` (optionally path-qualified) is a
+                // return type followed by a function body, not a literal.
+                let before = src[..idx]
+                    .trim_end()
+                    .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':')
+                    .trim_end();
+                if before.ends_with("->") {
+                    continue;
+                }
+                let open = idx + "UsageEvent ".len();
+                let Some(block) = braced_block(&src[open..]) else {
+                    panic!("{name}: unbalanced UsageEvent literal at byte {idx}");
+                };
+                blocks += 1;
+                if !block.contains("guardrail_bypassed_reason") && !block.contains(EXEMPT) {
+                    let line = src[..idx].lines().count();
+                    missing.push(format!("{name}:{line}"));
+                }
+            }
+        }
+
+        // The parse must actually find the emitters, not silently yield an
+        // empty set that makes the assertion below vacuous.
+        assert!(
+            blocks >= 15,
+            "the UsageEvent literal scan found only {blocks} — it has stopped tracking the \
+             emitter family",
+        );
+        assert!(
+            missing.is_empty(),
+            "these UsageEvent emitters neither set guardrail_bypassed_reason nor carry a \
+             `{EXEMPT} <why>` comment saying they have no guardrail chain: {missing:?}\n\
+             An unset field reports a screened request, so an emitter that skips it makes the \
+             field unusable as a negative answer.",
+        );
+    }
+
+    /// The `{ … }` starting at `src`, string-literal aware so a brace
+    /// inside a quoted value cannot end the block early.
+    fn braced_block(src: &str) -> Option<&str> {
+        let bytes = src.as_bytes();
+        assert_eq!(bytes[0], b'{');
+        let mut depth = 0usize;
+        let mut in_str = false;
+        let mut escaped = false;
+        for (i, b) in bytes.iter().enumerate() {
+            if in_str {
+                match b {
+                    _ if escaped => escaped = false,
+                    b'\\' => escaped = true,
+                    b'"' => in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_str = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&src[..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 }

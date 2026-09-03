@@ -223,6 +223,7 @@ pub async fn count_tokens(
                 &client,
                 crate::usage_attr::enforced_hits(&screening.audit),
                 crate::usage_attr::guardrail_scores(&screening.audit),
+                crate::usage_attr::bypass_reason(&screening.audit),
             );
             // Anthropic-shape envelope (#336) — count_tokens callers are
             // the Anthropic SDK, not OpenAI-compatible clients.
@@ -294,6 +295,9 @@ async fn screen_input(
                     "cannot scan /v1/messages/count_tokens body for guardrails; \
                      nothing attached both reads the request and fails closed",
                 );
+                // See the same arm in `messages.rs`: unscreened is a
+                // bypass, under the tag the fail-closed direction uses.
+                chain.record_unevaluable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
                 return Ok(());
             }
             tracing::warn!(
@@ -825,6 +829,7 @@ fn emit_usage_event(
         guardrail_monitor_hits: screening.monitor_hits.clone(),
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(&screening.audit),
         guardrail_scores: crate::usage_attr::guardrail_scores(&screening.audit),
+        guardrail_bypassed_reason: crate::usage_attr::bypass_reason(&screening.audit),
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);
@@ -1187,6 +1192,68 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// The forwarding above is a fail-open BYPASS, and an operator has to
+    /// be able to find it: the request reached the provider with nothing
+    /// screening it, and its usage row otherwise reads exactly like a
+    /// screened one. The tag matches what the fail-CLOSED direction puts in
+    /// its refusal envelope, so one unscannable body reads the same
+    /// whichever way the chain is configured.
+    #[tokio::test]
+    async fn a_forwarded_unparseable_body_records_the_bypass_on_its_usage_event() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 7})),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(anthropic_model("ct-open"));
+        snap.apikeys.insert(apikey_entry(&["ct-open"]));
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"in-open","kind":"keyword","hook_point":"input","fail_open":true,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-open", row, 1));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized(
+            "anthropic",
+            Arc::new(aisix_provider_anthropic::AnthropicBridge::new()),
+        );
+        let handle = SnapshotHandle::new(snap);
+        let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone(), None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, hub, &cfg())
+                .without_cache()
+                .with_guardrail_index(index)
+                .with_usage_sink(UsageSink::new(tx)),
+        );
+
+        // No `messages` — the scan parser rejects it, which is what makes
+        // the body unscannable.
+        let res = app
+            .oneshot(make_req(serde_json::json!({ "model": "ct-open" })))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("count_tokens must emit a usage event")
+            .expect("channel open");
+        assert_eq!(
+            event.guardrail_bypassed_reason,
+            crate::error::TAG_UNSCANNABLE_BODY,
+            "{event:?}",
+        );
     }
 
     /// The same body with an INPUT-hook row keeps the fail-closed refusal.

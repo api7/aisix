@@ -978,7 +978,10 @@ async fn apply_output_guardrails(
     let value: serde_json::Value = match serde_json::from_slice(response_bytes) {
         Ok(value) => value,
         Err(_) if !aisix_guardrails::Guardrail::refuses_unevaluable_output(chain) => {
-            return ToolResultOutcome::Allow(None)
+            // Released unscanned — a bypass, under the tag the fail-closed
+            // arm below refuses with. See the same pair in `messages.rs`.
+            chain.record_unevaluable_output_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+            return ToolResultOutcome::Allow(None);
         }
         Err(_) => {
             return ToolResultOutcome::Block {
@@ -1211,6 +1214,9 @@ fn emit_tool_call_usage(
             .map(|c| c.enforced_hits())
             .unwrap_or_default(),
         guardrail_scores: guardrail_chain.map(|c| c.scores()).unwrap_or_default(),
+        guardrail_bypassed_reason: guardrail_chain
+            .and_then(|c| c.bypass_reason())
+            .unwrap_or_default(),
         ..Default::default()
     };
     crate::usage_attr::apply_caller_identity(
@@ -2773,6 +2779,46 @@ mod tests {
                 .await
                 .is_some(),
             "an output-hook row must still fail closed"
+        );
+    }
+
+    /// Releasing an unparseable tool result under a fail-open OUTPUT row is
+    /// a bypass — the client got tool output nothing screened — and it is
+    /// recorded under the same tag the fail-closed direction refuses with.
+    ///
+    /// The input-only chain is the control: nothing in it was ever going to
+    /// read the result, so releasing it bypassed nothing and the field must
+    /// stay empty. Tagging that case would make the field fire on results
+    /// that were never going to be screened.
+    #[tokio::test]
+    async fn releasing_an_unparseable_tool_result_records_a_bypass_only_when_a_row_read_it() {
+        let sse_body = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"result\":{}}\n\n";
+
+        const OUTPUT_OPEN_GUARD: &str = r#"{"name":"mcp-output-open","kind":"keyword","hook_point":"output","fail_open":true,"patterns":[{"kind":"literal","value":"forbidden-token"}]}"#;
+        let output_open = env_chain_with(OUTPUT_OPEN_GUARD);
+        assert!(
+            output_guardrail_block(&output_open, sse_body, "echo", &mut Vec::new())
+                .await
+                .is_none(),
+            "premise: a fail-open output row must release the result"
+        );
+        assert_eq!(
+            output_open.bypass_reason().as_deref(),
+            Some(crate::error::TAG_UNSCANNABLE_BODY),
+        );
+
+        const INPUT_ONLY_GUARD: &str = r#"{"name":"mcp-input-only","kind":"keyword","hook_point":"input","patterns":[{"kind":"literal","value":"forbidden-token"}]}"#;
+        let input_only = env_chain_with(INPUT_ONLY_GUARD);
+        assert!(
+            output_guardrail_block(&input_only, sse_body, "echo", &mut Vec::new())
+                .await
+                .is_none(),
+            "premise: an input-only row must release the result"
+        );
+        assert_eq!(
+            input_only.bypass_reason(),
+            None,
+            "nothing in this chain reads the result, so nothing was bypassed",
         );
     }
 

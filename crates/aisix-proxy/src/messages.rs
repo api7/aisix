@@ -659,6 +659,12 @@ async fn dispatch(
                     "cannot scan /v1/messages body for guardrails; nothing \
                      attached both reads the request and fails closed",
                 );
+                // The request goes upstream unscreened, so it is a bypass
+                // even though no member ran to report one — recorded under
+                // the tag the fail-CLOSED direction refuses with, so one
+                // unscannable body reads the same whichever way the chain
+                // is configured.
+                resolved_chain.record_unevaluable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
                 break 'input_screen;
             }
             Err(err) => {
@@ -3097,6 +3103,7 @@ fn emit_anthropic_usage_event(
         // otherwise repeat the same hit once per retry.
         guardrail_enforced_hits: crate::usage_attr::terminal_enforced_hits(terminal, audit),
         guardrail_scores: crate::usage_attr::terminal_guardrail_scores(terminal, audit),
+        guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),
         // Same rule, same reason.
         guardrail_blocked: terminal && guardrail_blocked,
         ..Default::default()
@@ -6617,6 +6624,68 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// The forwarding above is a fail-open BYPASS, and it has to be
+    /// findable: the prompt reached the provider with nothing screening
+    /// it, and the usage row otherwise reads exactly like a screened one.
+    /// The tag matches what the fail-CLOSED direction puts in its refusal
+    /// envelope.
+    #[tokio::test]
+    async fn a_forwarded_unparseable_body_records_the_bypass_on_its_usage_event() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-3",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("my-claude"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"in-open","enabled":true,"kind":"keyword","hook_point":"input","fail_open":true,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-open", row, 1));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        // No `messages` — the scan parser rejects it, which is what makes
+        // the body unscannable.
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "my-claude",
+                "max_tokens": 100,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("/v1/messages must emit a usage event")
+            .expect("channel open");
+        assert_eq!(
+            event.guardrail_bypassed_reason,
+            crate::error::TAG_UNSCANNABLE_BODY,
+            "{event:?}",
+        );
     }
 
     /// The same unparseable body with an INPUT-hook row attached keeps the

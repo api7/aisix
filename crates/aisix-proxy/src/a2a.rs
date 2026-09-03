@@ -905,6 +905,7 @@ fn emit_a2a_usage(
         guardrail_monitor_hits: call.guardrail_monitor_hits.clone(),
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(&call.guardrail_audit),
         guardrail_scores: crate::usage_attr::guardrail_scores(&call.guardrail_audit),
+        guardrail_bypassed_reason: crate::usage_attr::bypass_reason(&call.guardrail_audit),
         ..Default::default()
     };
     crate::usage_attr::apply_caller_identity(

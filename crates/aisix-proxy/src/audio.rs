@@ -246,6 +246,7 @@ pub async fn transcriptions(
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
                 crate::usage_attr::guardrail_scores(&audit),
+                crate::usage_attr::bypass_reason(&audit),
             );
             err.into_response()
         }
@@ -408,6 +409,7 @@ pub async fn translations(
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
                 crate::usage_attr::guardrail_scores(&audit),
+                crate::usage_attr::bypass_reason(&audit),
             );
             err.into_response()
         }
@@ -579,6 +581,7 @@ pub async fn speech(
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
                 crate::usage_attr::guardrail_scores(&audit),
+                crate::usage_attr::bypass_reason(&audit),
             );
             err.into_response()
         }
@@ -2114,6 +2117,7 @@ fn emit_usage_event(
         guardrail_blocked,
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(audit),
         guardrail_scores: crate::usage_attr::guardrail_scores(audit),
+        guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),
         ..Default::default()
     };
     // Per-PK telemetry attribution, same lookup as chat / messages /

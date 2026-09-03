@@ -105,6 +105,46 @@ buffered SSE body). Honouring `fail_open` there does not mean skipping a
 refusal, it means releasing already-buffered bytes that were never scanned —
 a different decision, and one nobody has taken.
 
+## The bypass reason rides the audit log, and every emitter must set it
+
+`usage_events.guardrail_bypassed_reason` is the only record that a request
+went upstream with nothing screening it. Its failure mode is silent in both
+directions: the caller gets a normal 200, and an emitter that leaves the
+field at its `String::default()` reports "nothing was bypassed" for a
+request that was — indistinguishable from a screened one.
+
+So it is not threaded per handler. The chain folds record the first `Bypass`
+they see onto the request's `GuardrailAuditLog`, which every handler already
+clones for `guardrail_enforced_hits`, and every emitter reads it back with
+`usage_attr::bypass_reason(audit)`. Not terminal-only, unlike the enforced
+hits: every attempt of a request that failed open went upstream unscreened.
+`chat.rs` still threads its own copy because its per-attempt and ensemble
+sub-call emitters are handed the value captured earlier in the request,
+which a request-scoped snapshot cannot express; the two agree by
+construction.
+
+Two rules follow, and both are enforced mechanically rather than by review:
+
+- A new `UsageEvent` literal in this crate sets the field, or carries a
+  `NO-GUARDRAIL-CHAIN: <why>` comment saying no chain was ever resolved
+  (`usage_attr`'s `every_usage_event_this_crate_builds_answers_the_bypass_question`
+  parses the crate's own source for both).
+- A pass-through the PROXY performs on a body it could not scan is recorded
+  with `GuardrailChain::record_unevaluable_{input,output}_bypass`, never
+  `record_bypass` directly. That pass has two causes and only one is a
+  bypass: a chain whose readers of that side are all fail-open let an
+  unscreened request through, while a chain where NOTHING reads that side
+  never offered to screen it. Tagging the second would fire the field on
+  requests that were never going to be screened, which breaks the negative
+  answer just as thoroughly as dropping the first.
+
+Values come from the guardrail kind's own `bypass_tag()` — the same bounded
+vocabulary `GuardrailVerdict::block_unavailable` carries, so one outage reads
+the same whichever way the row is configured — plus `unscannable_body` for
+the proxy-raised pass. The audit log clamps whatever it is given through
+`bounded_failure_tag`, because the value lands on an unsanitized metric
+label and on a wire field the control plane stores as `varchar(64)`.
+
 ## Every terminal path emits the access log — including the ones that give up early
 
 The access log and `request_metrics::record` are emitted **by the handler**, at

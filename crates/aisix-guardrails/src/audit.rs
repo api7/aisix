@@ -20,9 +20,16 @@
 //! every point that builds a usage event, and a score is recorded on the
 //! same executions this log already sees — including the ones that allowed.
 //!
-//! Names, counts and indices only: the matched value, the block reason, the
-//! screened text and the example text never enter this log (#153 / #932
-//! no-leak criterion).
+//! It also carries the request's fail-open bypass tag, which
+//! `usage_events.guardrail_bypassed_reason` is built from. It rides here
+//! rather than through a per-handler out-param for the same reason the
+//! scores do: this handle is already threaded to every point that builds a
+//! usage event, and a bypass is recorded on an execution this log already
+//! sees.
+//!
+//! Names, counts, indices and bounded failure tags only: the matched value,
+//! the block reason, the screened text and the example text never enter
+//! this log (#153 / #932 no-leak criterion).
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -62,6 +69,10 @@ pub struct GuardrailAuditLog {
     /// array would silently widen a field whose whole meaning is "a policy
     /// acted here".
     scores: Mutex<BTreeMap<ScoreKey, GuardrailScore>>,
+    /// The request's first fail-open bypass tag, for
+    /// `usage_events.guardrail_bypassed_reason`. Not a map: a bypass is
+    /// one fact per request, and the field it feeds is a single string.
+    bypass: Mutex<Option<String>>,
 }
 
 impl GuardrailAuditLog {
@@ -145,6 +156,37 @@ impl GuardrailAuditLog {
                 }
             }
         }
+    }
+
+    /// Record that a guardrail was bypassed instead of enforced, under
+    /// the kind's bounded failure tag (`lakera_timeout`,
+    /// `unscannable_body`, …).
+    ///
+    /// First one sticks, matching the chain folds and `chat.rs`: the
+    /// policy that failed FIRST is the one that explains the request, and
+    /// a later bypass on the same request is the same outage seen again.
+    ///
+    /// The tag is clamped by [`bounded_failure_tag`] on the way in. Every
+    /// producer already passes a constant, but the type cannot say so —
+    /// a decorator forwards whatever reason its inner guardrail's
+    /// `Bypass` carried — and this value lands on a wire field the
+    /// control plane stores as `varchar(64)`.
+    ///
+    /// A poisoned lock is swallowed for the same reason as
+    /// [`Self::record`].
+    pub fn record_bypass(&self, reason: &str) {
+        let Ok(mut bypass) = self.bypass.lock() else {
+            return;
+        };
+        if bypass.is_none() {
+            *bypass = Some(crate::bounded_failure_tag(reason));
+        }
+    }
+
+    /// The request's bypass tag, or `None` when nothing was bypassed.
+    /// Non-destructive, for the same reason as [`Self::snapshot`].
+    pub fn bypass_reason(&self) -> Option<String> {
+        self.bypass.lock().ok().and_then(|b| b.clone())
     }
 
     /// Snapshot the similarity scores recorded so far, in
@@ -384,5 +426,34 @@ mod tests {
         );
         assert_eq!(log.snapshot().len(), 1);
         assert_eq!(log.snapshot().len(), 1);
+    }
+
+    /// First-wins, matching the chain folds and `chat.rs`: a later bypass
+    /// on the same request is the same outage seen again, and the policy
+    /// that failed FIRST is the one that explains why the request went
+    /// upstream unscreened.
+    #[test]
+    fn the_first_bypass_wins_and_reading_does_not_drain() {
+        let log = GuardrailAuditLog::new();
+        assert_eq!(log.bypass_reason(), None);
+        log.record_bypass("lakera_timeout");
+        log.record_bypass("bedrock_5xx");
+        assert_eq!(log.bypass_reason().as_deref(), Some("lakera_timeout"));
+        assert_eq!(log.bypass_reason().as_deref(), Some("lakera_timeout"));
+    }
+
+    /// The tag lands on a wire field the control plane stores as
+    /// `varchar(64)` and on an unsanitized metric label. Every producer
+    /// passes a constant, but the parameter is a `String` — a decorator can
+    /// forward whatever reason its inner guardrail carried.
+    #[test]
+    fn a_bypass_tag_is_clamped_to_what_the_wire_field_can_hold() {
+        let log = GuardrailAuditLog::new();
+        log.record_bypass("Lakera Timeout!! <script>");
+        assert_eq!(log.bypass_reason().as_deref(), Some("lakeratimeoutscript"));
+
+        let long = GuardrailAuditLog::new();
+        long.record_bypass(&"a".repeat(200));
+        assert_eq!(long.bypass_reason().map(|r| r.len()), Some(64));
     }
 }
