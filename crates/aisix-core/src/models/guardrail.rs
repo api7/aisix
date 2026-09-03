@@ -1310,11 +1310,20 @@ pub struct Guardrail {
     #[serde(default)]
     pub hook_point: GuardrailHookPoint,
 
-    /// Behavior when a remote API guardrail cannot complete its check —
-    /// upstream unreachable, timing out, throttling, or rejecting the
-    /// call. `true` allows the request and records the bypass reason in
-    /// `usage_events.guardrail_bypassed_reason`; `false` (the default)
-    /// blocks with 422. Keyword guardrails do not use this setting.
+    /// Behavior when this guardrail cannot complete its check. Two
+    /// causes: a remote provider that is unreachable, timing out,
+    /// throttling, or rejecting the call; and a body the gateway could
+    /// not give the guardrail at all — one that does not decode as UTF-8
+    /// or does not parse, which the proxy would otherwise refuse with
+    /// `unscannable_body`. `true` allows the request; `false` (the
+    /// default) blocks with 422.
+    ///
+    /// Applies to EVERY kind. A kind that calls out has only the first
+    /// cause, and splits the policy per hook: this field governs the
+    /// input hook and the kind's own `output_fail_open` governs the
+    /// output hook. `keyword` and `pii` never call out and so have no
+    /// `output_fail_open`; for them this one value governs both hooks,
+    /// and only the second cause can arise.
     ///
     /// Defaults to fail-closed so an unchecked request is never released
     /// on the strength of a guardrail that did not run: an operator who
