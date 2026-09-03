@@ -490,11 +490,13 @@ pub fn validate_model(value: &Value) -> Result<(), SchemaError> {
     if validate(&SCHEMAS.model, &probe).is_err() {
         return Err(err);
     }
-    // strip_kind_inapplicable only reports on these three kinds.
+    // strip_kind_inapplicable reports only on these non-direct shapes.
     let kind = if model.is_routing() {
         "model group"
     } else if model.is_ensemble() {
         "ensemble"
+    } else if model.is_embedding() {
+        "embedding model"
     } else {
         "semantic router"
     };
@@ -4935,6 +4937,19 @@ mod tests {
         let msg = validate_model(&semantic).unwrap_err().message;
         assert!(msg.contains("`auto_prompt_caching`"), "{msg}");
         assert!(msg.contains("semantic router"), "{msg}");
+
+        let embedding = json!({
+            "display_name": "embed",
+            "provider": "openai",
+            "model_name": "text-embedding-3-small",
+            "provider_key_id": "pk",
+            "embedding": {"dimensions": 1536},
+            "effort_mapping": {"medium": "high"}
+        });
+        let msg = validate_model(&embedding).unwrap_err().message;
+        assert!(msg.contains("`effort_mapping`"), "{msg}");
+        assert!(msg.contains("embedding model"), "{msg}");
+        assert!(!msg.contains("semantic router"), "{msg}");
     }
 
     #[test]

@@ -44,7 +44,8 @@ use serde::Deserialize;
 use std::time::{Duration, Instant};
 
 use aisix_provider_anthropic::wire::{
-    build_request, response_into_chat_response, split_system, AnthropicResponse,
+    build_request, response_into_chat_response, split_system,
+    translate_reasoning_effort_to_anthropic, AnthropicResponse,
 };
 
 // Per-`ProviderKey` request override pipeline (#302 §5 / #340). The JSON-body
@@ -978,6 +979,9 @@ impl BedrockBridge {
         if let Some(cfg) = build_inference_config(req, pk_param_constraints(ctx)) {
             call = call.inference_config(cfg);
         }
+        if let Some(fields) = build_converse_additional_model_request_fields(req, upstream_id) {
+            call = call.additional_model_request_fields(fields);
+        }
         // #560: forward OpenAI `tools` / `tool_choice` into Converse's
         // `toolConfig`. Without this every Converse publisher silently
         // drops tool calling and improvises the call as prose
@@ -1047,6 +1051,9 @@ impl BedrockBridge {
         // the #463 param_constraints temperature clamp.
         if let Some(cfg) = build_inference_config(req, pk_param_constraints(ctx)) {
             call = call.inference_config(cfg);
+        }
+        if let Some(fields) = build_converse_additional_model_request_fields(req, upstream_id) {
+            call = call.additional_model_request_fields(fields);
         }
         // #560: forward tools on the stream path too (all publishers,
         // incl. Anthropic, stream through Converse).
@@ -1760,6 +1767,35 @@ fn build_inference_config(
         b = b.top_p(p);
     }
     Some(b.build())
+}
+
+/// Carry Anthropic-specific reasoning controls through Bedrock Converse.
+/// Anthropic non-streaming requests use the native `/invoke` envelope, where
+/// `build_request` already translates `reasoning_effort`; streaming has to use
+/// Converse and therefore places the same provider fields under
+/// `additionalModelRequestFields`. Other Bedrock publishers must not receive
+/// Anthropic parameters they may reject.
+fn build_converse_additional_model_request_fields(
+    req: &ChatFormat,
+    upstream_id: &str,
+) -> Option<aws_smithy_types::Document> {
+    if BedrockPublisher::from_model_id(upstream_id) != Some(BedrockPublisher::Anthropic) {
+        return None;
+    }
+
+    let mut extras = req.extra.clone();
+    translate_reasoning_effort_to_anthropic(&mut extras);
+    let mut fields = serde_json::Map::new();
+    for name in ["thinking", "output_config", "anthropic_beta"] {
+        if let Some(value) = extras.remove(name) {
+            fields.insert(name.to_string(), value);
+        }
+    }
+    if fields.is_empty() {
+        None
+    } else {
+        Some(json_to_document(&serde_json::Value::Object(fields)))
+    }
 }
 
 /// Build a Converse [`ToolConfiguration`] from the OpenAI `tools` /
@@ -2564,6 +2600,59 @@ mod tests {
         assert_eq!(
             messages[0].get("role").and_then(|v| v.as_str()),
             Some("user")
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_effort_reaches_both_invoke_and_converse_stream_wires() {
+        let server = MockServer::start().await;
+        let invoke = CapturingResponder::default();
+        let stream = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(invoke.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse-stream$"))
+            .respond_with(stream.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-effort",
+            sample_model_with("anthropic.claude-opus-4-5-20251101-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let mut req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+        req.extra
+            .insert("reasoning_effort".to_string(), serde_json::json!("high"));
+
+        bridge.chat(&req, &ctx).await.unwrap();
+        let _ = bridge.chat_stream(&req, &ctx).await;
+
+        let invoke_body = invoke.captured_body.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            invoke_body
+                .pointer("/output_config/effort")
+                .and_then(|v| v.as_str()),
+            Some("high"),
+            "legacy non-streaming wire lost reasoning effort; body={invoke_body}"
+        );
+        let stream_body = stream.captured_body.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            stream_body
+                .pointer("/additionalModelRequestFields/output_config/effort")
+                .and_then(|v| v.as_str()),
+            Some("high"),
+            "ConverseStream wire must carry the same Anthropic effort; body={stream_body}"
+        );
+        assert!(
+            stream_body.pointer("/reasoning_effort").is_none(),
+            "OpenAI-shaped reasoning_effort must not leak onto the Bedrock wire; body={stream_body}"
         );
     }
 
