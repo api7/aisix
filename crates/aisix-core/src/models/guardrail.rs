@@ -1318,12 +1318,16 @@ pub struct Guardrail {
     /// `unscannable_body`. `true` allows the request; `false` (the
     /// default) blocks with 422.
     ///
-    /// Applies to EVERY kind. A kind that calls out has only the first
-    /// cause, and splits the policy per hook: this field governs the
-    /// input hook and the kind's own `output_fail_open` governs the
-    /// output hook. `keyword` and `pii` never call out and so have no
-    /// `output_fail_open`; for them this one value governs both hooks,
-    /// and only the second cause can arise.
+    /// Both causes apply to EVERY kind: the second one is the gateway
+    /// failing to produce scannable text, which happens before any
+    /// guardrail runs and so reaches all of them. `keyword` and `pii`
+    /// never call out, so only the second can arise for them; a kind
+    /// that calls out can meet either.
+    ///
+    /// The per-hook split follows the same line. A kind that calls out
+    /// carries its own `output_fail_open` for the output hook, leaving
+    /// this field to govern the input hook. `keyword` and `pii` have no
+    /// `output_fail_open`, so this one value governs both of their hooks.
     ///
     /// Defaults to fail-closed so an unchecked request is never released
     /// on the strength of a guardrail that did not run: an operator who
