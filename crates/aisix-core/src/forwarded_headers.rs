@@ -32,8 +32,9 @@
 //!    does NOT apply this second tier.
 //!
 //! Credential slots — `authorization`, `x-api-key`, `api-key`,
-//! `x-goog-api-key`, `proxy-authorization`, `cookie` — are in neither tier
-//! on purpose. Handing an internal upstream the end user's own credential,
+//! `x-goog-api-key`, `proxy-authorization`, `cookie`, and the AWS SigV4
+//! trio `x-amz-security-token` / `x-amz-date` / `x-amz-content-sha256` —
+//! are in neither tier on purpose. Handing an internal upstream the end user's own credential,
 //! in the slot that upstream already reads, is the capability's whole
 //! point, and the surface that injects a gateway credential into the same
 //! slot stands aside for it (see each dispatch site).
@@ -163,9 +164,10 @@ pub fn exact_match_only(name: &str) -> bool {
 /// header_key` the gateway credential arrives in the route's
 /// `auth_header_name`, and `identity_header` carries an end-user identity
 /// the route promises to record and strip. The route schema forbids MOST
-/// of the shared credential names for those two fields, and the two it
-/// does allow (`api-key`, `x-goog-api-key`) are on the shared list
-/// already — so the union below is what makes the rule complete, and
+/// of the shared credential names for those two fields, and the ones it
+/// does allow (`api-key`, `x-goog-api-key`, and the SigV4 trio) are on
+/// the shared list already — so the union below is what makes the rule
+/// complete, and
 /// without it a `["x-*"]` pattern sweeps in exactly the header the
 /// gateway just consumed to authenticate
 /// the caller and relays it upstream, where it can be replayed against
