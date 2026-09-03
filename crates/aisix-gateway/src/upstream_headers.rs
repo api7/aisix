@@ -480,6 +480,27 @@ mod tests {
     }
 
     #[test]
+    fn a_static_credential_survives_a_forward_that_did_not_claim_it() {
+        // The flattened form drops a credential-slot `default_headers`
+        // entry only when the forward actually took that slot. Dropping it
+        // whenever the name IS a credential slot would delete the static
+        // second credential the field exists to carry — the case of an
+        // upstream that reads one in a slot the provider's own credential
+        // does not occupy, and of a caller who simply did not send the
+        // header.
+        let r = overrides(&[("x-api-key", "operator-static")], &["x-team"]);
+        let inbound = client(&[("x-team", "client-claimed")]);
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
+        let resolved = resolve_extra_headers(&ctx);
+        assert!(
+            resolved
+                .iter()
+                .any(|(n, v)| n.as_str() == "x-api-key" && v == "operator-static"),
+            "static credential-slot entry lost: {resolved:?}"
+        );
+    }
+
+    #[test]
     fn a_call_with_no_client_request_forwards_nothing() {
         // Background job polls and semantic-routing embedding lookups have
         // no inbound headers to draw on.
