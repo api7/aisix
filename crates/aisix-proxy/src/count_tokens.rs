@@ -1151,6 +1151,23 @@ mod tests {
         .unwrap();
         crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-open", row, 1));
 
+        // Premise: the row IS in the chain and DOES read the request; it
+        // simply must not refuse. Without this, a row that never arrived
+        // would forward for an entirely different reason.
+        let probe =
+            aisix_guardrails::LiveGuardrailIndex::new(SnapshotHandle::new(snap.clone()), None)
+                .resolve(&aisix_guardrails::RequestContext {
+                    passthrough_route_id: "",
+                    model_id: "",
+                    mcp_server_id: "",
+                    api_key_id: "",
+                    team_id: None,
+                });
+        assert!(aisix_guardrails::Guardrail::runs_on_input(&probe));
+        assert!(!aisix_guardrails::Guardrail::refuses_unevaluable_input(
+            &probe
+        ));
+
         let hub = Arc::new(Hub::new());
         hub.register_specialized(
             "anthropic",

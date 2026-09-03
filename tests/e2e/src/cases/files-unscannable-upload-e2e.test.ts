@@ -334,10 +334,13 @@ describe("files: an unscannable upload is refused, not forwarded", () => {
       ctx.skip();
       return;
     }
+    // Counted rather than asserted at length 1: this env is shared with
+    // the leg below.
+    const before = failOpen.upstream.uploads.length;
     const res = await upload(failOpen, NON_UTF8_LINE);
     expect(res.status).toBe(200);
-    expect(failOpen.upstream.uploads).toHaveLength(1);
-    expect(failOpen.upstream.uploads[0].includes(NON_UTF8_LINE)).toBe(true);
+    expect(failOpen.upstream.uploads).toHaveLength(before + 1);
+    expect(failOpen.upstream.uploads[before].includes(NON_UTF8_LINE)).toBe(true);
   });
 
   // ...and that row is still SCANNING. `fail_open` changes what happens

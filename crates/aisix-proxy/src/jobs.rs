@@ -3028,16 +3028,37 @@ mod tests {
     /// an input-side one. Without this the forwarding assertion below is
     /// the same observation as the no-guardrail test, and would pass just
     /// as well if the row had never been indexed at all.
+    fn resolved_chain(snap: &AisixSnapshot) -> aisix_guardrails::GuardrailChain {
+        aisix_guardrails::LiveGuardrailIndex::new(SnapshotHandle::new(snap.clone()), None).resolve(
+            &aisix_guardrails::RequestContext {
+                passthrough_route_id: "",
+                model_id: "m-a",
+                mcp_server_id: "",
+                api_key_id: "",
+                team_id: None,
+            },
+        )
+    }
+
+    /// The chain reads the request, so the upload IS still scanned — it
+    /// just must not be refused. Distinguishes a real fail-open chain from
+    /// one where the seeded row never arrived, which would forward for an
+    /// entirely different reason.
+    fn assert_scanned_but_fail_open(snap: &AisixSnapshot) {
+        let chain = resolved_chain(snap);
+        assert!(!chain.is_empty(), "the seeded row must reach the chain");
+        assert!(
+            aisix_guardrails::Guardrail::runs_on_input(&chain),
+            "it must still READ the request"
+        );
+        assert!(
+            !aisix_guardrails::Guardrail::refuses_unevaluable_input(&chain),
+            "but nothing in it may refuse a body it could not be given"
+        );
+    }
+
     fn assert_output_only_chain(snap: &AisixSnapshot) {
-        let chain =
-            aisix_guardrails::LiveGuardrailIndex::new(SnapshotHandle::new(snap.clone()), None)
-                .resolve(&aisix_guardrails::RequestContext {
-                    passthrough_route_id: "",
-                    model_id: "m-a",
-                    mcp_server_id: "",
-                    api_key_id: "",
-                    team_id: None,
-                });
+        let chain = resolved_chain(snap);
         assert!(!chain.is_empty(), "the seeded row must reach the chain");
         assert!(
             !aisix_guardrails::Guardrail::runs_on_input(&chain),
@@ -3059,6 +3080,7 @@ mod tests {
         snap.models.insert(model("m-a", "jobs-a", PK_A));
         snap.apikeys.insert(apikey_entry(&["*"]));
         seed_fail_open_input_guardrail(&snap);
+        assert_scanned_but_fail_open(&snap);
         let app = build_app(snap);
 
         let resp = app
@@ -3091,6 +3113,10 @@ mod tests {
         snap.apikeys.insert(apikey_entry(&["*"]));
         seed_fail_open_input_guardrail(&snap);
         seed_never_matching_guardrail(&snap);
+        assert!(
+            aisix_guardrails::Guardrail::refuses_unevaluable_input(&resolved_chain(&snap)),
+            "the fail-closed row must survive the fold"
+        );
         let app = build_app(snap);
 
         let resp = app
@@ -3115,6 +3141,18 @@ mod tests {
         snap.apikeys.insert(apikey_entry(&["*"]));
         seed_fail_open_input_guardrail(&snap);
         seed_never_matching_output_guardrail(&snap);
+        // What makes this the CROSS case rather than a degenerate one: the
+        // chain DOES read the request and DOES contain a fail-closed row,
+        // and still must not refuse — because those are different rows.
+        // Drop either seeded row and one of these three fails.
+        {
+            let chain = resolved_chain(&snap);
+            assert!(aisix_guardrails::Guardrail::runs_on_input(&chain));
+            assert!(aisix_guardrails::Guardrail::fails_closed_on_input(&chain));
+            assert!(!aisix_guardrails::Guardrail::refuses_unevaluable_input(
+                &chain
+            ));
+        }
         let app = build_app(snap);
 
         let resp = app
