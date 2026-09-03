@@ -4787,7 +4787,7 @@ fn emit_failed_attempts(
                 // Same reason as the pre-dispatch failure event: the
                 // bypass is a request-scoped fact and every attempt of a
                 // request that failed open went upstream unscreened.
-                bypass_reason: String::new(),
+                bypass_reason: crate::usage_attr::bypass_reason(audit),
                 ..UsageExtras::default()
             },
             /* cost_usd */ 0.0,
