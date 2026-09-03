@@ -628,7 +628,10 @@ async fn dispatch(
     // check below blocks it (#379 / closes the anthropic gap in #519).
     *applied_out = resolved_chain.applied().to_vec();
     *audit_out = resolved_chain.audit_log();
-    if !resolved_chain.is_empty() {
+    'input_screen: {
+        if resolved_chain.is_empty() {
+            break 'input_screen;
+        }
         // Fail CLOSED when the body cannot be parsed into something
         // scannable. This used to be `if let Ok(chat) = ...`, so a shape
         // the gateway's Anthropic parser rejects skipped the guardrail
@@ -638,6 +641,21 @@ async fn dispatch(
         // body; this is the same rule on the LLM side.
         let chat = match aisix_provider_anthropic::parse_inbound_request_for_scan(body) {
             Ok(chat) => chat,
+            // ...but only a chain that would have READ the request can be
+            // the reason it is refused. A chain resolved from output-hook
+            // attachments alone is never offered this body, so an
+            // unparseable one leaves exactly as it would with no guardrail
+            // configured at all.
+            Err(err) if !aisix_guardrails::Guardrail::runs_on_input(resolved_chain.as_ref()) => {
+                tracing::debug!(
+                    guardrail_hook = "input",
+                    model = %model_name,
+                    error = %err,
+                    "cannot scan /v1/messages body for guardrails; no input-hook \
+                     guardrail is attached, so no check is being skipped",
+                );
+                break 'input_screen;
+            }
             Err(err) => {
                 tracing::warn!(
                     guardrail_hook = "input",
@@ -6463,6 +6481,99 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
             .expect("usage event was never emitted")
             .expect("usage event sender dropped");
         assert_refused_not_abandoned(&event);
+    }
+
+    /// The input-side refusal of a body the Anthropic parser rejects is a
+    /// GUARDRAIL decision, so it needs a guardrail that would have read the
+    /// body. An output-hook-only row is in the resolved chain but never sees
+    /// the request; refusing on its strength turns an output policy into a
+    /// request-shape validator. Fails on `a456ab71` with 422.
+    #[tokio::test]
+    async fn unparseable_body_with_an_output_only_guardrail_is_forwarded() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-3",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("my-claude"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"out-only","enabled":true,"kind":"keyword","hook_point":"output","fail_open":false,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-out", row, 1));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+
+        // No `messages` key: the scan parser rejects it, the provider is the
+        // one entitled to judge the shape.
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "my-claude",
+                "max_tokens": 100,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// The same unparseable body with an INPUT-hook row attached keeps the
+    /// fail-closed refusal #1022 introduced.
+    #[tokio::test]
+    async fn unparseable_body_with_an_input_guardrail_is_refused() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("my-claude"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"in-only","enabled":true,"kind":"keyword","hook_point":"input","fail_open":false,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-in", row, 1));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "my-claude",
+                "max_tokens": 100,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(crate::error::TAG_UNSCANNABLE_BODY),
+            "{v}"
+        );
     }
 
     /// Drive one streamed `/v1/messages` request through a block-capable

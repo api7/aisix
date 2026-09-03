@@ -69,6 +69,23 @@ mock upstream that trickles its response over ~1s, and a client read loop that
 counts chunks and measures first-byte against last-byte
 (`audio-stream-relay-e2e.test.ts`).
 
+## A guardrail-raised refusal is gated on the direction, not on `is_empty()`
+
+`GuardrailIndex::resolve` matches on SCOPE only — env / model / mcp_server /
+api_key / team. It does not filter by `hook_point`, so a chain resolved for a
+request is non-empty whenever any attachment is in scope, including one attached
+on the output hook alone. Each guardrail then no-ops on the hook it is not
+configured for, which makes `!chain.is_empty()` a safe gate for *running* the
+checks and a wrong gate for *refusing*: a refusal the proxy raises itself —
+`unscannable_body`, and anything else the code decides rather than a verdict —
+is only justified when something would have read that side of the exchange.
+
+Gate the refusal on `Guardrail::runs_on_input(&chain)` for a request-side one and
+`runs_on_output(&chain)` for a response-side one. `/mcp` is the sharp case: it
+resolves ONE chain and uses it in both directions, so an input-only row reaches
+the output arm and vice versa. Note also that `hook_point` defaults to `both`, so
+this only bites a deployment that set the hook explicitly.
+
 ## Every terminal path emits the access log — including the ones that give up early
 
 The access log and `request_metrics::record` are emitted **by the handler**, at

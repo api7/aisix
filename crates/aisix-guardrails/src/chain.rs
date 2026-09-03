@@ -402,6 +402,14 @@ impl Guardrail for GuardrailChain {
         self.members.iter().any(|m| m.guardrail.runs_on_output())
     }
 
+    /// `true` when at least one member inspects the request. An empty
+    /// chain — and a chain whose every member is attached on the output
+    /// hook alone — reports `false`, so a caller can tell "guardrails are
+    /// attached" apart from "a guardrail will read this request".
+    fn runs_on_input(&self) -> bool {
+        self.members.iter().any(|m| m.guardrail.runs_on_input())
+    }
+
     /// A nested chain binds its own members and answers `Some` only when
     /// one of them took the bind — so an outer chain replaces this member
     /// exactly when doing so changes anything.
@@ -1364,6 +1372,47 @@ mod tests {
         let empty = GuardrailChain::new(vec![]);
         assert!(!empty.runs_on_output());
         assert!(!empty.stream_output_policy().holds_back());
+    }
+
+    /// `runs_on_input` is the mirror of `runs_on_output`, and callers that
+    /// refuse a request the scanner cannot read key on it: "a guardrail is
+    /// attached" is not the same question as "a guardrail will read this
+    /// request" (#1113 / #1114 follow-up).
+    #[test]
+    fn runs_on_input_reports_only_input_side_members() {
+        let output_only = GuardrailChain::new(vec![Arc::new(KeywordBlocklist::output_only(vec![
+            KeywordRule::literal("x"),
+        ]))]);
+        assert!(
+            !output_only.runs_on_input(),
+            "an output-only chain never reads the request"
+        );
+        assert!(output_only.runs_on_output());
+        // The distinction the gate needs: non-empty, yet nothing reads input.
+        assert!(!output_only.is_empty());
+
+        let input_only = GuardrailChain::new(vec![Arc::new(KeywordBlocklist::input_only(vec![
+            KeywordRule::literal("x"),
+        ]))]);
+        assert!(input_only.runs_on_input());
+
+        let both = GuardrailChain::new(vec![Arc::new(KeywordBlocklist::new(vec![
+            KeywordRule::literal("x"),
+        ]))]);
+        assert!(both.runs_on_input());
+        assert!(both.runs_on_output());
+
+        let mixed = GuardrailChain::new(vec![
+            Arc::new(KeywordBlocklist::output_only(vec![KeywordRule::literal(
+                "x",
+            )])),
+            Arc::new(KeywordBlocklist::input_only(vec![KeywordRule::literal(
+                "y",
+            )])),
+        ]);
+        assert!(mixed.runs_on_input(), "one input-side member is enough");
+
+        assert!(!GuardrailChain::new(vec![]).runs_on_input());
     }
 
     // --- segment moderation folds (#932 bedrock follow-up) ---------------

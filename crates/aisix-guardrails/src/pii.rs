@@ -366,6 +366,10 @@ impl Guardrail for PiiGuardrail {
         self.check_output_enabled
     }
 
+    fn runs_on_input(&self) -> bool {
+        self.check_input_enabled
+    }
+
     /// Masking a streamed response requires the whole response held back —
     /// a span can cross any chunk boundary, and a mask can't be applied
     /// retroactively to bytes already on the wire. Cap + overflow policy

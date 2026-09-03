@@ -349,6 +349,13 @@ impl Guardrail for TextModerationGuardrail {
         )
     }
 
+    fn runs_on_input(&self) -> bool {
+        matches!(
+            self.hook_point,
+            GuardrailHookPoint::Input | GuardrailHookPoint::Both
+        )
+    }
+
     fn stream_output_policy(&self) -> StreamOutputPolicy {
         match self.stream_processing_mode.as_str() {
             "buffer_full" => StreamOutputPolicy::BufferFull {

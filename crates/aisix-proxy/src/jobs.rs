@@ -523,12 +523,17 @@ async fn scan_input_blob(
     // deliberate — refusing it would break lawful PDF/image uploads, which
     // is a product decision, not a guardrail one.
     //
-    // Reached only once a chain is attached, which is also deliberate. An
-    // upload nobody screens keeps forwarding whatever it forwards today;
-    // this is a guardrail refusal, not a structural check on the file.
+    // Reached only once a guardrail that reads the REQUEST is attached,
+    // which is also deliberate. An upload nobody screens keeps forwarding
+    // whatever it forwards today; this is a guardrail refusal, not a
+    // structural check on the file. A chain resolved from output-hook
+    // attachments alone would never have been offered this payload, so it
+    // cannot be the reason the payload is refused — it falls through to the
+    // lossy scan the same way an unconfigured deployment does.
+    let scanned_on_input = aisix_guardrails::Guardrail::runs_on_input(&chain);
     let text = match (std::str::from_utf8(blob), undecodable) {
         (Ok(text), _) => std::borrow::Cow::Borrowed(text),
-        (Err(err), Undecodable::Refuse) => {
+        (Err(err), Undecodable::Refuse) if scanned_on_input => {
             tracing::warn!(
                 guardrail_hook = "input",
                 model = %target.display_name(),
@@ -541,7 +546,9 @@ async fn scan_input_blob(
                 Some(crate::error::TAG_UNSCANNABLE_BODY),
             ));
         }
-        (Err(_), Undecodable::ScanLossily) => String::from_utf8_lossy(blob),
+        // Binary-purpose upload, or a text one nothing on the request side
+        // would have read: best-effort lossy scan, forwarded verbatim.
+        (Err(_), _) => String::from_utf8_lossy(blob),
     };
     let chat = aisix_gateway::ChatFormat::new(
         target.display_name(),
@@ -2982,6 +2989,89 @@ mod tests {
                 .contains(crate::error::TAG_UNSCANNABLE_BODY),
             "the caller must be able to tell an unscannable body from a \
              policy hit: {v}"
+        );
+    }
+
+    /// The same never-matching keyword row, attached on the OUTPUT hook
+    /// alone. `scan_input_blob` resolves by scope, so this row is in the
+    /// chain — but it is never offered the request, so it cannot be the
+    /// reason the request is refused.
+    fn seed_never_matching_output_guardrail(snap: &AisixSnapshot) {
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"never-matches-out","enabled":true,"hook_point":"output","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"zzz-no-such-term-zzz"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(
+            snap,
+            aisix_core::resource::ResourceEntry::new("g-out", g, 1),
+        );
+    }
+
+    /// The gate is "a guardrail would read this upload", not "a guardrail
+    /// is attached". An output-hook-only deployment never inspects the
+    /// request side, so a text-purpose upload it cannot decode must leave
+    /// exactly as it would with nothing configured. Fails on `a456ab71`
+    /// with 422 — the resolved chain is non-empty there and that was the
+    /// whole gate.
+    #[tokio::test]
+    async fn non_utf8_upload_with_an_output_only_guardrail_is_forwarded() {
+        let upstream = MockServer::start().await;
+        files_upstream_mock().expect(1).mount(&upstream).await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        seed_never_matching_output_guardrail(&snap);
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(upload_request("XBOUNDARYX", NON_UTF8_UPLOAD))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert!(
+            received[0]
+                .body
+                .windows(NON_UTF8_UPLOAD.len())
+                .any(|w| w == NON_UTF8_UPLOAD),
+            "the original bytes must still forward byte-for-byte"
+        );
+    }
+
+    /// One input-hook member is enough: adding the output-only row to the
+    /// input-hook one must not soften the refusal into a forward.
+    #[tokio::test]
+    async fn non_utf8_upload_with_input_and_output_guardrails_is_still_refused() {
+        let upstream = MockServer::start().await;
+        files_upstream_mock().expect(0).mount(&upstream).await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        seed_never_matching_output_guardrail(&snap);
+        seed_never_matching_guardrail(&snap);
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(upload_request("XBOUNDARYX", NON_UTF8_UPLOAD))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter", "{v}");
+        assert_eq!(v["error"]["code"], "guardrail_unavailable", "{v}");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(crate::error::TAG_UNSCANNABLE_BODY),
+            "{v}"
         );
     }
 

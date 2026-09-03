@@ -393,6 +393,13 @@ impl Guardrail for SemanticGuardrail {
         )
     }
 
+    fn runs_on_input(&self) -> bool {
+        matches!(
+            self.cfg.hook_point,
+            GuardrailHookPoint::Input | GuardrailHookPoint::Both
+        )
+    }
+
     /// This kind reports similarity scores, so it takes a per-request bind.
     fn bind_score_log(&self, log: &Arc<GuardrailAuditLog>) -> Option<Arc<dyn Guardrail>> {
         Some(Arc::new(Self {

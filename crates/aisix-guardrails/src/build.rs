@@ -861,6 +861,10 @@ impl Guardrail for MonitorGuardrail {
         self.inner.runs_on_output()
     }
 
+    fn runs_on_input(&self) -> bool {
+        self.inner.runs_on_input()
+    }
+
     /// Forward the bind and re-wrap. A monitor-mode row is the one an
     /// operator is actively tuning, so it is the LAST place scores may go
     /// missing.
@@ -1014,6 +1018,10 @@ impl Guardrail for LiveGuardrailChain {
 
     fn runs_on_output(&self) -> bool {
         self.current().runs_on_output()
+    }
+
+    fn runs_on_input(&self) -> bool {
+        self.current().runs_on_input()
     }
 
     fn redacts_input(&self) -> bool {

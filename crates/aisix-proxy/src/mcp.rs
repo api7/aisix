@@ -967,8 +967,17 @@ async fn apply_output_guardrails(
     // `application/json` object; a body that does not parse (e.g. if that ever
     // regressed to SSE framing) must not slip an unscanned tool result past the
     // guardrail — block rather than allow.
+    //
+    // Only when a guardrail would have READ the result, though. The chain is
+    // resolved once for both directions, so it is non-empty for a tool call
+    // screened on the request side alone; refusing the RESULT on the strength
+    // of an input-hook attachment would refuse a body that attachment was
+    // never going to inspect.
     let value: serde_json::Value = match serde_json::from_slice(response_bytes) {
         Ok(value) => value,
+        Err(_) if !aisix_guardrails::Guardrail::runs_on_output(chain) => {
+            return ToolResultOutcome::Allow(None)
+        }
         Err(_) => {
             return ToolResultOutcome::Block {
                 guardrail_name: None,
@@ -2717,6 +2726,38 @@ mod tests {
                 .await
                 .is_some(),
             "an unparseable response body must fail closed (block)"
+        );
+    }
+
+    /// The mirror of the `/v1/files` gate on the response side: `/mcp`
+    /// resolves ONE chain for both directions, so a tool call screened on
+    /// the request side alone still arrives here with a non-empty chain.
+    /// An unparseable tool result must not be refused on the strength of a
+    /// row that only ever reads the arguments. Fails on `a456ab71` — the
+    /// parse arm blocked unconditionally there.
+    #[tokio::test]
+    async fn unparseable_tool_result_with_an_input_only_chain_is_allowed() {
+        let sse_body = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"result\":{}}\n\n";
+
+        // Explicitly input-only: `INPUT_GUARD` omits `hook_point`, whose
+        // default is `both`, so it would read the result too.
+        const INPUT_ONLY_GUARD: &str = r#"{"name":"mcp-input-only","kind":"keyword","hook_point":"input","patterns":[{"kind":"literal","value":"forbidden-token"}]}"#;
+        let input_only = env_chain_with(INPUT_ONLY_GUARD);
+        assert!(!input_only.is_empty(), "the chain must be non-empty");
+        assert!(
+            output_guardrail_block(&input_only, sse_body, "echo", &mut Vec::new())
+                .await
+                .is_none(),
+            "an input-hook row never reads the tool result, so it cannot refuse it"
+        );
+
+        // The output-hook row still fails closed on the same bytes.
+        let output = env_chain_with(OUTPUT_GUARD);
+        assert!(
+            output_guardrail_block(&output, sse_body, "echo", &mut Vec::new())
+                .await
+                .is_some(),
+            "an output-hook row must still fail closed"
         );
     }
 

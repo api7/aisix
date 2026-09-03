@@ -101,6 +101,10 @@ impl Guardrail for KeywordBlocklist {
         self.check_output_enabled
     }
 
+    fn runs_on_input(&self) -> bool {
+        self.check_input_enabled
+    }
+
     async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
         if !self.check_input_enabled {
             return GuardrailVerdict::Allow;

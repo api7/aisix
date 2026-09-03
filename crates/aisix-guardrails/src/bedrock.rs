@@ -809,6 +809,13 @@ impl Guardrail for BedrockGuardrail {
         )
     }
 
+    fn runs_on_input(&self) -> bool {
+        matches!(
+            self.hook_point,
+            GuardrailHookPoint::Input | GuardrailHookPoint::Both
+        )
+    }
+
     fn name(&self) -> &'static str {
         // Static name keeps metric cardinality bounded; the row's
         // own name is logged via tracing fields when we hit a

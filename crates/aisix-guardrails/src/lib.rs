@@ -690,6 +690,18 @@ pub trait Guardrail: Send + Sync + 'static {
         true
     }
 
+    /// Whether this guardrail actually inspects the INPUT hook — the mirror
+    /// of [`Self::runs_on_output`]. Callers use it to decide whether a
+    /// request-side decision is one this guardrail has any say in: a
+    /// proxy-raised refusal of a body the scanner cannot read is only
+    /// justified when something would have read it, so an output-only
+    /// attachment must not cause a request to be refused (#1113 / #1114).
+    /// Default: `true` (assume input-relevant, secure-leaning); impls that
+    /// carry a hook point override to gate on it.
+    fn runs_on_input(&self) -> bool {
+        true
+    }
+
     // --- redaction (#932) -------------------------------------------------
     //
     // Redaction is a separate, synchronous, text→text capability rather
