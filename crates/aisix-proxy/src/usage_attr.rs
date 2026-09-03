@@ -1071,6 +1071,18 @@ mod tests {
             let src = std::fs::read_to_string(&path).expect("source must read");
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             for (idx, _) in src.match_indices("UsageEvent {") {
+                // This file writes the token it searches for, in a string
+                // literal and in a doc comment, and both would be counted
+                // as emitters — a check that inflates its own coverage.
+                // Judged from the line prefix rather than the whole file:
+                // none of these matches sits inside a multi-line construct,
+                // and a whole-file string scanner would have to model raw
+                // strings to be worth more.
+                let line_start = src[..idx].rfind('\n').map_or(0, |n| n + 1);
+                let prefix = &src[line_start..idx];
+                if prefix.contains("//") || prefix.matches('"').count() % 2 == 1 {
+                    continue;
+                }
                 // `-> UsageEvent {` (optionally path-qualified) is a
                 // return type followed by a function body, not a literal.
                 let before = src[..idx]
