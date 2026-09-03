@@ -19,11 +19,15 @@ import {
 // The upstream recorder is the load-bearing assertion in all three legs:
 // the whole bug was that a "scanned" upload still reached the provider.
 //
-// The scope boundary is pinned here too, deliberately. The refusal is
-// conditional on a guardrail being attached — this is NOT structural
-// validation of the file, and an operator running no guardrails sees no
-// behaviour change at all. The second leg is the one that fails if someone
-// later widens this into an unconditional UTF-8 check on the files API.
+// The scope boundary is pinned here too, deliberately, on two axes. The
+// refusal is conditional on a guardrail being attached — this is NOT
+// structural validation of the file, and an operator running no guardrails
+// sees no behaviour change at all. And it is conditional on the declared
+// `purpose` naming a payload that is contractually UTF-8 text (`batch`,
+// `fine-tune`, `evals`); an `assistants`/`vision`/`user_data` upload, or
+// one that declares no purpose at all, legitimately carries binary and is
+// forwarded as it always was. The later legs are what fail if someone
+// widens this back into an unconditional UTF-8 check on the files API.
 
 const GUARDED_KEY = "sk-files-unscannable-guarded";
 const UNGUARDED_KEY = "sk-files-unscannable-open";
@@ -40,17 +44,28 @@ const NON_UTF8_LINE = Buffer.concat([
 /** The same term, correctly encoded. */
 const CLEAN_LINE = Buffer.from('{"custom_id":"r1","note":"你好"}\n', "utf8");
 
-/** A keyword row that cannot match these fixtures: the refusal must come
- *  from the blob being unscannable, not from a hit. A fix that simply
- *  started blocking every upload fails the third leg. */
-const NEVER_MATCHING_GUARDRAIL = {
+/** The input chain these tests attach. Its first pattern cannot match any
+ *  fixture, so a refusal must come from the blob being unscannable rather
+ *  than from a hit — a fix that simply started blocking every upload fails
+ *  the forwarding legs. The second pattern appears in exactly one fixture,
+ *  the one that proves a binary-purpose upload is still scanned. */
+const GUARDRAIL = {
   name: "files-unscannable-e2e",
   enabled: true,
   hook_point: "input",
   fail_open: false,
   kind: "keyword",
-  patterns: [{ kind: "literal", value: "zzz-no-such-term-zzz" }],
+  patterns: [
+    { kind: "literal", value: "zzz-no-such-term-zzz" },
+    // The one term these fixtures can hit, used by the final leg to prove
+    // a binary-purpose upload is still scanned rather than skipped. Kept
+    // out of every other fixture above.
+    { kind: "literal", value: "zzz-blocked-term-zzz" },
+  ],
 };
+
+/** The one term {@link GUARDRAIL} can actually hit. */
+const BLOCKED_TERM = "zzz-blocked-term-zzz";
 
 interface FilesUpstream {
   baseUrl: string;
@@ -94,12 +109,22 @@ async function startFilesUpstream(): Promise<FilesUpstream> {
   };
 }
 
-/** Hand-built multipart so the `file` part's bytes survive verbatim. */
-function multipartUpload(boundary: string, model: string, file: Buffer): Buffer {
+/** Hand-built multipart so the `file` part's bytes survive verbatim.
+ *  `purpose` is omitted entirely when null. */
+function multipartUpload(
+  boundary: string,
+  model: string,
+  purpose: string | null,
+  file: Buffer,
+): Buffer {
+  const purposePart =
+    purpose === null
+      ? ""
+      : `--${boundary}\r\ncontent-disposition: form-data; name="purpose"\r\n\r\n${purpose}\r\n`;
   return Buffer.concat([
     Buffer.from(
       `--${boundary}\r\ncontent-disposition: form-data; name="model"\r\n\r\n${model}\r\n` +
-        `--${boundary}\r\ncontent-disposition: form-data; name="purpose"\r\n\r\nbatch\r\n` +
+        purposePart +
         `--${boundary}\r\ncontent-disposition: form-data; name="file"; filename="input.jsonl"\r\n` +
         `content-type: application/jsonl\r\n\r\n`,
       "utf8",
@@ -138,7 +163,7 @@ const startEnv = async (
     provider_key_id: pk.id,
   });
   if (guarded) {
-    await seed.createGuardrail(NEVER_MATCHING_GUARDRAIL);
+    await seed.createGuardrail(GUARDRAIL);
   }
   // Written LAST: the key authenticating implies every row above it
   // landed (etcd applies in revision order).
@@ -161,7 +186,7 @@ const startEnv = async (
   return { app, upstream, key, model };
 };
 
-const upload = (env: Env, file: Buffer) => {
+const upload = (env: Env, file: Buffer, purpose: string | null = "batch") => {
   const boundary = "XFILESUNSCANNABLEX";
   return fetch(`${env.app.proxyUrl}/v1/files`, {
     method: "POST",
@@ -169,7 +194,7 @@ const upload = (env: Env, file: Buffer) => {
       authorization: `Bearer ${env.key}`,
       "content-type": `multipart/form-data; boundary=${boundary}`,
     },
-    body: multipartUpload(boundary, env.model, file),
+    body: multipartUpload(boundary, env.model, purpose, file),
   });
 };
 
@@ -234,5 +259,81 @@ describe("files: an unscannable upload is refused, not forwarded", () => {
     expect(res.status).toBe(200);
     expect(guarded.upstream.uploads).toHaveLength(before + 1);
     expect(guarded.upstream.uploads[before].includes(CLEAN_LINE)).toBe(true);
+  });
+
+  // A binary upload under a purpose whose payload is not contractually
+  // text is the case the first version of this refusal broke: a PDF or an
+  // image started returning 422 for every deployment running any input
+  // guardrail.
+  for (const purpose of ["assistants", "vision", "user_data"]) {
+    test(`a non-UTF-8 blob under purpose=${purpose} is forwarded, not refused`, async (ctx) => {
+      if (!etcdReachable || !guarded) {
+        ctx.skip();
+        return;
+      }
+      const before = guarded.upstream.uploads.length;
+      const res = await upload(guarded, NON_UTF8_LINE, purpose);
+      expect(res.status).toBe(200);
+      expect(guarded.upstream.uploads).toHaveLength(before + 1);
+      // Byte-for-byte: the refusal was narrowed, the forwarding was not.
+      expect(guarded.upstream.uploads[before].includes(NON_UTF8_LINE)).toBe(
+        true,
+      );
+    });
+  }
+
+  test("a non-UTF-8 blob with no declared purpose is forwarded", async (ctx) => {
+    if (!etcdReachable || !guarded) {
+      ctx.skip();
+      return;
+    }
+    // An upload we cannot classify is not one we can claim should have
+    // been text.
+    const before = guarded.upstream.uploads.length;
+    const res = await upload(guarded, NON_UTF8_LINE, null);
+    expect(res.status).toBe(200);
+    expect(guarded.upstream.uploads).toHaveLength(before + 1);
+  });
+
+  test("purpose=fine-tune is refused on the same terms as batch", async (ctx) => {
+    if (!etcdReachable || !guarded) {
+      ctx.skip();
+      return;
+    }
+    const before = guarded.upstream.uploads.length;
+    const res = await upload(guarded, NON_UTF8_LINE, "fine-tune");
+    expect(res.status).toBe(422);
+    const body = (await res.json()) as { error?: { message?: string } };
+    expect(body.error?.message).toContain("unscannable_body");
+    expect(guarded.upstream.uploads).toHaveLength(before);
+  });
+
+  test("a binary purpose is still SCANNED, just not refused", async (ctx) => {
+    if (!etcdReachable || !guarded) {
+      ctx.skip();
+      return;
+    }
+    // The chain still runs on a lossy decode, so a term that survives it
+    // still blocks. This is the leg that fails if someone "fixes" the
+    // regression by skipping the chain for non-text purposes instead of
+    // narrowing the refusal.
+    const before = guarded.upstream.uploads.length;
+    const res = await upload(
+      guarded,
+      Buffer.concat([
+        Buffer.from(`{"note":"${BLOCKED_TERM}","x":"`, "utf8"),
+        Buffer.from([0xc4, 0xe3, 0xba, 0xc3]),
+        Buffer.from('"}\n', "utf8"),
+      ]),
+      "assistants",
+    );
+    expect(res.status).toBe(422);
+    const body = (await res.json()) as {
+      error?: { type?: string; message?: string };
+    };
+    expect(body.error?.type).toBe("content_filter");
+    // A policy hit, not the unscannable-body refusal.
+    expect(body.error?.message).not.toContain("unscannable_body");
+    expect(guarded.upstream.uploads).toHaveLength(before);
   });
 });
