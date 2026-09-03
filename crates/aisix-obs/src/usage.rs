@@ -285,15 +285,26 @@ pub struct UsageEvent {
     /// status stays 200 and this bool is the whole record of the block.
     pub guardrail_blocked: bool,
 
-    /// Set when at least one remote-API guardrail (today: kind=bedrock)
-    /// failed open: its upstream was unreachable but the operator
-    /// configured `fail_open=true`, so the request went through. The
-    /// reason ("bedrock_5xx" / "bedrock_timeout" / "bedrock_throttled")
-    /// is what gets recorded so a compliance audit can identify
-    /// requests that slipped past the policy. Empty string = no
-    /// bypass (the normal Allow / Block paths). cp-api persists this
-    /// to `dpmgr_usage_events.guardrail_bypassed_reason`; on the
-    /// wire empty maps to NULL via `skip_serializing_if`.
+    /// Set when a guardrail on this request did not evaluate and its
+    /// configured failure policy let the request past it: a remote kind
+    /// whose upstream was unreachable on a `fail_open: true` row, or a
+    /// body the scanner could not read on a chain where nothing that
+    /// reads that side fails closed. The value is the kind's bounded
+    /// failure tag (`bedrock_5xx`, `lakera_timeout`,
+    /// `custom_script_error`, …) or `unscannable_body`, clamped to 64
+    /// bytes; the first bypass of the request wins.
+    ///
+    /// NOT mutually exclusive with `guardrail_blocked`. A chain can fail
+    /// open on one member and be refused by another, and an input hook
+    /// can fail open on a prompt that reached the provider before the
+    /// output hook refused the answer — in both cases something really
+    /// did go unscreened, and suppressing the tag would discard the more
+    /// compliance-relevant half. "Reached a provider unscreened" is the
+    /// two fields read together, not this one alone.
+    ///
+    /// Empty string = nothing was bypassed. cp-api persists this to
+    /// `dpmgr_usage_events.guardrail_bypassed_reason`; on the wire empty
+    /// maps to NULL via `skip_serializing_if`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub guardrail_bypassed_reason: String,
 

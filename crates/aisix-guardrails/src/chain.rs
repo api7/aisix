@@ -166,6 +166,58 @@ impl GuardrailChain {
             .unwrap_or_default()
     }
 
+    /// The request's fail-open bypass tag, or `None` when nothing was
+    /// bypassed (the dominant case) or the chain carries no audit log.
+    /// Non-destructive — see [`GuardrailAuditLog::bypass_reason`].
+    pub fn bypass_reason(&self) -> Option<String> {
+        self.audit.as_ref().and_then(|a| a.bypass_reason())
+    }
+
+    /// Record a bypass the PROXY performed on the chain's behalf, rather
+    /// than one a member returned.
+    ///
+    /// One caller shape: a body the scanner cannot read, which the
+    /// handler passes through when nothing attached both reads that side
+    /// and refuses when it cannot evaluate (#1115). No member ran, so no
+    /// member can report it, yet the request was screened by nothing —
+    /// exactly what the field is read to rule out.
+    ///
+    /// A no-op when the chain carries no log; first-wins is
+    /// [`GuardrailAuditLog::record_bypass`]'s rule.
+    pub fn record_bypass(&self, reason: &str) {
+        if let Some(audit) = self.audit.as_ref() {
+            audit.record_bypass(reason);
+        }
+    }
+
+    /// Record the proxy's pass-through of a REQUEST body it could not scan
+    /// — but only when that pass-through is a bypass.
+    ///
+    /// The pass-through has two causes and only one of them is one. A chain
+    /// where every member that reads the request is fail-open let an
+    /// unscreened request through: that is a bypass. A chain where NO member
+    /// reads the request never offered to screen it, so nothing was
+    /// bypassed and the request left exactly as it would with no guardrail
+    /// configured — tagging it would make the field fire on requests that
+    /// were never going to be screened, which is the way to make a
+    /// negative answer untrustworthy in the other direction.
+    ///
+    /// Both halves are read off the same member set the refusal gate uses
+    /// (#1115), so the two cannot disagree about which chain refuses.
+    pub fn record_unevaluable_input_bypass(&self, reason: &str) {
+        if Guardrail::runs_on_input(self) && !Guardrail::refuses_unevaluable_input(self) {
+            self.record_bypass(reason);
+        }
+    }
+
+    /// Response-side counterpart of
+    /// [`Self::record_unevaluable_input_bypass`].
+    pub fn record_unevaluable_output_bypass(&self, reason: &str) {
+        if Guardrail::runs_on_output(self) && !Guardrail::refuses_unevaluable_output(self) {
+            self.record_bypass(reason);
+        }
+    }
+
     /// The request's audit log handle, for a caller that outlives the
     /// chain value: a streaming emitter running inside a `move` closure
     /// after the handler frame is gone, or a handler whose chain is
@@ -275,11 +327,16 @@ struct Recorders<'a> {
 /// per-entity mask counts, and only the segment pass has any — the check
 /// folds pass `None`.
 ///
-/// The audit log takes only the two ENFORCED outcomes it exists to
-/// record: `masked` and `blocked`. `allowed` is not an event, `bypassed`
-/// is already carried by `guardrail_bypassed_reason`, and the two
-/// `would_*` results belong to `guardrail_monitor_hits` — routing them
-/// here would make an enforcing hit indistinguishable from a staged one.
+/// [`GuardrailAuditLog::record`] takes only the two ENFORCED outcomes the
+/// hit array exists to record: `masked` and `blocked`. `allowed` is not an
+/// event, and the two `would_*` results belong to
+/// `guardrail_monitor_hits` — routing them here would make an enforcing
+/// hit indistinguishable from a staged one.
+///
+/// `bypassed` is recorded too, but onto the log's separate `bypass` slot
+/// rather than as a hit: it is what `guardrail_bypassed_reason` is built
+/// from, and a bypass enforced nothing, so folding it into an array whose
+/// whole meaning is "a policy acted here" would widen that field silently.
 ///
 /// The two are told apart on the audit event (AISIX-Cloud#1365): a member
 /// with `fail_open: false` whose upstream is
@@ -317,6 +374,14 @@ fn record_execution(
             error_type,
             elapsed,
         });
+    }
+    // A fail-open bypass is not an enforced hit — nothing was masked or
+    // refused — but it IS the fact `guardrail_bypassed_reason` exists to
+    // report, and every handler already threads this log to its usage
+    // event. Recording it here is what makes the field reach the non-chat
+    // routes: they read the log, not a hand-threaded out-param.
+    if let (Some(audit), Some(tag)) = (to.audit, verdict.bypass_reason()) {
+        audit.record_bypass(tag);
     }
     if let (Some(audit), "blocked" | "masked") = (to.audit, result) {
         // A `blocked` member reports no counts: the block short-circuits
@@ -1031,6 +1096,145 @@ mod tests {
         assert_eq!(hits[0].guardrail_name, "deny-secrets");
         assert_eq!(hits[0].hook, "input");
         assert_eq!(hits[0].action, "blocked");
+    }
+
+    /// A fail-OPEN bypass is the outcome nobody sees: no refusal reaches
+    /// the caller, and the request's usage row is otherwise identical to a
+    /// screened one. It rides the same per-request log the enforced hits do
+    /// so every handler that already threads that handle reports it — the
+    /// alternative was one hand-threaded out-param per handler, which is
+    /// how `guardrail_bypassed_reason` came to exist on chat and nowhere
+    /// else.
+    #[tokio::test]
+    async fn a_fold_records_the_first_bypass_on_the_audit_log() {
+        struct FailsOpen(&'static str);
+        #[async_trait]
+        impl Guardrail for FailsOpen {
+            fn name(&self) -> &'static str {
+                "fails-open"
+            }
+            async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
+                GuardrailVerdict::Bypass {
+                    reason: self.0.to_owned(),
+                }
+            }
+        }
+
+        let audit = Arc::new(GuardrailAuditLog::new());
+        let chain = GuardrailChain::new(vec![
+            Arc::new(FailsOpen("lakera_timeout")) as Arc<dyn Guardrail>,
+            Arc::new(FailsOpen("bedrock_5xx")) as Arc<dyn Guardrail>,
+        ])
+        .with_audit_log(Some(Arc::clone(&audit)));
+
+        assert!(chain.check_input(&req("anything")).await.is_bypass());
+        assert_eq!(
+            chain.bypass_reason().as_deref(),
+            Some("lakera_timeout"),
+            "the policy that failed FIRST is the one that explains the request",
+        );
+        assert!(
+            chain.enforced_hits().is_empty(),
+            "a bypass enforced nothing, so it must not appear as an enforced hit",
+        );
+    }
+
+    /// A refusal by one member does not erase another member's bypass.
+    ///
+    /// The fold does not short-circuit on `Bypass`, so a chain of
+    /// [fail-open remote row, blocking row] refuses the request while the
+    /// first row screened nothing. Both facts ride the event: this is the
+    /// same pair `chat.rs` has always emitted on a billed-then-blocked
+    /// response, where an input hook failed open on a prompt the provider
+    /// had already answered. Suppressing the tag whenever
+    /// `guardrail_blocked` is set would discard exactly that case, which is
+    /// the more compliance-relevant of the two.
+    #[tokio::test]
+    async fn a_block_by_one_member_does_not_erase_another_member_bypass() {
+        struct FailsOpen;
+        #[async_trait]
+        impl Guardrail for FailsOpen {
+            fn name(&self) -> &'static str {
+                "fails-open"
+            }
+            async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
+                GuardrailVerdict::Bypass {
+                    reason: "lakera_timeout".to_owned(),
+                }
+            }
+        }
+
+        let audit = Arc::new(GuardrailAuditLog::new());
+        let chain = GuardrailChain::new_with_applied(
+            vec![
+                (
+                    "open-row".to_owned(),
+                    Arc::new(FailsOpen) as Arc<dyn Guardrail>,
+                ),
+                (
+                    "deny-secrets".to_owned(),
+                    Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("nope")]))
+                        as Arc<dyn Guardrail>,
+                ),
+            ],
+            vec![
+                AppliedGuardrail {
+                    kind: "lakera".to_owned(),
+                    hook: "input".to_owned(),
+                },
+                AppliedGuardrail {
+                    kind: "keyword".to_owned(),
+                    hook: "input".to_owned(),
+                },
+            ],
+        )
+        .with_audit_log(Some(Arc::clone(&audit)));
+
+        // The refusal still happens — recording must not weaken it.
+        assert!(chain.check_input(&req("nope")).await.is_block());
+        assert_eq!(
+            chain.bypass_reason().as_deref(),
+            Some("lakera_timeout"),
+            "the first row screened nothing; the second one refusing does not change that",
+        );
+    }
+
+    /// The pass-through the proxy performs on a body it could not scan is a
+    /// bypass only when something would have read that side. An output-only
+    /// chain never offered to screen the request, so tagging it would fire
+    /// the field on requests that were never going to be screened.
+    #[test]
+    fn an_unevaluable_pass_is_a_bypass_only_when_a_member_reads_that_side() {
+        let rule = || vec![KeywordRule::literal("x")];
+        let log = || Some(Arc::new(GuardrailAuditLog::new()));
+
+        let open_in = GuardrailChain::new(vec![Arc::new(
+            KeywordBlocklist::input_only(rule()).with_fail_open(true),
+        )])
+        .with_audit_log(log());
+        open_in.record_unevaluable_input_bypass("unscannable_body");
+        assert_eq!(
+            open_in.bypass_reason().as_deref(),
+            Some("unscannable_body"),
+            "a fail-open row that reads the request WAS bypassed",
+        );
+
+        let output_only =
+            GuardrailChain::new(vec![Arc::new(KeywordBlocklist::output_only(rule()))])
+                .with_audit_log(log());
+        output_only.record_unevaluable_input_bypass("unscannable_body");
+        assert_eq!(
+            output_only.bypass_reason(),
+            None,
+            "nothing here reads the request, so nothing was bypassed",
+        );
+
+        // The fail-closed direction never reaches the call at all, but the
+        // predicate must agree with the refusal gate if it ever does.
+        let closed_in = GuardrailChain::new(vec![Arc::new(KeywordBlocklist::input_only(rule()))])
+            .with_audit_log(log());
+        closed_in.record_unevaluable_input_bypass("unscannable_body");
+        assert_eq!(closed_in.bypass_reason(), None);
     }
 
     /// AISIX-Cloud#1365: a fail-CLOSED refusal is an outage, not a policy

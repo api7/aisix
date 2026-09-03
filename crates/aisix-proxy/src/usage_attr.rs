@@ -55,6 +55,27 @@ pub(crate) fn enforced_hits(audit: &GuardrailAudit) -> Vec<aisix_core::Guardrail
     audit.as_ref().map(|a| a.snapshot()).unwrap_or_default()
 }
 
+/// Snapshot `audit` into a `UsageEvent`'s `guardrail_bypassed_reason`:
+/// the bounded tag of the first guardrail this request failed OPEN on,
+/// empty when none did.
+///
+/// Not terminal-only, unlike [`enforced_hits`]. A bypass says the request
+/// went upstream unscreened, which is true of every attempt the request
+/// made, and `chat.rs` has stamped it on its per-attempt events since the
+/// field existed — a retry that dropped it would read as a screened
+/// attempt.
+///
+/// `chat.rs` keeps threading its own copy instead of calling this: it
+/// hands the value to per-attempt and ensemble sub-call emitters at
+/// points where the value is deliberately the one captured EARLIER in the
+/// request, which a request-scoped snapshot cannot express.
+pub(crate) fn bypass_reason(audit: &GuardrailAudit) -> String {
+    audit
+        .as_ref()
+        .and_then(|a| a.bypass_reason())
+        .unwrap_or_default()
+}
+
 /// Snapshot `audit` into a terminal `UsageEvent`'s `guardrail_scores`
 /// (AISIX-Cloud#1467). Same handle, same terminal-only rule and same
 /// non-destructive read as [`enforced_hits`] — a scoring guardrail runs
@@ -74,14 +95,23 @@ pub(crate) fn guardrail_scores(audit: &GuardrailAudit) -> Vec<aisix_core::Guardr
 /// and unparseable-usage paths historically suppress zero-value noise rows.
 /// A mask/block, monitor hit, or similarity score is an operator-visible
 /// security fact, so those paths must emit a zero-token event instead.
+///
+/// A BYPASS is one too, and it needs saying separately because it leaves no
+/// enforced hit and no score — a bypass is precisely the outcome where no
+/// policy acted. Without this arm a fail-open request whose upstream
+/// reported no parseable usage has its whole event suppressed, so the
+/// reason is written onto an event nobody ever receives: the same silence
+/// this field exists to break, one layer further out.
 pub(crate) fn has_guardrail_attribution(
     audit: &GuardrailAudit,
     monitor_hits: &[aisix_core::GuardrailMonitorHit],
 ) -> bool {
     !monitor_hits.is_empty()
-        || audit
-            .as_ref()
-            .is_some_and(|log| !log.snapshot().is_empty() || !log.score_snapshot().is_empty())
+        || audit.as_ref().is_some_and(|log| {
+            !log.snapshot().is_empty()
+                || !log.score_snapshot().is_empty()
+                || log.bypass_reason().is_some()
+        })
 }
 
 /// [`guardrail_scores`] for the retrying families — see
@@ -537,6 +567,11 @@ pub(crate) fn emit_error_usage_event(
     // operator is certain to look at — as the only execution with no
     // number attached.
     scores: Vec<aisix_core::GuardrailScore>,
+    // The request's fail-open bypass tag, drained the same way. A request
+    // that went upstream unscreened and THEN failed is still a request
+    // that went upstream unscreened, so dropping the tag here would make
+    // the field answerable only for the requests that succeeded.
+    bypass: String,
 ) {
     let event = build_error_usage_event(
         inbound_protocol,
@@ -549,6 +584,7 @@ pub(crate) fn emit_error_usage_event(
         client,
         enforced,
         scores,
+        bypass,
     );
     // The failed request's own attribution, off the same cell
     // `request_metrics::LastTarget` reads — so the usage-event counters and
@@ -583,6 +619,8 @@ pub(crate) fn build_error_usage_event(
     client: &ClientContext,
     enforced: Vec<aisix_core::GuardrailEnforcedHit>,
     scores: Vec<aisix_core::GuardrailScore>,
+    // See [`emit_error_usage_event`].
+    bypass: String,
 ) -> UsageEvent {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -597,6 +635,7 @@ pub(crate) fn build_error_usage_event(
         guardrail_blocked,
         guardrail_enforced_hits: enforced,
         guardrail_scores: scores,
+        guardrail_bypassed_reason: bypass,
         ..Default::default()
     };
     apply_caller_identity(
@@ -757,6 +796,27 @@ mod tests {
             top_example_index: 0,
             embedding_model: "embedder".into(),
         });
+        assert!(has_guardrail_attribution(&audit, &[]));
+    }
+
+    /// A bypass leaves no enforced hit and no score — it is the outcome
+    /// where no policy acted — so it has to be named here explicitly.
+    /// Without it, the unbilled paths that consult this gate
+    /// (`/v1/completions`, `/v1/embeddings`, `/v1/images/*`, `/v1/rerank`)
+    /// suppress the whole event, and the reason lands on a row nobody
+    /// receives.
+    #[test]
+    fn a_bypass_alone_requires_a_zero_token_event() {
+        let log = Arc::new(aisix_guardrails::GuardrailAuditLog::new());
+        let audit = Some(Arc::clone(&log));
+        assert!(!has_guardrail_attribution(&audit, &[]));
+
+        log.record_bypass("lakera_timeout");
+        assert!(
+            log.snapshot().is_empty() && log.score_snapshot().is_empty(),
+            "premise: a bypass is not an enforced hit and not a score, so the \
+             other two arms of this gate cannot be what carries it",
+        );
         assert!(has_guardrail_attribution(&audit, &[]));
     }
 
@@ -1002,5 +1062,302 @@ mod tests {
 
         let snap = snap_with_pk("\u{1}\u{2}", "");
         assert_eq!(ResolvedPk::resolve(&snap, PK_ID).labels().name, "unknown");
+    }
+
+    /// Every `UsageEvent` this crate builds must set
+    /// `guardrail_bypassed_reason`, and an emitter that genuinely has no
+    /// chain behind it must say so where it is written.
+    ///
+    /// The field defaults to empty, so an emitter that forgets it reports
+    /// "nothing was bypassed" for a request that went upstream unscreened —
+    /// and no behavioural test can see the omission, because an unset field
+    /// and a screened request produce the same row. That is exactly how the
+    /// field spent its whole life written on `/v1/chat/completions` and
+    /// nowhere else.
+    ///
+    /// A parse of the source rather than a list of emitters, for the reason
+    /// `guardrail_coverage` parses the router instead of listing routes: a
+    /// hand-written list nobody updates agrees with itself forever, and the
+    /// emitter family here has sixteen members that keep gaining a
+    /// seventeenth.
+    #[test]
+    fn every_usage_event_this_crate_builds_answers_the_bypass_question() {
+        /// Written inside an emitter that has no guardrail chain behind it
+        /// at all, followed by why.
+        const EXEMPT: &str = "NO-GUARDRAIL-CHAIN:";
+
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut blocks = 0usize;
+        let mut missing = Vec::new();
+
+        // Recursive: `src/` is flat today, and a refactor that moved a
+        // handler into a subdirectory would otherwise take its emitter out
+        // of scope while this still reported green.
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let entries = std::fs::read_dir(dir).expect("the crate's own src/ must be readable");
+            for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        rs_files(&src_dir, &mut files);
+        files.sort();
+
+        for path in files {
+            let src = std::fs::read_to_string(&path).expect("source must read");
+            let name = path
+                .strip_prefix(&src_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            let code = code_mask(&src);
+            for (idx, _) in src.match_indices("UsageEvent {") {
+                // Skip anything that is not Rust code: this file writes the
+                // token it searches for in a string literal and in a
+                // comment, and both would otherwise be counted as emitters
+                // — a check inflating its own coverage.
+                if !code[idx] {
+                    continue;
+                }
+                // `-> UsageEvent {` (optionally path-qualified) is a
+                // return type followed by a function body, not a literal.
+                let before = src[..idx]
+                    .trim_end()
+                    .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':')
+                    .trim_end();
+                if before.ends_with("->") {
+                    continue;
+                }
+                let open = idx + "UsageEvent ".len();
+                let Some(block) = braced_block(&src, &code, open) else {
+                    panic!("{name}: unbalanced UsageEvent literal at byte {idx}");
+                };
+                blocks += 1;
+                if !sets_bypass_reason(block) && !block.contains(EXEMPT) {
+                    let line = src[..idx].lines().count();
+                    missing.push(format!("{name}:{line}"));
+                }
+            }
+        }
+
+        // The parse must actually find the emitters, not silently yield an
+        // empty set that makes the assertion below vacuous.
+        // The crate's real count. A floor rather than an equality so
+        // adding an emitter does not fail here (the `missing` check
+        // already governs a new one) — but losing four to a parse that
+        // quietly stopped matching is the drift this exists to catch.
+        assert!(
+            blocks >= 18,
+            "the UsageEvent literal scan found only {blocks} — it has stopped tracking the \
+             emitter family",
+        );
+        assert!(
+            missing.is_empty(),
+            "these UsageEvent emitters neither set guardrail_bypassed_reason nor carry a \
+             `{EXEMPT} <why>` comment saying they have no guardrail chain: {missing:?}\n\
+             An unset field reports a screened request, so an emitter that skips it makes the \
+             field unusable as a negative answer.",
+        );
+    }
+
+    /// A byte mask over `src` marking the bytes that are Rust CODE —
+    /// false inside string literals (raw ones included), char literals,
+    /// line comments and nestable block comments.
+    ///
+    /// A real lexer pass rather than a per-line heuristic. The heuristic
+    /// this replaces judged a match by whether its line prefix held a `//`
+    /// or an odd number of quotes, which gets two things wrong that occur
+    /// in ordinary code: a literal after a completed string on the same
+    /// line (`let u = "https://x"; ... UsageEvent {`) reads as commented
+    /// out, and an escaped quote miscounts the parity.
+    fn code_mask(src: &str) -> Vec<bool> {
+        #[derive(Clone, Copy)]
+        enum St {
+            Code,
+            Str,
+            Raw(usize),
+            Char,
+            Line,
+            Block(usize),
+        }
+        let b = src.as_bytes();
+        let mut mask = vec![false; b.len()];
+        let mut st = St::Code;
+        let mut i = 0;
+        while i < b.len() {
+            match st {
+                St::Code => {
+                    mask[i] = true;
+                    match b[i] {
+                        b'/' if b.get(i + 1) == Some(&b'/') => {
+                            st = St::Line;
+                            mask[i] = false;
+                        }
+                        b'/' if b.get(i + 1) == Some(&b'*') => {
+                            st = St::Block(1);
+                            mask[i] = false;
+                            i += 2;
+                            continue;
+                        }
+                        b'"' => st = St::Str,
+                        // A char literal is `'x'` or `'\\n'`; anything
+                        // else starting with a quote is a LIFETIME
+                        // (`&'a str`), and treating one as a literal
+                        // swallows every byte up to the next apostrophe.
+                        b'\'' if b.get(i + 1) == Some(&b'\\') || b.get(i + 2) == Some(&b'\'') => {
+                            st = St::Char
+                        }
+                        b'r' => {
+                            // `r"…"` / `r#"…"#`, but not an identifier
+                            // ending in `r`, and not a lifetime.
+                            let prev_ident =
+                                i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+                            let mut j = i + 1;
+                            while b.get(j) == Some(&b'#') {
+                                j += 1;
+                            }
+                            if !prev_ident && b.get(j) == Some(&b'"') {
+                                st = St::Raw(j - i - 1);
+                                i = j + 1;
+                                continue;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                St::Str => {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'"' {
+                        st = St::Code;
+                    }
+                }
+                St::Raw(hashes) => {
+                    if b[i] == b'"' && b[i + 1..].iter().take(hashes).all(|c| *c == b'#') {
+                        st = St::Code;
+                        i += hashes + 1;
+                        continue;
+                    }
+                }
+                St::Char => {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'\'' {
+                        st = St::Code;
+                    }
+                }
+                St::Line => {
+                    if b[i] == b'\n' {
+                        st = St::Code;
+                    }
+                }
+                St::Block(depth) => {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        st = St::Block(depth + 1);
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        st = if depth == 1 {
+                            St::Code
+                        } else {
+                            St::Block(depth - 1)
+                        };
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+        mask
+    }
+
+    /// Whether an emitter block ASSIGNS the field, rather than merely
+    /// mentioning it.
+    ///
+    /// `block.contains("guardrail_bypassed_reason")` would be satisfied by
+    /// a comment, and by `guardrail_bypassed_reason: String::new()` — which
+    /// is exactly the shape of a reverted fix, so the check would have been
+    /// unfalsifiable in the one dimension it is here to guard.
+    fn sets_bypass_reason(block: &str) -> bool {
+        let Some(at) = block.find("guardrail_bypassed_reason") else {
+            return false;
+        };
+        let rest = &block[at + "guardrail_bypassed_reason".len()..];
+        // Field-init shorthand (`guardrail_bypassed_reason,`) takes its
+        // value from a binding, which cannot be an inline empty literal.
+        let Some(rest) = rest.strip_prefix(':') else {
+            return rest.starts_with(',');
+        };
+        // Values run to the end of their line, except the one that wraps
+        // onto continuation lines — whose first line is a receiver, which
+        // is non-empty and passes for the right reason.
+        let value = rest
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(',')
+            .trim();
+        !matches!(
+            value,
+            "" | "\"\"" | "String::new()" | "String::default()" | "Default::default()"
+        )
+    }
+
+    /// The `{ … }` at `open`, skipping braces the mask says are not code.
+    fn braced_block<'a>(src: &'a str, code: &[bool], open: usize) -> Option<&'a str> {
+        let b = src.as_bytes();
+        assert_eq!(b[open], b'{');
+        let mut depth = 0usize;
+        for i in open..b.len() {
+            if !code[i] {
+                continue;
+            }
+            match b[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&src[open..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The mask is load-bearing for the guard above, so it is pinned
+    /// directly: every one of these would be a false positive or a false
+    /// negative under the line-prefix heuristic it replaces.
+    #[test]
+    fn the_code_mask_excludes_strings_comments_and_raw_strings() {
+        let at = |src: &str, needle: &str| {
+            let m = code_mask(src);
+            m[src.find(needle).expect("needle must appear")]
+        };
+        assert!(at("let x = 1; UsageEvent {}", "UsageEvent"));
+        assert!(!at("let s = \"UsageEvent {\";", "UsageEvent"));
+        assert!(!at("// UsageEvent {", "UsageEvent"));
+        assert!(!at("/* a /* b */ UsageEvent */", "UsageEvent"));
+        assert!(!at("let s = r#\"UsageEvent {\"#;", "UsageEvent"));
+        // The two the heuristic got wrong: a completed string earlier on
+        // the line, and an escaped quote inside one.
+        assert!(at("let u = \"https://x\"; UsageEvent {}", "UsageEvent"));
+        assert!(at("let e = \"a\\\"b\"; UsageEvent {}", "UsageEvent"));
+        // A char literal must not open a string, and an identifier ending
+        // in `r` must not open a raw string.
+        assert!(at("let c = '\"'; UsageEvent {}", "UsageEvent"));
+        assert!(at("let var = 1; UsageEvent {}", "UsageEvent"));
     }
 }

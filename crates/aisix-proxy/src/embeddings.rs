@@ -253,6 +253,7 @@ pub async fn embeddings(
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
                 crate::usage_attr::guardrail_scores(&audit),
+                crate::usage_attr::bypass_reason(&audit),
             );
             err.into_response()
         }
@@ -687,9 +688,6 @@ fn emit_usage_event(
     //   - cost_usd — cp-api computes server-side from pricing catalog
     //   - guardrail_blocked — a blocked input short-circuits before this
     //     emit (success-only path), so it is never set here
-    //   - guardrail_bypassed_reason — embeddings now run input guardrails
-    //     (#719); fail-open bypass telemetry is not yet plumbed for the
-    //     non-chat handlers (follow-up, same as the per-PK fields below)
     //   - cache_status / cache_hit_saved_* — no caching on embeddings
     //   - ttft_ms — embeddings are not streamed
     //   - served_by_model / routing_* — embeddings don't run routing
@@ -719,6 +717,7 @@ fn emit_usage_event(
         guardrail_monitor_hits,
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(audit),
         guardrail_scores: crate::usage_attr::guardrail_scores(audit),
+        guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         ..Default::default()

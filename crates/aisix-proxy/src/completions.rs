@@ -282,6 +282,7 @@ pub async fn completions(
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
                 crate::usage_attr::guardrail_scores(&audit),
+                crate::usage_attr::bypass_reason(&audit),
             );
             err.into_response()
         }
@@ -820,6 +821,7 @@ fn emit_usage_event(
         guardrail_monitor_hits,
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(audit),
         guardrail_scores: crate::usage_attr::guardrail_scores(audit),
+        guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);
@@ -1544,6 +1546,79 @@ mod tests {
         assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
         assert_eq!(ev.guardrail_enforced_hits[0].action, "masked");
         assert_eq!(ev.applied_guardrails.len(), 1);
+    }
+
+    /// The same 501 path, but the guardrail FAILS OPEN instead of masking.
+    ///
+    /// A bypass leaves no enforced hit and no score, so before the gate
+    /// learned about it this event was suppressed outright — the reason was
+    /// written onto a row nobody received, which is the same silence this
+    /// field exists to break, one layer further out. The unbilled paths are
+    /// where it bites: `success.usage` is `None`, so the guardrail
+    /// attribution is the only thing that can keep the row alive.
+    #[tokio::test]
+    async fn a_fail_open_bypass_alone_keeps_the_unbilled_event_alive() {
+        use aisix_obs::UsageSink;
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        const ANTHROPIC_PK_ID: &str = "22222222-2222-2222-2222-222222222222";
+
+        let anthropic_pk: aisix_core::ProviderKey = serde_json::from_str(
+            r#"{"display_name":"anthropic-up","secret":"sk-ant-test","provider":"anthropic","adapter":"anthropic"}"#,
+        )
+        .unwrap();
+        let anthropic_model: Model = serde_json::from_str(&format!(
+            r#"{{"display_name":"claude-instruct","provider":"anthropic","model_name":"claude-3-haiku-20240307","provider_key_id":"{ANTHROPIC_PK_ID}"}}"#
+        ))
+        .unwrap();
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(ResourceEntry::new(ANTHROPIC_PK_ID, anthropic_pk, 1));
+        snap.models
+            .insert(ResourceEntry::new("m-anthropic", anthropic_model, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        // Faults instead of deciding, input hook only.
+        let row: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+            "name": "completions-fail-open",
+            "enabled": true,
+            "kind": "custom",
+            "hook_point": "input",
+            "fail_open": true,
+            "script": "export function checkInput() { throw new Error('x'); }",
+            "timeout_ms": 5000,
+        }))
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-open", row, 1));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = tower::ServiceExt::oneshot(
+            crate::build_router(state),
+            make_req(serde_json::json!({"model": "claude-instruct", "prompt": "hi"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a bypassed request must not have its event suppressed")
+            .expect("usage sink remains open");
+        assert_eq!(
+            ev.guardrail_bypassed_reason, "custom_script_error",
+            "{ev:?}"
+        );
+        // The premise: nothing else on this event could have kept it alive.
+        assert!(ev.guardrail_enforced_hits.is_empty(), "{ev:?}");
+        assert!(ev.guardrail_scores.is_empty(), "{ev:?}");
+        assert!(ev.guardrail_monitor_hits.is_empty(), "{ev:?}");
+        assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
     }
 
     /// A 200 response with NO `usage` block at all (vs `usage: {}`

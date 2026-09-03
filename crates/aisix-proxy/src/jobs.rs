@@ -497,6 +497,9 @@ async fn scan_input_blob(
     // audit logs (AISIX-Cloud#1330 / #1024).
     enforced_hits: &mut Vec<aisix_core::GuardrailEnforcedHit>,
     scores: &mut Vec<aisix_core::GuardrailScore>,
+    // The request's fail-open bypass tag, accumulated the same way and
+    // for the same reason. First one sticks, matching the chain folds.
+    bypass: &mut String,
 ) -> Result<(), ProxyError> {
     let ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
@@ -549,8 +552,19 @@ async fn scan_input_blob(
                 Some(crate::error::TAG_UNSCANNABLE_BODY),
             ));
         }
-        // Binary-purpose upload, or a text one nothing on the request side
-        // would have read: best-effort lossy scan, forwarded verbatim.
+        // A text-purpose upload nothing on the request side would have
+        // read: best-effort lossy scan, forwarded verbatim. The scan runs
+        // on a copy with every invalid sequence replaced, so whatever the
+        // original bytes spelled was never screened — that is a bypass,
+        // and it is recorded under the same tag the fail-CLOSED direction
+        // refuses with.
+        (Err(_), Undecodable::Refuse) => {
+            chain.record_unevaluable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+            String::from_utf8_lossy(blob)
+        }
+        // Binary-purpose upload: the lossy scan is the contract, not a
+        // fallback — a PDF was never going to decode and refusing it was
+        // never on the table, so nothing was bypassed.
         (Err(_), _) => String::from_utf8_lossy(blob),
     };
     let chat = aisix_gateway::ChatFormat::new(
@@ -563,6 +577,11 @@ async fn scan_input_blob(
     // that leaves through `Err`, and the caller's `?` would drop it.
     enforced_hits.extend(chain.enforced_hits());
     scores.extend(chain.scores());
+    if bypass.is_empty() {
+        if let Some(reason) = chain.bypass_reason() {
+            *bypass = reason;
+        }
+    }
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
@@ -598,6 +617,7 @@ async fn scan_input_blob(
 /// the input side tell a JSONL payload from a lawful PDF. Failing closed
 /// here would refuse lawful downloads, so the direction needs a product
 /// decision rather than a mirrored `match`. Tracked in #1022.
+#[allow(clippy::too_many_arguments)]
 async fn scan_output_blob(
     state: &ProxyState,
     auth: &AuthenticatedKey,
@@ -609,6 +629,9 @@ async fn scan_output_blob(
     // audit logs (AISIX-Cloud#1330 / #1024).
     enforced_hits: &mut Vec<aisix_core::GuardrailEnforcedHit>,
     scores: &mut Vec<aisix_core::GuardrailScore>,
+    // The request's fail-open bypass tag, accumulated the same way and
+    // for the same reason. First one sticks, matching the chain folds.
+    bypass: &mut String,
 ) -> Result<(), ProxyError> {
     let ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
@@ -633,6 +656,11 @@ async fn scan_output_blob(
     // See `scan_input_blob`.
     enforced_hits.extend(chain.enforced_hits());
     scores.extend(chain.scores());
+    if bypass.is_empty() {
+        if let Some(reason) = chain.bypass_reason() {
+            *bypass = reason;
+        }
+    }
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
@@ -712,6 +740,7 @@ fn emit_job_usage_event(
     // (AISIX-Cloud#1330).
     guardrail_enforced_hits: Vec<aisix_core::GuardrailEnforcedHit>,
     guardrail_scores: Vec<aisix_core::GuardrailScore>,
+    guardrail_bypassed_reason: String,
 ) {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -730,6 +759,7 @@ fn emit_job_usage_event(
         guardrail_monitor_hits,
         guardrail_enforced_hits,
         guardrail_scores,
+        guardrail_bypassed_reason,
         ..Default::default()
     };
     let pk = crate::usage_attr::ResolvedPk::resolve(snap, &target.pk_entry.id);
@@ -815,6 +845,7 @@ fn finish(
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     enforced_hits: Vec<aisix_core::GuardrailEnforcedHit>,
     scores: Vec<aisix_core::GuardrailScore>,
+    bypass: String,
 ) -> Response {
     let elapsed = started.elapsed();
     // `path` carries the real job/file id — bounded route template only.
@@ -857,6 +888,7 @@ fn finish(
                 monitor_hits,
                 enforced_hits,
                 scores,
+                bypass,
             );
             if let Ok(hv) = HeaderValue::from_str(&request_id) {
                 resp.headers_mut().insert("x-aisix-request-id", hv);
@@ -901,6 +933,7 @@ fn finish(
                 client,
                 enforced_hits,
                 scores,
+                bypass,
             );
             err.into_response()
         }
@@ -981,6 +1014,7 @@ pub(crate) async fn create_file(
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
     let mut scores: Vec<aisix_core::GuardrailScore> = Vec::new();
+    let mut bypass = String::new();
     // Loaded below, after the upload is drained — see the note in
     // `audio::multipart_dispatch` (#941 audit M2).
     let mut snapshot = None;
@@ -1076,6 +1110,7 @@ pub(crate) async fn create_file(
             &mut monitor_hits,
             &mut enforced_hits,
             &mut scores,
+            &mut bypass,
         )
         .await?;
         let _reservation = crate::quota::enforce(
@@ -1108,6 +1143,7 @@ pub(crate) async fn create_file(
             &mut monitor_hits,
             &mut enforced_hits,
             &mut scores,
+            &mut bypass,
         )
         .await?;
         let model = target.display_name().to_string();
@@ -1134,6 +1170,7 @@ pub(crate) async fn create_file(
         monitor_hits,
         enforced_hits,
         scores,
+        bypass,
     )
 }
 
@@ -1290,6 +1327,7 @@ pub(crate) async fn create_batch(
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
     let mut scores: Vec<aisix_core::GuardrailScore> = Vec::new();
+    let mut bypass = String::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1345,6 +1383,7 @@ pub(crate) async fn create_batch(
             &mut monitor_hits,
             &mut enforced_hits,
             &mut scores,
+            &mut bypass,
         )
         .await?;
         let _reservation = crate::quota::enforce(
@@ -1377,6 +1416,7 @@ pub(crate) async fn create_batch(
             &mut monitor_hits,
             &mut enforced_hits,
             &mut scores,
+            &mut bypass,
         )
         .await?;
         let model = target.display_name().to_string();
@@ -1401,6 +1441,7 @@ pub(crate) async fn create_batch(
         monitor_hits,
         enforced_hits,
         scores,
+        bypass,
     )
 }
 
@@ -1418,6 +1459,7 @@ pub(crate) async fn get_batch(
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
     let mut scores: Vec<aisix_core::GuardrailScore> = Vec::new();
+    let mut bypass = String::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1456,6 +1498,7 @@ pub(crate) async fn get_batch(
             &mut monitor_hits,
             &mut enforced_hits,
             &mut scores,
+            &mut bypass,
         )
         .await?;
 
@@ -1489,6 +1532,7 @@ pub(crate) async fn get_batch(
         monitor_hits,
         enforced_hits,
         scores,
+        bypass,
     )
 }
 
@@ -1585,6 +1629,7 @@ pub(crate) async fn create_ft_job(
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
     let mut scores: Vec<aisix_core::GuardrailScore> = Vec::new();
+    let mut bypass = String::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1637,6 +1682,7 @@ pub(crate) async fn create_ft_job(
             &mut monitor_hits,
             &mut enforced_hits,
             &mut scores,
+            &mut bypass,
         )
         .await?;
         let _reservation = crate::quota::enforce(
@@ -1669,6 +1715,7 @@ pub(crate) async fn create_ft_job(
             &mut monitor_hits,
             &mut enforced_hits,
             &mut scores,
+            &mut bypass,
         )
         .await?;
         let model = target.display_name().to_string();
@@ -1693,6 +1740,7 @@ pub(crate) async fn create_ft_job(
         monitor_hits,
         enforced_hits,
         scores,
+        bypass,
     )
 }
 
@@ -1819,6 +1867,7 @@ async fn forward_simple(
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
     let mut scores: Vec<aisix_core::GuardrailScore> = Vec::new();
+    let mut bypass = String::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1847,6 +1896,7 @@ async fn forward_simple(
                 &mut monitor_hits,
                 &mut enforced_hits,
                 &mut scores,
+                &mut bypass,
             )
             .await?;
         }
@@ -1878,6 +1928,7 @@ async fn forward_simple(
             &mut monitor_hits,
             &mut enforced_hits,
             &mut scores,
+            &mut bypass,
         )
         .await?;
 
@@ -1912,6 +1963,7 @@ async fn forward_simple(
         monitor_hits,
         enforced_hits,
         scores,
+        bypass,
     )
 }
 
@@ -2113,6 +2165,11 @@ async fn attribute_batch_usage(
     for (idx, (provider_model, agg)) in per_model.iter().enumerate() {
         let request_id = batch_attribution_request_id(raw_batch_id, idx, multi);
         let mut event = UsageEvent {
+            // NO-GUARDRAIL-CHAIN: a retroactive billing row for work the
+            // provider did inside a batch. There is no request here, so no
+            // chain was ever resolved and nothing could have been bypassed;
+            // the upload that created the batch was screened at its own
+            // time, and carries its own event.
             request_id,
             occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             model_id: model_id.to_string(),
@@ -3098,6 +3155,53 @@ mod tests {
                 .any(|w| w == NON_UTF8_UPLOAD),
             "the original bytes must still forward byte-for-byte"
         );
+    }
+
+    /// The forwarding above is a fail-open BYPASS: the upload reached the
+    /// provider having been screened only as a copy with every invalid
+    /// sequence replaced, so a term written in a non-UTF-8 encoding was
+    /// never in the scanned text. Its usage row must say so, under the same
+    /// tag the fail-CLOSED direction refuses with.
+    ///
+    /// A binary-purpose upload is the control: the lossy scan is the
+    /// contract there, refusing it was never on the table, and nothing was
+    /// bypassed.
+    #[tokio::test]
+    async fn a_forwarded_non_utf8_upload_records_the_bypass_only_when_it_is_one() {
+        for (purpose, want) in [
+            (Some("batch"), crate::error::TAG_UNSCANNABLE_BODY),
+            (Some("assistants"), ""),
+        ] {
+            let upstream = MockServer::start().await;
+            files_upstream_mock().expect(1).mount(&upstream).await;
+
+            let snap = AisixSnapshot::new();
+            snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+            snap.models.insert(model("m-a", "jobs-a", PK_A));
+            snap.apikeys.insert(apikey_entry(&["*"]));
+            seed_fail_open_input_guardrail(&snap);
+            assert_scanned_but_fail_open(&snap);
+            let (app, mut rx) = build_app_with_sink(snap);
+
+            let resp = app
+                .oneshot(upload_request_with_purpose(
+                    "XBOUNDARYX",
+                    purpose,
+                    NON_UTF8_UPLOAD,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "purpose {purpose:?}");
+
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("/v1/files must emit a usage event")
+                .expect("channel open");
+            assert_eq!(
+                event.guardrail_bypassed_reason, want,
+                "purpose {purpose:?}: {event:?}",
+            );
+        }
     }
 
     /// A mixed chain folds to the strictest: one fail-CLOSED input row is

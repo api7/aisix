@@ -289,9 +289,10 @@ pub(crate) async fn realtime(
                 &client,
                 // Refused before the handshake, so no chain was ever
                 // resolved and no guardrail can have enforced anything —
-                // nor scored anything.
+                // nor scored anything, nor been bypassed.
                 Vec::new(),
                 Vec::new(),
+                String::new(),
             );
             err.into_response()
         }
@@ -767,6 +768,7 @@ async fn run_session(
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
                 crate::usage_attr::guardrail_scores(&audit),
+                crate::usage_attr::bypass_reason(&audit),
             );
             return;
         }
@@ -1011,6 +1013,7 @@ async fn run_session(
         guardrail_monitor_hits: monitor_hits,
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(&audit),
         guardrail_scores: crate::usage_attr::guardrail_scores(&audit),
+        guardrail_bypassed_reason: crate::usage_attr::bypass_reason(&audit),
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &pk);

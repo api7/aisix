@@ -632,6 +632,12 @@ pub async fn chat_completions(
                             // Input masking may have fired before the failure.
                             redacted_entity_counts: redaction_counts.clone(),
                             guardrail_monitor_hits: monitor_hits.clone(),
+                            // Read off the audit handle rather than
+                            // `dispatch`'s local: a failure unwinds through
+                            // `DispatchFailure`, which never carried the
+                            // bypass, so a request that failed open and then
+                            // errored used to report an empty reason.
+                            bypass_reason: crate::usage_attr::bypass_reason(&audit),
                             ..UsageExtras::default()
                         },
                         /* cost_usd */ 0.0,
@@ -699,7 +705,18 @@ struct Success {
     /// guardrail upstream unreachable + `fail_open=true`). The first
     /// bypass reason wins. Goes onto `usage_events.guardrail_bypassed_reason`
     /// so a compliance audit can see what slipped past during a Bedrock
-    /// outage. None for the normal Allow / Block paths.
+    /// outage. `None` when nothing was bypassed.
+    ///
+    /// A Block does not clear it: an input hook that failed open on a
+    /// prompt the provider then answered is still a bypass, whatever the
+    /// output hook went on to decide — which is why the billed-then-blocked
+    /// event carries this through `UpstreamCharge`.
+    ///
+    /// Threaded here rather than read back off the audit handle — which is
+    /// where every other handler gets it — because the per-attempt and
+    /// ensemble sub-call emitters are handed the value captured EARLIER in
+    /// the request, which a request-scoped snapshot cannot express. The two
+    /// agree by construction: both are the first `Bypass` the chain folded.
     bypass_reason: Option<String>,
     /// Cache outcome for this request. `disabled` when no enabled
     /// cache_policy is in snapshot for the env; `miss` when the cache
@@ -4772,6 +4789,10 @@ fn emit_failed_attempts(
                 error_class: rec.error_class.clone(),
                 error_message: rec.error_message.clone(),
                 applied_guardrails: applied_guardrails.to_vec(),
+                // Same reason as the pre-dispatch failure event: the
+                // bypass is a request-scoped fact and every attempt of a
+                // request that failed open went upstream unscreened.
+                bypass_reason: crate::usage_attr::bypass_reason(audit),
                 ..UsageExtras::default()
             },
             /* cost_usd */ 0.0,

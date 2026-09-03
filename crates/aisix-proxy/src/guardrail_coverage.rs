@@ -420,7 +420,28 @@ fn census_router() -> axum::Router {
 /// answerable — which is the whole question below.
 pub(crate) fn census_router_with_usage() -> (axum::Router, tokio::sync::mpsc::Receiver<UsageEvent>)
 {
-    let handle = SnapshotHandle::new(census_snapshot());
+    census_router_with(serde_json::json!({
+        "name": GUARDRAIL_ROW,
+        "enabled": true,
+        "kind": "custom",
+        "hook_point": "input",
+        "fail_open": false,
+        "script": BLOCK_EVERYTHING,
+        "timeout_ms": 5000,
+    }))
+}
+
+/// [`census_router_with_usage`] with the census guardrail row replaced, so
+/// a test can drive the same router-derived surface set against a
+/// different disposition (block, fail open) without restating the wiring.
+fn census_router_with(
+    row: serde_json::Value,
+) -> (axum::Router, tokio::sync::mpsc::Receiver<UsageEvent>) {
+    let snap = census_snapshot();
+    snap.guardrails.remove("g-census");
+    let guardrail: aisix_core::Guardrail = serde_json::from_value(row).expect("valid guardrail");
+    crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-census", guardrail, 2));
+    let handle = SnapshotHandle::new(snap);
     let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone(), None);
     let (tx, rx) = tokio::sync::mpsc::channel(32);
     let state = crate::ProxyState::new(handle, census_hub(), &cfg())
@@ -832,4 +853,92 @@ async fn fixtures_do_not_self_refuse_without_a_guardrail() {
             "{surface} reported a guardrail refusal with no guardrail configured: {body}",
         );
     }
+}
+
+/// A script that faults instead of deciding. Paired with `fail_open: true`
+/// it produces the OTHER outcome an operator has to be able to see: the
+/// request went upstream with nothing screening it.
+const FAULT_EVERYTHING: &str = r#"
+export function checkInput() {
+  throw new Error("census");
+}
+"#;
+
+/// The tag `kind: custom` reports for a script that threw. Asserted as a
+/// literal rather than derived: the value is the operator's filter, and a
+/// test that accepted any non-empty string would pass on a typo.
+const FAULT_TAG: &str = "custom_script_error";
+
+/// A fail-open bypass has to be REPORTED on the same router-derived set a
+/// refusal is, and for a stronger reason: a refusal is visible to the
+/// caller, so an unreported one is at least noticed. A bypass is visible to
+/// nobody. `guardrail_bypassed_reason` was written on `/v1/chat/completions`
+/// alone, so on every other surface an outage passed traffic unscreened and
+/// the usage record said the same thing it says for a screened request.
+///
+/// Driven with `fail_open: true` and a script that faults, which is the
+/// provider-outage shape without a provider: the chain runs, decides
+/// nothing, and lets the request through.
+#[tokio::test]
+async fn a_bypassed_surface_reports_the_bypass() {
+    let mut wrong = Vec::new();
+
+    for (surface, posture) in POSTURE {
+        if !matches!(posture, Posture::Enforced) {
+            continue;
+        }
+        let Some(request) = fixture(surface) else {
+            // `enforced_surfaces_refuse_a_blocking_guardrail` owns the
+            // missing-fixture complaint.
+            continue;
+        };
+        let (router, mut rx) = census_router_with(serde_json::json!({
+            "name": GUARDRAIL_ROW,
+            "enabled": true,
+            "kind": "custom",
+            "hook_point": "input",
+            "fail_open": true,
+            "script": FAULT_EVERYTHING,
+            "timeout_ms": 5000,
+        }));
+        let response = router.oneshot(request).await.expect("router must answer");
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body must read");
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+        // A fail-open row must not refuse — if it did, the surface never
+        // reached the bypass this test is about and the assertion below
+        // would be measuring the wrong thing.
+        if refused_by_guardrail(&body) {
+            wrong.push(format!("{surface}: fail_open row still refused: {body}"));
+            continue;
+        }
+
+        let mut events = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await
+        {
+            events.push(event);
+        }
+        if events.is_empty() {
+            wrong.push(format!("{surface}: bypassed but emitted no usage event"));
+            continue;
+        }
+        for event in &events {
+            if event.guardrail_bypassed_reason != FAULT_TAG {
+                wrong.push(format!(
+                    "{surface}: usage event carries guardrail_bypassed_reason {:?}, want {FAULT_TAG:?}",
+                    event.guardrail_bypassed_reason,
+                ));
+            }
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "a guardrail that failed OPEN must say so on every enforced surface's usage event \
+         (usage_events.guardrail_bypassed_reason) — otherwise an unscreened request is \
+         indistinguishable from a screened one:\n  {}",
+        wrong.join("\n  "),
+    );
 }
