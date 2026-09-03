@@ -6515,6 +6515,26 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
         .unwrap();
         crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-out", row, 1));
 
+        // The premise, asserted rather than assumed: the seeded row IS in
+        // the chain this request resolves, and it is not an input-side
+        // one. Without this the forwarding assertion below is the same
+        // observation as the no-guardrail case, and would pass just as
+        // well if the row had never been indexed at all.
+        let probe =
+            aisix_guardrails::LiveGuardrailIndex::new(SnapshotHandle::new(snap.clone()), None)
+                .resolve(&aisix_guardrails::RequestContext {
+                    passthrough_route_id: "",
+                    model_id: "",
+                    mcp_server_id: "",
+                    api_key_id: "",
+                    team_id: None,
+                });
+        assert!(!probe.is_empty(), "the seeded row must reach the chain");
+        assert!(
+            !aisix_guardrails::Guardrail::runs_on_input(&probe),
+            "and it must be output-side only"
+        );
+
         let hub = Arc::new(Hub::new());
         hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
         let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();

@@ -1087,6 +1087,26 @@ mod tests {
         .unwrap();
         crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-out", row, 1));
 
+        // The premise, asserted rather than assumed: the seeded row IS in
+        // the chain this request resolves, and it is not an input-side
+        // one. Without this the forwarding assertion below is the same
+        // observation as the no-guardrail case, and would pass just as
+        // well if the row had never been indexed at all.
+        let probe =
+            aisix_guardrails::LiveGuardrailIndex::new(SnapshotHandle::new(snap.clone()), None)
+                .resolve(&aisix_guardrails::RequestContext {
+                    passthrough_route_id: "",
+                    model_id: "",
+                    mcp_server_id: "",
+                    api_key_id: "",
+                    team_id: None,
+                });
+        assert!(!probe.is_empty(), "the seeded row must reach the chain");
+        assert!(
+            !aisix_guardrails::Guardrail::runs_on_input(&probe),
+            "and it must be output-side only"
+        );
+
         let hub = Arc::new(Hub::new());
         hub.register_specialized(
             "anthropic",
@@ -1149,6 +1169,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(res.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(crate::error::TAG_UNSCANNABLE_BODY),
+            "{v}"
+        );
     }
 
     /// Mixed group [anthropic, openai]: the openai target is `continue`d

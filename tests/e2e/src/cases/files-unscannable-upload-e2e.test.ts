@@ -67,7 +67,7 @@ const guardrail = (hook: string) => ({
   ],
 });
 
-/** The one term {@link GUARDRAIL} can actually hit. */
+/** The one term the rows built by {@link guardrail} can actually hit. */
 const BLOCKED_TERM = "zzz-blocked-term-zzz";
 
 interface FilesUpstream {
@@ -77,7 +77,11 @@ interface FilesUpstream {
 }
 
 /** Minimal `POST /v1/files` mock that keeps the RAW request bytes, so a
- *  test can assert byte-for-byte forwarding rather than a lossy re-read. */
+ *  test can assert byte-for-byte forwarding rather than a lossy re-read.
+ *
+ *  The response echoes the uploaded `filename`, which is what gives the
+ *  OUTPUT hook something under the caller's control to scan — see the
+ *  leg that proves an output-only row is actually live. */
 async function startFilesUpstream(): Promise<FilesUpstream> {
   const uploads: Buffer[] = [];
   const server: Server = createServer((req, res) => {
@@ -87,7 +91,11 @@ async function startFilesUpstream(): Promise<FilesUpstream> {
     req.on("end", () => {
       const path = (req.url ?? "/").split("?")[0];
       if (req.method === "POST" && path === "/v1/files") {
-        uploads.push(Buffer.concat(chunks));
+        const raw = Buffer.concat(chunks);
+        uploads.push(raw);
+        const echoed =
+          /filename="([^"]*)"/.exec(raw.toString("latin1"))?.[1] ??
+          "input.jsonl";
         res.statusCode = 200;
         res.setHeader("content-type", "application/json");
         return res.end(
@@ -95,7 +103,7 @@ async function startFilesUpstream(): Promise<FilesUpstream> {
             id: "file-e2e-in",
             object: "file",
             purpose: "batch",
-            filename: "input.jsonl",
+            filename: echoed,
           }),
         );
       }
@@ -119,6 +127,7 @@ function multipartUpload(
   model: string,
   purpose: string | null,
   file: Buffer,
+  filename = "input.jsonl",
 ): Buffer {
   const purposePart =
     purpose === null
@@ -128,7 +137,7 @@ function multipartUpload(
     Buffer.from(
       `--${boundary}\r\ncontent-disposition: form-data; name="model"\r\n\r\n${model}\r\n` +
         purposePart +
-        `--${boundary}\r\ncontent-disposition: form-data; name="file"; filename="input.jsonl"\r\n` +
+        `--${boundary}\r\ncontent-disposition: form-data; name="file"; filename="${filename}"\r\n` +
         `content-type: application/jsonl\r\n\r\n`,
       "utf8",
     ),
@@ -193,7 +202,12 @@ const startEnv = async (
   return { app, upstream, key, model };
 };
 
-const upload = (env: Env, file: Buffer, purpose: string | null = "batch") => {
+const upload = (
+  env: Env,
+  file: Buffer,
+  purpose: string | null = "batch",
+  filename = "input.jsonl",
+) => {
   const boundary = "XFILESUNSCANNABLEX";
   return fetch(`${env.app.proxyUrl}/v1/files`, {
     method: "POST",
@@ -201,7 +215,7 @@ const upload = (env: Env, file: Buffer, purpose: string | null = "batch") => {
       authorization: `Bearer ${env.key}`,
       "content-type": `multipart/form-data; boundary=${boundary}`,
     },
-    body: multipartUpload(boundary, env.model, purpose, file),
+    body: multipartUpload(boundary, env.model, purpose, file, filename),
   });
 };
 
@@ -265,6 +279,35 @@ describe("files: an unscannable upload is refused, not forwarded", () => {
     expect(res.status).toBe(200);
     expect(outputOnly.upstream.uploads).toHaveLength(1);
     expect(outputOnly.upstream.uploads[0].includes(NON_UTF8_LINE)).toBe(true);
+  });
+
+  // The premise of the leg above, asserted rather than assumed: that row
+  // really is attached and really does run. Without this, "forwarded" is
+  // the same observation as the no-guardrail environment, and the leg
+  // would pass just as well if the row had never reached the chain. The
+  // upstream echoes the uploaded filename, so an output-hook rule has
+  // something under the caller's control to match on.
+  test("the output-only guardrail is attached and live on the response", async (ctx) => {
+    if (!etcdReachable || !outputOnly) {
+      ctx.skip();
+      return;
+    }
+    const before = outputOnly.upstream.uploads.length;
+    const res = await upload(
+      outputOnly,
+      CLEAN_LINE,
+      "batch",
+      `${BLOCKED_TERM}.jsonl`,
+    );
+    expect(res.status).toBe(422);
+    const body = (await res.json()) as {
+      error?: { type?: string; message?: string };
+    };
+    expect(body.error?.type).toBe("content_filter");
+    // A policy hit on the RESPONSE, not the request-side refusal.
+    expect(body.error?.message).not.toContain("unscannable_body");
+    // The upload itself was forwarded — the block happened on the way back.
+    expect(outputOnly.upstream.uploads).toHaveLength(before + 1);
   });
 
   // ...and one input-hook row is enough: adding the output-only row must

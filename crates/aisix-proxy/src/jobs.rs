@@ -530,10 +530,9 @@ async fn scan_input_blob(
     // attachments alone would never have been offered this payload, so it
     // cannot be the reason the payload is refused — it falls through to the
     // lossy scan the same way an unconfigured deployment does.
-    let scanned_on_input = aisix_guardrails::Guardrail::runs_on_input(&chain);
     let text = match (std::str::from_utf8(blob), undecodable) {
         (Ok(text), _) => std::borrow::Cow::Borrowed(text),
-        (Err(err), Undecodable::Refuse) if scanned_on_input => {
+        (Err(err), Undecodable::Refuse) if aisix_guardrails::Guardrail::runs_on_input(&chain) => {
             tracing::warn!(
                 guardrail_hook = "input",
                 model = %target.display_name(),
@@ -3007,6 +3006,28 @@ mod tests {
         );
     }
 
+    /// The premise of the output-only tests, asserted rather than assumed:
+    /// the seeded row IS in the chain this request resolves, and it is not
+    /// an input-side one. Without this the forwarding assertion below is
+    /// the same observation as the no-guardrail test, and would pass just
+    /// as well if the row had never been indexed at all.
+    fn assert_output_only_chain(snap: &AisixSnapshot) {
+        let chain =
+            aisix_guardrails::LiveGuardrailIndex::new(SnapshotHandle::new(snap.clone()), None)
+                .resolve(&aisix_guardrails::RequestContext {
+                    passthrough_route_id: "",
+                    model_id: "m-a",
+                    mcp_server_id: "",
+                    api_key_id: "",
+                    team_id: None,
+                });
+        assert!(!chain.is_empty(), "the seeded row must reach the chain");
+        assert!(
+            !aisix_guardrails::Guardrail::runs_on_input(&chain),
+            "and it must be output-side only"
+        );
+    }
+
     /// The gate is "a guardrail would read this upload", not "a guardrail
     /// is attached". An output-hook-only deployment never inspects the
     /// request side, so a text-purpose upload it cannot decode must leave
@@ -3023,6 +3044,7 @@ mod tests {
         snap.models.insert(model("m-a", "jobs-a", PK_A));
         snap.apikeys.insert(apikey_entry(&["*"]));
         seed_never_matching_output_guardrail(&snap);
+        assert_output_only_chain(&snap);
         let app = build_app(snap);
 
         let resp = app
