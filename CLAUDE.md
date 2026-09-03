@@ -197,9 +197,9 @@ Anchor on a release that has **already shipped**, never on a guess at the next v
 
 ## An Absent Config Block Means Off
 
-**Never give an absent optional block a default that switches on user-visible behaviour.** The operator who omitted it did not ask for the feature, the console has no field showing it is on, and nothing in the request path reveals it — so the first sign is the behaviour itself. Defaults for the knobs INSIDE a block the operator did enable are a different thing and stay.
+**An optional block's absence must mean the feature is off — including the block's own `enabled` flag, when the operator wrote the block and omitted the flag.** Neither the console nor the request path reveals a default that switches user-visible behavior on, so the first sign of one is the behavior. The block's other knobs keep their defaults, and a security control still defaults fail-closed: restricting is not enabling.
 
-When you add such a block, its schema description must say what omitting it means; that sentence is what the published reference shows. (Precedent: `cooldown` — AISIX-Cloud#1499.)
+State what omitting the block means in the field's own description and in `cp-admin.yaml`. (Precedent: `cooldown` — AISIX-Cloud#1499.)
 
 ## A Retired Startup-Config Key Is Tombstoned, Never Deleted
 
