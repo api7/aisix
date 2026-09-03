@@ -50,6 +50,11 @@ pub(crate) enum Posture {
     /// Nothing a caller authored reaches an upstream, so there is nothing
     /// for an input hook to screen. Carries why.
     NoUpstreamContent(&'static str),
+    /// Caller-authored content DOES reach an upstream here and the chain
+    /// does not run over it. Carries why, and where the screening this
+    /// surface needs is tracked, so the next person reading the census can
+    /// tell a deliberate gap from an oversight without reading the handler.
+    Unscreened(&'static str),
 }
 
 /// Every surface `build_router` mounts, and its posture. The set of keys is
@@ -73,7 +78,9 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
     ),
     (
         "/a2a/:agent/.well-known/agent-card.json",
-        Posture::NoUpstreamContent("serves the agent's card with the URL rewritten; no caller body"),
+        Posture::NoUpstreamContent(
+            "serves the agent's card with the URL rewritten; no caller body",
+        ),
     ),
     // --- reads of a job/asset the caller already created ----------------
     (
@@ -135,26 +142,14 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
     ),
     (
         "/v1/files",
-        Posture::EnforcedNotDrivableInCrate(
-            "`jobs::scan_input_blob` screens the uploaded blob, but reaching it needs a resolvable \
-             job target plus a multipart upload the mock upstream must accept. Covered by the jobs \
-             e2e suite.",
+        Posture::Unscreened(
+            "an uploaded file is a batch of independent requests, not one message: a whole-blob \
+             scan answers with a single verdict over decoded JSON syntax and can rewrite nothing. \
+             Screening it per record, through the ordinary request chain, is #1120.",
         ),
     ),
-    (
-        "/v1/batches",
-        Posture::EnforcedNotDrivableInCrate(
-            "same `jobs::scan_input_blob` gate; POST needs an `input_file_id` that resolves \
-             through a prior upload.",
-        ),
-    ),
-    (
-        "/v1/fine_tuning/jobs",
-        Posture::EnforcedNotDrivableInCrate(
-            "same `jobs::scan_input_blob` gate; POST needs a `training_file` that resolves \
-             through a prior upload.",
-        ),
-    ),
+    ("/v1/batches", Posture::Enforced),
+    ("/v1/fine_tuning/jobs", Posture::Enforced),
     (
         FALLBACK_SURFACE,
         Posture::EnforcedNotDrivableInCrate(
@@ -238,9 +233,9 @@ fn posture_covers_every_mounted_surface() {
     for (surface, posture) in POSTURE {
         let reason = match posture {
             Posture::Enforced => continue,
-            Posture::EnforcedNotDrivableInCrate(reason) | Posture::NoUpstreamContent(reason) => {
-                reason
-            }
+            Posture::EnforcedNotDrivableInCrate(reason)
+            | Posture::NoUpstreamContent(reason)
+            | Posture::Unscreened(reason) => reason,
         };
         assert!(
             !reason.trim().is_empty(),
@@ -603,6 +598,24 @@ pub(crate) fn fixture(surface: &str) -> Option<Request<Body>> {
                 "id": 1,
                 "method": "tools/call",
                 "params": { "name": "tool", "arguments": {} },
+            }),
+        ),
+        // The jobs surfaces that still screen: both send a re-serialised
+        // JSON request body, and both route off the encoded file id rather
+        // than a `model` field, so neither needs a prior upload to drive.
+        "/v1/batches" => json(
+            surface,
+            serde_json::json!({
+                "input_file_id": crate::jobs::encode_routed_id("file-census", "census-openai"),
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h",
+            }),
+        ),
+        "/v1/fine_tuning/jobs" => json(
+            surface,
+            serde_json::json!({
+                "model": "gpt-4o-mini-2024-07-18",
+                "training_file": crate::jobs::encode_routed_id("file-census", "census-openai"),
             }),
         ),
         // `tasks/get` carries no message at all.

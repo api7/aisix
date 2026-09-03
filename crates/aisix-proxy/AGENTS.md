@@ -149,22 +149,22 @@ Two rules follow, and both are enforced mechanically rather than by review:
   requests that were never going to be screened, which breaks the negative
   answer just as thoroughly as dropping the first.
 
-Deliberately NOT recorded, so the next person does not read the four
+Deliberately NOT recorded, so the next person does not read the gated
 unscannable sites as the full set: the places that scan a mangled copy
 unconditionally, with no failure policy involved. `jobs::scan_output_blob`
-and the binary-purpose arm of `scan_input_blob` scan
-`String::from_utf8_lossy` and relay the original bytes whatever the row
-says; `passthrough_route` scans the lossy body; `audio.rs`'s
+scans `String::from_utf8_lossy` of a batch or fine-tuning response and, where
+the verdict lets it through, relays the original bytes whatever the row's
+failure policy says; `passthrough_route` scans the lossy body; `audio.rs`'s
 `transcription_output_text` falls back to the lossy body for the plain-text
 transcript formats (`text` / `srt` / `vtt`). None of these consults
 `refuses_unevaluable_*`, so a fail-CLOSED row does not refuse there either —
 not something telemetry can paper over, and making them refuse is a behaviour
-change rather than an observability one. Tagging them instead would fire the
-field on every binary upload and download, which destroys the negative answer
-just as thoroughly. Note that `record_unevaluable_*` is the wrong helper at
-such a site: its predicate assumes the fail-closed case was already refused,
-so at a site that never refuses it would silently drop exactly the case worth
-reporting.
+change rather than an observability one. Tagging them instead
+would fire the field on every job response, every passthrough body and every
+plain-text transcript, which destroys the negative answer just as thoroughly.
+Note that `record_unevaluable_*` is the wrong helper at such a site: its
+predicate assumes the fail-closed case was already refused, so at a site that
+never refuses it would silently drop exactly the case worth reporting.
 
 What is no longer in that set is the multipart `prompt` on `audio.rs` and
 `images_edits.rs`: since #1016 both call

@@ -447,50 +447,14 @@ async fn send_upstream(
     ))
 }
 
-/// Purposes whose uploaded payload is contractually UTF-8 text, and so the
-/// only ones under which a blob the scanner cannot decode is refused.
-///
-/// `batch` and `fine-tune` take JSONL, and so does an eval data set: every
-/// eval run data source that accepts a file id declares that file to be a
-/// JSONL source, with no binary variant. The remaining upload purposes of
-/// the six a caller may declare — `assistants`,
-/// `vision`, `user_data` — legitimately carry binary (a PDF, an image, or
-/// "any purpose" respectively), so an undecodable blob there is a normal
-/// upload rather than an evasion. This route never validates `purpose`:
-/// it forwards whatever the caller declared, so an unrecognised or absent
-/// value is not classifiable as text and is not refused.
-const TEXT_PURPOSES: [&str; 3] = ["batch", "fine-tune", "evals"];
-
-/// What [`scan_input_blob`] does with a payload it cannot decode as UTF-8.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Undecodable {
-    /// The payload is contractually UTF-8 text, so invalid bytes are
-    /// refused rather than hidden behind a lossy decode (#1022).
-    Refuse,
-    /// The payload may legitimately be binary — keep the best-effort lossy
-    /// scan and let the upload through.
-    ScanLossily,
-}
-
-/// Classify a declared multipart `purpose` for the refusal above.
-fn undecodable_posture(purpose: Option<&str>) -> Undecodable {
-    match purpose {
-        Some(p) if TEXT_PURPOSES.contains(&p) => Undecodable::Refuse,
-        _ => Undecodable::ScanLossily,
-    }
-}
-
 /// Run the resolved input-guardrail chain over an opaque blob (whole-body
-/// text scan — the `/passthrough` precedent from #911 [6]). A blob that is
-/// not valid UTF-8 is refused rather than scanned lossily when the payload
-/// is contractually text; see the arm below.
+/// text scan — the `/passthrough` precedent from #911 [6]).
 #[allow(clippy::too_many_arguments)]
 async fn scan_input_blob(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     target: &JobTarget,
     blob: &[u8],
-    undecodable: Undecodable,
     monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
     // Accumulated rather than handed back as one handle: the input and
     // output scans resolve their own chain, so a request can produce two
@@ -512,61 +476,7 @@ async fn scan_input_blob(
     if chain.is_empty() {
         return Ok(());
     }
-    // Fail closed on a text payload the scanner cannot read — the same arm
-    // as `messages.rs` / `count_tokens.rs` / `mcp.rs`. `from_utf8_lossy`
-    // replaces every invalid sequence with U+FFFD, so a term written in a
-    // non-UTF-8 encoding never appeared in the scanned text while
-    // `create_file` forwarded the ORIGINAL bytes to the provider (#1022):
-    // the guardrail was offered a redacted copy of the payload and the
-    // payload left the boundary anyway.
-    //
-    // Only a payload the declared `purpose` says is UTF-8 text can be
-    // refused on that ground; a binary-purpose upload keeps the lossy scan
-    // it has always had, and is still forwarded verbatim. That asymmetry is
-    // deliberate — refusing it would break lawful PDF/image uploads, which
-    // is a product decision, not a guardrail one.
-    //
-    // Reached only once some guardrail would BOTH read the request and
-    // refuse when it cannot evaluate, which is also deliberate. An upload
-    // nobody screens keeps forwarding whatever it forwards today; this is a
-    // guardrail refusal, not a structural check on the file. Two ways to be
-    // outside it: a chain resolved from output-hook attachments alone is
-    // never offered this payload, and a row set `fail_open: true` has asked
-    // for exactly the opposite disposition — the refusal reports itself as
-    // `guardrail_unavailable`, which is the condition that setting governs.
-    // Both fall through to the lossy scan an unconfigured deployment gets.
-    let text = match (std::str::from_utf8(blob), undecodable) {
-        (Ok(text), _) => std::borrow::Cow::Borrowed(text),
-        (Err(err), Undecodable::Refuse)
-            if aisix_guardrails::Guardrail::refuses_unevaluable_input(&chain) =>
-        {
-            tracing::warn!(
-                guardrail_hook = "input",
-                model = %target.display_name(),
-                error = %err,
-                "cannot scan jobs upload for guardrails; blocking",
-            );
-            return Err(crate::error::guardrail_block_error(
-                "request",
-                None,
-                Some(crate::error::TAG_UNSCANNABLE_BODY),
-            ));
-        }
-        // A text-purpose upload nothing on the request side would have
-        // read: best-effort lossy scan, forwarded verbatim. The scan runs
-        // on a copy with every invalid sequence replaced, so whatever the
-        // original bytes spelled was never screened — that is a bypass,
-        // and it is recorded under the same tag the fail-CLOSED direction
-        // refuses with.
-        (Err(_), Undecodable::Refuse) => {
-            chain.record_unevaluable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
-            String::from_utf8_lossy(blob)
-        }
-        // Binary-purpose upload: the lossy scan is the contract, not a
-        // fallback — a PDF was never going to decode and refusing it was
-        // never on the table, so nothing was bypassed.
-        (Err(_), _) => String::from_utf8_lossy(blob),
-    };
+    let text = String::from_utf8_lossy(blob);
     let chat = aisix_gateway::ChatFormat::new(
         target.display_name(),
         vec![aisix_gateway::ChatMessage::user(text.into_owned())],
@@ -603,20 +513,9 @@ async fn scan_input_blob(
     Ok(())
 }
 
-/// Output-side counterpart of [`scan_input_blob`] — but NOT a symmetric
-/// one, and deliberately not renamed to hide that.
-///
-/// The input side refuses a blob it cannot decode when the declared
-/// `purpose` says the payload is UTF-8 text (#1022). This side still scans
-/// `from_utf8_lossy` and still relays the original bytes, so the same
-/// evasion is open on `GET /v1/files/{id}/content`, whose `relay_raw_body`
-/// arm returns the provider's bytes untouched. That is not an oversight to
-/// tidy up in passing: the download path legitimately carries binary the
-/// caller never chose (whatever the provider holds under a file id), and it
-/// has no `purpose` to classify it by — the upload's `purpose` is what lets
-/// the input side tell a JSONL payload from a lawful PDF. Failing closed
-/// here would refuse lawful downloads, so the direction needs a product
-/// decision rather than a mirrored `match`. Tracked in #1022.
+/// Run the resolved output-guardrail chain over an upstream body, as one
+/// synthetic assistant turn. The body is decoded best-effort and relayed
+/// as the provider sent it.
 #[allow(clippy::too_many_arguments)]
 async fn scan_output_blob(
     state: &ProxyState,
@@ -1011,10 +910,6 @@ pub(crate) async fn create_file(
             );
         }
     };
-    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
-    let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
-    let mut scores: Vec<aisix_core::GuardrailScore> = Vec::new();
-    let mut bypass = String::new();
     // Loaded below, after the upload is drained — see the note in
     // `audio::multipart_dispatch` (#941 audit M2).
     let mut snapshot = None;
@@ -1025,16 +920,7 @@ pub(crate) async fn create_file(
         // forward verbatim.
         let mut form = reqwest::multipart::Form::new();
         let mut form_model: Option<String> = None;
-        let mut file_bytes: Option<Bytes> = None;
-        // Read but not consumed: `purpose` forwards verbatim like any other
-        // text field, and only classifies the blob for the scan below.
-        //
-        // Folded rather than overwritten, so a body declaring `purpose`
-        // more than once takes the STRICTER reading. Such a body is
-        // malformed and the provider picks whichever part it picks; taking
-        // the last one would let a caller append a binary purpose after a
-        // text one to pick the looser reading for us.
-        let mut undecodable = Undecodable::ScanLossily;
+        let mut saw_file = false;
 
         while let Some(field) = multipart.next_field().await.map_err(|e| {
             crate::error::proxy_error_from_multipart(
@@ -1074,7 +960,7 @@ pub(crate) async fn create_file(
                     })?;
                 }
                 form = form.part("file", part);
-                file_bytes = Some(bytes);
+                saw_file = true;
                 continue;
             }
             let v = field.text().await.map_err(|e| {
@@ -1084,35 +970,19 @@ pub(crate) async fn create_file(
                     "malformed multipart field",
                 )
             })?;
-            if name == "purpose" && undecodable_posture(Some(v.as_str())) == Undecodable::Refuse {
-                undecodable = Undecodable::Refuse;
-            }
             form = form.text(name, v);
         }
 
-        let file_bytes = file_bytes.ok_or_else(|| {
-            ProxyError::InvalidRequest("multipart body must include a `file` field".into())
-        })?;
+        if !saw_file {
+            return Err(ProxyError::InvalidRequest(
+                "multipart body must include a `file` field".into(),
+            ));
+        }
 
         let wanted = form_model.or_else(|| explicit_model(&params, &headers));
         let snapshot = &**snapshot.insert(state.snapshot.load());
         let target = resolve_target(snapshot, &auth, wanted.as_deref(), &client)?;
 
-        // Uploads carry end-user content — scan them like any other inbound
-        // payload. Only a text `purpose` may be refused for being
-        // undecodable; see `undecodable_posture`.
-        scan_input_blob(
-            &state,
-            &auth,
-            &target,
-            &file_bytes,
-            undecodable,
-            &mut monitor_hits,
-            &mut enforced_hits,
-            &mut scores,
-            &mut bypass,
-        )
-        .await?;
         let _reservation = crate::quota::enforce(
             &state,
             snapshot,
@@ -1133,17 +1003,6 @@ pub(crate) async fn create_file(
             &url,
             UpstreamBody::Multipart(form),
             &request_id,
-        )
-        .await?;
-        scan_output_blob(
-            &state,
-            &auth,
-            &target,
-            &bytes,
-            &mut monitor_hits,
-            &mut enforced_hits,
-            &mut scores,
-            &mut bypass,
         )
         .await?;
         let model = target.display_name().to_string();
@@ -1167,10 +1026,10 @@ pub(crate) async fn create_file(
         started,
         request_id,
         result,
-        monitor_hits,
-        enforced_hits,
-        scores,
-        bypass,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        String::new(),
     )
 }
 
@@ -1376,10 +1235,6 @@ pub(crate) async fn create_batch(
             &auth,
             &target,
             &out_body,
-            // A `serde_json` re-serialisation is valid UTF-8 by
-            // construction, so the refusal arm is unreachable here; the
-            // posture still states what the payload is.
-            Undecodable::Refuse,
             &mut monitor_hits,
             &mut enforced_hits,
             &mut scores,
@@ -1675,10 +1530,6 @@ pub(crate) async fn create_ft_job(
             &auth,
             &target,
             &out_body,
-            // A `serde_json` re-serialisation is valid UTF-8 by
-            // construction, so the refusal arm is unreachable here; the
-            // posture still states what the payload is.
-            Undecodable::Refuse,
             &mut monitor_hits,
             &mut enforced_hits,
             &mut scores,
@@ -1889,10 +1740,6 @@ async fn forward_simple(
                 &auth,
                 &target,
                 body,
-                // No caller sets `spec.body` today, so this is unreachable
-                // too; if one ever does it will be a re-serialised JSON
-                // body, which makes text the right posture for it.
-                Undecodable::Refuse,
                 &mut monitor_hits,
                 &mut enforced_hits,
                 &mut scores,
@@ -1920,17 +1767,24 @@ async fn forward_simple(
         };
         let (status, resp_headers, bytes) =
             send_upstream(&state, &target, spec.method, &url, body, &request_id).await?;
-        scan_output_blob(
-            &state,
-            &auth,
-            &target,
-            &bytes,
-            &mut monitor_hits,
-            &mut enforced_hits,
-            &mut scores,
-            &mut bypass,
-        )
-        .await?;
+        // The files surface carries opaque payloads, not model output: an
+        // uploaded batch file is thousands of independent requests and a
+        // download is whatever the provider stored under an id. Screening
+        // either as one synthetic message is #1120's job, per record,
+        // through the ordinary request chain.
+        if surface != crate::operation::FILES {
+            scan_output_blob(
+                &state,
+                &auth,
+                &target,
+                &bytes,
+                &mut monitor_hits,
+                &mut enforced_hits,
+                &mut scores,
+                &mut bypass,
+            )
+            .await?;
+        }
 
         let resp = if spec.relay_raw_body {
             let mut resp = Response::builder()
@@ -2167,9 +2021,7 @@ async fn attribute_batch_usage(
         let mut event = UsageEvent {
             // NO-GUARDRAIL-CHAIN: a retroactive billing row for work the
             // provider did inside a batch. There is no request here, so no
-            // chain was ever resolved and nothing could have been bypassed;
-            // the upload that created the batch was screened at its own
-            // time, and carries its own event.
+            // chain was ever resolved and nothing could have been bypassed.
             request_id,
             occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             model_id: model_id.to_string(),
@@ -2891,96 +2743,42 @@ mod tests {
         );
     }
 
-    /// AISIX-Cloud#1330 / #1024: the jobs surface scans an uploaded blob
-    /// with its own resolved chain, and a block leaves through `Err`. The
-    /// hits are therefore accumulated inside the scan — BEFORE the block
-    /// branch returns — rather than read back from a chain the `?` has
-    /// already discarded.
-    #[tokio::test]
-    async fn blocked_upload_names_the_policy_on_the_usage_event() {
-        let upstream = MockServer::start().await;
-        Mock::given(wm_method("POST"))
-            .and(path("/v1/files"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "file-abc",
-                "object": "file",
-                "purpose": "batch",
-                "filename": "input.jsonl"
-            })))
-            .expect(0)
-            .mount(&upstream)
-            .await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
-        snap.models.insert(model("m-a", "jobs-a", PK_A));
-        snap.apikeys.insert(apikey_entry(&["*"]));
-        // The uploaded blob carries `custom_id`, so blocking on that
-        // literal refuses the upload without touching the fixture.
-        let g: aisix_core::Guardrail = serde_json::from_str(
-            r#"{"name":"test-block","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"custom_id"}]}"#,
-        )
-        .unwrap();
-        crate::seed_env_scoped_guardrail(
-            &snap,
-            aisix_core::resource::ResourceEntry::new("g-1", g, 1),
-        );
-        let (app, mut rx) = build_app_with_sink(snap);
-
-        let boundary = "XBOUNDARYX";
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/files")
-            .header("authorization", "Bearer sk-caller")
-            .header(
-                "content-type",
-                format!("multipart/form-data; boundary={boundary}"),
-            )
-            .body(axum::body::Body::from(multipart_body(
-                boundary,
-                Some("jobs-a"),
-            )))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-
-        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
-            .await
-            .expect("UsageEvent must be emitted for the refusal")
-            .expect("usage_sink sender dropped");
-        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
-        assert_eq!(ev.guardrail_enforced_hits[0].guardrail_name, "test-block");
-        assert_eq!(ev.guardrail_enforced_hits[0].hook, "input");
-        assert_eq!(ev.guardrail_enforced_hits[0].action, "blocked");
-        let wire = serde_json::to_string(&ev).unwrap();
-        assert!(!wire.contains("custom_id"), "{wire}");
-    }
-
-    /// GBK bytes for 你好 embedded in an otherwise well-formed JSONL line.
+    /// GBK bytes for 你好 inside an otherwise well-formed JSONL line.
     /// `0xC4` opens a two-byte sequence and `0xE3` is not a continuation
-    /// byte, so the blob is not valid UTF-8 — and `from_utf8_lossy` used
-    /// to hand the guardrail `\u{FFFD}` in place of the term while the
-    /// original bytes went to the provider untouched (#1022).
-    const NON_UTF8_UPLOAD: &[u8] = b"{\"custom_id\":\"r1\",\"note\":\"\xc4\xe3\xba\xc3\"}";
+    /// byte, so the blob does not decode as UTF-8. It also carries
+    /// `custom_id`, the literal [`seed_blocking_input_guardrail`] blocks
+    /// on, so one upload exercises both ways a scan of the whole blob
+    /// could stop it.
+    const BLOB_UPLOAD: &[u8] = b"{\"custom_id\":\"r1\",\"note\":\"\xc4\xe3\xba\xc3\"}";
 
-    /// A keyword row that cannot match anything in these fixtures. The
-    /// refusal below must come from the blob being unscannable, not from
-    /// a hit — otherwise the test would also pass for a fix that simply
-    /// started blocking every upload.
-    fn seed_never_matching_guardrail(snap: &AisixSnapshot) {
+    /// A fail-closed input row matching `custom_id`, which every request
+    /// fixture below carries. The files surface must forward regardless;
+    /// `a_batch_create_is_still_screened` is what proves the literal still
+    /// matches, so a pattern that quietly stopped matching cannot turn the
+    /// forwarding assertions into tautologies.
+    fn seed_blocking_input_guardrail(snap: &AisixSnapshot) {
         let g: aisix_core::Guardrail = serde_json::from_str(
-            r#"{"name":"never-matches","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"zzz-no-such-term-zzz"}]}"#,
+            r#"{"name":"blocks-a-term","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"custom_id"}]}"#,
         )
         .unwrap();
         crate::seed_env_scoped_guardrail(
             snap,
-            aisix_core::resource::ResourceEntry::new("g-1", g, 1),
+            aisix_core::resource::ResourceEntry::new("g-in", g, 1),
         );
     }
 
-    fn upload_request(boundary: &str, file: &[u8]) -> Request<axum::body::Body> {
-        upload_request_with_purpose(boundary, Some("batch"), file)
+    /// The response-side counterpart, matching `forbidden-term`, which
+    /// every response fixture below carries.
+    /// `a_fine_tuning_job_read_is_still_screened` pins that it matches.
+    fn seed_blocking_output_guardrail(snap: &AisixSnapshot) {
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"blocks-a-term","enabled":true,"hook_point":"output","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"forbidden-term"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(
+            snap,
+            aisix_core::resource::ResourceEntry::new("g-out", g, 1),
+        );
     }
 
     fn upload_request_with_purpose(
@@ -3012,166 +2810,22 @@ mod tests {
                 "id": "file-abc",
                 "object": "file",
                 "purpose": "batch",
-                "filename": "input.jsonl"
+                "filename": "forbidden-term.jsonl"
             })))
     }
 
-    /// #1022: with a chain attached, a blob the scanner cannot read is
-    /// refused and never reaches the provider. `expect(0)` is the
-    /// load-bearing half — the old code scanned a lossy copy and then
-    /// forwarded the original bytes, so the guardrail decided about
-    /// content that was not what left the boundary.
-    #[tokio::test]
-    async fn non_utf8_upload_is_refused_and_never_forwarded() {
-        let upstream = MockServer::start().await;
-        files_upstream_mock().expect(0).mount(&upstream).await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
-        snap.models.insert(model("m-a", "jobs-a", PK_A));
-        snap.apikeys.insert(apikey_entry(&["*"]));
-        seed_never_matching_guardrail(&snap);
-        let app = build_app(snap);
-
-        let resp = app
-            .oneshot(upload_request("XBOUNDARYX", NON_UTF8_UPLOAD))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        let v: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["type"], "content_filter", "{v}");
-        assert_eq!(v["error"]["code"], "guardrail_unavailable", "{v}");
-        assert!(
-            v["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains(crate::error::TAG_UNSCANNABLE_BODY),
-            "the caller must be able to tell an unscannable body from a \
-             policy hit: {v}"
-        );
-    }
-
-    /// The same never-matching keyword row, attached on the OUTPUT hook
-    /// alone. `scan_input_blob` resolves by scope, so this row is in the
-    /// chain — but it is never offered the request, so it cannot be the
-    /// reason the request is refused.
-    fn seed_never_matching_output_guardrail(snap: &AisixSnapshot) {
-        let g: aisix_core::Guardrail = serde_json::from_str(
-            r#"{"name":"never-matches-out","enabled":true,"hook_point":"output","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"zzz-no-such-term-zzz"}]}"#,
-        )
-        .unwrap();
-        crate::seed_env_scoped_guardrail(
-            snap,
-            aisix_core::resource::ResourceEntry::new("g-out", g, 1),
-        );
-    }
-
-    /// An input-hook row that asked to fail OPEN. It still scans; it just
-    /// must not turn a body the gateway could not decode into a refusal.
-    fn seed_fail_open_input_guardrail(snap: &AisixSnapshot) {
-        let g: aisix_core::Guardrail = serde_json::from_str(
-            r#"{"name":"never-matches-open","enabled":true,"hook_point":"input","fail_open":true,"kind":"keyword","patterns":[{"kind":"literal","value":"zzz-no-such-term-zzz"}]}"#,
-        )
-        .unwrap();
-        crate::seed_env_scoped_guardrail(
-            snap,
-            aisix_core::resource::ResourceEntry::new("g-open", g, 1),
-        );
-    }
-
-    /// The premise of the output-only tests, asserted rather than assumed:
-    /// the seeded row IS in the chain this request resolves, and it is not
-    /// an input-side one. Without this the forwarding assertion below is
-    /// the same observation as the no-guardrail test, and would pass just
-    /// as well if the row had never been indexed at all.
-    fn resolved_chain(snap: &AisixSnapshot) -> aisix_guardrails::GuardrailChain {
-        aisix_guardrails::LiveGuardrailIndex::new(SnapshotHandle::new(snap.clone()), None).resolve(
-            &aisix_guardrails::RequestContext {
-                passthrough_route_id: "",
-                model_id: "m-a",
-                mcp_server_id: "",
-                api_key_id: "",
-                team_id: None,
-            },
-        )
-    }
-
-    /// The chain reads the request, so the upload IS still scanned — it
-    /// just must not be refused. Distinguishes a real fail-open chain from
-    /// one where the seeded row never arrived, which would forward for an
-    /// entirely different reason.
-    fn assert_scanned_but_fail_open(snap: &AisixSnapshot) {
-        let chain = resolved_chain(snap);
-        assert!(!chain.is_empty(), "the seeded row must reach the chain");
-        assert!(
-            aisix_guardrails::Guardrail::runs_on_input(&chain),
-            "it must still READ the request"
-        );
-        assert!(
-            !aisix_guardrails::Guardrail::refuses_unevaluable_input(&chain),
-            "but nothing in it may refuse a body it could not be given"
-        );
-    }
-
-    fn assert_output_only_chain(snap: &AisixSnapshot) {
-        let chain = resolved_chain(snap);
-        assert!(!chain.is_empty(), "the seeded row must reach the chain");
-        assert!(
-            !aisix_guardrails::Guardrail::runs_on_input(&chain),
-            "and it must be output-side only"
-        );
-    }
-
-    /// `fail_open: true` opts the row out of the refusal. The refusal
-    /// reports itself as `guardrail_unavailable`, and that is exactly the
-    /// condition this setting governs — a row that asked to fail open must
-    /// not be the reason an upload is refused. Fails on `8955d6ab` with 422.
-    #[tokio::test]
-    async fn non_utf8_upload_with_a_fail_open_guardrail_is_forwarded() {
-        let upstream = MockServer::start().await;
-        files_upstream_mock().expect(1).mount(&upstream).await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
-        snap.models.insert(model("m-a", "jobs-a", PK_A));
-        snap.apikeys.insert(apikey_entry(&["*"]));
-        seed_fail_open_input_guardrail(&snap);
-        assert_scanned_but_fail_open(&snap);
-        let app = build_app(snap);
-
-        let resp = app
-            .oneshot(upload_request("XBOUNDARYX", NON_UTF8_UPLOAD))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let received = upstream.received_requests().await.unwrap();
-        assert_eq!(received.len(), 1);
-        assert!(
-            received[0]
-                .body
-                .windows(NON_UTF8_UPLOAD.len())
-                .any(|w| w == NON_UTF8_UPLOAD),
-            "the original bytes must still forward byte-for-byte"
-        );
-    }
-
-    /// The forwarding above is a fail-open BYPASS: the upload reached the
-    /// provider having been screened only as a copy with every invalid
-    /// sequence replaced, so a term written in a non-UTF-8 encoding was
-    /// never in the scanned text. Its usage row must say so, under the same
-    /// tag the fail-CLOSED direction refuses with.
+    /// An upload reaches the provider whatever the chain says, under every
+    /// class of declared `purpose`: one whose payload is contractually
+    /// JSONL, one that legitimately carries binary, and none at all. The
+    /// fixture is both undecodable AND a policy hit, so each leg covers
+    /// the two ways a whole-blob scan used to stop an upload.
     ///
-    /// A binary-purpose upload is the control: the lossy scan is the
-    /// contract there, refusing it was never on the table, and nothing was
-    /// bypassed.
+    /// The usage event must not claim a bypass either: nothing offered to
+    /// screen this request, which is not the same as a check that ran and
+    /// was let past.
     #[tokio::test]
-    async fn a_forwarded_non_utf8_upload_records_the_bypass_only_when_it_is_one() {
-        for (purpose, want) in [
-            (Some("batch"), crate::error::TAG_UNSCANNABLE_BODY),
-            (Some("assistants"), ""),
-        ] {
+    async fn an_upload_is_forwarded_under_every_purpose_class() {
+        for purpose in [Some("batch"), Some("assistants"), None] {
             let upstream = MockServer::start().await;
             files_upstream_mock().expect(1).mount(&upstream).await;
 
@@ -3179,63 +2833,49 @@ mod tests {
             snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
             snap.models.insert(model("m-a", "jobs-a", PK_A));
             snap.apikeys.insert(apikey_entry(&["*"]));
-            seed_fail_open_input_guardrail(&snap);
-            assert_scanned_but_fail_open(&snap);
+            seed_blocking_input_guardrail(&snap);
             let (app, mut rx) = build_app_with_sink(snap);
 
             let resp = app
                 .oneshot(upload_request_with_purpose(
                     "XBOUNDARYX",
                     purpose,
-                    NON_UTF8_UPLOAD,
+                    BLOB_UPLOAD,
                 ))
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "purpose {purpose:?}");
 
-            let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            let received = upstream.received_requests().await.unwrap();
+            assert_eq!(received.len(), 1, "purpose {purpose:?}");
+            assert!(
+                received[0]
+                    .body
+                    .windows(BLOB_UPLOAD.len())
+                    .any(|w| w == BLOB_UPLOAD),
+                "purpose {purpose:?}: the original bytes must forward byte-for-byte"
+            );
+
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
                 .await
                 .expect("/v1/files must emit a usage event")
                 .expect("channel open");
+            assert!(
+                ev.guardrail_enforced_hits.is_empty(),
+                "purpose {purpose:?}: {ev:?}"
+            );
             assert_eq!(
-                event.guardrail_bypassed_reason, want,
-                "purpose {purpose:?}: {event:?}",
+                ev.guardrail_bypassed_reason, "",
+                "purpose {purpose:?}: nothing offered to screen this request, \
+                 so nothing was bypassed: {ev:?}"
             );
         }
     }
 
-    /// A mixed chain folds to the strictest: one fail-CLOSED input row is
-    /// enough, whatever else is attached.
+    /// The upload's response is relayed too. The row matches `input.jsonl`,
+    /// which the provider echoes back as the stored file's `filename`.
     #[tokio::test]
-    async fn non_utf8_upload_with_one_fail_closed_row_is_still_refused() {
-        let upstream = MockServer::start().await;
-        files_upstream_mock().expect(0).mount(&upstream).await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
-        snap.models.insert(model("m-a", "jobs-a", PK_A));
-        snap.apikeys.insert(apikey_entry(&["*"]));
-        seed_fail_open_input_guardrail(&snap);
-        seed_never_matching_guardrail(&snap);
-        assert!(
-            aisix_guardrails::Guardrail::refuses_unevaluable_input(&resolved_chain(&snap)),
-            "the fail-closed row must survive the fold"
-        );
-        let app = build_app(snap);
-
-        let resp = app
-            .oneshot(upload_request("XBOUNDARYX", NON_UTF8_UPLOAD))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
-    /// The case a naive fold gets wrong: the chain reads the request (the
-    /// fail-open input row) and contains a fail-closed row (the output-only
-    /// one), but neither member is both — so nothing here justifies
-    /// refusing a request.
-    #[tokio::test]
-    async fn non_utf8_upload_with_the_two_halves_on_different_rows_is_forwarded() {
+    async fn an_upload_response_is_relayed_past_a_blocking_output_row() {
         let upstream = MockServer::start().await;
         files_upstream_mock().expect(1).mount(&upstream).await;
 
@@ -3243,385 +2883,134 @@ mod tests {
         snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
         snap.models.insert(model("m-a", "jobs-a", PK_A));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        seed_fail_open_input_guardrail(&snap);
-        seed_never_matching_output_guardrail(&snap);
-        // What makes this the CROSS case rather than a degenerate one: the
-        // chain DOES read the request and DOES contain a fail-closed row,
-        // and still must not refuse — because those are different rows.
-        // Drop either seeded row and one of these three fails.
-        {
-            let chain = resolved_chain(&snap);
-            assert!(aisix_guardrails::Guardrail::runs_on_input(&chain));
-            assert!(aisix_guardrails::Guardrail::fails_closed_on_input(&chain));
-            assert!(!aisix_guardrails::Guardrail::refuses_unevaluable_input(
-                &chain
-            ));
-        }
-        let app = build_app(snap);
-
-        let resp = app
-            .oneshot(upload_request("XBOUNDARYX", NON_UTF8_UPLOAD))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
-    }
-
-    /// The gate is "a guardrail would read this upload", not "a guardrail
-    /// is attached". An output-hook-only deployment never inspects the
-    /// request side, so a text-purpose upload it cannot decode must leave
-    /// exactly as it would with nothing configured. Fails on `a456ab71`
-    /// with 422 — the resolved chain is non-empty there and that was the
-    /// whole gate.
-    #[tokio::test]
-    async fn non_utf8_upload_with_an_output_only_guardrail_is_forwarded() {
-        let upstream = MockServer::start().await;
-        files_upstream_mock().expect(1).mount(&upstream).await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
-        snap.models.insert(model("m-a", "jobs-a", PK_A));
-        snap.apikeys.insert(apikey_entry(&["*"]));
-        seed_never_matching_output_guardrail(&snap);
-        assert_output_only_chain(&snap);
-        let app = build_app(snap);
-
-        let resp = app
-            .oneshot(upload_request("XBOUNDARYX", NON_UTF8_UPLOAD))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let received = upstream.received_requests().await.unwrap();
-        assert_eq!(received.len(), 1);
-        assert!(
-            received[0]
-                .body
-                .windows(NON_UTF8_UPLOAD.len())
-                .any(|w| w == NON_UTF8_UPLOAD),
-            "the original bytes must still forward byte-for-byte"
-        );
-    }
-
-    /// One input-hook member is enough: adding the output-only row to the
-    /// input-hook one must not soften the refusal into a forward.
-    #[tokio::test]
-    async fn non_utf8_upload_with_input_and_output_guardrails_is_still_refused() {
-        let upstream = MockServer::start().await;
-        files_upstream_mock().expect(0).mount(&upstream).await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
-        snap.models.insert(model("m-a", "jobs-a", PK_A));
-        snap.apikeys.insert(apikey_entry(&["*"]));
-        seed_never_matching_output_guardrail(&snap);
-        seed_never_matching_guardrail(&snap);
-        let app = build_app(snap);
-
-        let resp = app
-            .oneshot(upload_request("XBOUNDARYX", NON_UTF8_UPLOAD))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        let v: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["type"], "content_filter", "{v}");
-        assert_eq!(v["error"]["code"], "guardrail_unavailable", "{v}");
-        assert!(
-            v["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains(crate::error::TAG_UNSCANNABLE_BODY),
-            "{v}"
-        );
-    }
-
-    /// The refusal is conditional on a chain being attached. With no
-    /// guardrail in the index the same upload behaves exactly as it does
-    /// today — this is not structural validation of the file.
-    #[tokio::test]
-    async fn non_utf8_upload_without_a_guardrail_still_forwards() {
-        let upstream = MockServer::start().await;
-        files_upstream_mock().expect(1).mount(&upstream).await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
-        snap.models.insert(model("m-a", "jobs-a", PK_A));
-        snap.apikeys.insert(apikey_entry(&["*"]));
-        let app = build_app(snap);
-
-        let resp = app
-            .oneshot(upload_request("XBOUNDARYX", NON_UTF8_UPLOAD))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let received = upstream.received_requests().await.unwrap();
-        assert_eq!(received.len(), 1);
-        assert!(
-            received[0]
-                .body
-                .windows(NON_UTF8_UPLOAD.len())
-                .any(|w| w == NON_UTF8_UPLOAD),
-            "the original bytes must still forward byte-for-byte"
-        );
-    }
-
-    /// An upload that DOES decode is still forwarded with a chain
-    /// attached — the new arm must not catch it.
-    ///
-    /// Named for what it asserts: that the chain actually ran is not
-    /// observable here, because a never-matching keyword produces no
-    /// enforced hit, no monitor hit, and no `applied` field on the jobs
-    /// usage event. `blocked_upload_names_the_policy_on_the_usage_event`
-    /// is what pins that the chain runs at all.
-    #[tokio::test]
-    async fn decodable_upload_with_a_chain_attached_still_forwards() {
-        let upstream = MockServer::start().await;
-        files_upstream_mock().expect(1).mount(&upstream).await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
-        snap.models.insert(model("m-a", "jobs-a", PK_A));
-        snap.apikeys.insert(apikey_entry(&["*"]));
-        seed_never_matching_guardrail(&snap);
-        let app = build_app(snap);
-
-        // The same term as `NON_UTF8_UPLOAD`, correctly encoded.
-        let clean = r#"{"custom_id":"r1","note":"你好"}"#.as_bytes();
-        let resp = app
-            .oneshot(upload_request("XBOUNDARYX", clean))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let received = upstream.received_requests().await.unwrap();
-        assert_eq!(received.len(), 1);
-        assert!(
-            received[0].body.windows(clean.len()).any(|w| w == clean),
-            "a decodable upload must still forward"
-        );
-    }
-
-    /// The whole set the refusal keys on, in one place. The route itself
-    /// never validates `purpose` — it forwards whatever the caller sent —
-    /// so this table is the only statement of which declared values mean
-    /// "the payload is contractually UTF-8 text".
-    ///
-    /// The six upload purposes are the ones a caller may declare; the
-    /// three `*_output` / `*-results` values are server-minted and appear
-    /// only on a stored file object, but are listed so a future reader
-    /// does not have to guess whether they were considered.
-    #[test]
-    fn undecodable_posture_classifies_every_declared_purpose() {
-        for text in ["batch", "fine-tune", "evals"] {
-            assert_eq!(
-                undecodable_posture(Some(text)),
-                Undecodable::Refuse,
-                "{text} takes JSONL and must refuse an undecodable blob"
-            );
-        }
-        for binary in [
-            // Upload purposes whose payload may legitimately be binary.
-            "assistants",
-            "vision",
-            "user_data",
-            // Server-minted purposes; a caller cannot upload under them.
-            "assistants_output",
-            "batch_output",
-            "fine-tune-results",
-            // Nothing normalises the value, so a case variant or a
-            // provider-specific extension is simply unrecognised.
-            "BATCH",
-            "fine_tune",
-            " batch",
-            "something-a-provider-invented",
-            "",
-        ] {
-            assert_eq!(
-                undecodable_posture(Some(binary)),
-                Undecodable::ScanLossily,
-                "{binary:?} must not be refused for being undecodable"
-            );
-        }
-        assert_eq!(
-            undecodable_posture(None),
-            Undecodable::ScanLossily,
-            "an upload we cannot classify is not one we can call text"
-        );
-    }
-
-    /// The regression #1113 introduced: its refusal was purpose-blind, so
-    /// a PDF or an image uploaded under `purpose=assistants` started
-    /// returning 422 for any deployment running an input guardrail. Fails
-    /// on `c2e89aa9` with 422.
-    #[tokio::test]
-    async fn non_utf8_upload_under_a_binary_purpose_is_forwarded() {
-        let upstream = MockServer::start().await;
-        files_upstream_mock().expect(1).mount(&upstream).await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
-        snap.models.insert(model("m-a", "jobs-a", PK_A));
-        snap.apikeys.insert(apikey_entry(&["*"]));
-        seed_never_matching_guardrail(&snap);
+        seed_blocking_output_guardrail(&snap);
         let app = build_app(snap);
 
         let resp = app
             .oneshot(upload_request_with_purpose(
                 "XBOUNDARYX",
-                Some("assistants"),
-                NON_UTF8_UPLOAD,
+                Some("batch"),
+                br#"{"custom_id":"r1"}"#,
             ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-
-        let received = upstream.received_requests().await.unwrap();
-        assert_eq!(received.len(), 1);
-        assert!(
-            received[0]
-                .body
-                .windows(NON_UTF8_UPLOAD.len())
-                .any(|w| w == NON_UTF8_UPLOAD),
-            "a binary-purpose upload must still forward byte-for-byte"
-        );
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["filename"], "forbidden-term.jsonl");
     }
 
-    /// A body declaring `purpose` more than once is malformed, and the
-    /// provider picks whichever part it picks — so the classification takes
-    /// the stricter reading rather than the last one written. Ordered
-    /// text-then-binary, which is the order that would pick `ScanLossily`
-    /// if the field were simply overwritten.
+    /// And a download: `GET /v1/files/{id}/content` relays the provider's
+    /// bytes verbatim, matching row or not.
     #[tokio::test]
-    async fn duplicate_purpose_fields_take_the_stricter_reading() {
+    async fn a_file_download_is_relayed_past_a_blocking_output_row() {
+        const STORED: &[u8] = b"{\"custom_id\":\"r1\",\"note\":\"forbidden-term\"}\n";
+
         let upstream = MockServer::start().await;
-        files_upstream_mock().expect(0).mount(&upstream).await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/files/file-abc/content"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(STORED))
+            .expect(1)
+            .mount(&upstream)
+            .await;
 
         let snap = AisixSnapshot::new();
         snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
         snap.models.insert(model("m-a", "jobs-a", PK_A));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        seed_never_matching_guardrail(&snap);
+        seed_blocking_output_guardrail(&snap);
         let app = build_app(snap);
 
-        let boundary = "XBOUNDARYX";
-        let mut body =
-            multipart_body_with_purpose(boundary, Some("jobs-a"), Some("batch"), NON_UTF8_UPLOAD);
-        // Splice a second, binary `purpose` part in after the first: the
-        // closing delimiter is rewritten into another part.
-        let closing = format!("--{boundary}--\r\n");
-        let extra = format!(
-            "--{boundary}\r\ncontent-disposition: form-data; \
-             name=\"purpose\"\r\n\r\nassistants\r\n--{boundary}--\r\n"
-        );
-        let at = body.len() - closing.len();
-        body.truncate(at);
-        body.extend_from_slice(extra.as_bytes());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/files/file-abc/content?model=jobs-a")
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert_eq!(bytes.as_ref(), STORED);
+    }
 
+    /// The scope boundary, request side: `/v1/batches` sends a serialised
+    /// JSON request body, which is a different thing from a caller's
+    /// uploaded blob and is still screened.
+    #[tokio::test]
+    async fn a_batch_create_is_still_screened() {
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(path("/v1/batches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "batch_777",
+                "object": "batch",
+                "status": "validating"
+            })))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        seed_blocking_input_guardrail(&snap);
+        let app = build_app(snap);
+
+        let body = serde_json::json!({
+            "input_file_id": encode_routed_id("file-real", "jobs-a"),
+            "endpoint": "/v1/chat/completions",
+            "completion_window": "24h",
+            "metadata": { "note": "custom_id" }
+        });
         let req = Request::builder()
             .method("POST")
-            .uri("/v1/files")
+            .uri("/v1/batches")
             .header("authorization", "Bearer sk-caller")
-            .header(
-                "content-type",
-                format!("multipart/form-data; boundary={boundary}"),
-            )
-            .body(axum::body::Body::from(body))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(
-            v["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains(crate::error::TAG_UNSCANNABLE_BODY),
-            "{v}"
-        );
+        assert_eq!(v["error"]["type"], "content_filter", "{v}");
     }
 
-    /// An upload we cannot classify is not one we can claim should have
-    /// been text. Also fails on `c2e89aa9` with 422.
+    /// The scope boundary, response side. Fine-tuning reads share
+    /// `forward_simple` with the files reads, so this is what fails if the
+    /// files surface is exempted by deleting that scan rather than by
+    /// naming the surface it belongs to.
     #[tokio::test]
-    async fn non_utf8_upload_without_a_purpose_is_forwarded() {
+    async fn a_fine_tuning_job_read_is_still_screened() {
         let upstream = MockServer::start().await;
-        files_upstream_mock().expect(1).mount(&upstream).await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/fine_tuning/jobs/ftjob-9"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "ftjob-9",
+                "object": "fine_tuning.job",
+                "status": "forbidden-term"
+            })))
+            .mount(&upstream)
+            .await;
 
         let snap = AisixSnapshot::new();
         snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
         snap.models.insert(model("m-a", "jobs-a", PK_A));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        seed_never_matching_guardrail(&snap);
+        seed_blocking_output_guardrail(&snap);
         let app = build_app(snap);
 
-        let resp = app
-            .oneshot(upload_request_with_purpose(
-                "XBOUNDARYX",
-                None,
-                NON_UTF8_UPLOAD,
-            ))
-            .await
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/fine_tuning/jobs/ftjob-9?model=jobs-a")
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
-    }
-
-    /// Not refusing is not the same as not scanning. A binary-purpose
-    /// upload keeps the best-effort lossy scan it has always had, so a
-    /// term that survives the lossy decode still blocks — this is the
-    /// assertion that fails if someone "fixes" the regression by skipping
-    /// the chain for non-text purposes instead of narrowing the refusal.
-    #[tokio::test]
-    async fn binary_purpose_upload_is_still_scanned_lossily() {
-        let upstream = MockServer::start().await;
-        files_upstream_mock().expect(0).mount(&upstream).await;
-
-        let snap = AisixSnapshot::new();
-        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
-        snap.models.insert(model("m-a", "jobs-a", PK_A));
-        snap.apikeys.insert(apikey_entry(&["*"]));
-        let g: aisix_core::Guardrail = serde_json::from_str(
-            r#"{"name":"blocks-a-term","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"forbidden-term"}]}"#,
-        )
-        .unwrap();
-        crate::seed_env_scoped_guardrail(
-            &snap,
-            aisix_core::resource::ResourceEntry::new("g-1", g, 1),
-        );
-        let app = build_app(snap);
-
-        // The term is ASCII, so it survives `from_utf8_lossy` intact even
-        // though the blob as a whole does not decode. It sits AFTER the
-        // invalid bytes deliberately: scanning only the valid prefix (a
-        // natural-looking "optimisation" of the lossy decode) would miss
-        // it, and that is the shape a real evasion takes — a few bad bytes
-        // up front, the payload behind them.
-        let blob: &[u8] = b"leading \xc4\xe3\xba\xc3 forbidden-term trailing";
-        let resp = app
-            .oneshot(upload_request_with_purpose(
-                "XBOUNDARYX",
-                Some("assistants"),
-                blob,
-            ))
-            .await
-            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "content_filter", "{v}");
-        // A policy hit, not the unscannable-body refusal: that one carries
-        // `code: guardrail_unavailable` and names the tag in the message,
-        // while a real block carries no code and names the guardrail.
-        assert!(v["error"]["code"].is_null(), "{v}");
-        assert!(
-            v["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("blocks-a-term"),
-            "the blob was scanned and hit the policy, not refused as \
-             unreadable: {v}"
-        );
     }
 }
