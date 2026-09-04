@@ -6,7 +6,6 @@ import {
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
-  waitConfigPropagation,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -38,6 +37,12 @@ interface StatusConfig {
   state: string;
   applied?: { resource_counts: Record<string, number> };
   last_failure: { last_error_kind: string; last_error: string } | null;
+}
+
+async function getStatusConfig(app: SpawnedApp): Promise<StatusConfig> {
+  const res = await fetch(`${app.metricsUrl}/status/config`);
+  expect(res.status).toBe(200);
+  return (await res.json()) as StatusConfig;
 }
 
 describe("etcd bootstrap: a configuration set larger than one gRPC message", () => {
@@ -110,20 +115,22 @@ describe("etcd bootstrap: a configuration set larger than one gRPC message", () 
     // very ceiling it exists to cross.
     expect(seededBytes).toBeGreaterThan(4 * 1024 * 1024);
 
-    // Wait for the config cycle to SETTLE, either way. Waiting only for
-    // success would turn a regression into a timeout; a gateway that
-    // cannot decode the range reports its failure within a second and
-    // then loops on it, so the assertions below run on a real verdict.
-    let status: StatusConfig | undefined;
-    await waitConfigPropagation(async () => {
-      const res = await fetch(`${app!.metricsUrl}/status/config`);
-      expect(res.status).toBe(200);
-      status = (await res.json()) as StatusConfig;
-      return status.state === "synced" || status.last_failure !== null;
-    });
+    // Poll rather than gate: a gateway that cannot decode the range never
+    // reaches a terminal state — it loops on the same failed read — so the
+    // deadline has to expire, and the assertion that follows names the
+    // reason (`never_loaded`, plus the fetch error) instead of leaving a
+    // timeout to explain itself. `last_failure` is no shortcut out of the
+    // wait: it is sticky for the life of the process, so one transient
+    // etcd blip would end the wait against a snapshot still loading.
+    let status = await getStatusConfig(app);
+    const deadline = Date.now() + 60_000;
+    while (status.state !== "synced" && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+      status = await getStatusConfig(app);
+    }
 
-    expect(status?.state, JSON.stringify(status?.last_failure)).toBe("synced");
-    expect(status?.applied?.resource_counts.models).toBe(BULK_MODEL_COUNT + 1);
+    expect(status.state, JSON.stringify(status.last_failure)).toBe("synced");
+    expect(status.applied?.resource_counts.models).toBe(BULK_MODEL_COUNT + 1);
   }, 120_000);
 
   test("a model from that set serves traffic", async (ctx) => {

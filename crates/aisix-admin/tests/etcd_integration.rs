@@ -33,6 +33,7 @@ use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AdminConfig, AisixSnapshot};
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
+use etcd_client::{DeleteOptions, Txn, TxnOp};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -176,6 +177,71 @@ async fn models_round_trip_through_real_etcd() {
         }),
     )
     .await;
+}
+
+/// The admin read surface ranges a whole kind subtree in one gRPC
+/// message, so it meets the transport's default 4 MiB decode ceiling the
+/// same way the gateway's bootstrap range does — by resource count, not by
+/// any one document being large. A store that read through that default
+/// would fail this list with `OutOfRange`.
+#[tokio::test]
+async fn model_list_reads_a_range_larger_than_the_default_decode_limit() {
+    let Some(url) = etcd_url() else {
+        eprintln!("skipping: ADMIN_TEST_ETCD_URL not set");
+        return;
+    };
+
+    let prefix = unique_prefix();
+    let mut client = etcd_client_for(&url).await;
+    let store = EtcdConfigStore::new(client.clone(), &prefix);
+
+    // etcd caps a transaction at 128 operations, so the fixture is written
+    // in batches of that rather than one round trip per key.
+    const COUNT: usize = 26_000;
+    const BATCH: usize = 128;
+    let mut seeded_bytes = 0usize;
+    let mut ops: Vec<TxnOp> = Vec::with_capacity(BATCH);
+    for i in 0..COUNT {
+        let key = format!("{prefix}/models/m-large-{i:05}");
+        let value = serde_json::to_vec(&json!({
+            "display_name": format!("large-{i:05}"),
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "11111111-1111-1111-1111-111111111111"
+        }))
+        .expect("serialize");
+        seeded_bytes += key.len() + value.len();
+        ops.push(TxnOp::put(key.into_bytes(), value, None));
+        if ops.len() == BATCH {
+            client
+                .txn(Txn::new().and_then(std::mem::take(&mut ops)))
+                .await
+                .expect("seed batch");
+        }
+    }
+    if !ops.is_empty() {
+        client
+            .txn(Txn::new().and_then(ops))
+            .await
+            .expect("seed batch");
+    }
+
+    // Key and value bytes only: protobuf framing adds to this, so it is a
+    // lower bound on the response the store has to decode. Guards the
+    // fixture — a shrunken one would pass against the very ceiling this
+    // test exists to cross.
+    assert!(
+        seeded_bytes > 4 * 1024 * 1024,
+        "fixture must exceed the default decode limit, got {seeded_bytes} bytes",
+    );
+
+    let models = store.list_models().await.expect("list models");
+    assert_eq!(models.len(), COUNT);
+
+    client
+        .delete(prefix, Some(DeleteOptions::new().with_prefix()))
+        .await
+        .expect("cleanup");
 }
 
 #[tokio::test]

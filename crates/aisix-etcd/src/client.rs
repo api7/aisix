@@ -17,6 +17,12 @@ use etcd_client::{Client, KvClient, WatchClient};
 /// re-issues the identical oversized range forever. Any finite ceiling
 /// would only move that failure to a larger config set, so the limit is
 /// lifted to the largest length a gRPC frame can express.
+///
+/// The trade-off that buys: an oversized length prefix is no longer
+/// rejected before the buffer for it is reserved. The peer is the etcd
+/// the operator configured, whose entire contents this process already
+/// trusts and holds resident, so the ceiling was never what stood between
+/// it and this gateway's memory.
 pub const MAX_DECODING_MESSAGE_SIZE: usize = i32::MAX as usize;
 
 /// KV client for reads under [`MAX_DECODING_MESSAGE_SIZE`].
