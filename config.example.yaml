@@ -7,8 +7,22 @@ etcd:
   prefix: "/aisix"
   # user: "aisix"
   # password_env: "AISIX_ETCD_PASSWORD"
-  dial_timeout_ms: 5000
-  request_timeout_ms: 5000
+  # Optional bounds on etcd I/O. Both are unset by default, and unset
+  # means unbounded.
+  #
+  # `dial_timeout_ms` bounds the TCP connect — not the TLS handshake
+  # after it, and not the authentication exchange when `user` is set.
+  # `request_timeout_ms` bounds a single unary call — the configuration
+  # range read at boot and on every reconnect, and the admin API's reads.
+  # It deliberately does not apply to the watch stream, which is
+  # long-lived and would be torn down by any such bound.
+  #
+  # Leave `request_timeout_ms` unset unless you specifically want a slow
+  # etcd to fail fast: the range read grows with the size of your
+  # configuration, and a bound it cannot finish inside makes the gateway
+  # retry the same read forever without ever serving traffic.
+  # dial_timeout_ms: 5000
+  # request_timeout_ms: 5000
   # Optional TLS / mTLS bundle. Required when connecting to an
   # AISIX Cloud Data Plane Manager (endpoint is https:// and the control plane issues
   # a client cert via IssueAIDataplaneCertificate). Uncomment and

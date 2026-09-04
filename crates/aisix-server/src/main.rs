@@ -743,6 +743,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                     &cfg.etcd.endpoints,
                     etcd_prefix.clone(),
                     connect_options.clone(),
+                    cfg.etcd.request_timeout(),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
@@ -763,6 +764,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                         .await
                         .map_err(|e| anyhow::anyhow!("etcd admin client connect failed: {e}"))?,
                     etcd_prefix.clone(),
+                    cfg.etcd.request_timeout(),
                 ))
             };
             // Snapshot cache: persist to disk so the DP can serve traffic
@@ -1184,7 +1186,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // view of the file-loaded snapshot. The admin resource surface is
     // read-only — writes were removed with the Admin API write path.
     let admin_store: Option<Arc<dyn ConfigStore>> = match (admin_client, &file_source_path) {
-        (Some((client, prefix)), _) => Some(Arc::new(EtcdConfigStore::new(client, prefix))),
+        (Some((client, prefix, request_timeout)), _) => Some(Arc::new(EtcdConfigStore::new(
+            client,
+            prefix,
+            request_timeout,
+        ))),
         (None, Some(_)) if !cfg.managed.is_managed() => {
             Some(Arc::new(FileManagedStore::new(snapshot_handle.clone())))
         }
@@ -1408,6 +1414,14 @@ fn build_etcd_connect_options_with_extra_ca(
 ) -> anyhow::Result<Option<ConnectOptions>> {
     let mut needs_options = false;
     let mut options = ConnectOptions::new();
+
+    // `with_connect_timeout` bounds establishing the channel only; it is
+    // not a deadline on the calls made over it (that is
+    // `etcd.request_timeout_ms`, applied per call).
+    if let Some(dial) = etcd.dial_timeout() {
+        options = options.with_connect_timeout(dial);
+        needs_options = true;
+    }
 
     if let (Some(user), Some(env_key)) = (etcd.user.as_ref(), etcd.password_env.as_ref()) {
         let pw = std::env::var(env_key).map_err(|_| {
@@ -2946,8 +2960,8 @@ models:
             env_id: String::new(),
             user: None,
             password_env: None,
-            dial_timeout_ms: 5000,
-            request_timeout_ms: 5000,
+            dial_timeout_ms: None,
+            request_timeout_ms: None,
             tls: None,
         };
         let opts = build_etcd_connect_options(&etcd).unwrap();
@@ -2965,8 +2979,8 @@ models:
             env_id: String::new(),
             user: None,
             password_env: None,
-            dial_timeout_ms: 5000,
-            request_timeout_ms: 5000,
+            dial_timeout_ms: None,
+            request_timeout_ms: None,
             tls: Some(aisix_core::EtcdTlsConfig {
                 ca_cert_file: "/definitely/does/not/exist/ca.crt".into(),
                 client_cert_file: "/tmp/c.crt".into(),

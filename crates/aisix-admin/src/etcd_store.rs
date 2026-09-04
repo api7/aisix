@@ -27,6 +27,7 @@ use aisix_core::{
 use aisix_etcd::kv_client;
 use etcd_client::{Client, GetOptions, KvClient};
 use serde::de::DeserializeOwned;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::store::{ConfigStore, StoreError};
@@ -49,6 +50,10 @@ pub struct EtcdConfigStore {
     /// keeps tonic's 4 MiB default, which a full configuration set outgrows.
     client: Mutex<KvClient>,
     prefix: String,
+    /// `etcd.request_timeout_ms`, applied per call. `None` — the default
+    /// — leaves the reads unbounded, which is what they were before the
+    /// key was wired to anything.
+    request_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for EtcdConfigStore {
@@ -60,11 +65,16 @@ impl std::fmt::Debug for EtcdConfigStore {
 }
 
 impl EtcdConfigStore {
-    pub fn new(client: Client, prefix: impl Into<String>) -> Self {
+    pub fn new(
+        client: Client,
+        prefix: impl Into<String>,
+        request_timeout: Option<Duration>,
+    ) -> Self {
         let prefix = prefix.into().trim_end_matches('/').to_string();
         Self {
             client: Mutex::new(kv_client(&client)),
             prefix,
+            request_timeout,
         }
     }
 
@@ -88,17 +98,29 @@ impl EtcdConfigStore {
         full_key.strip_prefix(&needle)
     }
 
+    /// Apply `request_timeout`, when set, to one in-flight read.
+    async fn bound<T>(&self, fut: impl std::future::Future<Output = T>) -> Result<T, StoreError> {
+        match self.request_timeout {
+            None => Ok(fut.await),
+            Some(d) => tokio::time::timeout(d, fut).await.map_err(|_| {
+                StoreError::Backend(format!(
+                    "etcd read exceeded etcd.request_timeout_ms ({} ms)",
+                    d.as_millis()
+                ))
+            }),
+        }
+    }
+
     async fn get_one<T: DeserializeOwned>(
         &self,
         key: &str,
     ) -> Result<Option<(T, i64)>, StoreError> {
-        let resp = self
-            .client
-            .lock()
-            .await
-            .get(key.as_bytes().to_vec(), None)
-            .await
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        let resp = {
+            let mut client = self.client.lock().await;
+            self.bound(client.get(key.as_bytes().to_vec(), None))
+                .await?
+        }
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
         let kv = match resp.kvs().first() {
             Some(kv) => kv,
             None => return Ok(None),
@@ -113,16 +135,17 @@ impl EtcdConfigStore {
         kind: &str,
     ) -> Result<Vec<(String, T, i64)>, StoreError> {
         let prefix = self.range_prefix(kind);
-        let resp = self
-            .client
-            .lock()
-            .await
-            .get(
+        // Scoped so the guard covers the call and not the decode loop
+        // below, which is where it sat before the bound was introduced.
+        let resp = {
+            let mut client = self.client.lock().await;
+            self.bound(client.get(
                 prefix.as_bytes().to_vec(),
                 Some(GetOptions::new().with_prefix()),
-            )
-            .await
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
+            ))
+            .await?
+        }
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
 
         let mut out = Vec::with_capacity(resp.kvs().len());
         for kv in resp.kvs() {
@@ -339,7 +362,7 @@ mod tests {
             .unwrap()
             .block_on(client_fut)
             .expect("lazy connect never fails synchronously");
-        EtcdConfigStore::new(client, "/aisix")
+        EtcdConfigStore::new(client, "/aisix", None)
     }
 
     #[test]
@@ -379,7 +402,7 @@ mod tests {
                 None,
             ))
             .expect("lazy connect never fails synchronously");
-        let store = EtcdConfigStore::new(client, "/aisix/");
+        let store = EtcdConfigStore::new(client, "/aisix/", None);
         assert_eq!(store.prefix(), "/aisix");
         assert_eq!(store.key_for("models", "a"), "/aisix/models/a");
     }
@@ -409,7 +432,7 @@ mod tests {
         let mut client = etcd_client::Client::connect([endpoint], None)
             .await
             .expect("etcd client");
-        let store = EtcdConfigStore::new(client.clone(), "/aisix-it");
+        let store = EtcdConfigStore::new(client.clone(), "/aisix-it", None);
 
         // Resources reach etcd by direct writes (the declarative path);
         // the store is the read side. Seed a model the way an operator

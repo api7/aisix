@@ -63,7 +63,7 @@ async fn etcd_client_for(url: &str) -> etcd_client::Client {
 }
 
 async fn build_state(client: etcd_client::Client, prefix: &str) -> AdminState {
-    let store: Arc<dyn ConfigStore> = Arc::new(EtcdConfigStore::new(client, prefix));
+    let store: Arc<dyn ConfigStore> = Arc::new(EtcdConfigStore::new(client, prefix, None));
     let handle = SnapshotHandle::new(AisixSnapshot::new());
     let cfg = AdminConfig {
         enabled: true,
@@ -193,7 +193,7 @@ async fn model_list_reads_a_range_larger_than_the_default_decode_limit() {
 
     let prefix = unique_prefix();
     let mut client = etcd_client_for(&url).await;
-    let store = EtcdConfigStore::new(client.clone(), &prefix);
+    let store = EtcdConfigStore::new(client.clone(), &prefix, None);
 
     // etcd caps a transaction at 128 operations, so the fixture is written
     // in batches of that rather than one round trip per key.

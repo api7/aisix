@@ -70,8 +70,6 @@ describe("listener TLS (#473)", () => {
       etcd: {
         endpoints: [etcdEndpoint()],
         prefix: `/aisix-e2e-tls-${randomUUID()}`,
-        dial_timeout_ms: 5000,
-        request_timeout_ms: 5000,
       },
       proxy: {
         addr: `127.0.0.1:${proxyPort}`,
