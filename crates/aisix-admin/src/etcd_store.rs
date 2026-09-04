@@ -24,7 +24,8 @@ use aisix_core::{
     A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter,
     PassthroughRoute, ProviderKey,
 };
-use etcd_client::{Client, GetOptions};
+use aisix_etcd::kv_client;
+use etcd_client::{Client, GetOptions, KvClient};
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
 
@@ -43,7 +44,10 @@ pub const A2A_AGENTS_SUBKEY: &str = "a2a_agents";
 pub const PASSTHROUGH_ROUTES_SUBKEY: &str = "passthrough_routes";
 
 pub struct EtcdConfigStore {
-    client: Mutex<Client>,
+    /// A KV client carrying the gateway's raised gRPC decode limit, not the
+    /// `Client` handed in: `Client::get` reads through a sub-client that
+    /// keeps tonic's 4 MiB default, which a full configuration set outgrows.
+    client: Mutex<KvClient>,
     prefix: String,
 }
 
@@ -59,7 +63,7 @@ impl EtcdConfigStore {
     pub fn new(client: Client, prefix: impl Into<String>) -> Self {
         let prefix = prefix.into().trim_end_matches('/').to_string();
         Self {
-            client: Mutex::new(client),
+            client: Mutex::new(kv_client(&client)),
             prefix,
         }
     }

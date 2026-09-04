@@ -9,7 +9,8 @@
 
 use async_trait::async_trait;
 use etcd_client::{
-    Client, ConnectOptions, Error as EtcdError, EventType, GetOptions, WatchOptions,
+    Client, ConnectOptions, Error as EtcdError, EventType, GetOptions, KvClient, WatchClient,
+    WatchOptions,
 };
 use futures::{Stream, StreamExt};
 use std::collections::VecDeque;
@@ -38,6 +39,7 @@ fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
     out
 }
 
+use crate::client::{kv_client, watch_client};
 use crate::provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
 
 /// Fixed-interval retry: 5s × 5 attempts (spec §2).
@@ -62,10 +64,14 @@ impl Default for ConnectPolicy {
 }
 
 pub struct EtcdConfigProvider {
-    /// The etcd client itself is `Clone`-cheap (internally Arc'd), but we
-    /// still serialise access for watches through a Mutex because the
-    /// underlying channel is not Sync at construction time.
-    client: Mutex<Client>,
+    /// The sub-clients are `Clone`-cheap (internally Arc'd), but we still
+    /// serialise access through a Mutex because their RPC methods take
+    /// `&mut self`. They are held rather than derived from a `Client` per
+    /// call so the raised decode limit cannot be lost by a later call site
+    /// reaching for `Client::get` / `Client::watch`, which keep tonic's
+    /// 4 MiB default.
+    kv: Mutex<KvClient>,
+    watch: Mutex<WatchClient>,
     prefix: String,
 }
 
@@ -102,7 +108,8 @@ impl EtcdConfigProvider {
                 Ok(client) => {
                     tracing::info!(attempt, prefix = %prefix, "etcd connected");
                     return Ok(Self {
-                        client: Mutex::new(client),
+                        kv: Mutex::new(kv_client(&client)),
+                        watch: Mutex::new(watch_client(&client)),
                         prefix,
                     });
                 }
@@ -136,8 +143,8 @@ impl EtcdConfigProvider {
 #[async_trait]
 impl ConfigProvider for EtcdConfigProvider {
     async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
-        let mut client = self.client.lock().await;
-        let resp = client
+        let mut kv = self.kv.lock().await;
+        let resp = kv
             .get(
                 self.prefix.as_bytes(),
                 Some(GetOptions::new().with_prefix()),
@@ -167,11 +174,11 @@ impl ConfigProvider for EtcdConfigProvider {
         Box<dyn Stream<Item = Result<WatchEvent, ProviderError>> + Send + Unpin>,
         ProviderError,
     > {
-        let mut client = self.client.lock().await;
+        let mut watch = self.watch.lock().await;
         let opts = WatchOptions::new()
             .with_prefix()
             .with_start_revision(start_revision);
-        let (watcher, stream) = client
+        let (watcher, stream) = watch
             .watch(self.prefix.as_bytes(), Some(opts))
             .await
             .map_err(|e| ProviderError::Watch(format_error_chain(&e)))?;
