@@ -39,9 +39,17 @@ interface StatusConfig {
   last_failure: { last_error_kind: string; last_error: string } | null;
 }
 
-async function getStatusConfig(app: SpawnedApp): Promise<StatusConfig> {
+/**
+ * `GET /status/config`, or undefined while the listener answers anything
+ * else — the caller is polling, so a transient non-200 is "not yet", not a
+ * verdict. The body is consumed either way.
+ */
+async function getStatusConfig(app: SpawnedApp): Promise<StatusConfig | undefined> {
   const res = await fetch(`${app.metricsUrl}/status/config`);
-  expect(res.status).toBe(200);
+  if (res.status !== 200) {
+    await res.text();
+    return undefined;
+  }
   return (await res.json()) as StatusConfig;
 }
 
@@ -124,13 +132,13 @@ describe("etcd bootstrap: a configuration set larger than one gRPC message", () 
     // etcd blip would end the wait against a snapshot still loading.
     let status = await getStatusConfig(app);
     const deadline = Date.now() + 60_000;
-    while (status.state !== "synced" && Date.now() < deadline) {
+    while (status?.state !== "synced" && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 100));
       status = await getStatusConfig(app);
     }
 
-    expect(status.state, JSON.stringify(status.last_failure)).toBe("synced");
-    expect(status.applied?.resource_counts.models).toBe(BULK_MODEL_COUNT + 1);
+    expect(status?.state, JSON.stringify(status?.last_failure)).toBe("synced");
+    expect(status?.applied?.resource_counts.models).toBe(BULK_MODEL_COUNT + 1);
   }, 120_000);
 
   test("a model from that set serves traffic", async (ctx) => {

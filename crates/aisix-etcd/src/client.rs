@@ -3,8 +3,9 @@
 //! `Client::get` / `Client::watch` delegate to sub-clients the `Client`
 //! keeps private, and `Client::kv_client()` / `watch_client()` hand back
 //! clones — so the decode limit can only be raised on the sub-client that
-//! actually issues the call. Every etcd read in this repository is built
-//! here so no call site can drift back onto tonic's default.
+//! actually issues the call. Every etcd read the gateway itself makes is
+//! built here so no call site can drift back onto tonic's default; test
+//! fixtures that talk to etcd directly are their own business.
 
 use etcd_client::{Client, KvClient, WatchClient};
 
