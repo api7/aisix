@@ -265,16 +265,27 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
       "spawnApp: control the admin listener with the `admin` boolean override, not `extra.admin`",
     );
   }
-  if (
-    overrides.awaitProxyListener === false &&
-    !adminEnabled &&
-    !prometheusEnabled
-  ) {
-    throw new Error(
-      "spawnApp: awaitProxyListener:false needs `admin` or `prometheus` on — " +
-        "with all three off nothing is waited on, so spawnApp would return before " +
-        "the binary has started and a later non-zero exit could not surface",
-    );
+  if (overrides.awaitProxyListener === false) {
+    // Readiness now rests entirely on the other two listeners, so both the
+    // ways of turning them off have to be refused. `extra` counts: it
+    // replaces whole top-level blocks, so an `extra.observability` can
+    // disable the metrics listener the readiness probe is waiting on while
+    // `prometheusEnabled` still reads true — spawnApp would then sit out its
+    // full readiness timeout.
+    if (!adminEnabled && !prometheusEnabled) {
+      throw new Error(
+        "spawnApp: awaitProxyListener:false needs `admin` or `prometheus` on — " +
+          "with all three off nothing is waited on, so spawnApp would return before " +
+          "the binary has started and a later non-zero exit could not surface",
+      );
+    }
+    if (overrides.extra && "observability" in overrides.extra) {
+      throw new Error(
+        "spawnApp: awaitProxyListener:false cannot be combined with " +
+          "`extra.observability` — it replaces the generated metrics block, which is " +
+          "what readiness waits on once the proxy listener is not",
+      );
+    }
   }
   const [proxyPort, adminPort, metricsPort] = await pickFreePorts(3);
   const adminKey = overrides.adminKey ?? `admin-${randomUUID()}`;
