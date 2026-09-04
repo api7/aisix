@@ -127,9 +127,11 @@ describe("the proxy listener waits for the first configuration", () => {
       etcdPrefix: prefix,
       // The subject of both specs is that this listener is NOT up yet.
       awaitProxyListener: false,
-      // No dial/request timeouts: those config keys reach nothing in the
-      // etcd client, and writing them here would suggest a timeout is
-      // driving the retries when the supervisor's backoff is.
+      // No dial/request timeouts. `etcd.request_timeout_ms` would abort
+      // the held read, and writing one here would suggest a timeout is
+      // driving the retries when the supervisor's backoff is. Unset —
+      // the shipped default — leaves the read unbounded, which is what
+      // makes "held" mean "still in flight" for these two specs.
       extra: { etcd: { endpoints: [relay.endpoint], prefix } },
     });
     apps.push(app);

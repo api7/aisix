@@ -303,11 +303,14 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     ...(fileMode
       ? { resources_file: resourcesPath }
       : {
+          // No `dial_timeout_ms` / `request_timeout_ms`: unset is the
+          // shipped default and means unbounded. A suite-wide bound on
+          // the configuration range read would be a source of flakes
+          // that no case is asking for; the cases that ARE about those
+          // keys set them through `extra`.
           etcd: {
             endpoints: [etcdEndpoint()],
             prefix: etcdPrefix,
-            dial_timeout_ms: 5000,
-            request_timeout_ms: 5000,
           },
         }),
     proxy: {

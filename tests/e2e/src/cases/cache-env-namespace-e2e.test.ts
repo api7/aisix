@@ -71,8 +71,6 @@ function envEtcd(prefix: string, envId: string) {
     endpoints: [ETCD_ENDPOINT],
     prefix,
     env_id: envId,
-    dial_timeout_ms: 5000,
-    request_timeout_ms: 5000,
   };
 }
 

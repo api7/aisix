@@ -73,6 +73,19 @@ pub struct EtcdConfigProvider {
     kv: Mutex<KvClient>,
     watch: Mutex<WatchClient>,
     prefix: String,
+    /// Bound applied to each unary call this provider makes — currently
+    /// the range read in [`Self::load_all`]. `None` leaves it unbounded.
+    ///
+    /// Applied per call with [`tokio::time::timeout`] rather than through
+    /// `ConnectOptions::with_timeout`, for two reasons. That option is
+    /// channel-wide, so it would also bound opening the watch. And it
+    /// bounds only the response *future*: tonic's `GrpcTimeout` races the
+    /// deadline against the arrival of response headers and then lets the
+    /// body stream run untimed, so an etcd that answers a range request
+    /// and stalls part-way through a large body would still hang here
+    /// forever — the very case a bound on the configuration read is for.
+    /// Wrapping the call bounds it whole, body included.
+    request_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for EtcdConfigProvider {
@@ -89,8 +102,16 @@ impl EtcdConfigProvider {
         endpoints: &[String],
         prefix: impl Into<String>,
         options: Option<ConnectOptions>,
+        request_timeout: Option<Duration>,
     ) -> Result<Self, ProviderError> {
-        Self::connect_with_policy(endpoints, prefix, options, ConnectPolicy::default()).await
+        Self::connect_with_policy(
+            endpoints,
+            prefix,
+            options,
+            request_timeout,
+            ConnectPolicy::default(),
+        )
+        .await
     }
 
     /// Connect with a caller-chosen retry policy. Returns the last-seen
@@ -99,6 +120,7 @@ impl EtcdConfigProvider {
         endpoints: &[String],
         prefix: impl Into<String>,
         options: Option<ConnectOptions>,
+        request_timeout: Option<Duration>,
         policy: ConnectPolicy,
     ) -> Result<Self, ProviderError> {
         let prefix = prefix.into();
@@ -111,6 +133,7 @@ impl EtcdConfigProvider {
                         kv: Mutex::new(kv_client(&client)),
                         watch: Mutex::new(watch_client(&client)),
                         prefix,
+                        request_timeout,
                     });
                 }
                 Err(err) => {
@@ -140,16 +163,37 @@ impl EtcdConfigProvider {
     }
 }
 
+/// Apply `timeout`, when set, to one in-flight etcd call.
+///
+/// Expiry is reported as [`ProviderError::Range`] so it lands on the
+/// supervisor's existing reconnect-with-backoff path: the aborted read is
+/// retried rather than ending the watch task.
+async fn bound<T>(
+    timeout: Option<Duration>,
+    what: &str,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T, ProviderError> {
+    match timeout {
+        None => Ok(fut.await),
+        Some(d) => tokio::time::timeout(d, fut).await.map_err(|_| {
+            ProviderError::Range(format!(
+                "{what} exceeded etcd.request_timeout_ms ({} ms)",
+                d.as_millis()
+            ))
+        }),
+    }
+}
+
 #[async_trait]
 impl ConfigProvider for EtcdConfigProvider {
     async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
         let mut kv = self.kv.lock().await;
-        let resp = kv
-            .get(
-                self.prefix.as_bytes(),
-                Some(GetOptions::new().with_prefix()),
-            )
-            .await
+        let read = kv.get(
+            self.prefix.as_bytes(),
+            Some(GetOptions::new().with_prefix()),
+        );
+        let resp = bound(self.request_timeout, "range read", read)
+            .await?
             .map_err(|e| ProviderError::Range(format_error_chain(&e)))?;
 
         let revision = resp.header().map(|h| h.revision()).unwrap_or(0);
@@ -295,10 +339,38 @@ mod tests {
             attempts: 1,
         };
         let endpoints: Vec<String> = vec![];
-        let err = EtcdConfigProvider::connect_with_policy(&endpoints, "/aisix", None, policy)
+        let err = EtcdConfigProvider::connect_with_policy(&endpoints, "/aisix", None, None, policy)
             .await
             .unwrap_err();
         assert!(matches!(err, ProviderError::Connect(_)));
+    }
+
+    #[tokio::test]
+    async fn bound_passes_through_when_no_timeout_is_set() {
+        let out = bound(None, "range read", async { 7u8 }).await.unwrap();
+        assert_eq!(out, 7);
+    }
+
+    #[tokio::test]
+    async fn expiry_maps_to_range_so_the_supervisor_backs_off_and_retries() {
+        // The variant matters as much as the expiry: `Range` is what
+        // `Supervisor::run` treats as a retryable source outage. Any other
+        // variant either ends the watch task or (for `Compacted`) skips
+        // the backoff entirely.
+        let err = bound(
+            Some(Duration::from_millis(1)),
+            "range read",
+            std::future::pending::<()>(),
+        )
+        .await
+        .unwrap_err();
+        let ProviderError::Range(msg) = err else {
+            panic!("expiry must surface as ProviderError::Range, got {err:?}");
+        };
+        assert!(
+            msg.contains("range read") && msg.contains("etcd.request_timeout_ms"),
+            "the message must name the call and the key that bounded it: {msg}"
+        );
     }
 
     #[test]

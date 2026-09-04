@@ -62,8 +62,6 @@ function sharedEtcd(prefix: string) {
   return {
     endpoints: [ETCD_ENDPOINT],
     prefix,
-    dial_timeout_ms: 5000,
-    request_timeout_ms: 5000,
   };
 }
 

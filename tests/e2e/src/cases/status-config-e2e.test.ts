@@ -449,8 +449,6 @@ async function spawnPointedAtDeadEtcd(): Promise<MinimalApp> {
     etcd: {
       endpoints: [`http://127.0.0.1:${deadPort}`],
       prefix: "/aisix-never-loaded",
-      dial_timeout_ms: 2000,
-      request_timeout_ms: 2000,
     },
     proxy: {
       addr: `127.0.0.1:${proxyPort}`,

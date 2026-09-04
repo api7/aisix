@@ -124,10 +124,27 @@ pub struct EtcdConfig {
     /// read at connect time — never stored in the config struct.
     #[serde(default)]
     pub password_env: Option<String>,
-    #[serde(default = "EtcdConfig::default_dial_timeout")]
-    pub dial_timeout_ms: u64,
-    #[serde(default = "EtcdConfig::default_request_timeout")]
-    pub request_timeout_ms: u64,
+    /// Bound on establishing the gRPC connection to etcd, in
+    /// milliseconds. Unset — the default — leaves the dial unbounded and
+    /// the OS TCP stack is the only limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dial_timeout_ms: Option<u64>,
+    /// Bound on a single unary etcd call, in milliseconds. Unset — the
+    /// default — leaves those calls unbounded.
+    ///
+    /// When set it covers the configuration range read (`load_all`) and
+    /// the admin surface's reads. It deliberately does NOT cover the
+    /// watch: that stream is long-lived by construction, so a bound on it
+    /// would expire on every interval quiet enough to produce no event
+    /// and leave the gateway reconnecting instead of watching.
+    ///
+    /// The default is unset rather than a finite value because the range
+    /// read scales with the size of the configuration set: a bound short
+    /// enough to be useful on a small deployment aborts the read on a
+    /// large one, and the supervisor then re-issues the identical read
+    /// forever without the instance ever serving traffic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
     /// Optional TLS / mTLS bundle used to authenticate to the etcd
     /// endpoint. Required when talking to an aisix.cloud DP Manager
     /// (see prd-09 §9.3.3 — the CP issues a 10-year client cert via
@@ -345,8 +362,8 @@ impl Default for EtcdConfig {
             env_id: String::new(),
             user: None,
             password_env: None,
-            dial_timeout_ms: Self::default_dial_timeout(),
-            request_timeout_ms: Self::default_request_timeout(),
+            dial_timeout_ms: None,
+            request_timeout_ms: None,
             tls: None,
         }
     }
@@ -356,19 +373,20 @@ impl EtcdConfig {
     fn default_prefix() -> String {
         "/aisix".into()
     }
-    const fn default_dial_timeout() -> u64 {
-        5_000
-    }
-    const fn default_request_timeout() -> u64 {
-        5_000
-    }
-
-    pub const fn dial_timeout(&self) -> Duration {
-        Duration::from_millis(self.dial_timeout_ms)
+    /// `None` when unset: the dial is unbounded.
+    pub const fn dial_timeout(&self) -> Option<Duration> {
+        match self.dial_timeout_ms {
+            Some(ms) => Some(Duration::from_millis(ms)),
+            None => None,
+        }
     }
 
-    pub const fn request_timeout(&self) -> Duration {
-        Duration::from_millis(self.request_timeout_ms)
+    /// `None` when unset: unary calls are unbounded.
+    pub const fn request_timeout(&self) -> Option<Duration> {
+        match self.request_timeout_ms {
+            Some(ms) => Some(Duration::from_millis(ms)),
+            None => None,
+        }
     }
 
     /// The full env-scoped key prefix the DP watches and parses.
@@ -1755,6 +1773,55 @@ admin:
         assert!(!cfg.proxy.real_ip.recursive);
         assert_eq!(cfg.proxy.real_ip.header, "x-forwarded-for");
         assert!(cfg.proxy.real_ip.parse_trusted().unwrap().is_empty());
+    }
+
+    #[test]
+    fn etcd_timeouts_default_to_unset_meaning_unbounded() {
+        // Both keys are optional and default to unbounded. A finite
+        // default would bound the configuration range read, whose cost
+        // scales with the size of the configuration set — the one call
+        // whose expiry leaves the instance with nothing to serve.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.etcd.dial_timeout_ms, None);
+        assert_eq!(cfg.etcd.request_timeout_ms, None);
+        assert_eq!(cfg.etcd.dial_timeout(), None);
+        assert_eq!(cfg.etcd.request_timeout(), None);
+    }
+
+    #[test]
+    fn etcd_timeouts_when_set_are_read_as_milliseconds() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+  dial_timeout_ms: 2500
+  request_timeout_ms: 7000
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.etcd.dial_timeout(), Some(Duration::from_millis(2500)));
+        assert_eq!(
+            cfg.etcd.request_timeout(),
+            Some(Duration::from_millis(7000))
+        );
     }
 
     #[test]

@@ -58,6 +58,10 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
         &args.endpoints,
         &args.prefix,
         None,
+        // The export CLI takes endpoints on the command line, not a
+        // config file, so there is no `etcd.request_timeout_ms` to honour
+        // — and an operator can interrupt it. The read stays unbounded.
+        None,
         CLI_CONNECT_POLICY,
     )
     .await

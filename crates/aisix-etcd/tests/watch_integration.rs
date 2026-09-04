@@ -48,7 +48,7 @@ async fn watch_stream_delivers_events_after_put() {
 
     let prefix = unique_prefix();
     let endpoints = vec![url.clone()];
-    let provider = EtcdConfigProvider::connect(&endpoints, prefix.clone(), None)
+    let provider = EtcdConfigProvider::connect(&endpoints, prefix.clone(), None, None)
         .await
         .expect("connect");
 
@@ -109,7 +109,7 @@ async fn supervisor_applied_revision_catches_up_to_writer_revision() {
 
     let prefix = unique_prefix();
     let endpoints = vec![url.clone()];
-    let provider = EtcdConfigProvider::connect(&endpoints, prefix.clone(), None)
+    let provider = EtcdConfigProvider::connect(&endpoints, prefix.clone(), None, None)
         .await
         .expect("connect");
     let supervisor = std::sync::Arc::new(aisix_etcd::Supervisor::new(
@@ -178,7 +178,7 @@ async fn watch_stream_delivers_all_events_from_batched_response() {
 
     let prefix = unique_prefix();
     let endpoints = vec![url.clone()];
-    let provider = EtcdConfigProvider::connect(&endpoints, prefix.clone(), None)
+    let provider = EtcdConfigProvider::connect(&endpoints, prefix.clone(), None, None)
         .await
         .expect("connect");
 
