@@ -57,8 +57,11 @@ pub struct A2aAgent {
     pub protocol_version: A2aProtocolVersion,
 
     /// How the gateway authenticates to the upstream agent. The credential is
-    /// held by the gateway and is never forwarded from or exposed to the calling
-    /// client.
+    /// held by the gateway and is not exposed to the calling client. The one
+    /// case where the agent sees a caller-supplied credential instead is when
+    /// `forward_client_headers` names the slot this `auth_type` fills, which
+    /// substitutes the caller's own value for the gateway's rather than
+    /// sending both.
     #[serde(default)]
     pub auth_type: A2aAuthType,
 
@@ -81,6 +84,39 @@ pub struct A2aAgent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub timeout_ms: Option<u64>,
+
+    /// Inbound client headers forwarded to this agent, as single-`*` glob
+    /// patterns matched case-insensitively against the header name
+    /// (`"x-trace-*"`, `"authorization"`). Empty — the default — forwards
+    /// nothing. Applies to the agent-card fetch at
+    /// `/a2a/<name>/.well-known/agent-card.json` as well as to every JSON-RPC
+    /// method served at `/a2a/<name>`, so an agent receives them on
+    /// `message/send`, `message/stream` and every task operation alike.
+    ///
+    /// A header named here reaches the agent whatever the gateway would
+    /// otherwise do with it. Naming the credential slot `auth_type` would
+    /// fill — `authorization` for `bearer`, `x-api-key` for `api_key` — hands
+    /// the agent the caller's own credential in place of the gateway's, never
+    /// both. That is what lets an internal agent that already authorizes on
+    /// the end user's `Authorization` keep doing so unchanged. An agent that
+    /// validates the `aud` claim will reject a token minted for the gateway.
+    ///
+    /// A credential slot, and `traceparent` / `tracestate`, are forwarded only
+    /// when a pattern names them exactly — a glob such as `"*"` or `"x-*"` is
+    /// a statement about the operator's own headers, not consent to hand a
+    /// third party the caller's credential or to graft the caller's trace
+    /// onto that party's telemetry.
+    ///
+    /// Headers whose forwarding would break the exchange rather than change
+    /// who it comes from are never forwarded whatever the patterns say:
+    /// `host`, the hop-by-hop headers that describe the caller's own
+    /// connection, the gateway's `x-aisix-*` namespace, the headers
+    /// describing a body this gateway re-serializes (`content-type`,
+    /// `content-length`, `accept`), and `a2a-version`, which is the gateway's
+    /// own announcement of the wire version pinned in `protocol_version` and
+    /// which a caller's value would override.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forward_client_headers: Vec<String>,
 
     /// Whether this agent is active. When `false`, it is not served and cannot
     /// be reached.
@@ -209,6 +245,31 @@ mod tests {
             crate::models::schema::validate_a2a_agent(&doc)
                 .expect_err("bearer needs a non-empty string secret");
         }
+    }
+
+    #[test]
+    fn the_client_header_forward_is_a_free_list_of_patterns() {
+        use crate::models::schema::{validate_a2a_agent, validate_a2a_agent_lenient};
+
+        let with = |patterns: Value| {
+            let mut v = json!({"name": "invoices", "url": "https://x/a2a"});
+            v["forward_client_headers"] = patterns;
+            v
+        };
+
+        // Credential slots are the point of the field, not an oversight: the
+        // runtime decides what is deliverable, so the schema does not
+        // second-guess an operator naming one.
+        validate_a2a_agent(&with(json!([
+            "authorization",
+            "x-api-key",
+            "x-trace-*",
+            "*"
+        ])))
+        .expect("credential slots and globs are both accepted");
+        validate_a2a_agent(&with(json!([]))).expect("an empty list is the default, spelled out");
+        validate_a2a_agent_lenient(&with(json!(["authorization"])))
+            .expect("the read path must not cost the row over a pattern");
     }
 
     #[test]
@@ -401,10 +462,15 @@ mod tests {
             auth_type: A2aAuthType::None,
             secret: None,
             timeout_ms: None,
+            forward_client_headers: Vec::new(),
             enabled: true,
             runtime_id: String::new(),
         };
         let s = serde_json::to_string(&original).unwrap();
+        assert!(
+            !s.contains("forward_client_headers"),
+            "an empty forward is the default and must not be written back: {s}"
+        );
         let back: A2aAgent = serde_json::from_str(&s).unwrap();
         assert_eq!(original, back);
     }

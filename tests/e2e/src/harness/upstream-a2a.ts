@@ -13,6 +13,15 @@ export interface A2aReceivedRequest {
   version: string | null;
   authorization: string | null;
   apiKey: string | null;
+  /** Every inbound header, lowercased, a repeated name joined with `,`. */
+  headers: Record<string, string>;
+  /**
+   * Header names as they arrived, one entry per occurrence and in wire
+   * order. `headers` collapses a repeated name (node keeps only the first
+   * `authorization`), so an assertion that a slot carries EXACTLY ONE
+   * value — the shape a doubled credential breaks — has to count here.
+   */
+  headerNames: string[];
   body?: Record<string, unknown>;
 }
 
@@ -183,6 +192,15 @@ async function handle(
     version: header("a2a-version"),
     authorization: header("authorization"),
     apiKey: header("x-api-key"),
+    headers: Object.fromEntries(
+      Object.entries(req.headers).map(([k, v]) => [
+        k,
+        Array.isArray(v) ? v.join(",") : (v ?? ""),
+      ]),
+    ),
+    headerNames: req.rawHeaders
+      .filter((_, i) => i % 2 === 0)
+      .map((n) => n.toLowerCase()),
     body,
   });
 

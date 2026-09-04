@@ -123,7 +123,7 @@
         }
       ],
       "default": "none",
-      "description": "How the gateway authenticates to the upstream agent. The credential is held by the gateway and is never forwarded from or exposed to the calling client."
+      "description": "How the gateway authenticates to the upstream agent. The credential is held by the gateway and is not exposed to the calling client. The one case where the agent sees a caller-supplied credential instead is when `forward_client_headers` names the slot this `auth_type` fills, which substitutes the caller's own value for the gateway's rather than sending both."
     },
     "display_name": {
       "description": "Accepted as an alternative spelling of `name`. Provide the label under exactly one of the two names.",
@@ -135,6 +135,13 @@
       "default": true,
       "description": "Whether this agent is active. When `false`, it is not served and cannot be reached.",
       "type": "boolean"
+    },
+    "forward_client_headers": {
+      "description": "Inbound client headers forwarded to this agent, as single-`*` glob patterns matched case-insensitively against the header name (`\"x-trace-*\"`, `\"authorization\"`). Empty — the default — forwards nothing. Applies to the agent-card fetch at `/a2a/<name>/.well-known/agent-card.json` as well as to every JSON-RPC method served at `/a2a/<name>`, so an agent receives them on `message/send`, `message/stream` and every task operation alike.\n\nA header named here reaches the agent whatever the gateway would otherwise do with it. Naming the credential slot `auth_type` would fill — `authorization` for `bearer`, `x-api-key` for `api_key` — hands the agent the caller's own credential in place of the gateway's, never both. That is what lets an internal agent that already authorizes on the end user's `Authorization` keep doing so unchanged. An agent that validates the `aud` claim will reject a token minted for the gateway.\n\nA credential slot, and `traceparent` / `tracestate`, are forwarded only when a pattern names them exactly — a glob such as `\"*\"` or `\"x-*\"` is a statement about the operator's own headers, not consent to hand a third party the caller's credential or to graft the caller's trace onto that party's telemetry.\n\nHeaders whose forwarding would break the exchange rather than change who it comes from are never forwarded whatever the patterns say: `host`, the hop-by-hop headers that describe the caller's own connection, the gateway's `x-aisix-*` namespace, the headers describing a body this gateway re-serializes (`content-type`, `content-length`, `accept`), and `a2a-version`, which is the gateway's own announcement of the wire version pinned in `protocol_version` and which a caller's value would override.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     },
     "name": {
       "description": "Operator-facing label, unique within the gateway. It is the path segment under which the agent is exposed to callers as `/a2a/<name>`, so it must be a single non-empty URL path segment. The name is interpolated into the advertised agent-card URL without percent-encoding, so `/`, `?`, `#`, `%` and whitespace are rejected: `a?b` would advertise a URL whose path is just `/a2a/a`, and the lookup is an exact match on the stored name.",

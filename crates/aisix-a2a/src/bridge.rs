@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use aisix_core::{A2aAgent, A2aAuthType, A2aProtocolVersion};
 use async_trait::async_trait;
 use futures::StreamExt;
+use http::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 
 use crate::error::A2aError;
@@ -210,6 +211,34 @@ fn warn_cleartext_credential(agent: &A2aAgent) {
     }
 }
 
+/// Header slots the A2A protocol itself owns on this hop.
+///
+/// `a2a-version` is the gateway's OWN announcement of the wire version the
+/// agent is pinned to in `protocol_version`, and the agent reads it to pick
+/// the envelope shape it answers in. A caller's copy relayed alongside would
+/// let the caller override that pin — the agent would answer in a format the
+/// operator did not configure, or refuse the call outright — so it is refused
+/// however broad the pattern is.
+pub const A2A_PROTOCOL_HEADERS: &[&str] = &["a2a-version"];
+
+/// The inbound client headers `agent` forwards out of `client_headers`.
+///
+/// `None` — a gateway operation with no calling request behind it — forwards
+/// nothing.
+pub fn forwarded_client_headers(
+    agent: &A2aAgent,
+    client_headers: Option<&http::HeaderMap>,
+) -> Vec<(HeaderName, HeaderValue)> {
+    let Some(client) = client_headers else {
+        return Vec::new();
+    };
+    aisix_core::resolve_forwarded_client_headers(
+        &agent.forward_client_headers,
+        client,
+        A2A_PROTOCOL_HEADERS,
+    )
+}
+
 /// Build an [`A2aUpstream`] from a registered [`A2aAgent`] resource.
 pub fn upstream_from_a2a_agent(agent: &A2aAgent) -> A2aUpstream {
     warn_cleartext_credential(agent);
@@ -275,7 +304,6 @@ pub trait A2aBridge: Send + Sync {
 }
 
 /// The default [`A2aBridge`], built on the workspace HTTP client.
-#[derive(Debug)]
 pub struct HttpBridge {
     upstream: A2aUpstream,
     /// The agent's JSON-RPC endpoint, parsed once process-wide instead of
@@ -283,6 +311,36 @@ pub struct HttpBridge {
     /// is one cache lookup per request in place of one `Url` parse.
     endpoint: aisix_gateway::url_cache::EndpointUrl,
     client: reqwest::Client,
+    /// Inbound client headers this agent's `forward_client_headers` admits,
+    /// resolved per request against the calling client's own request. Empty
+    /// when the agent configures none, or when nothing the caller sent
+    /// matched.
+    ///
+    /// Independent of the upstream's `auth`, which stays the gateway's own
+    /// credential — except when both name the same header, where the
+    /// forwarded value wins and the gateway's is not sent at all.
+    forwarded_client_headers: Vec<(HeaderName, HeaderValue)>,
+}
+
+// Manual so a forwarded value — which may be the caller's own credential —
+// cannot leak through `Debug`, and so the gateway-held credential keeps the
+// redaction `A2aUpstream`'s own impl gives it.
+impl std::fmt::Debug for HttpBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpBridge")
+            .field("upstream", &self.upstream)
+            .field(
+                // Names only: the slot stays diagnosable, the value never
+                // prints.
+                "forwarded_client_headers",
+                &self
+                    .forwarded_client_headers
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl HttpBridge {
@@ -294,20 +352,47 @@ impl HttpBridge {
             endpoint: aisix_gateway::url_cache::cached_url(&upstream.url),
             upstream,
             client: shared_client(),
+            forwarded_client_headers: Vec::new(),
         }
     }
 
-    /// Apply the gateway-held upstream credential and announce the wire version
-    /// this agent is pinned to. Both belong on every outgoing request: the
-    /// credential because the gateway is the one holding it, the version
-    /// because an agent that receives no `A2A-Version` must assume `0.3`.
+    /// Deliver the client headers this agent forwards, as already resolved
+    /// against the inbound request by [`forwarded_client_headers`].
+    pub fn with_forwarded_client_headers(
+        mut self,
+        forwarded: Vec<(HeaderName, HeaderValue)>,
+    ) -> Self {
+        self.forwarded_client_headers = forwarded;
+        self
+    }
+
+    /// Apply the gateway-held upstream credential, announce the wire version
+    /// this agent is pinned to, and deliver the forwarded client headers. All
+    /// three belong on every outgoing request: the credential because the
+    /// gateway is the one holding it, the version because an agent that
+    /// receives no `A2A-Version` must assume `0.3`, and the forward because it
+    /// is configured per agent rather than per operation.
+    ///
+    /// The gateway credential and the forward can name the same slot: an
+    /// operator who lists `authorization` in `forward_client_headers` is
+    /// choosing the caller's own credential over the gateway's, and the agent
+    /// must receive exactly one of them. `reqwest`'s `header` APPENDS, so
+    /// suppressing the gateway's is the only way to keep a single value on the
+    /// wire — the claimed set is read before anything fills a slot, so the
+    /// suppression and the delivery cannot disagree.
     fn prepare(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let forwarded = &self.forwarded_client_headers;
+        let claims = |name: &str| forwarded.iter().any(|(n, _)| n.as_str() == name);
         let req = req.header(VERSION_HEADER, self.upstream.protocol_version.as_wire_str());
-        match &self.upstream.auth {
+        let req = match &self.upstream.auth {
             A2aAuth::None => req,
-            A2aAuth::Bearer(token) => req.bearer_auth(token),
-            A2aAuth::ApiKey(key) => req.header(API_KEY_HEADER, key),
-        }
+            A2aAuth::Bearer(token) if !claims("authorization") => req.bearer_auth(token),
+            A2aAuth::ApiKey(key) if !claims(API_KEY_HEADER) => req.header(API_KEY_HEADER, key),
+            A2aAuth::Bearer(_) | A2aAuth::ApiKey(_) => req,
+        };
+        forwarded.iter().fold(req, |req, (name, value)| {
+            req.header(name.clone(), value.clone())
+        })
     }
 
     /// Candidate agent-card URIs, most specific first: each well-known path
