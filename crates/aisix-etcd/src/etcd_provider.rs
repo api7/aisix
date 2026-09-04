@@ -165,9 +165,12 @@ impl EtcdConfigProvider {
 
 /// Apply `timeout`, when set, to one in-flight etcd call.
 ///
-/// Expiry is reported as [`ProviderError::Range`] so it lands on the
-/// supervisor's existing reconnect-with-backoff path: the aborted read is
-/// retried rather than ending the watch task.
+/// Expiry is reported as [`ProviderError::Range`] to match the variant
+/// the same call's transport failures already use, so the supervisor's
+/// warn line attributes it to the range read. It is attribution, not
+/// control flow: `Supervisor::run` routes every `ProviderError` out of
+/// `load_all` to the same reconnect-with-backoff path, so the aborted
+/// read is retried whichever variant carries it.
 async fn bound<T>(
     timeout: Option<Duration>,
     what: &str,
@@ -352,11 +355,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expiry_maps_to_range_so_the_supervisor_backs_off_and_retries() {
-        // The variant matters as much as the expiry: `Range` is what
-        // `Supervisor::run` treats as a retryable source outage. Any other
-        // variant either ends the watch task or (for `Compacted`) skips
-        // the backoff entirely.
+    async fn expiry_reports_the_call_and_the_key_that_bounded_it() {
+        // An expiry has to reach the operator as a diagnosable failure,
+        // not as a bare cancellation: the message names both the call it
+        // aborted and the config key that set the bound, so a boot loop
+        // is traceable to `etcd.request_timeout_ms` without a code read.
+        // `Range` is chosen to match the variant this call's transport
+        // failures already use — the supervisor sends every
+        // `ProviderError` from `load_all` down the same backoff path, so
+        // the variant is what the warn line says, not what it does.
         let err = bound(
             Some(Duration::from_millis(1)),
             "range read",
