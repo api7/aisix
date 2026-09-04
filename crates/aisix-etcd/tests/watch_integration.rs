@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aisix_etcd::provider::ConfigProvider;
 use aisix_etcd::EtcdConfigProvider;
-use etcd_client::Client;
+use etcd_client::{Client, DeleteOptions};
 use futures::StreamExt;
 use tokio::time::timeout;
 
@@ -30,6 +30,49 @@ fn unique_prefix() -> String {
         .unwrap_or_default();
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("/aisix-etcd-it/{nanos:x}-{}-{seq}", std::process::id())
+}
+
+/// A full environment snapshot can legitimately exceed tonic's 4 MiB
+/// default receive limit even though every individual etcd value is small.
+/// A fresh gateway must still be able to bootstrap that snapshot.
+#[tokio::test]
+async fn load_all_accepts_snapshot_larger_than_tonic_default() {
+    let url = match etcd_url() {
+        Some(u) => u,
+        None => {
+            eprintln!("ETCD_TEST_URL not set — skipping");
+            return;
+        }
+    };
+
+    let prefix = unique_prefix();
+    let mut writer = Client::connect([url.as_str()], None)
+        .await
+        .expect("writer connect");
+    let value = vec![b'x'; 128 * 1024];
+    let entry_count = 34;
+    for i in 0..entry_count {
+        writer
+            .put(format!("{prefix}/large/{i}"), value.clone(), None)
+            .await
+            .expect("put large snapshot entry");
+    }
+
+    let provider = EtcdConfigProvider::connect(&[url.clone()], prefix.clone(), None)
+        .await
+        .expect("provider connect");
+    let (entries, _) = provider.load_all().await.expect("load large snapshot");
+
+    assert_eq!(entries.len(), entry_count);
+    assert!(
+        entries.iter().map(|entry| entry.value.len()).sum::<usize>() > 4 * 1024 * 1024,
+        "fixture must exceed tonic's default receive limit",
+    );
+
+    writer
+        .delete(prefix, Some(DeleteOptions::new().with_prefix()))
+        .await
+        .expect("cleanup large snapshot entries");
 }
 
 /// The core regression test for issue #237: after `watch()` returns,

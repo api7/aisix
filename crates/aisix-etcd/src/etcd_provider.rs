@@ -43,6 +43,8 @@ use crate::provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
 /// Fixed-interval retry: 5s × 5 attempts (spec §2).
 pub const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 pub const CONNECT_MAX_ATTEMPTS: u32 = 5;
+/// Maximum gRPC response size accepted from etcd.
+pub const ETCD_MAX_DECODING_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Retry policy used on the initial connect. Exposed for tests so they
 /// can shrink the interval; production uses [`ConnectPolicy::default`].
@@ -136,8 +138,10 @@ impl EtcdConfigProvider {
 #[async_trait]
 impl ConfigProvider for EtcdConfigProvider {
     async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
-        let mut client = self.client.lock().await;
+        let client = self.client.lock().await;
         let resp = client
+            .kv_client()
+            .max_decoding_message_size(ETCD_MAX_DECODING_MESSAGE_SIZE)
             .get(
                 self.prefix.as_bytes(),
                 Some(GetOptions::new().with_prefix()),
@@ -167,11 +171,13 @@ impl ConfigProvider for EtcdConfigProvider {
         Box<dyn Stream<Item = Result<WatchEvent, ProviderError>> + Send + Unpin>,
         ProviderError,
     > {
-        let mut client = self.client.lock().await;
+        let client = self.client.lock().await;
         let opts = WatchOptions::new()
             .with_prefix()
             .with_start_revision(start_revision);
         let (watcher, stream) = client
+            .watch_client()
+            .max_decoding_message_size(ETCD_MAX_DECODING_MESSAGE_SIZE)
             .watch(self.prefix.as_bytes(), Some(opts))
             .await
             .map_err(|e| ProviderError::Watch(format_error_chain(&e)))?;

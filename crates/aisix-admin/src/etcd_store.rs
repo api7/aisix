@@ -24,6 +24,7 @@ use aisix_core::{
     A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter,
     PassthroughRoute, ProviderKey,
 };
+use aisix_etcd::ETCD_MAX_DECODING_MESSAGE_SIZE;
 use etcd_client::{Client, GetOptions};
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
@@ -88,10 +89,10 @@ impl EtcdConfigStore {
         &self,
         key: &str,
     ) -> Result<Option<(T, i64)>, StoreError> {
-        let resp = self
-            .client
-            .lock()
-            .await
+        let client = self.client.lock().await;
+        let resp = client
+            .kv_client()
+            .max_decoding_message_size(ETCD_MAX_DECODING_MESSAGE_SIZE)
             .get(key.as_bytes().to_vec(), None)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))?;
@@ -109,10 +110,10 @@ impl EtcdConfigStore {
         kind: &str,
     ) -> Result<Vec<(String, T, i64)>, StoreError> {
         let prefix = self.range_prefix(kind);
-        let resp = self
-            .client
-            .lock()
-            .await
+        let client = self.client.lock().await;
+        let resp = client
+            .kv_client()
+            .max_decoding_message_size(ETCD_MAX_DECODING_MESSAGE_SIZE)
             .get(
                 prefix.as_bytes().to_vec(),
                 Some(GetOptions::new().with_prefix()),

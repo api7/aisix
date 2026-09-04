@@ -33,6 +33,7 @@ use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AdminConfig, AisixSnapshot};
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
+use etcd_client::DeleteOptions;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -176,6 +177,53 @@ async fn models_round_trip_through_real_etcd() {
         }),
     )
     .await;
+}
+
+#[tokio::test]
+async fn model_list_accepts_snapshot_larger_than_tonic_default() {
+    let Some(url) = etcd_url() else {
+        eprintln!("skipping: ADMIN_TEST_ETCD_URL not set");
+        return;
+    };
+
+    let prefix = unique_prefix();
+    let mut client = etcd_client_for(&url).await;
+    let store = EtcdConfigStore::new(client.clone(), &prefix);
+    let display_name = "x".repeat(128 * 1024);
+    let mut snapshot_size = 0;
+    let entry_count = 34;
+    for i in 0..entry_count {
+        let payload = json!({
+            "display_name": display_name,
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "11111111-1111-1111-1111-111111111111"
+        });
+        snapshot_size += serde_json::to_vec(&payload).expect("serialize").len();
+        seed(
+            &mut client,
+            &prefix,
+            "models",
+            &format!("m-large-{i}"),
+            &payload,
+        )
+        .await;
+    }
+    assert!(
+        snapshot_size > 4 * 1024 * 1024,
+        "fixture must exceed tonic's default receive limit",
+    );
+
+    let models = store
+        .list_models()
+        .await
+        .expect("list large model snapshot");
+    assert_eq!(models.len(), entry_count);
+
+    client
+        .delete(prefix, Some(DeleteOptions::new().with_prefix()))
+        .await
+        .expect("cleanup large model snapshot");
 }
 
 #[tokio::test]

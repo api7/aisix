@@ -30,7 +30,7 @@ pub mod supervisor;
 pub use backoff::{ExpBackoff, BASE_MS, MAX_MS};
 pub use etcd_provider::{
     ConnectPolicy, EtcdConfigProvider, EtcdWatchStream, CONNECT_MAX_ATTEMPTS,
-    CONNECT_RETRY_INTERVAL,
+    CONNECT_RETRY_INTERVAL, ETCD_MAX_DECODING_MESSAGE_SIZE,
 };
 pub use key::{parse as parse_key, KeyError, ResourceKey};
 pub use loader::{build_snapshot, BuildStats};
