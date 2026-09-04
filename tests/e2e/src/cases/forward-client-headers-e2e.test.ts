@@ -4,9 +4,11 @@ import {
   EtcdClient,
   SeedClient,
   spawnApp,
+  startA2aUpstream,
   startMcpUpstream,
   startOpenAiUpstream,
   waitConfigPropagation,
+  type A2aUpstream,
   type McpUpstream,
   type OpenAiUpstream,
   type ReceivedRequest,
@@ -22,7 +24,7 @@ import {
 // hands that service the end user's own credentials and context — the
 // service keeps reading the header it always read.
 //
-// Three faces build their outbound headers in completely different code,
+// Four faces build their outbound headers in completely different code,
 // which is why each gets its own coverage here:
 //
 //   1. /v1/*             — ProviderKey `request.forward_client_headers`,
@@ -35,6 +37,9 @@ import {
 //   3. /passthrough/*    — the `passthrough_route` field, where the
 //                          default is the opposite (forward everything)
 //                          and the list OVERRIDES a strip.
+//   4. /a2a/*            — the `a2a_agent` field, on the JSON-RPC call,
+//                          its streaming variant, and the agent-card
+//                          fetch, which is an upstream hop of its own.
 //
 // And beside them, the sub-dispatch paths of the model kinds that do NOT
 // go through the one convergence point the faces above share: an
@@ -60,6 +65,9 @@ const ENSEMBLE_MEMBER_A = "fwd-ensemble-member-a";
 const ENSEMBLE_MEMBER_B = "fwd-ensemble-member-b";
 const ENSEMBLE_JUDGE = "fwd-ensemble-judge";
 const ROUTE_PREFIX = "/passthrough/fwd";
+const A2A_AGENT = "fwdagent";
+const A2A_PLAIN_AGENT = "fwdplainagent";
+const A2A_GATEWAY_SECRET = "gateway-held-a2a-secret";
 const GATEWAY_KEY_HEADER = "x-gw-key";
 const CUSTOM_HEADER = "x-user-jwt";
 const CALLER_CREDENTIAL = "Bearer callers-own-credential";
@@ -96,13 +104,14 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
   let upstream: OpenAiUpstream | undefined;
   let anthropicUpstream: OpenAiUpstream | undefined;
   let mcpUpstream: McpUpstream | undefined;
+  let a2aUpstream: A2aUpstream | undefined;
   let etcdReachable = false;
 
   const since = (mark: number): ReceivedRequest[] =>
     upstream!.receivedRequests.slice(mark);
 
   /** How many times `name` arrived on the wire, occurrences not values. */
-  const occurrences = (req: ReceivedRequest, name: string): number =>
+  const occurrences = (req: { headerNames: string[] }, name: string): number =>
     req.headerNames.filter((n) => n === name).length;
 
   const bodyOf = async (res: Response, what: string): Promise<string> => {
@@ -190,6 +199,9 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
     upstream = await startOpenAiUpstream();
     anthropicUpstream = await startOpenAiUpstream({ nonStreamBody: ANTHROPIC_BODY });
     mcpUpstream = await startMcpUpstream("fwd");
+    // No `token`: this stub gates on the gateway's bearer when given one, and
+    // the point here is to READ what arrived rather than to be refused for it.
+    a2aUpstream = await startA2aUpstream();
     app = await spawnApp({});
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
@@ -328,10 +340,32 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
       forward_client_headers: [CUSTOM_HEADER, "*"],
     });
 
+    // Two A2A agents behind one stub: one opted in, one with the default.
+    // `"*"` beside the named entries is what proves the version announcement
+    // resists a glob rather than simply never matching a pattern.
+    await seed.update("a2a_agents", randomUUID(), {
+      name: A2A_AGENT,
+      url: a2aUpstream.url,
+      protocol_version: "1.0",
+      auth_type: "bearer",
+      secret: A2A_GATEWAY_SECRET,
+      forward_client_headers: [CUSTOM_HEADER, "authorization", "*"],
+      enabled: true,
+    });
+    await seed.update("a2a_agents", randomUUID(), {
+      name: A2A_PLAIN_AGENT,
+      url: a2aUpstream.url,
+      protocol_version: "1.0",
+      auth_type: "bearer",
+      secret: A2A_GATEWAY_SECRET,
+      enabled: true,
+    });
+
     const callerKey = await seed.createApiKey({
       key_hash: CALLER_HASH,
       allowed_models: ["*"],
       allowed_routes: ["*"],
+      allowed_agents: ["*"],
       mcp_access: { allow: ["*"] },
     });
 
@@ -389,6 +423,7 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
     await upstream?.close();
     await anthropicUpstream?.close();
     await mcpUpstream?.close();
+    await a2aUpstream?.close();
   });
 
   test("a named header reaches an LLM upstream that opted in", async () => {
@@ -623,6 +658,127 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
       expect(h["mcp-session-id"] ?? "").not.toContain("callers-own-session");
       expect(h["last-event-id"] ?? "").not.toContain("callers-own-event");
     }
+  });
+
+  /** A JSON-RPC call to an agent through the gateway. */
+  const a2aCall = async (
+    agent: string,
+    method: string,
+    headers: Record<string, string> = {},
+  ): Promise<Response> =>
+    fetch(`${app!.proxyUrl}/a2a/${agent}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_KEY}`,
+        "content-type": "application/json",
+        ...headers,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: "fwd-1",
+        method,
+        params: {
+          message: {
+            role: "user",
+            parts: [{ kind: "text", text: "probe" }],
+            messageId: "m-fwd",
+          },
+        },
+      }),
+    });
+
+  /**
+   * Every request the A2A stub saw since `mark` under `httpMethod` — the card
+   * fetch is a GET and the JSON-RPC call a POST, and one test drives both.
+   */
+  const a2aSince = (mark: number, httpMethod: "GET" | "POST") =>
+    a2aUpstream!.requests.slice(mark).filter((r) => r.httpMethod === httpMethod);
+
+  test("an A2A agent receives a named header, and a forwarded credential rides alone", async () => {
+    if (!etcdReachable) return;
+    const mark = a2aUpstream!.requests.length;
+
+    await a2aCall(A2A_AGENT, "message/send", {
+      [CUSTOM_HEADER]: "carried.verbatim",
+    }).then((r) => bodyOf(r, "/a2a message/send"));
+
+    const seen = a2aSince(mark, "POST").at(-1)!;
+    expect(seen.headers[CUSTOM_HEADER]).toBe("carried.verbatim");
+    // The caller authenticates to the GATEWAY with its own AISIX key; the
+    // operator has declared that this agent reads the caller's credential
+    // rather than the one the gateway holds for it.
+    expect(seen.headers.authorization).toBe(`Bearer ${CALLER_KEY}`);
+    // And ALONE: node keeps only the FIRST `authorization`, so a gateway
+    // credential appended behind the caller's would be invisible in the
+    // collapsed value and only the occurrence count shows it stood aside.
+    expect(occurrences(seen, "authorization")).toBe(1);
+    expect(seen.headers.authorization).not.toContain(A2A_GATEWAY_SECRET);
+  });
+
+  test("an A2A agent nobody opted in receives nothing", async () => {
+    if (!etcdReachable) return;
+    const mark = a2aUpstream!.requests.length;
+
+    await a2aCall(A2A_PLAIN_AGENT, "message/send", {
+      [CUSTOM_HEADER]: "carried.verbatim",
+    }).then((r) => bodyOf(r, "/a2a on the un-opted-in agent"));
+
+    const seen = a2aSince(mark, "POST").at(-1)!;
+    expect(seen.headers[CUSTOM_HEADER]).toBeUndefined();
+    expect(seen.headers.authorization).toBe(`Bearer ${A2A_GATEWAY_SECRET}`);
+  });
+
+  test("the A2A agent-card fetch forwards them too", async () => {
+    if (!etcdReachable) return;
+    const mark = a2aUpstream!.requests.length;
+
+    // Card discovery is an upstream hop of its own, built at a different call
+    // site than the JSON-RPC one — an agent that gates discovery on the end
+    // user's own credential is exactly what this capability is for.
+    await fetch(
+      `${app!.proxyUrl}/a2a/${A2A_AGENT}/.well-known/agent-card.json`,
+      { headers: { authorization: `Bearer ${CALLER_KEY}`, [CUSTOM_HEADER]: "carried.verbatim" } },
+    ).then((r) => bodyOf(r, "the A2A agent card"));
+
+    const card = a2aSince(mark, "GET").at(-1)!;
+    expect(card.headers[CUSTOM_HEADER]).toBe("carried.verbatim");
+    expect(card.headers.authorization).toBe(`Bearer ${CALLER_KEY}`);
+    expect(occurrences(card, "authorization")).toBe(1);
+  });
+
+  test("an A2A streaming call forwards them too", async () => {
+    if (!etcdReachable) return;
+    const mark = a2aUpstream!.requests.length;
+
+    // `message/stream` opens its upstream request at a different call site
+    // than the buffered one, and only this path exercises it.
+    await a2aCall(A2A_AGENT, "message/stream", {
+      [CUSTOM_HEADER]: "carried.verbatim",
+    }).then((r) => bodyOf(r, "/a2a message/stream"));
+
+    const seen = a2aSince(mark, "POST").at(-1)!;
+    expect(seen.headers[CUSTOM_HEADER]).toBe("carried.verbatim");
+    expect(seen.headers.authorization).toBe(`Bearer ${CALLER_KEY}`);
+  });
+
+  test("a glob never sweeps the A2A version the gateway announces", async () => {
+    if (!etcdReachable) return;
+    const mark = a2aUpstream!.requests.length;
+
+    await a2aCall(A2A_AGENT, "message/send", {
+      // Both MATCH the configured `*`, so what separates them is the rule
+      // under test rather than a pattern that failed to fire.
+      "a2a-version": "0.3",
+      "x-allowed": "yes",
+    }).then((r) => bodyOf(r, "the A2A glob case"));
+
+    const seen = a2aSince(mark, "POST").at(-1)!;
+    expect(seen.headers["x-allowed"]).toBe("yes");
+    // The version is the gateway's own announcement of the agent's pinned
+    // wire format. A relayed copy would let the caller pick the envelope
+    // shape the agent answers in, or make it refuse the call outright.
+    expect(seen.version).toBe("1.0");
+    expect(occurrences(seen, "a2a-version")).toBe(1);
   });
 
   test("an ensemble's panel and judge each forward on their own upstream", async () => {

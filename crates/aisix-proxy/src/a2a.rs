@@ -44,7 +44,7 @@ use aisix_a2a::{
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::body::to_bytes;
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 
@@ -232,7 +232,11 @@ async fn dispatch(
 
     let upstream = upstream_from_a2a_agent(&entry.value);
 
-    let (_parts, body) = request.into_parts();
+    let (parts, body) = request.into_parts();
+    // Resolved here rather than inside the bridge: the inbound headers exist
+    // only on this side, and the same resolved set serves the buffered and the
+    // streaming dispatch below.
+    let forwarded = aisix_a2a::forwarded_client_headers(&entry.value, Some(&parts.headers));
     let bytes = match to_bytes(
         body,
         crate::error::body_read_cap(state.request_body_limit_bytes),
@@ -361,6 +365,7 @@ async fn dispatch(
             request_id,
             trace.clone(),
             upstream,
+            forwarded,
             value,
             call,
             rpc_id,
@@ -370,7 +375,7 @@ async fn dispatch(
     }
     let _reservation = reservation;
 
-    let bridge = HttpBridge::new(upstream);
+    let bridge = HttpBridge::new(upstream).with_forwarded_client_headers(forwarded);
     let started = Instant::now();
     let result = bridge.send(&value).await;
     let latency = started.elapsed();
@@ -502,13 +507,14 @@ async fn dispatch_stream(
     request_id: &str,
     trace: Option<std::sync::Arc<aisix_obs::RequestTraceBundle>>,
     upstream: aisix_a2a::A2aUpstream,
+    forwarded: Vec<(HeaderName, HeaderValue)>,
     request: serde_json::Value,
     call: A2aCall,
     rpc_id: Option<serde_json::Value>,
     reservation: aisix_ratelimit::MultiReservation,
 ) -> Response {
     let started = Instant::now();
-    let bridge = HttpBridge::new(upstream);
+    let bridge = HttpBridge::new(upstream).with_forwarded_client_headers(forwarded);
     let events = match bridge.send_stream(&request).await {
         Ok(events) => events,
         // The upstream refused before any event: the headers have not gone out,
@@ -661,7 +667,9 @@ pub async fn a2a_agent_card(
 
     let upstream = upstream_from_a2a_agent(&entry.value);
 
-    let bridge = HttpBridge::new(upstream);
+    let bridge = HttpBridge::new(upstream).with_forwarded_client_headers(
+        aisix_a2a::forwarded_client_headers(&entry.value, Some(&headers)),
+    );
     let mut card = match bridge.fetch_agent_card().await {
         Ok(card) => card,
         Err(err) => {
