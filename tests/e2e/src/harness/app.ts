@@ -119,6 +119,15 @@ export interface AppOverrides {
    */
   etcdPrefix?: string;
   /**
+   * Skip the proxy `/livez` readiness gate. The proxy listener does not
+   * bind until the gateway has applied its first configuration, so a
+   * spec that deliberately starves the gateway of configuration would
+   * otherwise fail in `spawnApp` instead of in its own assertions.
+   * Readiness then rests on the metrics listener, which binds regardless
+   * of the configuration source. Defaults to true.
+   */
+  awaitProxyListener?: boolean;
+  /**
    * `managed.snapshot_cache_path` — enables the on-disk snapshot cache
    * (#871) without managed mode. Point two sequential apps (same
    * `etcdPrefix`) at one path to exercise cache-restored restarts.
@@ -375,7 +384,11 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   try {
     await Promise.race([
       Promise.all([
-        waitForReady(`${proxyUrl}/livez`, READY_TIMEOUT_MS),
+        // The proxy listener binds only once a configuration has been
+        // applied, so a spec that holds configuration back opts out here.
+        ...((overrides.awaitProxyListener ?? true)
+          ? [waitForReady(`${proxyUrl}/livez`, READY_TIMEOUT_MS)]
+          : []),
         // The admin health endpoint only exists when the admin listener is
         // bound; with `admin: false` there is no admin surface, so gate on
         // the proxy `/livez` and the metrics listener alone. (If both

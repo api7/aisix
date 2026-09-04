@@ -37,6 +37,10 @@ http.workspace = true
 # filesource: resources.yaml parsing + deterministic UUIDv5 resource ids
 yaml-rust2.workspace = true
 uuid.workspace = true
+# `tokio::sync::watch` backs ConfigStatus::wait_until_applied — the
+# awaitable first-apply signal the boot path gates the proxy listener on.
+# Runtime-agnostic: no reactor or driver is pulled into this crate.
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

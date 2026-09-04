@@ -1288,26 +1288,41 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         }
     };
 
-    // Step 9: bind + serve the proxy (always). Admin is handled above.
+    // Step 9: bind + serve the proxy, once a configuration has been
+    // applied. Admin is handled above.
     let proxy_addr: std::net::SocketAddr = cfg.proxy.addr.parse()?;
     let proxy_tls = cfg.proxy.tls.clone();
     let proxy_workers = cfg
         .proxy
         .thread_per_core_enabled()
         .then(|| cfg.proxy.worker_threads());
-    let proxy_serve = serve_http(
-        proxy_addr,
-        proxy_router,
-        proxy_tls,
-        downstream_idle_timeout,
-        shutdown,
-        "proxy",
-        proxy_workers,
-        // Only the proxy listener's connections are counted: the drain is
-        // about client traffic, and folding the platform's probes into the
-        // number would report a connection nobody is waiting on.
-        Some(livez_state.clone()),
-    );
+    // Only the proxy listener's connections are counted for the drain: it is
+    // about client traffic, and folding the platform's probes into the number
+    // would report a connection nobody is waiting on.
+    let proxy_drain = livez_state.clone();
+    let gate_status = config_status.clone();
+    let mut gate_cancel = cancel_rx.clone();
+    // The gate wraps the call rather than living inside `serve_http`, which
+    // both listener modes enter: `serve_http_tpc` branches off before the
+    // single-listener bind, so a gate placed further in would not cover the
+    // thread-per-core `SO_REUSEPORT` path. Left lazy so the shutdown
+    // coordinator below is spawned before the wait begins.
+    let proxy_serve = async move {
+        if !await_first_config(&gate_status, &mut gate_cancel, proxy_addr).await {
+            return Ok(());
+        }
+        serve_http(
+            proxy_addr,
+            proxy_router,
+            proxy_tls,
+            downstream_idle_timeout,
+            shutdown,
+            "proxy",
+            proxy_workers,
+            Some(proxy_drain),
+        )
+        .await
+    };
 
     // Step 10: shutdown coordinator. Whichever of (signal, proxy, admin)
     // completes first triggers the rest.
@@ -1889,6 +1904,65 @@ async fn sniff_downstream_version(
         Downstream::Http1
     };
     Ok((version, Rewind::new(head[..filled].to_vec(), stream)))
+}
+
+/// How often the boot path repeats the "still waiting for a configuration"
+/// line while the proxy listener is held closed.
+const FIRST_CONFIG_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Hold the boot path until the gateway has applied a configuration, so the
+/// proxy listener never binds on an instance that has nothing to serve. A
+/// platform that reads "the TCP port accepts" as "this instance is ready"
+/// otherwise routes client traffic to a gateway whose first configuration
+/// read is still in flight, and every request is rejected as an unknown API
+/// key.
+///
+/// The paths that already hold a configuration pay nothing: file mode loads
+/// synchronously and boot-fatally before this point, and an etcd boot seeded
+/// from the on-disk snapshot cache has applied that snapshot before the watch
+/// task is spawned. A cold etcd boot is the only one that waits, and it waits
+/// indefinitely — the watch supervisor owns the retry loop and its backoff,
+/// and `/status/ready` on the metrics listener answers 503 throughout.
+///
+/// Returns `false` when shutdown was requested first, in which case the proxy
+/// listener is never bound at all.
+async fn await_first_config(
+    config_status: &ConfigStatus,
+    cancel: &mut watch::Receiver<bool>,
+    proxy_addr: std::net::SocketAddr,
+) -> bool {
+    if config_status.is_ready() {
+        return true;
+    }
+    let applied = config_status.wait_until_applied();
+    tokio::pin!(applied);
+    // Ticks immediately, so the first line lands as soon as the wait starts.
+    let mut ticker = tokio::time::interval(FIRST_CONFIG_WAIT_LOG_INTERVAL);
+    loop {
+        tokio::select! {
+            _ = &mut applied => {
+                tracing::info!(
+                    addr = %proxy_addr,
+                    "first configuration applied — binding the proxy listener",
+                );
+                return true;
+            }
+            _ = ticker.tick() => {
+                tracing::warn!(
+                    addr = %proxy_addr,
+                    "proxy listener not bound: waiting for the first configuration to be applied",
+                );
+            }
+            _ = cancel.wait_for(|cancelled| *cancelled) => {
+                tracing::info!(
+                    addr = %proxy_addr,
+                    "shutdown requested before the first configuration was applied — \
+                     proxy listener never bound",
+                );
+                return false;
+            }
+        }
+    }
 }
 
 /// Serve `router` on `addr`, choosing HTTPS when `tls` is configured and
