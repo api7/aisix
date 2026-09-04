@@ -38,7 +38,8 @@ etcd:
     - "https://placeholder-overridden-at-register:2379"
   prefix: "/aisix"
   # Both timeouts are unset by default, and unset means unbounded.
-  # `dial_timeout_ms` bounds the connect; `request_timeout_ms` bounds a
+  # `dial_timeout_ms` bounds the TCP connect only, not the TLS handshake
+  # layered above it; `request_timeout_ms` bounds a
   # single unary call (the configuration range read, the admin reads) but
   # never the watch stream. A `request_timeout_ms` the range read cannot
   # finish inside makes the gateway retry it forever without ever serving

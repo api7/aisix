@@ -10,7 +10,8 @@ etcd:
   # Optional bounds on etcd I/O. Both are unset by default, and unset
   # means unbounded.
   #
-  # `dial_timeout_ms` bounds establishing the connection.
+  # `dial_timeout_ms` bounds the TCP connect — not the TLS handshake
+  # after it, and not the authentication exchange when `user` is set.
   # `request_timeout_ms` bounds a single unary call — the configuration
   # range read at boot and on every reconnect, and the admin API's reads.
   # It deliberately does not apply to the watch stream, which is

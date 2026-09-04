@@ -115,11 +115,12 @@ impl EtcdConfigStore {
         &self,
         key: &str,
     ) -> Result<Option<(T, i64)>, StoreError> {
-        let mut client = self.client.lock().await;
-        let resp = self
-            .bound(client.get(key.as_bytes().to_vec(), None))
-            .await?
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        let resp = {
+            let mut client = self.client.lock().await;
+            self.bound(client.get(key.as_bytes().to_vec(), None))
+                .await?
+        }
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
         let kv = match resp.kvs().first() {
             Some(kv) => kv,
             None => return Ok(None),
@@ -134,14 +135,17 @@ impl EtcdConfigStore {
         kind: &str,
     ) -> Result<Vec<(String, T, i64)>, StoreError> {
         let prefix = self.range_prefix(kind);
-        let mut client = self.client.lock().await;
-        let resp = self
-            .bound(client.get(
+        // Scoped so the guard covers the call and not the decode loop
+        // below, which is where it sat before the bound was introduced.
+        let resp = {
+            let mut client = self.client.lock().await;
+            self.bound(client.get(
                 prefix.as_bytes().to_vec(),
                 Some(GetOptions::new().with_prefix()),
             ))
             .await?
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        }
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
 
         let mut out = Vec::with_capacity(resp.kvs().len());
         for kv in resp.kvs() {

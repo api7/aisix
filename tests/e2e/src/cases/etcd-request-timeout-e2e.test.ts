@@ -240,9 +240,17 @@ describe("etcd.request_timeout_ms", () => {
 
     expect(await waitForChat(app, MODEL, 30_000)).toBe(200);
 
+    // Assert on the log written during the idle window, not on the whole
+    // log. The boot range read is bounded by this same 1000 ms, and on a
+    // loaded runner a cold TCP + HTTP/2 handshake plus the read can
+    // exceed it once — the supervisor then retries and succeeds, and the
+    // spec still reaches this point. Reading the cumulative output would
+    // report that as the watch being torn down, which it is not.
+    const beforeIdle = app.output().length;
+
     // Nothing written under the prefix for many multiples of the bound.
     await sleep(6_000);
-    expect(app.output()).not.toContain(BACKOFF_LINE);
+    expect(app.output().slice(beforeIdle)).not.toContain(BACKOFF_LINE);
 
     // The watch opened before that idle window must still deliver this.
     await seedModel(prefix, SECOND_MODEL);

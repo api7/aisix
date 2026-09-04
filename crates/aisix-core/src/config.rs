@@ -124,16 +124,26 @@ pub struct EtcdConfig {
     /// read at connect time — never stored in the config struct.
     #[serde(default)]
     pub password_env: Option<String>,
-    /// Bound on establishing the gRPC connection to etcd, in
-    /// milliseconds. Unset — the default — leaves the dial unbounded and
-    /// the OS TCP stack is the only limit.
+    /// Bound on the TCP connect to etcd, in milliseconds. Unset — the
+    /// default — leaves it to the OS TCP stack.
+    ///
+    /// It reaches hyper's connector via `Endpoint::connect_timeout`, so
+    /// it covers the TCP handshake and nothing after it. Two later steps
+    /// of "connecting" are outside it and remain unbounded: the TLS
+    /// handshake, which is layered above the connector, and the
+    /// `Authenticate` call etcd-client issues inside `Client::connect`
+    /// when `user` / `password_env` are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dial_timeout_ms: Option<u64>,
     /// Bound on a single unary etcd call, in milliseconds. Unset — the
     /// default — leaves those calls unbounded.
     ///
     /// When set it covers the configuration range read (`load_all`) and
-    /// the admin surface's reads. It deliberately does NOT cover the
+    /// the admin surface's reads. It does not reach the two calls that
+    /// sit outside that set and are still unbounded — the `Authenticate`
+    /// inside `Client::connect`, and the watch-create handshake — so an
+    /// etcd that answers a range read but stalls on either of those can
+    /// still hang the gateway. It deliberately does NOT cover the
     /// watch: that stream is long-lived by construction, so a bound on it
     /// would expire on every interval quiet enough to produce no event
     /// and leave the gateway reconnecting instead of watching.
