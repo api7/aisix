@@ -172,6 +172,38 @@ export class EtcdClient {
     }
   }
 
+  /**
+   * Put many key/values in as few round trips as etcd allows (etcd v3
+   * `/v3/kv/txn`, whose `success` branch applies every op atomically).
+   *
+   * etcd caps a transaction at 128 operations (`--max-txn-ops`) and a
+   * whole request at 1.5 MiB (`--max-request-bytes`), so entries are sent
+   * in chunks of 128 and callers with large values may need smaller ones.
+   * For a fixture of tens of thousands of keys, one `put` per key is tens
+   * of thousands of round trips.
+   */
+  async putMany(entries: Array<[key: string, value: string]>): Promise<void> {
+    const CHUNK = 128;
+    for (let i = 0; i < entries.length; i += CHUNK) {
+      const ops = entries.slice(i, i + CHUNK).map(([key, value]) => ({
+        requestPut: {
+          key: Buffer.from(key, "utf8").toString("base64"),
+          value: Buffer.from(value, "utf8").toString("base64"),
+        },
+      }));
+      const res = await harnessRequest(`${this.endpoint}/v3/kv/txn`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ success: ops }),
+      });
+      if (res.statusCode >= 300) {
+        const body = await res.body.text();
+        throw new Error(`etcd txn failed (${res.statusCode}): ${body}`);
+      }
+      await res.body.dump();
+    }
+  }
+
   /** Read one key's value (etcd v3 `/v3/kv/range`); undefined when absent. */
   async get(key: string): Promise<string | undefined> {
     const res = await harnessRequest(`${this.endpoint}/v3/kv/range`, {

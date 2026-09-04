@@ -20,6 +20,7 @@
 #![deny(rust_2018_idioms)]
 
 pub mod backoff;
+pub mod client;
 pub mod etcd_provider;
 pub mod key;
 pub mod loader;
@@ -28,6 +29,7 @@ pub mod snapshot_cache;
 pub mod supervisor;
 
 pub use backoff::{ExpBackoff, BASE_MS, MAX_MS};
+pub use client::{kv_client, watch_client, MAX_DECODING_MESSAGE_SIZE};
 pub use etcd_provider::{
     ConnectPolicy, EtcdConfigProvider, EtcdWatchStream, CONNECT_MAX_ATTEMPTS,
     CONNECT_RETRY_INTERVAL,
