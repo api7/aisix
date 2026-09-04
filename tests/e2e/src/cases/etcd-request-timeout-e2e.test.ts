@@ -63,18 +63,36 @@ async function waitForOutput(
  * out. A refused connection counts as "not yet": the proxy listener binds
  * only once a configuration has been applied, which in these specs is
  * after the read the relay was holding finally lands.
+ *
+ * Two ways to run out of budget, and they need different reports. If the
+ * gateway answered at all, the last status is returned and the caller's
+ * `toBe(200)` names it. If every attempt was refused, there is no status
+ * to report — returning `0` would fail as "expected 0 to be 200" and lose
+ * the transport cause — so the last error is raised instead.
  */
 async function waitForChat(app: SpawnedApp, model: string, timeoutMs: number): Promise<number> {
   const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
   const deadline = Date.now() + timeoutMs;
   let status = 0;
+  let lastError: unknown;
   for (;;) {
     try {
       status = (await proxy.chat({ model, messages: [{ role: "user", content: "hi" }] })).status;
-    } catch {
+      lastError = undefined;
+    } catch (err) {
       status = 0;
+      lastError = err;
     }
-    if (status === 200 || Date.now() >= deadline) return status;
+    if (status === 200) return status;
+    if (Date.now() >= deadline) {
+      if (lastError !== undefined) {
+        throw new Error(
+          `no response for model ${model} within ${timeoutMs} ms — the proxy listener never bound`,
+          { cause: lastError },
+        );
+      }
+      return status;
+    }
     await sleep(500);
   }
 }
