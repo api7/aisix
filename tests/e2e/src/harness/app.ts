@@ -119,12 +119,16 @@ export interface AppOverrides {
    */
   etcdPrefix?: string;
   /**
-   * Skip the proxy `/livez` readiness gate. The proxy listener does not
-   * bind until the gateway has applied its first configuration, so a
-   * spec that deliberately starves the gateway of configuration would
-   * otherwise fail in `spawnApp` instead of in its own assertions.
-   * Readiness then rests on the metrics listener, which binds regardless
-   * of the configuration source. Defaults to true.
+   * Whether readiness waits for the proxy `/livez` to answer. **Defaults
+   * to `true`**; `false` skips that gate.
+   *
+   * The proxy listener does not bind until the gateway has applied its
+   * first configuration, so a spec that deliberately starves the gateway
+   * of configuration would otherwise fail in `spawnApp` instead of in its
+   * own assertions. Readiness then rests on the metrics listener, which
+   * binds regardless of the configuration source — so `prometheus` (or
+   * `admin`) must stay on, and `spawnApp` rejects the combination that
+   * would leave it with nothing to wait for.
    */
   awaitProxyListener?: boolean;
   /**
@@ -259,6 +263,17 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   if (overrides.extra && "admin" in overrides.extra) {
     throw new Error(
       "spawnApp: control the admin listener with the `admin` boolean override, not `extra.admin`",
+    );
+  }
+  if (
+    overrides.awaitProxyListener === false &&
+    !adminEnabled &&
+    !prometheusEnabled
+  ) {
+    throw new Error(
+      "spawnApp: awaitProxyListener:false needs `admin` or `prometheus` on — " +
+        "with all three off nothing is waited on, so spawnApp would return before " +
+        "the binary has started and a later non-zero exit could not surface",
     );
   }
   const [proxyPort, adminPort, metricsPort] = await pickFreePorts(3);

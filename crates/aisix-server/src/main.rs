@@ -1939,7 +1939,19 @@ async fn await_first_config(
     // Ticks immediately, so the first line lands as soon as the wait starts.
     let mut ticker = tokio::time::interval(FIRST_CONFIG_WAIT_LOG_INTERVAL);
     loop {
+        // `biased` so a configuration arriving in the same wakeup as the
+        // shutdown signal cannot win the race and open a listener the
+        // shutdown coordinator is already tearing down.
         tokio::select! {
+            biased;
+            _ = cancel.wait_for(|cancelled| *cancelled) => {
+                tracing::info!(
+                    addr = %proxy_addr,
+                    "shutdown requested before the first configuration was applied — \
+                     proxy listener never bound",
+                );
+                return false;
+            }
             _ = &mut applied => {
                 tracing::info!(
                     addr = %proxy_addr,
@@ -1952,14 +1964,6 @@ async fn await_first_config(
                     addr = %proxy_addr,
                     "proxy listener not bound: waiting for the first configuration to be applied",
                 );
-            }
-            _ = cancel.wait_for(|cancelled| *cancelled) => {
-                tracing::info!(
-                    addr = %proxy_addr,
-                    "shutdown requested before the first configuration was applied — \
-                     proxy listener never bound",
-                );
-                return false;
             }
         }
     }

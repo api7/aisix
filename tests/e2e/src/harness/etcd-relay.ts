@@ -70,12 +70,28 @@ export async function startEtcdRelay(): Promise<EtcdRelay> {
     if (forwarding) forward(client);
     else held.push(client);
   });
+  // Keeps a post-listen accept error from throwing on an EventEmitter with
+  // no 'error' listener. `listen()` adds its own, which still sees the event.
   server.on("error", () => {});
 
   const listen = async () => {
     if (server.listening) return;
+    // Race the two outcomes: awaiting `listening` alone turns a bind
+    // failure into a hang, and the spec would time out with no cause.
+    const up = new Promise<void>((resolve, reject) => {
+      const onListening = () => {
+        server.off("error", onError);
+        resolve();
+      };
+      const onError = (err: Error) => {
+        server.off("listening", onListening);
+        reject(err);
+      };
+      server.once("listening", onListening);
+      server.once("error", onError);
+    });
     server.listen(port, "127.0.0.1");
-    await once(server, "listening");
+    await up;
   };
 
   const unlisten = async () => {
