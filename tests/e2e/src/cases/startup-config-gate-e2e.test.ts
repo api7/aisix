@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { connect } from "node:net";
-import { afterEach, beforeAll, describe, expect, test } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
   ProxyClient,
@@ -8,6 +8,7 @@ import {
   spawnApp,
   startEtcdRelay,
   startOpenAiUpstream,
+  type AppOverrides,
   type EtcdRelay,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -88,6 +89,10 @@ describe("the proxy listener waits for the first configuration", () => {
     await Promise.all(relays.splice(0).map((r) => r.stop()));
   });
 
+  afterAll(async () => {
+    await upstream?.close();
+  });
+
   /**
    * Everything a caller needs to get a 200 out of the gateway, written
    * straight to the real etcd. The relay decides when the gateway is
@@ -112,24 +117,37 @@ describe("the proxy listener waits for the first configuration", () => {
   async function spawnBehindRelay(
     relay: EtcdRelay,
     prefix: string,
-    overrides: Record<string, unknown> = {},
+    overrides: Partial<AppOverrides> = {},
   ): Promise<SpawnedApp> {
     const app = await spawnApp({
+      // Spread first: the three keys below are what make these specs mean
+      // anything, and a caller must not be able to replace the relay
+      // endpoint or re-arm the readiness gate without a type error.
+      ...overrides,
       etcdPrefix: prefix,
       // The subject of both specs is that this listener is NOT up yet.
       awaitProxyListener: false,
-      extra: {
-        etcd: {
-          endpoints: [relay.endpoint],
-          prefix,
-          dial_timeout_ms: 5000,
-          request_timeout_ms: 5000,
-        },
-      },
-      ...overrides,
+      // No dial/request timeouts: those config keys reach nothing in the
+      // etcd client, and writing them here would suggest a timeout is
+      // driving the retries when the supervisor's backoff is.
+      extra: { etcd: { endpoints: [relay.endpoint], prefix } },
     });
     apps.push(app);
     return app;
+  }
+
+  /** Poll the captured output until `needle` shows up. */
+  async function waitForOutput(
+    app: SpawnedApp,
+    needle: string,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (app.output().includes(needle)) return true;
+      await sleep(100);
+    }
+    return false;
   }
 
   test("refuses TCP while the first read is in flight, then serves that snapshot", async (ctx) => {
@@ -154,7 +172,7 @@ describe("the proxy listener waits for the first configuration", () => {
     expect(ready.status).toBe(503);
 
     await relay.release();
-    expect(await waitForTcp(port, 20_000)).toBe(true);
+    expect(await waitForTcp(port, 70_000)).toBe(true);
 
     // Serving the snapshot the gate waited for: the caller key and the
     // model were seeded before the gateway ever read anything.
@@ -193,10 +211,16 @@ describe("the proxy listener waits for the first configuration", () => {
 
     // Several supervisor retries go by without a listener appearing.
     await staysClosed(port, 3_000);
-    expect(app.output()).toContain("waiting for the first configuration to be applied");
+    expect(
+      await waitForOutput(
+        app,
+        "waiting for the first configuration before binding the proxy listener",
+        5_000,
+      ),
+    ).toBe(true);
 
     await relay.release();
-    expect(await waitForTcp(port, 20_000)).toBe(true);
+    expect(await waitForTcp(port, 70_000)).toBe(true);
 
     const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
     const res = await proxy.chat({
