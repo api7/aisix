@@ -15,8 +15,8 @@ use etcd_client::{Client, KvClient, WatchClient};
 /// really a cap on how much configuration a deployment may hold — and
 /// crossing it is unrecoverable on its own: the supervisor backs off and
 /// re-issues the identical oversized range forever. Any finite ceiling
-/// would only move that failure to a larger config set, so the limit is
-/// lifted to the largest length a gRPC frame can express.
+/// would only move that failure to a larger config set, so the limit goes
+/// to `i32::MAX`, the conventional ceiling for a gRPC message size.
 ///
 /// The trade-off that buys: an oversized length prefix is no longer
 /// rejected before the buffer for it is reserved. The peer is the etcd

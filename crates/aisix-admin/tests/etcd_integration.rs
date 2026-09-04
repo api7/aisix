@@ -235,13 +235,17 @@ async fn model_list_reads_a_range_larger_than_the_default_decode_limit() {
         "fixture must exceed the default decode limit, got {seeded_bytes} bytes",
     );
 
-    let models = store.list_models().await.expect("list models");
-    assert_eq!(models.len(), COUNT);
-
+    // Clean up before asserting: a store that decodes at the default limit
+    // fails this list, and panicking first would leave the whole fixture
+    // behind in an etcd other tests share.
+    let listed = store.list_models().await;
     client
         .delete(prefix, Some(DeleteOptions::new().with_prefix()))
         .await
         .expect("cleanup");
+
+    let models = listed.expect("list models");
+    assert_eq!(models.len(), COUNT);
 }
 
 #[tokio::test]
