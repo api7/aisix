@@ -1,16 +1,19 @@
 //! Forwarding inbound client headers to an upstream.
 //!
-//! Three resources let an operator name headers that must reach the
+//! Four resources let an operator name headers that must reach the
 //! upstream — `provider_key`'s `request.forward_client_headers`, and the
-//! same field on `passthrough_route` and `mcp_server` — because the
-//! gateway fronts upstreams on three different surfaces and the choice is
-//! made per upstream, never gateway-wide: the same deployment reaches
-//! internal services that need the caller's own credentials and claims AND
-//! public model providers that must never see them.
+//! same field on `passthrough_route`, `mcp_server` and `a2a_agent` —
+//! because the gateway fronts upstreams on four different surfaces and the
+//! choice is made per upstream, never gateway-wide: the same deployment
+//! reaches internal services that need the caller's own credentials and
+//! claims AND public model providers that must never see them.
 //!
 //! The rule lives here rather than at each call site so every surface
 //! answers "may this header be forwarded, and does the pattern name it"
 //! the same way — the drift this repo's handler-family rule warns about.
+//! The list above is that rule's own census: a new surface belongs in it,
+//! or the next reader cannot tell which faces have been checked against a
+//! change made here.
 //!
 //! ## What is blocked, and why only this much
 //!
@@ -151,9 +154,9 @@ pub const TRACE_CONTEXT_HEADERS: &[&str] = &["traceparent", "tracestate"];
 ///
 /// The list here is the one every surface shares, and it is complete only
 /// where the caller's credential always arrives in a slot it names — on
-/// `/v1/*` and MCP the gateway reads `authorization` or `x-api-key` and
-/// nothing else. A surface where the OPERATOR chooses the slot has to add
-/// its own; see [`exact_match_only_with`].
+/// `/v1/*`, MCP and `/a2a/*` the gateway reads `authorization` or
+/// `x-api-key` and nothing else. A surface where the OPERATOR chooses the
+/// slot has to add its own; see [`exact_match_only_with`].
 pub fn exact_match_only(name: &str) -> bool {
     CREDENTIAL_SLOT_HEADERS.contains(&name) || TRACE_CONTEXT_HEADERS.contains(&name)
 }
@@ -375,6 +378,12 @@ mod tests {
         assert!(!header_forward_blocked("content-type"));
         assert!(!client_header_forwardable("x-stainless-lang"));
         assert!(!client_header_forwardable("anthropic-version"));
+        // Named rather than left to the list: a surface that negotiates its
+        // own response shape relies on this one — the A2A streaming path
+        // asks for `text/event-stream` and then parses SSE, so a caller's
+        // `accept` reaching the upstream changes a body it has to read.
+        assert!(!client_header_forwardable("accept"));
+        assert!(!header_forward_blocked("accept"));
         assert!(client_header_forwardable("anthropic-beta"));
     }
 

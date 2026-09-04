@@ -770,10 +770,16 @@ async fn a_streaming_call_forwards_too() {
     use futures::StreamExt;
 
     let addr = spawn_streaming_agent().await;
+    // `["*"]` and a caller that really sends `accept`: this call negotiates
+    // its own response shape and then parses SSE, so the assertion below is
+    // about the blocked set rather than about a pattern that never matched.
     let bridge = HttpBridge::new(upstream(format!("http://{addr}/a2a"), A2aAuth::None))
         .with_forwarded_client_headers(resolved(
-            &["x-user-jwt"],
-            &[("x-user-jwt", "eyJhbGciOi.caller")],
+            &["*"],
+            &[
+                ("x-user-jwt", "eyJhbGciOi.caller"),
+                ("accept", "application/json"),
+            ],
         ));
 
     let events: Vec<Value> = bridge
@@ -788,7 +794,11 @@ async fn a_streaming_call_forwards_too() {
         seen(&events[0]["result"]["headers"], "x-user-jwt"),
         vec!["eyJhbGciOi.caller"]
     );
-    // The streaming call still asks for SSE with its own `accept`, which the
-    // forward's blocked set is what keeps a caller from overriding.
-    assert_eq!(events[0]["result"]["accept"], "text/event-stream");
+    // The arity is what pins it: the builder APPENDS, so a caller's `accept`
+    // that got through would ride behind the gateway's and leave the agent
+    // choosing which body shape to send.
+    assert_eq!(
+        seen(&events[0]["result"]["headers"], "accept"),
+        vec!["text/event-stream"]
+    );
 }

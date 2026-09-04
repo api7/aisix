@@ -24,7 +24,7 @@ import {
 // hands that service the end user's own credentials and context — the
 // service keeps reading the header it always read.
 //
-// Three faces build their outbound headers in completely different code,
+// Four faces build their outbound headers in completely different code,
 // which is why each gets its own coverage here:
 //
 //   1. /v1/*             — ProviderKey `request.forward_client_headers`,
@@ -687,7 +687,10 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
       }),
     });
 
-  /** The last request the A2A stub saw on `method`, since `mark`. */
+  /**
+   * Every request the A2A stub saw since `mark` under `httpMethod` — the card
+   * fetch is a GET and the JSON-RPC call a POST, and one test drives both.
+   */
   const a2aSince = (mark: number, httpMethod: "GET" | "POST") =>
     a2aUpstream!.requests.slice(mark).filter((r) => r.httpMethod === httpMethod);
 
