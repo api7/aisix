@@ -2,6 +2,7 @@ export { spawnApp, suiteThreadPerCore, type SpawnedApp, type AppOverrides } from
 export { AdminClient, waitConfigPropagation, awaitWindowHeadroom } from "./admin.js";
 export { ProxyClient } from "./proxy.js";
 export { EtcdClient, etcdEndpoint } from "./etcd.js";
+export { startEtcdRelay, type EtcdRelay } from "./etcd-relay.js";
 export { SeedClient } from "./seed.js";
 export { startOpenAiUpstream, type OpenAiUpstream, type ReceivedRequest } from "./upstream-openai.js";
 export {

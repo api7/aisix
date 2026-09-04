@@ -442,8 +442,10 @@ async function spawnPointedAtDeadEtcd(): Promise<MinimalApp> {
   const dir = await mkdtemp(join(tmpdir(), "aisix-status-nl-"));
   const cfg = {
     // etcd-client's connect is lazy (no eager dial without auth), so the
-    // gateway boots and binds its listeners even though nothing answers here;
-    // the watch supervisor's first load never succeeds → never_loaded.
+    // gateway boots and binds its metrics listener even though nothing answers
+    // here; the watch supervisor's first load never succeeds → never_loaded.
+    // The proxy listener stays closed for exactly that reason, which is why
+    // this case gates on the metrics listener alone.
     etcd: {
       endpoints: [`http://127.0.0.1:${deadPort}`],
       prefix: "/aisix-never-loaded",

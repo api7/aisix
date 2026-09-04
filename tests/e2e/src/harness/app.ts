@@ -119,6 +119,19 @@ export interface AppOverrides {
    */
   etcdPrefix?: string;
   /**
+   * Whether readiness waits for the proxy `/livez` to answer. **Defaults
+   * to `true`**; `false` skips that gate.
+   *
+   * The proxy listener does not bind until the gateway has applied its
+   * first configuration, so a spec that deliberately starves the gateway
+   * of configuration would otherwise fail in `spawnApp` instead of in its
+   * own assertions. Readiness then rests on the metrics listener, which
+   * binds regardless of the configuration source — so `prometheus` (or
+   * `admin`) must stay on, and `spawnApp` rejects the combination that
+   * would leave it with nothing to wait for.
+   */
+  awaitProxyListener?: boolean;
+  /**
    * `managed.snapshot_cache_path` — enables the on-disk snapshot cache
    * (#871) without managed mode. Point two sequential apps (same
    * `etcdPrefix`) at one path to exercise cache-restored restarts.
@@ -252,6 +265,28 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
       "spawnApp: control the admin listener with the `admin` boolean override, not `extra.admin`",
     );
   }
+  if (overrides.awaitProxyListener === false) {
+    // Readiness now rests entirely on the other two listeners, so both the
+    // ways of turning them off have to be refused. `extra` counts: it
+    // replaces whole top-level blocks, so an `extra.observability` can
+    // disable the metrics listener the readiness probe is waiting on while
+    // `prometheusEnabled` still reads true — spawnApp would then sit out its
+    // full readiness timeout.
+    if (!adminEnabled && !prometheusEnabled) {
+      throw new Error(
+        "spawnApp: awaitProxyListener:false needs `admin` or `prometheus` on — " +
+          "with all three off nothing is waited on, so spawnApp would return before " +
+          "the binary has started and a later non-zero exit could not surface",
+      );
+    }
+    if (overrides.extra && "observability" in overrides.extra) {
+      throw new Error(
+        "spawnApp: awaitProxyListener:false cannot be combined with " +
+          "`extra.observability` — it replaces the generated metrics block, which is " +
+          "what readiness waits on once the proxy listener is not",
+      );
+    }
+  }
   const [proxyPort, adminPort, metricsPort] = await pickFreePorts(3);
   const adminKey = overrides.adminKey ?? `admin-${randomUUID()}`;
   const etcdPrefix = overrides.etcdPrefix ?? `/aisix-e2e-${randomUUID()}`;
@@ -375,7 +410,11 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   try {
     await Promise.race([
       Promise.all([
-        waitForReady(`${proxyUrl}/livez`, READY_TIMEOUT_MS),
+        // The proxy listener binds only once a configuration has been
+        // applied, so a spec that holds configuration back opts out here.
+        ...((overrides.awaitProxyListener ?? true)
+          ? [waitForReady(`${proxyUrl}/livez`, READY_TIMEOUT_MS)]
+          : []),
         // The admin health endpoint only exists when the admin listener is
         // bound; with `admin: false` there is no admin surface, so gate on
         // the proxy `/livez` and the metrics listener alone. (If both

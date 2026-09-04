@@ -52,6 +52,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use tokio::sync::watch;
 
 /// Maximum number of source + runtime rejection details retained for status
 /// and heartbeat reporting. Aggregate counts and the runtime identity digest
@@ -267,6 +268,12 @@ pub struct LoadObservation {
 #[derive(Debug, Clone)]
 pub struct ConfigStatus {
     inner: Arc<Mutex<ConfigStatusInner>>,
+    /// Level-triggered mirror of `inner.ever_applied`, so the boot path can
+    /// *await* the first apply instead of polling [`Self::is_ready`].
+    /// A `watch` rather than a `Notify` deliberately: a waiter that arrives
+    /// after the first apply resolves immediately instead of hanging on a
+    /// notification that already fired.
+    ever_applied_tx: Arc<watch::Sender<bool>>,
 }
 
 #[derive(Debug)]
@@ -345,6 +352,7 @@ impl ConfigStatus {
     /// Construct a status handle for a source. Starts in `never_loaded`.
     pub fn new(source_kind: SourceKind) -> Self {
         Self {
+            ever_applied_tx: Arc::new(watch::channel(false).0),
             inner: Arc::new(Mutex::new(ConfigStatusInner {
                 source_kind,
                 connected: false,
@@ -392,6 +400,11 @@ impl ConfigStatus {
         inner.latest_wholly_rejected = obs.wholly_rejected;
 
         if let Some(applied) = obs.applied {
+            if !was_applied {
+                // Open the boot-time proxy-listener gate. Sending under the
+                // inner lock is safe: waiters are woken, not run inline.
+                self.ever_applied_tx.send_replace(true);
+            }
             inner.ever_applied = true;
             inner.config_hash = Some(applied.config_hash);
             inner.applied_revision = applied.revision;
@@ -591,6 +604,20 @@ impl ConfigStatus {
     /// `GET /status/ready`.
     pub fn is_ready(&self) -> bool {
         self.inner.lock().unwrap().ever_applied
+    }
+
+    /// Resolve once a configuration has been applied — the awaitable form of
+    /// [`Self::is_ready`]. Returns immediately when an apply already
+    /// happened, so a caller cannot miss the signal by racing it.
+    ///
+    /// The boot path gates the proxy listener on this: an instance that has
+    /// never applied a configuration must not accept client traffic, because
+    /// a platform that reads "the TCP port accepts" as "this instance is
+    /// ready" would route to a gateway with nothing to serve.
+    pub async fn wait_until_applied(&self) {
+        // `wait_for` inspects the current value before it awaits.
+        // The error arm is unreachable — `self` owns the sender.
+        let _ = self.ever_applied_tx.subscribe().wait_for(|v| *v).await;
     }
 
     /// The hash of the last applied (served) config snapshot, or `None`
@@ -985,6 +1012,65 @@ mod tests {
         let cs = ConfigStatus::new(SourceKind::Etcd);
         assert_eq!(cs.view().state, ConfigState::NeverLoaded);
         assert!(!cs.is_ready());
+    }
+
+    fn clean_load() -> LoadObservation {
+        LoadObservation {
+            source_hash: "h".into(),
+            observed_revision: Some(7),
+            applied: Some(applied("h", &[("models", 1)])),
+            rejected: vec![],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: true,
+            wholly_rejected: false,
+        }
+    }
+
+    // The boot path gates the proxy listener on this: a waiter that never
+    // resolves would hang a gateway that HAS a configuration, and one that
+    // resolves early would bind a listener with nothing to serve.
+    #[tokio::test]
+    async fn wait_until_applied_resolves_on_the_first_apply() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        let waiter = tokio::spawn({
+            let cs = cs.clone();
+            async move { cs.wait_until_applied().await }
+        });
+        // Nothing applied yet, so the waiter must still be pending.
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        cs.record_load(clean_load());
+        waiter.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_until_applied_returns_immediately_after_an_earlier_apply() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        cs.record_load(clean_load());
+        // Subscribing after the fact must not miss the signal — the reason
+        // this is a watch channel and not a one-shot notification.
+        cs.wait_until_applied().await;
+    }
+
+    #[tokio::test]
+    async fn wait_until_applied_stays_pending_while_every_load_is_rejected() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        cs.record_load(LoadObservation {
+            applied: None,
+            wholly_rejected: true,
+            ..clean_load()
+        });
+        cs.record_fetch_failure();
+        assert!(!cs.is_ready());
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            cs.wait_until_applied(),
+        )
+        .await
+        .expect_err("no configuration was applied, so the gate must stay closed");
     }
 
     #[test]
