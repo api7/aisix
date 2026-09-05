@@ -42,6 +42,13 @@ pub enum WatchEvent {
 pub enum ProviderError {
     #[error("etcd connection failed: {0}")]
     Connect(String),
+    /// etcd answered and refused the connection — wrong credentials, a
+    /// user without the required permission, or endpoints that cannot be
+    /// used at all. Distinct from [`ProviderError::Connect`] because it
+    /// does not heal by waiting: the boot path exits on it instead of
+    /// joining the retry loop.
+    #[error("etcd rejected the connection: {0}")]
+    Rejected(String),
     #[error("etcd range request failed: {0}")]
     Range(String),
     #[error("etcd watch stream failed: {0}")]

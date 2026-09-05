@@ -146,6 +146,14 @@ jobs:
       ADMIN_TEST_ETCD_URL: http://127.0.0.1:2379
       # Picked up by crates/aisix-etcd/tests/watch_integration.rs.
       ETCD_TEST_URL: http://127.0.0.1:2379
+      # Picked up by crates/aisix-etcd/tests/auth_connect_integration.rs.
+      # A SECOND cluster, started with authentication ON by the step
+      # below: enabling auth is cluster-wide, so doing it on the service
+      # above would lock every other etcd test out of it. Same
+      # skip-if-unset / no-AISIX_-prefix rules.
+      ETCD_AUTH_TEST_URL: http://127.0.0.1:2479
+      ETCD_AUTH_TEST_USER: root
+      ETCD_AUTH_TEST_PASSWORD: aisix-ci-etcd
     steps:
       - uses: actions/checkout@v6
         with:
@@ -161,6 +169,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Start an authenticated etcd
+        # Not a service container: a user has to be created and
+        # `auth enable` called after the server is up, which service
+        # containers cannot do.
+        run: |
+          docker run -d --name etcd-auth -p 2479:2479 quay.io/coreos/etcd:v3.5.18 \
+            /usr/local/bin/etcd --name auth1 \
+            --listen-client-urls http://0.0.0.0:2479 \
+            --advertise-client-urls http://127.0.0.1:2479 \
+            --listen-peer-urls http://0.0.0.0:2480 \
+            --initial-advertise-peer-urls http://127.0.0.1:2480 \
+            --initial-cluster auth1=http://127.0.0.1:2480
+          for _ in $(seq 30); do
+            docker exec -e ETCDCTL_API=3 -e ETCDCTL_ENDPOINTS=http://127.0.0.1:2479 \
+              etcd-auth etcdctl endpoint health && break
+            sleep 1
+          done
+          docker exec -e ETCDCTL_API=3 -e ETCDCTL_ENDPOINTS=http://127.0.0.1:2479 \
+            etcd-auth etcdctl user add root:aisix-ci-etcd
+          docker exec -e ETCDCTL_API=3 -e ETCDCTL_ENDPOINTS=http://127.0.0.1:2479 \
+            etcd-auth etcdctl user grant-role root root
+          docker exec -e ETCDCTL_API=3 -e ETCDCTL_ENDPOINTS=http://127.0.0.1:2479 \
+            etcd-auth etcdctl auth enable
       - name: Start Redis Cluster + Sentinel
         # The `redis` service above covers single-node. Here we bring up a
         # 3-node cluster (7000-7002) and a sentinel (26379) monitoring the

@@ -13,8 +13,10 @@ etcd:
   # one out: it falls back to the next level of a resolution chain these
   # flat startup settings do not have.)
   #
-  # `dial_timeout_ms` bounds the TCP connect — not the TLS handshake
-  # after it, and not the authentication exchange when `user` is set.
+  # `dial_timeout_ms` bounds the whole dial: the TCP connect, the TLS
+  # handshake after it, and the authentication exchange when `user` is
+  # set. An expired dial is treated as an etcd that is not reachable —
+  # the gateway keeps retrying it rather than exiting.
   # `request_timeout_ms` bounds a single request/response call — the
   # configuration range read at boot and on every reconnect, creating the
   # watch, and the admin API's reads. It deliberately does not apply to

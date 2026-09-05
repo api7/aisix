@@ -41,8 +41,10 @@ etcd:
   # means unbounded as well — the same reading a model's `timeout: 0`
   # gets. (A model's `stream_timeout: 0` instead falls back to the next
   # level of a resolution chain these flat startup keys do not have.)
-  # `dial_timeout_ms` bounds the TCP connect only, not the TLS handshake
-  # layered above it; `request_timeout_ms` bounds a
+  # `dial_timeout_ms` bounds the whole dial — the TCP connect, the TLS
+  # handshake above it and the authentication exchange when `user` is
+  # set — and an expired dial is retried, not fatal;
+  # `request_timeout_ms` bounds a
   # single request/response call (the configuration range read, creating
   # the watch, the admin reads) but never the established watch stream. A
   # `request_timeout_ms` the range read cannot finish inside makes the
