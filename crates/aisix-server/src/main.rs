@@ -738,20 +738,26 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // (env_id populated from the register response above), bare
             // `<prefix>` in self-hosted dev where env_id is empty.
             let etcd_prefix = cfg.etcd.effective_prefix();
+            // Only a refusal ends the boot here: an etcd that cannot be
+            // reached leaves the connection pending and the supervisor
+            // dials it again, so the gateway waits for its source instead
+            // of exiting on it. See `EtcdConfigProvider::connect`.
             let provider = Arc::new(
                 EtcdConfigProvider::connect(
                     &cfg.etcd.endpoints,
                     etcd_prefix.clone(),
                     connect_options.clone(),
                     cfg.etcd.request_timeout(),
+                    cfg.etcd.dial_timeout(),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
             );
-            // Separate client for the admin read surface — only needed when
-            // the admin listener is bound. We could share a single underlying
-            // connection via `Client::clone()` but keeping two is cleaner:
-            // admin reads and the watch stream don't contend on the same mutex.
+            // Separate connection for the admin read surface — only needed
+            // when the admin listener is bound. It could share the config
+            // provider's, but keeping two means an admin read and the watch
+            // stream never queue behind the same connect, and neither can
+            // stall the other's channel.
             // Skipped whenever the admin listener is not bound — managed mode,
             // or `admin.enabled = false` — so admin-off doesn't pay for (or
             // fail boot on) a connection it immediately drops; `/status/models`
@@ -760,9 +766,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 None
             } else {
                 Some((
-                    etcd_client::Client::connect(&cfg.etcd.endpoints, connect_options.clone())
-                        .await
-                        .map_err(|e| anyhow::anyhow!("etcd admin client connect failed: {e}"))?,
+                    Arc::new(aisix_etcd::LazyEtcdClient::new(
+                        cfg.etcd.endpoints.clone(),
+                        connect_options.clone(),
+                        cfg.etcd.dial_timeout(),
+                    )),
                     etcd_prefix.clone(),
                     cfg.etcd.request_timeout(),
                 ))

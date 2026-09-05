@@ -4,7 +4,8 @@
 //! (see `aisix-core`). This crate is what *populates* that handle, running
 //! a single supervisor task that:
 //!
-//! 1. Connects to etcd (5s × 5 retries on bootstrap — spec §2)
+//! 1. Connects to etcd — an etcd that cannot be reached is left to this
+//!    loop rather than failing the boot; credentials it refuses are fatal
 //! 2. Performs a full range read under the configured prefix
 //! 3. Opens a watch stream from the next revision
 //! 4. Applies Put / Delete events by copy-on-write replacing the snapshot
@@ -29,7 +30,9 @@ pub mod snapshot_cache;
 pub mod supervisor;
 
 pub use backoff::{ExpBackoff, BASE_MS, MAX_MS};
-pub use client::{kv_client, watch_client, MAX_DECODING_MESSAGE_SIZE};
+pub use client::{
+    kv_client, watch_client, ConnectError, LazyEtcdClient, MAX_DECODING_MESSAGE_SIZE,
+};
 pub use etcd_provider::{
     ConnectPolicy, EtcdConfigProvider, EtcdWatchStream, CONNECT_MAX_ATTEMPTS,
     CONNECT_RETRY_INTERVAL,

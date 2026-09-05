@@ -130,6 +130,7 @@ dependencies = [
  "etcd-client",
  "futures",
  "h2",
+ "http 1.4.0",
  "serde",
  "serde_ignored",
  "serde_json",

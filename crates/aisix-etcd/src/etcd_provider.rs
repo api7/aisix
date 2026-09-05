@@ -1,45 +1,26 @@
 //! Real [`ConfigProvider`] backed by `etcd-client`.
 //!
 //! Connection sequence (spec §2):
-//! - Fixed-interval retry on initial connect: 5s × up to 5 attempts
+//! - The initial connect splits its failures by cause: an etcd that never
+//!   answered leaves the connection pending for the supervisor's retry
+//!   loop, while credentials etcd refused are returned to the caller. The
+//!   fixed-interval 5s × 5 ladder is now only the `export` CLI's
+//!   ([`EtcdConfigProvider::connect_with_policy`])
 //! - On success, `get` with prefix to bootstrap
 //! - `watch` with `start_revision = range_revision + 1` to avoid a gap
 //! - Compaction errors map to [`ProviderError::Compacted`] so the
 //!   supervisor can trigger a full resync
 
 use async_trait::async_trait;
-use etcd_client::{
-    Client, ConnectOptions, Error as EtcdError, EventType, GetOptions, KvClient, WatchClient,
-    WatchOptions,
-};
+use etcd_client::{ConnectOptions, EventType, GetOptions, WatchOptions};
 use futures::{Stream, StreamExt};
 use std::collections::VecDeque;
-use std::error::Error as StdError;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::sync::Mutex;
 
-/// Flatten an error and its source chain into a single readable line.
-/// Without this, tonic surfaces opaque strings like "dns error" while
-/// the real cause (`getaddrinfo: Name or service not known`, TLS
-/// handshake reason, …) hides in `.source()`. The supervisor logs
-/// the returned string, so CI triage gets the full picture.
-fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
-    let mut out = err.to_string();
-    let mut cur = err.source();
-    while let Some(next) = cur {
-        let s = next.to_string();
-        if !s.is_empty() && !out.ends_with(&s) {
-            out.push_str(": ");
-            out.push_str(&s);
-        }
-        cur = next.source();
-    }
-    out
-}
-
-use crate::client::{kv_client, watch_client};
+use crate::client::{classify, format_etcd_error, ConnectError, LazyEtcdClient};
 use crate::provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
 
 /// Fixed-interval retry: 5s × 5 attempts (spec §2).
@@ -64,14 +45,13 @@ impl Default for ConnectPolicy {
 }
 
 pub struct EtcdConfigProvider {
-    /// The sub-clients are `Clone`-cheap (internally Arc'd), but we still
-    /// serialise access through a Mutex because their RPC methods take
-    /// `&mut self`. They are held rather than derived from a `Client` per
-    /// call so the raised decode limit cannot be lost by a later call site
-    /// reaching for `Client::get` / `Client::watch`, which keep tonic's
-    /// 4 MiB default.
-    kv: Mutex<KvClient>,
-    watch: Mutex<WatchClient>,
+    /// The connection, which may not have been established yet: an etcd
+    /// that could not be reached at boot is dialled again by whichever
+    /// call the supervisor's retry loop makes next. Sub-clients are taken
+    /// from it per call — they are `Clone`-cheap (internally Arc'd) and
+    /// carry the raised decode limit, which `Client::get` /
+    /// `Client::watch` would not.
+    client: Arc<LazyEtcdClient>,
     prefix: String,
     /// Bound applied to each request/response call this provider makes —
     /// the range read in [`Self::load_all`] and the watch-create
@@ -99,53 +79,95 @@ impl std::fmt::Debug for EtcdConfigProvider {
 }
 
 impl EtcdConfigProvider {
-    /// Connect with the spec §2 default retry policy.
+    /// Connect for a gateway boot, splitting the failure by cause.
+    ///
+    /// A dial that etcd never answered is not an error here: the provider
+    /// comes back with its connection still pending and the watch
+    /// supervisor's retry loop dials again, which is what an
+    /// unauthenticated deployment has always done (`Client::connect` does
+    /// no I/O without credentials, so every failure lands on the first
+    /// read). The gateway boots, holds the proxy listener closed and binds
+    /// as soon as a configuration arrives.
+    ///
+    /// Credentials etcd has refused are fatal and returned as
+    /// [`ProviderError::Rejected`] on the first answer — no retry ladder,
+    /// because no amount of waiting turns a wrong password into a right
+    /// one, and a boot that hangs on one is worse than a boot that stops
+    /// and says so.
     pub async fn connect(
         endpoints: &[String],
         prefix: impl Into<String>,
         options: Option<ConnectOptions>,
         request_timeout: Option<Duration>,
+        dial_timeout: Option<Duration>,
     ) -> Result<Self, ProviderError> {
-        Self::connect_with_policy(
-            endpoints,
-            prefix,
+        let prefix = prefix.into();
+        let client = Arc::new(LazyEtcdClient::new(
+            endpoints.to_vec(),
             options,
+            dial_timeout,
+        ));
+        match client.connect_now().await {
+            Ok(()) => tracing::info!(prefix = %prefix, "etcd connected"),
+            Err(ConnectError::Unreachable(detail)) => tracing::warn!(
+                error = %detail,
+                prefix = %prefix,
+                "etcd is not reachable yet — starting anyway and retrying in the background; \
+                 the proxy listener stays closed until a configuration is applied",
+            ),
+            Err(err @ ConnectError::Rejected(_)) => {
+                return Err(ProviderError::Rejected(err.detail().to_string()))
+            }
+        }
+        Ok(Self {
+            client,
+            prefix,
             request_timeout,
-            ConnectPolicy::default(),
-        )
-        .await
+        })
     }
 
-    /// Connect with a caller-chosen retry policy. Returns the last-seen
-    /// error on failure to surface useful context in the bootstrap logs.
+    /// Connect eagerly, retrying an unreachable etcd on `policy` and
+    /// failing once it is exhausted. For callers that cannot wait for a
+    /// source to come back — the `export` CLI — rather than the gateway,
+    /// which uses [`Self::connect`] and defers to the supervisor.
+    ///
+    /// Refused credentials end it on the first answer, as they do there.
     pub async fn connect_with_policy(
         endpoints: &[String],
         prefix: impl Into<String>,
         options: Option<ConnectOptions>,
         request_timeout: Option<Duration>,
+        dial_timeout: Option<Duration>,
         policy: ConnectPolicy,
     ) -> Result<Self, ProviderError> {
         let prefix = prefix.into();
-        let mut last_err: Option<EtcdError> = None;
+        let client = Arc::new(LazyEtcdClient::new(
+            endpoints.to_vec(),
+            options,
+            dial_timeout,
+        ));
+        let mut last_err: Option<String> = None;
         for attempt in 1..=policy.attempts {
-            match Client::connect(endpoints, options.clone()).await {
-                Ok(client) => {
+            match client.connect_now().await {
+                Ok(()) => {
                     tracing::info!(attempt, prefix = %prefix, "etcd connected");
                     return Ok(Self {
-                        kv: Mutex::new(kv_client(&client)),
-                        watch: Mutex::new(watch_client(&client)),
+                        client,
                         prefix,
                         request_timeout,
                     });
                 }
-                Err(err) => {
+                Err(err @ ConnectError::Rejected(_)) => {
+                    return Err(ProviderError::Rejected(err.detail().to_string()))
+                }
+                Err(ConnectError::Unreachable(detail)) => {
                     tracing::warn!(
                         attempt,
                         max = policy.attempts,
-                        error = %format_error_chain(&err),
+                        error = %detail,
                         "etcd connect failed — retrying",
                     );
-                    last_err = Some(err);
+                    last_err = Some(detail);
                     if attempt < policy.attempts {
                         tokio::time::sleep(policy.interval).await;
                     }
@@ -153,15 +175,24 @@ impl EtcdConfigProvider {
             }
         }
         Err(ProviderError::Connect(
-            last_err
-                .as_ref()
-                .map(|e| format_error_chain(e))
-                .unwrap_or_else(|| "exhausted retries".to_string()),
+            last_err.unwrap_or_else(|| "exhausted retries".to_string()),
         ))
     }
 
     pub fn prefix(&self) -> &str {
         &self.prefix
+    }
+}
+
+impl From<ConnectError> for ProviderError {
+    /// Both classes reach the supervisor, which backs off and retries
+    /// whichever it gets — the split is what the boot path acts on, and
+    /// what the operator reads in the warn line.
+    fn from(err: ConnectError) -> Self {
+        match &err {
+            ConnectError::Unreachable(detail) => ProviderError::Connect(detail.clone()),
+            ConnectError::Rejected(detail) => ProviderError::Rejected(detail.clone()),
+        }
     }
 }
 
@@ -173,6 +204,23 @@ impl EtcdConfigProvider {
 /// attribution, not control flow: `Supervisor::run` routes every
 /// `ProviderError` out of a cycle to the same reconnect-with-backoff
 /// path, so the aborted call is retried whichever variant carries it.
+/// Report one failed etcd call.
+///
+/// A refusal is reported as such wherever etcd hands it over, not only
+/// on the dial: a user who authenticates but lacks the permission is
+/// refused by the range read, and a token an etcd restart invalidated is
+/// refused by every call after it. Those never heal by retrying, and
+/// reporting them as ordinary transport trouble is what buries them in a
+/// warn line that repeats forever. Everything else keeps the variant
+/// naming the call that failed, which is what the supervisor's backoff
+/// line says.
+fn call_error(err: &etcd_client::Error, into_err: fn(String) -> ProviderError) -> ProviderError {
+    match classify(err) {
+        ConnectError::Rejected(detail) => ProviderError::Rejected(detail),
+        ConnectError::Unreachable(_) => into_err(format_etcd_error(err)),
+    }
+}
+
 async fn bound<T>(
     timeout: Option<Duration>,
     what: &str,
@@ -193,7 +241,20 @@ async fn bound<T>(
 #[async_trait]
 impl ConfigProvider for EtcdConfigProvider {
     async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
-        let mut kv = self.kv.lock().await;
+        // The dial is bounded like the call it is part of. Without
+        // credentials there is nothing to dial here — the channel
+        // connects inside the `get` below, under the same bound — but
+        // with them the `Authenticate` round trip happens on the way in,
+        // and an endpoint that accepts TCP and answers nothing would
+        // otherwise hold this read open forever: no backoff, no failure
+        // recorded, and `/status/config` still reporting connected.
+        let mut kv = bound(
+            self.request_timeout,
+            "etcd connect",
+            ProviderError::Connect,
+            self.client.kv(),
+        )
+        .await??;
         let read = kv.get(
             self.prefix.as_bytes(),
             Some(GetOptions::new().with_prefix()),
@@ -205,7 +266,7 @@ impl ConfigProvider for EtcdConfigProvider {
             read,
         )
         .await?
-        .map_err(|e| ProviderError::Range(format_error_chain(&e)))?;
+        .map_err(|e| call_error(&e, ProviderError::Range))?;
 
         let revision = resp.header().map(|h| h.revision()).unwrap_or(0);
 
@@ -229,7 +290,13 @@ impl ConfigProvider for EtcdConfigProvider {
         Box<dyn Stream<Item = Result<WatchEvent, ProviderError>> + Send + Unpin>,
         ProviderError,
     > {
-        let mut watch = self.watch.lock().await;
+        let mut watch = bound(
+            self.request_timeout,
+            "etcd connect",
+            ProviderError::Connect,
+            self.client.watch(),
+        )
+        .await??;
         let opts = WatchOptions::new()
             .with_prefix()
             .with_start_revision(start_revision);
@@ -251,7 +318,7 @@ impl ConfigProvider for EtcdConfigProvider {
             create,
         )
         .await?
-        .map_err(|e| ProviderError::Watch(format_error_chain(&e)))?;
+        .map_err(|e| call_error(&e, ProviderError::Watch))?;
 
         Ok(Box::new(EtcdWatchStream {
             inner: stream,
@@ -310,7 +377,7 @@ impl Stream for EtcdWatchStream {
                 {
                     Poll::Ready(Some(Err(ProviderError::Compacted)))
                 } else {
-                    Poll::Ready(Some(Err(ProviderError::Watch(format_error_chain(&err)))))
+                    Poll::Ready(Some(Err(call_error(&err, ProviderError::Watch))))
                 }
             }
             Poll::Ready(Some(Ok(resp))) => {
@@ -341,6 +408,381 @@ impl Stream for EtcdWatchStream {
 mod tests {
     use super::*;
 
+    /// Credentials for a dial. Any user is enough to make
+    /// `Client::connect` issue the `Authenticate` RPC, which is the only
+    /// thing that makes it perform I/O — and the reason an authenticated
+    /// deployment used to exit on an etcd an unauthenticated one waits for.
+    fn credentials() -> Option<ConnectOptions> {
+        Some(ConnectOptions::new().with_user("root", "rootpw"))
+    }
+
+    /// An address nothing is listening on: every dial is refused.
+    async fn closed_endpoint() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    /// An etcd that answers every call with one gRPC status and nothing
+    /// else — a trailers-only response, which is how a real server
+    /// reports a refusal. `code` is the wire number: 3 is
+    /// `InvalidArgument`, what etcd answers a wrong password with; 14 is
+    /// `Unavailable`, what it answers while it has no leader.
+    async fn spawn_grpc_status_server(code: u16, message: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let Ok(mut conn) = h2::server::handshake(socket).await else {
+                        return;
+                    };
+                    while let Some(Ok((_req, mut respond))) = conn.accept().await {
+                        let response = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc")
+                            .header("grpc-status", code.to_string())
+                            .header("grpc-message", message)
+                            .body(())
+                            .unwrap();
+                        let _ = respond.send_response(response, true);
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_authenticated_etcd_does_not_end_the_boot() {
+        // The bug: with `etcd.user` set, `Client::connect` issues the
+        // `Authenticate` RPC, so an etcd that is down failed the connect
+        // — and the boot path exited on it. An unauthenticated
+        // deployment, whose connect performs no I/O, has always started
+        // and waited. Both must wait.
+        let endpoint = closed_endpoint().await;
+        let started = std::time::Instant::now();
+        let provider = tokio::time::timeout(
+            Duration::from_secs(5),
+            EtcdConfigProvider::connect(&[endpoint], "/aisix", credentials(), None, None),
+        )
+        .await
+        .expect("an unreachable etcd must not hold the boot path")
+        .expect("an unreachable etcd must not fail the boot");
+        assert!(
+            started.elapsed() < CONNECT_RETRY_INTERVAL,
+            "the boot must not spend a retry ladder before starting: {:?}",
+            started.elapsed(),
+        );
+
+        // …and the failure lands where the supervisor already retries it.
+        let err = provider.load_all().await.expect_err("etcd is not there");
+        assert!(
+            matches!(err, ProviderError::Connect(_)),
+            "an unreachable etcd must stay retryable, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_etcd_connects_on_the_first_call_that_reaches_it() {
+        // The other half of deferring: the connection is pending, not
+        // abandoned. Nothing about the provider has to be rebuilt for the
+        // gateway to pick etcd up once it answers — which is what lets
+        // the supervisor's retry loop bind a configuration on its own.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let provider = EtcdConfigProvider::connect(
+            &[format!("http://{addr}")],
+            "/aisix",
+            credentials(),
+            Some(Duration::from_secs(2)),
+            None,
+        )
+        .await
+        .expect("an unreachable etcd must not fail the boot");
+        assert!(matches!(
+            provider.load_all().await,
+            Err(ProviderError::Connect(_))
+        ));
+
+        // The endpoint comes back — as a server that refuses the
+        // credentials, which is an answer, and so proves the dial was
+        // re-attempted rather than short-circuited by the first failure.
+        let server = tokio::net::TcpListener::bind(addr).await.unwrap();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = server.accept().await {
+                tokio::spawn(async move {
+                    let Ok(mut conn) = h2::server::handshake(socket).await else {
+                        return;
+                    };
+                    while let Some(Ok((_req, mut respond))) = conn.accept().await {
+                        let response = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc")
+                            .header("grpc-status", "3")
+                            .header("grpc-message", "etcdserver: authentication failed")
+                            .body(())
+                            .unwrap();
+                        let _ = respond.send_response(response, true);
+                    }
+                });
+            }
+        });
+        let err = provider
+            .load_all()
+            .await
+            .expect_err("the credentials are refused");
+        assert!(
+            matches!(err, ProviderError::Rejected(_)),
+            "a re-dial that reached the server must report its answer, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn credentials_the_server_refuses_end_the_boot_on_the_first_answer() {
+        // The other class: etcd answered. Waiting cannot turn a wrong
+        // password into a right one, so the boot stops and names the
+        // cause instead of retrying — and it stops on the first answer,
+        // not after the connect ladder.
+        let endpoint = spawn_grpc_status_server(
+            3,
+            "etcdserver: authentication failed, invalid user ID or password",
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let err = EtcdConfigProvider::connect(&[endpoint], "/aisix", credentials(), None, None)
+            .await
+            .expect_err("refused credentials cannot produce a usable provider");
+        let ProviderError::Rejected(msg) = err else {
+            panic!("a refusal must be its own class, got {err:?}");
+        };
+        assert!(
+            msg.contains("authentication failed"),
+            "the error must carry what etcd said: {msg}",
+        );
+        assert!(
+            started.elapsed() < CONNECT_RETRY_INTERVAL,
+            "a refusal must not walk the retry ladder: {:?}",
+            started.elapsed(),
+        );
+    }
+
+    #[tokio::test]
+    async fn the_export_path_stops_on_a_refusal_instead_of_retrying_it() {
+        // Same split on the CLI's eager path, which does retry an
+        // unreachable etcd: three attempts a second apart would be
+        // visible in the elapsed time if a refusal walked the ladder.
+        let endpoint = spawn_grpc_status_server(7, "etcdserver: permission denied").await;
+        let policy = ConnectPolicy {
+            interval: Duration::from_secs(1),
+            attempts: 3,
+        };
+        let started = std::time::Instant::now();
+        let err = EtcdConfigProvider::connect_with_policy(
+            &[endpoint],
+            "/aisix",
+            credentials(),
+            None,
+            None,
+            policy,
+        )
+        .await
+        .expect_err("refused credentials cannot produce a usable provider");
+        assert!(matches!(err, ProviderError::Rejected(_)), "got {err:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a refusal must not walk the retry ladder: {:?}",
+            started.elapsed(),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_cannot_serve_yet_is_treated_as_unreachable() {
+        // etcd answers `Unavailable` while it has no leader or is
+        // stopping, and tonic manufactures the same code for a refused
+        // TCP connect. Both heal on their own, so neither may end a boot
+        // — and classifying on the status code rather than the message
+        // is what keeps them together.
+        let endpoint = spawn_grpc_status_server(14, "etcdserver: no leader").await;
+        let provider =
+            EtcdConfigProvider::connect(&[endpoint], "/aisix", credentials(), None, None)
+                .await
+                .expect("an etcd that cannot serve yet must not fail the boot");
+        assert!(matches!(
+            provider.load_all().await,
+            Err(ProviderError::Connect(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_dial_timeout_bounds_an_authenticated_connect_that_is_never_answered() {
+        // `ConnectOptions::with_connect_timeout` bounds the TCP connect
+        // only. An endpoint that completes TCP and then goes silent
+        // leaves the TLS handshake and the `Authenticate` round trip
+        // unbounded, so the dial hangs — and with it the boot, before any
+        // listener is up. `etcd.dial_timeout_ms` has to cover the whole
+        // dial, and its expiry is a reachability failure: retried, not
+        // fatal.
+        let endpoint = spawn_silent_h2_server().await;
+        let provider = tokio::time::timeout(
+            Duration::from_secs(10),
+            EtcdConfigProvider::connect(
+                &[endpoint],
+                "/aisix",
+                credentials(),
+                None,
+                Some(Duration::from_millis(300)),
+            ),
+        )
+        .await
+        .expect("the dial must be bounded; without the bound this hangs")
+        .expect("an endpoint that never answers must not fail the boot");
+
+        let err = provider
+            .load_all()
+            .await
+            .expect_err("a dial that never completes cannot read");
+        let ProviderError::Connect(msg) = err else {
+            panic!("an expired dial must stay retryable, got {err:?}");
+        };
+        assert!(
+            msg.contains("etcd.dial_timeout_ms"),
+            "the message must name the key that bounded it: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_the_read_meets_is_reported_as_a_refusal() {
+        // Where etcd refuses is not the caller's choice. A wrong password
+        // is refused by `Authenticate`, but a user who authenticates and
+        // then lacks the permission is refused by the range read, and a
+        // token an etcd restart invalidated is refused by every call
+        // after it. Classifying only the dial would report those as
+        // ordinary transport trouble and bury them in a warn line that
+        // repeats forever.
+        //
+        // No credentials here on purpose: that is the shape where the
+        // dial cannot classify anything at all, because it does no I/O.
+        let endpoint = spawn_grpc_status_server(7, "etcdserver: permission denied").await;
+        let provider = EtcdConfigProvider::connect(&[endpoint], "/aisix", None, None, None)
+            .await
+            .expect("connect is lazy without credentials");
+
+        let err = provider
+            .load_all()
+            .await
+            .expect_err("a refused read cannot succeed");
+        let ProviderError::Rejected(msg) = err else {
+            panic!("a refusal on the read must be its own class, got {err:?}");
+        };
+        assert!(
+            msg.contains("permission denied"),
+            "the error must carry what etcd said: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_request_timeout_also_bounds_the_dial_a_read_has_to_make() {
+        // Without credentials there is nothing to dial on the way into a
+        // read: the channel connects inside the `get`, under
+        // `etcd.request_timeout_ms` like the rest of the call. With them
+        // the `Authenticate` round trip happens first, so a dial left
+        // outside that bound would hold the read open forever against an
+        // endpoint that accepts TCP and answers nothing — no backoff, no
+        // recorded failure, and a `/status/config` still reporting
+        // connected. No `dial_timeout_ms` here on purpose: the operator
+        // set one bound, and it has to cover the whole read.
+        //
+        // The endpoint is refused at connect time and only becomes the
+        // silent one afterwards, so the dial under test is the read's.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let provider = EtcdConfigProvider::connect(
+            &[format!("http://{addr}")],
+            "/aisix",
+            credentials(),
+            Some(Duration::from_millis(300)),
+            None,
+        )
+        .await
+        .expect("an unreachable etcd must not fail the boot");
+
+        serve_silently(tokio::net::TcpListener::bind(addr).await.unwrap());
+
+        let err = tokio::time::timeout(Duration::from_secs(10), provider.load_all())
+            .await
+            .expect("the dial the read makes must be bounded; without it this hangs")
+            .expect_err("a dial that never completes cannot read");
+        let ProviderError::Connect(msg) = err else {
+            panic!("an expired dial must stay retryable, got {err:?}");
+        };
+        assert!(
+            msg.contains("etcd connect") && msg.contains("etcd.request_timeout_ms"),
+            "the message must name the call and the key that bounded it: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unset_dial_timeout_leaves_the_dial_unbounded() {
+        // `0` and unset both mean unbounded (#1134), and that has to keep
+        // meaning it here: a bound reintroduced as a default would abort
+        // dials an operator asked to leave alone.
+        let endpoint = spawn_silent_h2_server().await;
+        let deferred = tokio::time::timeout(
+            Duration::from_millis(750),
+            EtcdConfigProvider::connect(&[endpoint], "/aisix", credentials(), None, None),
+        )
+        .await;
+        assert!(
+            deferred.is_err(),
+            "with no dial timeout the connect must still be in flight",
+        );
+    }
+
+    #[tokio::test]
+    async fn each_status_code_lands_on_one_side_deliberately() {
+        // The whole fix rests on telling "no answer" from "answered and
+        // refused", so the split is pinned per wire code against a server
+        // that really sends them. The retryable set is an allowlist:
+        // anything outside it ends the boot, which is what keeps a wrong
+        // password from being waited out forever.
+        //
+        // 2 Unknown, 4 DeadlineExceeded, 13 Internal and 14 Unavailable
+        // are what a call that never got a usable answer arrives as —
+        // tonic manufactures Unavailable for a refused connect, a DNS
+        // failure and a failed TLS handshake, and etcd answers it while
+        // it has no leader. 1 Cancelled and 10 Aborted are a peer or an
+        // intermediary resetting the stream; 8 ResourceExhausted is
+        // throttling. All of them heal without anyone editing a config.
+        for code in [1u16, 2, 4, 8, 10, 13, 14] {
+            let endpoint = spawn_grpc_status_server(code, "no answer").await;
+            let provider =
+                EtcdConfigProvider::connect(&[endpoint], "/aisix", credentials(), None, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("code {code} must be waited out, got {e:?}"));
+            assert!(matches!(
+                provider.load_all().await,
+                Err(ProviderError::Connect(_))
+            ));
+        }
+        // 3 InvalidArgument (etcd's answer to a wrong user or password),
+        // 7 PermissionDenied, 9 FailedPrecondition (credentials sent to a
+        // cluster with authentication disabled), 16 Unauthenticated.
+        for code in [3u16, 7, 9, 16] {
+            let endpoint = spawn_grpc_status_server(code, "refused").await;
+            let err = EtcdConfigProvider::connect(&[endpoint], "/aisix", credentials(), None, None)
+                .await
+                .expect_err("a refusal must end the boot");
+            assert!(
+                matches!(err, ProviderError::Rejected(_)),
+                "code {code} must be fatal, got {err:?}",
+            );
+        }
+    }
+
     #[test]
     fn connect_retry_constants_match_spec() {
         assert_eq!(CONNECT_RETRY_INTERVAL, Duration::from_secs(5));
@@ -355,20 +797,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_with_malformed_endpoint_returns_connect_error() {
-        // Empty endpoint list is treated as a parse failure by etcd-client,
-        // which lets us exercise the retry loop's error branch without
-        // waiting on a real TCP timeout. A compressed policy keeps the
-        // test sub-millisecond.
-        let policy = ConnectPolicy {
-            interval: Duration::from_millis(1),
-            attempts: 1,
-        };
+    async fn endpoints_that_cannot_be_used_at_all_end_the_boot() {
+        // An empty endpoint list is a parse failure inside etcd-client,
+        // not a reachability one: no retry ladder can turn it into a
+        // usable endpoint, so it must reach the caller as a refusal
+        // rather than deferring to a supervisor that would dial it
+        // forever.
         let endpoints: Vec<String> = vec![];
-        let err = EtcdConfigProvider::connect_with_policy(&endpoints, "/aisix", None, None, policy)
+        let err = EtcdConfigProvider::connect(&endpoints, "/aisix", None, None, None)
             .await
             .unwrap_err();
-        assert!(matches!(err, ProviderError::Connect(_)));
+        assert!(
+            matches!(err, ProviderError::Rejected(_)),
+            "unusable endpoints must be fatal, got {err:?}",
+        );
     }
 
     /// An etcd that is reachable and answers nothing.
@@ -382,6 +824,13 @@ mod tests {
     async fn spawn_silent_h2_server() -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        serve_silently(listener);
+        format!("http://{addr}")
+    }
+
+    /// The silent server on a listener the caller owns, so a test can
+    /// leave a port dead first and make it silent afterwards.
+    fn serve_silently(listener: tokio::net::TcpListener) {
         tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
                 tokio::spawn(async move {
@@ -398,7 +847,6 @@ mod tests {
                 });
             }
         });
-        format!("http://{addr}")
     }
 
     #[tokio::test]
@@ -416,6 +864,7 @@ mod tests {
             "/aisix",
             None,
             Some(Duration::from_millis(300)),
+            None,
         )
         .await
         .expect("connect is lazy without credentials");
@@ -450,6 +899,7 @@ mod tests {
             "/aisix",
             None,
             Some(Duration::from_millis(300)),
+            None,
         )
         .await
         .expect("connect is lazy without credentials");
@@ -502,41 +952,5 @@ mod tests {
             msg.contains("range read") && msg.contains("etcd.request_timeout_ms"),
             "the message must name the call and the key that bounded it: {msg}"
         );
-    }
-
-    #[test]
-    fn format_error_chain_joins_sources_without_duplicating() {
-        #[derive(Debug)]
-        struct Inner;
-        impl std::fmt::Display for Inner {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("Name or service not known")
-            }
-        }
-        impl StdError for Inner {}
-
-        #[derive(Debug)]
-        struct Outer {
-            inner: Inner,
-        }
-        impl std::fmt::Display for Outer {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("dns error")
-            }
-        }
-        impl StdError for Outer {
-            fn source(&self) -> Option<&(dyn StdError + 'static)> {
-                Some(&self.inner)
-            }
-        }
-
-        let joined = format_error_chain(&Outer { inner: Inner });
-        assert_eq!(joined, "dns error: Name or service not known");
-    }
-
-    #[test]
-    fn format_error_chain_handles_empty_source() {
-        let err = std::io::Error::other("bare");
-        assert_eq!(format_error_chain(&err), "bare");
     }
 }

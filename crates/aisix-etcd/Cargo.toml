@@ -28,6 +28,9 @@ tempfile.workspace = true
 # and then never answers it — the shape of an etcd that is reachable but
 # never confirms a call. See the `etcd_provider` tests.
 h2.workspace = true
+# Builds the responses that h2 server sends back — a trailers-only gRPC
+# error is how a test stands in for an etcd that answered and refused.
+http.workspace = true
 # `test-util` drives the shutdown-drain bound on a paused clock, so the
 # test asserts the bound without spending it.
 tokio = { workspace = true, features = ["test-util"] }

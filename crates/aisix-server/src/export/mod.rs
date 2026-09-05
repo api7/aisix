@@ -39,8 +39,9 @@ pub struct ExportArgs {
     pub output: Option<PathBuf>,
 }
 
-/// A CLI-appropriate connect policy: fail after a few quick attempts
-/// rather than the gateway's 25s boot budget.
+/// A CLI-appropriate connect policy: fail after a few quick attempts.
+/// The gateway leaves an unreachable etcd to its supervisor instead; a
+/// one-shot command has nothing to wait with.
 const CLI_CONNECT_POLICY: ConnectPolicy = ConnectPolicy {
     interval: Duration::from_secs(1),
     attempts: 3,
@@ -59,8 +60,10 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
         &args.prefix,
         None,
         // The export CLI takes endpoints on the command line, not a
-        // config file, so there is no `etcd.request_timeout_ms` to honour
-        // — and an operator can interrupt it. The read stays unbounded.
+        // config file, so there is no `etcd.request_timeout_ms` or
+        // `etcd.dial_timeout_ms` to honour — and an operator can
+        // interrupt it. Both stay unbounded.
+        None,
         None,
         CLI_CONNECT_POLICY,
     )

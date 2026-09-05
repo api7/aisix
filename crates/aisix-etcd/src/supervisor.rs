@@ -1116,11 +1116,26 @@ impl<P: ConfigProvider> Supervisor<P> {
                     // The last-good applied snapshot keeps serving.
                     self.config_status.record_fetch_failure();
                     let delay = backoff.next_delay();
-                    tracing::warn!(
-                        error = %err,
-                        backoff_ms = delay.as_millis() as u64,
-                        "etcd watch failed; backing off before reconnect",
-                    );
+                    // A refusal is not a transport hiccup: etcd answered
+                    // and said no, and no amount of backing off changes
+                    // that. The boot path exits on one, but by here the
+                    // process is already up (etcd was unreachable when it
+                    // started), so the loop keeps going and says loudly
+                    // why nothing is being applied.
+                    if matches!(err, ProviderError::Rejected(_)) {
+                        tracing::error!(
+                            error = %err,
+                            backoff_ms = delay.as_millis() as u64,
+                            "etcd refused this gateway's credentials — no configuration can be \
+                             read until they are fixed; still retrying",
+                        );
+                    } else {
+                        tracing::warn!(
+                            error = %err,
+                            backoff_ms = delay.as_millis() as u64,
+                            "etcd watch failed; backing off before reconnect",
+                        );
+                    }
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
                         _ = cancel.changed() => {

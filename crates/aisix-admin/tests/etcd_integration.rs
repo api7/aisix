@@ -56,14 +56,23 @@ fn unique_prefix() -> String {
     .replace(['(', ')', ' '], "")
 }
 
+fn lazy_client_for(url: &str) -> Arc<aisix_etcd::LazyEtcdClient> {
+    Arc::new(aisix_etcd::LazyEtcdClient::new(
+        vec![url.to_string()],
+        None,
+        None,
+    ))
+}
+
 async fn etcd_client_for(url: &str) -> etcd_client::Client {
     etcd_client::Client::connect([url], None)
         .await
         .expect("etcd connect")
 }
 
-async fn build_state(client: etcd_client::Client, prefix: &str) -> AdminState {
-    let store: Arc<dyn ConfigStore> = Arc::new(EtcdConfigStore::new(client, prefix, None));
+async fn build_state(url: &str, prefix: &str) -> AdminState {
+    let store: Arc<dyn ConfigStore> =
+        Arc::new(EtcdConfigStore::new(lazy_client_for(url), prefix, None));
     let handle = SnapshotHandle::new(AisixSnapshot::new());
     let cfg = AdminConfig {
         enabled: true,
@@ -125,7 +134,7 @@ async fn direct_write_read_round_trip(
 ) {
     let prefix = unique_prefix();
     let mut client = etcd_client_for(url).await;
-    let state = build_state(client.clone(), &prefix).await;
+    let state = build_state(url, &prefix).await;
 
     seed(&mut client, &prefix, kind, id, &payload).await;
 
@@ -193,7 +202,7 @@ async fn model_list_reads_a_range_larger_than_the_default_decode_limit() {
 
     let prefix = unique_prefix();
     let mut client = etcd_client_for(&url).await;
-    let store = EtcdConfigStore::new(client.clone(), &prefix, None);
+    let store = EtcdConfigStore::new(lazy_client_for(&url), &prefix, None);
 
     // etcd caps a transaction at 128 operations, so the fixture is written
     // in batches of that rather than one round trip per key.
@@ -401,7 +410,7 @@ async fn admin_writes_are_refused_against_real_etcd() {
     };
     let prefix = unique_prefix();
     let mut client = etcd_client_for(&url).await;
-    let state = build_state(client.clone(), &prefix).await;
+    let state = build_state(&url, &prefix).await;
 
     let payload = json!({
         "display_name": "sneaky",
