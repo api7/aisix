@@ -84,11 +84,14 @@ impl EtcdConfigStore {
     }
 
     /// The KV sub-client for one read, connecting first when the boot
-    /// dial had not reached etcd yet.
+    /// dial had not reached etcd yet. Under the same `request_timeout`
+    /// as the read itself: with etcd credentials configured the dial
+    /// includes an `Authenticate` round trip, and an endpoint that
+    /// accepts TCP and answers nothing would otherwise hang the admin
+    /// request — and every other read behind this client's connect.
     async fn kv(&self) -> Result<etcd_client::KvClient, StoreError> {
-        self.client
-            .kv()
-            .await
+        self.bound(self.client.kv())
+            .await?
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 

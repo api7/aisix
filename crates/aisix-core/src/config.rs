@@ -124,16 +124,17 @@ pub struct EtcdConfig {
     /// read at connect time — never stored in the config struct.
     #[serde(default)]
     pub password_env: Option<String>,
-    /// Bound on the TCP connect to etcd, in milliseconds. Unset — the
-    /// default — and `0` both mean unbounded (see the note on `0` under
+    /// Bound on dialling etcd, in milliseconds. Unset — the default —
+    /// and `0` both mean unbounded (see the note on `0` under
     /// [`EtcdConfig::request_timeout`]), leaving it to the OS TCP stack.
     ///
-    /// It reaches hyper's connector via `Endpoint::connect_timeout`, so
-    /// it covers the TCP handshake and nothing after it. Two later steps
-    /// of "connecting" are outside it and remain unbounded: the TLS
-    /// handshake, which is layered above the connector, and the
-    /// `Authenticate` call etcd-client issues inside `Client::connect`
-    /// when `user` / `password_env` are set.
+    /// When set it covers the whole dial: it reaches hyper's connector
+    /// via `Endpoint::connect_timeout` for the TCP handshake, and the
+    /// gateway wraps `Client::connect` in it as well, so the TLS
+    /// handshake layered above the connector and the `Authenticate` call
+    /// etcd-client issues when `user` / `password_env` are set are
+    /// bounded too. An expired dial reports an etcd that could not be
+    /// reached, which the gateway retries rather than exits on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dial_timeout_ms: Option<u64>,
     /// Bound on a single request/response etcd call, in milliseconds.
@@ -141,9 +142,10 @@ pub struct EtcdConfig {
     /// `0` below).
     ///
     /// When set it covers the configuration range read (`load_all`), the
-    /// watch-create handshake, and the admin surface's reads. It does not
-    /// reach the `Authenticate` inside `Client::connect`, which is still
-    /// unbounded. It deliberately does NOT cover the established watch
+    /// watch-create handshake, and the admin surface's reads — including
+    /// the dial each of those has to make when the connection is not up
+    /// yet, `Authenticate` included. It deliberately does NOT cover the
+    /// established watch
     /// stream either: that stream is long-lived by construction, so a
     /// bound on it would expire on every interval quiet enough to produce
     /// no event and leave the gateway reconnecting instead of watching.

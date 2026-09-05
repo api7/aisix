@@ -33,6 +33,8 @@ const BACKOFF_LINE = "etcd watch failed; backing off before reconnect";
 const DEFERRED_LINE = "etcd is not reachable yet";
 /** What a refusal has to be reported as, whatever etcd's own message says. */
 const REFUSED_LINE = "etcd rejected the connection";
+/** The supervisor's line for a refusal it meets after the boot is past. */
+const REFUSED_AFTER_BOOT_LINE = "etcd refused this gateway's credentials";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -161,6 +163,38 @@ describe("etcd credentials: unreachable is waited out, refused is not", () => {
     expect(app.output()).toContain("etcd.dial_timeout_ms");
     expect(await waitForOutput(app, BACKOFF_LINE, 30_000, 2)).toBeGreaterThanOrEqual(2);
 
+    const metrics = await fetch(`${app.metricsUrl}/metrics`);
+    expect(metrics.status).toBe(200);
+  }, 120_000);
+
+  test("a refusal that only arrives after boot is reported, not buried", async (ctx) => {
+    if (!etcdReachable) {
+      ctx.skip();
+      return;
+    }
+    // The boot can only exit on a refusal it is given. Scheduled before
+    // its etcd — the ordering this whole change is about — it takes the
+    // unreachable branch instead, and a refusal that lands later reaches
+    // the supervisor rather than the boot path. The process is up and
+    // serving from whatever it has by then, so it keeps retrying; what it
+    // must not do is file "your credentials are wrong" under the same
+    // routine warn line as "etcd is restarting", which is how a
+    // configuration mistake stays invisible for a day.
+    const prefix = `/aisix-e2e-etcd-auth-late-${randomUUID()}`;
+    const relay = await startEtcdRelay();
+    relays.push(relay);
+    await relay.refuse();
+
+    const app = await spawnAuthenticated(relay.endpoint, prefix);
+    expect(app.output()).toContain(DEFERRED_LINE);
+
+    // The endpoint comes back — as the suite's own etcd, which has
+    // authentication disabled and therefore answers the credentials with
+    // a refusal rather than going quiet.
+    await relay.release();
+    expect(await waitForOutput(app, REFUSED_AFTER_BOOT_LINE, 60_000)).toBeGreaterThanOrEqual(1);
+
+    // Still up: a refusal after boot is loud, not fatal.
     const metrics = await fetch(`${app.metricsUrl}/metrics`);
     expect(metrics.status).toBe(200);
   }, 120_000);

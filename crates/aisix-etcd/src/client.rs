@@ -48,6 +48,27 @@ pub fn watch_client(client: &Client) -> WatchClient {
 /// the real cause (`getaddrinfo: Name or service not known`, TLS
 /// handshake reason, …) hides in `.source()`. The supervisor logs
 /// the returned string, so CI triage gets the full picture.
+/// The readable cause of one `etcd-client` failure.
+///
+/// `etcd_client::Error` implements `Error` without `source()`, so
+/// [`format_error_chain`] alone stops at its own `Display` and the cause
+/// that matters — the transport error under a tonic `Status`, and the
+/// `getaddrinfo` / TLS reason under that — never appears. Reach into the
+/// payload to get there.
+pub(crate) fn format_etcd_error(err: &EtcdError) -> String {
+    let mut out = format_error_chain(err);
+    if let EtcdError::GRpcStatus(status) = err {
+        if let Some(source) = StdError::source(status) {
+            let chain = format_error_chain(source);
+            if !chain.is_empty() && !out.ends_with(&chain) {
+                out.push_str(": ");
+                out.push_str(&chain);
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
     let mut out = err.to_string();
     let mut cur = err.source();
@@ -89,8 +110,11 @@ pub enum ConnectError {
 /// (<https://grpc.io/docs/guides/status-codes/>). Compared numerically so
 /// this crate does not have to depend on — and keep in step with — the
 /// exact `tonic` release `etcd-client` builds against.
+const GRPC_CANCELLED: i32 = 1;
 const GRPC_UNKNOWN: i32 = 2;
 const GRPC_DEADLINE_EXCEEDED: i32 = 4;
+const GRPC_RESOURCE_EXHAUSTED: i32 = 8;
+const GRPC_ABORTED: i32 = 10;
 const GRPC_INTERNAL: i32 = 13;
 const GRPC_UNAVAILABLE: i32 = 14;
 
@@ -115,8 +139,16 @@ impl ConnectError {
 /// / "tls handshake eof"), while a wrong password arrives as
 /// `InvalidArgument` carrying etcd's own "authentication failed, invalid
 /// user ID or password".
-fn classify(err: &EtcdError) -> ConnectError {
-    let detail = format_error_chain(err);
+///
+/// Used on the reads too, not only on the dial. Which failures etcd
+/// answers *where* is not something a caller can assume: a user whose
+/// password is wrong is refused by `Authenticate`, but a user who
+/// authenticates and lacks the permission is refused by the range read
+/// (`PermissionDenied`), and a token invalidated by an etcd restart is
+/// refused by every later call (`Unauthenticated`). Classifying only the
+/// dial would report those as ordinary transport trouble.
+pub(crate) fn classify(err: &EtcdError) -> ConnectError {
+    let detail = format_etcd_error(err);
     match err {
         // The call never reached a server.
         EtcdError::TransportError(_) | EtcdError::IoError(_) => ConnectError::Unreachable(detail),
@@ -125,12 +157,21 @@ fn classify(err: &EtcdError) -> ConnectError {
             // failure to reach a server and what etcd itself answers
             // while it has no leader or is stopping. `DeadlineExceeded`
             // is a call that ran out of time. `Unknown` and `Internal`
-            // are what a connection broken mid-call surfaces as. None of
-            // them is an answer about the credentials, and all of them
-            // can heal on their own.
-            GRPC_UNAVAILABLE | GRPC_DEADLINE_EXCEEDED | GRPC_UNKNOWN | GRPC_INTERNAL => {
-                ConnectError::Unreachable(detail)
-            }
+            // are what a connection broken mid-call surfaces as.
+            // `Cancelled` and `Aborted` are what a peer or an
+            // intermediary resetting the stream produces — an ingress in
+            // front of etcd restarting looks like this — and
+            // `ResourceExhausted` is an etcd throttling a fleet of
+            // gateways that all restarted at once. None of them is an
+            // answer about the credentials, and all of them heal on
+            // their own.
+            GRPC_UNAVAILABLE
+            | GRPC_DEADLINE_EXCEEDED
+            | GRPC_UNKNOWN
+            | GRPC_INTERNAL
+            | GRPC_CANCELLED
+            | GRPC_ABORTED
+            | GRPC_RESOURCE_EXHAUSTED => ConnectError::Unreachable(detail),
             // Everything else is etcd having evaluated the request and
             // said no: `InvalidArgument` for a wrong user or password,
             // `PermissionDenied` for a user without the rights,
@@ -289,6 +330,33 @@ mod tests {
         // empty endpoint list dialable — so it is fatal, not a wait.
         let err = EtcdError::InvalidArgs("empty endpoints".to_string());
         assert!(matches!(classify(&err), ConnectError::Rejected(_)));
+    }
+
+    #[tokio::test]
+    async fn the_cause_under_a_status_reaches_the_message() {
+        // `etcd_client::Error` has no `source()`, so walking the chain
+        // from it alone stops at its own `Display` and the reason the
+        // dial failed — which lives under the tonic `Status` — never
+        // reaches the log line the supervisor prints.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let err = match Client::connect(
+            [format!("http://{addr}")],
+            Some(ConnectOptions::new().with_user("u", "p")),
+        )
+        .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("nothing is listening on {addr}"),
+        };
+
+        let shallow = format_error_chain(&err);
+        let deep = format_etcd_error(&err);
+        assert!(
+            deep.len() > shallow.len() && deep.starts_with(&shallow),
+            "the payload's own cause chain must be appended: {deep:?} vs {shallow:?}",
+        );
     }
 
     #[test]

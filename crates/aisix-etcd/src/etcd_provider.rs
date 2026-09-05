@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use crate::client::{format_error_chain, ConnectError, LazyEtcdClient};
+use crate::client::{classify, format_etcd_error, ConnectError, LazyEtcdClient};
 use crate::provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
 
 /// Fixed-interval retry: 5s × 5 attempts (spec §2).
@@ -204,6 +204,23 @@ impl From<ConnectError> for ProviderError {
 /// attribution, not control flow: `Supervisor::run` routes every
 /// `ProviderError` out of a cycle to the same reconnect-with-backoff
 /// path, so the aborted call is retried whichever variant carries it.
+/// Report one failed etcd call.
+///
+/// A refusal is reported as such wherever etcd hands it over, not only
+/// on the dial: a user who authenticates but lacks the permission is
+/// refused by the range read, and a token an etcd restart invalidated is
+/// refused by every call after it. Those never heal by retrying, and
+/// reporting them as ordinary transport trouble is what buries them in a
+/// warn line that repeats forever. Everything else keeps the variant
+/// naming the call that failed, which is what the supervisor's backoff
+/// line says.
+fn call_error(err: &etcd_client::Error, into_err: fn(String) -> ProviderError) -> ProviderError {
+    match classify(err) {
+        ConnectError::Rejected(detail) => ProviderError::Rejected(detail),
+        ConnectError::Unreachable(_) => into_err(format_etcd_error(err)),
+    }
+}
+
 async fn bound<T>(
     timeout: Option<Duration>,
     what: &str,
@@ -224,7 +241,20 @@ async fn bound<T>(
 #[async_trait]
 impl ConfigProvider for EtcdConfigProvider {
     async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
-        let mut kv = self.client.kv().await?;
+        // The dial is bounded like the call it is part of. Without
+        // credentials there is nothing to dial here — the channel
+        // connects inside the `get` below, under the same bound — but
+        // with them the `Authenticate` round trip happens on the way in,
+        // and an endpoint that accepts TCP and answers nothing would
+        // otherwise hold this read open forever: no backoff, no failure
+        // recorded, and `/status/config` still reporting connected.
+        let mut kv = bound(
+            self.request_timeout,
+            "etcd connect",
+            ProviderError::Connect,
+            self.client.kv(),
+        )
+        .await??;
         let read = kv.get(
             self.prefix.as_bytes(),
             Some(GetOptions::new().with_prefix()),
@@ -236,7 +266,7 @@ impl ConfigProvider for EtcdConfigProvider {
             read,
         )
         .await?
-        .map_err(|e| ProviderError::Range(format_error_chain(&e)))?;
+        .map_err(|e| call_error(&e, ProviderError::Range))?;
 
         let revision = resp.header().map(|h| h.revision()).unwrap_or(0);
 
@@ -260,7 +290,13 @@ impl ConfigProvider for EtcdConfigProvider {
         Box<dyn Stream<Item = Result<WatchEvent, ProviderError>> + Send + Unpin>,
         ProviderError,
     > {
-        let mut watch = self.client.watch().await?;
+        let mut watch = bound(
+            self.request_timeout,
+            "etcd connect",
+            ProviderError::Connect,
+            self.client.watch(),
+        )
+        .await??;
         let opts = WatchOptions::new()
             .with_prefix()
             .with_start_revision(start_revision);
@@ -282,7 +318,7 @@ impl ConfigProvider for EtcdConfigProvider {
             create,
         )
         .await?
-        .map_err(|e| ProviderError::Watch(format_error_chain(&e)))?;
+        .map_err(|e| call_error(&e, ProviderError::Watch))?;
 
         Ok(Box::new(EtcdWatchStream {
             inner: stream,
@@ -341,7 +377,7 @@ impl Stream for EtcdWatchStream {
                 {
                     Poll::Ready(Some(Err(ProviderError::Compacted)))
                 } else {
-                    Poll::Ready(Some(Err(ProviderError::Watch(format_error_chain(&err)))))
+                    Poll::Ready(Some(Err(call_error(&err, ProviderError::Watch))))
                 }
             }
             Poll::Ready(Some(Ok(resp))) => {
@@ -618,6 +654,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refusal_the_read_meets_is_reported_as_a_refusal() {
+        // Where etcd refuses is not the caller's choice. A wrong password
+        // is refused by `Authenticate`, but a user who authenticates and
+        // then lacks the permission is refused by the range read, and a
+        // token an etcd restart invalidated is refused by every call
+        // after it. Classifying only the dial would report those as
+        // ordinary transport trouble and bury them in a warn line that
+        // repeats forever.
+        //
+        // No credentials here on purpose: that is the shape where the
+        // dial cannot classify anything at all, because it does no I/O.
+        let endpoint = spawn_grpc_status_server(7, "etcdserver: permission denied").await;
+        let provider = EtcdConfigProvider::connect(&[endpoint], "/aisix", None, None, None)
+            .await
+            .expect("connect is lazy without credentials");
+
+        let err = provider
+            .load_all()
+            .await
+            .expect_err("a refused read cannot succeed");
+        let ProviderError::Rejected(msg) = err else {
+            panic!("a refusal on the read must be its own class, got {err:?}");
+        };
+        assert!(
+            msg.contains("permission denied"),
+            "the error must carry what etcd said: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_request_timeout_also_bounds_the_dial_a_read_has_to_make() {
+        // Without credentials there is nothing to dial on the way into a
+        // read: the channel connects inside the `get`, under
+        // `etcd.request_timeout_ms` like the rest of the call. With them
+        // the `Authenticate` round trip happens first, so a dial left
+        // outside that bound would hold the read open forever against an
+        // endpoint that accepts TCP and answers nothing — no backoff, no
+        // recorded failure, and a `/status/config` still reporting
+        // connected. No `dial_timeout_ms` here on purpose: the operator
+        // set one bound, and it has to cover the whole read.
+        //
+        // The endpoint is refused at connect time and only becomes the
+        // silent one afterwards, so the dial under test is the read's.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let provider = EtcdConfigProvider::connect(
+            &[format!("http://{addr}")],
+            "/aisix",
+            credentials(),
+            Some(Duration::from_millis(300)),
+            None,
+        )
+        .await
+        .expect("an unreachable etcd must not fail the boot");
+
+        serve_silently(tokio::net::TcpListener::bind(addr).await.unwrap());
+
+        let err = tokio::time::timeout(Duration::from_secs(10), provider.load_all())
+            .await
+            .expect("the dial the read makes must be bounded; without it this hangs")
+            .expect_err("a dial that never completes cannot read");
+        let ProviderError::Connect(msg) = err else {
+            panic!("an expired dial must stay retryable, got {err:?}");
+        };
+        assert!(
+            msg.contains("etcd connect") && msg.contains("etcd.request_timeout_ms"),
+            "the message must name the call and the key that bounded it: {msg}",
+        );
+    }
+
+    #[tokio::test]
     async fn an_unset_dial_timeout_leaves_the_dial_unbounded() {
         // `0` and unset both mean unbounded (#1134), and that has to keep
         // meaning it here: a bound reintroduced as a default would abort
@@ -646,8 +754,10 @@ mod tests {
         // are what a call that never got a usable answer arrives as —
         // tonic manufactures Unavailable for a refused connect, a DNS
         // failure and a failed TLS handshake, and etcd answers it while
-        // it has no leader.
-        for code in [2u16, 4, 13, 14] {
+        // it has no leader. 1 Cancelled and 10 Aborted are a peer or an
+        // intermediary resetting the stream; 8 ResourceExhausted is
+        // throttling. All of them heal without anyone editing a config.
+        for code in [1u16, 2, 4, 8, 10, 13, 14] {
             let endpoint = spawn_grpc_status_server(code, "no answer").await;
             let provider =
                 EtcdConfigProvider::connect(&[endpoint], "/aisix", credentials(), None, None)
@@ -714,6 +824,13 @@ mod tests {
     async fn spawn_silent_h2_server() -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        serve_silently(listener);
+        format!("http://{addr}")
+    }
+
+    /// The silent server on a listener the caller owns, so a test can
+    /// leave a port dead first and make it silent afterwards.
+    fn serve_silently(listener: tokio::net::TcpListener) {
         tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
                 tokio::spawn(async move {
@@ -730,7 +847,6 @@ mod tests {
                 });
             }
         });
-        format!("http://{addr}")
     }
 
     #[tokio::test]

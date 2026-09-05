@@ -753,10 +753,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
             );
-            // Separate client for the admin read surface — only needed when
-            // the admin listener is bound. We could share a single underlying
-            // connection via `Client::clone()` but keeping two is cleaner:
-            // admin reads and the watch stream don't contend on the same mutex.
+            // Separate connection for the admin read surface — only needed
+            // when the admin listener is bound. It could share the config
+            // provider's, but keeping two means an admin read and the watch
+            // stream never queue behind the same connect, and neither can
+            // stall the other's channel.
             // Skipped whenever the admin listener is not bound — managed mode,
             // or `admin.enabled = false` — so admin-off doesn't pay for (or
             // fail boot on) a connection it immediately drops; `/status/models`
