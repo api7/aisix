@@ -1843,21 +1843,17 @@ mod tests {
             .unwrap();
 
         rt.block_on(async {
-            // The heavy configuration set arrives on the WATCH, not on the
-            // initial load, so exactly one costly write is ever in flight
-            // and this test's verdict cannot be decided by which of two
-            // concurrent writes reaches the cache's lock first.
-            // `SnapshotCache::store` serialises its snapshot before taking
-            // that lock, so concurrent writes can commit out of order --
-            // a pre-existing property this test must not depend on either
-            // way.
-            let mut arriving: Vec<RawEntry> = (0..PADDING_ROWS).map(padding_entry).collect();
-            arriving.push(entry("/aisix/models/late", VALID_MODEL, 2));
-            let provider = Arc::new(FakeProvider::new(Vec::new(), 1).with_events(vec![Ok(
-                WatchEvent::Resync {
-                    entries: arriving.into(),
-                    revision: 2,
-                },
+            // A boot resync followed by a put: two writes, so the second
+            // is still queued behind the first when shutdown arrives.
+            // That backlog is what keeps a write genuinely IN FLIGHT —
+            // a single write finishes on its own during the shutdown
+            // path, and an assertion built on one would hold with the
+            // drain removed. It is also the realistic shape: the control
+            // plane writes several rows and the replica is stopped
+            // straight after.
+            let entries: Vec<RawEntry> = (0..PADDING_ROWS).map(padding_entry).collect();
+            let provider = Arc::new(FakeProvider::new(entries, 1).with_events(vec![Ok(
+                WatchEvent::Put(entry("/aisix/models/late", VALID_MODEL, 2)),
             )]));
             let sup = Arc::new(Supervisor::with_cache(
                 provider,
@@ -1867,7 +1863,7 @@ mod tests {
             let (tx, rx) = tokio::sync::watch::channel(false);
             let join = tokio::spawn(sup.clone().run(rx));
 
-            // Cancel the moment the apply is visible in the served
+            // Cancel the moment the put is visible in the served
             // snapshot. The flush it spawned is then still on its way to
             // disk, which is exactly the window this pins.
             for _ in 0..5_000 {
@@ -1878,7 +1874,7 @@ mod tests {
             }
             assert!(
                 sup.handle().load().models.get_by_id("late").is_some(),
-                "the apply must reach the served snapshot before shutdown",
+                "the put must reach the served snapshot before shutdown",
             );
             tx.send(true).unwrap();
             join.await.unwrap();
