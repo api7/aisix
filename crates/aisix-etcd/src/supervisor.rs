@@ -145,7 +145,7 @@ const MAX_RETAINED_PARTIAL_ROWS: usize = 1024;
 /// is one local file and completes in milliseconds on any healthy one.
 /// Deliberately not configurable — an operator has nothing to trade off
 /// here, and a knob would only offer a way to make shutdown hang longer.
-pub const CACHE_WRITE_DRAIN: Duration = Duration::from_secs(5);
+const CACHE_WRITE_DRAIN: Duration = Duration::from_secs(5);
 
 /// One key whose latest etcd bytes are rejected while its last
 /// successfully loaded value keeps serving (#871, xDS-NACK style).
@@ -521,7 +521,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// [`Self::run`] calls this through [`Self::drain_pending_cache_writes`],
     /// which supplies the shutdown bound. Tests call it directly to order
     /// deterministically against the disk read that follows.
-    pub async fn await_pending_cache_writes(&self) {
+    async fn await_pending_cache_writes(&self) {
         let handles: Vec<JoinHandle<()>> = {
             let mut pending = self.pending_writes.lock().unwrap();
             std::mem::take(&mut *pending)
