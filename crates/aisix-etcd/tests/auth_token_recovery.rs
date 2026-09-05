@@ -3,11 +3,20 @@
 //! `etcd-client` authenticates once, inside `Client::connect`, and never
 //! again. The token it gets there is the only one that connection will
 //! ever carry, and etcd stops accepting it in two ordinary situations:
-//! the token's `--auth-token-ttl` elapses while nothing is using it, or
-//! etcd's token store is cleared out from under the connection —
-//! authentication re-enabled, a JWT signing key regenerated at startup, a
-//! member brought up on an empty data directory. Every later call is then
-//! refused, and before this the only cure was restarting the gateway.
+//!
+//! 1. **The token's TTL elapses.** Answered `Unauthenticated`
+//!    (`etcdserver: invalid auth token`).
+//! 2. **The auth store's revision changes** — someone runs `etcdctl user
+//!    add`, grants a role, edits a permission. Every token issued before
+//!    that is refused from the moment it lands, and answered
+//!    `InvalidArgument` (`etcdserver: revision of auth store is old`),
+//!    sharing a status code with a wrong password.
+//!
+//! Every later call is then refused, and before this the only cure was
+//! restarting the gateway. Note what is *not* on the list: an etcd
+//! restart on its own does not invalidate anything, because
+//! `Authenticate` is a raft entry and replaying the WAL re-registers the
+//! tokens it minted.
 //!
 //! Both need a server that really issues and forgets tokens — the status
 //! code, the wording and the *timing* are etcd's, not something a stub
@@ -17,11 +26,13 @@
 //! cluster and sets the variables in `.github/workflows/ci.yml`.
 //!
 //! The cluster this file uses is a **third** etcd, separate from the
-//! `ETCD_AUTH_TEST_URL` one, for two reasons: its `--auth-token-ttl` is
+//! `ETCD_AUTH_TEST_URL` one, for two reasons. Its token lifetime is
 //! seconds rather than the five-minute default, which would make every
-//! other authenticated test depend on this feature; and one test here
-//! momentarily turns authentication off on it, which no other test can
-//! be reading through.
+//! other authenticated test depend on this feature. And it runs
+//! `--auth-token jwt` rather than the default `simple`, which is what
+//! reaches case 2 above: under `simple` the auth revision is read at
+//! request time, so only JWT — what a multi-member cluster runs anyway —
+//! refuses a token for it.
 //!
 //! The container and short-TTL cluster this needs were built by community
 //! PR api7/aisix#763 (`okaybase`), which proposed the scheduled-refresh
@@ -35,18 +46,19 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use aisix_etcd::{ConfigProvider, EtcdConfigProvider, ProviderError};
 use etcd_client::ConnectOptions;
 
-/// One test here turns the cluster's authentication off and on again,
-/// which every other test in this file is reading through, so they take
-/// turns. Test binaries are run one at a time, so nothing outside this
-/// file is talking to it.
+/// Two tests here change the cluster's auth store, which stales every
+/// token every other test in this file is holding, so they take turns.
+/// Test binaries are run one at a time, so nothing outside this file is
+/// talking to it.
 static ETCD: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 struct AuthEtcd {
     url: String,
     user: String,
     password: String,
-    /// The cluster's `--auth-token-ttl`. Read from the environment rather
-    /// than assumed, so the sleep below tracks whatever CI started.
+    /// The lifetime of a token this cluster issues (the `ttl` inside its
+    /// `--auth-token`). Read from the environment rather than assumed, so
+    /// the sleep below tracks whatever CI started.
     token_ttl: Duration,
 }
 
@@ -67,12 +79,15 @@ fn auth_ttl_etcd() -> Option<AuthEtcd> {
     })
 }
 
-fn unique_prefix() -> String {
-    let nanos = SystemTime::now()
+fn unique_suffix() -> u128 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    format!("/aisix-token-it-{nanos}")
+        .unwrap_or_default()
+}
+
+fn unique_prefix() -> String {
+    format!("/aisix-token-it-{}", unique_suffix())
 }
 
 impl AuthEtcd {
@@ -154,7 +169,7 @@ async fn a_token_that_expired_while_idle_is_replaced_without_a_restart() {
 }
 
 #[tokio::test]
-async fn a_token_the_server_has_discarded_is_replaced_without_a_restart() {
+async fn a_token_an_auth_store_change_staled_is_replaced_without_a_restart() {
     let Some(etcd) = auth_ttl_etcd() else {
         eprintln!("skipping: ETCD_AUTH_TTL_TEST_URL not set");
         return;
@@ -171,31 +186,39 @@ async fn a_token_the_server_has_discarded_is_replaced_without_a_restart() {
     let (entries, _) = provider.load_all().await.expect("the first read works");
     assert_eq!(entries.len(), 1);
 
-    // The other half of the failure, and the one no schedule could have
-    // covered: the token stops being valid at a moment nothing on the
-    // client can predict. Toggling authentication clears etcd's token
-    // store, which is what an operator re-enabling auth, a JWT signing
-    // key regenerated at startup, and a member brought up on an empty
-    // data directory all do to the tokens already handed out. Unlike an
-    // expiry this never comes back on its own — the read keeps being
-    // refused until something authenticates again.
-    discard_every_token(&etcd).await;
+    // The half no schedule could have covered: adding a user bumps the
+    // auth store's revision, and from that instant every token issued
+    // before it is refused — nothing about it is predictable from the
+    // client, and it does not come back on its own. It is also refused
+    // with `InvalidArgument`, the same status code as a wrong password,
+    // so this is the test that keeps those two apart end to end: if the
+    // gateway treated it as a wrong password it would stop reading its
+    // configuration for good, over an operator adding a user.
+    let stale_user = format!("stale-{}", unique_suffix());
+    let mut admin = etcd.writer().await;
+    admin
+        .user_add(stale_user.clone(), "stale-pw", None)
+        .await
+        .expect("bump the auth store revision");
 
     let (entries, _) = provider
         .load_all()
         .await
-        .expect("a discarded token must be replaced, not fail the read");
+        .expect("a staled token must be replaced, not fail the read");
     assert_eq!(
         entries.len(),
         1,
         "the read after re-authenticating must return the same configuration",
     );
 
+    // Key first, user second: deleting the user bumps the revision
+    // again and stales this writer's own token, so nothing may follow it.
     let mut writer = etcd.writer().await;
     writer
         .delete(format!("{prefix}/models/m-token-2"), None)
         .await
         .expect("cleanup");
+    writer.user_delete(stale_user).await.expect("cleanup user");
 }
 
 #[tokio::test]
@@ -211,11 +234,7 @@ async fn a_user_etcd_refuses_is_answered_once_and_not_re_authenticated() {
     // so the case the new retry path could have turned into a spin. It
     // must fail on the first answer, the way a wrong password does at the
     // dial.
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    let user = format!("norole-{nanos}");
+    let user = format!("norole-{}", unique_suffix());
     let password = "norole-pw";
     let mut root = etcd.writer().await;
     root.user_add(user.clone(), password, None)
@@ -254,22 +273,4 @@ async fn a_user_etcd_refuses_is_answered_once_and_not_re_authenticated() {
     // has nothing to do with what this test asserts.
     let mut root = etcd.writer().await;
     root.user_delete(user).await.expect("cleanup");
-}
-
-/// Make etcd forget every token it has issued, this one included.
-///
-/// `auth disable` drops the token store and `auth enable` starts a fresh
-/// one, so the token the provider holds is refused from here on with
-/// `Unauthenticated` — the same answer an elapsed TTL produces, from a
-/// cause that never heals by waiting.
-async fn discard_every_token(etcd: &AuthEtcd) {
-    let mut admin = etcd.writer().await;
-    // Both calls are made before either is asserted on: a panic between
-    // them would leave the shared cluster with authentication off, which
-    // does not fail this test — it silently guts the one below it, whose
-    // whole subject is a user etcd refuses.
-    let disabled = admin.auth_disable().await;
-    let enabled = admin.auth_enable().await;
-    disabled.expect("auth disable");
-    enabled.expect("auth enable");
 }

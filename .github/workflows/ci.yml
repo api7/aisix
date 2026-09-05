@@ -156,15 +156,17 @@ jobs:
       ETCD_AUTH_TEST_PASSWORD: aisix-ci-etcd
       # Picked up by crates/aisix-etcd/tests/auth_token_recovery.rs and
       # crates/aisix-admin/tests/etcd_integration.rs. A THIRD cluster,
-      # authenticated like the one above but with an auth token that
-      # expires in seconds instead of the five-minute default, so a test
-      # can sit out a real expiry. Kept separate because that TTL would
-      # otherwise make every authenticated test depend on the recovery
-      # being tested, and because one test here turns authentication off
-      # and on again to make etcd discard the tokens it has issued. The
-      # container and this short-TTL approach come from community PR
+      # authenticated like the one above but differing in two ways that
+      # the token-recovery tests need and that no other test should have
+      # to live with: its tokens expire in seconds instead of the
+      # five-minute default, so a test can sit out a real expiry; and it
+      # runs `--auth-token jwt` instead of the default `simple`, which is
+      # the only mode in which an auth-store revision change refuses a
+      # token that was already issued. Tests here also change that auth
+      # store, which stales every token the cluster has handed out. The
+      # container and this short-lifetime approach come from community PR
       # api7/aisix#763 (okaybase). `ETCD_AUTH_TTL_TEST_SECS` must match
-      # the `--auth-token-ttl` below — the tests sleep past it.
+      # the `ttl=` below — the tests sleep past it.
       ETCD_AUTH_TTL_TEST_URL: http://127.0.0.1:2579
       ETCD_AUTH_TTL_TEST_USER: root
       ETCD_AUTH_TTL_TEST_PASSWORD: aisix-ci-etcd
@@ -189,18 +191,25 @@ jobs:
         # `auth enable` called after the server is up, which service
         # containers cannot do.
         #
-        # Two of them, on 2479 and 2579. The second differs only in its
-        # `--auth-token-ttl`, short enough for a test to sit out a real
-        # token expiry; it is a cluster of its own so that TTL — and the
-        # test that makes etcd discard its tokens — cannot reach the
-        # first.
+        # Two of them, on 2479 and 2579. The second issues JWT tokens
+        # with a lifetime short enough for a test to sit out a real
+        # expiry. It is a cluster of its own so that neither that
+        # lifetime, nor the auth-store changes those tests make, can
+        # reach the first.
         run: |
+          # Signing key for the JWT cluster below. Generated per run and
+          # thrown away with the runner: it authenticates nothing outside
+          # this job.
+          mkdir -p /tmp/etcd-jwt
+          openssl genpkey -algorithm RSA -out /tmp/etcd-jwt/jwt.key -pkeyopt rsa_keygen_bits:2048
+          openssl rsa -in /tmp/etcd-jwt/jwt.key -pubout -out /tmp/etcd-jwt/jwt.pub
           start_auth_etcd() {
             name=$1
             client=$2
             peer=$3
             shift 3
-            docker run -d --name "$name" -p "$client:$client" quay.io/coreos/etcd:v3.5.18 \
+            docker run -d --name "$name" -p "$client:$client" -v /tmp/etcd-jwt:/keys \
+              quay.io/coreos/etcd:v3.5.18 \
               /usr/local/bin/etcd --name "$name" "$@" \
               --listen-client-urls "http://0.0.0.0:$client" \
               --advertise-client-urls "http://127.0.0.1:$client" \
@@ -225,8 +234,9 @@ jobs:
             etcdctl auth enable
           }
           start_auth_etcd etcd-auth 2479 2480
-          # Keep in step with ETCD_AUTH_TTL_TEST_SECS above.
-          start_auth_etcd etcd-auth-ttl 2579 2580 --auth-token-ttl 5
+          # Keep `ttl=` in step with ETCD_AUTH_TTL_TEST_SECS above.
+          start_auth_etcd etcd-auth-ttl 2579 2580 \
+            --auth-token 'jwt,pub-key=/keys/jwt.pub,priv-key=/keys/jwt.key,sign-method=RS256,ttl=5s'
       - name: Start Redis Cluster + Sentinel
         # The `redis` service above covers single-node. Here we bring up a
         # 3-node cluster (7000-7002) and a sentinel (26379) monitoring the

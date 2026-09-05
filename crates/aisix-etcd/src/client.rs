@@ -136,7 +136,45 @@ const GRPC_RESOURCE_EXHAUSTED: i32 = 8;
 const GRPC_ABORTED: i32 = 10;
 const GRPC_INTERNAL: i32 = 13;
 const GRPC_UNAVAILABLE: i32 = 14;
+const GRPC_INVALID_ARGUMENT: i32 = 3;
 const GRPC_UNAUTHENTICATED: i32 = 16;
+
+/// etcd's own error strings for the two answers that mean "the token you
+/// sent is stale" but arrive as `InvalidArgument`, sharing a status code
+/// with "your password is wrong".
+///
+/// **Do not replace these with a status-code check, and do not delete
+/// them as a fragile string match.** The text *is* the signal here.
+/// etcd's own reference client recovers these errors the same way: its
+/// `rpctypes.Error()` maps a gRPC error back to a typed one through a
+/// table keyed on the error string, and `shouldRefreshToken` in the v3
+/// client's retry interceptor then treats exactly these two, plus
+/// `Unauthenticated`, as "re-authenticate and retry" — while
+/// deliberately leaving `authentication failed, invalid user ID or
+/// password` out. This match is that list, matched the way the
+/// reference implementation matches it.
+///
+/// - `revision of auth store is old` — the deployment-facing one, and
+///   the reason this matters. Under `--auth-token jwt` (what a
+///   multi-member cluster runs) **any** change to the auth store bumps
+///   its revision, and every token issued before it is refused from that
+///   moment: one `etcdctl user add` on the cluster and a gateway can no
+///   longer read its configuration until it authenticates again.
+///   Verified against etcd 3.5.18.
+/// - `user name is empty` — carried for parity with the reference
+///   client, which refreshes on it too. No reachable scenario was
+///   constructed for it here; it is included because it fails in the
+///   safe direction (one extra re-authentication) and because a list
+///   that silently drops one of upstream's three arms is the kind of
+///   difference nobody finds later.
+const STALE_TOKEN_MESSAGES: [&str; 2] = [
+    "etcdserver: revision of auth store is old",
+    "etcdserver: user name is empty",
+];
+
+fn is_stale_token(message: &str) -> bool {
+    STALE_TOKEN_MESSAGES.iter().any(|m| message.contains(m))
+}
 
 impl ConnectError {
     /// The flattened cause, without this type's own framing — so a
@@ -172,16 +210,13 @@ impl ConnectError {
 ///
 /// This is what the safety condition behind re-authenticating rests on.
 /// A wrong user or password is answered on `Authenticate` with
-/// `InvalidArgument` (`etcdserver: authentication failed, invalid user ID
-/// or password`) and a user without the rights with `PermissionDenied`,
-/// so neither can reach the retry path however many times it is
-/// presented. `Unauthenticated` is what etcd answers a token it does not
-/// recognise (`etcdserver: invalid auth token`), and that is the only
-/// code routed there.
+/// `InvalidArgument` carrying `etcdserver: authentication failed, invalid
+/// user ID or password`, and a user without the rights with
+/// `PermissionDenied`; neither can reach the retry path however many
+/// times it is presented.
 ///
-/// Note the implication does not run backwards: `InvalidArgument` covers
-/// more than refused credentials, and telling its members apart would
-/// take the message text rather than the code.
+/// `InvalidArgument` is not only that, though, which is why two of its
+/// members are named by message below. See [`STALE_TOKEN_MESSAGES`].
 pub(crate) fn classify(err: &EtcdError) -> ConnectError {
     let detail = format_etcd_error(err);
     match err {
@@ -212,11 +247,17 @@ pub(crate) fn classify(err: &EtcdError) -> ConnectError {
             // The configured credentials are not what it is complaining
             // about, so this one heals by authenticating again.
             GRPC_UNAUTHENTICATED => ConnectError::Unauthenticated(detail),
+            // The two `InvalidArgument` answers that mean the same
+            // thing. See [`STALE_TOKEN_MESSAGES`] for why they are
+            // matched by message and why that is not a workaround.
+            GRPC_INVALID_ARGUMENT if is_stale_token(status.message()) => {
+                ConnectError::Unauthenticated(detail)
+            }
             // Everything else is etcd having evaluated the request and
-            // said no: `InvalidArgument` for a wrong user or password,
-            // `PermissionDenied` for a user without the rights,
-            // `FailedPrecondition` for credentials sent to a cluster
-            // that has authentication disabled.
+            // said no: the rest of `InvalidArgument` — a wrong user or
+            // password — `PermissionDenied` for a user without the
+            // rights, `FailedPrecondition` for credentials sent to a
+            // cluster that has authentication disabled.
             _ => ConnectError::Rejected(detail),
         },
         // Unparseable endpoints, an empty endpoint list, a bad header
@@ -721,12 +762,65 @@ mod reauth_tests {
     }
 
     #[tokio::test]
+    async fn a_stale_auth_store_revision_is_retried_like_an_invalid_token() {
+        // `revision of auth store is old` is `InvalidArgument`, the same
+        // code as a wrong password, and it is the one a deployment
+        // actually meets: under `--auth-token jwt` any change to the
+        // auth store — one `etcdctl user add` — bumps the revision and
+        // every token issued before it is refused from that moment. Only
+        // etcd's message separates the two, which is why the message is
+        // matched. Second answer is `Unavailable` so the retry is
+        // distinguishable from the first attempt.
+        let etcd = spawn_scripted_etcd(&[
+            (3, "etcdserver: revision of auth store is old"),
+            (14, "etcdserver: no leader"),
+        ])
+        .await;
+
+        let err = read_once(&etcd.endpoint).await.expect_err("both fail");
+        let CallError::Call(err) = err else {
+            panic!("the server answered, so this is a call failure: {err:?}");
+        };
+        assert!(
+            matches!(classify(&err), ConnectError::Unreachable(_)),
+            "the retry's own answer is what surfaces: {err:?}",
+        );
+        assert_eq!(
+            etcd.calls.load(Ordering::Relaxed),
+            2,
+            "an auth-store revision change must be re-authenticated, not reported as a \
+             wrong password",
+        );
+        assert_eq!(
+            etcd.connections.load(Ordering::Relaxed),
+            2,
+            "the retry must run on a new connection — that is what re-authenticates",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_user_name_is_retried_like_an_invalid_token() {
+        // Carried for parity with etcd's own reference client, which
+        // refreshes its token on this too. No reachable scenario was
+        // constructed for it — this pins the wiring, not a reproduction.
+        let etcd = spawn_scripted_etcd(&[
+            (3, "etcdserver: user name is empty"),
+            (14, "etcdserver: no leader"),
+        ])
+        .await;
+
+        read_once(&etcd.endpoint).await.expect_err("both fail");
+        assert_eq!(etcd.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(etcd.connections.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
     async fn a_refused_credential_is_answered_once_and_never_retried() {
-        // The other half of the safety condition, and the reason the
-        // split is on the status code: etcd answers a wrong user or
-        // password with `InvalidArgument`, never with `Unauthenticated`.
-        // So a credential it has refused fails on the first answer, as
-        // it did before any of this — no re-authentication, no second
+        // The safety condition, and the one line in this file that must
+        // never move: a wrong user or password shares `InvalidArgument`
+        // with the two stale-token answers above, and is told apart from
+        // them by etcd's own message. It must fail on the first answer,
+        // as it did before any of this — no re-authentication, no second
         // connection, nothing for an operator's typo to spin on.
         let etcd = spawn_scripted_etcd(&[(
             3,

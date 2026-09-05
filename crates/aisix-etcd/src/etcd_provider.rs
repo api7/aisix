@@ -242,15 +242,13 @@ fn provider_error(
             d.as_millis()
         )),
         CallError::Call(err) => match classify(&err) {
-            // An `Unauthenticated` reaching here has already been
-            // retried on a freshly authenticated connection and was
-            // refused again, so it belongs with the refusals: waiting
-            // does not fix a token etcd will not accept however new it
-            // is, and reporting it as ordinary transport trouble is what
-            // buries it in a warn line that repeats forever.
-            ConnectError::Rejected(detail) | ConnectError::Unauthenticated(detail) => {
-                ProviderError::Rejected(detail)
-            }
+            ConnectError::Rejected(detail) => ProviderError::Rejected(detail),
+            // Already retried on a freshly authenticated connection and
+            // refused again, so it does not belong on the routine warn
+            // path — but it does not belong under "your credentials are
+            // wrong" either, since etcd just accepted them. Its own
+            // variant, and its own line.
+            ConnectError::Unauthenticated(detail) => ProviderError::TokenRefused(detail),
             ConnectError::Unreachable(_) => into_err(format_etcd_error(&err)),
         },
     }
@@ -815,11 +813,16 @@ mod tests {
                 Err(ProviderError::Connect(_))
             ));
         }
-        // 3 InvalidArgument (etcd's answer to a wrong user or password),
-        // 7 PermissionDenied, 9 FailedPrecondition (credentials sent to a
-        // cluster with authentication disabled).
+        // 3 InvalidArgument *with etcd's wrong-password message* — the
+        // code alone is not enough, see `STALE_TOKEN_MESSAGES` — plus
+        // 7 PermissionDenied and 9 FailedPrecondition (credentials sent
+        // to a cluster with authentication disabled).
         for code in [3u16, 7, 9] {
-            let endpoint = spawn_grpc_status_server(code, "refused").await;
+            let endpoint = spawn_grpc_status_server(
+                code,
+                "etcdserver: authentication failed, invalid user ID or password",
+            )
+            .await;
             let err = EtcdConfigProvider::connect(&[endpoint], "/aisix", credentials(), None, None)
                 .await
                 .expect_err("a refusal must end the boot");
@@ -991,14 +994,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_freshly_authenticated_connection_etcd_still_refuses_is_a_refusal() {
+    async fn a_freshly_authenticated_connection_etcd_still_refuses_gets_its_own_report() {
         // By the time a call's `Unauthenticated` reaches `provider_error`
         // it has already been retried on a connection that authenticated
         // moments earlier. Whatever is wrong with it is not something
-        // another 60s of backoff fixes, so it gets the refusal line an
-        // operator can act on rather than the routine one they filter
-        // out. No credentials here, so the dial is lazy and both attempts
-        // land on the read — which is where the retry lives.
+        // another 60s of backoff fixes — but it is not `Rejected`
+        // either, because etcd issued the token it is refusing, so the
+        // credentials an operator would be sent to check are fine. No
+        // credentials here, so the dial is lazy and both attempts land
+        // on the read, which is where the retry lives.
         let endpoint = spawn_grpc_status_server(16, "etcdserver: invalid auth token").await;
         let provider = EtcdConfigProvider::connect(&[endpoint], "/aisix", None, None, None)
             .await
@@ -1008,9 +1012,28 @@ mod tests {
             .await
             .expect_err("a server that only answers 16 cannot serve a read");
         assert!(
-            matches!(err, ProviderError::Rejected(_)),
-            "a re-authenticated call etcd refused again must be loud, got {err:?}",
+            matches!(err, ProviderError::TokenRefused(_)),
+            "a re-authenticated call etcd refused again is not a credentials problem, \
+             got {err:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn an_auth_store_revision_change_is_waited_out_not_treated_as_a_bad_password() {
+        // `revision of auth store is old` shares `InvalidArgument` with a
+        // wrong password, and before it was told apart, one `etcdctl user
+        // add` on a JWT cluster ended the boot of every gateway pointed
+        // at it. It must reach the same place `Unauthenticated` does.
+        let endpoint =
+            spawn_grpc_status_server(3, "etcdserver: revision of auth store is old").await;
+        let provider =
+            EtcdConfigProvider::connect(&[endpoint], "/aisix", credentials(), None, None)
+                .await
+                .expect("an auth-store change must not end the boot");
+        assert!(matches!(
+            provider.load_all().await,
+            Err(ProviderError::Connect(_))
+        ));
     }
 
     #[test]

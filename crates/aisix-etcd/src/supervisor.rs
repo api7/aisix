@@ -1129,6 +1129,24 @@ impl<P: ConfigProvider> Supervisor<P> {
                             "etcd refused this gateway's credentials — no configuration can be \
                              read until they are fixed; still retrying",
                         );
+                    } else if matches!(err, ProviderError::TokenRefused(_)) {
+                        // Deliberately NOT the line above. etcd accepted
+                        // the credentials — it issued the token being
+                        // refused — so pointing at the username and
+                        // password sends an operator somewhere there is
+                        // nothing to find. The causes are the auth store
+                        // changing faster than the gateway can
+                        // re-authenticate, and, under `--auth-token jwt`,
+                        // a token that is already outside its `ttl` when
+                        // it arrives because the two clocks disagree.
+                        tracing::error!(
+                            error = %err,
+                            backoff_ms = delay.as_millis() as u64,
+                            "etcd would not accept an auth token it had just issued to this \
+                             gateway — the credentials are fine; check whether etcd's auth \
+                             store is being changed continuously, and whether this host's \
+                             clock agrees with etcd's; still retrying",
+                        );
                     } else {
                         tracing::warn!(
                             error = %err,
