@@ -125,7 +125,8 @@ pub struct EtcdConfig {
     #[serde(default)]
     pub password_env: Option<String>,
     /// Bound on the TCP connect to etcd, in milliseconds. Unset — the
-    /// default — leaves it to the OS TCP stack.
+    /// default — and `0` both mean unbounded (see the note on `0` under
+    /// [`EtcdConfig::request_timeout`]), leaving it to the OS TCP stack.
     ///
     /// It reaches hyper's connector via `Endpoint::connect_timeout`, so
     /// it covers the TCP handshake and nothing after it. Two later steps
@@ -135,18 +136,19 @@ pub struct EtcdConfig {
     /// when `user` / `password_env` are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dial_timeout_ms: Option<u64>,
-    /// Bound on a single unary etcd call, in milliseconds. Unset — the
-    /// default — leaves those calls unbounded.
+    /// Bound on a single request/response etcd call, in milliseconds.
+    /// Unset — the default — and `0` both mean unbounded (see the note on
+    /// `0` below).
     ///
-    /// When set it covers the configuration range read (`load_all`) and
-    /// the admin surface's reads. It does not reach the two calls that
-    /// sit outside that set and are still unbounded — the `Authenticate`
-    /// inside `Client::connect`, and the watch-create handshake — so an
-    /// etcd that answers a range read but stalls on either of those can
-    /// still hang the gateway. It deliberately does NOT cover the
-    /// watch: that stream is long-lived by construction, so a bound on it
-    /// would expire on every interval quiet enough to produce no event
-    /// and leave the gateway reconnecting instead of watching.
+    /// When set it covers the configuration range read (`load_all`), the
+    /// watch-create handshake, and the admin surface's reads. It does not
+    /// reach the `Authenticate` inside `Client::connect`, which is still
+    /// unbounded. It deliberately does NOT cover the established watch
+    /// stream either: that stream is long-lived by construction, so a
+    /// bound on it would expire on every interval quiet enough to produce
+    /// no event and leave the gateway reconnecting instead of watching.
+    /// Creating the watch is request/response shaped and is bounded;
+    /// consuming it is not.
     ///
     /// The default is unset rather than a finite value because the range
     /// read scales with the size of the configuration set: a bound short
@@ -383,19 +385,36 @@ impl EtcdConfig {
     fn default_prefix() -> String {
         "/aisix".into()
     }
-    /// `None` when unset: the dial is unbounded.
+    /// `None` when unset or `0`: the dial is unbounded.
+    ///
+    /// See [`EtcdConfig::request_timeout`] for why `0` means unbounded
+    /// here and "fall back to the next level" elsewhere in this repo.
     pub const fn dial_timeout(&self) -> Option<Duration> {
-        match self.dial_timeout_ms {
-            Some(ms) => Some(Duration::from_millis(ms)),
-            None => None,
-        }
+        Self::bound(self.dial_timeout_ms)
     }
 
-    /// `None` when unset: unary calls are unbounded.
+    /// `None` when unset or `0`: request/response calls are unbounded.
+    ///
+    /// `0` is the same as unset, not an instant abort — the same reading
+    /// `Model::timeout: 0` gets ("no deadline, stop resolving"). The one
+    /// key in this repo where `0` means "fall back to the next level" is
+    /// `Model::stream_timeout`, and only because it sits on a model →
+    /// group → `upstream.*` resolution chain where deferring is an
+    /// expressible meaning. These two keys are flat, single-level startup
+    /// configuration with nothing to defer to, so the only other reading
+    /// `0` could carry is an instant abort, and that is unreachable:
+    /// every connect and every read would expire, so the proxy listener
+    /// would never bind.
     pub const fn request_timeout(&self) -> Option<Duration> {
-        match self.request_timeout_ms {
+        Self::bound(self.request_timeout_ms)
+    }
+
+    /// Shared reading of both etcd timeout keys, so the two cannot drift
+    /// apart on what `0` means.
+    const fn bound(ms: Option<u64>) -> Option<Duration> {
+        match ms {
+            None | Some(0) => None,
             Some(ms) => Some(Duration::from_millis(ms)),
-            None => None,
         }
     }
 
@@ -1831,6 +1850,44 @@ admin:
         assert_eq!(
             cfg.etcd.request_timeout(),
             Some(Duration::from_millis(7000))
+        );
+    }
+
+    #[test]
+    fn etcd_timeouts_read_zero_as_unbounded_not_as_an_instant_abort() {
+        // `0` is the same as unset for both keys, matching what
+        // `Model::timeout: 0` already means. The alternative reading —
+        // abort immediately — bricks the gateway silently: every connect
+        // and every read expires, so the proxy listener never binds and
+        // nothing says why. The one `0` in this repo that means "fall
+        // back to the next level" is `Model::stream_timeout`, which needs
+        // a resolution chain these two flat startup keys do not have.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+  dial_timeout_ms: 0
+  request_timeout_ms: 0
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.etcd.dial_timeout_ms, Some(0), "the key still parses");
+        assert_eq!(cfg.etcd.request_timeout_ms, Some(0));
+        assert_eq!(
+            cfg.etcd.dial_timeout(),
+            None,
+            "dial_timeout_ms: 0 must read as unbounded",
+        );
+        assert_eq!(
+            cfg.etcd.request_timeout(),
+            None,
+            "request_timeout_ms: 0 must read as unbounded",
         );
     }
 

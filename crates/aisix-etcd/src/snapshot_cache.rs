@@ -54,9 +54,17 @@ struct Inner {
     /// Some(path) → enabled; None → no-op.
     path: Option<PathBuf>,
     /// Serialise concurrent writes so the tmp-file rename dance can't
-    /// race with itself. Reads are unguarded — they go through OS
-    /// caches and the rename is atomic.
-    write_lock: Mutex<()>,
+    /// race with itself, and carry the highest revision committed so far
+    /// so they also commit in order. Reads are unguarded — they go
+    /// through OS caches and the rename is atomic.
+    ///
+    /// The ordering half matters because [`Self::store`] serialises its
+    /// snapshot BEFORE taking this lock: the supervisor spawns one write
+    /// per apply and never waits for it, so two writes racing that work
+    /// can reach the lock in the opposite order to the applies that
+    /// produced them, and the older snapshot lands last. `i64::MIN`
+    /// until the first write, so a revision of `0` still commits.
+    write_lock: Mutex<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,7 +118,7 @@ impl SnapshotCache {
         Self {
             inner: Arc::new(Inner {
                 path: Some(path.into()),
-                write_lock: Mutex::new(()),
+                write_lock: Mutex::new(i64::MIN),
             }),
         }
     }
@@ -122,7 +130,7 @@ impl SnapshotCache {
         Self {
             inner: Arc::new(Inner {
                 path: None,
-                write_lock: Mutex::new(()),
+                write_lock: Mutex::new(i64::MIN),
             }),
         }
     }
@@ -231,10 +239,21 @@ impl SnapshotCache {
                 return;
             }
         };
-        let _guard = self.inner.write_lock.lock().await;
+        let mut committed = self.inner.write_lock.lock().await;
+        // A write that lost the serialisation race to a NEWER apply has
+        // nothing to add: committing it would roll the cache back to a
+        // snapshot the gateway has already moved past, and the next
+        // restart would then serve it. Equal revisions still commit — a
+        // delete flushes at the current revision floor, so same-revision
+        // writes carry different content.
+        if revision < *committed {
+            return;
+        }
         if let Err(e) = atomic_write(&path, &bytes).await {
             tracing::warn!(error = %e, path = %path.display(), "snapshot cache write failed");
+            return;
         }
+        *committed = revision;
     }
 }
 
@@ -282,6 +301,53 @@ mod tests {
         assert_eq!(cached.revision, 42);
         assert_eq!(cached.entries, entries);
         assert!(cached.stale.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_write_that_lost_its_race_cannot_roll_the_cache_back() {
+        // The supervisor spawns one write per apply and does not order
+        // them, and `store` serialises its snapshot before taking the
+        // write lock — so a write for an older apply can reach the lock
+        // after a newer one. Committing it would roll the cache back to
+        // a snapshot the gateway has already moved past, and the next
+        // restart would serve it. Sequential calls stand in for the race:
+        // the lock is what the race resolves to, and this is the order it
+        // can resolve to.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("snap.json");
+        let cache = SnapshotCache::new(&path);
+
+        let newer = vec![entry("/aisix/models/m-1", br#"{"name":"new"}"#, 9)];
+        let older = vec![entry("/aisix/models/m-1", br#"{"name":"old"}"#, 8)];
+        cache.store(&newer, 9, &[]).await;
+        cache.store(&older, 8, &[]).await;
+
+        let cached = cache.load().expect("cache file exists");
+        assert_eq!(
+            cached.revision, 9,
+            "the older apply must not overwrite the newer one",
+        );
+        assert_eq!(cached.entries, newer);
+    }
+
+    #[tokio::test]
+    async fn a_write_at_the_same_revision_still_commits() {
+        // A delete flushes at the current revision floor rather than a
+        // revision of its own, so same-revision writes carry different
+        // content and the guard above must not swallow them.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("snap.json");
+        let cache = SnapshotCache::new(&path);
+
+        let before = vec![entry("/aisix/models/m-1", br#"{"name":"m1"}"#, 9)];
+        cache.store(&before, 9, &[]).await;
+        cache.store(&[], 9, &[]).await;
+
+        let cached = cache.load().expect("cache file exists");
+        assert!(
+            cached.entries.is_empty(),
+            "a same-revision write must still commit",
+        );
     }
 
     #[tokio::test]

@@ -8,14 +8,18 @@ etcd:
   # user: "aisix"
   # password_env: "AISIX_ETCD_PASSWORD"
   # Optional bounds on etcd I/O. Both are unset by default, and unset
-  # means unbounded.
+  # means unbounded. `0` means unbounded as well — the same reading a
+  # model's `timeout: 0` gets. (A model's `stream_timeout: 0` is the odd
+  # one out: it falls back to the next level of a resolution chain these
+  # flat startup settings do not have.)
   #
   # `dial_timeout_ms` bounds the TCP connect — not the TLS handshake
   # after it, and not the authentication exchange when `user` is set.
-  # `request_timeout_ms` bounds a single unary call — the configuration
-  # range read at boot and on every reconnect, and the admin API's reads.
-  # It deliberately does not apply to the watch stream, which is
-  # long-lived and would be torn down by any such bound.
+  # `request_timeout_ms` bounds a single request/response call — the
+  # configuration range read at boot and on every reconnect, creating the
+  # watch, and the admin API's reads. It deliberately does not apply to
+  # the established watch stream, which is long-lived and would be torn
+  # down by any such bound.
   #
   # Leave `request_timeout_ms` unset unless you specifically want a slow
   # etcd to fail fast: the range read grows with the size of your
