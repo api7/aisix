@@ -20,7 +20,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use crate::client::{classify, format_etcd_error, ConnectError, LazyEtcdClient};
+use crate::client::{
+    classify, format_etcd_error, kv_client, watch_client, CallError, ConnectError, LazyEtcdClient,
+};
 use crate::provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
 
 /// Fixed-interval retry: 5s × 5 attempts (spec §2).
@@ -109,12 +111,18 @@ impl EtcdConfigProvider {
         ));
         match client.connect_now().await {
             Ok(()) => tracing::info!(prefix = %prefix, "etcd connected"),
-            Err(ConnectError::Unreachable(detail)) => tracing::warn!(
-                error = %detail,
-                prefix = %prefix,
-                "etcd is not reachable yet — starting anyway and retrying in the background; \
-                 the proxy listener stays closed until a configuration is applied",
-            ),
+            // A token etcd will not accept is grouped with an etcd that
+            // did not answer, not with a refused credential: nothing
+            // about the configured user is in question, and the next
+            // call dials again and authenticates again.
+            Err(err @ (ConnectError::Unreachable(_) | ConnectError::Unauthenticated(_))) => {
+                tracing::warn!(
+                    error = %err.detail(),
+                    prefix = %prefix,
+                    "etcd is not reachable yet — starting anyway and retrying in the background; \
+                     the proxy listener stays closed until a configuration is applied",
+                )
+            }
             Err(err @ ConnectError::Rejected(_)) => {
                 return Err(ProviderError::Rejected(err.detail().to_string()))
             }
@@ -160,7 +168,8 @@ impl EtcdConfigProvider {
                 Err(err @ ConnectError::Rejected(_)) => {
                     return Err(ProviderError::Rejected(err.detail().to_string()))
                 }
-                Err(ConnectError::Unreachable(detail)) => {
+                Err(err @ (ConnectError::Unreachable(_) | ConnectError::Unauthenticated(_))) => {
+                    let detail = err.detail().to_string();
                     tracing::warn!(
                         attempt,
                         max = policy.attempts,
@@ -185,88 +194,92 @@ impl EtcdConfigProvider {
 }
 
 impl From<ConnectError> for ProviderError {
-    /// Both classes reach the supervisor, which backs off and retries
+    /// Every class reaches the supervisor, which backs off and retries
     /// whichever it gets — the split is what the boot path acts on, and
     /// what the operator reads in the warn line.
     fn from(err: ConnectError) -> Self {
         match &err {
             ConnectError::Unreachable(detail) => ProviderError::Connect(detail.clone()),
             ConnectError::Rejected(detail) => ProviderError::Rejected(detail.clone()),
+            // A token etcd has forgotten is not a refused credential:
+            // `LazyEtcdClient::call` has already authenticated again and
+            // retried by the time one reaches here, so what is left is a
+            // condition to retry, not one to report as a configuration
+            // mistake that will never heal.
+            ConnectError::Unauthenticated(detail) => ProviderError::Connect(detail.clone()),
         }
     }
 }
 
-/// Apply `timeout`, when set, to one in-flight etcd call.
+/// Report one failed etcd call.
 ///
-/// `into_err` names the call: expiry is reported as the same
-/// `ProviderError` variant that call's transport failures already use,
-/// so the supervisor's warn line attributes it to the right step. It is
+/// `into_err` names the call — the range read, the watch create — so the
+/// supervisor's warn line attributes the failure to the right step. It is
 /// attribution, not control flow: `Supervisor::run` routes every
 /// `ProviderError` out of a cycle to the same reconnect-with-backoff
 /// path, so the aborted call is retried whichever variant carries it.
-/// Report one failed etcd call.
 ///
-/// A refusal is reported as such wherever etcd hands it over, not only
-/// on the dial: a user who authenticates but lacks the permission is
-/// refused by the range read, and a token an etcd restart invalidated is
-/// refused by every call after it. Those never heal by retrying, and
-/// reporting them as ordinary transport trouble is what buries them in a
-/// warn line that repeats forever. Everything else keeps the variant
-/// naming the call that failed, which is what the supervisor's backoff
-/// line says.
-fn call_error(err: &etcd_client::Error, into_err: fn(String) -> ProviderError) -> ProviderError {
-    match classify(err) {
-        ConnectError::Rejected(detail) => ProviderError::Rejected(detail),
-        ConnectError::Unreachable(_) => into_err(format_etcd_error(err)),
-    }
-}
-
-async fn bound<T>(
-    timeout: Option<Duration>,
+/// A refusal is reported as such wherever etcd hands it over, not only on
+/// the dial: a user who authenticates but lacks the permission is refused
+/// by the range read. That never heals by retrying, and reporting it as
+/// ordinary transport trouble is what buries it in a warn line that
+/// repeats forever.
+fn provider_error(
+    err: CallError,
     what: &str,
     into_err: fn(String) -> ProviderError,
-    fut: impl std::future::Future<Output = T>,
-) -> Result<T, ProviderError> {
-    match timeout {
-        None => Ok(fut.await),
-        Some(d) => tokio::time::timeout(d, fut).await.map_err(|_| {
-            into_err(format!(
-                "{what} exceeded etcd.request_timeout_ms ({} ms)",
-                d.as_millis()
-            ))
-        }),
+) -> ProviderError {
+    match err {
+        CallError::Connect(err) => err.into(),
+        CallError::ConnectTimeout(d) => ProviderError::Connect(format!(
+            "etcd connect exceeded etcd.request_timeout_ms ({} ms)",
+            d.as_millis()
+        )),
+        CallError::CallTimeout(d) => into_err(format!(
+            "{what} exceeded etcd.request_timeout_ms ({} ms)",
+            d.as_millis()
+        )),
+        CallError::Call(err) => match classify(&err) {
+            ConnectError::Rejected(detail) => ProviderError::Rejected(detail),
+            // Retryable, and by here already retried once on a freshly
+            // authenticated connection: an `Unauthenticated` that
+            // survived that is etcd still catching up on its own auth
+            // revision, not a credential it has refused.
+            ConnectError::Unreachable(_) | ConnectError::Unauthenticated(_) => {
+                into_err(format_etcd_error(&err))
+            }
+        },
     }
 }
 
 #[async_trait]
 impl ConfigProvider for EtcdConfigProvider {
     async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
-        // The dial is bounded like the call it is part of. Without
-        // credentials there is nothing to dial here — the channel
-        // connects inside the `get` below, under the same bound — but
-        // with them the `Authenticate` round trip happens on the way in,
-        // and an endpoint that accepts TCP and answers nothing would
+        // Through `LazyEtcdClient::call`, so the read is bounded, and so
+        // a token etcd has forgotten — it restarted, or the token's TTL
+        // elapsed — is re-authenticated and retried here instead of
+        // failing every cycle until the gateway is restarted.
+        //
+        // The dial it may have to make first is bounded like the call it
+        // is part of. Without credentials there is nothing to dial here —
+        // the channel connects inside the `get`, under the same bound —
+        // but with them the `Authenticate` round trip happens on the way
+        // in, and an endpoint that accepts TCP and answers nothing would
         // otherwise hold this read open forever: no backoff, no failure
         // recorded, and `/status/config` still reporting connected.
-        let mut kv = bound(
-            self.request_timeout,
-            "etcd connect",
-            ProviderError::Connect,
-            self.client.kv(),
-        )
-        .await??;
-        let read = kv.get(
-            self.prefix.as_bytes(),
-            Some(GetOptions::new().with_prefix()),
-        );
-        let resp = bound(
-            self.request_timeout,
-            "range read",
-            ProviderError::Range,
-            read,
-        )
-        .await?
-        .map_err(|e| call_error(&e, ProviderError::Range))?;
+        let prefix = self.prefix.as_bytes().to_vec();
+        let resp = self
+            .client
+            .call(self.request_timeout, move |client| {
+                let prefix = prefix.clone();
+                async move {
+                    kv_client(&client)
+                        .get(prefix, Some(GetOptions::new().with_prefix()))
+                        .await
+                }
+            })
+            .await
+            .map_err(|e| provider_error(e, "range read", ProviderError::Range))?;
 
         let revision = resp.header().map(|h| h.revision()).unwrap_or(0);
 
@@ -290,16 +303,7 @@ impl ConfigProvider for EtcdConfigProvider {
         Box<dyn Stream<Item = Result<WatchEvent, ProviderError>> + Send + Unpin>,
         ProviderError,
     > {
-        let mut watch = bound(
-            self.request_timeout,
-            "etcd connect",
-            ProviderError::Connect,
-            self.client.watch(),
-        )
-        .await??;
-        let opts = WatchOptions::new()
-            .with_prefix()
-            .with_start_revision(start_revision);
+        let prefix = self.prefix.as_bytes().to_vec();
         // Creating the watch is request/response shaped — etcd-client
         // sends the create request and awaits the server's create
         // confirmation before handing back the stream — so it is bounded
@@ -310,15 +314,19 @@ impl ConfigProvider for EtcdConfigProvider {
         // reads but never confirms the watch leaves the gateway serving
         // its first snapshot forever, blind to every later change, while
         // `/status/config` still reports it connected.
-        let create = watch.watch(self.prefix.as_bytes(), Some(opts));
-        let (watcher, stream) = bound(
-            self.request_timeout,
-            "watch create",
-            ProviderError::Watch,
-            create,
-        )
-        .await?
-        .map_err(|e| call_error(&e, ProviderError::Watch))?;
+        let (watcher, stream) = self
+            .client
+            .call(self.request_timeout, move |client| {
+                let prefix = prefix.clone();
+                async move {
+                    let opts = WatchOptions::new()
+                        .with_prefix()
+                        .with_start_revision(start_revision);
+                    watch_client(&client).watch(prefix, Some(opts)).await
+                }
+            })
+            .await
+            .map_err(|e| provider_error(e, "watch create", ProviderError::Watch))?;
 
         Ok(Box::new(EtcdWatchStream {
             inner: stream,
@@ -377,7 +385,16 @@ impl Stream for EtcdWatchStream {
                 {
                     Poll::Ready(Some(Err(ProviderError::Compacted)))
                 } else {
-                    Poll::Ready(Some(Err(call_error(&err, ProviderError::Watch))))
+                    // No re-authentication here: an established stream
+                    // cannot be moved onto a new connection, and a poll
+                    // is not a place to dial one. Ending the stream is
+                    // the recovery — the supervisor re-enters its cycle,
+                    // and `load_all` re-authenticates on the way through.
+                    Poll::Ready(Some(Err(provider_error(
+                        CallError::Call(err),
+                        "watch stream",
+                        ProviderError::Watch,
+                    ))))
                 }
             }
             Poll::Ready(Some(Ok(resp))) => {
@@ -768,10 +785,29 @@ mod tests {
                 Err(ProviderError::Connect(_))
             ));
         }
+        // 16 Unauthenticated is the third class: etcd answered, and what
+        // it refused is the token rather than the credentials — it
+        // restarted, or `--auth-token-ttl` elapsed. Dialling again is
+        // what cures that, so the boot waits like the codes above rather
+        // than ending. On a call rather than a dial,
+        // `LazyEtcdClient::call` re-authenticates and retries it; here
+        // it is the dial itself that is refused, and there is nothing
+        // left to re-authenticate.
+        {
+            let endpoint = spawn_grpc_status_server(16, "etcdserver: invalid auth token").await;
+            let provider =
+                EtcdConfigProvider::connect(&[endpoint], "/aisix", credentials(), None, None)
+                    .await
+                    .expect("an invalid token must be waited out, not fatal");
+            assert!(matches!(
+                provider.load_all().await,
+                Err(ProviderError::Connect(_))
+            ));
+        }
         // 3 InvalidArgument (etcd's answer to a wrong user or password),
         // 7 PermissionDenied, 9 FailedPrecondition (credentials sent to a
-        // cluster with authentication disabled), 16 Unauthenticated.
-        for code in [3u16, 7, 9, 16] {
+        // cluster with authentication disabled).
+        for code in [3u16, 7, 9] {
             let endpoint = spawn_grpc_status_server(code, "refused").await;
             let err = EtcdConfigProvider::connect(&[endpoint], "/aisix", credentials(), None, None)
                 .await
@@ -919,16 +955,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn bound_passes_through_when_no_timeout_is_set() {
-        let out = bound(None, "range read", ProviderError::Range, async { 7u8 })
-            .await
-            .unwrap();
-        assert_eq!(out, 7);
-    }
-
-    #[tokio::test]
-    async fn expiry_reports_the_call_and_the_key_that_bounded_it() {
+    #[test]
+    fn expiry_reports_the_call_and_the_key_that_bounded_it() {
         // An expiry has to reach the operator as a diagnosable failure,
         // not as a bare cancellation: the message names both the call it
         // aborted and the config key that set the bound, so a boot loop
@@ -937,20 +965,38 @@ mod tests {
         // failures already use — the supervisor sends every
         // `ProviderError` from `load_all` down the same backoff path, so
         // the variant is what the warn line says, not what it does.
-        let err = bound(
-            Some(Duration::from_millis(1)),
+        let err = provider_error(
+            CallError::CallTimeout(Duration::from_millis(1)),
             "range read",
             ProviderError::Range,
-            std::future::pending::<()>(),
-        )
-        .await
-        .unwrap_err();
+        );
         let ProviderError::Range(msg) = err else {
             panic!("expiry must surface as ProviderError::Range, got {err:?}");
         };
         assert!(
             msg.contains("range read") && msg.contains("etcd.request_timeout_ms"),
             "the message must name the call and the key that bounded it: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_dial_that_ran_out_of_time_is_attributed_to_the_connect() {
+        // The connect is bounded separately from the call it carries, so
+        // an operator reading the warn line can tell "etcd never finished
+        // answering the dial" from "etcd never finished the read" —
+        // different causes, and after a re-authentication both are
+        // reachable from the same `load_all`.
+        let err = provider_error(
+            CallError::ConnectTimeout(Duration::from_millis(1)),
+            "range read",
+            ProviderError::Range,
+        );
+        let ProviderError::Connect(msg) = err else {
+            panic!("a dial expiry must surface as ProviderError::Connect, got {err:?}");
+        };
+        assert!(
+            msg.contains("etcd connect") && msg.contains("etcd.request_timeout_ms"),
+            "the message must name the step and the key that bounded it: {msg}"
         );
     }
 }

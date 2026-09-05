@@ -24,7 +24,7 @@ use aisix_core::{
     A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter,
     PassthroughRoute, ProviderKey,
 };
-use aisix_etcd::LazyEtcdClient;
+use aisix_etcd::{kv_client, CallError, LazyEtcdClient};
 use etcd_client::GetOptions;
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
@@ -83,18 +83,6 @@ impl EtcdConfigStore {
         }
     }
 
-    /// The KV sub-client for one read, connecting first when the boot
-    /// dial had not reached etcd yet. Under the same `request_timeout`
-    /// as the read itself: with etcd credentials configured the dial
-    /// includes an `Authenticate` round trip, and an endpoint that
-    /// accepts TCP and answers nothing would otherwise hang the admin
-    /// request — and every other read behind this client's connect.
-    async fn kv(&self) -> Result<etcd_client::KvClient, StoreError> {
-        self.bound(self.client.kv())
-            .await?
-            .map_err(|e| StoreError::Backend(e.to_string()))
-    }
-
     pub fn prefix(&self) -> &str {
         &self.prefix
     }
@@ -115,29 +103,50 @@ impl EtcdConfigStore {
         full_key.strip_prefix(&needle)
     }
 
-    /// Apply `request_timeout`, when set, to one in-flight read.
-    async fn bound<T>(&self, fut: impl std::future::Future<Output = T>) -> Result<T, StoreError> {
-        match self.request_timeout {
-            None => Ok(fut.await),
-            Some(d) => tokio::time::timeout(d, fut).await.map_err(|_| {
-                StoreError::Backend(format!(
-                    "etcd read exceeded etcd.request_timeout_ms ({} ms)",
-                    d.as_millis()
-                ))
-            }),
-        }
+    /// One read against etcd, through the connection this store shares
+    /// with the config provider.
+    ///
+    /// Everything the admin GET surface reads goes through here, for two
+    /// reasons that are easy to lose if a call site is written by hand.
+    /// `request_timeout` bounds the read *and* the dial it may have to
+    /// make first — with etcd credentials configured that dial includes
+    /// an `Authenticate` round trip, and an endpoint that accepts TCP and
+    /// answers nothing would otherwise hang the admin request and every
+    /// other read queued behind the same connect. And a token etcd has
+    /// forgotten — it restarted, or `--auth-token-ttl` elapsed while the
+    /// admin listener was idle, which is exactly when it does — is
+    /// re-authenticated and retried instead of failing every admin read
+    /// until the gateway is restarted.
+    async fn read<T, F, Fut>(&self, op: F) -> Result<T, StoreError>
+    where
+        F: FnMut(etcd_client::Client) -> Fut,
+        Fut: std::future::Future<Output = Result<T, etcd_client::Error>>,
+    {
+        self.client
+            .call(self.request_timeout, op)
+            .await
+            .map_err(|err| match err {
+                CallError::ConnectTimeout(d) | CallError::CallTimeout(d) => {
+                    StoreError::Backend(format!(
+                        "etcd read exceeded etcd.request_timeout_ms ({} ms)",
+                        d.as_millis()
+                    ))
+                }
+                CallError::Connect(err) => StoreError::Backend(err.to_string()),
+                CallError::Call(err) => StoreError::Backend(err.to_string()),
+            })
     }
 
     async fn get_one<T: DeserializeOwned>(
         &self,
         key: &str,
     ) -> Result<Option<(T, i64)>, StoreError> {
-        let resp = {
-            let mut client = self.kv().await?;
-            self.bound(client.get(key.as_bytes().to_vec(), None))
-                .await?
-        }
-        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        let resp = self
+            .read(move |client| {
+                let key = key.as_bytes().to_vec();
+                async move { kv_client(&client).get(key, None).await }
+            })
+            .await?;
         let kv = match resp.kvs().first() {
             Some(kv) => kv,
             None => return Ok(None),
@@ -152,17 +161,18 @@ impl EtcdConfigStore {
         kind: &str,
     ) -> Result<Vec<(String, T, i64)>, StoreError> {
         let prefix = self.range_prefix(kind);
-        // Scoped so the bound covers the call and not the decode loop
-        // below, which is where it sat before the bound was introduced.
-        let resp = {
-            let mut client = self.kv().await?;
-            self.bound(client.get(
-                prefix.as_bytes().to_vec(),
-                Some(GetOptions::new().with_prefix()),
-            ))
-            .await?
-        }
-        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        // The bound covers the call and not the decode loop below,
+        // which is where it sat before the bound was introduced.
+        let resp = self
+            .read(move |client| {
+                let prefix = prefix.as_bytes().to_vec();
+                async move {
+                    kv_client(&client)
+                        .get(prefix, Some(GetOptions::new().with_prefix()))
+                        .await
+                }
+            })
+            .await?;
 
         let mut out = Vec::with_capacity(resp.kvs().len());
         for kv in resp.kvs() {

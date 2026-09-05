@@ -31,7 +31,7 @@ pub mod supervisor;
 
 pub use backoff::{ExpBackoff, BASE_MS, MAX_MS};
 pub use client::{
-    kv_client, watch_client, ConnectError, LazyEtcdClient, MAX_DECODING_MESSAGE_SIZE,
+    kv_client, watch_client, CallError, ConnectError, LazyEtcdClient, MAX_DECODING_MESSAGE_SIZE,
 };
 pub use etcd_provider::{
     ConnectPolicy, EtcdConfigProvider, EtcdWatchStream, CONNECT_MAX_ATTEMPTS,

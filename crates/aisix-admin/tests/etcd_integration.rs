@@ -604,3 +604,97 @@ async fn loader_picks_up_every_direct_write() {
     assert_eq!(snap.mcp_servers.len(), 1);
     assert_eq!(snap.a2a_agents.len(), 1);
 }
+
+/// The admin read path against an etcd whose auth token stops working
+/// under it.
+///
+/// `etcd-client` authenticates once, inside `Client::connect`, and never
+/// again, so the token a store dialled with is the only one it will ever
+/// have. An admin listener is idle for long stretches by nature — nobody
+/// is calling `GET /apisix/admin/models` every second — which is exactly
+/// the state in which etcd's `--auth-token-ttl` elapses. Every later
+/// admin read was then refused until the gateway was restarted.
+///
+/// Bracketed by `ETCD_AUTH_TTL_TEST_URL`, the short-TTL authenticated
+/// cluster `.github/workflows/ci.yml` starts (the container and the
+/// short-TTL approach come from community PR api7/aisix#763, `okaybase`);
+/// no-ops when it is unset, like every other integration test here.
+#[tokio::test]
+async fn admin_reads_survive_a_token_the_server_forgets() {
+    let (Ok(url), Ok(user), Ok(password), Ok(ttl)) = (
+        std::env::var("ETCD_AUTH_TTL_TEST_URL"),
+        std::env::var("ETCD_AUTH_TTL_TEST_USER"),
+        std::env::var("ETCD_AUTH_TTL_TEST_PASSWORD"),
+        std::env::var("ETCD_AUTH_TTL_TEST_SECS"),
+    ) else {
+        eprintln!("skipping: ETCD_AUTH_TTL_TEST_URL not set");
+        return;
+    };
+    let ttl: u64 = ttl.parse().expect("ETCD_AUTH_TTL_TEST_SECS is a number");
+    let credentials =
+        || Some(etcd_client::ConnectOptions::new().with_user(user.clone(), password.clone()));
+
+    let prefix = unique_prefix();
+    let mut writer = etcd_client::Client::connect([url.clone()], credentials())
+        .await
+        .expect("seed client");
+    seed(
+        &mut writer,
+        &prefix,
+        "models",
+        "m-token",
+        &json!({
+            "display_name": "token-it",
+            "provider": "openai",
+            "model_name": "gpt-4o-mini",
+            "provider_key_id": "11111111-1111-1111-1111-111111111111"
+        }),
+    )
+    .await;
+
+    let store = EtcdConfigStore::new(
+        Arc::new(aisix_etcd::LazyEtcdClient::new(
+            vec![url.clone()],
+            credentials(),
+            Some(std::time::Duration::from_secs(10)),
+        )),
+        &prefix,
+        Some(std::time::Duration::from_secs(10)),
+    );
+    assert_eq!(
+        store
+            .list_models()
+            .await
+            .expect("the first read works")
+            .len(),
+        1,
+    );
+
+    // etcd's token TTL is refreshed by use, so it is only ever an idle
+    // admin listener that reaches it — which is the failure as reported.
+    tokio::time::sleep(std::time::Duration::from_secs(ttl + 4)).await;
+
+    let models = store
+        .list_models()
+        .await
+        .expect("an expired token must be replaced, not fail the admin read");
+    assert_eq!(
+        models.len(),
+        1,
+        "the read after re-authenticating must return the same configuration",
+    );
+    assert_eq!(models[0].id, "m-token");
+
+    // A writer of its own: this one's token expired during the sleep too,
+    // and nothing re-authenticates a bare `etcd_client::Client`.
+    let mut writer = etcd_client::Client::connect([url], credentials())
+        .await
+        .expect("cleanup client");
+    writer
+        .delete(
+            format!("{prefix}/models/m-token"),
+            Some(DeleteOptions::new().with_prefix()),
+        )
+        .await
+        .expect("cleanup");
+}

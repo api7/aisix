@@ -9,6 +9,8 @@
 
 use etcd_client::{Client, ConnectOptions, Error as EtcdError, KvClient, WatchClient};
 use std::error::Error as StdError;
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -104,6 +106,19 @@ pub enum ConnectError {
     /// these, so they are fatal at boot.
     #[error("etcd refused the connection: {0}")]
     Rejected(String),
+    /// etcd answered and refused *the token this connection is using*,
+    /// not the configured credentials: the gateway authenticated once
+    /// and etcd has since forgotten that token — it restarted (the token
+    /// store is in memory), or the token's `--auth-token-ttl` elapsed.
+    ///
+    /// Kept apart from [`Self::Rejected`] because the two need opposite
+    /// handling. A refused credential never becomes a good one, so
+    /// waiting on it is what turns a typo into a permanently empty
+    /// gateway. A forgotten token is cured by the one thing the gateway
+    /// has not done since it started: authenticate again. See
+    /// [`LazyEtcdClient::call`].
+    #[error("etcd rejected the connection's auth token: {0}")]
+    Unauthenticated(String),
 }
 
 /// Canonical gRPC status codes, as sent on the wire
@@ -117,6 +132,7 @@ const GRPC_RESOURCE_EXHAUSTED: i32 = 8;
 const GRPC_ABORTED: i32 = 10;
 const GRPC_INTERNAL: i32 = 13;
 const GRPC_UNAVAILABLE: i32 = 14;
+const GRPC_UNAUTHENTICATED: i32 = 16;
 
 impl ConnectError {
     /// The flattened cause, without this type's own framing — so a
@@ -124,7 +140,9 @@ impl ConnectError {
     /// two prefixes in front of what etcd actually said.
     pub fn detail(&self) -> &str {
         match self {
-            Self::Unreachable(detail) | Self::Rejected(detail) => detail,
+            Self::Unreachable(detail) | Self::Rejected(detail) | Self::Unauthenticated(detail) => {
+                detail
+            }
         }
     }
 }
@@ -147,6 +165,13 @@ impl ConnectError {
 /// (`PermissionDenied`), and a token invalidated by an etcd restart is
 /// refused by every later call (`Unauthenticated`). Classifying only the
 /// dial would report those as ordinary transport trouble.
+///
+/// The `Unauthenticated` / `InvalidArgument` split is the whole safety
+/// condition behind re-authenticating: etcd answers a wrong user or
+/// password on `Authenticate` with `InvalidArgument`, and reserves
+/// `Unauthenticated` for a token it does not recognise (`etcdserver:
+/// invalid auth token`). So a credential etcd has refused can never
+/// reach the retry path, however many times it is presented.
 pub(crate) fn classify(err: &EtcdError) -> ConnectError {
     let detail = format_etcd_error(err);
     match err {
@@ -172,6 +197,11 @@ pub(crate) fn classify(err: &EtcdError) -> ConnectError {
             | GRPC_CANCELLED
             | GRPC_ABORTED
             | GRPC_RESOURCE_EXHAUSTED => ConnectError::Unreachable(detail),
+            // etcd knows the call arrived with a token it no longer
+            // holds — it restarted, or the token's TTL elapsed. The
+            // configured credentials are not what it is complaining
+            // about, so this one heals by authenticating again.
+            GRPC_UNAUTHENTICATED => ConnectError::Unauthenticated(detail),
             // Everything else is etcd having evaluated the request and
             // said no: `InvalidArgument` for a wrong user or password,
             // `PermissionDenied` for a user without the rights,
@@ -182,6 +212,75 @@ pub(crate) fn classify(err: &EtcdError) -> ConnectError {
         // Unparseable endpoints, an empty endpoint list, a bad header
         // value: configuration, not reachability.
         _ => ConnectError::Rejected(detail),
+    }
+}
+
+/// Why one [`LazyEtcdClient::call`] attempt failed.
+///
+/// Split by step so a caller can attribute it in its own error type: the
+/// connect and the call it carries are separate lines in an operator's
+/// log, and each carries a different one of the two `etcd.*_timeout_ms`
+/// keys.
+#[derive(Debug, thiserror::Error)]
+pub enum CallError {
+    /// The connection could not be established.
+    #[error(transparent)]
+    Connect(ConnectError),
+    /// Establishing the connection outran the caller's bound.
+    #[error("etcd connect exceeded its bound ({} ms)", .0.as_millis())]
+    ConnectTimeout(Duration),
+    /// The connection was there and etcd failed the call.
+    #[error("{0}")]
+    Call(EtcdError),
+    /// The call outran the caller's bound.
+    #[error("the etcd call exceeded its bound ({} ms)", .0.as_millis())]
+    CallTimeout(Duration),
+}
+
+/// How often a dial that has not finished says so.
+///
+/// Mirrors `FIRST_CONFIG_WAIT_LOG_INTERVAL` in `aisix-server`, which
+/// reports the other half of the same wait: that gate explains why the
+/// proxy listener is still closed, this one explains why no configuration
+/// has arrived to open it.
+const DIAL_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Run `fut`, saying every `interval` that it has not finished yet.
+///
+/// What this closes is a silence, not a hang. `Client::connect` waits for
+/// the `Authenticate` round trip, and against an endpoint that accepts the
+/// TCP connection and then answers nothing it waits for as long as
+/// `etcd.dial_timeout_ms` allows — unset, the shipped default, means
+/// forever. The gateway is then stuck before any listener binds and, until
+/// this, wrote not one line about it: an operator saw a process with no
+/// port and no explanation. The bound itself is deliberately unchanged;
+/// this only makes the wait visible.
+///
+/// First tick one interval in, not immediately, so a healthy dial — which
+/// finishes in milliseconds — logs nothing at all.
+async fn announce_while_pending<T>(
+    interval: Duration,
+    endpoints: &[String],
+    fut: impl Future<Output = T>,
+) -> T {
+    tokio::pin!(fut);
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    let mut waited = Duration::ZERO;
+    loop {
+        tokio::select! {
+            // `biased` so a dial that completes in the same wakeup as a
+            // tick reports success rather than one last complaint.
+            biased;
+            outcome = &mut fut => return outcome,
+            _ = ticker.tick() => {
+                waited += interval;
+                tracing::warn!(
+                    endpoints = ?endpoints,
+                    waited_secs = waited.as_secs(),
+                    "still connecting to etcd — no configuration can be read until it answers",
+                );
+            }
+        }
     }
 }
 
@@ -205,7 +304,22 @@ pub struct LazyEtcdClient {
     /// goes silent would otherwise hang the dial with no bound at all.
     /// `None` — the default, and what `0` means — leaves it unbounded.
     dial_timeout: Option<Duration>,
-    connected: Mutex<Option<Client>>,
+    connected: Mutex<Option<Connected>>,
+    /// Handed to the next connection [`LazyEtcdClient::dial`] establishes.
+    /// See [`Connected::generation`].
+    next_generation: AtomicU64,
+}
+
+/// One established connection, tagged so a caller whose call etcd refused
+/// can ask for *that* connection to be replaced.
+struct Connected {
+    client: Client,
+    /// Which dial produced this connection. A burst of calls that all
+    /// failed on the same invalidated token quote the same generation, so
+    /// the first to arrive replaces it and the rest see a connection that
+    /// is already newer than the one they failed on and reuse it — one
+    /// re-authentication for the burst, not one per call.
+    generation: u64,
 }
 
 impl std::fmt::Debug for LazyEtcdClient {
@@ -227,6 +341,7 @@ impl LazyEtcdClient {
             options,
             dial_timeout,
             connected: Mutex::new(None),
+            next_generation: AtomicU64::new(0),
         }
     }
 
@@ -235,35 +350,115 @@ impl LazyEtcdClient {
     /// it before anything else is started. A successful dial is cached
     /// like any other.
     pub async fn connect_now(&self) -> Result<(), ConnectError> {
-        self.client().await.map(|_| ())
+        self.connection().await.map(|_| ())
     }
 
-    /// The connection, dialling if this is the first call to get there.
+    /// The connection, dialling if this is the first call to get there,
+    /// and the generation it belongs to — what [`Self::invalidate`] needs
+    /// to replace exactly this connection.
     ///
     /// The lock is held across the dial on purpose: concurrent first
     /// calls wait for the one dial rather than opening a connection each.
-    pub async fn client(&self) -> Result<Client, ConnectError> {
+    async fn connection(&self) -> Result<(Client, u64), ConnectError> {
         let mut slot = self.connected.lock().await;
-        if let Some(client) = slot.as_ref() {
-            return Ok(client.clone());
+        if let Some(connected) = slot.as_ref() {
+            return Ok((connected.client.clone(), connected.generation));
         }
         let client = self.dial().await?;
-        *slot = Some(client.clone());
-        Ok(client)
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        *slot = Some(Connected {
+            client: client.clone(),
+            generation,
+        });
+        Ok((client, generation))
     }
 
-    /// KV sub-client for reads, under [`MAX_DECODING_MESSAGE_SIZE`].
-    pub async fn kv(&self) -> Result<KvClient, ConnectError> {
-        Ok(kv_client(&self.client().await?))
+    /// Discard the connection `stale` names so the next call dials a new
+    /// one, which authenticates on the way in.
+    ///
+    /// A no-op once someone else has already replaced that generation —
+    /// see [`Connected::generation`].
+    async fn invalidate(&self, stale: u64) {
+        let mut slot = self.connected.lock().await;
+        if slot.as_ref().is_some_and(|c| c.generation == stale) {
+            *slot = None;
+        }
     }
 
-    /// Watch sub-client, under [`MAX_DECODING_MESSAGE_SIZE`].
-    pub async fn watch(&self) -> Result<WatchClient, ConnectError> {
-        Ok(watch_client(&self.client().await?))
+    /// Run one etcd call on the shared connection, authenticating again
+    /// and retrying it **once** if etcd rejects the connection's auth
+    /// token.
+    ///
+    /// This is how a gateway survives an etcd restart or an elapsed
+    /// `--auth-token-ttl`: `etcd-client` authenticates inside
+    /// `Client::connect` and never again, so the token this connection
+    /// carries is the only one it will ever have, and once etcd forgets
+    /// it every later call is refused until the process is restarted.
+    /// Rebuilding the client is what re-runs `Authenticate`.
+    ///
+    /// The retry is bounded at one attempt, and reached only from
+    /// [`ConnectError::Unauthenticated`] — never from
+    /// [`ConnectError::Rejected`]. Credentials etcd has refused
+    /// therefore fail on the first answer, exactly as they did before:
+    /// a wrong password cannot spin here, and neither can a token etcd
+    /// keeps refusing, which surfaces after the second attempt.
+    ///
+    /// `timeout` bounds each attempt — the dial and the call separately,
+    /// as [`CallError`]'s two timeout variants say — rather than the pair
+    /// of them together, so a re-authenticated retry gets the same window
+    /// the original call had instead of whatever was left of it.
+    pub async fn call<T, F, Fut>(
+        &self,
+        timeout: Option<Duration>,
+        mut op: F,
+    ) -> Result<T, CallError>
+    where
+        F: FnMut(Client) -> Fut,
+        Fut: Future<Output = Result<T, EtcdError>>,
+    {
+        let mut reauthenticated = false;
+        loop {
+            let (client, generation) = match timeout {
+                None => self.connection().await,
+                Some(d) => tokio::time::timeout(d, self.connection())
+                    .await
+                    .map_err(|_| CallError::ConnectTimeout(d))?,
+            }
+            .map_err(CallError::Connect)?;
+
+            let call = op(client);
+            let outcome = match timeout {
+                None => call.await,
+                Some(d) => tokio::time::timeout(d, call)
+                    .await
+                    .map_err(|_| CallError::CallTimeout(d))?,
+            };
+
+            match outcome {
+                Ok(value) => return Ok(value),
+                Err(err) if !reauthenticated => {
+                    let ConnectError::Unauthenticated(detail) = classify(&err) else {
+                        return Err(CallError::Call(err));
+                    };
+                    tracing::info!(
+                        error = %detail,
+                        "etcd no longer accepts this connection's auth token — \
+                         authenticating again and retrying",
+                    );
+                    self.invalidate(generation).await;
+                    reauthenticated = true;
+                }
+                Err(err) => return Err(CallError::Call(err)),
+            }
+        }
     }
 
     async fn dial(&self) -> Result<Client, ConnectError> {
-        let connect = Client::connect(&self.endpoints, self.options.clone());
+        let connect = announce_while_pending(
+            DIAL_WAIT_LOG_INTERVAL,
+            &self.endpoints,
+            Client::connect(&self.endpoints, self.options.clone()),
+        );
         let outcome = match self.dial_timeout {
             None => connect.await,
             Some(d) => match tokio::time::timeout(d, connect).await {
@@ -363,5 +558,268 @@ mod tests {
     fn a_local_io_failure_is_reachability_not_refusal() {
         let err = EtcdError::IoError(std::io::Error::other("connection reset by peer"));
         assert!(matches!(classify(&err), ConnectError::Unreachable(_)));
+    }
+}
+
+#[cfg(test)]
+mod reauth_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    /// A server that answers each call with the next gRPC status in its
+    /// script — trailers-only, which is how a real server reports a
+    /// refusal — and counts both the calls it was asked and the TCP
+    /// connections it was asked them on.
+    ///
+    /// The connection count is what separates "the call was retried" from
+    /// "the client was rebuilt": re-authenticating means a new
+    /// `Client::connect`, and a new `Client::connect` means a second
+    /// connection here. A retry on the same channel would carry the same
+    /// token and change nothing.
+    struct ScriptedEtcd {
+        endpoint: String,
+        connections: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    async fn spawn_scripted_etcd(script: &[(u16, &'static str)]) -> ScriptedEtcd {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let remaining = Arc::new(StdMutex::new(script.to_vec()));
+        let (conns, reqs) = (connections.clone(), calls.clone());
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                conns.fetch_add(1, Ordering::Relaxed);
+                let (reqs, remaining) = (reqs.clone(), remaining.clone());
+                tokio::spawn(async move {
+                    let Ok(mut conn) = h2::server::handshake(socket).await else {
+                        return;
+                    };
+                    while let Some(Ok((_req, mut respond))) = conn.accept().await {
+                        reqs.fetch_add(1, Ordering::Relaxed);
+                        let mut script = remaining.lock().unwrap();
+                        // Past the end of the script the server keeps
+                        // answering, so an unexpected extra call shows up
+                        // as a count rather than as a hang.
+                        let (code, message) = if script.is_empty() {
+                            (14, "off the end of the script")
+                        } else {
+                            script.remove(0)
+                        };
+                        drop(script);
+                        let response = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc")
+                            .header("grpc-status", code.to_string())
+                            .header("grpc-message", message)
+                            .body(())
+                            .unwrap();
+                        let _ = respond.send_response(response, true);
+                    }
+                });
+            }
+        });
+        ScriptedEtcd {
+            endpoint: format!("http://{addr}"),
+            connections,
+            calls,
+        }
+    }
+
+    /// One range read through [`LazyEtcdClient::call`], unbounded.
+    ///
+    /// No credentials, so `Client::connect` performs no I/O and every
+    /// answer in the script lands on the read — the shape a token that
+    /// went stale after the dial has.
+    async fn read_once(endpoint: &str) -> Result<(), CallError> {
+        let client = LazyEtcdClient::new(vec![endpoint.to_string()], None, None);
+        client
+            .call(None, |c| async move {
+                kv_client(&c).get("/aisix", None).await.map(|_| ())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_stale_token_is_retried_on_a_freshly_authenticated_connection() {
+        // etcd forgot the token this connection authenticated with — it
+        // restarted, or `--auth-token-ttl` elapsed. Nothing about the
+        // configured credentials changed, and `etcd-client` never
+        // authenticates again on its own, so without rebuilding the
+        // client every later call is refused until the gateway is
+        // restarted. The second answer is `Unavailable` only so the
+        // retry is distinguishable from the first attempt.
+        let etcd = spawn_scripted_etcd(&[
+            (16, "etcdserver: invalid auth token"),
+            (14, "etcdserver: no leader"),
+        ])
+        .await;
+
+        let err = read_once(&etcd.endpoint)
+            .await
+            .expect_err("both scripted answers are failures");
+        let CallError::Call(err) = err else {
+            panic!("the server answered, so this is a call failure: {err:?}");
+        };
+        assert!(
+            matches!(classify(&err), ConnectError::Unreachable(_)),
+            "the retry's own answer is what surfaces, not the stale token: {err:?}",
+        );
+        assert_eq!(
+            etcd.calls.load(Ordering::Relaxed),
+            2,
+            "a stale token must be retried exactly once",
+        );
+        assert_eq!(
+            etcd.connections.load(Ordering::Relaxed),
+            2,
+            "the retry must run on a new connection — that is what re-authenticates",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_etcd_keeps_refusing_stops_after_one_retry() {
+        // The safety condition, at the mechanism: however etcd came to
+        // refuse the token, one re-authentication is all it gets. A
+        // second refusal ends the call instead of dialling again.
+        let etcd = spawn_scripted_etcd(&[
+            (16, "etcdserver: invalid auth token"),
+            (16, "etcdserver: invalid auth token"),
+        ])
+        .await;
+
+        let err = read_once(&etcd.endpoint).await.expect_err("both refuse");
+        let CallError::Call(err) = err else {
+            panic!("the server answered, so this is a call failure: {err:?}");
+        };
+        assert!(matches!(classify(&err), ConnectError::Unauthenticated(_)));
+        assert_eq!(
+            etcd.calls.load(Ordering::Relaxed),
+            2,
+            "re-authenticating must not become a loop",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_credential_is_answered_once_and_never_retried() {
+        // The other half of the safety condition, and the reason the
+        // split is on the status code: etcd answers a wrong user or
+        // password with `InvalidArgument`, never with `Unauthenticated`.
+        // So a credential it has refused fails on the first answer, as
+        // it did before any of this — no re-authentication, no second
+        // connection, nothing for an operator's typo to spin on.
+        let etcd = spawn_scripted_etcd(&[(
+            3,
+            "etcdserver: authentication failed, invalid user ID or password",
+        )])
+        .await;
+
+        let err = read_once(&etcd.endpoint).await.expect_err("refused");
+        let CallError::Call(err) = err else {
+            panic!("the server answered, so this is a call failure: {err:?}");
+        };
+        assert!(
+            matches!(classify(&err), ConnectError::Rejected(_)),
+            "a refused credential must stay refused: {err:?}",
+        );
+        assert_eq!(
+            etcd.calls.load(Ordering::Relaxed),
+            1,
+            "a refused credential must not be presented a second time",
+        );
+        assert_eq!(
+            etcd.connections.load(Ordering::Relaxed),
+            1,
+            "a refused credential must not cause a re-dial",
+        );
+    }
+
+    /// A writer every clone of which appends to the same buffer, so a
+    /// test can read back what was logged.
+    #[derive(Clone)]
+    struct SharedBuf(Arc<StdMutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for SharedBuf {
+        type Writer = Self;
+        fn make_writer(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dial_that_never_finishes_says_so_while_it_waits() {
+        // `etcd.dial_timeout_ms` unset — the shipped default — against an
+        // endpoint that accepts the TCP connection and then answers
+        // nothing. `Client::connect` waits for the `Authenticate` round
+        // trip forever, so the gateway is stuck before any listener
+        // binds; until this line it wrote nothing at all, and an operator
+        // saw a process with no port and no explanation.
+        //
+        // The bound is deliberately untouched: what is asserted here is
+        // that the wait is audible, not that it ends.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                // Held, never spoken to: closing the socket would be an
+                // answer, and the dial would end.
+                held.push(socket);
+            }
+        });
+
+        let logs = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(SharedBuf(logs.clone()))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let client = LazyEtcdClient::new(
+            vec![format!("http://{addr}")],
+            Some(ConnectOptions::new().with_user("root", "rootpw")),
+            None,
+        );
+        let dial = client.connect_now();
+        tokio::pin!(dial);
+
+        tokio::time::pause();
+        assert!(
+            futures::poll!(&mut dial).is_pending(),
+            "a silent endpoint cannot complete a dial",
+        );
+        assert!(
+            logs.lock().unwrap().is_empty(),
+            "a dial that has only just started says nothing — a line on every \
+             healthy boot is one operators learn to filter out",
+        );
+
+        tokio::time::advance(DIAL_WAIT_LOG_INTERVAL + Duration::from_secs(1)).await;
+        assert!(
+            futures::poll!(&mut dial).is_pending(),
+            "the endpoint is still silent",
+        );
+
+        let logged = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("still connecting to etcd"),
+            "an outstanding dial must report itself: {logged:?}",
+        );
+        assert!(
+            logged.contains(&addr.to_string()),
+            "the line must name the endpoint it is waiting on: {logged:?}",
+        );
     }
 }

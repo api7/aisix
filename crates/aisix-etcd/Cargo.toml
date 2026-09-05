@@ -34,3 +34,7 @@ http.workspace = true
 # `test-util` drives the shutdown-drain bound on a paused clock, so the
 # test asserts the bound without spending it.
 tokio = { workspace = true, features = ["test-util"] }
+# Captures the log lines a test asserts on — the periodic "still
+# connecting" line is the whole of what a hanging boot dial produces, so
+# it is asserted on directly rather than through its effects.
+tracing-subscriber.workspace = true

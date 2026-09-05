@@ -132,6 +132,19 @@ export interface AppOverrides {
    */
   awaitProxyListener?: boolean;
   /**
+   * Whether readiness waits for ANY listener. **Defaults to `true`.**
+   *
+   * `false` returns as soon as the process is spawned, for the one shape
+   * `awaitProxyListener` cannot express: a gateway that binds nothing at
+   * all. The boot dials etcd before any listener is opened, so an
+   * endpoint that accepts TCP and then goes silent — with
+   * `dial_timeout_ms` unset, which is the shipped default — leaves the
+   * process running with no port at all. A spec that opts out has only
+   * `output()` to assert on, so it must poll for the line it expects
+   * rather than assume the binary got anywhere.
+   */
+  awaitListeners?: boolean;
+  /**
    * `managed.snapshot_cache_path` — enables the on-disk snapshot cache
    * (#871) without managed mode. Point two sequential apps (same
    * `etcdPrefix`) at one path to exercise cache-restored restarts.
@@ -263,6 +276,12 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   if (overrides.extra && "admin" in overrides.extra) {
     throw new Error(
       "spawnApp: control the admin listener with the `admin` boolean override, not `extra.admin`",
+    );
+  }
+  if (overrides.awaitListeners === false && overrides.awaitProxyListener === false) {
+    throw new Error(
+      "spawnApp: awaitListeners:false already skips every readiness gate — " +
+        "drop the awaitProxyListener override",
     );
   }
   if (overrides.awaitProxyListener === false) {
@@ -411,36 +430,40 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   const metricsUrl = `http://127.0.0.1:${metricsPort}`;
 
   try {
-    await Promise.race([
-      Promise.all([
-        // The proxy listener binds only once a configuration has been
-        // applied, so a spec that holds configuration back opts out here.
-        ...((overrides.awaitProxyListener ?? true)
-          ? [waitForReady(`${proxyUrl}/livez`, READY_TIMEOUT_MS)]
-          : []),
-        // The admin health endpoint only exists when the admin listener is
-        // bound; with `admin: false` there is no admin surface, so gate on
-        // the proxy `/livez` and the metrics listener alone. (If both
-        // `admin` and `prometheus` are off, readiness reduces to the proxy
-        // `/livez` — liveness only; a case that needs config-propagation
-        // readiness should keep prometheus on, as the default does.)
-        ...(adminEnabled
-          ? [waitForReady(`${adminUrl}/admin/v1/health`, READY_TIMEOUT_MS, adminKey)]
-          : []),
-        // Gate on the dedicated metrics listener too, so scrapes in the test
-        // never race the listener coming up. Skipped when prometheus is
-        // disabled — nothing binds the metrics port then.
-        ...(prometheusEnabled
-          ? [
-              waitForReady(
-                `${metricsUrl}${overrides.prometheusPath ?? "/metrics"}`,
-                READY_TIMEOUT_MS,
-              ),
-            ]
-          : []),
-      ]),
-      exitedEarly,
-    ]);
+    // A spec that opted out of every gate owns its own waiting: nothing
+    // is listening to probe, so `output()` is the only signal there is.
+    if (overrides.awaitListeners !== false) {
+      await Promise.race([
+        Promise.all([
+          // The proxy listener binds only once a configuration has been
+          // applied, so a spec that holds configuration back opts out here.
+          ...((overrides.awaitProxyListener ?? true)
+            ? [waitForReady(`${proxyUrl}/livez`, READY_TIMEOUT_MS)]
+            : []),
+          // The admin health endpoint only exists when the admin listener is
+          // bound; with `admin: false` there is no admin surface, so gate on
+          // the proxy `/livez` and the metrics listener alone. (If both
+          // `admin` and `prometheus` are off, readiness reduces to the proxy
+          // `/livez` — liveness only; a case that needs config-propagation
+          // readiness should keep prometheus on, as the default does.)
+          ...(adminEnabled
+            ? [waitForReady(`${adminUrl}/admin/v1/health`, READY_TIMEOUT_MS, adminKey)]
+            : []),
+          // Gate on the dedicated metrics listener too, so scrapes in the test
+          // never race the listener coming up. Skipped when prometheus is
+          // disabled — nothing binds the metrics port then.
+          ...(prometheusEnabled
+            ? [
+                waitForReady(
+                  `${metricsUrl}${overrides.prometheusPath ?? "/metrics"}`,
+                  READY_TIMEOUT_MS,
+                ),
+              ]
+            : []),
+        ]),
+        exitedEarly,
+      ]);
+    }
   } catch (err) {
     const detail = exitErr ?? "still running";
     // Keep the head too — a startup error (anyhow's `Error: …` line)
