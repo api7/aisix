@@ -43,9 +43,27 @@ use crate::overrides::{
 };
 use crate::wire::{
     build_request, embed_request_body, embed_response_into, messages_from,
-    response_into_chat_response, stream_chunk_into_chat_chunk, OpenAiEmbedResponse, OpenAiResponse,
-    OpenAiStreamChunk,
+    response_into_chat_response, stream_chunk_into_chat_chunk, DeveloperRoleMode,
+    OpenAiEmbedResponse, OpenAiResponse, OpenAiStreamChunk,
 };
+
+fn developer_role_mode(ctx: &BridgeContext) -> DeveloperRoleMode {
+    let provider = ctx.provider_key.provider.trim();
+    // Mirror `resolve_base`: a legacy empty-provider key with no explicit
+    // base still reaches `OPENAI_DEFAULT_BASE`, so it must preserve the
+    // canonical OpenAI wire role too.
+    let uses_default_openai_base = provider.is_empty()
+        && ctx
+            .provider_key
+            .api_base
+            .as_deref()
+            .is_none_or(|base| base.trim().is_empty());
+    if provider.eq_ignore_ascii_case("openai") || uses_default_openai_base {
+        DeveloperRoleMode::Preserve
+    } else {
+        DeveloperRoleMode::MapToSystem
+    }
+}
 
 /// Default OpenAI upstream host. Used only when `ProviderKey.api_base`
 /// is empty AND the dispatching PK identifies the openai vendor — the
@@ -394,7 +412,7 @@ impl Bridge for OpenAiBridge {
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
-        let messages = messages_from(req);
+        let messages = messages_from(req, developer_role_mode(ctx));
         let typed = build_request(req, upstream, &messages, false);
         let body = prepare_outbound_body(
             &typed,
@@ -611,7 +629,7 @@ impl Bridge for OpenAiBridge {
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
-        let messages = messages_from(req);
+        let messages = messages_from(req, developer_role_mode(ctx));
         let typed = build_request(req, upstream, &messages, true);
         let body = prepare_outbound_body(
             &typed,
@@ -1330,6 +1348,50 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     fn pk_with_base(api_base: &str) -> ProviderKey {
         let cfg = format!(r#"{{"display_name":"x","secret":"k","api_base":"{api_base}"}}"#);
         serde_json::from_str(&cfg).unwrap()
+    }
+
+    #[test]
+    fn developer_role_mode_matches_provider_endpoint_identity() {
+        let legacy_pk: ProviderKey =
+            serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
+        let legacy_ctx = BridgeContext::new("rid", sample_model(), Arc::new(legacy_pk));
+        assert_eq!(
+            developer_role_mode(&legacy_ctx),
+            DeveloperRoleMode::Preserve,
+            "legacy empty-provider keys without api_base resolve to canonical OpenAI"
+        );
+
+        let custom_ctx = BridgeContext::new(
+            "rid",
+            sample_model(),
+            Arc::new(pk_with_base("https://compatible.example/v1")),
+        );
+        assert_eq!(
+            developer_role_mode(&custom_ctx),
+            DeveloperRoleMode::MapToSystem,
+            "an empty provider with a custom endpoint is not canonical OpenAI"
+        );
+
+        let deepseek_pk: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"ds","secret":"k","provider":"deepseek","adapter":"openai","api_base":"https://api.deepseek.com"}"#,
+        )
+        .unwrap();
+        let deepseek_ctx = BridgeContext::new("rid", sample_model(), Arc::new(deepseek_pk));
+        assert_eq!(
+            developer_role_mode(&deepseek_ctx),
+            DeveloperRoleMode::MapToSystem
+        );
+
+        let openai_pk: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"oai","secret":"k","provider":" OpenAI ","adapter":"openai","api_base":"https://proxy.example/v1"}"#,
+        )
+        .unwrap();
+        let openai_ctx = BridgeContext::new("rid", sample_model(), Arc::new(openai_pk));
+        assert_eq!(
+            developer_role_mode(&openai_ctx),
+            DeveloperRoleMode::Preserve,
+            "an explicitly declared OpenAI key preserves the canonical role through a proxy"
+        );
     }
 
     /// `OpenAiBridge::new()` is the `Adapter::Openai` family bridge.

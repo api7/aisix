@@ -114,11 +114,24 @@ pub fn build_request<'a>(
     }
 }
 
-pub fn messages_from(req: &ChatFormat) -> Vec<OpenAiMessage<'_>> {
+/// How an upstream Chat Completions endpoint represents developer
+/// instructions. Canonical OpenAI receives the distinct `developer` role;
+/// providers whose selected API contract does not define it are given the
+/// broadly supported `system` role instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeveloperRoleMode {
+    Preserve,
+    MapToSystem,
+}
+
+pub fn messages_from(
+    req: &ChatFormat,
+    developer_role_mode: DeveloperRoleMode,
+) -> Vec<OpenAiMessage<'_>> {
     req.messages
         .iter()
         .map(|m| OpenAiMessage {
-            role: role_str(m.role),
+            role: role_str(m.role, developer_role_mode),
             // Vision / multimodal callers send `content` as an array
             // of typed blocks; OpenAI accepts the array form natively
             // (no translation needed for OpenAI / Gemini-OpenAI-compat /
@@ -136,9 +149,11 @@ pub fn messages_from(req: &ChatFormat) -> Vec<OpenAiMessage<'_>> {
         .collect()
 }
 
-fn role_str(role: Role) -> &'static str {
+fn role_str(role: Role, developer_role_mode: DeveloperRoleMode) -> &'static str {
     match role {
         Role::System => "system",
+        Role::Developer if developer_role_mode == DeveloperRoleMode::Preserve => "developer",
+        Role::Developer => "system",
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::Tool => "tool",
@@ -592,6 +607,44 @@ pub(crate) fn embed_response_into(raw: OpenAiEmbedResponse) -> EmbeddingResponse
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn messages_from_preserves_developer_role() {
+        let req = ChatFormat::new(
+            "gpt-4o",
+            vec![
+                ChatMessage::developer("Follow application instructions"),
+                ChatMessage::user("hello"),
+            ],
+        );
+
+        let messages = messages_from(&req, DeveloperRoleMode::Preserve);
+        assert_eq!(messages[0].role, "developer");
+        assert!(matches!(
+            messages[0].content,
+            OpenAiContent::Text("Follow application instructions")
+        ));
+        assert_eq!(messages[1].role, "user");
+    }
+
+    #[test]
+    fn messages_from_maps_developer_to_system_for_compatible_upstreams() {
+        let req = ChatFormat::new(
+            "deepseek-chat",
+            vec![
+                ChatMessage::developer("Follow application instructions"),
+                ChatMessage::user("hello"),
+            ],
+        );
+
+        let messages = messages_from(&req, DeveloperRoleMode::MapToSystem);
+        assert_eq!(messages[0].role, "system");
+        assert!(matches!(
+            messages[0].content,
+            OpenAiContent::Text("Follow application instructions")
+        ));
+        assert_eq!(messages[1].role, "user");
+    }
 
     #[test]
     fn non_streaming_response_parses_into_chat_response() {
@@ -1275,7 +1328,7 @@ mod tests {
             stream: None,
             extra: serde_json::Map::new(),
         };
-        let msgs = messages_from(&req);
+        let msgs = messages_from(&req, DeveloperRoleMode::Preserve);
         let built = build_request(&req, "gpt-4o", &msgs, true);
         let json = serde_json::to_value(&built).unwrap();
         assert_eq!(json["model"], "gpt-4o");
@@ -1304,7 +1357,7 @@ mod tests {
             stream: Some(true),
             extra: serde_json::Map::new(),
         };
-        let msgs = messages_from(&req);
+        let msgs = messages_from(&req, DeveloperRoleMode::Preserve);
         let json = serde_json::to_value(build_request(&req, "gpt-4o", &msgs, true)).unwrap();
         assert_eq!(
             json["stream_options"],
@@ -1330,7 +1383,7 @@ mod tests {
             stream: Some(true),
             extra,
         };
-        let msgs = messages_from(&req);
+        let msgs = messages_from(&req, DeveloperRoleMode::Preserve);
         let raw = serde_json::to_string(&build_request(&req, "gpt-4o", &msgs, true)).unwrap();
         // Exactly one stream_options key on the wire (flatten + typed
         // field would double-emit if both were set).
@@ -1355,7 +1408,7 @@ mod tests {
             stream: None,
             extra: serde_json::Map::new(),
         };
-        let msgs = messages_from(&req);
+        let msgs = messages_from(&req, DeveloperRoleMode::Preserve);
         let json = serde_json::to_value(build_request(&req, "gpt-4o", &msgs, false)).unwrap();
         assert!(json.get("stream_options").is_none());
     }
@@ -1374,7 +1427,7 @@ mod tests {
             stream: None,
             extra,
         };
-        let msgs = messages_from(&req);
+        let msgs = messages_from(&req, DeveloperRoleMode::Preserve);
         let built = build_request(&req, "gpt-4o", &msgs, false);
         let json = serde_json::to_value(&built).unwrap();
         assert_eq!(json["seed"], 42);
@@ -1406,7 +1459,7 @@ mod tests {
             stream: None,
             extra: serde_json::Map::new(),
         };
-        let msgs = messages_from(&req);
+        let msgs = messages_from(&req, DeveloperRoleMode::Preserve);
         let built = build_request(&req, "gpt-4o", &msgs, false);
         let json = serde_json::to_value(&built).unwrap();
         let assistant = &json["messages"][1];

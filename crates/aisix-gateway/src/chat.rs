@@ -15,13 +15,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Role of a chat message. Providers that only
-/// support system/user/assistant are expected to reject `Tool` at their
-/// own boundary rather than silently collapsing roles.
+/// Role of a chat message. Provider bridges are responsible for preserving
+/// roles that their upstream accepts and translating the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
+    Developer,
     User,
     Assistant,
     Tool,
@@ -183,6 +183,17 @@ impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: Role::System,
+            content: Some(content.into()),
+            content_blocks: None,
+            name: None,
+            tool_call_id: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    pub fn developer(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Developer,
             content: Some(content.into()),
             content_blocks: None,
             name: None,
@@ -721,6 +732,29 @@ mod tests {
     }
 
     #[test]
+    fn chat_message_accepts_and_round_trips_developer_role() {
+        let m: ChatMessage = serde_json::from_str(
+            r#"{"role": "developer", "content": "Follow application instructions"}"#,
+        )
+        .expect("developer is a documented Chat Completions message role");
+
+        let value = serde_json::to_value(m).unwrap();
+        assert_eq!(value["role"], "developer");
+        assert_eq!(value["content"], "Follow application instructions");
+    }
+
+    #[test]
+    fn chat_message_rejects_unknown_and_mis_cased_roles() {
+        for role in ["Developer", "tool_result"] {
+            let raw = format!(r#"{{"role":"{role}","content":"x"}}"#);
+            assert!(
+                serde_json::from_str::<ChatMessage>(&raw).is_err(),
+                "role {role:?} must remain invalid"
+            );
+        }
+    }
+
+    #[test]
     fn content_null_preserved_as_none() {
         // #395: `content: null` (OpenAI's assistant-with-tool_calls shape)
         // is preserved as `None` so it round-trips back to JSON `null`,
@@ -1112,6 +1146,7 @@ mod tests {
     #[test]
     fn message_constructors_set_role() {
         assert_eq!(ChatMessage::system("x").role, Role::System);
+        assert_eq!(ChatMessage::developer("x").role, Role::Developer);
         assert_eq!(ChatMessage::user("x").role, Role::User);
         assert_eq!(ChatMessage::assistant("x").role, Role::Assistant);
     }

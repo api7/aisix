@@ -277,6 +277,7 @@ fn message_pair(m: &ChatMessage) -> (String, String) {
 fn role_str(role: Role) -> &'static str {
     match role {
         Role::System => "system",
+        Role::Developer => "developer",
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::Tool => "tool",
@@ -325,6 +326,16 @@ mod tests {
         assert_ne!(
             CacheKey::from_request(&a).fingerprint(),
             CacheKey::from_request(&b).fingerprint(),
+        );
+    }
+
+    #[test]
+    fn developer_and_system_roles_have_distinct_fingerprints() {
+        let system = req("m", vec![ChatMessage::system("same")], None);
+        let developer = req("m", vec![ChatMessage::developer("same")], None);
+        assert_ne!(
+            CacheKey::from_request(&system).fingerprint(),
+            CacheKey::from_request(&developer).fingerprint(),
         );
     }
 

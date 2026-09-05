@@ -36,13 +36,19 @@ use aisix_provider_openai::overrides::{
 };
 use aisix_provider_openai::wire::{
     build_request, messages_from, response_into_chat_response, stream_chunk_into_chat_chunk,
-    OpenAiResponse, OpenAiStreamChunk,
+    DeveloperRoleMode, OpenAiResponse, OpenAiStreamChunk,
 };
 
 use crate::aad_token_mint::TokenMinter;
 use crate::wire;
 
 use std::sync::Arc;
+
+/// The bridge pins Azure API version `2024-10-21`, whose request-message
+/// union does not define `developer`. Azure documents developer instructions
+/// as functionally equivalent to system instructions, so both chat paths map
+/// them to the supported `system` wire role.
+const AZURE_DEVELOPER_ROLE_MODE: DeveloperRoleMode = DeveloperRoleMode::MapToSystem;
 
 /// Family Bridge for Azure OpenAI Service.
 pub struct AzureOpenAiBridge {
@@ -716,7 +722,7 @@ impl Bridge for AzureOpenAiBridge {
         // body's `model` field is ignored by Azure (or echoed back).
         // We still set it to the deployment name for log-trace clarity
         // and to mirror the upstream OpenAI SDK convention.
-        let messages = messages_from(req);
+        let messages = messages_from(req, AZURE_DEVELOPER_ROLE_MODE);
         let typed = build_request(req, deployment, &messages, false);
         let body = prepare_outbound_body(
             &typed,
@@ -768,7 +774,7 @@ impl Bridge for AzureOpenAiBridge {
 
         // See chat() — resolve auth before the request future.
         let auth = self.resolve_auth(ctx).await?;
-        let messages = messages_from(req);
+        let messages = messages_from(req, AZURE_DEVELOPER_ROLE_MODE);
         let typed = build_request(req, deployment, &messages, true);
         let body = prepare_outbound_body(
             &typed,
@@ -1696,7 +1702,13 @@ mod tests {
         let bridge =
             AzureOpenAiBridge::new().with_url_override(mock_chat_url(&server.uri(), "gpt4o-prod"));
         let ctx = canonical_test_ctx();
-        let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+        let req = ChatFormat::new(
+            "my-azure-gpt4",
+            vec![
+                ChatMessage::developer("follow application instructions"),
+                ChatMessage::user("hi"),
+            ],
+        );
         bridge.chat(&req, &ctx).await.unwrap();
 
         let body = responder.captured_body.lock().unwrap().clone().unwrap();
@@ -1706,13 +1718,22 @@ mod tests {
             "body.model must = deployment name; got body={body}"
         );
         let messages = body.get("messages").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(messages.len(), 1, "exactly one message; got body={body}");
+        assert_eq!(messages.len(), 2, "exactly two messages; got body={body}");
         assert_eq!(
             messages[0].get("role").and_then(|v| v.as_str()),
-            Some("user")
+            Some("system"),
+            "Azure API version 2024-10-21 receives developer instructions as system"
         );
         assert_eq!(
             messages[0].get("content").and_then(|v| v.as_str()),
+            Some("follow application instructions")
+        );
+        assert_eq!(
+            messages[1].get("role").and_then(|v| v.as_str()),
+            Some("user")
+        );
+        assert_eq!(
+            messages[1].get("content").and_then(|v| v.as_str()),
             Some("hi")
         );
         assert_eq!(
@@ -2117,14 +2138,15 @@ mod tests {
             "data: {\"id\":\"x\",\"model\":\"gpt4o-prod\",\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":\"stop\"}]}\n\n",
             "data: [DONE]\n\n",
         );
+        let responder = CapturingResponder::default().with_response(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_body),
+        );
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
             .and(header("accept", "text/event-stream"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string(sse_body),
-            )
+            .respond_with(responder.clone())
             .expect(1)
             .mount(&server)
             .await;
@@ -2132,7 +2154,13 @@ mod tests {
         let bridge =
             AzureOpenAiBridge::new().with_url_override(mock_chat_url(&server.uri(), "gpt4o-prod"));
         let ctx = canonical_test_ctx();
-        let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+        let req = ChatFormat::new(
+            "my-azure-gpt4",
+            vec![
+                ChatMessage::developer("follow application instructions"),
+                ChatMessage::user("hi"),
+            ],
+        );
         let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
         let mut chunks = Vec::new();
         while let Some(item) = stream.next().await {
@@ -2157,6 +2185,15 @@ mod tests {
         assert!(
             last.finish_reason.is_some(),
             "last chunk must carry finish_reason"
+        );
+        let body = responder.captured_body.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            body.get("messages"),
+            Some(&serde_json::json!([
+                {"role": "system", "content": "follow application instructions"},
+                {"role": "user", "content": "hi"}
+            ])),
+            "streaming Azure requests map developer instructions to system: {body}"
         );
     }
 
