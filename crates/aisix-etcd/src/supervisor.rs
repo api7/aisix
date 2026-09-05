@@ -547,6 +547,16 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// Bounded because shutdown must not be able to hang on a stuck disk.
     /// The bound is fixed rather than configurable: it is a backstop on a
     /// local file write, not a tuning knob.
+    ///
+    /// Expiry abandons the WAIT, not the write: dropping a `JoinHandle`
+    /// detaches its task rather than cancelling it, so a write that was
+    /// merely slow can still commit before the process exits. That is
+    /// left alone deliberately — the supervisor loop has stopped, so no
+    /// fresher state exists to lose the race to, and
+    /// [`SnapshotCache::store`] renames a fsynced temporary over the
+    /// destination, so a late write commits whole or not at all. Which of
+    /// the two applies wins is therefore unknown at this point, and the
+    /// warning says so rather than promising either.
     async fn drain_pending_cache_writes(&self) {
         if tokio::time::timeout(CACHE_WRITE_DRAIN, self.await_pending_cache_writes())
             .await
@@ -554,8 +564,10 @@ impl<P: ConfigProvider> Supervisor<P> {
         {
             tracing::warn!(
                 bound_ms = CACHE_WRITE_DRAIN.as_millis() as u64,
-                "snapshot-cache write still in flight at shutdown; abandoning it — \
-                 the on-disk cache keeps its previous contents",
+                "snapshot-cache write did not finish inside the shutdown drain; \
+                 no longer waiting for it. It is abandoned rather than cancelled, \
+                 so the on-disk cache ends up at either this apply or the previous \
+                 one — never partway between them",
             );
         }
     }
