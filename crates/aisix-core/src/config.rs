@@ -395,15 +395,16 @@ impl EtcdConfig {
 
     /// `None` when unset or `0`: request/response calls are unbounded.
     ///
-    /// `0` is the same as unset, not an instant abort. This repo also
-    /// reads `0` as "fall back to the next level" — `Model::timeout` and
-    /// `Model::stream_timeout` both do — but only because those sit on a
-    /// model → group → `upstream.*` resolution chain where deferring is
-    /// an expressible meaning. These two keys are flat, single-level
-    /// startup configuration with nothing to defer to, so the only
-    /// choice `0` can express is unbounded or instant abort, and an
-    /// instant abort is unreachable: every connect and every read would
-    /// expire, so the proxy listener would never bind.
+    /// `0` is the same as unset, not an instant abort — the same reading
+    /// `Model::timeout: 0` gets ("no deadline, stop resolving"). The one
+    /// key in this repo where `0` means "fall back to the next level" is
+    /// `Model::stream_timeout`, and only because it sits on a model →
+    /// group → `upstream.*` resolution chain where deferring is an
+    /// expressible meaning. These two keys are flat, single-level startup
+    /// configuration with nothing to defer to, so the only other reading
+    /// `0` could carry is an instant abort, and that is unreachable:
+    /// every connect and every read would expire, so the proxy listener
+    /// would never bind.
     pub const fn request_timeout(&self) -> Option<Duration> {
         Self::bound(self.request_timeout_ms)
     }
@@ -1854,13 +1855,13 @@ admin:
 
     #[test]
     fn etcd_timeouts_read_zero_as_unbounded_not_as_an_instant_abort() {
-        // `0` is the same as unset for both keys. The alternative
-        // reading — abort immediately — bricks the gateway silently:
-        // every connect and every read expires, so the proxy listener
-        // never binds and nothing says why. The other `0` convention in
-        // this repo (`Model::timeout`, `Model::stream_timeout`) means
-        // "fall back to the next level", which needs a resolution chain
-        // these two flat startup keys do not have.
+        // `0` is the same as unset for both keys, matching what
+        // `Model::timeout: 0` already means. The alternative reading —
+        // abort immediately — bricks the gateway silently: every connect
+        // and every read expires, so the proxy listener never binds and
+        // nothing says why. The one `0` in this repo that means "fall
+        // back to the next level" is `Model::stream_timeout`, which needs
+        // a resolution chain these two flat startup keys do not have.
         let f = write_yaml(
             r#"
 etcd:

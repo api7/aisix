@@ -402,6 +402,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_request_timeout_bounds_a_range_read_that_is_never_answered() {
+        // The symmetric half of the watch-create spec below, and the only
+        // thing that pins `load_all`'s own variant now that `bound` takes
+        // the constructor as a parameter: the helper-level spec passes
+        // `ProviderError::Range` in itself, so it would stay green if this
+        // call site started reporting expiry as `Watch`. The supervisor
+        // routes both to the same backoff, so the variant is what the warn
+        // line says — which is the whole point of naming the call.
+        let endpoint = spawn_silent_h2_server().await;
+        let provider = EtcdConfigProvider::connect(
+            &[endpoint],
+            "/aisix",
+            None,
+            Some(Duration::from_millis(300)),
+        )
+        .await
+        .expect("connect is lazy without credentials");
+
+        let err = tokio::time::timeout(Duration::from_secs(10), provider.load_all())
+            .await
+            .expect("the range read must be bounded; without the bound this hangs")
+            .expect_err("an unanswered range read cannot succeed");
+
+        let ProviderError::Range(msg) = err else {
+            panic!("expiry must surface as ProviderError::Range, got {err:?}");
+        };
+        assert!(
+            msg.contains("range read") && msg.contains("etcd.request_timeout_ms"),
+            "the message must name the call and the key that bounded it: {msg}",
+        );
+    }
+
+    #[tokio::test]
     async fn the_request_timeout_bounds_a_watch_creation_that_is_never_confirmed() {
         // Creating a watch is request/response shaped: etcd-client sends
         // the create request and awaits the server's create confirmation

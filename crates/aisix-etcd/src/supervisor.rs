@@ -226,7 +226,12 @@ pub struct Supervisor<P: ConfigProvider> {
 
     // JoinHandles for in-flight `flush_cache` writes. [`Self::run`]
     // drains them before returning so a gateway stopped shortly after an
-    // apply still persists that apply; tests use
+    // apply comes back with a persisted snapshot rather than none. WHICH
+    // apply is a separate question: `SnapshotCache::store` serialises its
+    // snapshot before taking the cache's write lock, so two writes racing
+    // that work can commit in the opposite order to the applies that
+    // produced them. Draining does not change that, and does not claim
+    // to. Tests use
     // [`Self::await_pending_cache_writes`] to order against a write
     // without relying on a wall-clock sleep, which proved flaky on slow
     // CI runners. Kept to the writes actually in flight: `flush_cache`
@@ -554,9 +559,9 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// left alone deliberately — the supervisor loop has stopped, so no
     /// fresher state exists to lose the race to, and
     /// [`SnapshotCache::store`] renames a fsynced temporary over the
-    /// destination, so a late write commits whole or not at all. Which of
-    /// the two applies wins is therefore unknown at this point, and the
-    /// warning says so rather than promising either.
+    /// destination, so a late write commits whole or not at all. Which
+    /// apply ends up on disk is therefore unknown at this point, and the
+    /// warning says so rather than promising one.
     async fn drain_pending_cache_writes(&self) {
         if tokio::time::timeout(CACHE_WRITE_DRAIN, self.await_pending_cache_writes())
             .await
@@ -566,8 +571,8 @@ impl<P: ConfigProvider> Supervisor<P> {
                 bound_ms = CACHE_WRITE_DRAIN.as_millis() as u64,
                 "snapshot-cache write did not finish inside the shutdown drain; \
                  no longer waiting for it. It is abandoned rather than cancelled, \
-                 so the on-disk cache ends up at either this apply or the previous \
-                 one — never partway between them",
+                 so the on-disk cache ends up at one of the recent applies — \
+                 never partway between them",
             );
         }
     }
@@ -1838,9 +1843,21 @@ mod tests {
             .unwrap();
 
         rt.block_on(async {
-            let entries: Vec<RawEntry> = (0..PADDING_ROWS).map(padding_entry).collect();
-            let provider = Arc::new(FakeProvider::new(entries, 1).with_events(vec![Ok(
-                WatchEvent::Put(entry("/aisix/models/late", VALID_MODEL, 2)),
+            // The heavy configuration set arrives on the WATCH, not on the
+            // initial load, so exactly one costly write is ever in flight
+            // and this test's verdict cannot be decided by which of two
+            // concurrent writes reaches the cache's lock first.
+            // `SnapshotCache::store` serialises its snapshot before taking
+            // that lock, so concurrent writes can commit out of order --
+            // a pre-existing property this test must not depend on either
+            // way.
+            let mut arriving: Vec<RawEntry> = (0..PADDING_ROWS).map(padding_entry).collect();
+            arriving.push(entry("/aisix/models/late", VALID_MODEL, 2));
+            let provider = Arc::new(FakeProvider::new(Vec::new(), 1).with_events(vec![Ok(
+                WatchEvent::Resync {
+                    entries: arriving.into(),
+                    revision: 2,
+                },
             )]));
             let sup = Arc::new(Supervisor::with_cache(
                 provider,
@@ -1850,7 +1867,7 @@ mod tests {
             let (tx, rx) = tokio::sync::watch::channel(false);
             let join = tokio::spawn(sup.clone().run(rx));
 
-            // Cancel the moment the put is visible in the served
+            // Cancel the moment the apply is visible in the served
             // snapshot. The flush it spawned is then still on its way to
             // disk, which is exactly the window this pins.
             for _ in 0..5_000 {
@@ -1861,7 +1878,7 @@ mod tests {
             }
             assert!(
                 sup.handle().load().models.get_by_id("late").is_some(),
-                "the put must reach the served snapshot before shutdown",
+                "the apply must reach the served snapshot before shutdown",
             );
             tx.send(true).unwrap();
             join.await.unwrap();
@@ -1894,6 +1911,16 @@ mod tests {
             .lock()
             .unwrap()
             .push(tokio::spawn(std::future::pending::<()>()));
+
+        // Both sides of the assertion below are the same constant, so it
+        // pins the behaviour and not the budget. The budget is part of
+        // what a deployment is promised at shutdown, so it is pinned here
+        // in its own right.
+        assert_eq!(
+            CACHE_WRITE_DRAIN,
+            Duration::from_secs(5),
+            "the shutdown drain's budget is part of the contract",
+        );
 
         let started = tokio::time::Instant::now();
         tokio::time::timeout(CACHE_WRITE_DRAIN * 4, sup.drain_pending_cache_writes())

@@ -8,10 +8,10 @@ etcd:
   # user: "aisix"
   # password_env: "AISIX_ETCD_PASSWORD"
   # Optional bounds on etcd I/O. Both are unset by default, and unset
-  # means unbounded. `0` means unbounded too — these two keys are flat
-  # startup settings with no next level to defer to, unlike the `0` on a
-  # model's `timeout`, so "no bound" is the only thing `0` can usefully
-  # say here.
+  # means unbounded. `0` means unbounded as well — the same reading a
+  # model's `timeout: 0` gets. (A model's `stream_timeout: 0` is the odd
+  # one out: it falls back to the next level of a resolution chain these
+  # flat startup settings do not have.)
   #
   # `dial_timeout_ms` bounds the TCP connect — not the TLS handshake
   # after it, and not the authentication exchange when `user` is set.
