@@ -154,6 +154,23 @@ jobs:
       ETCD_AUTH_TEST_URL: http://127.0.0.1:2479
       ETCD_AUTH_TEST_USER: root
       ETCD_AUTH_TEST_PASSWORD: aisix-ci-etcd
+      # Picked up by crates/aisix-etcd/tests/auth_token_recovery.rs and
+      # crates/aisix-admin/tests/etcd_integration.rs. A THIRD cluster,
+      # authenticated like the one above but differing in two ways that
+      # the token-recovery tests need and that no other test should have
+      # to live with: its tokens expire in seconds instead of the
+      # five-minute default, so a test can sit out a real expiry; and it
+      # runs `--auth-token jwt` instead of the default `simple`, which is
+      # the only mode in which an auth-store revision change refuses a
+      # token that was already issued. Tests here also change that auth
+      # store, which stales every token the cluster has handed out. The
+      # container and this short-lifetime approach come from community PR
+      # api7/aisix#763 (okaybase). `ETCD_AUTH_TTL_TEST_SECS` must match
+      # the `ttl=` below — the tests sleep past it.
+      ETCD_AUTH_TTL_TEST_URL: http://127.0.0.1:2579
+      ETCD_AUTH_TTL_TEST_USER: root
+      ETCD_AUTH_TTL_TEST_PASSWORD: aisix-ci-etcd
+      ETCD_AUTH_TTL_TEST_SECS: 5
     steps:
       - uses: actions/checkout@v6
         with:
@@ -169,29 +186,57 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Start an authenticated etcd
-        # Not a service container: a user has to be created and
+      - name: Start the authenticated etcds
+        # Not service containers: a user has to be created and
         # `auth enable` called after the server is up, which service
         # containers cannot do.
+        #
+        # Two of them, on 2479 and 2579. The second issues JWT tokens
+        # with a lifetime short enough for a test to sit out a real
+        # expiry. It is a cluster of its own so that neither that
+        # lifetime, nor the auth-store changes those tests make, can
+        # reach the first.
         run: |
-          docker run -d --name etcd-auth -p 2479:2479 quay.io/coreos/etcd:v3.5.18 \
-            /usr/local/bin/etcd --name auth1 \
-            --listen-client-urls http://0.0.0.0:2479 \
-            --advertise-client-urls http://127.0.0.1:2479 \
-            --listen-peer-urls http://0.0.0.0:2480 \
-            --initial-advertise-peer-urls http://127.0.0.1:2480 \
-            --initial-cluster auth1=http://127.0.0.1:2480
-          for _ in $(seq 30); do
-            docker exec -e ETCDCTL_API=3 -e ETCDCTL_ENDPOINTS=http://127.0.0.1:2479 \
-              etcd-auth etcdctl endpoint health && break
-            sleep 1
-          done
-          docker exec -e ETCDCTL_API=3 -e ETCDCTL_ENDPOINTS=http://127.0.0.1:2479 \
-            etcd-auth etcdctl user add root:aisix-ci-etcd
-          docker exec -e ETCDCTL_API=3 -e ETCDCTL_ENDPOINTS=http://127.0.0.1:2479 \
-            etcd-auth etcdctl user grant-role root root
-          docker exec -e ETCDCTL_API=3 -e ETCDCTL_ENDPOINTS=http://127.0.0.1:2479 \
-            etcd-auth etcdctl auth enable
+          # Signing key for the JWT cluster below. Generated per run and
+          # thrown away with the runner: it authenticates nothing outside
+          # this job.
+          mkdir -p /tmp/etcd-jwt
+          openssl genpkey -algorithm RSA -out /tmp/etcd-jwt/jwt.key -pkeyopt rsa_keygen_bits:2048
+          openssl rsa -in /tmp/etcd-jwt/jwt.key -pubout -out /tmp/etcd-jwt/jwt.pub
+          start_auth_etcd() {
+            name=$1
+            client=$2
+            peer=$3
+            shift 3
+            docker run -d --name "$name" -p "$client:$client" -v /tmp/etcd-jwt:/keys \
+              quay.io/coreos/etcd:v3.5.18 \
+              /usr/local/bin/etcd --name "$name" "$@" \
+              --listen-client-urls "http://0.0.0.0:$client" \
+              --advertise-client-urls "http://127.0.0.1:$client" \
+              --listen-peer-urls "http://0.0.0.0:$peer" \
+              --initial-advertise-peer-urls "http://127.0.0.1:$peer" \
+              --initial-cluster "$name=http://127.0.0.1:$peer"
+            etcdctl() {
+              docker exec -e ETCDCTL_API=3 -e ETCDCTL_ENDPOINTS="http://127.0.0.1:$client" \
+                "$name" etcdctl "$@"
+            }
+            for _ in $(seq 30); do
+              etcdctl endpoint health && break
+              sleep 1
+            done
+            # Fail here rather than let the three `etcdctl` calls below
+            # fail one at a time with a connection error that says
+            # nothing about which cluster never came up.
+            etcdctl endpoint health \
+              || { echo "::error::$name never became ready on $client"; exit 1; }
+            etcdctl user add root:aisix-ci-etcd
+            etcdctl user grant-role root root
+            etcdctl auth enable
+          }
+          start_auth_etcd etcd-auth 2479 2480
+          # Keep `ttl=` in step with ETCD_AUTH_TTL_TEST_SECS above.
+          start_auth_etcd etcd-auth-ttl 2579 2580 \
+            --auth-token 'jwt,pub-key=/keys/jwt.pub,priv-key=/keys/jwt.key,sign-method=RS256,ttl=5s'
       - name: Start Redis Cluster + Sentinel
         # The `redis` service above covers single-node. Here we bring up a
         # 3-node cluster (7000-7002) and a sentinel (26379) monitoring the

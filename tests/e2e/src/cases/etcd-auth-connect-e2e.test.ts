@@ -35,6 +35,8 @@ const DEFERRED_LINE = "etcd is not reachable yet";
 const REFUSED_LINE = "etcd rejected the connection";
 /** The supervisor's line for a refusal it meets after the boot is past. */
 const REFUSED_AFTER_BOOT_LINE = "etcd refused this gateway's credentials";
+/** What an outstanding dial repeats while it is still outstanding. */
+const STILL_DIALLING_LINE = "still connecting to etcd";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -92,10 +94,11 @@ describe("etcd credentials: unreachable is waited out, refused is not", () => {
     endpoint: string,
     prefix: string,
     etcdExtra: Record<string, unknown> = {},
+    awaitListeners = true,
   ): Promise<SpawnedApp> {
     const app = await spawnApp({
       etcdPrefix: prefix,
-      awaitProxyListener: false,
+      ...(awaitListeners ? { awaitProxyListener: false } : { awaitListeners: false }),
       // The supervisor's backoff line and the boot's deferral line are
       // both WARN, which this level keeps.
       logLevel: "warn",
@@ -165,6 +168,39 @@ describe("etcd credentials: unreachable is waited out, refused is not", () => {
 
     const metrics = await fetch(`${app.metricsUrl}/metrics`);
     expect(metrics.status).toBe(200);
+  }, 120_000);
+
+  test("an unbounded dial that hangs says so instead of going silent", async (ctx) => {
+    if (!etcdReachable) {
+      ctx.skip();
+      return;
+    }
+    // The same silent endpoint as the spec above, but with
+    // `dial_timeout_ms` left unset — the shipped default, and the only
+    // configuration in which the dial has no bound at all. The gateway
+    // is then stuck inside `Client::connect` before any listener binds,
+    // and it used to write NOTHING: an operator saw a process with no
+    // port, no log line and nothing to grep for. The bound is unchanged
+    // — what is asserted is that the wait is audible.
+    const prefix = `/aisix-e2e-etcd-auth-hang-${randomUUID()}`;
+    const relay = await startEtcdRelay();
+    relays.push(relay);
+    await relay.hold();
+
+    // Nothing to wait for: the proxy, admin and metrics listeners are
+    // all still unopened, which is the defect.
+    const app = await spawnAuthenticated(relay.endpoint, prefix, {}, false);
+    // Two lines, not one: a single line is also what a one-off warning
+    // would produce. The repetition is what tells an operator the
+    // gateway is still waiting rather than having given up.
+    expect(await waitForOutput(app, STILL_DIALLING_LINE, 60_000, 2)).toBeGreaterThanOrEqual(2);
+    // …and it is still inside the dial, which is the point: it is
+    // running, and no listener came up while it was reporting. The
+    // running half is not redundant — a process that logged twice and
+    // then died would satisfy the closed-port assertions too.
+    await expect(app.waitForExit(1_000)).rejects.toThrow();
+    expect(await tcpAccepts(Number(new URL(app.metricsUrl).port))).toBe(false);
+    expect(await tcpAccepts(Number(new URL(app.proxyUrl).port))).toBe(false);
   }, 120_000);
 
   test("a refusal that only arrives after boot is reported, not buried", async (ctx) => {
