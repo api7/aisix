@@ -170,12 +170,18 @@ impl ConnectError {
 /// by every later call (`Unauthenticated`). Classifying only the dial
 /// would report those as ordinary transport trouble.
 ///
-/// The `Unauthenticated` / `InvalidArgument` split is the whole safety
-/// condition behind re-authenticating: etcd answers a wrong user or
-/// password on `Authenticate` with `InvalidArgument`, and reserves
-/// `Unauthenticated` for a token it does not recognise (`etcdserver:
-/// invalid auth token`). So a credential etcd has refused can never
-/// reach the retry path, however many times it is presented.
+/// This is what the safety condition behind re-authenticating rests on.
+/// A wrong user or password is answered on `Authenticate` with
+/// `InvalidArgument` (`etcdserver: authentication failed, invalid user ID
+/// or password`) and a user without the rights with `PermissionDenied`,
+/// so neither can reach the retry path however many times it is
+/// presented. `Unauthenticated` is what etcd answers a token it does not
+/// recognise (`etcdserver: invalid auth token`), and that is the only
+/// code routed there.
+///
+/// Note the implication does not run backwards: `InvalidArgument` covers
+/// more than refused credentials, and telling its members apart would
+/// take the message text rather than the code.
 pub(crate) fn classify(err: &EtcdError) -> ConnectError {
     let detail = format_etcd_error(err);
     match err {

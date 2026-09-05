@@ -394,11 +394,18 @@ impl Stream for EtcdWatchStream {
                     // is not a place to dial one. Ending the stream is
                     // the recovery — the supervisor re-enters its cycle,
                     // and `load_all` re-authenticates on the way through.
-                    Poll::Ready(Some(Err(provider_error(
-                        CallError::Call(err),
-                        "watch stream",
-                        ProviderError::Watch,
-                    ))))
+                    //
+                    // Which is why this does not go through
+                    // `provider_error`: that one reports an
+                    // `Unauthenticated` as a refusal *because* it has
+                    // already been retried on a fresh connection, and
+                    // this is the one call site where that is not true.
+                    Poll::Ready(Some(Err(match classify(&err) {
+                        ConnectError::Rejected(detail) => ProviderError::Rejected(detail),
+                        ConnectError::Unreachable(_) | ConnectError::Unauthenticated(_) => {
+                            ProviderError::Watch(format_etcd_error(&err))
+                        }
+                    })))
                 }
             }
             Poll::Ready(Some(Ok(resp))) => {
