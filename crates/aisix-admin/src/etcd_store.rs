@@ -103,8 +103,11 @@ impl EtcdConfigStore {
         full_key.strip_prefix(&needle)
     }
 
-    /// One read against etcd, through the connection this store shares
-    /// with the config provider.
+    /// One read against etcd, on this store's own connection — separate
+    /// from the config provider's, so neither queues behind the other's
+    /// connect (`aisix-server` builds the two deliberately). Each
+    /// recovers on its own, and this is where that happens for the admin
+    /// side.
     ///
     /// Everything the admin GET surface reads goes through here, for two
     /// reasons that are easy to lose if a call site is written by hand.
@@ -113,8 +116,8 @@ impl EtcdConfigStore {
     /// an `Authenticate` round trip, and an endpoint that accepts TCP and
     /// answers nothing would otherwise hang the admin request and every
     /// other read queued behind the same connect. And a token etcd has
-    /// forgotten — it restarted, or `--auth-token-ttl` elapsed while the
-    /// admin listener was idle, which is exactly when it does — is
+    /// stopped holding — `--auth-token-ttl` elapses while the admin
+    /// listener is idle, which is what an admin listener mostly is — is
     /// re-authenticated and retried instead of failing every admin read
     /// until the gateway is restarted.
     async fn read<T, F, Fut>(&self, op: F) -> Result<T, StoreError>

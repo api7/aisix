@@ -278,10 +278,11 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
       "spawnApp: control the admin listener with the `admin` boolean override, not `extra.admin`",
     );
   }
-  if (overrides.awaitListeners === false && overrides.awaitProxyListener === false) {
+  if (overrides.awaitListeners === false && overrides.awaitProxyListener !== undefined) {
     throw new Error(
       "spawnApp: awaitListeners:false already skips every readiness gate — " +
-        "drop the awaitProxyListener override",
+        "drop the awaitProxyListener override, which reads as if `/livez` were " +
+        "still being waited on",
     );
   }
   if (overrides.awaitProxyListener === false) {
@@ -432,7 +433,13 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   try {
     // A spec that opted out of every gate owns its own waiting: nothing
     // is listening to probe, so `output()` is the only signal there is.
-    if (overrides.awaitListeners !== false) {
+    if (overrides.awaitListeners === false) {
+      // `exitedEarly` is armed either way, and nothing is racing it here.
+      // Left alone, an early non-zero exit would surface as a bare
+      // unhandled rejection under vitest instead of through `waitForExit`
+      // and `output()`, which is where such a spec looks.
+      exitedEarly.catch(() => {});
+    } else {
       await Promise.race([
         Promise.all([
           // The proxy listener binds only once a configuration has been

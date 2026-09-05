@@ -201,11 +201,13 @@ impl From<ConnectError> for ProviderError {
         match &err {
             ConnectError::Unreachable(detail) => ProviderError::Connect(detail.clone()),
             ConnectError::Rejected(detail) => ProviderError::Rejected(detail.clone()),
-            // A token etcd has forgotten is not a refused credential:
-            // `LazyEtcdClient::call` has already authenticated again and
-            // retried by the time one reaches here, so what is left is a
-            // condition to retry, not one to report as a configuration
-            // mistake that will never heal.
+            // Only the DIAL reaches here with this — a call's has been
+            // re-authenticated and retried first (see `provider_error`).
+            // A dial refused with `Unauthenticated` has nothing to
+            // re-authenticate: it just tried. Retryable rather than
+            // fatal, because a cluster whose authentication was being
+            // re-enabled as the gateway dialled answers exactly this and
+            // then starts working.
             ConnectError::Unauthenticated(detail) => ProviderError::Connect(detail.clone()),
         }
     }
@@ -240,14 +242,16 @@ fn provider_error(
             d.as_millis()
         )),
         CallError::Call(err) => match classify(&err) {
-            ConnectError::Rejected(detail) => ProviderError::Rejected(detail),
-            // Retryable, and by here already retried once on a freshly
-            // authenticated connection: an `Unauthenticated` that
-            // survived that is etcd still catching up on its own auth
-            // revision, not a credential it has refused.
-            ConnectError::Unreachable(_) | ConnectError::Unauthenticated(_) => {
-                into_err(format_etcd_error(&err))
+            // An `Unauthenticated` reaching here has already been
+            // retried on a freshly authenticated connection and was
+            // refused again, so it belongs with the refusals: waiting
+            // does not fix a token etcd will not accept however new it
+            // is, and reporting it as ordinary transport trouble is what
+            // buries it in a warn line that repeats forever.
+            ConnectError::Rejected(detail) | ConnectError::Unauthenticated(detail) => {
+                ProviderError::Rejected(detail)
             }
+            ConnectError::Unreachable(_) => into_err(format_etcd_error(&err)),
         },
     }
 }
@@ -976,6 +980,29 @@ mod tests {
         assert!(
             msg.contains("range read") && msg.contains("etcd.request_timeout_ms"),
             "the message must name the call and the key that bounded it: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_freshly_authenticated_connection_etcd_still_refuses_is_a_refusal() {
+        // By the time a call's `Unauthenticated` reaches `provider_error`
+        // it has already been retried on a connection that authenticated
+        // moments earlier. Whatever is wrong with it is not something
+        // another 60s of backoff fixes, so it gets the refusal line an
+        // operator can act on rather than the routine one they filter
+        // out. No credentials here, so the dial is lazy and both attempts
+        // land on the read — which is where the retry lives.
+        let endpoint = spawn_grpc_status_server(16, "etcdserver: invalid auth token").await;
+        let provider = EtcdConfigProvider::connect(&[endpoint], "/aisix", None, None, None)
+            .await
+            .expect("connect is lazy without credentials");
+        let err = provider
+            .load_all()
+            .await
+            .expect_err("a server that only answers 16 cannot serve a read");
+        assert!(
+            matches!(err, ProviderError::Rejected(_)),
+            "a re-authenticated call etcd refused again must be loud, got {err:?}",
         );
     }
 

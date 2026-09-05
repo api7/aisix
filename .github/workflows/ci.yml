@@ -215,6 +215,11 @@ jobs:
               etcdctl endpoint health && break
               sleep 1
             done
+            # Fail here rather than let the three `etcdctl` calls below
+            # fail one at a time with a connection error that says
+            # nothing about which cluster never came up.
+            etcdctl endpoint health \
+              || { echo "::error::$name never became ready on $client"; exit 1; }
             etcdctl user add root:aisix-ci-etcd
             etcdctl user grant-role root root
             etcdctl auth enable

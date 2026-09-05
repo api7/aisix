@@ -3,10 +3,11 @@
 //! `etcd-client` authenticates once, inside `Client::connect`, and never
 //! again. The token it gets there is the only one that connection will
 //! ever carry, and etcd stops accepting it in two ordinary situations:
-//! the server restarts (its token store is in memory), or the token's
-//! `--auth-token-ttl` elapses while nothing is using it. Every later call
-//! is then refused, and before this the only cure was restarting the
-//! gateway.
+//! the token's `--auth-token-ttl` elapses while nothing is using it, or
+//! etcd's token store is cleared out from under the connection —
+//! authentication re-enabled, a JWT signing key regenerated at startup, a
+//! member brought up on an empty data directory. Every later call is then
+//! refused, and before this the only cure was restarting the gateway.
 //!
 //! Both need a server that really issues and forgets tokens — the status
 //! code, the wording and the *timing* are etcd's, not something a stub
@@ -54,10 +55,14 @@ fn auth_ttl_etcd() -> Option<AuthEtcd> {
         url: std::env::var("ETCD_AUTH_TTL_TEST_URL").ok()?,
         user: std::env::var("ETCD_AUTH_TTL_TEST_USER").ok()?,
         password: std::env::var("ETCD_AUTH_TTL_TEST_PASSWORD").ok()?,
+        // Parsed strictly on purpose: a typo in the workflow would
+        // otherwise turn every test in this file into a silent skip,
+        // which on a check is the same colour as a pass.
         token_ttl: Duration::from_secs(
             std::env::var("ETCD_AUTH_TTL_TEST_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())?,
+                .ok()?
+                .parse()
+                .expect("ETCD_AUTH_TTL_TEST_SECS must be a whole number of seconds"),
         ),
     })
 }
@@ -243,6 +248,11 @@ async fn a_user_etcd_refuses_is_answered_once_and_not_re_authenticated() {
         started.elapsed(),
     );
 
+    // A writer of its own. This cluster's token TTL is seconds, and the
+    // connect and read above can outlast it on a loaded runner — a
+    // cleanup on the original `root` would then fail for a reason that
+    // has nothing to do with what this test asserts.
+    let mut root = etcd.writer().await;
     root.user_delete(user).await.expect("cleanup");
 }
 
@@ -254,6 +264,12 @@ async fn a_user_etcd_refuses_is_answered_once_and_not_re_authenticated() {
 /// cause that never heals by waiting.
 async fn discard_every_token(etcd: &AuthEtcd) {
     let mut admin = etcd.writer().await;
-    admin.auth_disable().await.expect("auth disable");
-    admin.auth_enable().await.expect("auth enable");
+    // Both calls are made before either is asserted on: a panic between
+    // them would leave the shared cluster with authentication off, which
+    // does not fail this test — it silently guts the one below it, whose
+    // whole subject is a user etcd refuses.
+    let disabled = admin.auth_disable().await;
+    let enabled = admin.auth_enable().await;
+    disabled.expect("auth disable");
+    enabled.expect("auth enable");
 }

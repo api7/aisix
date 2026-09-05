@@ -108,8 +108,12 @@ pub enum ConnectError {
     Rejected(String),
     /// etcd answered and refused *the token this connection is using*,
     /// not the configured credentials: the gateway authenticated once
-    /// and etcd has since forgotten that token — it restarted (the token
-    /// store is in memory), or the token's `--auth-token-ttl` elapsed.
+    /// and etcd has since forgotten that token. Either the token's
+    /// `--auth-token-ttl` elapsed — it is refreshed by use, so only an
+    /// idle connection reaches it — or etcd's token store was cleared:
+    /// authentication re-enabled on the cluster, a JWT signing key
+    /// regenerated at startup, a member brought up on an empty data
+    /// directory.
     ///
     /// Kept apart from [`Self::Rejected`] because the two need opposite
     /// handling. A refused credential never becomes a good one, so
@@ -162,9 +166,9 @@ impl ConnectError {
 /// answers *where* is not something a caller can assume: a user whose
 /// password is wrong is refused by `Authenticate`, but a user who
 /// authenticates and lacks the permission is refused by the range read
-/// (`PermissionDenied`), and a token invalidated by an etcd restart is
-/// refused by every later call (`Unauthenticated`). Classifying only the
-/// dial would report those as ordinary transport trouble.
+/// (`PermissionDenied`), and a token etcd has stopped holding is refused
+/// by every later call (`Unauthenticated`). Classifying only the dial
+/// would report those as ordinary transport trouble.
 ///
 /// The `Unauthenticated` / `InvalidArgument` split is the whole safety
 /// condition behind re-authenticating: etcd answers a wrong user or
@@ -198,8 +202,8 @@ pub(crate) fn classify(err: &EtcdError) -> ConnectError {
             | GRPC_ABORTED
             | GRPC_RESOURCE_EXHAUSTED => ConnectError::Unreachable(detail),
             // etcd knows the call arrived with a token it no longer
-            // holds — it restarted, or the token's TTL elapsed. The
-            // configured credentials are not what it is complaining
+            // holds — the TTL elapsed, or its token store was cleared.
+            // The configured credentials are not what it is complaining
             // about, so this one heals by authenticating again.
             GRPC_UNAUTHENTICATED => ConnectError::Unauthenticated(detail),
             // Everything else is etcd having evaluated the request and
@@ -265,7 +269,13 @@ async fn announce_while_pending<T>(
 ) -> T {
     tokio::pin!(fut);
     let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
-    let mut waited = Duration::ZERO;
+    // A runtime stalled past several ticks — a suspended host, a starved
+    // scheduler — would otherwise wake to a burst of identical lines
+    // under the default `Burst` behaviour. One line per interval that
+    // actually elapsed is the whole point; the count of ticks missed
+    // while nobody was running is not information.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let started = tokio::time::Instant::now();
     loop {
         tokio::select! {
             // `biased` so a dial that completes in the same wakeup as a
@@ -273,11 +283,11 @@ async fn announce_while_pending<T>(
             biased;
             outcome = &mut fut => return outcome,
             _ = ticker.tick() => {
-                waited += interval;
                 tracing::warn!(
                     endpoints = ?endpoints,
-                    waited_secs = waited.as_secs(),
-                    "still connecting to etcd — no configuration can be read until it answers",
+                    waited_secs = started.elapsed().as_secs(),
+                    "still connecting to etcd — nothing waiting on this connection can \
+                     proceed until it answers",
                 );
             }
         }
@@ -389,8 +399,9 @@ impl LazyEtcdClient {
     /// and retrying it **once** if etcd rejects the connection's auth
     /// token.
     ///
-    /// This is how a gateway survives an etcd restart or an elapsed
-    /// `--auth-token-ttl`: `etcd-client` authenticates inside
+    /// This is how a gateway survives an elapsed `--auth-token-ttl`, or
+    /// an etcd that has stopped holding its token at all:
+    /// `etcd-client` authenticates inside
     /// `Client::connect` and never again, so the token this connection
     /// carries is the only one it will ever have, and once etcd forgets
     /// it every later call is refused until the process is restarted.

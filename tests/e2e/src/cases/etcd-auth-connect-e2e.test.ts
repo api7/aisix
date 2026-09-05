@@ -194,8 +194,11 @@ describe("etcd credentials: unreachable is waited out, refused is not", () => {
     // would produce. The repetition is what tells an operator the
     // gateway is still waiting rather than having given up.
     expect(await waitForOutput(app, STILL_DIALLING_LINE, 60_000, 2)).toBeGreaterThanOrEqual(2);
-    // …and it is still inside the dial, which is the point: no listener
-    // came up while it was reporting.
+    // …and it is still inside the dial, which is the point: it is
+    // running, and no listener came up while it was reporting. The
+    // running half is not redundant — a process that logged twice and
+    // then died would satisfy the closed-port assertions too.
+    await expect(app.waitForExit(1_000)).rejects.toThrow();
     expect(await tcpAccepts(Number(new URL(app.metricsUrl).port))).toBe(false);
     expect(await tcpAccepts(Number(new URL(app.proxyUrl).port))).toBe(false);
   }, 120_000);
