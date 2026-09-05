@@ -138,6 +138,15 @@ const MAX_RETAINED_REJECTIONS: usize = 256;
 /// the aggregated report, with a WARN so the truncation is never silent.
 const MAX_RETAINED_PARTIAL_ROWS: usize = 1024;
 
+/// How long shutdown waits for an in-flight snapshot-cache write to
+/// reach disk before abandoning it.
+///
+/// Sized as a backstop against a wedged disk, not as a budget: the write
+/// is one local file and completes in milliseconds on any healthy one.
+/// Deliberately not configurable — an operator has nothing to trade off
+/// here, and a knob would only offer a way to make shutdown hang longer.
+pub const CACHE_WRITE_DRAIN: Duration = Duration::from_secs(5);
+
 /// One key whose latest etcd bytes are rejected while its last
 /// successfully loaded value keeps serving (#871, xDS-NACK style).
 /// `entry` pins the last-known-good raw document with the revision it
@@ -215,14 +224,14 @@ pub struct Supervisor<P: ConfigProvider> {
     /// user snapshots or mutates it in its own scope.
     stale_serving: Mutex<HashMap<String, StaleServing>>,
 
-    // JoinHandles for in-flight `flush_cache` writes. Tests use
-    // [`Self::await_pending_cache_writes`] to deterministically wait
-    // for these without relying on a wall-clock sleep, which proved
-    // flaky on slow CI runners. Production code does not read this
-    // field; if a handle is dropped (e.g. during shutdown), the
-    // underlying write either completed or was cancelled — either
-    // way the on-disk cache is best-effort and the next live cycle
-    // re-publishes from etcd.
+    // JoinHandles for in-flight `flush_cache` writes. [`Self::run`]
+    // drains them before returning so a gateway stopped shortly after an
+    // apply still persists that apply; tests use
+    // [`Self::await_pending_cache_writes`] to order against a write
+    // without relying on a wall-clock sleep, which proved flaky on slow
+    // CI runners. Kept to the writes actually in flight: `flush_cache`
+    // drops finished handles as it pushes, so a long-lived gateway does
+    // not accumulate one per apply.
     pending_writes: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -507,20 +516,47 @@ impl<P: ConfigProvider> Supervisor<P> {
     }
 
     /// Drain the JoinHandles for any in-flight cache writes spawned
-    /// by [`Self::flush_cache`] and await them. Test-only synchroniser:
-    /// production code never needs to block on disk persistence.
-    #[cfg(test)]
+    /// by [`Self::flush_cache`] and await them, without a bound.
+    ///
+    /// [`Self::run`] calls this through [`Self::drain_pending_cache_writes`],
+    /// which supplies the shutdown bound. Tests call it directly to order
+    /// deterministically against the disk read that follows.
     pub async fn await_pending_cache_writes(&self) {
         let handles: Vec<JoinHandle<()>> = {
             let mut pending = self.pending_writes.lock().unwrap();
             std::mem::take(&mut *pending)
         };
         for handle in handles {
-            // Failures here are not test failures — a write that
-            // panicked is its own bug surfaced separately. We only
-            // need the await to deterministically order against the
-            // disk read that follows.
+            // A write that panicked is its own bug, surfaced separately;
+            // there is nothing useful to do about it here.
             let _ = handle.await;
+        }
+    }
+
+    /// Shutdown drain: give any cache write still in flight up to
+    /// [`CACHE_WRITE_DRAIN`] to reach disk, then give up.
+    ///
+    /// [`Self::flush_cache`] spawns the write detached so the apply path
+    /// stays sync, so a gateway stopped shortly after an apply used to
+    /// exit with that write unfinished and come back without its
+    /// last-known-good snapshot — which since the proxy listener started
+    /// gating on a first applied configuration means it refuses to bind
+    /// at all until it reaches etcd, where it previously bound and served
+    /// 401s.
+    ///
+    /// Bounded because shutdown must not be able to hang on a stuck disk.
+    /// The bound is fixed rather than configurable: it is a backstop on a
+    /// local file write, not a tuning knob.
+    async fn drain_pending_cache_writes(&self) {
+        if tokio::time::timeout(CACHE_WRITE_DRAIN, self.await_pending_cache_writes())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                bound_ms = CACHE_WRITE_DRAIN.as_millis() as u64,
+                "snapshot-cache write still in flight at shutdown; abandoning it — \
+                 the on-disk cache keeps its previous contents",
+            );
         }
     }
 
@@ -1004,21 +1040,39 @@ impl<P: ConfigProvider> Supervisor<P> {
         let cache = self.cache.clone();
         // Spawn the actual write so the apply path stays sync. If we
         // aren't inside a runtime (cache::disabled() tests), just skip.
-        // Track the JoinHandle so tests can deterministically await
-        // the write via [`Self::await_pending_cache_writes`] instead
-        // of leaning on `tokio::time::sleep`, which under CI load
-        // raced the spawn (~50ms wasn't enough on heavily loaded
-        // GitHub Actions runners).
+        // Track the JoinHandle so [`Self::run`] can drain it at shutdown,
+        // and so tests can deterministically await the write via
+        // [`Self::await_pending_cache_writes`] instead of leaning on
+        // `tokio::time::sleep`, which under CI load raced the spawn
+        // (~50ms wasn't enough on heavily loaded GitHub Actions runners).
         if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
             let join =
                 rt_handle.spawn(async move { cache.store(&entries, revision, &stale).await });
-            self.pending_writes.lock().unwrap().push(join);
+            let mut pending = self.pending_writes.lock().unwrap();
+            // Only writes still in flight are worth draining, and only
+            // those may be retained: the list is appended to on every
+            // apply and would otherwise grow for the life of the process.
+            pending.retain(|handle| !handle.is_finished());
+            pending.push(join);
         }
     }
 
     /// Long-running loop. Handles exp-backoff reconnects and resync on
-    /// compaction. Runs until cancelled via the cancellation token.
-    pub async fn run(self: Arc<Self>, mut cancel: tokio::sync::watch::Receiver<bool>) {
+    /// compaction. Runs until cancelled via the cancellation token, then
+    /// drains any snapshot-cache write still in flight.
+    ///
+    /// The drain lives here rather than in the server's shutdown
+    /// coordinator so it cannot be forgotten by a caller, and so it lands
+    /// in the one place where no further write can be spawned: the loop
+    /// that owns every call to [`Self::flush_cache`] has just exited.
+    /// Callers already await this task after the connection drain, so
+    /// nothing about the graceful-drain sequence changes.
+    pub async fn run(self: Arc<Self>, cancel: tokio::sync::watch::Receiver<bool>) {
+        self.watch_loop(cancel).await;
+        self.drain_pending_cache_writes().await;
+    }
+
+    async fn watch_loop(&self, mut cancel: tokio::sync::watch::Receiver<bool>) {
         let mut backoff = ExpBackoff::default();
         loop {
             if *cancel.borrow() {
@@ -1723,6 +1777,120 @@ mod tests {
 
         tx.send(true).unwrap();
         join.await.unwrap();
+    }
+
+    /// Rows enough to make persisting the configuration set real work
+    /// rather than one scheduler tick. The write the shutdown drain has
+    /// to catch is the serialisation and fsync of this much data; a
+    /// handful of small rows finishes inside the first poll, and an
+    /// assertion built on that would hold with or without the drain.
+    const PADDING_ROWS: usize = 128;
+    const PADDING_NAME_BYTES: usize = 96 * 1024;
+
+    /// A valid model whose display name carries the padding, so the
+    /// loader accepts every row and the test produces no rejection noise.
+    fn padding_entry(i: usize) -> RawEntry {
+        let name = format!("pad-{i}-{}", "x".repeat(PADDING_NAME_BYTES));
+        let value = format!(
+            r#"{{"display_name":"{name}","provider":"openai","model_name":"gpt-4o","provider_key_id":"11111111-1111-1111-1111-111111111111"}}"#
+        );
+        RawEntry {
+            key: format!("/aisix/models/pad-{i}"),
+            value: value.into_bytes(),
+            revision: 1,
+        }
+    }
+
+    /// `flush_cache` spawns the cache write detached so the apply path can
+    /// stay sync, and nothing used to wait for it: a gateway stopped
+    /// shortly after an apply exited with that write unfinished and came
+    /// back without its last-known-good snapshot. That costs more since
+    /// the proxy listener started gating on a first applied configuration
+    /// — a gateway with no usable cache now refuses to bind at all until
+    /// it reaches etcd, where it previously bound and served 401s.
+    ///
+    /// Shaped like the production sequence rather than around the fix: the
+    /// supervisor's own `run` task applies the change, the runtime then
+    /// goes away exactly as it does when `main` returns — dropping every
+    /// spawned task at its await point — and the assertion is on what a
+    /// restart would read off disk.
+    #[test]
+    fn an_apply_immediately_before_shutdown_reaches_the_on_disk_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("snap.json");
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let entries: Vec<RawEntry> = (0..PADDING_ROWS).map(padding_entry).collect();
+            let provider = Arc::new(FakeProvider::new(entries, 1).with_events(vec![Ok(
+                WatchEvent::Put(entry("/aisix/models/late", VALID_MODEL, 2)),
+            )]));
+            let sup = Arc::new(Supervisor::with_cache(
+                provider,
+                "/aisix",
+                SnapshotCache::new(&cache_path),
+            ));
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let join = tokio::spawn(sup.clone().run(rx));
+
+            // Cancel the moment the put is visible in the served
+            // snapshot. The flush it spawned is then still on its way to
+            // disk, which is exactly the window this pins.
+            for _ in 0..5_000 {
+                if sup.handle().load().models.get_by_id("late").is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert!(
+                sup.handle().load().models.get_by_id("late").is_some(),
+                "the put must reach the served snapshot before shutdown",
+            );
+            tx.send(true).unwrap();
+            join.await.unwrap();
+        });
+
+        // What `main` returning does to a spawned write nobody waited for.
+        drop(rt);
+
+        let survived = SnapshotCache::new(&cache_path)
+            .load()
+            .is_some_and(|cached| cached.entries.iter().any(|e| e.key == "/aisix/models/late"));
+        assert!(
+            survived,
+            "the last apply before shutdown must reach disk; undrained, its \
+             write is still in flight when the runtime goes away",
+        );
+    }
+
+    /// The drain must not become a way for shutdown to hang: a write that
+    /// never finishes is abandoned, not waited on forever. Time is paused,
+    /// so the bound is asserted without spending it.
+    #[tokio::test(start_paused = true)]
+    async fn the_shutdown_drain_abandons_a_write_that_never_finishes() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        // A stuck disk cannot be produced on demand through `flush_cache`,
+        // so the handle is planted directly. The subject is the drain's
+        // bound, not how the write got stuck.
+        sup.pending_writes
+            .lock()
+            .unwrap()
+            .push(tokio::spawn(std::future::pending::<()>()));
+
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(CACHE_WRITE_DRAIN * 4, sup.drain_pending_cache_writes())
+            .await
+            .expect("shutdown must not be able to hang on a stuck disk write");
+        assert!(
+            started.elapsed() >= CACHE_WRITE_DRAIN,
+            "the drain must actually wait out its bound before giving up",
+        );
     }
 
     #[tokio::test]

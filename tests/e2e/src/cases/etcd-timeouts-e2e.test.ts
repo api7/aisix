@@ -13,20 +13,19 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// `etcd.request_timeout_ms` bounds one unary etcd call. Until it was
-// wired, both etcd timeout keys were accepted by the config parser and
-// read by nothing: a configuration range read that never answered stayed
-// in flight forever, and the instance served nothing while producing no
-// error that explained why.
+// The two `etcd.*_timeout_ms` keys. Until they were wired, both were
+// accepted by the config parser and read by nothing: a configuration
+// range read that never answered stayed in flight forever, and the
+// instance served nothing while producing no error that explained why.
 //
-// The three specs pin the three halves of the contract — the bound aborts
-// such a read and hands the supervisor a retryable failure; unset leaves
-// the read unbounded, with no implicit default, which is what keeps a
-// large configuration set bootable; and the watch stream is exempt, so a
-// set bound does not tear down a quiet watch.
+// These specs pin the contract an operator sees — the bound aborts such
+// a read and hands the supervisor a retryable failure; unset AND `0`
+// both leave the read unbounded, with no implicit default, which is what
+// keeps a large configuration set bootable; the watch stream is exempt,
+// so a set bound does not tear down a quiet watch.
 //
-// The first two drive the gateway through a TCP relay standing in for
-// etcd, which is what makes a read that never completes reproducible:
+// Most of them drive the gateway through a TCP relay standing in for
+// etcd, which is what makes a call that never completes reproducible:
 // `hold()` accepts the connection and forwards nothing.
 
 const MODEL = "etcd-timeout-model";
@@ -97,7 +96,7 @@ async function waitForChat(app: SpawnedApp, model: string, timeoutMs: number): P
   }
 }
 
-describe("etcd.request_timeout_ms", () => {
+describe("etcd.dial_timeout_ms & etcd.request_timeout_ms", () => {
   let etcd: EtcdClient | undefined;
   let etcdReachable = false;
   let upstream: OpenAiUpstream | undefined;
@@ -220,6 +219,41 @@ describe("etcd.request_timeout_ms", () => {
 
     // Still a live read rather than a wedged one: releasing it serves that
     // very snapshot.
+    await relay.release();
+    expect(await waitForChat(app, MODEL, 60_000)).toBe(200);
+  }, 150_000);
+
+  test("reads 0 on both keys as unbounded, exactly like leaving them unset", async (ctx) => {
+    if (!etcdReachable) {
+      ctx.skip();
+      return;
+    }
+    const prefix = `/aisix-e2e-etcd-zero-${randomUUID()}`;
+    const relay = await startEtcdRelay();
+    relays.push(relay);
+    await relay.hold();
+    await seedFixtures(prefix);
+
+    // `0` used to brick the gateway silently in both directions: it
+    // reached hyper's connector as an already-expired connect deadline,
+    // so every dial aborted, and it aborted every range read the instant
+    // it was issued. Nothing ever applied, so the proxy listener never
+    // bound, and the only signal was a boot loop that named neither key.
+    const app = await spawnAgainst(
+      relay.endpoint,
+      prefix,
+      { dial_timeout_ms: 0, request_timeout_ms: 0 },
+      { awaitProxyListener: false },
+    );
+
+    // Same window the unset spec uses, for the same reason: an implicit
+    // bound of any size would have fired many times over by now.
+    await sleep(12_000);
+    expect(app.output()).not.toContain(BACKOFF_LINE);
+    expect(app.output()).not.toContain(TIMEOUT_LINE);
+
+    // And it is a live read, not a wedged one — the same end state the
+    // unset spec reaches.
     await relay.release();
     expect(await waitForChat(app, MODEL, 60_000)).toBe(200);
   }, 150_000);

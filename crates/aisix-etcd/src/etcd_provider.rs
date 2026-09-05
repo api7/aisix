@@ -73,12 +73,14 @@ pub struct EtcdConfigProvider {
     kv: Mutex<KvClient>,
     watch: Mutex<WatchClient>,
     prefix: String,
-    /// Bound applied to each unary call this provider makes — currently
-    /// the range read in [`Self::load_all`]. `None` leaves it unbounded.
+    /// Bound applied to each request/response call this provider makes —
+    /// the range read in [`Self::load_all`] and the watch-create
+    /// handshake in [`Self::watch`]. `None` leaves them unbounded, and
+    /// the established watch stream is never bounded by it.
     ///
     /// Applied per call with [`tokio::time::timeout`] rather than through
     /// `ConnectOptions::with_timeout`, for two reasons. That option is
-    /// channel-wide, so it would also bound opening the watch. And it
+    /// channel-wide, so it would also bound consuming the watch. And it
     /// bounds only the response *future*: tonic's `GrpcTimeout` races the
     /// deadline against the arrival of response headers and then lets the
     /// body stream run untimed, so an etcd that answers a range request
@@ -165,21 +167,22 @@ impl EtcdConfigProvider {
 
 /// Apply `timeout`, when set, to one in-flight etcd call.
 ///
-/// Expiry is reported as [`ProviderError::Range`] to match the variant
-/// the same call's transport failures already use, so the supervisor's
-/// warn line attributes it to the range read. It is attribution, not
-/// control flow: `Supervisor::run` routes every `ProviderError` out of
-/// `load_all` to the same reconnect-with-backoff path, so the aborted
-/// read is retried whichever variant carries it.
+/// `into_err` names the call: expiry is reported as the same
+/// `ProviderError` variant that call's transport failures already use,
+/// so the supervisor's warn line attributes it to the right step. It is
+/// attribution, not control flow: `Supervisor::run` routes every
+/// `ProviderError` out of a cycle to the same reconnect-with-backoff
+/// path, so the aborted call is retried whichever variant carries it.
 async fn bound<T>(
     timeout: Option<Duration>,
     what: &str,
+    into_err: fn(String) -> ProviderError,
     fut: impl std::future::Future<Output = T>,
 ) -> Result<T, ProviderError> {
     match timeout {
         None => Ok(fut.await),
         Some(d) => tokio::time::timeout(d, fut).await.map_err(|_| {
-            ProviderError::Range(format!(
+            into_err(format!(
                 "{what} exceeded etcd.request_timeout_ms ({} ms)",
                 d.as_millis()
             ))
@@ -195,9 +198,14 @@ impl ConfigProvider for EtcdConfigProvider {
             self.prefix.as_bytes(),
             Some(GetOptions::new().with_prefix()),
         );
-        let resp = bound(self.request_timeout, "range read", read)
-            .await?
-            .map_err(|e| ProviderError::Range(format_error_chain(&e)))?;
+        let resp = bound(
+            self.request_timeout,
+            "range read",
+            ProviderError::Range,
+            read,
+        )
+        .await?
+        .map_err(|e| ProviderError::Range(format_error_chain(&e)))?;
 
         let revision = resp.header().map(|h| h.revision()).unwrap_or(0);
 
@@ -225,10 +233,25 @@ impl ConfigProvider for EtcdConfigProvider {
         let opts = WatchOptions::new()
             .with_prefix()
             .with_start_revision(start_revision);
-        let (watcher, stream) = watch
-            .watch(self.prefix.as_bytes(), Some(opts))
-            .await
-            .map_err(|e| ProviderError::Watch(format_error_chain(&e)))?;
+        // Creating the watch is request/response shaped — etcd-client
+        // sends the create request and awaits the server's create
+        // confirmation before handing back the stream — so it is bounded
+        // like any other unary call. Consuming the stream that comes back
+        // is not: see the `request_timeout` field docs.
+        //
+        // The failure this closes is silent. An etcd that answers range
+        // reads but never confirms the watch leaves the gateway serving
+        // its first snapshot forever, blind to every later change, while
+        // `/status/config` still reports it connected.
+        let create = watch.watch(self.prefix.as_bytes(), Some(opts));
+        let (watcher, stream) = bound(
+            self.request_timeout,
+            "watch create",
+            ProviderError::Watch,
+            create,
+        )
+        .await?
+        .map_err(|e| ProviderError::Watch(format_error_chain(&e)))?;
 
         Ok(Box::new(EtcdWatchStream {
             inner: stream,
@@ -348,9 +371,76 @@ mod tests {
         assert!(matches!(err, ProviderError::Connect(_)));
     }
 
+    /// An etcd that is reachable and answers nothing.
+    ///
+    /// A real HTTP/2 server: the connection preface and SETTINGS exchange
+    /// complete, every request is accepted, and no response is ever sent.
+    /// That is the failure the bound below exists for — the call reached
+    /// a reachable etcd, which simply never answered it.
+    ///
+    /// Returns the endpoint. The listener task lives for the test.
+    async fn spawn_silent_h2_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let Ok(mut conn) = h2::server::handshake(socket).await else {
+                        return;
+                    };
+                    // Hold each responder without ever using it: dropping
+                    // one would RST_STREAM the request, which the client
+                    // would see as an answer.
+                    let mut accepted = Vec::new();
+                    while let Some(Ok((_req, respond))) = conn.accept().await {
+                        accepted.push(respond);
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn the_request_timeout_bounds_a_watch_creation_that_is_never_confirmed() {
+        // Creating a watch is request/response shaped: etcd-client sends
+        // the create request and awaits the server's create confirmation
+        // before handing back the stream. Unbounded, an etcd that answers
+        // range reads and never confirms the watch leaves the gateway
+        // serving its first snapshot forever, blind to every later
+        // change, while `/status/config` still reports it connected.
+        let endpoint = spawn_silent_h2_server().await;
+        // No user, so `Client::connect` is lazy and returns without a
+        // round trip — the stall this asserts on is the watch create.
+        let provider = EtcdConfigProvider::connect(
+            &[endpoint],
+            "/aisix",
+            None,
+            Some(Duration::from_millis(300)),
+        )
+        .await
+        .expect("connect is lazy without credentials");
+
+        let err = tokio::time::timeout(Duration::from_secs(10), provider.watch(1))
+            .await
+            .expect("the watch create must be bounded; without the bound this hangs")
+            .err()
+            .expect("an unconfirmed watch create cannot succeed");
+
+        let ProviderError::Watch(msg) = err else {
+            panic!("expiry must surface as ProviderError::Watch, got {err:?}");
+        };
+        assert!(
+            msg.contains("watch create") && msg.contains("etcd.request_timeout_ms"),
+            "the message must name the call and the key that bounded it: {msg}",
+        );
+    }
+
     #[tokio::test]
     async fn bound_passes_through_when_no_timeout_is_set() {
-        let out = bound(None, "range read", async { 7u8 }).await.unwrap();
+        let out = bound(None, "range read", ProviderError::Range, async { 7u8 })
+            .await
+            .unwrap();
         assert_eq!(out, 7);
     }
 
@@ -367,6 +457,7 @@ mod tests {
         let err = bound(
             Some(Duration::from_millis(1)),
             "range read",
+            ProviderError::Range,
             std::future::pending::<()>(),
         )
         .await
