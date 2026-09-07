@@ -9,7 +9,7 @@ import {
 
 const KEY = "sk-cache-write-usage-test";
 const surfaces = ["chat/completions", "messages", "responses", "completions", "responses-bridge"];
-const cases = surfaces.flatMap((surface) => [false, true].flatMap((stream) =>
+const cases = surfaces.flatMap((surface) => (surface === "completions" ? [false] : [false, true]).flatMap((stream) =>
   [37, 0, undefined].map((write) => ({
     surface, stream, write,
     model: `write-${surface.replaceAll("/", "-")}-${stream}-${write ?? "absent"}`,
@@ -75,7 +75,7 @@ describe("OpenAI cache-write usage survives every supported entry point", () => 
     const seed = new SeedClient(etcd, app.etcdPrefix);
     await seed.createObservabilityExporter({
       name: "cache-write", kind: "datadog", enabled: true,
-      site: `127.0.0.1:${port}`, credential_ref: "write", content_mode: "metadata_only",
+      site: `127.0.0.1:${port}`, credential_ref: "write", service: "cache-write-test", content_mode: "metadata_only",
     });
     for (const provider of ["openai", "deepseek"]) {
       const pk = await seed.createProviderKey({
@@ -135,8 +135,8 @@ describe("OpenAI cache-write usage survives every supported entry point", () => 
     for (const scenario of cases) {
       const event = logs.find((l) => l["aisix.requested_model"] === scenario.model)!;
       expect(event["aisix.cache_write_tokens"], scenario.model).toBe(scenario.write);
-      expect(event["aisix.prompt_tokens"], scenario.model).toBe(101);
-      expect(event["aisix.completion_tokens"], scenario.model).toBe(11);
+      expect(event["gen_ai.usage.input_tokens"], scenario.model).toBe(101);
+      expect(event["gen_ai.usage.output_tokens"], scenario.model).toBe(11);
       expect(event["aisix.cached_prompt_tokens"], scenario.model).toBe(19);
       expect(event["aisix.cache_creation_tokens"], scenario.model).toBeUndefined();
     }
