@@ -1545,7 +1545,10 @@ fn without_billing_header_line(text: &str) -> SystemText<'_> {
         return SystemText::Unchanged;
     }
     match trimmed.split_once('\n') {
-        Some((_, rest)) if !rest.is_empty() => SystemText::Remainder(rest),
+        // A remainder that is only whitespace is nothing surviving, not a
+        // prompt: keeping it would put a blank `system` on the wire, and
+        // Anthropic-protocol upstreams reject an empty text block.
+        Some((_, rest)) if !rest.trim().is_empty() => SystemText::Remainder(rest),
         // No newline: the client emits the attribution as its own line, so
         // a text that starts with the marker and never ends the line is
         // the attribution and nothing else.
@@ -2634,6 +2637,50 @@ mod tests {
         });
         let out = strip_billing_header_attribution(&trailing);
         assert!(out.get("system").is_none());
+    }
+
+    /// A remainder made only of whitespace is nothing surviving. Keeping
+    /// it would put a blank `system` on the wire — and a blank text block
+    /// is what Anthropic-protocol upstreams reject outright.
+    #[test]
+    fn strip_billing_header_treats_a_blank_remainder_as_nothing_surviving() {
+        for tail in ["\n", "\n   \n", "\n\t"] {
+            let string = serde_json::json!({
+                "model": "claude",
+                "system": format!("{BILLING_LINE}{tail}"),
+                "messages": [{ "role": "user", "content": "hi" }]
+            });
+            assert!(
+                strip_billing_header_attribution(&string)
+                    .get("system")
+                    .is_none(),
+                "string form with trailing {tail:?} must omit `system`"
+            );
+
+            let array = serde_json::json!({
+                "model": "claude",
+                "system": [{ "type": "text", "text": format!("{BILLING_LINE}{tail}") }],
+                "messages": [{ "role": "user", "content": "hi" }]
+            });
+            assert!(
+                strip_billing_header_attribution(&array)
+                    .get("system")
+                    .is_none(),
+                "array form with trailing {tail:?} must omit `system`"
+            );
+        }
+
+        // A blank line BEFORE real prompt text is not a blank remainder —
+        // the operator's text survives with its own leading whitespace.
+        let kept = serde_json::json!({
+            "model": "claude",
+            "system": format!("{BILLING_LINE}\n\nYou are a terse assistant."),
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        assert_eq!(
+            strip_billing_header_attribution(&kept)["system"],
+            serde_json::json!("\nYou are a terse assistant.")
+        );
     }
 
     #[test]
