@@ -11,17 +11,17 @@ schemas/
 ├── resources/            # strict — the write contract
 │   ├── api_key.schema.json
 │   ├── cache_policy.schema.json
-│   ├── embedding.schema.json
 │   ├── guardrail.schema.json
 │   ├── model.schema.json
-│   ├── observability_exporter.schema.json
 │   ├── provider_key.schema.json
-│   ├── rate_limit.schema.json
-│   ├── rate_limit_policy.schema.json
-│   ├── routing.schema.json
-│   └── semantic.schema.json
+│   └── …                 # one per resource, plus the nested struct types
 └── resources-lenient/    # lenient — the etcd read contract, same file names
 ```
+
+Both directories hold the same file names. The listing above is a sample;
+the set is whatever `dump-schema` emits, which is every entry of
+`schema::RESOURCES` plus `ensemble`, `rate_limit`, `routing`, `semantic`
+and `embedding`.
 
 Each file is a self-contained JSON Schema draft-07 document. Nested
 types (e.g. `Adapter`, `RoutingTarget`, `TelemetryTags`) live in the
