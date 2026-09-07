@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use aisix_core::RedisConnConfig;
 use aisix_gateway::ChatResponse;
+use aisix_obs::metrics::Metrics;
 use aisix_redis::RedisConn;
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -57,6 +58,10 @@ pub struct RedisSemanticCache {
     /// hot path pays one `DashMap` read instead of an `FT.CREATE`
     /// round-trip per request.
     ensured: DashMap<String, EnsuredIndex>,
+    /// Prometheus handle for `aisix_redis_failures_total`. A failed
+    /// lookup degrades to an ordinary miss, so without this a broken
+    /// vector store looks exactly like a cache nobody is hitting.
+    metrics: Option<Metrics>,
 }
 
 impl std::fmt::Debug for RedisSemanticCache {
@@ -79,7 +84,20 @@ impl RedisSemanticCache {
             conn,
             prefix: DEFAULT_PREFIX.into(),
             ensured: DashMap::new(),
+            metrics: None,
         })
+    }
+
+    /// Count Redis operation failures on `metrics` (#1060).
+    pub fn with_metrics(mut self, metrics: Metrics) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    fn note_failure(&self, op: &str) {
+        if let Some(m) = &self.metrics {
+            m.record_redis_failure(op);
+        }
     }
 
     /// Namespace by environment id, mirroring the exact cache's
@@ -124,10 +142,10 @@ impl RedisSemanticCache {
     }
 
     async fn acquire(&self) -> Result<aisix_redis::RedisConnHandle, CacheError> {
-        self.conn
-            .acquire()
-            .await
-            .map_err(|e| CacheError::Backend(format!("redis acquire: {e}")))
+        self.conn.acquire().await.map_err(|e| {
+            self.note_failure("semantic_acquire");
+            CacheError::Backend(format!("redis acquire: {e}"))
+        })
     }
 
     fn index_name(&self, policy_id: &str, generation: u32, dims: usize) -> String {
@@ -203,6 +221,7 @@ impl RedisSemanticCache {
                     .to_ascii_lowercase()
                     .contains("already exists") => {}
             Err(e) => {
+                self.note_failure("semantic_index");
                 self.conn.note_error().await;
                 return Err(CacheError::Backend(format!("redis FT.CREATE: {e}")));
             }
@@ -417,6 +436,7 @@ impl SemanticCacheStore for RedisSemanticCache {
         let reply = match reply {
             Ok(v) => v,
             Err(e) => {
+                self.note_failure("semantic_lookup");
                 self.conn.note_error().await;
                 let err = CacheError::Backend(format!("redis FT.SEARCH: {e}"));
                 self.forget_missing_index(policy_id, &err);
@@ -455,6 +475,7 @@ impl SemanticCacheStore for RedisSemanticCache {
         {
             Ok(v) => v,
             Err(e) => {
+                self.note_failure("semantic_lookup");
                 self.conn.note_error().await;
                 return Err(CacheError::Backend(format!("redis PTTL: {e}")));
             }
@@ -510,6 +531,7 @@ impl SemanticCacheStore for RedisSemanticCache {
             .arg(ttl.as_millis().max(1) as u64)
             .ignore();
         if let Err(e) = pipe.query_async::<()>(&mut conn).await {
+            self.note_failure("semantic_store");
             self.conn.note_error().await;
             let err = CacheError::Backend(format!("redis HSET: {e}"));
             self.forget_missing_index(policy_id, &err);

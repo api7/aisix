@@ -40,6 +40,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use aisix_core::{RateLimit, RedisConnConfig};
+use aisix_obs::metrics::Metrics;
 use aisix_redis::RedisConn;
 use async_trait::async_trait;
 use redis::Script;
@@ -213,6 +214,10 @@ pub struct RedisStore {
     /// One-shot guard so the degradation warning is logged once, not per
     /// request, while Redis stays down.
     degraded_logged: AtomicBool,
+    /// Prometheus handle for `aisix_redis_failures_total`. The warning
+    /// above fires once per outage by design, so it cannot answer how
+    /// long or how hard Redis is failing; the counter can.
+    metrics: Option<Metrics>,
 }
 
 impl std::fmt::Debug for RedisStore {
@@ -237,7 +242,16 @@ impl RedisStore {
             grace: DEFAULT_GRACE_SECS,
             local: Arc::new(LocalStore::new()),
             degraded_logged: AtomicBool::new(false),
+            metrics: None,
         })
+    }
+
+    /// Count Redis operation failures on `metrics`. Without it the
+    /// fail-open degradation below is invisible to a scrape — the whole
+    /// point of the family (#1060).
+    pub fn with_metrics(mut self, metrics: Metrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     pub fn with_conc_ttl(mut self, secs: u64) -> Self {
@@ -266,6 +280,13 @@ impl RedisStore {
         format!("{}:{{{}}}", self.prefix, key)
     }
 
+    /// Count the failure and log the fail-open transition once per
+    /// outage. Every failed operation counts; only the first logs.
+    fn note_failure(&self, op: &str, err: &redis::RedisError) {
+        record_failure(&self.metrics, op);
+        self.warn_degraded(op, err);
+    }
+
     /// Log the fail-open transition once per outage.
     fn warn_degraded(&self, op: &str, err: &redis::RedisError) {
         if !self.degraded_logged.swap(true, Ordering::Relaxed) {
@@ -283,6 +304,16 @@ impl RedisStore {
     /// Mark Redis healthy again after a successful op (re-arms the warn).
     fn mark_ok(&self) {
         self.degraded_logged.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Bump `aisix_redis_failures_total` for one failed rate-limit store
+/// operation. The label is subsystem-qualified because a deployment
+/// points the limiter and the caches at the same Redis, and a bare
+/// `acquire` could have come from either.
+fn record_failure(metrics: &Option<Metrics>, op: &str) {
+    if let Some(m) = metrics {
+        m.record_redis_failure(&format!("ratelimit_{op}"));
     }
 }
 
@@ -325,7 +356,7 @@ impl RateStore for RedisStore {
         let mut conn = match self.conn.acquire().await {
             Ok(c) => c,
             Err(e) => {
-                self.warn_degraded("acquire", &e);
+                self.note_failure("acquire", &e);
                 return self.local.acquire(key, limits, member).await;
             }
         };
@@ -371,7 +402,7 @@ impl RateStore for RedisStore {
                 }
             }
             Err(e) => {
-                self.warn_degraded("acquire", &e);
+                self.note_failure("acquire", &e);
                 self.conn.note_error().await;
                 self.local.acquire(key, limits, member).await
             }
@@ -383,7 +414,7 @@ impl RateStore for RedisStore {
         let mut conn = match self.conn.acquire().await {
             Ok(c) => c,
             Err(e) => {
-                self.warn_degraded("commit", &e);
+                self.note_failure("commit", &e);
                 return self.local.commit(key, tokens, member).await;
             }
         };
@@ -398,7 +429,7 @@ impl RateStore for RedisStore {
         match res {
             Ok(_) => self.mark_ok(),
             Err(e) => {
-                self.warn_degraded("commit", &e);
+                self.note_failure("commit", &e);
                 self.conn.note_error().await;
                 self.local.commit(key, tokens, member).await;
             }
@@ -412,11 +443,16 @@ impl RateStore for RedisStore {
         let conc_key = format!("{}:conc", self.bucket_prefix(key));
         let conn = self.conn.clone();
         let member = member.to_string();
+        let metrics = self.metrics.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 // ZREM's first arg is the key, so Redis Cluster routes it.
-                let Ok(mut c) = conn.acquire().await else {
-                    return;
+                let mut c = match conn.acquire().await {
+                    Ok(c) => c,
+                    Err(_) => {
+                        record_failure(&metrics, "release");
+                        return;
+                    }
                 };
                 let res: Result<(), redis::RedisError> = redis::cmd("ZREM")
                     .arg(&conc_key)
@@ -424,6 +460,10 @@ impl RateStore for RedisStore {
                     .query_async(&mut c)
                     .await;
                 if res.is_err() {
+                    // The detached tasks are the only Redis failures with
+                    // no log at all — nothing awaits them, so the counter
+                    // is their only trace.
+                    record_failure(&metrics, "release");
                     conn.note_error().await;
                 }
             });
@@ -440,10 +480,15 @@ impl RateStore for RedisStore {
         let prefix = self.bucket_prefix(key);
         let grace = self.grace;
         let conn = self.conn.clone();
+        let metrics = self.metrics.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let Ok(mut c) = conn.acquire().await else {
-                    return;
+                let mut c = match conn.acquire().await {
+                    Ok(c) => c,
+                    Err(_) => {
+                        record_failure(&metrics, "add_tokens");
+                        return;
+                    }
                 };
                 let res: Result<i64, redis::RedisError> = Script::new(ADD_TOKENS_LUA)
                     .key(&prefix)
@@ -453,6 +498,7 @@ impl RateStore for RedisStore {
                     .invoke_async(&mut c)
                     .await;
                 if res.is_err() {
+                    record_failure(&metrics, "add_tokens");
                     conn.note_error().await;
                 }
             });
@@ -467,7 +513,7 @@ impl RateStore for RedisStore {
         let mut conn = match self.conn.acquire().await {
             Ok(c) => c,
             Err(e) => {
-                self.warn_degraded("peek", &e);
+                self.note_failure("peek", &e);
                 return self.local.peek(key, limits).await;
             }
         };
@@ -492,7 +538,7 @@ impl RateStore for RedisStore {
                 })
             }
             Err(e) => {
-                self.warn_degraded("peek", &e);
+                self.note_failure("peek", &e);
                 self.conn.note_error().await;
                 self.local.peek(key, limits).await
             }

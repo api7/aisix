@@ -9,6 +9,7 @@
 use std::time::Duration;
 
 use aisix_core::{RateLimit, RateLimitScope, RedisConnConfig, RedisMode};
+use aisix_obs::metrics::Metrics;
 use aisix_ratelimit::{RateStore, RedisStore};
 
 fn redis_url() -> Option<String> {
@@ -526,4 +527,147 @@ async fn env_namespace_isolates_model_alias_bucket() {
         .acquire(key, &limits, "a-3")
         .await
         .expect_err("same env shares the counter");
+}
+
+/// A TCP relay in front of Redis that a test can cut. Until then every
+/// byte is forwarded both ways; afterwards the relay answers each client
+/// request with a Redis error instead of forwarding it.
+///
+/// An error reply rather than a dropped socket on purpose: the client's
+/// connection manager answers a dropped socket by reconnecting with its
+/// own multi-minute backoff, so a test that closes the connection spends
+/// that backoff before the operation it is measuring ever returns. Both
+/// shapes reach `RedisStore` as the same `Err`.
+struct RedisCutoff {
+    port: u16,
+    cut: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RedisCutoff {
+    async fn start(upstream: &str) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let upstream = upstream
+            .trim_start_matches("redis://")
+            .trim_end_matches('/')
+            .to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cut = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cut.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut client, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(mut server) = tokio::net::TcpStream::connect(&upstream).await else {
+                    continue;
+                };
+                let flag = flag.clone();
+                tokio::spawn(async move {
+                    let mut from_client = [0u8; 8192];
+                    let mut from_server = [0u8; 8192];
+                    loop {
+                        tokio::select! {
+                            n = client.read(&mut from_client) => {
+                                let Ok(n) = n else { return };
+                                if n == 0 {
+                                    return;
+                                }
+                                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                    if client
+                                        .write_all(b"-ERR simulated redis outage\r\n")
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                } else if server.write_all(&from_client[..n]).await.is_err() {
+                                    return;
+                                }
+                            }
+                            n = server.read(&mut from_server) => {
+                                let Ok(n) = n else { return };
+                                if n == 0 || client.write_all(&from_server[..n]).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        Self { port, cut }
+    }
+
+    fn url(&self) -> String {
+        format!("redis://127.0.0.1:{}", self.port)
+    }
+
+    fn cut(&self) {
+        self.cut.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn counter_value(rendered: &str, operation: &str) -> f64 {
+    let needle = format!("aisix_redis_failures_total{{operation=\"{operation}\"}} ");
+    rendered
+        .lines()
+        .find_map(|l| l.trim().strip_prefix(&needle))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0.0)
+}
+
+/// #1060: the shared limiter fails OPEN — an unreachable Redis silently
+/// degrades every replica to its own in-memory counters, so the cluster
+/// stops enforcing one global window and nothing about the answer to a
+/// caller changes. The warning logs once per outage, which cannot say how
+/// long or how hard it is failing. `aisix_redis_failures_total` is the
+/// only signal an operator can scrape, and before this it was never
+/// emitted at all.
+#[tokio::test]
+async fn a_redis_outage_counts_every_failed_operation() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let metrics = Metrics::new(false);
+    let relay = RedisCutoff::start(&url).await;
+    let store = RedisStore::connect(&single(&relay.url()))
+        .await
+        .expect("redis connect through the relay")
+        .with_metrics(metrics.clone());
+    let key = unique_key("outage");
+    let limits = RateLimit {
+        rpm: Some(10),
+        ..rl()
+    };
+
+    // Healthy: the operation succeeds and nothing is counted.
+    store
+        .acquire(&key, &limits, "m-1")
+        .await
+        .expect("allowed while Redis is reachable");
+    assert_eq!(counter_value(&metrics.render(), "ratelimit_acquire"), 0.0);
+
+    relay.cut();
+
+    // Still admitted — that is the fail-open contract, and exactly why
+    // the outage is invisible without the counter.
+    store
+        .acquire(&key, &limits, "m-2")
+        .await
+        .expect("fail-open keeps admitting");
+    let first = counter_value(&metrics.render(), "ratelimit_acquire");
+    assert!(first >= 1.0, "the failed acquire must be counted: {first}");
+
+    // Every subsequent failure counts, not just the first: the log line
+    // is one-shot per outage and cannot report a rate.
+    store
+        .acquire(&key, &limits, "m-3")
+        .await
+        .expect("fail-open keeps admitting");
+    assert!(
+        counter_value(&metrics.render(), "ratelimit_acquire") > first,
+        "each failed operation counts, not only the one that logged",
+    );
 }

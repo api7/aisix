@@ -24,6 +24,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use super::{ObservabilitySink, PipelineConfig, SinkHandle, SinkPipeline, SinkStatsSnapshot};
+use crate::metrics::Metrics;
 
 /// One running pipeline plus the bookkeeping needed to stop/rebuild it.
 struct Running {
@@ -40,6 +41,7 @@ struct Running {
 pub struct ExporterPipelines {
     running: Mutex<HashMap<String, Running>>,
     cfg: PipelineConfig,
+    metrics: Option<Metrics>,
 }
 
 impl ExporterPipelines {
@@ -49,7 +51,15 @@ impl ExporterPipelines {
         Self {
             running: Mutex::new(HashMap::new()),
             cfg,
+            metrics: None,
         }
+    }
+
+    /// Emit the fan-out drop/failure counters on `metrics`. Every
+    /// pipeline this manager starts inherits the handle.
+    pub fn with_metrics(mut self, metrics: Metrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Number of running pipelines.
@@ -85,7 +95,8 @@ impl ExporterPipelines {
             }
         }
         let sink = build();
-        let (handle, pipeline) = SinkPipeline::new(sink, self.cfg.clone());
+        let (handle, pipeline) =
+            SinkPipeline::with_metrics(sink, self.cfg.clone(), self.metrics.clone());
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let worker = tokio::spawn(pipeline.run(cancel_rx));
         running.insert(

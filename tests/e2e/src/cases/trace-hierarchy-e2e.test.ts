@@ -14,6 +14,7 @@ import {
   type CapturedSpan,
   type MockOtlp,
 } from "../harness/otlp-mock.js";
+import { metricDelta, scrapeMetrics } from "../harness/metrics.js";
 
 // E2E (AISIX-Cloud#1279): the OTLP export is a real trace, not a bag of
 // disconnected spans. One request — including a failover with a failed
@@ -818,6 +819,64 @@ describe("trace hierarchy e2e (AISIX-Cloud#1279)", () => {
     expect(spans).toHaveLength(1);
     expect(spans[0].kind).toBe(KIND_SERVER);
     expect(spans[0].parentSpanId).toBe("");
+  });
+
+  test("an exporter that never recovers counts every failed attempt and the records it lost", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    // #1060: the fan-out already accounted these in `SinkStats`, which is
+    // the heartbeat's view and resets whenever an exporter is
+    // reconfigured. Nothing reached `GET /metrics`, so an operator
+    // querying either family saw an empty result whether telemetry was
+    // flowing or being discarded.
+    //
+    // More 503s than the pipeline will retry (1 attempt + 4 retries), so
+    // the batch is given up on rather than eventually delivered.
+    const otlp = await startMockOtlp({ failFirst: 50 });
+    receivers.push(otlp);
+    const exporterName = "trace-fanout-drop-otlp";
+    await seed.createObservabilityExporter({
+      name: exporterName,
+      enabled: true,
+      kind: "otlp_http",
+      endpoint: otlp.url,
+    });
+    const upstream = await startOpenAiUpstream({
+      nonStreamBody: okUpstreamBody("cmpl-fanout-drop"),
+    });
+    upstreams.push(upstream);
+    await createOpenAiModel("trace-fanout-drop-direct", upstream);
+    await propagate();
+
+    const before = await scrapeMetrics(app.metricsUrl);
+    await driveChat("trace-fanout-drop-direct");
+
+    // Wait for the pipeline to exhaust its retries: the 5th POST is the
+    // last attempt, and the drop is recorded when it fails.
+    const deadline = Date.now() + 30_000;
+    let drops = 0;
+    let failures = 0;
+    while (Date.now() < deadline) {
+      const after = await scrapeMetrics(app.metricsUrl);
+      drops = metricDelta(before, after, "aisix_otlp_fanout_drops_total", {
+        exporter: exporterName,
+        reason: "retries_exhausted",
+      });
+      failures = metricDelta(before, after, "aisix_otlp_fanout_failures_total", {
+        exporter: exporterName,
+      });
+      if (drops > 0) break;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+
+    expect(drops).toBeGreaterThan(0);
+    // One count per failed ATTEMPT, so the retries are visible too — the
+    // distinction between the two families is exactly this.
+    expect(failures).toBeGreaterThanOrEqual(5);
+    // The receiver really did refuse every one of them.
+    expect(otlp.posts).toBeGreaterThanOrEqual(5);
   });
 
   test("a transient receiver failure re-delivers byte-identical span ids", async (ctx) => {
