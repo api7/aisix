@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { connect } from "node:net";
+import { connect, createServer, type Server, type Socket } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -13,6 +13,7 @@ import {
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
+import { metricDelta, scrapeMetrics } from "../harness/metrics.js";
 
 // E2E: cluster-level rate limiting (api7/AISIX-Cloud#798).
 //
@@ -216,5 +217,134 @@ describe("rate limit is NOT shared with backend=memory (per-replica, the #798 bu
     const second = await chatRequest(appB.proxyUrl, model);
     expect(second.status).toBe(200);
     await second.body?.cancel();
+  });
+});
+
+
+/**
+ * A TCP relay in front of Redis that the test can cut.
+ *
+ * Until cut, every byte is forwarded both ways. Afterwards each client
+ * request is answered with a Redis error instead of being forwarded — an
+ * error reply rather than a dropped socket, because a dropped socket sends
+ * the gateway's connection manager into its own multi-minute reconnect
+ * backoff and the request under measurement would not return inside the
+ * test. Both shapes reach the store as the same failed operation.
+ */
+async function startRedisCutoff(upstreamUrl: string): Promise<{
+  url: string;
+  cut(): void;
+  close(): Promise<void>;
+}> {
+  const m = /^redis:\/\/(?:[^@/]*@)?([^:/]+)(?::(\d+))?/.exec(upstreamUrl);
+  if (!m) throw new Error(`unparseable redis url: ${upstreamUrl}`);
+  const host = m[1];
+  const port = m[2] ? Number(m[2]) : 6379;
+  let cut = false;
+  const live = new Set<Socket>();
+  const server: Server = createServer((client) => {
+    live.add(client);
+    const server = connect({ host, port });
+    live.add(server);
+    client.on("data", (buf) => {
+      if (cut) client.write("-ERR simulated redis outage\r\n");
+      else server.write(buf);
+    });
+    server.on("data", (buf) => client.write(buf));
+    const bin = () => {
+      client.destroy();
+      server.destroy();
+      live.delete(client);
+      live.delete(server);
+    };
+    client.on("error", bin);
+    server.on("error", bin);
+    client.on("close", bin);
+    server.on("close", bin);
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const addr = server.address();
+  if (typeof addr === "string" || addr === null) throw new Error("no relay port");
+  return {
+    url: `redis://127.0.0.1:${addr.port}`,
+    cut: () => {
+      cut = true;
+    },
+    close: () =>
+      new Promise<void>((r) => {
+        for (const s of live) s.destroy();
+        server.close(() => r());
+      }),
+  };
+}
+
+// #1060: `aisix_redis_failures_total` had no caller at all, so an operator
+// querying it got an empty result whether the shared backend was healthy or
+// failing constantly. The limiter fails OPEN — it degrades to per-replica
+// in-memory counting and keeps answering 200 — so nothing else about the
+// request changes and this counter is the only signal the degradation ever
+// produces. Asserted through a real gateway's `GET /metrics`, because an
+// emit that is only exercised by a unit test is exactly the shape that
+// shipped uncalled three times before.
+describe("a Redis outage on the shared rate-limit backend is scrapeable (#1060)", () => {
+  let app: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let relay: Awaited<ReturnType<typeof startRedisCutoff>> | undefined;
+  let infraReady = false;
+  const prefix = `/aisix-e2e-rl-redisfail-${randomUUID()}`;
+  const model = "rl-redis-fail";
+
+  beforeAll(async () => {
+    infraReady = (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
+    if (!infraReady) return;
+
+    upstream = await startOpenAiUpstream();
+    relay = await startRedisCutoff(REDIS_URL);
+    app = await spawnApp({
+      extra: {
+        etcd: sharedEtcd(prefix),
+        ratelimit: { backend: "redis", redis: { url: relay.url } },
+      },
+    });
+    await seed(prefix, upstream.baseUrl, model);
+    await waitModelLive(app.proxyUrl, model);
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+    await relay?.close();
+    if (infraReady) await new EtcdClient().deletePrefix(prefix);
+  });
+
+  test("the failure counter rises while the gateway keeps serving", async (ctx) => {
+    if (!infraReady || !app || !relay) {
+      ctx.skip();
+      return;
+    }
+
+    // Healthy: the request is served and nothing is counted.
+    await awaitWindowHeadroom();
+    const healthy = await chatRequest(app.proxyUrl, model);
+    expect(healthy.status).toBe(200);
+    await healthy.body?.cancel();
+    const before = await scrapeMetrics(app.metricsUrl);
+
+    relay.cut();
+
+    // Still served — that is the fail-open contract, and exactly why the
+    // outage is invisible without the counter. (The seeded key is RPM=1, so
+    // this second call would have been a 429 had the shared counter still
+    // been readable; per-replica fallback starts from an empty window.)
+    const degraded = await chatRequest(app.proxyUrl, model);
+    expect(degraded.status).toBe(200);
+    await degraded.body?.cancel();
+
+    const after = await scrapeMetrics(app.metricsUrl);
+    expect(
+      metricDelta(before, after, "aisix_redis_failures_total", (labels) =>
+        labels.operation.startsWith("ratelimit_"),
+      ),
+    ).toBeGreaterThan(0);
   });
 });
