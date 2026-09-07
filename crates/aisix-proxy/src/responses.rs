@@ -359,7 +359,8 @@ pub async fn responses(
                         &request_id,
                         &success.model_id,
                         &model_name,
-                        &api_key_id,
+                        &model_name,
+                        crate::request_metrics::Caller::new(&auth),
                         &success.provider,
                         &success.upstream_model,
                         status,
@@ -1730,7 +1731,6 @@ async fn responses_to_target(
         let request_id_c = request_id.to_string();
         let model_id_c = model_id.to_string();
         let requested_model_c = requested_model.to_string();
-        let api_key_id_c = api_key_id.to_string();
         let provider_key_id_c = provider_key_id.clone();
         let provider_c = provider_label.clone();
         let upstream_model_c = upstream_model.clone();
@@ -1862,9 +1862,10 @@ async fn responses_to_target(
                     &request_id_c,
                     &model_id_c,
                     &requested_model_c,
-                    &api_key_id_c,
+                    &metric_model,
+                    metric_caller.as_caller(),
                     &provider_c,
-                    &upstream_model_c,
+                    &metric_upstream_model,
                     // A stream the consumer abandoned mid-flight is reported
                     // as 499, matching LiteLLM. The upstream work still
                     // happened, so the event is emitted either way — only
@@ -2260,7 +2261,6 @@ async fn responses_cross_provider_to_target(
         let request_id_c = request_id.to_string();
         let model_id_c = model_id.to_string();
         let requested_model_c = requested_model.to_string();
-        let api_key_id_c = api_key_id.to_string();
         let provider_key_id_c = provider_key_id.clone();
         let provider_c = provider_label.clone();
         let upstream_model_c = model.upstream_model().unwrap_or("unknown").to_string();
@@ -2385,9 +2385,10 @@ async fn responses_cross_provider_to_target(
                     &request_id_c,
                     &model_id_c,
                     &requested_model_c,
-                    &api_key_id_c,
+                    &metric_model,
+                    metric_caller.as_caller(),
                     &provider_c,
-                    &upstream_model_c,
+                    &metric_upstream_model,
                     status,
                     // Attempt-scoped — see the sibling verbatim path.
                     attempt_started.elapsed(),
@@ -3349,7 +3350,8 @@ fn emit_usage_event(
     request_id: &str,
     model_id: &str,
     requested_model: &str,
-    api_key_id: &str,
+    metric_model: &str,
+    caller: crate::request_metrics::Caller<'_>,
     // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
     // follow-up): the wire struct is the CP contract, so they ride
     // alongside rather than in it.
@@ -3383,7 +3385,7 @@ fn emit_usage_event(
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         model_id: model_id.to_string(),
-        api_key_id: api_key_id.to_string(),
+        api_key_id: caller.api_key_id.to_string(),
         requested_model: requested_model.to_string(),
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
@@ -3456,15 +3458,13 @@ fn emit_usage_event(
         usage.cache_creation_tokens,
         usage.cache_read_tokens,
     );
-    let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
-    let caller = owned_caller.as_caller();
     crate::request_metrics::record_usage(
         state,
         "/v1/responses",
         caller,
         crate::request_metrics::Upstream {
             provider,
-            model: requested_model,
+            model: metric_model,
             upstream_model,
             pk: pk.labels(),
             ..Default::default()
@@ -3482,7 +3482,7 @@ fn emit_usage_event(
     );
     if usage.upstream_ttft_ms > 0 {
         let (bounded_model, bounded_upstream) =
-            crate::usage_attr::metric_model_label_pair(snap, requested_model, upstream_model);
+            crate::usage_attr::metric_model_label_pair(snap, metric_model, upstream_model);
         let ttft = Duration::from_millis(u64::from(usage.upstream_ttft_ms));
         state.metrics.record_request_ttft(
             LatencyLabels {

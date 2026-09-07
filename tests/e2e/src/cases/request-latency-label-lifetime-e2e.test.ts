@@ -9,12 +9,14 @@ import { scrapeMetrics, sumMetric } from "../harness/metrics.js";
 
 const KEY = "sk-latency-lifetime";
 const E2E = "aisix_request_e2e_latency_seconds";
+const TTFT = "aisix_request_ttft_seconds";
 const contexts = [
   { endpoint: "chat/completions", provider: "openai", adapter: "openai" },
   { endpoint: "messages", provider: "anthropic", adapter: "anthropic" },
   { endpoint: "messages", provider: "deepseek", adapter: "openai" },
   { endpoint: "responses", provider: "openai", adapter: "openai" },
   { endpoint: "responses", provider: "deepseek", adapter: "openai" },
+  { endpoint: "chat/completions", provider: "ensemble", adapter: "openai" },
 ];
 
 describe("request latency labels survive buffering and configuration reloads", () => {
@@ -35,7 +37,9 @@ describe("request latency labels survive buffering and configuration reloads", (
   async function setup() {
     const app = await spawnApp({ extraEnv: {
       AISIX_OBSERVABILITY__METRICS__LABELS: JSON.stringify({
-        [E2E]: ["endpoint", "model", "upstream_model", "status_class", "streaming", "api_key_id", "team_id", "user_id", "user_name"],
+        ...Object.fromEntries([E2E, TTFT].map((metric) => [metric,
+          ["endpoint", "model", "upstream_model", "status_class", "streaming", "api_key_id", "team_id", "user_id", "user_name"],
+        ])),
       }),
     } });
     apps.push(app);
@@ -99,7 +103,19 @@ describe("request latency labels survive buffering and configuration reloads", (
     const { app, seed } = await setup();
     const pending: Array<{ res: ServerResponse; terminal: unknown[] }> = [];
     const server = createServer(async (req, res) => {
-      for await (const _ of req) { /* consume the request before streaming */ }
+      let raw = "";
+      for await (const chunk of req) raw += chunk.toString();
+      const input = JSON.parse(raw);
+      if (!input.stream) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id: "panel", model: "upstream",
+          choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+        }));
+        return;
+      }
+      // Ensure the gateway measures a non-zero upstream TTFT.
+      await new Promise((resolve) => setTimeout(resolve, 20));
       res.writeHead(200, { "content-type": "text/event-stream" });
       if (req.url === "/v1/messages") {
         res.write(`data: ${JSON.stringify({ type: "message_start", message: { id: "msg-lifetime", model: "upstream", type: "message", role: "assistant", content: [], usage: { input_tokens: 10, output_tokens: 0 } } })}\n\n`);
@@ -123,18 +139,30 @@ describe("request latency labels survive buffering and configuration reloads", (
       server.listen(port, "127.0.0.1", resolve);
     });
     const models = [];
+    const allowed: string[] = [];
+    const requested: string[] = [];
     for (const [index, context] of contexts.entries()) {
+      const ensemble = context.provider === "ensemble";
+      const provider = ensemble ? "openai" : context.provider;
       const pk = await seed.createProviderKey({ display_name: `lifetime-${index}`,
-        provider: context.provider, adapter: context.adapter,
+        provider, adapter: context.adapter,
         secret: "test", api_base: `http://127.0.0.1:${port}/v1`,
       });
-      const model = await seed.createModel({ display_name: `lifetime-${index}/*`, model_name: "*",
-        provider: context.provider, provider_key_id: pk.id,
+      const displayName = ensemble ? "lifetime-member" : `lifetime-${index}/*`;
+      const model = await seed.createModel({ display_name: displayName, model_name: "*",
+        provider, provider_key_id: pk.id,
       });
       models.push(model);
+      if (ensemble) {
+        models.push(await seed.createModel({ display_name: "lifetime-ensemble", ensemble: {
+          panel: [{ model: displayName }], judge: { model: displayName }, min_responses: 1,
+        } }));
+      }
+      allowed.push(ensemble ? "lifetime-ensemble" : displayName);
+      requested.push(ensemble ? "lifetime-ensemble" : `lifetime-${index}/caller-name-${index}`);
     }
-    const { client, apiKey } = await authorize(app, seed, contexts.map((_, index) => `lifetime-${index}/*`));
-    const requests = contexts.map((context, index) => request(app, context.endpoint, `lifetime-${index}/caller-name-${index}`));
+    const { client, apiKey } = await authorize(app, seed, allowed);
+    const requests = contexts.map((context, index) => request(app, context.endpoint, requested[index]));
     await expect.poll(() => pending.length).toBe(contexts.length);
     // Wait for client headers too: each request has entered its relay before the reload.
     const responses = await Promise.all(requests);
@@ -155,10 +183,13 @@ describe("request latency labels survive buffering and configuration reloads", (
     await expect.poll(async () => sumMetric(await scrapeMetrics(app.metricsUrl), `${E2E}_count`)).toBe(contexts.length);
     const samples = await scrapeMetrics(app.metricsUrl);
     for (const [index, context] of contexts.entries()) {
-      expect(sumMetric(samples, `${E2E}_count`, {
-        endpoint: `/v1/${context.endpoint}`, model: `lifetime-${index}/*`, upstream_model: "*", streaming: "true",
-        api_key_id: apiKey.id, team_id: "original-team", user_id: "original-user", user_name: "Original User",
-      })).toBe(1);
+      for (const metric of [E2E, TTFT]) {
+        expect(sumMetric(samples, `${metric}_count`, {
+          endpoint: `/v1/${context.endpoint}`, model: allowed[index],
+          upstream_model: context.provider === "ensemble" ? "unknown" : "*", streaming: "true",
+          api_key_id: apiKey.id, team_id: "original-team", user_id: "original-user", user_name: "Original User",
+        }), `${metric} ${context.endpoint} ${context.provider}`).toBe(1);
+      }
     }
     expect(samples.filter((s) => s.name.startsWith(`${E2E}_`)).every((s) =>
       !s.labels.model.includes("caller-name") && !s.labels.upstream_model.includes("caller-name"),

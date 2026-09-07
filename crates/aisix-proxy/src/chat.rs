@@ -3802,6 +3802,7 @@ async fn dispatch_ensemble(
         let client_model_for_telem = req.model.clone();
         let bounded_model_for_telem =
             crate::usage_attr::metric_model_label(snapshot, &req.model).into_owned();
+        let metric_caller = crate::request_metrics::Caller::from_api_key_id(snapshot, api_key_id);
         let api_key_id_for_telem = api_key_id.to_string();
         let applied_guardrails_for_telem = applied_guardrails.to_vec();
         // See the single-upstream streaming path.
@@ -3997,9 +3998,7 @@ async fn dispatch_ensemble(
                 // so record the client-visible panel+judge aggregate against
                 // the ensemble alias rather than dropping the request from
                 // those series entirely.
-                let owned_caller =
-                    crate::request_metrics::Caller::from_api_key_id(&snap, &api_key_id_for_telem);
-                let caller = owned_caller.as_caller();
+                let caller = metric_caller.as_caller();
                 let ensemble_pk =
                     crate::usage_attr::ResolvedPk::resolve(&snap, crate::request_metrics::UNKNOWN);
                 crate::request_metrics::record_usage(

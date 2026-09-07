@@ -295,6 +295,7 @@ pub async fn messages(
                     &api_key_id,
                     &provider_label,
                     &model_name,
+                    &model_name,
                     &upstream_model,
                     auth.key().team_id.as_deref(),
                     auth.key().user_id.as_deref(),
@@ -441,6 +442,7 @@ pub async fn messages(
                     &api_key_id,
                     "unknown",
                     &model_name,
+                    &model_name,
                     "unknown",
                     auth.key().team_id.as_deref(),
                     auth.key().user_id.as_deref(),
@@ -537,6 +539,7 @@ fn emit_failed_attempts_anthropic(
             &rec.target_model_id,
             api_key_id,
             provider,
+            model,
             model,
             upstream_model,
             team_id,
@@ -1581,7 +1584,8 @@ async fn anthropic_passthrough_dispatch(
                     &api_key_id_c,
                     &provider_c,
                     &model_name_c,
-                    &upstream_model_c,
+                    &metric_model,
+                    &metric_upstream_model,
                     team_id_c.as_deref(),
                     user_id_c.as_deref(),
                     user_name_c.as_deref(),
@@ -2282,7 +2286,8 @@ async fn cross_provider_dispatch(
                     &api_key_id_for_telem,
                     &provider_for_telem,
                     &model_for_telem,
-                    &upstream_model_for_telem,
+                    &metric_model,
+                    &metric_upstream_model,
                     team_id_for_telem.as_deref(),
                     user_id_for_telem.as_deref(),
                     user_name_for_telem.as_deref(),
@@ -3056,6 +3061,7 @@ fn emit_anthropic_usage_event(
     api_key_id: &str,
     provider: &str,
     model: &str,
+    metric_model: &str,
     upstream_model: &str,
     team_id: Option<&str>,
     user_id: Option<&str>,
@@ -3192,7 +3198,7 @@ fn emit_anthropic_usage_event(
         },
         crate::request_metrics::Upstream {
             provider,
-            model,
+            model: metric_model,
             upstream_model,
             pk: pk.labels(),
             ..Default::default()
@@ -3210,8 +3216,11 @@ fn emit_anthropic_usage_event(
     );
     if metrics.upstream_ttft_ms > 0 {
         let snap_for_labels = state.snapshot.load();
-        let (bounded_model, bounded_upstream) =
-            crate::usage_attr::metric_model_label_pair(&snap_for_labels, model, upstream_model);
+        let (bounded_model, bounded_upstream) = crate::usage_attr::metric_model_label_pair(
+            &snap_for_labels,
+            metric_model,
+            upstream_model,
+        );
         state.metrics.record_request_ttft(
             LatencyLabels {
                 endpoint: "/v1/messages",
