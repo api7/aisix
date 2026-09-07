@@ -130,6 +130,9 @@ pub struct PassthroughRoute {
     /// (`"authorization"`, `"x-trace-*"`). Empty — the default — overrides
     /// no stripping.
     ///
+    /// A header the caller sends more than once is forwarded with every
+    /// value preserved.
+    ///
     /// A route forwards the caller's headers by default, so this field
     /// only matters for the ones it removes: the ProviderKey's
     /// `strip_headers` under `credential_mode: inject`, and the slot the

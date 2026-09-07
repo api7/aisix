@@ -776,7 +776,11 @@ async fn dispatch(
     }
 
     // Inject the gateway-held upstream credential (inject mode only).
-    // Strip ran first, so the wire stays single-valued (#411 ordering).
+    // Strip ran first, so this never adds a second value to a slot the
+    // caller's own header already took (#411 ordering). That is a
+    // statement about the INJECTION, not about the wire: a caller who
+    // repeated the slot still has every value relayed below, which is
+    // what `forward_client_headers` promises on this surface.
     if let Some(pk) = pk_entry.as_ref() {
         let api_key = pk.value.api_key.as_str();
         let provider_lower = pk.value.provider.to_ascii_lowercase();
@@ -3634,6 +3638,42 @@ mod tests {
         let auths: Vec<_> = received.headers.get_all("authorization").iter().collect();
         assert_eq!(auths.len(), 1);
         assert_eq!(auths[0], "Bearer sk-upstream");
+    }
+
+    /// `passthrough_route` is the one surface that relays EVERY value of
+    /// a repeated header — the other three collapse to the first — and
+    /// its field description now promises that to users. The only thing
+    /// keeping the promise is that this path walks the inbound map per
+    /// value instead of per name, so collapsing it must go red here.
+    #[tokio::test]
+    async fn a_repeated_header_forwards_every_value() {
+        let (upstream, snap) = slot_route_fixture(serde_json::json!({
+            "forward_client_headers": ["x-*"]
+        }))
+        .await;
+
+        // `x-stripped-control` is in the ProviderKey's strip set and
+        // [`slot_request`] always sends one, so the second copy makes
+        // this the STRIP-OVERRIDE path rather than the default-forward
+        // one — the branch where a per-name decision would be easiest to
+        // write and would silently drop a value.
+        let resp = build_app(snap)
+            .oneshot(slot_request(&[
+                ("authorization", "Bearer sk-caller"),
+                ("x-stripped-control", "second"),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = &upstream.received_requests().await.unwrap()[0];
+        let got: Vec<_> = received
+            .headers
+            .get_all("x-stripped-control")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(got, vec!["recovered", "second"]);
     }
 
     /// An `inject` route with the given overrides merged onto it. The

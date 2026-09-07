@@ -124,6 +124,12 @@ pub struct McpServer {
     /// nothing. Applies to both `type: mcp` and `type: openapi`, so a REST
     /// API exposed here as tools receives them on every tool call.
     ///
+    /// A header the caller sends more than once is forwarded with its
+    /// first value only; the upstream receives one well-formed header
+    /// rather than a list this gateway never interpreted. An HTTP/2
+    /// caller may split `cookie` across several header fields, and only
+    /// the first of them is forwarded.
+    ///
     /// A header named here reaches the server whatever the gateway would
     /// otherwise do with it. Naming the credential slot `auth_type` would
     /// fill — `authorization` for `bearer` and `oauth2`, `api_key_header`

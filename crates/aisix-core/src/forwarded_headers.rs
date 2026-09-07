@@ -507,6 +507,26 @@ mod tests {
         assert_eq!(got, vec!["authorization", "x-trace-id"]);
     }
 
+    /// The `provider_key`, `mcp_server` and `a2a_agent` field
+    /// descriptions promise this to users, so it is pinned here rather
+    /// than left to the `keys()` + `get()` pair that happens to produce
+    /// it. `append` is the whole point: `map()` above builds with
+    /// `insert`, which cannot express a header the caller sent twice, so
+    /// no other test in this module can go red if the rule changes.
+    #[test]
+    fn a_repeated_header_forwards_its_first_value_only() {
+        let mut client = HeaderMap::new();
+        for v in ["a=1", "b=2"] {
+            client.append(
+                HeaderName::from_static("cookie"),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        let got = resolve_forwarded_client_headers(&["cookie".into()], &client, &[]);
+        assert_eq!(names(&got), vec!["cookie"]);
+        assert_eq!(got[0].1.to_str().unwrap(), "a=1");
+    }
+
     #[test]
     fn forwarded_values_are_marked_sensitive() {
         let client = map(&[("authorization", "Bearer caller")]);
