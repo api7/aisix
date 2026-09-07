@@ -117,8 +117,13 @@ pub(crate) fn restamp_sse_frame(
         return None;
     }
     let mut payload: Vec<u8> = Vec::new();
-    for r in &ranges {
-        if !payload.is_empty() {
+    for (i, r) in ranges.iter().enumerate() {
+        // Separated by POSITION, not by whether anything has been written
+        // yet: a frame whose first `data:` line is empty contributes a
+        // leading newline, and skipping it would join one line fewer than
+        // there are ranges — which the line-count guard below then turns
+        // back into the un-restamped frame this fix exists to remove.
+        if i > 0 {
             payload.push(b'\n');
         }
         payload.extend_from_slice(&frame[r.clone()]);
@@ -285,6 +290,27 @@ mod tests {
         assert!(out.starts_with("event: message_start\ndata: {\"type\":\"message_start\""));
         assert!(out.contains("\"input_tokens\":1e2"));
         assert!(out.ends_with("}}}\n\n"));
+    }
+
+    /// A frame that opens with an EMPTY `data:` line still joins to the
+    /// payload every other reader sees, so it restamps like any other.
+    #[test]
+    fn restamp_sse_frame_rewrites_a_payload_whose_first_data_line_is_empty() {
+        let frame = b"event: message_start\ndata:\n\
+                      data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-x\"}}\n\n";
+        let out = restamp_sse_frame(frame, "my-claude", anthropic_message_model)
+            .expect("the empty first line is part of the payload, not a reason to skip it");
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("\"model\":\"my-claude\""), "{out}");
+        assert!(
+            out.starts_with("event: message_start\ndata:\ndata: "),
+            "{out}"
+        );
+        // And the joined payload is exactly what every other consumer reads.
+        assert_eq!(
+            crate::redact::frame_payload(frame).as_deref(),
+            Some("\n{\"type\":\"message_start\",\"message\":{\"model\":\"claude-x\"}}"),
+        );
     }
 
     /// The same frame, restamped from the buffered pass rather than the

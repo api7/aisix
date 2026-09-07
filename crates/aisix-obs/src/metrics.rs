@@ -2475,9 +2475,6 @@ impl Metrics {
     /// what the exporter did deliver: one failed batch loses as many
     /// records as it carried.
     pub fn record_otlp_fanout_drop(&self, exporter: &str, reason: &str, records: u64) {
-        if records == 0 {
-            return;
-        }
         self.cached_counter(
             M_OTLP_FANOUT_DROPS_TOTAL,
             records,
