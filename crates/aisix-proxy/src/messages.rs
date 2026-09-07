@@ -3514,35 +3514,6 @@ pub(crate) fn find_frame_end(buf: &[u8]) -> Option<usize> {
     None
 }
 
-/// The FIRST `data:` line of one SSE frame, as a range into `frame`
-/// (after `data:` and an optional leading space), or `None` if the frame
-/// has no data line.
-///
-/// First line only, and deliberately so: the restamp path is the one
-/// consumer, and it needs byte offsets so it can splice a value back into
-/// the frame without rebuilding the bytes around it
-/// (`model_echo::restamp_sse_frame`) — offsets a payload joined across
-/// several lines cannot supply. Every consumer that only READS a frame
-/// takes `redact::frame_payload` instead, which is the whole payload
-/// (#1100). A multi-`data:`-line frame therefore goes un-restamped rather
-/// than half-restamped; that gap is tracked in #1105.
-pub(crate) fn extract_sse_data_range(frame: &[u8]) -> Option<std::ops::Range<usize>> {
-    let mut offset = 0usize;
-    for line in frame.split(|&b| b == b'\n') {
-        let start = offset;
-        offset += line.len() + 1; // the split consumed one `\n`
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.starts_with(b"data:") {
-            let mut from = start + b"data:".len();
-            if frame.get(from) == Some(&b' ') {
-                from += 1;
-            }
-            return Some(from..start + line.len());
-        }
-    }
-    None
-}
-
 /// Drop guard that fires `on_complete` exactly once with the
 /// accumulated usage — on normal end-of-stream AND on client
 /// disconnect (the async-stream generator drops at its suspension
@@ -5638,51 +5609,6 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(event.cache_read_tokens, 9);
         assert_eq!(event.provider_request_id, "gen_01REPRO952");
         assert_eq!(event.provider_model_version, "mco-5");
-    }
-
-    /// `extract_sse_data_range` is what the model restamp splices into, so
-    /// an off-by-one in its arithmetic would rewrite the wrong bytes. The
-    /// range is checked against the payload it must select on every framing
-    /// variant a provider is allowed to emit.
-    #[test]
-    fn extract_sse_data_range_selects_exactly_the_payload() {
-        use super::extract_sse_data_range;
-
-        for (frame, want) in [
-            // Canonical: labelled event, LF terminators, one space after the colon.
-            (
-                &b"event: message_start\ndata: {\"a\":1}\n\n"[..],
-                Some(&b"{\"a\":1}"[..]),
-            ),
-            // CRLF: the `\r` belongs to the framing, not the payload.
-            (
-                &b"event: x\r\ndata: {\"a\":1}\r\n\r\n"[..],
-                Some(&b"{\"a\":1}"[..]),
-            ),
-            // No space after the colon — the spec makes it optional.
-            (&b"data:{\"a\":1}\n\n"[..], Some(&b"{\"a\":1}"[..])),
-            // A comment/keepalive line ahead of the data line.
-            (&b": ping\ndata: {\"a\":1}\n\n"[..], Some(&b"{\"a\":1}"[..])),
-            // Terminal sentinel.
-            (&b"data: [DONE]\n\n"[..], Some(&b"[DONE]"[..])),
-            // Empty payload: a zero-width range, not a panic and not the tail.
-            (&b"data:\n\n"[..], Some(&b""[..])),
-            // No data line at all.
-            (&b"event: ping\n\n"[..], None),
-            // A value containing the delimiter bytes must not confuse the scan.
-            (
-                &b"event: e\ndata: {\"t\":\"a: b\"}\n\n"[..],
-                Some(&b"{\"t\":\"a: b\"}"[..]),
-            ),
-        ] {
-            let range = extract_sse_data_range(frame);
-            assert_eq!(
-                range.clone().map(|r| &frame[r]),
-                want,
-                "range selects the payload for {:?}",
-                String::from_utf8_lossy(frame),
-            );
-        }
     }
 
     /// A frame whose data line is not splice-able JSON forwards verbatim

@@ -147,6 +147,52 @@ describe("client-facing model echo e2e: the response names what the caller asked
     expectAliasNotUpstreamId(await res.text(), "echo-messages");
   });
 
+  test("/v1/messages native passthrough: a message_start split over two data: lines still echoes the alias", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return void ctx.skip();
+
+    // #1105: the event-stream spec lets one frame spell its payload over
+    // several `data:` lines, joined with a newline. A reader that takes
+    // only the first line sees invalid JSON, forwards the frame
+    // untouched, and the caller is answered with the upstream's own model
+    // id instead of the alias they addressed.
+    const upstream = await startOpenAiUpstream({
+      rawStreamFrames: [
+        `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_echo_ml","type":"message","role":"assistant",\ndata: "model":"${UPSTREAM_REPORTED_MODEL}","content":[],"usage":{"input_tokens":4,"output_tokens":0}}}\n\n`,
+        `event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n`,
+        `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\n`,
+        `event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n`,
+        `event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}\n\n`,
+        `event: message_stop\ndata: {"type":"message_stop"}\n\n`,
+      ],
+      eventDelayMs: 5,
+    });
+    upstreams.push(upstream);
+    await seedAlias("echo-messages-multiline", upstream, {
+      provider: "anthropic",
+      adapter: "anthropic",
+    });
+
+    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify({
+        model: "echo-messages-multiline",
+        max_tokens: 16,
+        stream: true,
+        messages: [{ role: "user", content: "say ok" }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expectAliasNotUpstreamId(text, "echo-messages-multiline");
+    // The continuation line is still a continuation line: the restamp
+    // writes back into the line the value came from rather than
+    // re-flowing the frame, so the client parses what the provider framed.
+    expect(text).toContain('\ndata: "model":"echo-messages-multiline"');
+    expect(text).toContain('"text":"ok"');
+    expect(text).toContain('"output_tokens":2');
+  });
+
   test("/v1/messages native passthrough: streamed message_start echoes the alias", async (ctx) => {
     if (!etcdReachable || !app || !seed) return void ctx.skip();
 
