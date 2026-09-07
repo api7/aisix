@@ -85,24 +85,14 @@ impl<'a> Caller<'a> {
         }
     }
 
-    /// Recover the caller from an api-key id alone.
-    ///
-    /// The streaming emits run from a detached task or a Drop guard that was
-    /// handed an `api_key_id: &str` rather than the key itself, and threading
-    /// the team / user / name triple down every dispatch signature to reach
-    /// them would be a lot of plumbing for three labels. The id resolves back
-    /// to the same row the auth extractor matched, so the labels come out
-    /// identical to [`Caller::new`]; an id that no longer resolves (the key
-    /// was deleted mid-stream) degrades to `unknown` rather than dropping the
-    /// sample.
-    pub(crate) fn from_api_key_id(
-        snap: &aisix_core::AisixSnapshot,
-        api_key_id: &'a str,
-    ) -> Owned<'a> {
+    /// Recover an owned caller from the request's dispatch snapshot.
+    /// Capture this before starting a stream so key deletion or reassignment
+    /// cannot change the caller attributed to the completed request.
+    pub(crate) fn from_api_key_id(snap: &aisix_core::AisixSnapshot, api_key_id: &str) -> Owned {
         let entry = snap.apikeys.get_by_id(api_key_id);
         let key = entry.as_ref().map(|e| &e.value);
         Owned {
-            api_key_id,
+            api_key_id: api_key_id.to_owned(),
             team_id: key.and_then(|k| k.team_id.clone()),
             user_id: key.and_then(|k| k.user_id.clone()),
             user_name: key.and_then(|k| k.user_name.clone()),
@@ -125,17 +115,17 @@ impl<'a> Caller<'a> {
 
 /// Owning form of [`Caller`], for the snapshot lookup whose strings cannot
 /// outlive the guard. Call [`Owned::as_caller`] at the emit.
-pub(crate) struct Owned<'a> {
-    api_key_id: &'a str,
+pub(crate) struct Owned {
+    api_key_id: String,
     team_id: Option<String>,
     user_id: Option<String>,
     user_name: Option<String>,
 }
 
-impl<'a> Owned<'a> {
-    pub(crate) fn as_caller(&'a self) -> Caller<'a> {
+impl Owned {
+    pub(crate) fn as_caller(&self) -> Caller<'_> {
         Caller {
-            api_key_id: self.api_key_id,
+            api_key_id: &self.api_key_id,
             team_id: self.team_id.as_deref().unwrap_or(UNKNOWN),
             user_id: self.user_id.as_deref().unwrap_or(UNKNOWN),
             user_name: self.user_name.as_deref().unwrap_or(UNKNOWN),

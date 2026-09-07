@@ -2551,20 +2551,27 @@ impl Metrics {
             metric,
             elapsed.as_secs_f64(),
             |k| {
-                k.label(labels.endpoint);
-                k.label(model);
-                k.label(provider);
-                k.label(status_bucket(labels.status));
-                k.label_bool(labels.streaming);
-                k.label(labels.details.inbound_protocol);
-                k.label(labels.details.upstream_protocol);
-                k.label(labels.details.upstream_model);
-                k.label(labels.details.provider_key_id);
-                k.label(labels.details.provider_key_name);
-                k.label(labels.details.api_key_id);
-                k.label(labels.details.team_id);
-                k.label(labels.details.user_id);
-                k.label(labels.details.user_name);
+                for name in self.inner.recorder.selected_labels(metric) {
+                    let value = match name.as_str() {
+                        "env_id" => continue,
+                        "endpoint" => labels.endpoint,
+                        "model" => model,
+                        "provider" => provider,
+                        "status_class" => status_bucket(labels.status),
+                        "streaming" => bool_str(labels.streaming),
+                        "inbound_protocol" => labels.details.inbound_protocol,
+                        "upstream_protocol" => labels.details.upstream_protocol,
+                        "upstream_model" => labels.details.upstream_model,
+                        "provider_key_id" => labels.details.provider_key_id,
+                        "provider_key_name" => labels.details.provider_key_name,
+                        "api_key_id" => labels.details.api_key_id,
+                        "team_id" => labels.details.team_id,
+                        "user_id" => labels.details.user_id,
+                        "user_name" => labels.details.user_name,
+                        _ => "unknown",
+                    };
+                    k.label(value);
+                }
             },
             || {
                 metrics::histogram!(
@@ -3947,6 +3954,66 @@ mod tests {
         // scrape does not gain a zero-valued series per request.
         assert!(!rendered.contains(M_LLM_CACHED_INPUT_TOKENS_TOTAL));
         assert!(!rendered.contains(M_LLM_INPUT_TOKENS_TOTAL));
+    }
+
+    #[test]
+    fn latency_cache_uses_only_selected_labels() {
+        let before = WORKER_CACHE.with(|cell| cell.borrow().histograms.len());
+        let defaults = Metrics::new(false);
+        for index in 0..100 {
+            let caller = format!("caller-{index}");
+            let labels = LatencyLabels {
+                details: UsageLabels {
+                    user_name: &caller,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            defaults.record_request_e2e_latency(labels, Duration::from_millis(1));
+            defaults.record_request_ttft(labels, Duration::from_millis(1));
+        }
+        assert_eq!(
+            WORKER_CACHE.with(|cell| cell.borrow().histograms.len()),
+            before + 2
+        );
+
+        let selected = Metrics::new_with_labels(
+            "test",
+            &HistogramBuckets::default(),
+            &[(
+                M_REQUEST_TTFT_SECONDS.to_string(),
+                vec!["user_name".to_string()],
+            )]
+            .into(),
+        )
+        .unwrap();
+        for user_name in ["alice", "bob"] {
+            for model in ["one", "two"] {
+                selected.record_request_ttft(
+                    LatencyLabels {
+                        model,
+                        details: UsageLabels {
+                            user_name,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    Duration::from_millis(1),
+                );
+            }
+        }
+        assert_eq!(
+            WORKER_CACHE.with(|cell| cell.borrow().histograms.len()),
+            before + 4
+        );
+        let rendered = selected.render();
+        for user_name in ["alice", "bob"] {
+            assert!(rendered
+                .lines()
+                .any(|line| line.starts_with("aisix_request_ttft_seconds_count{")
+                    && line.contains(&format!("user_name=\"{user_name}\""))
+                    && line.ends_with(" 2")));
+        }
     }
 
     #[test]

@@ -1441,6 +1441,7 @@ async fn anthropic_passthrough_dispatch(
         let upstream_model_c = upstream_model.clone();
         let (metric_model, metric_upstream_model) =
             crate::usage_attr::metric_model_label_pair(snapshot, model_name, &upstream_model_c);
+        let metric_caller = crate::request_metrics::Caller::from_api_key_id(snapshot, api_key_id);
         let metric_model = metric_model.into_owned();
         let metric_upstream_model = metric_upstream_model.into_owned();
         let team_id_c = team_id.clone();
@@ -1555,8 +1556,7 @@ async fn anthropic_passthrough_dispatch(
                 crate::request_metrics::record_e2e_latency(
                     &state_c,
                     "/v1/messages",
-                    crate::request_metrics::Caller::from_api_key_id(&snap_c, &api_key_id_c)
-                        .as_caller(),
+                    metric_caller.as_caller(),
                     crate::request_metrics::Upstream {
                         provider: &provider_c,
                         model: &metric_model,
@@ -2153,6 +2153,7 @@ async fn cross_provider_dispatch(
             model_name,
             &upstream_model_for_telem,
         );
+        let metric_caller = crate::request_metrics::Caller::from_api_key_id(snapshot, api_key_id);
         let metric_model = metric_model.into_owned();
         let metric_upstream_model = metric_upstream_model.into_owned();
         let team_id_for_telem = team_id;
@@ -2257,11 +2258,7 @@ async fn cross_provider_dispatch(
                 crate::request_metrics::record_e2e_latency(
                     &state_for_telem,
                     "/v1/messages",
-                    crate::request_metrics::Caller::from_api_key_id(
-                        &snap_telem,
-                        &api_key_id_for_telem,
-                    )
-                    .as_caller(),
+                    metric_caller.as_caller(),
                     crate::request_metrics::Upstream {
                         provider: &provider_for_telem,
                         model: &metric_model,

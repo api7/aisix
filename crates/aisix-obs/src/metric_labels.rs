@@ -415,6 +415,10 @@ pub(crate) struct LabelRecorder {
 }
 
 impl LabelRecorder {
+    pub(crate) fn selected_labels(&self, metric: &str) -> &[String] {
+        self.selection.labels.get(metric).map_or(&[], Vec::as_slice)
+    }
+
     pub fn new(inner: PrometheusRecorder, selection: LabelSelection, env_id: &str) -> Self {
         Self {
             inner,

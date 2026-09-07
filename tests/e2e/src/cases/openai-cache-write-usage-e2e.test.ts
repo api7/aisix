@@ -70,7 +70,10 @@ describe("OpenAI cache-write usage survives every supported entry point", () => 
       res.end();
     });
     const port = await pickFreePort();
-    await new Promise<void>((resolve) => server!.listen(port, "127.0.0.1", resolve));
+    await new Promise<void>((resolve, reject) => {
+      server!.once("error", reject);
+      server!.listen(port, "127.0.0.1", resolve);
+    });
     app = await spawnApp({ extraEnv: { DD_CRED_WRITE_API_KEY: "test" } });
     const seed = new SeedClient(etcd, app.etcdPrefix);
     await seed.createObservabilityExporter({

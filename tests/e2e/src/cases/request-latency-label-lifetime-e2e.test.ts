@@ -10,6 +10,7 @@ import { scrapeMetrics, sumMetric } from "../harness/metrics.js";
 const KEY = "sk-latency-lifetime";
 const E2E = "aisix_request_e2e_latency_seconds";
 const contexts = [
+  { endpoint: "chat/completions", provider: "openai", adapter: "openai" },
   { endpoint: "messages", provider: "anthropic", adapter: "anthropic" },
   { endpoint: "messages", provider: "deepseek", adapter: "openai" },
   { endpoint: "responses", provider: "openai", adapter: "openai" },
@@ -34,7 +35,7 @@ describe("request latency labels survive buffering and configuration reloads", (
   async function setup() {
     const app = await spawnApp({ extraEnv: {
       AISIX_OBSERVABILITY__METRICS__LABELS: JSON.stringify({
-        [E2E]: ["endpoint", "model", "upstream_model", "status_class", "streaming"],
+        [E2E]: ["endpoint", "model", "upstream_model", "status_class", "streaming", "api_key_id", "team_id", "user_id", "user_name"],
       }),
     } });
     apps.push(app);
@@ -42,12 +43,13 @@ describe("request latency labels survive buffering and configuration reloads", (
   }
 
   async function authorize(app: SpawnedApp, seed: SeedClient, models: string[]) {
-    await seed.createApiKey({
+    const apiKey = await seed.createApiKey({
+      team_id: "original-team", user_id: "original-user", user_name: "Original User",
       key_hash: createHash("sha256").update(KEY).digest("hex"), allowed_models: models,
     });
     const client = new ProxyClient(app.proxyUrl, KEY);
     await waitConfigPropagation(async () => (await client.listModels()).status === 200);
-    return client;
+    return { client, apiKey };
   }
 
   function request(app: SpawnedApp, endpoint: string, model: string) {
@@ -92,7 +94,7 @@ describe("request latency labels survive buffering and configuration reloads", (
     }
   });
 
-  test("deleting wildcard rows during native and bridged streams retains bounded labels", async (ctx) => {
+  test("deleting models and API keys during native and bridged streams retains request labels", async (ctx) => {
     if (!reachable) return ctx.skip();
     const { app, seed } = await setup();
     const pending: Array<{ res: ServerResponse; terminal: unknown[] }> = [];
@@ -116,7 +118,10 @@ describe("request latency labels survive buffering and configuration reloads", (
     });
     servers.push(server);
     const port = await pickFreePort();
-    await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(port, "127.0.0.1", resolve);
+    });
     const models = [];
     for (const [index, context] of contexts.entries()) {
       const pk = await seed.createProviderKey({ display_name: `lifetime-${index}`,
@@ -128,7 +133,7 @@ describe("request latency labels survive buffering and configuration reloads", (
       });
       models.push(model);
     }
-    const client = await authorize(app, seed, contexts.map((_, index) => `lifetime-${index}/*`));
+    const { client, apiKey } = await authorize(app, seed, contexts.map((_, index) => `lifetime-${index}/*`));
     const requests = contexts.map((context, index) => request(app, context.endpoint, `lifetime-${index}/caller-name-${index}`));
     await expect.poll(() => pending.length).toBe(contexts.length);
     // Wait for client headers too: each request has entered its relay before the reload.
@@ -138,6 +143,8 @@ describe("request latency labels survive buffering and configuration reloads", (
       const response = await client.listModels();
       return response.status === 200 && (response.body as { data: unknown[] }).data.length === 0;
     });
+    await seed.delete("api_keys", apiKey.id);
+    await waitConfigPropagation(async () => (await client.listModels()).status === 401);
     for (const { res, terminal } of pending) {
       for (const event of terminal) res.write(`data: ${JSON.stringify(event)}\n\n`);
       res.end("data: [DONE]\n\n");
@@ -150,6 +157,7 @@ describe("request latency labels survive buffering and configuration reloads", (
     for (const [index, context] of contexts.entries()) {
       expect(sumMetric(samples, `${E2E}_count`, {
         endpoint: `/v1/${context.endpoint}`, model: `lifetime-${index}/*`, upstream_model: "*", streaming: "true",
+        api_key_id: apiKey.id, team_id: "original-team", user_id: "original-user", user_name: "Original User",
       })).toBe(1);
     }
     expect(samples.filter((s) => s.name.startsWith(`${E2E}_`)).every((s) =>

@@ -1739,6 +1739,7 @@ async fn responses_to_target(
             requested_model,
             &upstream_model_c,
         );
+        let metric_caller = crate::request_metrics::Caller::from_api_key_id(snapshot, api_key_id);
         let metric_model = metric_model.into_owned();
         let metric_upstream_model = metric_upstream_model.into_owned();
         let client_c = client_ctx.clone();
@@ -1832,8 +1833,7 @@ async fn responses_to_target(
                 crate::request_metrics::record_e2e_latency(
                     &state_c,
                     "/v1/responses",
-                    crate::request_metrics::Caller::from_api_key_id(&snap_c, &api_key_id_c)
-                        .as_caller(),
+                    metric_caller.as_caller(),
                     crate::request_metrics::Upstream {
                         provider: &provider_c,
                         model: &metric_model,
@@ -2269,6 +2269,7 @@ async fn responses_cross_provider_to_target(
             requested_model,
             &upstream_model_c,
         );
+        let metric_caller = crate::request_metrics::Caller::from_api_key_id(snapshot, api_key_id);
         let metric_model = metric_model.into_owned();
         let metric_upstream_model = metric_upstream_model.into_owned();
         let client_c = client_ctx.clone();
@@ -2362,8 +2363,7 @@ async fn responses_cross_provider_to_target(
                 crate::request_metrics::record_e2e_latency(
                     &state_c,
                     "/v1/responses",
-                    crate::request_metrics::Caller::from_api_key_id(&snap_c, &api_key_id_c)
-                        .as_caller(),
+                    metric_caller.as_caller(),
                     crate::request_metrics::Upstream {
                         provider: &provider_c,
                         model: &metric_model,
