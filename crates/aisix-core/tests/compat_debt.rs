@@ -1,11 +1,13 @@
 //! Release-debt gate: time-boxed compatibility code comes due mechanically.
 //!
 //! This repository deliberately ships compatibility shims that are meant to
-//! live for exactly one release — a tombstone the next generation consumes
-//! and ignores, a `410` migration pointer, a lenient reader for a document
-//! shape the control plane no longer writes. Until this gate existed those
-//! deadlines lived only as prose in code comments, so nothing ever made them
-//! come due and they were found by grep, one release too late.
+//! live for exactly one release — a `410` migration pointer on a retired
+//! client-facing path, a lenient reader for a document shape the control
+//! plane no longer writes. They are always this side's OWN debt: a
+//! cross-plane reshape has no data-plane half at all (see the projection
+//! rule in CLAUDE.md), so it never carries a marker. Until this gate existed
+//! those deadlines lived only as prose in code comments, so nothing ever
+//! made them come due and they were found by grep, one release too late.
 //!
 //! # The marker
 //!
@@ -455,7 +457,7 @@ fn compat_since_markers_are_well_formed() {
         "malformed release-debt marker(s):\n{report}\n\
          The one accepted spelling is:\n\
          \x20 {MARKER} <MAJOR.MINOR.PATCH> <#issue> — <what this tolerates and why it can go>\n\
-         e.g. {MARKER} 0.10.0 #1009 — consumes the pre-0.10.0 `mode` tombstone the CP no longer emits\n\
+         e.g. {MARKER} 0.10.0 #1009 — reads the pre-0.10.0 `mode` shape the CP no longer writes\n\
          See the module docs in crates/aisix-core/tests/compat_debt.rs."
     );
 }
@@ -610,13 +612,13 @@ mod logic {
     #[test]
     fn the_canonical_marker_parses() {
         let parsed = parse_marker_line(
-            "/// COMPAT-SINCE: 0.10.0 #1009 — consumes the pre-0.10.0 `mode` tombstone",
+            "/// COMPAT-SINCE: 0.10.0 #1009 — reads the pre-0.10.0 `mode` shape",
         )
         .expect("recognised")
         .expect("well formed");
         assert_eq!(parsed.anchor, parse_version("0.10.0").unwrap());
         assert_eq!(parsed.issue, "#1009");
-        assert!(parsed.reason.starts_with("consumes the pre-0.10.0"));
+        assert!(parsed.reason.starts_with("reads the pre-0.10.0"));
     }
 
     #[test]
