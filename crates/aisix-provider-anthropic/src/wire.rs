@@ -21,6 +21,8 @@
 //!   …). We only emit a `ChatChunk` when a delta carries content or a
 //!   stop reason — other events just advance internal state.
 
+use std::borrow::Cow;
+
 use aisix_gateway::{
     BridgeError, ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, FinishReason, Role,
     UsageStats,
@@ -1504,6 +1506,139 @@ enum InboundUse {
     Scan,
 }
 
+/// Leading marker of the attribution line some Anthropic-native clients
+/// prepend to the system prompt.
+///
+/// The line is metadata for Anthropic's own billing and telemetry — no
+/// other provider reads it — and clients emit it as the first line of the
+/// system prompt. Matched case-insensitively: the name is header-shaped,
+/// and a client that capitalises it the way HTTP does would otherwise
+/// bypass the strip with no signal.
+const BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
+
+/// What is left of one system text once the attribution line is removed.
+enum SystemText<'a> {
+    /// No attribution line here — the text stands exactly as written.
+    Unchanged,
+    /// The line was removed; this is what followed it.
+    Remainder(&'a str),
+    /// The text was the attribution line and nothing else.
+    Empty,
+}
+
+/// Remove a leading attribution line from one system text.
+///
+/// Line-granular on purpose, for both wire shapes. The marker prefixes a
+/// line, not necessarily a whole block or a whole string: a client that
+/// puts the line and its real system prompt in the same block would
+/// otherwise lose the prompt entirely, which is a far worse failure than
+/// the cache miss this exists to prevent.
+fn without_billing_header_line(text: &str) -> SystemText<'_> {
+    // Leading whitespace belongs to the line being removed, so the cut is
+    // measured from `trimmed`. Cutting the raw text instead would split at
+    // a leading newline and leave the attribution line itself in place.
+    let trimmed = text.trim_start();
+    if !trimmed
+        .get(..BILLING_HEADER_PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(BILLING_HEADER_PREFIX))
+    {
+        return SystemText::Unchanged;
+    }
+    match trimmed.split_once('\n') {
+        // A remainder that is only whitespace is nothing surviving, not a
+        // prompt: keeping it would put a blank `system` on the wire, and
+        // Anthropic-protocol upstreams reject an empty text block.
+        Some((_, rest)) if !rest.trim().is_empty() => SystemText::Remainder(rest),
+        // No newline: the client emits the attribution as its own line, so
+        // a text that starts with the marker and never ends the line is
+        // the attribution and nothing else.
+        _ => SystemText::Empty,
+    }
+}
+
+/// Drop the client's billing-header attribution line from an Anthropic
+/// `/v1/messages` body's `system` field, returning the body unchanged
+/// (borrowed) when there is nothing to drop.
+///
+/// Callers apply this only when the resolved upstream is NOT Anthropic's
+/// own first-party API (`dispatch::is_first_party_anthropic`). The line
+/// carries a segment that varies per request in some deployments, and it
+/// sits at the very start of the system prompt, so forwarding it to any
+/// other provider changes the prefix of every prompt and defeats that
+/// provider's prompt cache for the whole conversation — while the line
+/// itself means nothing there.
+///
+/// Only `system` is rewritten; `messages` is never touched, because a
+/// caller may legitimately quote the line inside conversation content and
+/// removing it there would alter what the model is asked about.
+///
+/// Both wire shapes of `system` are handled, and both remove the LINE
+/// rather than its container: a string keeps whatever followed it, and an
+/// array block keeps its remaining text along with its `cache_control`.
+/// A block or a string left with nothing is dropped, and a `system` left
+/// with no blocks at all is removed outright rather than sent empty.
+///
+/// A block qualifies by carrying a `text` string, not by declaring
+/// `type: "text"` — that is what [`parse_inbound`] flattens into the
+/// prompt, and a block this gateway would forward has to be a block it
+/// would also consider.
+pub fn strip_billing_header_attribution(body: &serde_json::Value) -> Cow<'_, serde_json::Value> {
+    use serde_json::Value;
+
+    let Some(system) = body.get("system") else {
+        return Cow::Borrowed(body);
+    };
+
+    let replacement = match system {
+        Value::Array(blocks) => {
+            let mut changed = false;
+            let mut kept: Vec<Value> = Vec::with_capacity(blocks.len());
+            for block in blocks {
+                let verdict = block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(without_billing_header_line);
+                match verdict {
+                    None | Some(SystemText::Unchanged) => kept.push(block.clone()),
+                    Some(SystemText::Remainder(rest)) => {
+                        changed = true;
+                        let mut rewritten = block.clone();
+                        if let Some(obj) = rewritten.as_object_mut() {
+                            obj.insert("text".to_string(), Value::String(rest.to_string()));
+                        }
+                        kept.push(rewritten);
+                    }
+                    Some(SystemText::Empty) => changed = true,
+                }
+            }
+            if !changed {
+                return Cow::Borrowed(body);
+            }
+            (!kept.is_empty()).then_some(Value::Array(kept))
+        }
+        Value::String(s) => match without_billing_header_line(s) {
+            SystemText::Unchanged => return Cow::Borrowed(body),
+            SystemText::Remainder(rest) => Some(Value::String(rest.to_string())),
+            SystemText::Empty => None,
+        },
+        _ => return Cow::Borrowed(body),
+    };
+
+    let mut outbound = body.clone();
+    let obj = outbound
+        .as_object_mut()
+        .expect("`system` was read from an object");
+    match replacement {
+        Some(v) => {
+            obj.insert("system".to_string(), v);
+        }
+        None => {
+            obj.remove("system");
+        }
+    }
+    Cow::Owned(outbound)
+}
+
 /// Parse an Anthropic `POST /v1/messages` JSON body into the gateway's
 /// internal [`ChatFormat`], for **cross-provider dispatch**. The `system`
 /// field is folded into a leading system message. Message content blocks
@@ -2418,6 +2553,283 @@ fn content_block_stop_event(index: usize) -> AnthropicSseEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BILLING_LINE: &str =
+        "x-anthropic-billing-header: cc_version=2.1.0; cc_entrypoint=cli; cch=7f3a91;";
+
+    #[test]
+    fn strip_billing_header_drops_the_leading_block_and_keeps_the_rest() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "system": [
+                { "type": "text", "text": BILLING_LINE },
+                {
+                    "type": "text",
+                    "text": "You are a helpful assistant.",
+                    "cache_control": { "type": "ephemeral" }
+                }
+            ],
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+
+        let out = strip_billing_header_attribution(&body);
+        assert!(matches!(out, Cow::Owned(_)));
+        assert_eq!(
+            out["system"],
+            serde_json::json!([
+                {
+                    "type": "text",
+                    "text": "You are a helpful assistant.",
+                    "cache_control": { "type": "ephemeral" }
+                }
+            ]),
+            "the surviving block keeps its cache_control verbatim"
+        );
+        assert_eq!(
+            out["messages"], body["messages"],
+            "messages are never touched"
+        );
+    }
+
+    #[test]
+    fn strip_billing_header_drops_the_leading_line_of_a_string_system() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "system": format!("{BILLING_LINE}\nYou are a helpful assistant.\nBe brief."),
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+
+        let out = strip_billing_header_attribution(&body);
+        assert_eq!(
+            out["system"],
+            serde_json::json!("You are a helpful assistant.\nBe brief."),
+            "only the first line goes; the remainder survives byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn strip_billing_header_omits_system_when_nothing_survives() {
+        let array = serde_json::json!({
+            "model": "claude",
+            "system": [{ "type": "text", "text": BILLING_LINE }],
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let out = strip_billing_header_attribution(&array);
+        assert!(
+            out.get("system").is_none(),
+            "an empty `system` array is removed, not sent empty"
+        );
+
+        let string = serde_json::json!({
+            "model": "claude",
+            "system": BILLING_LINE,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let out = strip_billing_header_attribution(&string);
+        assert!(out.get("system").is_none());
+
+        // A trailing newline leaves an empty remainder, which is the same
+        // thing as nothing surviving.
+        let trailing = serde_json::json!({
+            "model": "claude",
+            "system": format!("{BILLING_LINE}\n"),
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let out = strip_billing_header_attribution(&trailing);
+        assert!(out.get("system").is_none());
+    }
+
+    /// A remainder made only of whitespace is nothing surviving. Keeping
+    /// it would put a blank `system` on the wire — and a blank text block
+    /// is what Anthropic-protocol upstreams reject outright.
+    #[test]
+    fn strip_billing_header_treats_a_blank_remainder_as_nothing_surviving() {
+        for tail in ["\n", "\n   \n", "\n\t"] {
+            let string = serde_json::json!({
+                "model": "claude",
+                "system": format!("{BILLING_LINE}{tail}"),
+                "messages": [{ "role": "user", "content": "hi" }]
+            });
+            assert!(
+                strip_billing_header_attribution(&string)
+                    .get("system")
+                    .is_none(),
+                "string form with trailing {tail:?} must omit `system`"
+            );
+
+            let array = serde_json::json!({
+                "model": "claude",
+                "system": [{ "type": "text", "text": format!("{BILLING_LINE}{tail}") }],
+                "messages": [{ "role": "user", "content": "hi" }]
+            });
+            assert!(
+                strip_billing_header_attribution(&array)
+                    .get("system")
+                    .is_none(),
+                "array form with trailing {tail:?} must omit `system`"
+            );
+        }
+
+        // A blank line BEFORE real prompt text is not a blank remainder —
+        // the operator's text survives with its own leading whitespace.
+        let kept = serde_json::json!({
+            "model": "claude",
+            "system": format!("{BILLING_LINE}\n\nYou are a terse assistant."),
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        assert_eq!(
+            strip_billing_header_attribution(&kept)["system"],
+            serde_json::json!("\nYou are a terse assistant.")
+        );
+    }
+
+    #[test]
+    fn strip_billing_header_leaves_an_unrelated_system_alone() {
+        for system in [
+            serde_json::json!("You are a helpful assistant."),
+            serde_json::json!([{ "type": "text", "text": "You are a helpful assistant." }]),
+            // The marker mid-prompt is prose, not the attribution line.
+            serde_json::json!(format!("Explain what {BILLING_LINE} means.")),
+            serde_json::Value::Null,
+        ] {
+            let body = serde_json::json!({
+                "model": "claude",
+                "system": system,
+                "messages": [{ "role": "user", "content": "hi" }]
+            });
+            let out = strip_billing_header_attribution(&body);
+            assert!(
+                matches!(out, Cow::Borrowed(_)),
+                "unchanged bodies are returned borrowed: {body}"
+            );
+        }
+
+        // No `system` at all.
+        let bare = serde_json::json!({
+            "model": "claude",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        assert!(matches!(
+            strip_billing_header_attribution(&bare),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn strip_billing_header_never_touches_messages() {
+        // The same line quoted inside the conversation is content the
+        // caller is asking about, and removing it would change the
+        // question.
+        let body = serde_json::json!({
+            "model": "claude",
+            "system": [{ "type": "text", "text": BILLING_LINE }, { "type": "text", "text": "be brief" }],
+            "messages": [
+                { "role": "user", "content": format!("what does `{BILLING_LINE}` mean?") },
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": BILLING_LINE }]
+                }
+            ]
+        });
+
+        let out = strip_billing_header_attribution(&body);
+        assert_eq!(out["messages"], body["messages"]);
+        assert_eq!(
+            out["system"],
+            serde_json::json!([{ "type": "text", "text": "be brief" }])
+        );
+    }
+
+    /// A blank line before the marker used to make the whole strip a
+    /// silent no-op: the prefix test trimmed it, the cut did not, so the
+    /// split landed on the leading newline and handed the attribution
+    /// line straight back.
+    #[test]
+    fn strip_billing_header_survives_whitespace_before_the_marker() {
+        for lead in ["\n", "  ", "\n\n  ", "\t"] {
+            let body = serde_json::json!({
+                "model": "claude",
+                "system": format!("{lead}{BILLING_LINE}\nYou are a helpful assistant."),
+                "messages": [{ "role": "user", "content": "hi" }]
+            });
+            let out = strip_billing_header_attribution(&body);
+            assert_eq!(
+                out["system"],
+                serde_json::json!("You are a helpful assistant."),
+                "leading {lead:?} must not save the attribution line"
+            );
+        }
+    }
+
+    /// The marker prefixes a LINE, not necessarily a whole block. Dropping
+    /// the block would take the operator's system prompt with it — a total
+    /// prompt loss, which is far worse than the cache miss being fixed.
+    #[test]
+    fn strip_billing_header_keeps_prompt_text_sharing_the_block() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "system": [{
+                "type": "text",
+                "text": format!("{BILLING_LINE}\nYou are a terse assistant.\nBe brief."),
+                "cache_control": { "type": "ephemeral" }
+            }],
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+
+        let out = strip_billing_header_attribution(&body);
+        assert_eq!(
+            out["system"],
+            serde_json::json!([{
+                "type": "text",
+                "text": "You are a terse assistant.\nBe brief.",
+                "cache_control": { "type": "ephemeral" }
+            }]),
+            "only the line goes; the block and its cache_control stay"
+        );
+    }
+
+    /// Header names are case-insensitive by convention, and a client that
+    /// capitalises this one would otherwise bypass the strip silently.
+    #[test]
+    fn strip_billing_header_matches_the_marker_case_insensitively() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "system": [
+                { "type": "text", "text": "X-Anthropic-Billing-Header: cc_version=2.1.0;" },
+                { "type": "text", "text": "keep me" }
+            ],
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let out = strip_billing_header_attribution(&body);
+        assert_eq!(
+            out["system"],
+            serde_json::json!([{ "type": "text", "text": "keep me" }])
+        );
+    }
+
+    #[test]
+    fn strip_billing_header_drops_every_attribution_block_and_tolerates_leading_space() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "system": [
+                { "type": "text", "text": format!("  {BILLING_LINE}") },
+                { "type": "text", "text": "keep me" },
+                { "type": "text", "text": BILLING_LINE },
+                // Not a text block: nothing to inspect, so it survives.
+                { "type": "unknown", "id": "x" }
+            ],
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+
+        let out = strip_billing_header_attribution(&body);
+        assert_eq!(
+            out["system"],
+            serde_json::json!([
+                { "type": "text", "text": "keep me" },
+                { "type": "unknown", "id": "x" }
+            ])
+        );
+    }
 
     #[test]
     fn split_system_merges_leading_system_messages() {

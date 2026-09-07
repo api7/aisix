@@ -31,9 +31,12 @@ pub use bridge::{AnthropicBridge, ANTHROPIC_DEFAULT_BASE, ANTHROPIC_VERSION};
 ///   `ChatResponse` back as Anthropic JSON.
 /// - [`AnthropicSseEncoder`] re-encodes the bridge's `ChatChunk`
 ///   stream as Anthropic typed SSE events.
+/// - [`strip_billing_header_attribution`] drops the client's
+///   Anthropic-only billing attribution line from `system` before the
+///   body is sent to any other provider.
 pub use wire::{
     chat_response_into_anthropic_json, parse_inbound_request, parse_inbound_request_for_scan,
-    translate_anthropic_tool_choice_to_openai, translate_anthropic_tools_to_openai,
-    translate_extras_to_openai_shape, AnthropicInboundError, AnthropicSseEncoder,
-    AnthropicSseEvent,
+    strip_billing_header_attribution, translate_anthropic_tool_choice_to_openai,
+    translate_anthropic_tools_to_openai, translate_extras_to_openai_shape, AnthropicInboundError,
+    AnthropicSseEncoder, AnthropicSseEvent,
 };
