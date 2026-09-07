@@ -54,9 +54,11 @@ differently on a gateway older than the one you are changing, and each needs
 a different discipline:
 
 - **Adding a field** is the safe, expected change, at any depth of any
-  resource. An older gateway loads the document with the new field ignored
-  and reports it as partially compatible (`GET /status/config`
-  `partially_compatible[]`, the heartbeat, and the
+  resource — as long as the Rust field is optional or carries a serde
+  default, since a field the current build requires kills every stored row
+  written before it (`CLAUDE.md`). An older gateway loads the document with
+  the new field ignored and reports it as partially compatible
+  (`GET /status/config` `partially_compatible[]`, the heartbeat, and the
   `aisix_config_partially_compatible_resources` metric). Never assume a new
   field is enforced fleet-wide until every data plane runs a version that
   knows it — this matters most for restriction-type fields (an old gateway
@@ -67,9 +69,13 @@ a different discipline:
   rejected on older versions. Do not "fix" that by opening the enum, and do
   not add a `#[serde(other)]` fallback for a value that selects serving
   behavior — silently running a different routing strategy than configured is
-  worse than rejecting the document. The rollout decision is not made here:
-  the control plane refuses to save a projection the gateways registered
-  against it cannot load, using the versions the heartbeat already reports.
+  worse than rejecting the document. Behind a control plane the rollout
+  decision is not made here — it refuses to save a projection the gateways
+  registered against it cannot load, using the versions the heartbeat already
+  reports. Nothing checks it on the paths that bypass a control plane (a
+  resources file, a direct etcd put) or in an environment with no gateway
+  registered yet: there an older gateway simply rejects the row into
+  `rejected[]`, which for a genuinely new capability is the correct outcome.
 
 Which releases a change has to stay loadable on is set by the support floor —
 see the projection rule in `CLAUDE.md`.
