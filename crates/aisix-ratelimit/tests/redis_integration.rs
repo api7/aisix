@@ -278,6 +278,51 @@ async fn token_usage_is_shared_across_replicas() {
     );
 }
 
+/// #950: the shared backend must draw the boundary where the local one
+/// does. Committed usage landing EXACTLY on the token cap is a spent
+/// budget, so the next request — on any replica — is refused. A `>` here
+/// would make the observable limit depend on which backend is
+/// configured, which is the one thing swapping them must never change.
+#[tokio::test]
+async fn a_token_window_exactly_on_the_limit_refuses_the_next_request() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let a = store(&url).await;
+    let b = store(&url).await;
+    let key = unique_key("tpm-exact");
+    let limits = RateLimit {
+        tpm: Some(1_000),
+        ..rl()
+    };
+
+    a.acquire(&key, &limits, "a-1")
+        .await
+        .expect("first allowed");
+    a.commit(&key, 1_000, "a-1").await; // the whole budget, exactly
+
+    let err = b
+        .acquire(&key, &limits, "b-1")
+        .await
+        .expect_err("a fully consumed token budget must stop admitting");
+    assert!(
+        matches!(err, aisix_ratelimit::RateLimitError::Tokens { .. }),
+        "got {err:?}"
+    );
+
+    // One token short still admits, so the assertion above is about the
+    // budget being spent rather than about any usage at all.
+    let under = unique_key("tpm-under");
+    a.acquire(&under, &limits, "a-2")
+        .await
+        .expect("first allowed");
+    a.commit(&under, 999, "a-2").await;
+    b.acquire(&under, &limits, "b-2")
+        .await
+        .expect("one token of budget left still admits");
+}
+
 #[tokio::test]
 async fn concurrency_slot_is_shared_and_released_across_replicas() {
     let Some(url) = redis_url() else {

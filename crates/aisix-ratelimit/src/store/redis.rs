@@ -110,7 +110,9 @@ for i = 1, ntok do
   local name, window, limit = tok[i][1], tok[i][2], tok[i][3]
   local ws = now - (now % window)
   local cur = tonumber(redis.call('GET', prefix .. ':' .. name .. ':' .. ws) or '0')
-  if cur > limit then
+  -- `>=`, matching the local backend: a token window whose committed
+  -- usage has reached the cap is spent, not still admissible (#950).
+  if cur >= limit then
     local retry = window - (now - ws); if retry < 1 then retry = 1 end
     return {2, retry, i, limit, cur}
   end

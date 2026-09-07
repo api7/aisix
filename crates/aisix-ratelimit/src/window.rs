@@ -90,13 +90,21 @@ impl FixedWindowCounter {
         self.count
     }
 
-    /// Peek at whether the current count already exceeds the limit. Used
-    /// on the *next* request's pre-commit to short-circuit before
+    /// Peek at whether the window's budget is already consumed. Used on
+    /// the *next* request's pre-commit to short-circuit before
     /// increment: TPM is checked-but-not-incremented at pre-commit, then
     /// incremented on post-deduct by the actual token usage.
+    ///
+    /// A count that has landed exactly ON the limit is consumed, not
+    /// still admissible. Token limiting is post-paid — the usage is
+    /// committed after the response — so crossing the cap by one
+    /// in-flight response is inherent; admitting at equality on top of
+    /// that overshot by a further whole response (#950). The Redis
+    /// backend's acquire script draws the same line, so swapping
+    /// backends cannot change the observable limit.
     pub fn is_exceeded(&mut self, now_secs: u64, limit: u64) -> Option<u64> {
         self.roll_if_stale(now_secs);
-        if self.count > limit {
+        if self.count >= limit {
             let remainder = self
                 .window_secs
                 .saturating_sub(now_secs.saturating_sub(self.window_start));
@@ -160,8 +168,26 @@ mod tests {
         w.add(101, 500);
         assert_eq!(w.current(101), 1_500);
 
-        assert!(w.is_exceeded(101, 2_000).is_none()); // 1500 <= 2000
+        assert!(w.is_exceeded(101, 2_000).is_none()); // 1500 < 2000
         assert!(w.is_exceeded(101, 1_000).is_some()); // 1500 > 1000
+    }
+
+    /// #950: usage landing exactly on the cap means the budget is gone.
+    /// Admitting there let a caller whose committed usage was already the
+    /// whole allowance spend one more full response.
+    #[test]
+    fn a_count_exactly_on_the_limit_is_exhausted() {
+        let mut w = FixedWindowCounter::new(60);
+        w.add(100, 10);
+        assert_eq!(w.current(100), 10);
+        assert!(
+            w.is_exceeded(100, 10).is_some(),
+            "committed usage == limit must stop admitting",
+        );
+        assert!(
+            w.is_exceeded(100, 11).is_none(),
+            "one token of budget left still admits",
+        );
     }
 
     #[test]
