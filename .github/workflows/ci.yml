@@ -43,7 +43,13 @@ jobs:
       - uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@v2
       - name: regenerate schemas
-        run: cargo run -p aisix-core --bin dump-schema
+        run: |
+          # The dump only ever writes, so a file it STOPPED emitting (a
+          # resource dropped from RESOURCES) would sit in the tree forever and
+          # keep being vendored. Clear both sets first so a vanished file shows
+          # up in `git diff` as a deletion.
+          rm -f schemas/resources/*.schema.json schemas/resources-lenient/*.schema.json
+          cargo run -p aisix-core --bin dump-schema
       - name: assert no drift
         run: |
           # --intent-to-add so a file the dump newly creates (a new resource,

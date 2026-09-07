@@ -45,6 +45,22 @@ resource closes them — is rejected on those paths. They are generated
 from the same producers the in-repo strict validators compile, so the
 published files and the gateway's own validators cannot drift.
 
+Four top-level resources intentionally **omit**
+`additionalProperties: false` even on the write contract (the list is
+`closes_on_write` in `crates/aisix-core/src/models/schema.rs`):
+
+- `guardrail.schema.json` — the discriminated-union `kind` field uses
+  serde's `flatten + tag` pattern, which is incompatible with a strict
+  outer deny; strict typo-rejection happens earlier via
+  `aisix-core::models::schema::validate_guardrail`.
+- `cache_policy.schema.json` — historically open on write as well.
+- `guardrail_attachment.schema.json` — likewise.
+- `observability_exporter.schema.json` — the top level is open, but the
+  per-`kind` branches stay closed on both paths: an unknown field there
+  could smuggle a plaintext credential past the `credential_ref`
+  indirection, and serde cannot report ignored fields inside the
+  tagged union, so an open branch would be a silent tolerance.
+
 Two write paths sit outside this enforcement: the AISIX Cloud control
 plane validates requests against its own API schema before writing
 etcd, and a **raw direct etcd put gets no synchronous validation** —
@@ -71,34 +87,69 @@ and validates every stored document against. A consumer that needs to
 know what a given gateway release will accept from etcd reads these
 files rather than deriving them from the strict ones.
 
-The two sets differ in exactly one way: a lenient file carries no
+**Do not validate writes against these files.** They are deliberately
+open, and for four resources they relax more than that (below), so a
+consumer that swaps `resources/` for `resources-lenient/` in a
+vendoring script silently turns its input validation into an
+accept-almost-anything gate. `resources/` stays the schema for anything
+a user submits; `resources-lenient/` answers only "will this build load
+this stored document".
+
+### How the two sets differ
+
+For **every** resource, a lenient file carries no
 `additionalProperties: false`, at **any** depth — not on the root, not on
 a `definitions` entry, not on a `oneOf` branch, not on a nested property.
-Field names, types, `required` lists, ranges, enum value sets, the
-`$ref`/`definitions` layout and the `if`/`then`/`oneOf` structure are
-identical. That single difference is the whole tolerance: an optional
-field a newer control plane adds inside a nested config object is
-ignored and reported, instead of taking the whole row down.
+That is the tolerance the split exists for: an optional field a newer
+control plane adds inside a nested config object is ignored and reported,
+instead of taking the whole row down.
 
-The five nested struct types (`ensemble`, `rate_limit`, `routing`,
-`semantic`, `embedding`) have no standalone loader validator — they are
-only ever validated as part of the resource that embeds them — so their
-lenient files are the same struct-derived schema run through the same
-opening pass.
+For **four** resources the read contract relaxes something further, and
+a consumer that models the lenient set as "the strict set with
+`additionalProperties` stripped" is wrong about them:
 
-Three top-level resources intentionally **omit**
-`additionalProperties: false` even on the write contract:
+| resource | additionally relaxed on read |
+| --- | --- |
+| `api_key` | `McpAccess.allow` is not required |
+| `guardrail` | the `semantic` kind does not require `embedding_model`, nor a threshold beside each example list; the `custom` kind does not require `script` |
+| `mcp_policy` | `allow` is not required |
+| `model` | the per-kind `not`/`anyOf` lists that forbid a knob a kind never resolves are shorter — a stored row keeps loading and `Model::strip_kind_inapplicable` drops the dead knob |
 
-- `guardrail.schema.json` — the discriminated-union `kind` field uses
-  serde's `flatten + tag` pattern, which is incompatible with a strict
-  outer deny; strict typo-rejection happens earlier via
-  `aisix-core::models::schema::validate_guardrail`.
-- `cache_policy.schema.json` — historically open on write as well.
-- `observability_exporter.schema.json` — the top level is open, but the
-  per-`kind` branches stay closed on both paths: an unknown field there
-  could smuggle a plaintext credential past the `credential_ref`
-  indirection, and serde cannot report ignored fields inside the
-  tagged union, so an open branch would be a silent tolerance.
+These come from the four producers that take a `strict` flag in
+`crates/aisix-core/src/models/schema.rs` and are deliberate. The list is
+pinned by `published_sets_differ_only_where_registered` in
+`crates/aisix-core/tests/resource_schema_characterization.rs`, so a new
+divergence has to be registered before the suite goes green. Everything
+else — field names, types, ranges, enum value sets, the
+`$ref`/`definitions` layout, the `if`/`then`/`oneOf` structure — is
+identical.
+
+### Two gates sit behind the lenient schema
+
+Passing a lenient file is necessary, not sufficient. After the schema
+gate the loader still deserialises the document into the Rust type, and
+a value the schema does not constrain (an integer past `u64`, say) fails
+there and takes the row; and `rate_limit_policy` runs a semantic pass
+(`validate_semantics`) for cross-field rules JSON Schema cannot express,
+which also rejects a row whole. Treat these files as the necessary
+condition for a row to load, not the complete one.
+
+### The five nested struct types are documentation, not a contract
+
+`ensemble`, `rate_limit`, `routing`, `semantic` and `embedding` have no
+standalone validator on either path — they are only ever validated as
+part of the resource that embeds them — so their standalone files, in
+**both** sets, document the struct's shape rather than anything that is
+enforced. They are also generated with schemars' default `Option<T>`
+rendering, which the embedding resources do not all use: `rate_limit`
+standalone renders `rpm` as `["integer", "null"]`, and
+`model.schema.json#/definitions/RateLimit` renders it as `"integer"`, so
+a `model` document writing an explicit `null` there is accepted by the
+standalone file and skipped by the loader. The authoritative copy of a
+nested type is always
+`<parent>.schema.json#/definitions/<Type>` — read it there. (Their key
+order also differs between the two sets, since only the lenient side
+round-trips through a sorted JSON map.)
 
 ## Regenerating
 
@@ -133,10 +184,10 @@ configured in the repository.
   files. (Follow-up PR.)
 - Documentation sites can consume the hosted Admin API OpenAPI document
   for the AISIX AI Gateway Admin API reference.
-- Control-plane services can pin these files for REST input validation
+- Control-plane services can pin `resources/` for REST input validation
   against the same shape the data plane consumes from etcd, and pin
   `resources-lenient/` to reason about what an already-deployed gateway
-  release will still load.
+  release will still load — never the other way round.
 - Dashboards can render forms from these schemas with
   [RJSF](https://github.com/rjsf-team/react-jsonschema-form) or
   equivalent, instead of hand-coded validators.

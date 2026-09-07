@@ -24,7 +24,14 @@
 //!   a newer control plane loads with its extra fields ignored instead of
 //!   the whole row being skipped. Published so a consumer that needs to know
 //!   what this build will LOAD can read it instead of deriving it from the
-//!   strict files.
+//!   strict files. It is NOT a write contract, and for `model`, `api_key`,
+//!   `guardrail` and `mcp_policy` it relaxes more than unknown fields —
+//!   `schemas/README.md` lists what.
+//!
+//! The five nested struct types have no standalone validator on either path,
+//! so their standalone files (in both sets) document the struct's shape
+//! rather than anything enforced; the authoritative copy of one is the
+//! embedding resource's own `definitions` entry.
 //!
 //! Re-run after modifying any resource struct in
 //! `crates/aisix-core/src/models/`. CI runs this binary and rejects PRs
@@ -92,11 +99,11 @@ fn dump<T: JsonSchema>(out_dir: &Path, lenient_dir: &Path, name: &str) {
     let mut root = schemars::schema_for!(T);
 
     // The lenient twin comes off the SAME producer, run through
-    // `schema::open_unknown_fields` — the very pass `LENIENT_SCHEMAS`
-    // compiles the resource roots with — before the closing pass below runs.
-    // These nested types have no standalone loader validator (they are only
-    // ever validated as part of the resource that embeds them), so the pass
-    // is what ties the published file to the read contract.
+    // `schema::open_unknown_fields` — the pass `LENIENT_SCHEMAS` compiles the
+    // resource roots with — before the closing pass below runs. These nested
+    // types have no standalone validator on either path, so neither file is a
+    // contract; the pair documents the struct's shape under each strictness,
+    // and the enforced copy is the embedding resource's `definitions` entry.
     let mut lenient = serde_json::to_value(&root).expect("serialize schema");
     schema::open_unknown_fields(&mut lenient);
     dump_value(lenient_dir, name, lenient);

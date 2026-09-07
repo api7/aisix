@@ -851,12 +851,33 @@ fn guardrail_attachment_corpus() {
 // ---------------------------------------------------------------------------
 
 /// Parse one published schema file out of `schemas/<dir>/`.
-fn published_schema(dir: &str, resource: &str) -> Value {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+fn schemas_dir() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
         .expect("CARGO_MANIFEST_DIR has two ancestors")
         .join("schemas")
+}
+
+/// Sorted file names published under `schemas/<sub>/`. Read off the directory
+/// rather than a hard-coded list so a file the dump starts (or stops) emitting
+/// reaches the checks below.
+fn published_file_names(sub: &str) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(schemas_dir().join(sub))
+        .unwrap_or_else(|e| panic!("read schemas/{sub}: {e}"))
+        .map(|e| {
+            e.expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+fn published_schema(dir: &str, resource: &str) -> Value {
+    let path = schemas_dir()
         .join(dir)
         .join(format!("{resource}.schema.json"));
     let bytes =
@@ -881,6 +902,103 @@ fn published_lenient_schemas_are_what_the_loader_compiles() {
              `cargo run -p aisix-core --bin dump-schema`"
         );
     }
+}
+
+/// The strict twin of the check above: every published strict file is exactly
+/// what the write validators compile. Those files are also `include_str!`ed
+/// into the DP admin OpenAPI document, so they are worth pinning here and not
+/// only in the CI drift job.
+#[test]
+fn published_strict_schemas_are_what_the_write_path_compiles() {
+    for resource in RESOURCES {
+        assert_eq!(
+            published_schema("resources", resource),
+            resource_root_schema(resource, true),
+            "schemas/resources/{resource}.schema.json is not \
+             resource_root_schema({resource:?}, true) — re-run \
+             `cargo run -p aisix-core --bin dump-schema`"
+        );
+    }
+}
+
+/// Resources whose read contract relaxes something BEYOND unknown fields,
+/// with the relaxation named. Every other published pair must differ by
+/// closures alone.
+///
+/// A consumer that treats the lenient set as "the strict set with
+/// `additionalProperties` stripped" is wrong for exactly these four, and the
+/// difference is not cosmetic — the loader accepts an `mcp_policy` with no
+/// `allow`, or a semantic guardrail with no `embedding_model`, and then reads
+/// the field's default. This table is what keeps `schemas/README.md` honest;
+/// a new relaxation has to be registered here before the suite goes green.
+const EXTRA_RELAXATIONS: &[(&str, &str)] = &[
+    (
+        "api_key",
+        "McpAccess.allow is required on write only; a stored key without it \
+         loads and adds no constraint of its own",
+    ),
+    (
+        "guardrail",
+        "the semantic kind requires embedding_model and a threshold beside each \
+         example list on write only; on read both take their defaults, as does \
+         the custom kind's script",
+    ),
+    (
+        "mcp_policy",
+        "allow is required on write only; a stored policy without it loads as \
+         the empty allow-list",
+    ),
+    (
+        "model",
+        "the per-kind `not/anyOf` lists that forbid a knob a kind never resolves \
+         are shorter on read — a stored row keeps loading and \
+         Model::strip_kind_inapplicable drops the dead knob instead",
+    ),
+];
+
+/// The two published sets differ ONLY by `additionalProperties: false`,
+/// except where [`EXTRA_RELAXATIONS`] says otherwise.
+///
+/// Strips every closure out of the strict file and requires the result to
+/// equal the lenient one. This is the claim `schemas/README.md` makes to
+/// downstream consumers, and the claim the control plane's own
+/// strict-to-lenient relaxation table exists because it cannot be made
+/// unconditionally.
+#[test]
+fn published_sets_differ_only_where_registered() {
+    fn without_closures(node: &Value) -> Value {
+        match node {
+            Value::Object(obj) => Value::Object(
+                obj.iter()
+                    .filter(|(k, v)| !(k.as_str() == "additionalProperties" && *v == &json!(false)))
+                    .map(|(k, v)| (k.clone(), without_closures(v)))
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.iter().map(without_closures).collect()),
+            other => other.clone(),
+        }
+    }
+
+    let mut differ: Vec<String> = Vec::new();
+    for name in published_file_names("resources-lenient") {
+        let resource = name.trim_end_matches(".schema.json").to_string();
+        let opened = without_closures(&published_schema("resources", &resource));
+        if opened != published_schema("resources-lenient", &resource) {
+            differ.push(resource);
+        }
+    }
+    differ.sort();
+    let mut registered: Vec<String> = EXTRA_RELAXATIONS
+        .iter()
+        .map(|(r, _)| (*r).to_string())
+        .collect();
+    registered.sort();
+    assert_eq!(
+        differ, registered,
+        "the published sets differ beyond `additionalProperties: false` for a \
+         resource EXTRA_RELAXATIONS does not name (or name one that no longer \
+         differs). schemas/README.md documents this list — update both."
+    );
 }
 
 /// No published lenient file closes anything, at any depth.
@@ -912,29 +1030,14 @@ fn published_lenient_schemas_close_nothing_at_any_depth() {
         }
     }
 
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("CARGO_MANIFEST_DIR has two ancestors")
-        .join("schemas");
-    let names = |sub: &str| {
-        let mut v: Vec<String> = fs::read_dir(dir.join(sub))
-            .unwrap_or_else(|e| panic!("read schemas/{sub}: {e}"))
-            .map(|e| {
-                e.expect("dir entry")
-                    .file_name()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
-        v.sort();
-        v
-    };
     // The two sets publish the same resources under the same file names — the
     // lenient set is a full twin, not a subset of interesting cases.
-    assert_eq!(names("resources"), names("resources-lenient"));
+    assert_eq!(
+        published_file_names("resources"),
+        published_file_names("resources-lenient")
+    );
 
-    for name in names("resources-lenient") {
+    for name in published_file_names("resources-lenient") {
         let resource = name.trim_end_matches(".schema.json");
         let schema = published_schema("resources-lenient", resource);
         let mut closed = Vec::new();
@@ -954,10 +1057,11 @@ struct Probe {
     document: fn() -> Value,
 }
 
-/// One valid document per resource, pointed at the DEEPEST position that
-/// resource's write contract closes. The test inserts a field no build knows
-/// there: the strict file must then reject the document it accepted a moment
-/// ago, and the lenient file must still accept it.
+/// One valid document per resource, pointed at a position that resource's
+/// write contract closes — nested wherever the resource has a nested closure.
+/// The test inserts a field no build knows there: the strict file must then
+/// reject the document it accepted a moment ago, and the lenient file must
+/// still accept it.
 ///
 /// Asserting the un-probed document passes the strict file is what makes the
 /// rejection attributable to the unknown field rather than to anything else in
