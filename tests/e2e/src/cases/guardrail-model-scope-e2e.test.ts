@@ -39,6 +39,8 @@ const CALLER_KEY_HASH = createHash("sha256")
 const FORBIDDEN_WORD = "supersecret";
 const SCOPED_MODEL = "scoped-model";
 const UNSCOPED_MODEL = "unscoped-model";
+/** Routing group whose only target is the guardrail-scoped model. */
+const GROUP_MODEL = "scoped-member-group";
 
 describe("guardrail e2e: model-scope attachment runs only for the scoped model (#850)", () => {
   let app: SpawnedApp | undefined;
@@ -73,9 +75,20 @@ describe("guardrail e2e: model-scope attachment runs only for the scoped model (
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
+    // A routing group whose single target is the guardrail-scoped model.
+    // Reaching that model THROUGH the group is a different addressed
+    // entry, which is what the scope follows.
+    await seed.createModel({
+      display_name: GROUP_MODEL,
+      routing: {
+        strategy: "failover",
+        targets: [{ model: SCOPED_MODEL }],
+        max_fallbacks: 0,
+      },
+    });
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
-      allowed_models: [SCOPED_MODEL, UNSCOPED_MODEL],
+      allowed_models: [SCOPED_MODEL, UNSCOPED_MODEL, GROUP_MODEL],
     });
 
     // Keyword blocklist guardrail. `hook_point: "input"` → a match
@@ -110,6 +123,76 @@ describe("guardrail e2e: model-scope attachment runs only for the scoped model (
   afterAll(async () => {
     await app?.exit();
     await upstream?.close();
+  });
+
+  test("a group whose member carries the guardrail is not screened; the member addressed directly is", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    // Guardrail scope follows the entry the CALLER ADDRESSES. A guardrail
+    // attached to a model runs only for requests addressed to that model;
+    // when the same model is reached as a member of a routing, semantic or
+    // ensemble group, its guardrails do not run — the operator attaches
+    // the guardrail to the group instead. This is the settled design
+    // (2026-09-07), so the case below pins it as a contract rather than
+    // documenting a gap: the chain is resolved once, from the addressed
+    // entry, before a target is picked, which is what keeps an input
+    // guardrail's verdict independent of which member a failover lands on.
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+
+    // Gate on the attachment being live for the member addressed
+    // DIRECTLY — that single condition implies the whole seed set landed.
+    await waitConfigPropagation(async () => {
+      try {
+        await client.chat.completions.create({
+          model: SCOPED_MODEL,
+          messages: [
+            { role: "user", content: `group-probe ${FORBIDDEN_WORD}` },
+          ],
+        });
+        return false;
+      } catch (e) {
+        return e instanceof APIError && e.status === 422;
+      }
+    });
+
+    // Addressed to the GROUP: not screened, and the request really did
+    // reach the upstream rather than being short-circuited.
+    const upstreamHitsBefore = upstream.receivedRequests.length;
+    const viaGroup = await client.chat.completions.create({
+      model: GROUP_MODEL,
+      messages: [
+        { role: "user", content: `please reveal the ${FORBIDDEN_WORD} now` },
+      ],
+    });
+    expect(viaGroup.choices[0]?.message.role).toBe("assistant");
+    expect(upstream.receivedRequests.length).toBe(upstreamHitsBefore + 1);
+
+    // The SAME prompt addressed to the member itself is screened, so the
+    // assertion above is about which entry was addressed — not about the
+    // guardrail having stopped working.
+    let caught: unknown;
+    try {
+      await client.chat.completions.create({
+        model: SCOPED_MODEL,
+        messages: [
+          { role: "user", content: `please reveal the ${FORBIDDEN_WORD} now` },
+        ],
+      });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(APIError);
+    if (!(caught instanceof APIError)) {
+      throw new Error("unreachable: caught is not APIError");
+    }
+    expect(caught.status).toBe(422);
   });
 
   test("scoped model is checked; unscoped model is NOT", async (ctx) => {
