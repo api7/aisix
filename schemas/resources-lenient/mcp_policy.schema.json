@@ -1,0 +1,89 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "scope": {
+            "const": "team"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "scope_ref": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope_ref"
+        ]
+      }
+    }
+  ],
+  "definitions": {
+    "McpPolicyScope": {
+      "description": "Which API keys an MCP access policy applies to.",
+      "oneOf": [
+        {
+          "description": "Applied to every key in the environment.",
+          "enum": [
+            "env"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Applied to the keys belonging to the team named by `scope_ref`, on top of the environment policy rather than in place of it.",
+          "enum": [
+            "team"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "properties": {
+    "allow": {
+      "default": [],
+      "description": "Namespaced `<server>__<tool>` patterns this layer allows. Entries are matched as single-`*` globs: `\"*\"` allows every tool, `\"<server>__*\"` every tool on one server, and an entry without a `*` matches one tool exactly. An empty list allows nothing, which is how a policy blocks all MCP access; a policy that only means to subtract tools writes `[\"*\"]` here and lists them under `deny`.\n\nThe write path requires the field (the strict schema adds it to `required`), so a layer never allows something by omission. The runtime loader defaults it to empty instead of rejecting the row: a document written before the layered shape would otherwise fail to deserialize, and a skipped `api_key` row stops authenticating altogether rather than merely losing MCP access.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "deny": {
+      "description": "Namespaced `<server>__<tool>` patterns subtracted from the effective grant of every key the policy applies to, using the same single-`*` glob matching as `allow`. Deny always wins: a tool matched here stays unavailable however the other layers allow it.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "enabled": {
+      "default": true,
+      "description": "Whether the policy is applied. A disabled policy is kept but contributes neither its allow nor its deny side. Treated as `true` when omitted.",
+      "type": "boolean"
+    },
+    "scope": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/McpPolicyScope"
+        }
+      ],
+      "description": "Which API keys the policy applies to: the whole environment or one team."
+    },
+    "scope_ref": {
+      "description": "Team identifier the policy targets. Required when `scope` is `team`; omitted for an environment policy.",
+      "minLength": 1,
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "scope"
+  ],
+  "title": "McpPolicy",
+  "type": "object"
+}

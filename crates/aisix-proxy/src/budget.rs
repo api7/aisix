@@ -289,6 +289,10 @@ fn apply_fail_mode(prev: &Decision) -> Decision {
 //
 // We surface only `message` to ProxyError::BudgetExceeded; the other
 // fields exist for the dashboard banner once we plumb them through.
+/// A data plane can run against a control plane many releases newer than
+/// itself, so this struct — and every other one that decodes a control-plane
+/// response — never carries `#[serde(deny_unknown_fields)]`, and every field
+/// except `allow`, the one the decision hinges on, is `#[serde(default)]`.
 #[derive(Debug, Deserialize)]
 struct WireDecision {
     allow: bool,

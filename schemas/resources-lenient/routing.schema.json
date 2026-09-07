@@ -1,0 +1,254 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "HashOnSource": {
+      "description": "One source for the `consistent_hash` hash key. Sources are tried in order; the first one that yields a non-empty value wins.",
+      "properties": {
+        "name": {
+          "description": "The header or cookie name to read. Required for `header` and `cookie` sources; not accepted for `api_key` or `client_ip`.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/HashOnType"
+            }
+          ],
+          "description": "Which request attribute supplies the hash key."
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    "HashOnType": {
+      "description": "Which request attribute a [`HashOnSource`] reads the hash key from.",
+      "oneOf": [
+        {
+          "description": "A request header, named by `name`.",
+          "enum": [
+            "header"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A cookie from the request's `Cookie` header, named by `name`.",
+          "enum": [
+            "cookie"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The caller's API key id.",
+          "enum": [
+            "api_key"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The caller's resolved client IP (honouring the trusted-proxy configuration).",
+          "enum": [
+            "client_ip"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "RoutingStrategy": {
+      "oneOf": [
+        {
+          "description": "Smooth weighted round-robin over target `weight`s. Equal (or absent) weights degrade to a plain declaration-order cycle.",
+          "enum": [
+            "round_robin"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Ketama-style consistent hashing of the request's hash key (see `hash_on`) over the targets, `weight` scaling each target's share of the ring. The same key keeps landing on the same target while it is healthy; on failure the walk follows the ring so only the failed target's keys move.",
+          "enum": [
+            "consistent_hash"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Always start with the first target and move to later targets only after failure.",
+          "enum": [
+            "failover"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Rank targets cheapest-first by the target model's `cost` (combined input+output per-1K price), then fall forward. Targets without a configured `cost` rank last.",
+          "enum": [
+            "least_cost"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Rank targets fastest-first by a moving average of recent observed upstream latency (time-to-first-token for streaming), then fall forward. Targets with no samples yet rank first so they get probed.",
+          "enum": [
+            "least_latency"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Rank targets least-loaded-first by in-flight requests divided by target `weight` (the APISIX least_conn score), then fall forward.",
+          "enum": [
+            "least_busy"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "RoutingTarget": {
+      "description": "One destination in a routing configuration. `model` references a direct model alias.",
+      "properties": {
+        "model": {
+          "description": "Model alias for a direct model that can receive routed traffic.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "priority": {
+          "description": "Priority tier, default `0`; a higher value is preferred (the APISIX node-priority convention — give backup targets `-1`). The strategy orders targets within each tier; a lower tier is only tried when every higher-tier target failed or is unavailable.",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tags": {
+          "description": "Tags for tag/metadata-conditional routing. When a request carries routing tags, only targets whose tags intersect the request's are eligible; a target tagged `\"default\"` is the fallback used when nothing matches and for untagged requests. Absent/empty means the target opts out of tag filtering (eligible only via the default fallback once any sibling target is tagged). The configured strategy then orders whatever set survives.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "weight": {
+          "description": "Target weight, default `1`. Used by `round_robin` (rotation share), `consistent_hash` (share of the hash ring), and `least_busy` (in-flight divided by weight). `failover`, `least_cost`, and `least_latency` accept the field but do not use it.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "type": "object"
+    },
+    "WhenAllUnavailablePolicy": {
+      "description": "Behavior when every routing target is unavailable because of runtime health or cooldown state.",
+      "oneOf": [
+        {
+          "description": "Return `503` with a fixed `Retry-After` hint.",
+          "enum": [
+            "fail"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Try every target in declaration order even when all of them are currently unavailable because of health or cooldown status. Use only when maintaining availability is preferred over avoiding recently unhealthy targets.",
+          "enum": [
+            "try_anyway"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "properties": {
+    "fallback_on_statuses": {
+      "description": "Additional upstream HTTP status codes that participate in retries and failover. By default a non-429 4xx response is treated as a caller error and returned as-is; providers that use 4xx codes for transient conditions (model overload, queue full, quota exhaustion) can be listed here, for example `[408, 409]`. 5xx codes are already retryable, so listing them changes nothing. Authentication (`401`/`403`) and validation (`400`) codes should only be listed when the provider is known to use them for transient failures.",
+      "items": {
+        "format": "uint16",
+        "maximum": 599.0,
+        "minimum": 400.0,
+        "type": "integer"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "hash_on": {
+      "description": "Where the `consistent_hash` hash key comes from: an ordered chain of sources, the first non-empty value winning. Defaults to the `x-aisix-routing-key` request header, falling back to the caller's API key id. Only valid with `strategy: consistent_hash`.",
+      "items": {
+        "$ref": "#/definitions/HashOnSource"
+      },
+      "minItems": 1,
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "max_fallbacks": {
+      "description": "Max number of later targets to attempt after the initial target fails permanently. When omitted, all later targets may be attempted.",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "retries": {
+      "description": "Retry attempts on the current target before failing over, applied to every target that does not set its own `retries`. Absent falls back to the deployment-wide `upstream.retries` default.",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "retry_on_429": {
+      "description": "Whether upstream 429 participates in retries and failover.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "strategy": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RoutingStrategy"
+        }
+      ],
+      "default": "failover",
+      "description": "Strategy used to select a target for each request."
+    },
+    "targets": {
+      "description": "Ordered set of direct models available to this routing model.",
+      "items": {
+        "$ref": "#/definitions/RoutingTarget"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "when_all_unavailable": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/WhenAllUnavailablePolicy"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Policy to apply when every target is unavailable because of runtime health or cooldown state."
+    }
+  },
+  "required": [
+    "targets"
+  ],
+  "title": "Routing",
+  "type": "object"
+}

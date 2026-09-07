@@ -1,0 +1,1677 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "BedrockAWSCredentials": {
+      "description": "AWS credentials for a Bedrock guardrail.",
+      "oneOf": [
+        {
+          "properties": {
+            "access_key_id": {
+              "description": "AWS access key ID for static Bedrock guardrail credentials.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "description": "Credential mode for explicitly configured AWS access keys.",
+              "enum": [
+                "static"
+              ],
+              "type": "string"
+            },
+            "secret_access_key": {
+              "description": "AWS secret access key used to authenticate requests to Amazon Bedrock. The gateway does not log the plaintext value.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "access_key_id",
+            "kind",
+            "secret_access_key"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "BedrockLatencyMode": {
+      "description": "Per-guardrail latency policy for `kind: \"bedrock\"`. Serial mode waits for the guardrail response; timed mode aborts at `timeout_ms` and applies `fail_open`.",
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "description": "Latency mode that waits for the Bedrock guardrail response.",
+              "enum": [
+                "serial"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "description": "Latency mode that stops waiting after `timeout_ms`.",
+              "enum": [
+                "timed"
+              ],
+              "type": "string"
+            },
+            "timeout_ms": {
+              "description": "Maximum time in milliseconds to wait for the Bedrock guardrail response.",
+              "format": "uint32",
+              "maximum": 5000.0,
+              "minimum": 100.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "timeout_ms"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "GuardrailHookPoint": {
+      "description": "What part of the request lifecycle a guardrail inspects.",
+      "oneOf": [
+        {
+          "description": "Run on the request payload before the upstream call.",
+          "enum": [
+            "input"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Run on the upstream response before the cache write + render.",
+          "enum": [
+            "output"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Run on both input and output.",
+          "enum": [
+            "both"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "KeywordPattern": {
+      "description": "Literal or regular-expression pattern used by a keyword guardrail.",
+      "oneOf": [
+        {
+          "description": "Literal string to match.",
+          "properties": {
+            "kind": {
+              "description": "Pattern type for matching the value as plain text.",
+              "enum": [
+                "literal"
+              ],
+              "type": "string"
+            },
+            "value": {
+              "description": "Literal string to match.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Regular expression pattern to match.",
+          "properties": {
+            "kind": {
+              "description": "Pattern type for matching the value as a regular expression.",
+              "enum": [
+                "regex"
+              ],
+              "type": "string"
+            },
+            "value": {
+              "description": "Regular expression pattern to match.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PiiCustomPattern": {
+      "description": "One operator-supplied regex detector for `kind: \"pii\"`.",
+      "properties": {
+        "action": {
+          "description": "Per-pattern action override. Falls back to the guardrail's `default_action` when omitted.",
+          "enum": [
+            "mask",
+            "block"
+          ],
+          "type": "string"
+        },
+        "name": {
+          "description": "Detector name surfaced in the mask token (`[<NAME>_REDACTED]`), telemetry counts, and block reasons. Never the matched value.",
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        "regex": {
+          "description": "Regular expression AISIX compiles when building the guardrail chain. An invalid pattern makes AISIX log and skip the guardrail.\n\nWhen the expression declares at least one capture group, a `mask` action rewrites only the first capture group of each match and keeps the rest of the match unchanged. Use this to replace a value while preserving its surrounding key or label, for example `\"version\"\\s*:\\s*\"([^\"]*)\"`. Without capture groups, the whole match is rewritten.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "replacement": {
+          "description": "Literal text that replaces the masked span, such as `***`. When omitted, the span is rewritten to `[<NAME>_REDACTED]`. An empty string removes the span. Only valid when the pattern's effective action is `mask`.",
+          "maxLength": 256,
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "regex"
+      ],
+      "type": "object"
+    },
+    "PiiDetectorConfig": {
+      "description": "One built-in detector selection for `kind: \"pii\"`. The `type` names the detector to enable; `action` optionally overrides the guardrail-level `default_action` for this detector only.",
+      "properties": {
+        "action": {
+          "description": "Per-detector action override. Falls back to the guardrail's `default_action` when omitted.",
+          "enum": [
+            "mask",
+            "block"
+          ],
+          "type": "string"
+        },
+        "type": {
+          "description": "Built-in detector to enable for this PII guardrail entry.",
+          "enum": [
+            "email",
+            "china_mobile",
+            "china_id_card",
+            "bank_card",
+            "us_ssn",
+            "ip_address",
+            "api_key",
+            "jwt",
+            "private_key"
+          ],
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    "PresidioEntityConfig": {
+      "description": "One entity selection for `kind: \"presidio\"`. The `type` names a Presidio entity (`EMAIL_ADDRESS`, `PHONE_NUMBER`, `PERSON`, `CREDIT_CARD`, …); `action` optionally overrides the guardrail-level `default_action` for this entity only — the same per-detector shape as `kind: \"pii\"`.",
+      "properties": {
+        "action": {
+          "description": "Per-entity action override. Falls back to the guardrail's `default_action` when omitted.",
+          "enum": [
+            "mask",
+            "block"
+          ],
+          "type": "string"
+        },
+        "type": {
+          "description": "Presidio entity type, e.g. `EMAIL_ADDRESS`, `PERSON`, `US_SSN`.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "Content policy evaluated before or after upstream calls.",
+  "oneOf": [
+    {
+      "description": "In-process literal/regex blocklist. Always available.",
+      "properties": {
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": false,
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
+        },
+        "kind": {
+          "description": "Guardrail provider type for literal and regular expression matching.",
+          "enum": [
+            "keyword"
+          ],
+          "type": "string"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "patterns": {
+          "description": "Blocklist patterns. An empty list is valid and allows every request, equivalent to `enabled: false`.",
+          "items": {
+            "$ref": "#/definitions/KeywordPattern"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "patterns"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "AWS Bedrock managed guardrail using `ApplyGuardrail` on input, output, or both.",
+      "properties": {
+        "aws_credentials": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/BedrockAWSCredentials"
+            }
+          ],
+          "description": "IAM credentials for Bedrock requests."
+        },
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": false,
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "type": "boolean"
+        },
+        "guardrail_id": {
+          "description": "Guardrail identifier issued by the AWS console.",
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        "guardrail_version": {
+          "description": "Version label: `DRAFT`, `1`, `2`, ...",
+          "maxLength": 16,
+          "minLength": 1,
+          "type": "string"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
+        },
+        "kind": {
+          "description": "Guardrail provider type for Amazon Bedrock Guardrails.",
+          "enum": [
+            "bedrock"
+          ],
+          "type": "string"
+        },
+        "latency_mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/BedrockLatencyMode"
+            }
+          ],
+          "description": "Bedrock guardrail latency policy. Timed mode caps wait time with `timeout_ms`."
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "output_fail_open": {
+          "default": false,
+          "description": "Fail-open policy for the output hook. When disabled (the default), a Bedrock outage blocks model output instead of releasing unscanned content. The input hook continues to use the top-level `fail_open` policy.",
+          "type": "boolean"
+        },
+        "region": {
+          "description": "AWS region for the Bedrock endpoint, such as `us-east-1`.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "aws_credentials",
+        "guardrail_id",
+        "guardrail_version",
+        "kind",
+        "latency_mode",
+        "region"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Azure AI Content Safety Prompt Shield. Detects jailbreak and indirect injection attacks via the `/contentsafety/text:shieldPrompt` API.",
+      "properties": {
+        "api_key": {
+          "description": "Azure subscription key sent with the `Ocp-Apim-Subscription-Key` header. Decrypted before projection. Plaintext is held in memory only and is not logged.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
+        "endpoint": {
+          "description": "Azure Cognitive Services resource endpoint, e.g. `https://my-resource.cognitiveservices.azure.com`. The gateway appends `/contentsafety/text:shieldPrompt?api-version=2024-09-01`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": false,
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
+        },
+        "kind": {
+          "description": "Guardrail provider type for Azure Prompt Shield.",
+          "enum": [
+            "azure_content_safety"
+          ],
+          "type": "string"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "output_fail_open": {
+          "default": false,
+          "description": "Fail-open policy for the output hook. When disabled (the default), an Azure outage blocks model output instead of releasing unscanned content. The input hook continues to use the top-level `fail_open` policy.",
+          "type": "boolean"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "description": "HTTP call timeout in milliseconds. A value of `0` triggers the timeout immediately.",
+          "format": "uint32",
+          "maximum": 4294967295.0,
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "api_key",
+        "endpoint",
+        "kind"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Azure AI Content Safety Text Moderation. Category-severity and blocklist moderation via the `/contentsafety/text:analyze` API, on input and/or output, including streaming output.",
+      "properties": {
+        "api_key": {
+          "description": "Azure subscription key sent with the `Ocp-Apim-Subscription-Key` header. Plaintext is held in memory only and is not logged.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "blocklist_names": {
+          "default": [],
+          "description": "Azure CS blocklist names to match against.",
+          "items": {
+            "description": "Azure blocklist name to match against.",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "categories": {
+          "default": [
+            "Hate",
+            "Sexual",
+            "SelfHarm",
+            "Violence"
+          ],
+          "description": "Categories to analyze.",
+          "items": {
+            "description": "Azure content category to analyze.",
+            "enum": [
+              "Hate",
+              "Sexual",
+              "SelfHarm",
+              "Violence"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
+        "endpoint": {
+          "description": "Azure Cognitive Services resource endpoint. The gateway appends `/contentsafety/text:analyze?api-version=2024-09-01`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": false,
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "type": "boolean"
+        },
+        "halt_on_blocklist_hit": {
+          "default": false,
+          "description": "Forwarded to Azure's `haltOnBlocklistHit`.",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
+        },
+        "kind": {
+          "description": "Guardrail provider type for Azure text moderation.",
+          "enum": [
+            "azure_content_safety_text_moderation"
+          ],
+          "type": "string"
+        },
+        "max_buffer_bytes": {
+          "default": 262144,
+          "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "on_buffer_exceeded": {
+          "default": "fail_closed",
+          "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
+          "type": "string"
+        },
+        "output_fail_open": {
+          "default": false,
+          "description": "Fail-open policy for the output hook. When disabled, an Azure outage does not release unscanned model output.",
+          "type": "boolean"
+        },
+        "output_type": {
+          "default": "FourSeverityLevels",
+          "description": "Severity scale used for Azure category scores. The four-level scale returns even severities; the eight-level scale returns every integer severity.",
+          "enum": [
+            "FourSeverityLevels",
+            "EightSeverityLevels"
+          ],
+          "type": "string"
+        },
+        "severity_threshold": {
+          "default": 2,
+          "description": "General severity threshold. A category at or above it blocks.",
+          "format": "uint8",
+          "maximum": 7.0,
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "severity_threshold_by_category": {
+          "additionalProperties": {
+            "description": "Severity threshold for the category key.",
+            "format": "uint8",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "default": {},
+          "description": "Per-category threshold overrides. These take precedence over the general threshold.",
+          "type": "object"
+        },
+        "stream_processing_mode": {
+          "default": "window",
+          "description": "Streaming output moderation mode: sliding-window incremental release or whole-response hold-back.",
+          "enum": [
+            "window",
+            "buffer_full"
+          ],
+          "type": "string"
+        },
+        "text_source": {
+          "default": "concatenate_user_content",
+          "description": "Input-hook text selection. The default scans user messages only; the alternate mode includes all message content. Ignored on the output hook.",
+          "enum": [
+            "concatenate_user_content",
+            "concatenate_all_content"
+          ],
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "description": "HTTP call timeout in milliseconds. `fail_open` and `output_fail_open` govern the verdict when it elapses. A value of `0` triggers the timeout immediately.",
+          "format": "uint32",
+          "maximum": 4294967295.0,
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "window_overlap_size": {
+          "default": 256,
+          "description": "Chars carried between windows so a span split across a boundary is still caught.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "window_size": {
+          "default": 10000,
+          "description": "Sliding-window size in characters for window mode.",
+          "format": "uint32",
+          "maximum": 10000.0,
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "api_key",
+        "endpoint",
+        "kind"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Aliyun content-safety guardrail. Risk-level moderation via the `TextModerationPlus` action on `green-cip.<region>.aliyuncs.com`, on input and/or output, including streaming output.",
+      "properties": {
+        "access_key_id": {
+          "description": "Aliyun AccessKey ID.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "access_key_secret": {
+          "description": "Aliyun AccessKey secret. Decrypted before projection. Plaintext is held in memory only and is not logged. Used to sign the request.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
+        "endpoint": {
+          "default": null,
+          "description": "Explicit endpoint override as a full URL with no trailing slash. When set, it takes precedence over `region`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": false,
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
+        },
+        "kind": {
+          "description": "Guardrail provider type for Aliyun text moderation.",
+          "enum": [
+            "aliyun_text_moderation"
+          ],
+          "type": "string"
+        },
+        "max_buffer_bytes": {
+          "default": 262144,
+          "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "on_buffer_exceeded": {
+          "default": "fail_closed",
+          "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
+          "type": "string"
+        },
+        "output_fail_open": {
+          "default": false,
+          "description": "Fail-open policy for the output hook. When disabled, an Aliyun outage does not release unscanned model output.",
+          "type": "boolean"
+        },
+        "region": {
+          "description": "Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The gateway builds the endpoint `https://green-cip.<region>.aliyuncs.com`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "risk_level_threshold": {
+          "default": "high",
+          "description": "Minimum risk level that triggers a block. A returned level at or above this threshold blocks.",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "type": "string"
+        },
+        "stream_processing_mode": {
+          "default": "window",
+          "description": "Streaming output moderation mode: sliding-window incremental release or whole-response hold-back.",
+          "enum": [
+            "window",
+            "buffer_full"
+          ],
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "description": "HTTP call timeout in milliseconds. `fail_open` and `output_fail_open` govern the verdict when it elapses. A value of `0` triggers the timeout immediately.",
+          "format": "uint32",
+          "maximum": 4294967295.0,
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "window_overlap_size": {
+          "default": 128,
+          "description": "Chars carried between windows so a span split across a boundary is still caught.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "window_size": {
+          "default": 2000,
+          "description": "Sliding-window size in characters when window mode is used. Aliyun limits each `llm_response_moderation` call to 2,000 characters.",
+          "format": "uint32",
+          "maximum": 2000.0,
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "access_key_id",
+        "access_key_secret",
+        "kind",
+        "region"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Aliyun AI Guardrails. Policy-driven moderation through the `MultiModalGuard` action: the verdict follows the policy configured in the provider's console. Content that policy marks for masking is released with the provider's desensitized text in place of the original, and blocked when no desensitized text is returned. Applies on input and/or output, including streaming output.",
+      "properties": {
+        "access_key_id": {
+          "description": "Aliyun AccessKey ID.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "access_key_secret": {
+          "description": "Aliyun AccessKey secret. Decrypted before projection. Plaintext is held in memory only and is not logged. Used to sign the request.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
+        "endpoint": {
+          "default": null,
+          "description": "Explicit endpoint override as a full URL with no trailing slash. When set, it takes precedence over `region`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": false,
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
+        },
+        "kind": {
+          "description": "Guardrail provider type for Aliyun AI Guardrails policy-driven moderation.",
+          "enum": [
+            "aliyun_ai_guardrail"
+          ],
+          "type": "string"
+        },
+        "max_buffer_bytes": {
+          "default": 262144,
+          "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "on_buffer_exceeded": {
+          "default": "fail_closed",
+          "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
+          "type": "string"
+        },
+        "output_fail_open": {
+          "default": false,
+          "description": "Fail-open policy for the output hook. When disabled, an Aliyun outage does not release unscanned model output.",
+          "type": "boolean"
+        },
+        "region": {
+          "description": "Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The gateway builds the endpoint `https://green-cip.<region>.aliyuncs.com`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "service_level": {
+          "default": "pro",
+          "description": "Which AI Guardrails service tier to call: `pro` uses `query_security_check_pro` / `response_security_check_pro`, `basic` uses `query_security_check` / `response_security_check`. Must match the tier activated on the Aliyun account.",
+          "type": "string"
+        },
+        "stream_processing_mode": {
+          "default": "window",
+          "description": "Streaming output moderation mode: sliding-window incremental release or whole-response hold-back.",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "description": "HTTP call timeout in milliseconds. `fail_open` and `output_fail_open` govern the verdict when it elapses. A value of `0` triggers the timeout immediately.",
+          "format": "uint32",
+          "maximum": 4294967295.0,
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "window_overlap_size": {
+          "default": 128,
+          "description": "Chars carried between windows so a span split across a boundary is still caught.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "window_size": {
+          "default": 2000,
+          "description": "Sliding-window size in characters when window mode is used. Aliyun limits each MultiModalGuard call to 2,000 characters of text.",
+          "format": "uint32",
+          "maximum": 2000.0,
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "access_key_id",
+        "access_key_secret",
+        "kind",
+        "region"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Built-in sensitive-data detection and redaction inside AISIX. Built-in detectors and custom regex patterns can mask matched spans or block traffic on input, output, or both, including buffered streaming output. Always available and does not call an external service.",
+      "properties": {
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "custom_patterns": {
+          "default": [],
+          "description": "Operator-supplied regex detectors, evaluated after the built-ins.",
+          "items": {
+            "$ref": "#/definitions/PiiCustomPattern"
+          },
+          "type": "array"
+        },
+        "default_action": {
+          "default": "mask",
+          "description": "Action for detectors that do not set their own override.",
+          "enum": [
+            "mask",
+            "block"
+          ],
+          "type": "string"
+        },
+        "detectors": {
+          "default": [],
+          "description": "Built-in detectors to enable. The resource schema rejects unknown detector ids, so a typo cannot silently disable the policy.",
+          "items": {
+            "$ref": "#/definitions/PiiDetectorConfig"
+          },
+          "type": "array"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": false,
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
+        },
+        "kind": {
+          "description": "Guardrail provider type for in-process sensitive-data detection and redaction.",
+          "enum": [
+            "pii"
+          ],
+          "type": "string"
+        },
+        "max_buffer_bytes": {
+          "default": 262144,
+          "description": "Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "on_buffer_exceeded": {
+          "default": "fail_closed",
+          "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Lakera Guard screening via `POST /v2/guard`. Prompt-injection, jailbreak, and content-policy detections block traffic. Detections that involve only PII mask spans using the returned offsets. Applies on input, output, or both, including buffered streaming output.",
+      "properties": {
+        "api_key": {
+          "description": "Lakera API key sent as a `Authorization: Bearer` header. Decrypted before projection. Plaintext is held in memory only and is not logged.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
+        "endpoint": {
+          "default": null,
+          "description": "Endpoint override, e.g. a regional or self-hosted Lakera deployment. The gateway appends `/v2/guard`. Defaults to `https://api.lakera.ai`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": false,
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
+        },
+        "kind": {
+          "description": "Guardrail provider type for Lakera Guard screening.",
+          "enum": [
+            "lakera"
+          ],
+          "type": "string"
+        },
+        "max_buffer_bytes": {
+          "default": 262144,
+          "description": "Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "on_buffer_exceeded": {
+          "default": "fail_closed",
+          "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
+          "type": "string"
+        },
+        "output_fail_open": {
+          "default": false,
+          "description": "Fail-open policy for the output hook. When disabled (the default), a Lakera outage blocks model output instead of releasing unscanned content. The input hook continues to use the top-level `fail_open` policy.",
+          "type": "boolean"
+        },
+        "project_id": {
+          "description": "Lakera project whose policy applies (`project-...`). Omitted → the account's default policy.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "description": "HTTP call timeout in milliseconds. `fail_open` and `output_fail_open` govern the verdict when it elapses. A value of `0` triggers the timeout immediately.",
+          "format": "uint32",
+          "maximum": 4294967295.0,
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "api_key",
+        "kind"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "OpenAI Moderation API category screening via `POST /moderations`. Flagged content or configured category thresholds block traffic. This guardrail is detection-only and never rewrites content. Applies on input, output, or both, including buffered streaming output.",
+      "properties": {
+        "api_key": {
+          "description": "OpenAI API key sent as a `Authorization: Bearer` header. Decrypted before projection. Plaintext is held in memory only and is not logged.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "category_thresholds": {
+          "additionalProperties": {
+            "description": "Score threshold for the category key.",
+            "format": "double",
+            "type": "number"
+          },
+          "default": {},
+          "description": "Per-category score thresholds, e.g. `{\"violence\": 0.5}`. When set, only the listed categories are enforced and a category blocks when its score reaches the threshold. When empty (the default), the provider's `flagged` decision determines whether to block.",
+          "type": "object"
+        },
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
+        "endpoint": {
+          "default": null,
+          "description": "Endpoint override, such as an Azure OpenAI deployment. AISIX appends `/moderations`. Defaults to `https://api.openai.com/v1`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": false,
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
+        },
+        "kind": {
+          "description": "Guardrail provider type for the OpenAI Moderation API.",
+          "enum": [
+            "openai_moderation"
+          ],
+          "type": "string"
+        },
+        "model": {
+          "default": "omni-moderation-latest",
+          "description": "Moderation model sent to the provider. The default is `omni-moderation-latest`; provider model names are not restricted by AISIX.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "output_fail_open": {
+          "default": false,
+          "description": "Fail-open policy for the output hook. When disabled (the default), an OpenAI outage blocks model output instead of releasing unscanned content. The input hook continues to use the top-level `fail_open` policy.",
+          "type": "boolean"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "description": "HTTP call timeout in milliseconds. `fail_open` and `output_fail_open` govern the verdict when it elapses. A value of `0` triggers the timeout immediately.",
+          "format": "uint32",
+          "maximum": 4294967295.0,
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "api_key",
+        "kind"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "PII detection and anonymization by a customer-run Presidio. Analyzer entities can mask or block per entity, and masked entities use the selected anonymize operator. Applies on input, output, or both, including buffered streaming output.",
+      "properties": {
+        "analyzer_url": {
+          "description": "Presidio analyzer base URL, e.g. `http://presidio-analyzer:3000`. The gateway appends `/analyze`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "anonymizer_url": {
+          "description": "Presidio anonymizer base URL, e.g. `http://presidio-anonymizer:3000`. The gateway appends `/anonymize`. Only called when a detected entity's effective action is `mask`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "default_action": {
+          "default": "mask",
+          "description": "Action for entities that do not set their own override.",
+          "enum": [
+            "mask",
+            "block"
+          ],
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "entities": {
+          "default": [],
+          "description": "Entities to detect. Empty (the default) analyzes with Presidio's full recognizer set and applies `default_action` to every hit.",
+          "items": {
+            "$ref": "#/definitions/PresidioEntityConfig"
+          },
+          "type": "array"
+        },
+        "fail_open": {
+          "default": false,
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
+        },
+        "kind": {
+          "description": "Guardrail provider type for PII detection and anonymization by a customer-run Presidio.",
+          "enum": [
+            "presidio"
+          ],
+          "type": "string"
+        },
+        "language": {
+          "default": "en",
+          "description": "Analyzer language code.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "max_buffer_bytes": {
+          "default": 262144,
+          "description": "Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "on_buffer_exceeded": {
+          "default": "fail_closed",
+          "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
+          "type": "string"
+        },
+        "operator": {
+          "default": "replace",
+          "description": "Anonymize operator applied to masked entities.",
+          "enum": [
+            "replace",
+            "mask",
+            "hash",
+            "redact"
+          ],
+          "type": "string"
+        },
+        "output_fail_open": {
+          "default": false,
+          "description": "Fail-open policy for the output hook. When disabled (the default), a Presidio outage blocks model output instead of releasing unscanned content. The input hook continues to use the top-level `fail_open` policy.",
+          "type": "boolean"
+        },
+        "score_threshold": {
+          "description": "Minimum analyzer confidence for a hit to count. Omitted → every result the analyzer returns counts (Presidio's own per-recognizer defaults apply).",
+          "format": "double",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "description": "HTTP call timeout in milliseconds, applied per analyzer/anonymizer call. `fail_open` and `output_fail_open` govern the verdict when it elapses. A value of `0` triggers the timeout immediately.",
+          "format": "uint32",
+          "maximum": 4294967295.0,
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "analyzer_url",
+        "anonymizer_url",
+        "kind"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Embedding-similarity screening against operator-supplied example texts. Deny examples block on a close match; an allow-list, when present, blocks everything that matches none of it. Calls an `embedding`-kind Model through the gateway's provider bridges. Detection-only — never rewrites content. Applies on input, output, or both, including buffered streaming output.",
+      "properties": {
+        "allow_examples": {
+          "default": [],
+          "description": "Example texts whose meaning is PERMITTED. When non-empty, a screened text that clears none of them blocks — an allow-list narrows traffic to the listed topics. Empty (the default) means \"no allow-list\": only `deny_examples` can block.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "type": "array"
+        },
+        "allow_threshold": {
+          "default": 0.75,
+          "description": "Cosine-similarity threshold for `allow_examples`, in `[-1, 1]`. RAISE it to block more — a text must reach it to be admitted. Required whenever `allow_examples` is non-empty, and only then: a row with no allow-list has nothing for this number to decide. See `deny_threshold` for why there is no portable value.",
+          "format": "float",
+          "maximum": 1.0,
+          "minimum": -1.0,
+          "type": "number"
+        },
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "deny_examples": {
+          "default": [],
+          "description": "Example texts whose meaning must be REFUSED. A screened text scoring at or above `deny_threshold` against any of them blocks.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "type": "array"
+        },
+        "deny_threshold": {
+          "default": 0.75,
+          "description": "Cosine-similarity threshold for `deny_examples`, in `[-1, 1]`. Lower it to block more. Required whenever `deny_examples` is non-empty.\n\nThere is no portable value. Cosine scores are not comparable across embedding models — the same pair of texts can fall on opposite sides of a fixed threshold depending on which model produced the vectors, and a threshold carried over from another model under-screens without any sign that it is doing so. Measure one against the model named in `embedding_model`, on your own traffic: a request that emits a usage event reports what it scored in `guardrail_scores`, including the requests this guardrail allowed. Not every surface can produce that sample. `/a2a`, `rerank`, `/v1/embeddings`, `/v1/images/*`, `/v1/videos`, `/v1/audio/speech` and `/v1/messages/count_tokens` run the INPUT hook only, so an output-hook row scores nothing on them (audio transcription and translation do run both); `/a2a` also resolves no model and no MCP server, so only a row attached at the environment, API-key or team scope reaches it at all.",
+          "format": "float",
+          "maximum": 1.0,
+          "minimum": -1.0,
+          "type": "number"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "embedding_model": {
+          "default": "",
+          "description": "Alias of an `embedding`-kind Model used to embed both the examples and the screened text. Must resolve in the same environment as this guardrail.\n\nDefaulted at the TYPE level and required by the strict write schema instead: a row the loader cannot deserialize is skipped whole, and a screening row that vanishes is a guardrail that stopped screening. Empty resolves to nothing, so the row degrades per `fail_open` — fail-closed by default — rather than disappearing.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": false,
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
+        },
+        "kind": {
+          "description": "Guardrail provider type for embedding-similarity screening against example texts, using an embedding-kind Model.",
+          "enum": [
+            "semantic"
+          ],
+          "type": "string"
+        },
+        "max_buffer_bytes": {
+          "default": 262144,
+          "description": "Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "max_screened_texts": {
+          "default": 8,
+          "description": "Cap on how many texts ONE request screens, bounding the embedding tokens a single request can spend. The input hook screens the MOST RECENT messages first and drops the rest: an earlier turn was already screened as the latest message of an earlier request, so the dropped tail is seen history rather than unread content.",
+          "format": "uint32",
+          "maximum": 64.0,
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "on_buffer_exceeded": {
+          "default": "fail_closed",
+          "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
+          "enum": [
+            "fail_closed",
+            "fail_open"
+          ],
+          "type": "string"
+        },
+        "output_fail_open": {
+          "default": false,
+          "description": "Fail-open policy for the output hook. When disabled, an embedding outage does not release unscreened model output.",
+          "type": "boolean"
+        },
+        "text_source": {
+          "default": "user_messages",
+          "description": "Input-hook text selection. The default screens user messages only; the alternate mode screens every message. Ignored on the output hook.",
+          "enum": [
+            "user_messages",
+            "all_messages"
+          ],
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "description": "Per-call deadline for the embedding request in milliseconds.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Screening by an operator-supplied script the gateway runs in a sandboxed engine, for a screening service that speaks its own protocol. The script can allow, block, or rewrite content. Applies on input, output, or both, including streaming output.",
+      "properties": {
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": false,
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
+        },
+        "kind": {
+          "description": "Guardrail provider type for screening by an operator-supplied script the gateway runs in a sandboxed engine.",
+          "enum": [
+            "custom"
+          ],
+          "type": "string"
+        },
+        "max_buffer_bytes": {
+          "default": 262144,
+          "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "max_memory_bytes": {
+          "default": 16777216,
+          "description": "Memory ceiling for the script engine, in bytes. A script that exceeds it is terminated and the hook's fail-open policy applies.",
+          "format": "uint64",
+          "maximum": 536870912.0,
+          "minimum": 1048576.0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "on_buffer_exceeded": {
+          "default": "fail_closed",
+          "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
+          "enum": [
+            "fail_closed",
+            "fail_open"
+          ],
+          "type": "string"
+        },
+        "output_fail_open": {
+          "default": false,
+          "description": "Fail-open policy for the output hook. When disabled (the default), a script failure blocks model output instead of releasing unscanned content. The input hook uses the top-level `fail_open` policy.",
+          "type": "boolean"
+        },
+        "script": {
+          "default": "",
+          "description": "The script source, as an ES module exporting `checkInput` and/or `checkOutput`. A hook whose function the module does not export is skipped, so a script may cover one direction only.\n\nRequired on both the write schema and the read one, so a row that omits it is refused rather than loaded: unlike the fields that are write-path-only, a `custom` row with no script screens nothing either way, and rejecting it is what puts it in `/status/config`'s `rejected` list where an operator can see it.\n\nA script that is whitespace-only or does not compile passes the schema — `minLength` counts characters, so a whitespace-only value is non-empty — and is refused when the chain is built instead. `aisix validate` reports that and exits non-zero; a serving gateway reports the runtime rejection through config status (api7/aisix#1084).",
+          "minLength": 1,
+          "type": "string"
+        },
+        "secrets": {
+          "additionalProperties": {
+            "description": "Value the script reads as ctx.secrets under this name.",
+            "type": "string"
+          },
+          "description": "Values the script reads as `ctx.secrets.<NAME>`, for credentials the screening service requires. Stored encrypted and decrypted before projection; plaintext is held in memory only and is never logged.",
+          "type": "object"
+        },
+        "stream_processing_mode": {
+          "default": "window",
+          "description": "Streaming output moderation mode: sliding-window incremental release or whole-response hold-back.",
+          "enum": [
+            "window",
+            "buffer_full"
+          ],
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "description": "Wall-clock budget for one hook invocation, in milliseconds, covering the script's own execution and every call it makes. `fail_open` and `output_fail_open` govern the verdict when it elapses. Per-call timeouts within the budget are the script's own to set.",
+          "format": "uint32",
+          "maximum": 300000.0,
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "window_overlap_size": {
+          "default": 256,
+          "description": "Chars carried between windows so a span split across a boundary is still caught.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "window_size": {
+          "default": 10000,
+          "description": "Sliding-window size in characters for window mode.",
+          "format": "uint32",
+          "maximum": 10000.0,
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "script"
+      ],
+      "type": "object"
+    }
+  ],
+  "properties": {
+    "created_at": {
+      "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+      "format": "date-time",
+      "type": "string"
+    },
+    "direction": {
+      "default": "both",
+      "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+      "type": "string"
+    },
+    "enabled": {
+      "default": true,
+      "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+      "type": "boolean"
+    },
+    "enforcement_mode": {
+      "default": "block",
+      "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+      "type": "string"
+    },
+    "fail_open": {
+      "default": false,
+      "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+      "type": "boolean"
+    },
+    "hook_point": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/GuardrailHookPoint"
+        }
+      ],
+      "default": "both",
+      "description": "Where in the lifecycle this rule runs."
+    },
+    "name": {
+      "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "name"
+  ],
+  "title": "Guardrail",
+  "type": "object"
+}
