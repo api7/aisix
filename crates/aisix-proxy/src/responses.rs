@@ -329,7 +329,7 @@ pub async fn responses(
                         model: &model_name,
                         upstream_model: &success.upstream_model,
                         pk: pk.labels(),
-                        stream: false,
+                        stream: stream_requested,
                         ..Default::default()
                     },
                     status,
@@ -1734,6 +1734,13 @@ async fn responses_to_target(
         let provider_key_id_c = provider_key_id.clone();
         let provider_c = provider_label.clone();
         let upstream_model_c = upstream_model.clone();
+        let (metric_model, metric_upstream_model) = crate::usage_attr::metric_model_label_pair(
+            snapshot,
+            requested_model,
+            &upstream_model_c,
+        );
+        let metric_model = metric_model.into_owned();
+        let metric_upstream_model = metric_upstream_model.into_owned();
         let client_c = client_ctx.clone();
         // #688: carry the reservation into the end-of-stream guard — keys drive
         // post-stream TPM/TPD accounting, the hold keeps the concurrency slot(s)
@@ -1829,8 +1836,8 @@ async fn responses_to_target(
                         .as_caller(),
                     crate::request_metrics::Upstream {
                         provider: &provider_c,
-                        model: &requested_model_c,
-                        upstream_model: &upstream_model_c,
+                        model: &metric_model,
+                        upstream_model: &metric_upstream_model,
                         pk: pk_c.labels(),
                         stream: true,
                         ..Default::default()
@@ -2257,6 +2264,13 @@ async fn responses_cross_provider_to_target(
         let provider_key_id_c = provider_key_id.clone();
         let provider_c = provider_label.clone();
         let upstream_model_c = model.upstream_model().unwrap_or("unknown").to_string();
+        let (metric_model, metric_upstream_model) = crate::usage_attr::metric_model_label_pair(
+            snapshot,
+            requested_model,
+            &upstream_model_c,
+        );
+        let metric_model = metric_model.into_owned();
+        let metric_upstream_model = metric_upstream_model.into_owned();
         let client_c = client_ctx.clone();
         let attempt_c = attempt.clone();
         // #688: carry the reservation into the end-of-stream guard — keys drive
@@ -2352,8 +2366,8 @@ async fn responses_cross_provider_to_target(
                         .as_caller(),
                     crate::request_metrics::Upstream {
                         provider: &provider_c,
-                        model: &requested_model_c,
-                        upstream_model: &upstream_model_c,
+                        model: &metric_model,
+                        upstream_model: &metric_upstream_model,
                         pk: pk_c.labels(),
                         stream: true,
                         ..Default::default()

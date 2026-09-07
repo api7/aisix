@@ -1439,6 +1439,10 @@ async fn anthropic_passthrough_dispatch(
         let model_name_c = model_name.to_string();
         let provider_key_id_c = pk_id.to_string();
         let upstream_model_c = upstream_model.clone();
+        let (metric_model, metric_upstream_model) =
+            crate::usage_attr::metric_model_label_pair(snapshot, model_name, &upstream_model_c);
+        let metric_model = metric_model.into_owned();
+        let metric_upstream_model = metric_upstream_model.into_owned();
         let team_id_c = team_id.clone();
         let user_id_c = user_id.clone();
         let user_name_c = user_name.clone();
@@ -1555,8 +1559,8 @@ async fn anthropic_passthrough_dispatch(
                         .as_caller(),
                     crate::request_metrics::Upstream {
                         provider: &provider_c,
-                        model: &model_name_c,
-                        upstream_model: &upstream_model_c,
+                        model: &metric_model,
+                        upstream_model: &metric_upstream_model,
                         pk: pk_c.labels(),
                         stream: true,
                         ..Default::default()
@@ -2144,6 +2148,13 @@ async fn cross_provider_dispatch(
         let model_for_telem = model_name.to_string();
         let provider_key_id_for_telem = provider_key_id.to_string();
         let upstream_model_for_telem = upstream_model.clone();
+        let (metric_model, metric_upstream_model) = crate::usage_attr::metric_model_label_pair(
+            snapshot,
+            model_name,
+            &upstream_model_for_telem,
+        );
+        let metric_model = metric_model.into_owned();
+        let metric_upstream_model = metric_upstream_model.into_owned();
         let team_id_for_telem = team_id;
         let user_id_for_telem = user_id;
         let user_name_for_telem = user_name;
@@ -2253,8 +2264,8 @@ async fn cross_provider_dispatch(
                     .as_caller(),
                     crate::request_metrics::Upstream {
                         provider: &provider_for_telem,
-                        model: &model_for_telem,
-                        upstream_model: &upstream_model_for_telem,
+                        model: &metric_model,
+                        upstream_model: &metric_upstream_model,
                         pk: pk_telem.labels(),
                         stream: true,
                         ..Default::default()

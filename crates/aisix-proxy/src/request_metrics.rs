@@ -413,6 +413,8 @@ pub(crate) fn record(
     }
 }
 
+/// Stream callbacks must capture bounded model labels from their dispatch
+/// snapshot: the model row may be gone by the time the stream ends.
 pub(crate) fn record_e2e_latency(
     state: &ProxyState,
     endpoint: &'static str,
