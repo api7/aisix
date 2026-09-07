@@ -148,6 +148,10 @@ This repo reads its config from etcd, but users never write etcd directly — th
 
 (Lesson from AISIX-Cloud#873 routing: `least_cost` / `least_latency` / `least_busy`, per-target `tags`, and `sticky` canary all shipped DP-only across #681/#682/#684/#686/#687 while `cp-admin.yaml` still pinned the closed `[round_robin, weighted, failover]` enum and the dashboard had no fields — so none of it was actually usable until the matching CP integration landed. The meta-repo `AGENTS.md` carries the same rule for cross-plane agents.)
 
+## A Control-Plane Response Decodes Loosely
+
+**A data plane may run against a control plane many releases newer than itself, and the etcd read tolerance covers only the resources it loads — the gateway's direct HTTP channels to the control plane need the same tolerance stated for them.** Any struct that decodes a control-plane response must never carry `#[serde(deny_unknown_fields)]`, and every field except the one the decision hinges on must be `#[serde(default)]`, so a field the newer control plane added, or an optional one it stopped sending, cannot turn into a hard error on the request path. A response the gateway does not parse today — one it reads only the status of — stays unparsed unless it is decoded under the same rule. The startup `Config` and its blocks are the deliberate exception: they are `deny_unknown_fields` because they parse the gateway's own `config.yaml`, which nothing but the operator writes.
+
 ## The Resource Model Is Canonical in cp-admin.yaml
 
 **When this repo and the control plane disagree about a resource field's name, enum values, or nesting, the control plane's spec (`AISIX-Cloud: openapi/cp-admin.yaml`) wins by definition — this repo converges to it.**

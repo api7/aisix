@@ -8,18 +8,19 @@ types. The files are **auto-generated** from the Rust type definitions in
 
 ```text
 schemas/
-└── resources/
-    ├── api_key.schema.json
-    ├── cache_policy.schema.json
-    ├── embedding.schema.json
-    ├── guardrail.schema.json
-    ├── model.schema.json
-    ├── observability_exporter.schema.json
-    ├── provider_key.schema.json
-    ├── rate_limit.schema.json
-    ├── rate_limit_policy.schema.json
-    ├── routing.schema.json
-    └── semantic.schema.json
+├── resources/            # strict — the write contract
+│   ├── api_key.schema.json
+│   ├── cache_policy.schema.json
+│   ├── embedding.schema.json
+│   ├── guardrail.schema.json
+│   ├── model.schema.json
+│   ├── observability_exporter.schema.json
+│   ├── provider_key.schema.json
+│   ├── rate_limit.schema.json
+│   ├── rate_limit_policy.schema.json
+│   ├── routing.schema.json
+│   └── semantic.schema.json
+└── resources-lenient/    # lenient — the etcd read contract, same file names
 ```
 
 Each file is a self-contained JSON Schema draft-07 document. Nested
@@ -58,6 +59,32 @@ the unknown fields ignored and reported as partially compatible on
 older gateway serving documents written by a newer control plane. Every
 other constraint in these files — types, required fields, ranges, closed
 enum value sets — applies on both paths.
+
+That read contract is published too, as `resources-lenient/` — see below.
+
+## `resources-lenient/`: what this build will LOAD
+
+`resources-lenient/` carries the same resources under the same file
+names, generated from the same producers with `strict: false` — the
+exact schemas the etcd snapshot loader compiles into `LENIENT_SCHEMAS`
+and validates every stored document against. A consumer that needs to
+know what a given gateway release will accept from etcd reads these
+files rather than deriving them from the strict ones.
+
+The two sets differ in exactly one way: a lenient file carries no
+`additionalProperties: false`, at **any** depth — not on the root, not on
+a `definitions` entry, not on a `oneOf` branch, not on a nested property.
+Field names, types, `required` lists, ranges, enum value sets, the
+`$ref`/`definitions` layout and the `if`/`then`/`oneOf` structure are
+identical. That single difference is the whole tolerance: an optional
+field a newer control plane adds inside a nested config object is
+ignored and reported, instead of taking the whole row down.
+
+The five nested struct types (`ensemble`, `rate_limit`, `routing`,
+`semantic`, `embedding`) have no standalone loader validator — they are
+only ever validated as part of the resource that embeds them — so their
+lenient files are the same struct-derived schema run through the same
+opening pass.
 
 Three top-level resources intentionally **omit**
 `additionalProperties: false` even on the write contract:
@@ -107,7 +134,9 @@ configured in the repository.
 - Documentation sites can consume the hosted Admin API OpenAPI document
   for the AISIX AI Gateway Admin API reference.
 - Control-plane services can pin these files for REST input validation
-  against the same shape the data plane consumes from etcd.
+  against the same shape the data plane consumes from etcd, and pin
+  `resources-lenient/` to reason about what an already-deployed gateway
+  release will still load.
 - Dashboards can render forms from these schemas with
   [RJSF](https://github.com/rjsf-team/react-jsonschema-form) or
   equivalent, instead of hand-coded validators.

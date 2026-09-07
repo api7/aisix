@@ -1,0 +1,1038 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "Aggregation": {
+      "description": "How a request's per-example similarity scores collapse into one score for the route. v1 uses `max` (the single best-matching example), chosen for explainability — the UI surfaces \"the top matching example\" — over semantic-router's default sum/mean-over-top_k.",
+      "oneOf": [
+        {
+          "description": "Route score = the highest cosine across its examples.",
+          "enum": [
+            "max"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "AutoPromptCaching": {
+      "description": "Automatic prompt-cache breakpoint injection for a direct Anthropic model. When enabled, the gateway adds cache-control markers to requests that carry none of their own, so callers get provider-side prompt-cache discounts without changing their requests. Requests that already set their own cache-control markers are forwarded unchanged.",
+      "properties": {
+        "enabled": {
+          "description": "Whether automatic prompt-cache injection is active for this model.",
+          "type": "boolean"
+        },
+        "ttl": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CacheTtl"
+            }
+          ],
+          "description": "Cache lifetime for injected breakpoints: `5m` (default when omitted) or `1h`. A `1h` cache write costs 2x the base input rate versus 1.25x for `5m`, so it pays off only when the cached prefix is reused across a longer session."
+        }
+      },
+      "required": [
+        "enabled"
+      ],
+      "type": "object"
+    },
+    "BackgroundModelCheck": {
+      "properties": {
+        "enabled": {
+          "description": "Whether background health checks are enabled for this model.",
+          "type": "boolean"
+        },
+        "ignore_statuses": {
+          "description": "Upstream status codes to ignore when evaluating background check failures.",
+          "items": {
+            "format": "uint16",
+            "maximum": 599.0,
+            "minimum": 100.0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "interval_seconds": {
+          "description": "Seconds between background health checks. Minimum: 5.",
+          "format": "uint64",
+          "minimum": 5.0,
+          "type": "integer"
+        },
+        "max_tokens": {
+          "description": "Maximum completion tokens requested during each background health check.",
+          "format": "uint32",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "prompt": {
+          "description": "Prompt sent to the model during each background health check.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "stale_after_seconds": {
+          "description": "Seconds after which the last completed background check is considered stale.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "timeout_seconds": {
+          "description": "Request timeout in seconds for each background health check. Minimum: 1.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "enabled",
+        "interval_seconds",
+        "max_tokens",
+        "prompt",
+        "stale_after_seconds",
+        "timeout_seconds"
+      ],
+      "type": "object"
+    },
+    "CacheTtl": {
+      "description": "Cache lifetime for gateway-injected prompt-cache breakpoints.",
+      "enum": [
+        "5m",
+        "1h"
+      ],
+      "type": "string"
+    },
+    "CooldownConfig": {
+      "description": "Request-path cooldown settings for a direct model after retryable upstream failures. Cooldown is opt-in: it runs only when `enabled` is `true`.",
+      "properties": {
+        "default_seconds": {
+          "description": "Cooldown TTL in seconds when the upstream did not supply a `Retry-After` header or `honor_retry_after` is `false`.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "enabled": {
+          "description": "Whether cooldown is active for this model. Cooldown is off unless this is set to `true`, so a model that omits it stays in rotation regardless of upstream failures.",
+          "type": "boolean"
+        },
+        "honor_retry_after": {
+          "description": "Whether to use the upstream's `Retry-After` header as the cooldown TTL when it contains seconds.",
+          "type": "boolean"
+        },
+        "max_seconds": {
+          "description": "Upper bound on cooldown TTL when `Retry-After` is used.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "trigger_on_timeout": {
+          "description": "Whether request-path timeouts trigger cooldown.",
+          "type": "boolean"
+        },
+        "trigger_on_transport": {
+          "description": "Whether transport, decode, or stream-abort errors trigger cooldown.",
+          "type": "boolean"
+        },
+        "trigger_statuses": {
+          "description": "Status codes that trigger cooldown, covering authentication failures, rate limits, and transient server errors. Caller-side validation errors such as `400`, `403`, and `422` are excluded.",
+          "items": {
+            "format": "uint16",
+            "maximum": 599.0,
+            "minimum": 100.0,
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "DistanceMetric": {
+      "description": "Distance metric used to compare the request embedding against route example embeddings. v1 supports cosine only.",
+      "oneOf": [
+        {
+          "description": "Cosine similarity — higher is more similar.",
+          "enum": [
+            "cosine"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "EmbeddingConfig": {
+      "description": "Embedding-modality metadata for a direct Model.",
+      "properties": {
+        "dimensions": {
+          "description": "Output vector dimensionality. Used to validate vectors, key the example-vector cache, and (for endpoints that support it) request a reduced output size.",
+          "format": "uint32",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "normalize": {
+          "default": true,
+          "description": "Whether the endpoint already returns L2-normalized vectors. When `false`, the gateway normalizes before computing cosine similarity. Defaults to `true`.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "dimensions"
+      ],
+      "type": "object"
+    },
+    "EmbeddingFailureMode": {
+      "description": "Mode for an enum-only failure policy: route to the router's `default`, or fail the request with `503`.",
+      "oneOf": [
+        {
+          "description": "Route to the semantic router's `default` model.",
+          "enum": [
+            "default"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Reject the request with `503`.",
+          "enum": [
+            "fail"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "EnsembleConfig": {
+      "properties": {
+        "judge": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Judge"
+            }
+          ],
+          "description": "Direct model that combines successful panel responses."
+        },
+        "min_responses": {
+          "description": "Minimum successful panel responses required before judge synthesis. When omitted, the gateway requires the smaller of 2 and the panel size.",
+          "format": "uint32",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "panel": {
+          "description": "Direct models called concurrently for each ensemble request.",
+          "items": {
+            "$ref": "#/definitions/PanelMember"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "timeout_ms": {
+          "description": "Per-call upstream deadline applied to each panel member and the judge. Set `0` or omit it to disable the ensemble-level deadline.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "judge",
+        "panel"
+      ],
+      "type": "object"
+    },
+    "HashOnSource": {
+      "description": "One source for the `consistent_hash` hash key. Sources are tried in order; the first one that yields a non-empty value wins.",
+      "properties": {
+        "name": {
+          "description": "The header or cookie name to read. Required for `header` and `cookie` sources; not accepted for `api_key` or `client_ip`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/HashOnType"
+            }
+          ],
+          "description": "Which request attribute supplies the hash key."
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    "HashOnType": {
+      "description": "Which request attribute a [`HashOnSource`] reads the hash key from.",
+      "oneOf": [
+        {
+          "description": "A request header, named by `name`.",
+          "enum": [
+            "header"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A cookie from the request's `Cookie` header, named by `name`.",
+          "enum": [
+            "cookie"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The caller's API key id.",
+          "enum": [
+            "api_key"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The caller's resolved client IP (honouring the trusted-proxy configuration).",
+          "enum": [
+            "client_ip"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "Judge": {
+      "description": "The judge model that synthesizes the panel responses into one answer. `model` references a direct model alias.",
+      "properties": {
+        "model": {
+          "description": "Model alias for the direct model that synthesizes panel responses.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "synthesis_prompt": {
+          "description": "Override for the built-in synthesis prompt template.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "type": "object"
+    },
+    "ModelCost": {
+      "description": "Per-token cost for budget tracking. Both values are in USD per 1,000 tokens.",
+      "properties": {
+        "input_per_1k": {
+          "description": "Prompt token cost in USD per 1,000 tokens.",
+          "format": "double",
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "output_per_1k": {
+          "description": "Completion token cost in USD per 1,000 tokens.",
+          "format": "double",
+          "minimum": 0.0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "input_per_1k",
+        "output_per_1k"
+      ],
+      "type": "object"
+    },
+    "OnEmbeddingFailure": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/EmbeddingFailureMode"
+            }
+          ],
+          "description": "`\"default\"` or `\"fail\"`."
+        },
+        {
+          "description": "`{ \"target\": \"<direct alias>\" }` — route to a specific safe model.",
+          "properties": {
+            "target": {
+              "description": "Direct-model alias to route to when embedding fails.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "What the router does when the embedding call errors or times out. Use `\"default\"` to route to the router's default model, `\"fail\"` to reject the request with `503`, or `{ \"target\": \"<direct alias>\" }` to route to a specific fallback model."
+    },
+    "PanelMember": {
+      "description": "One member of an ensemble panel. `model` references a direct model alias.",
+      "properties": {
+        "model": {
+          "description": "Model alias for a direct model that receives one panel request.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "seed": {
+          "description": "Sampling seed for this panel member.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "temperature": {
+          "description": "Sampling temperature for this panel member. Omit it to keep the request's temperature.",
+          "format": "float",
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "weight": {
+          "description": "Reserved for a future voting/quorum strategy. AISIX currently ignores this field.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "type": "object"
+    },
+    "RateLimit": {
+      "properties": {
+        "concurrency": {
+          "description": "Max concurrent in-flight requests.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "rpd": {
+          "description": "Requests per 86,400-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "rph": {
+          "description": "Requests per 3,600-second window. There is no per-hour token limit field.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "rpm": {
+          "description": "Requests per 60-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "rps": {
+          "description": "Requests per 1-second window. There is no per-second token limit field.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tpd": {
+          "description": "Tokens per 86,400-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tpm": {
+          "description": "Tokens per 60-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "Routing": {
+      "properties": {
+        "fallback_on_statuses": {
+          "description": "Additional upstream HTTP status codes that participate in retries and failover. By default a non-429 4xx response is treated as a caller error and returned as-is; providers that use 4xx codes for transient conditions (model overload, queue full, quota exhaustion) can be listed here, for example `[408, 409]`. 5xx codes are already retryable, so listing them changes nothing. Authentication (`401`/`403`) and validation (`400`) codes should only be listed when the provider is known to use them for transient failures.",
+          "items": {
+            "format": "uint16",
+            "maximum": 599.0,
+            "minimum": 400.0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "hash_on": {
+          "description": "Where the `consistent_hash` hash key comes from: an ordered chain of sources, the first non-empty value winning. Defaults to the `x-aisix-routing-key` request header, falling back to the caller's API key id. Only valid with `strategy: consistent_hash`.",
+          "items": {
+            "$ref": "#/definitions/HashOnSource"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "max_fallbacks": {
+          "description": "Max number of later targets to attempt after the initial target fails permanently. When omitted, all later targets may be attempted.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "retries": {
+          "description": "Retry attempts on the current target before failing over, applied to every target that does not set its own `retries`. Absent falls back to the deployment-wide `upstream.retries` default.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "retry_on_429": {
+          "description": "Whether upstream 429 participates in retries and failover.",
+          "type": "boolean"
+        },
+        "strategy": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RoutingStrategy"
+            }
+          ],
+          "default": "failover",
+          "description": "Strategy used to select a target for each request."
+        },
+        "targets": {
+          "description": "Ordered set of direct models available to this routing model.",
+          "items": {
+            "$ref": "#/definitions/RoutingTarget"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "when_all_unavailable": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/WhenAllUnavailablePolicy"
+            }
+          ],
+          "description": "Policy to apply when every target is unavailable because of runtime health or cooldown state."
+        }
+      },
+      "required": [
+        "targets"
+      ],
+      "type": "object"
+    },
+    "RoutingStrategy": {
+      "oneOf": [
+        {
+          "description": "Smooth weighted round-robin over target `weight`s. Equal (or absent) weights degrade to a plain declaration-order cycle.",
+          "enum": [
+            "round_robin"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Ketama-style consistent hashing of the request's hash key (see `hash_on`) over the targets, `weight` scaling each target's share of the ring. The same key keeps landing on the same target while it is healthy; on failure the walk follows the ring so only the failed target's keys move.",
+          "enum": [
+            "consistent_hash"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Always start with the first target and move to later targets only after failure.",
+          "enum": [
+            "failover"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Rank targets cheapest-first by the target model's `cost` (combined input+output per-1K price), then fall forward. Targets without a configured `cost` rank last.",
+          "enum": [
+            "least_cost"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Rank targets fastest-first by a moving average of recent observed upstream latency (time-to-first-token for streaming), then fall forward. Targets with no samples yet rank first so they get probed.",
+          "enum": [
+            "least_latency"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Rank targets least-loaded-first by in-flight requests divided by target `weight` (the APISIX least_conn score), then fall forward.",
+          "enum": [
+            "least_busy"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "RoutingTarget": {
+      "description": "One destination in a routing configuration. `model` references a direct model alias.",
+      "properties": {
+        "model": {
+          "description": "Model alias for a direct model that can receive routed traffic.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "priority": {
+          "description": "Priority tier, default `0`; a higher value is preferred (the APISIX node-priority convention — give backup targets `-1`). The strategy orders targets within each tier; a lower tier is only tried when every higher-tier target failed or is unavailable.",
+          "format": "int32",
+          "type": "integer"
+        },
+        "tags": {
+          "description": "Tags for tag/metadata-conditional routing. When a request carries routing tags, only targets whose tags intersect the request's are eligible; a target tagged `\"default\"` is the fallback used when nothing matches and for untagged requests. Absent/empty means the target opts out of tag filtering (eligible only via the default fallback once any sibling target is tagged). The configured strategy then orders whatever set survives.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "weight": {
+          "description": "Target weight, default `1`. Used by `round_robin` (rotation share), `consistent_hash` (share of the hash ring), and `least_busy` (in-flight divided by weight). `failover`, `least_cost`, and `least_latency` accept the field but do not use it.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "type": "object"
+    },
+    "Semantic": {
+      "description": "Semantic-routing config: pick a target by request meaning.",
+      "properties": {
+        "default": {
+          "description": "Direct model alias used when no route clears its threshold.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "embedding_model": {
+          "description": "Alias of an `embedding`-modality Model used to embed the request and (at apply time) the route examples.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "embedding_timeout_ms": {
+          "description": "Per-call deadline for the embedding request in milliseconds. `0` or absent disables the embedding-specific deadline.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "match": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SemanticMatch"
+            }
+          ],
+          "description": "Shared matching parameters (metric, aggregation, default threshold)."
+        },
+        "on_embedding_failure": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OnEmbeddingFailure"
+            }
+          ],
+          "description": "Behavior when the embedding call fails or times out. Defaults to routing to `default`."
+        },
+        "routes": {
+          "description": "Routes evaluated for each request. At least one is required.",
+          "items": {
+            "$ref": "#/definitions/SemanticRoute"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "default",
+        "embedding_model",
+        "match",
+        "routes"
+      ],
+      "type": "object"
+    },
+    "SemanticMatch": {
+      "description": "Matching parameters shared across every route in a semantic router.",
+      "properties": {
+        "aggregation": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Aggregation"
+            }
+          ],
+          "default": "max",
+          "description": "Per-example score aggregation. v1: max."
+        },
+        "distance_metric": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/DistanceMetric"
+            }
+          ],
+          "default": "cosine",
+          "description": "Similarity metric. v1: cosine."
+        },
+        "threshold": {
+          "description": "Default similarity threshold for routes that do not set their own `threshold`. Higher is stricter.",
+          "format": "float",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "threshold"
+      ],
+      "type": "object"
+    },
+    "SemanticRoute": {
+      "description": "One semantic route: a labeled set of example utterances whose embeddings define the route. A request that scores high enough against them dispatches to `target`.",
+      "properties": {
+        "description": {
+          "description": "Human-facing description. Documentation only — v1 matches on `examples`, not on this field.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "examples": {
+          "description": "Example utterances that define this route. AISIX embeds each example when applying the configuration and caches the vector. A request is matched against these examples. At least one example is required.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "name": {
+          "description": "Operator-facing route label. Surfaced in the `x-aisix-route` response header and access logs (e.g. `prod-chat -> route:legal`).",
+          "minLength": 1,
+          "type": "string"
+        },
+        "target": {
+          "description": "Direct model alias that receives traffic matching this route.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "threshold": {
+          "description": "Per-route similarity threshold. A request matches this route only when its aggregated score is `>=` this value. When omitted, the router-level threshold applies.",
+          "format": "float",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "examples",
+        "name",
+        "target"
+      ],
+      "type": "object"
+    },
+    "WhenAllUnavailablePolicy": {
+      "description": "Behavior when every routing target is unavailable because of runtime health or cooldown state.",
+      "oneOf": [
+        {
+          "description": "Return `503` with a fixed `Retry-After` hint.",
+          "enum": [
+            "fail"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Try every target in declaration order even when all of them are currently unavailable because of health or cooldown status. Use only when maintaining availability is preferred over avoiding recently unhealthy targets.",
+          "enum": [
+            "try_anyway"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "provider"
+            ]
+          },
+          {
+            "required": [
+              "model_name"
+            ]
+          },
+          {
+            "required": [
+              "provider_key_id"
+            ]
+          },
+          {
+            "required": [
+              "background_model_check"
+            ]
+          },
+          {
+            "required": [
+              "cooldown"
+            ]
+          },
+          {
+            "required": [
+              "ensemble"
+            ]
+          },
+          {
+            "required": [
+              "semantic"
+            ]
+          },
+          {
+            "required": [
+              "embedding"
+            ]
+          }
+        ]
+      },
+      "required": [
+        "routing"
+      ]
+    },
+    {
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "routing"
+            ]
+          },
+          {
+            "required": [
+              "ensemble"
+            ]
+          },
+          {
+            "required": [
+              "semantic"
+            ]
+          }
+        ]
+      },
+      "required": [
+        "provider",
+        "model_name",
+        "provider_key_id"
+      ]
+    },
+    {
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "provider"
+            ]
+          },
+          {
+            "required": [
+              "model_name"
+            ]
+          },
+          {
+            "required": [
+              "provider_key_id"
+            ]
+          },
+          {
+            "required": [
+              "routing"
+            ]
+          },
+          {
+            "required": [
+              "background_model_check"
+            ]
+          },
+          {
+            "required": [
+              "cooldown"
+            ]
+          },
+          {
+            "required": [
+              "semantic"
+            ]
+          },
+          {
+            "required": [
+              "embedding"
+            ]
+          }
+        ]
+      },
+      "required": [
+        "ensemble"
+      ]
+    },
+    {
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "provider"
+            ]
+          },
+          {
+            "required": [
+              "model_name"
+            ]
+          },
+          {
+            "required": [
+              "provider_key_id"
+            ]
+          },
+          {
+            "required": [
+              "routing"
+            ]
+          },
+          {
+            "required": [
+              "ensemble"
+            ]
+          },
+          {
+            "required": [
+              "background_model_check"
+            ]
+          },
+          {
+            "required": [
+              "cooldown"
+            ]
+          },
+          {
+            "required": [
+              "embedding"
+            ]
+          }
+        ]
+      },
+      "required": [
+        "semantic"
+      ]
+    }
+  ],
+  "properties": {
+    "allowed_cidrs": {
+      "description": "Client IP allowlist in CIDR notation. Empty or absent allows all clients.",
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "auto_prompt_caching": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AutoPromptCaching"
+        }
+      ],
+      "description": "Automatic prompt-cache breakpoint injection for direct Anthropic models. Omit to leave injection off."
+    },
+    "background_model_check": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/BackgroundModelCheck"
+        }
+      ],
+      "description": "Direct-model-only background health-check configuration."
+    },
+    "cooldown": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/CooldownConfig"
+        }
+      ],
+      "description": "Direct-model-only request-path cooldown configuration. Cooldown is opt-in: omit this field, or leave `enabled` unset, and the model is never taken out of rotation by request-path failures."
+    },
+    "cost": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ModelCost"
+        }
+      ],
+      "description": "Per-token cost for budget tracking. Omit it when cost tracking is not needed."
+    },
+    "display_name": {
+      "description": "Operator-facing unique label. Surfaces on `/v1/models`, `req.model` on chat completions, `ApiKey.allowed_models`, and the dashboard model list. `Resource::name()` returns this.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "effort_mapping": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Direct-model-only mapping from a client-requested reasoning effort to the value sent upstream. The gateway applies one exact lookup after resolving the final target; unlisted values pass through unchanged.",
+      "type": "object"
+    },
+    "embedding": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/EmbeddingConfig"
+        }
+      ],
+      "description": "Embedding-modality metadata. Present on direct Models that serve an OpenAI-compatible `/v1/embeddings` endpoint (and can be referenced by a semantic router's `embedding_model`)."
+    },
+    "ensemble": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/EnsembleConfig"
+        }
+      ],
+      "description": "Ensemble configuration for panel calls and judge synthesis."
+    },
+    "model_name": {
+      "description": "Upstream model identifier sent in provider requests. Routing and ensemble models leave this field unset.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "provider": {
+      "description": "Upstream vendor identity used for dispatch, compatibility checks, telemetry, and access logs. Routing and ensemble models leave this field unset.",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[a-z0-9][a-z0-9._-]*$",
+      "type": "string"
+    },
+    "provider_key_id": {
+      "description": "Provider key resource ID used to authenticate upstream requests. Routing and ensemble models leave this field unset.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "rate_limit": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RateLimit"
+        }
+      ],
+      "description": "Request, token, and concurrency limits for this model."
+    },
+    "retries": {
+      "description": "Retry attempts against this model after a retryable upstream failure, before the request gives up (or, inside a model group, fails over to the next target). Absent falls back to the group's `routing.retries`, then to the deployment-wide `upstream.retries` default.",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "routing": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/Routing"
+        }
+      ],
+      "description": "Virtual routing configuration. When set, the gateway selects a target from `routing.targets` and uses that target model's `provider`, `model_name`, and `provider_key_id` fields for upstream dispatch."
+    },
+    "semantic": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/Semantic"
+        }
+      ],
+      "description": "Semantic-routing configuration. When set, the gateway embeds the request and dispatches to the route whose examples it matches best, using that route's target Model for upstream dispatch."
+    },
+    "stream_timeout": {
+      "description": "Maximum gap in milliseconds between upstream streaming chunks. `0` or absent falls back to the group's `stream_timeout`, then to the model's (or group's) `timeout`, then to the deployment-wide `upstream.stream_timeout_ms` / `timeout_ms` defaults.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "timeout": {
+      "description": "End-to-end timeout in milliseconds for non-streaming upstream calls. Absent falls back to the group's `timeout`, then to the deployment-wide `upstream.timeout_ms` default. `0` disables the non-streaming timeout for this model.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "display_name"
+  ],
+  "title": "Model",
+  "type": "object"
+}

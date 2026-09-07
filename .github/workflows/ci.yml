@@ -46,8 +46,14 @@ jobs:
         run: cargo run -p aisix-core --bin dump-schema
       - name: assert no drift
         run: |
+          # --intent-to-add so a file the dump newly creates (a new resource,
+          # or a whole set) shows up in `git diff` instead of passing as
+          # untracked. Both published sets are checked: `schemas/resources/`
+          # (strict write contract) and `schemas/resources-lenient/` (the
+          # etcd loader's read contract).
+          git add --intent-to-add schemas/
           if ! git diff --exit-code schemas/; then
-            echo "::error::Resource JSON Schemas in 'schemas/resources/' drift from the Rust types in 'crates/aisix-core/src/models/'."
+            echo "::error::Resource JSON Schemas in 'schemas/resources/' or 'schemas/resources-lenient/' drift from the Rust types in 'crates/aisix-core/src/models/'."
             echo "::error::Fix: run 'cargo run -p aisix-core --bin dump-schema' locally and commit the diff."
             exit 1
           fi

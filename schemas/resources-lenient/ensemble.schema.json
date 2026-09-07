@@ -1,0 +1,110 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "Judge": {
+      "description": "The judge model that synthesizes the panel responses into one answer. `model` references a direct model alias.",
+      "properties": {
+        "model": {
+          "description": "Model alias for the direct model that synthesizes panel responses.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "synthesis_prompt": {
+          "description": "Override for the built-in synthesis prompt template.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "type": "object"
+    },
+    "PanelMember": {
+      "description": "One member of an ensemble panel. `model` references a direct model alias.",
+      "properties": {
+        "model": {
+          "description": "Model alias for a direct model that receives one panel request.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "seed": {
+          "description": "Sampling seed for this panel member.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "temperature": {
+          "description": "Sampling temperature for this panel member. Omit it to keep the request's temperature.",
+          "format": "float",
+          "minimum": 0.0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "weight": {
+          "description": "Reserved for a future voting/quorum strategy. AISIX currently ignores this field.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "judge": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/Judge"
+        }
+      ],
+      "description": "Direct model that combines successful panel responses."
+    },
+    "min_responses": {
+      "description": "Minimum successful panel responses required before judge synthesis. When omitted, the gateway requires the smaller of 2 and the panel size.",
+      "format": "uint32",
+      "minimum": 1.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "panel": {
+      "description": "Direct models called concurrently for each ensemble request.",
+      "items": {
+        "$ref": "#/definitions/PanelMember"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "timeout_ms": {
+      "description": "Per-call upstream deadline applied to each panel member and the judge. Set `0` or omit it to disable the ensemble-level deadline.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "judge",
+    "panel"
+  ],
+  "title": "EnsembleConfig",
+  "type": "object"
+}

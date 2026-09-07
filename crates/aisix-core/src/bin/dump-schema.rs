@@ -12,6 +12,20 @@
 //! `schemars` 0.8) — nested types live in the `definitions/` section
 //! of the same document, no cross-file `$ref` required.
 //!
+//! Every run writes BOTH published sets, under the same file names:
+//!
+//! - `schemas/resources/` — the **strict** write contract
+//!   (`resource_root_schema(name, true)`), what `aisix validate` and the
+//!   resources-file source enforce.
+//! - `schemas/resources-lenient/` — the **read** contract
+//!   (`resource_root_schema(name, false)`), the schema the etcd loader
+//!   actually validates stored documents against. It is free of
+//!   `additionalProperties: false` at every depth, so a document written by
+//!   a newer control plane loads with its extra fields ignored instead of
+//!   the whole row being skipped. Published so a consumer that needs to know
+//!   what this build will LOAD can read it instead of deriving it from the
+//!   strict files.
+//!
 //! Re-run after modifying any resource struct in
 //! `crates/aisix-core/src/models/`. CI runs this binary and rejects PRs
 //! that leave `schemas/` out of date (drift check, follow-up PR).
@@ -34,8 +48,11 @@ use aisix_core::models::schema;
 use aisix_core::models::{EmbeddingConfig, EnsembleConfig, RateLimit, Routing, Semantic};
 
 fn main() {
-    let out_dir = workspace_root().join("schemas").join("resources");
+    let schemas_dir = workspace_root().join("schemas");
+    let out_dir = schemas_dir.join("resources");
+    let lenient_dir = schemas_dir.join("resources-lenient");
     fs::create_dir_all(&out_dir).expect("create schemas/resources dir");
+    fs::create_dir_all(&lenient_dir).expect("create schemas/resources-lenient dir");
 
     // Every resource with a runtime validator goes through the SAME
     // `resource_root_schema(name, strict: true)` producer the strict
@@ -44,8 +61,10 @@ fn main() {
     // STRICT shape: they document the declarative write contract (unknown
     // fields are rejected by `aisix validate` and the file source wherever
     // a resource closes them) and the
-    // etcd loader's lenient read tolerance is a runtime behavior, not a
-    // contract callers may write against.
+    // etcd loader's lenient read tolerance is published beside them, as
+    // `schemas/resources-lenient/`, from the same producer with
+    // `strict: false` — the exact value `LENIENT_SCHEMAS` compiles, so the
+    // published read contract cannot drift from the enforced one either.
     // `ensemble`/`rate_limit`/`routing` have no standalone validator (they
     // are nested struct types) so they dump straight from the struct via
     // `schema_for!`, closed the same way.
@@ -55,23 +74,39 @@ fn main() {
             resource,
             schema::resource_root_schema(resource, true),
         );
+        dump_value(
+            &lenient_dir,
+            resource,
+            schema::resource_root_schema(resource, false),
+        );
     }
 
-    dump::<EnsembleConfig>(&out_dir, "ensemble");
-    dump::<RateLimit>(&out_dir, "rate_limit");
-    dump::<Routing>(&out_dir, "routing");
-    dump::<Semantic>(&out_dir, "semantic");
-    dump::<EmbeddingConfig>(&out_dir, "embedding");
+    dump::<EnsembleConfig>(&out_dir, &lenient_dir, "ensemble");
+    dump::<RateLimit>(&out_dir, &lenient_dir, "rate_limit");
+    dump::<Routing>(&out_dir, &lenient_dir, "routing");
+    dump::<Semantic>(&out_dir, &lenient_dir, "semantic");
+    dump::<EmbeddingConfig>(&out_dir, &lenient_dir, "embedding");
 }
 
-fn dump<T: JsonSchema>(out_dir: &Path, name: &str) {
+fn dump<T: JsonSchema>(out_dir: &Path, lenient_dir: &Path, name: &str) {
+    let mut root = schemars::schema_for!(T);
+
+    // The lenient twin comes off the SAME producer, run through
+    // `schema::open_unknown_fields` — the very pass `LENIENT_SCHEMAS`
+    // compiles the resource roots with — before the closing pass below runs.
+    // These nested types have no standalone loader validator (they are only
+    // ever validated as part of the resource that embeds them), so the pass
+    // is what ties the published file to the read contract.
+    let mut lenient = serde_json::to_value(&root).expect("serialize schema");
+    schema::open_unknown_fields(&mut lenient);
+    dump_value(lenient_dir, name, lenient);
+
     // Serialize the `RootSchema` directly to preserve schemars' native key
     // ordering. (Routing through `serde_json::Value` would re-sort keys.)
     // These nested types belong to closed resources, so re-close the root
     // and every struct-shaped definition on the typed schema — the same
     // strictness `schema::close_unknown_fields` applies to the resource
     // documents, kept typed here so the key order stays schemars-native.
-    let mut root = schemars::schema_for!(T);
     close_object_schema(&mut root.schema);
     for def in root.definitions.values_mut() {
         if let schemars::schema::Schema::Object(obj) = def {
