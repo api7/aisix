@@ -1,0 +1,211 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "Aggregation": {
+      "description": "How a request's per-example similarity scores collapse into one score for the route. v1 uses `max` (the single best-matching example), chosen for explainability — the UI surfaces \"the top matching example\" — over semantic-router's default sum/mean-over-top_k.",
+      "oneOf": [
+        {
+          "description": "Route score = the highest cosine across its examples.",
+          "enum": [
+            "max"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "DistanceMetric": {
+      "description": "Distance metric used to compare the request embedding against route example embeddings. v1 supports cosine only.",
+      "oneOf": [
+        {
+          "description": "Cosine similarity — higher is more similar.",
+          "enum": [
+            "cosine"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "EmbeddingFailureMode": {
+      "description": "Mode for an enum-only failure policy: route to the router's `default`, or fail the request with `503`.",
+      "oneOf": [
+        {
+          "description": "Route to the semantic router's `default` model.",
+          "enum": [
+            "default"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Reject the request with `503`.",
+          "enum": [
+            "fail"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "OnEmbeddingFailure": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/EmbeddingFailureMode"
+            }
+          ],
+          "description": "`\"default\"` or `\"fail\"`."
+        },
+        {
+          "description": "`{ \"target\": \"<direct alias>\" }` — route to a specific safe model.",
+          "properties": {
+            "target": {
+              "description": "Direct-model alias to route to when embedding fails.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "What the router does when the embedding call errors or times out. Use `\"default\"` to route to the router's default model, `\"fail\"` to reject the request with `503`, or `{ \"target\": \"<direct alias>\" }` to route to a specific fallback model."
+    },
+    "SemanticMatch": {
+      "description": "Matching parameters shared across every route in a semantic router.",
+      "properties": {
+        "aggregation": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Aggregation"
+            }
+          ],
+          "default": "max",
+          "description": "Per-example score aggregation. v1: max."
+        },
+        "distance_metric": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/DistanceMetric"
+            }
+          ],
+          "default": "cosine",
+          "description": "Similarity metric. v1: cosine."
+        },
+        "threshold": {
+          "description": "Default similarity threshold for routes that do not set their own `threshold`. Higher is stricter.",
+          "format": "float",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "threshold"
+      ],
+      "type": "object"
+    },
+    "SemanticRoute": {
+      "description": "One semantic route: a labeled set of example utterances whose embeddings define the route. A request that scores high enough against them dispatches to `target`.",
+      "properties": {
+        "description": {
+          "description": "Human-facing description. Documentation only — v1 matches on `examples`, not on this field.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "examples": {
+          "description": "Example utterances that define this route. AISIX embeds each example when applying the configuration and caches the vector. A request is matched against these examples. At least one example is required.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "name": {
+          "description": "Operator-facing route label. Surfaced in the `x-aisix-route` response header and access logs (e.g. `prod-chat -> route:legal`).",
+          "minLength": 1,
+          "type": "string"
+        },
+        "target": {
+          "description": "Direct model alias that receives traffic matching this route.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "threshold": {
+          "description": "Per-route similarity threshold. A request matches this route only when its aggregated score is `>=` this value. When omitted, the router-level threshold applies.",
+          "format": "float",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "examples",
+        "name",
+        "target"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "Semantic-routing config: pick a target by request meaning.",
+  "properties": {
+    "default": {
+      "description": "Direct model alias used when no route clears its threshold.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "embedding_model": {
+      "description": "Alias of an `embedding`-modality Model used to embed the request and (at apply time) the route examples.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "embedding_timeout_ms": {
+      "description": "Per-call deadline for the embedding request in milliseconds. `0` or absent disables the embedding-specific deadline.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "match": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/SemanticMatch"
+        }
+      ],
+      "description": "Shared matching parameters (metric, aggregation, default threshold)."
+    },
+    "on_embedding_failure": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/OnEmbeddingFailure"
+        }
+      ],
+      "description": "Behavior when the embedding call fails or times out. Defaults to routing to `default`."
+    },
+    "routes": {
+      "description": "Routes evaluated for each request. At least one is required.",
+      "items": {
+        "$ref": "#/definitions/SemanticRoute"
+      },
+      "minItems": 1,
+      "type": "array"
+    }
+  },
+  "required": [
+    "default",
+    "embedding_model",
+    "match",
+    "routes"
+  ],
+  "title": "Semantic",
+  "type": "object"
+}
