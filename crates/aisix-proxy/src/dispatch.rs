@@ -167,6 +167,28 @@ pub(crate) fn speaks_anthropic(snapshot: &AisixSnapshot, model: &Model) -> bool 
     serves_natively(snapshot, model, ApiSurface::Messages)
 }
 
+/// Whether this Model's upstream is Anthropic's **own** API, as opposed
+/// to any of the other upstreams that merely speak the same wire
+/// protocol.
+///
+/// [`speaks_anthropic`] answers "may this body be forwarded verbatim",
+/// which is true for `provider: "byo"` + `adapter: anthropic` and for any
+/// vendor declaring [`ProviderKey::apis`]`.messages` as well. This answers
+/// the narrower question "is the request being billed and served by
+/// Anthropic", which is what decides whether Anthropic-only request
+/// metadata is meaningful at the other end. It is deliberately keyed on
+/// the catalog vendor id rather than on `api_base`, so a first-party key
+/// pointed at a regional or proxied Anthropic endpoint still counts.
+///
+/// `serves_natively` is the second half rather than a redundant one: a
+/// hand-written resources file can put `provider: "anthropic"` in front of
+/// a platform-adapter key, and such a request is translated onto Bedrock's
+/// or Vertex's own route, where Anthropic's metadata means no more than it
+/// does to any other foreign upstream.
+pub(crate) fn is_first_party_anthropic(snapshot: &AisixSnapshot, model: &Model) -> bool {
+    model.provider.as_deref() == Some("anthropic") && speaks_anthropic(snapshot, model)
+}
+
 /// Whether this Model's upstream serves `surface` natively — i.e. whether
 /// the caller's body may be forwarded verbatim instead of being translated
 /// through a provider bridge.
@@ -861,6 +883,56 @@ mod tests {
         );
         let m = model_on("byo", "pk-1");
         assert!(serves_natively(&snap, &m, ApiSurface::Messages));
+    }
+
+    /// The first-party gate is narrower than the protocol gate, and every
+    /// upstream that only *speaks* Anthropic falls on the other side of it.
+    #[test]
+    fn only_the_catalog_anthropic_vendor_is_first_party() {
+        // The catalog vendor, even pointed at a proxied endpoint.
+        let snap = snapshot_with_pk_json(
+            "pk-1",
+            r#"{"display_name":"a","secret":"k","api_base":"https://anthropic.corp-proxy/","provider":"anthropic","adapter":"anthropic"}"#,
+        );
+        let m = model_on("anthropic", "pk-1");
+        assert!(is_first_party_anthropic(&snap, &m));
+
+        // byo + anthropic adapter: speaks the protocol, is not Anthropic.
+        let snap = snapshot_with_pk_json(
+            "pk-1",
+            r#"{"display_name":"a","secret":"k","api_base":"https://up","provider":"byo","adapter":"anthropic"}"#,
+        );
+        let m = model_on("byo", "pk-1");
+        assert!(speaks_anthropic(&snap, &m));
+        assert!(!is_first_party_anthropic(&snap, &m));
+
+        // A vendor declaring `apis.messages`: same answer.
+        let snap = snapshot_with_pk_json(
+            "pk-1",
+            r#"{"display_name":"ds","secret":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","adapter":"openai",
+                "apis":{"messages":{"base":"https://api.deepseek.com/anthropic"}}}"#,
+        );
+        let m = model_on("deepseek", "pk-1");
+        assert!(speaks_anthropic(&snap, &m));
+        assert!(!is_first_party_anthropic(&snap, &m));
+
+        // An OpenAI-compatible upstream reached through the bridge.
+        let snap = snapshot_with_pk_json(
+            "pk-1",
+            r#"{"display_name":"o","secret":"k","api_base":"https://up/v1","provider":"openai","adapter":"openai"}"#,
+        );
+        let m = model_on("openai", "pk-1");
+        assert!(!is_first_party_anthropic(&snap, &m));
+
+        // A hand-written file can name the anthropic vendor in front of a
+        // platform key. That request is translated onto Bedrock's own
+        // route, so it is not first-party either.
+        let snap = snapshot_with_pk_json(
+            "pk-1",
+            r#"{"display_name":"b","secret":"{}","api_base":"https://up","provider":"anthropic","adapter":"bedrock"}"#,
+        );
+        let m = model_on("anthropic", "pk-1");
+        assert!(!is_first_party_anthropic(&snap, &m));
     }
 
     /// A platform adapter never takes a native path, declaration or not:

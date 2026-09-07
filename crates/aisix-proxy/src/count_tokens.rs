@@ -601,7 +601,17 @@ async fn count_tokens_to_target(
     client: &ClientContext,
 ) -> Result<CountTokensSuccess, ProxyError> {
     let attempt_started = Instant::now();
-    let mut body = crate::effort_mapping::anthropic_request(body, model).into_owned();
+    // Same billing-attribution strip as `/v1/messages` (see
+    // `messages::dispatch_to_target`). This route only ever dispatches to
+    // an Anthropic-protocol upstream, but that includes third-party ones,
+    // and the count it returns must be the count for the body the sibling
+    // route would actually send.
+    let body = if crate::dispatch::is_first_party_anthropic(snapshot, model) {
+        std::borrow::Cow::Borrowed(body)
+    } else {
+        aisix_provider_anthropic::strip_billing_header_attribution(body)
+    };
+    let mut body = crate::effort_mapping::anthropic_request(body.as_ref(), model).into_owned();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();

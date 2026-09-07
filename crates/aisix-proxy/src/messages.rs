@@ -1084,7 +1084,20 @@ async fn dispatch_to_target(
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<DispatchOutcome, ProxyError> {
     let model = &target.model;
-    let body = crate::effort_mapping::anthropic_request(body, model);
+    // Anthropic-native clients prepend a billing-attribution line to the
+    // system prompt that only Anthropic's own API consumes. It varies per
+    // request in some deployments and sits at the very front of the
+    // prompt, so forwarding it to any other upstream misses that
+    // provider's prompt cache on every turn. Dropped here, once, so both
+    // the passthrough and the cross-provider branch below are covered —
+    // and after the handler's guardrail scan, which reads the caller's
+    // body as it was sent.
+    let body = if crate::dispatch::is_first_party_anthropic(snapshot, model) {
+        std::borrow::Cow::Borrowed(body)
+    } else {
+        aisix_provider_anthropic::strip_billing_header_attribution(body)
+    };
+    let body = crate::effort_mapping::anthropic_request(body.as_ref(), model);
     let body = body.as_ref();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
 
