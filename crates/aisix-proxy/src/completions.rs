@@ -101,6 +101,7 @@ struct CompletionUsage {
     /// on `/v1/chat/completions`; 0 when the upstream omits it, never
     /// inferred.
     cached_prompt_tokens: u32,
+    cache_write_tokens: Option<u32>,
     /// True when any counter was filled by the local estimator because
     /// the upstream reported no usage (AISIX-Cloud#1074).
     usage_estimated: bool,
@@ -210,6 +211,7 @@ pub async fn completions(
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     cached_prompt_tokens: 0,
+                    cache_write_tokens: None,
                     usage_estimated: false,
                 });
                 emit_usage_event(
@@ -495,6 +497,7 @@ async fn dispatch(
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     cached_prompt_tokens: 0,
+                    cache_write_tokens: None,
                     usage_estimated: false,
                 });
                 let est_model = model.upstream_model().unwrap_or("unknown");
@@ -706,10 +709,15 @@ fn extract_completion_usage(body: &Value) -> Option<CompletionUsage> {
         .and_then(|d| d.get("cached_tokens"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
+    let cache_write_tokens = usage
+        .pointer("/prompt_tokens_details/cache_write_tokens")
+        .and_then(Value::as_u64)
+        .map(|n| n.min(u32::MAX as u64) as u32);
     Some(CompletionUsage {
         prompt_tokens,
         completion_tokens,
         cached_prompt_tokens,
+        cache_write_tokens,
         usage_estimated: false,
     })
 }
@@ -803,6 +811,8 @@ fn emit_usage_event(
         requested_model: requested_model.to_string(),
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
+        cached_prompt_tokens: usage.cached_prompt_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
         usage_estimated: usage.usage_estimated,
         // Single-attempt endpoint: the attempt spans the whole request, so
         // the upstream figure and what the caller waited for coincide.

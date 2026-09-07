@@ -28,9 +28,8 @@
 //! `metrics-exporter-prometheus`'s text renderer; no global recorder is
 //! installed, so tests can spin up isolated instances per case.
 
-use metrics_exporter_prometheus::{
-    Matcher, PrometheusBuilder, PrometheusHandle, PrometheusRecorder,
-};
+use crate::metric_labels::{LabelRecorder, LabelSelection};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::collections::HashMap;
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -577,7 +576,7 @@ pub struct Metrics {
 }
 
 struct MetricsInner {
-    recorder: PrometheusRecorder,
+    recorder: LabelRecorder,
     handle: PrometheusHandle,
     /// Per-(endpoint, protocol) in-flight counts. A linear scan over a
     /// bounded slot list (route templates × protocols): the steady-state
@@ -931,6 +930,16 @@ impl Metrics {
     /// Like [`Metrics::new_with_env_id`], with operator-supplied histogram
     /// bucket edges (`observability.metrics.buckets`, AISIX-Cloud#1226).
     pub fn new_with_buckets(env_id: &str, buckets: &HistogramBuckets) -> Self {
+        Self::new_with_labels(env_id, buckets, &Default::default())
+            .expect("default metric labels are valid")
+    }
+
+    pub fn new_with_labels(
+        env_id: &str,
+        buckets: &HistogramBuckets,
+        labels: &std::collections::BTreeMap<String, Vec<String>>,
+    ) -> Result<Self, String> {
+        let selection = LabelSelection::compile(labels)?;
         // Buckets ONLY for the SLO histograms and the guardrail latency
         // histogram: with `metrics-exporter-prometheus`, a distribution
         // without configured buckets renders as a summary — which is what
@@ -958,8 +967,9 @@ impl Metrics {
             .expect("bucket lists are validated non-empty")
             .build_recorder();
         let handle = recorder.handle();
+        let recorder = LabelRecorder::new(recorder, selection, env_id);
         static NEXT_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        Self {
+        Ok(Self {
             inner: Arc::new(MetricsInner {
                 recorder,
                 handle,
@@ -976,7 +986,7 @@ impl Metrics {
                 config_labels: Mutex::new(ConfigLabelState::default()),
                 retirable: Mutex::new(HashMap::new()),
             }),
-        }
+        })
     }
 
     /// Remember one label set of a retirable gauge family.
@@ -2546,6 +2556,15 @@ impl Metrics {
                 k.label(provider);
                 k.label(status_bucket(labels.status));
                 k.label_bool(labels.streaming);
+                k.label(labels.details.inbound_protocol);
+                k.label(labels.details.upstream_protocol);
+                k.label(labels.details.upstream_model);
+                k.label(labels.details.provider_key_id);
+                k.label(labels.details.provider_key_name);
+                k.label(labels.details.api_key_id);
+                k.label(labels.details.team_id);
+                k.label(labels.details.user_id);
+                k.label(labels.details.user_name);
             },
             || {
                 metrics::histogram!(
@@ -2556,6 +2575,15 @@ impl Metrics {
                     "provider" => provider.to_string(),
                     "status_class" => status_bucket(labels.status),
                     "streaming" => bool_str(labels.streaming),
+                    "inbound_protocol" => labels.details.inbound_protocol.to_string(),
+                    "upstream_protocol" => labels.details.upstream_protocol.to_string(),
+                    "upstream_model" => labels.details.upstream_model.to_string(),
+                    "provider_key_id" => labels.details.provider_key_id.to_string(),
+                    "provider_key_name" => labels.details.provider_key_name.to_string(),
+                    "api_key_id" => labels.details.api_key_id.to_string(),
+                    "team_id" => labels.details.team_id.to_string(),
+                    "user_id" => labels.details.user_id.to_string(),
+                    "user_name" => labels.details.user_name.to_string(),
                 )
             },
         );
@@ -2614,7 +2642,7 @@ pub struct A2aCallOutcome {
     pub task_state: &'static str,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct LatencyLabels<'a> {
     /// Route template, e.g. `/v1/chat/completions`. Bounded set.
     pub endpoint: &'a str,
@@ -2625,6 +2653,9 @@ pub struct LatencyLabels<'a> {
     /// Raw HTTP status; bucketed to `2xx`/`4xx`/… at record time.
     pub status: u16,
     pub streaming: bool,
+    /// Attribution available for optional labels; the default histogram
+    /// selection retains only its historical dimensions.
+    pub details: UsageLabels<'a>,
 }
 
 /// Missing dimensions default to `"unknown"`, never an empty label value.
@@ -2944,6 +2975,7 @@ impl RequestLabels<'_> {
             "user_id" => self.user_id.to_string(),
             "user_name" => self.user_name.to_string(),
             "stream" => bool_str(self.stream),
+            "is_fallback" => bool_str(self.is_fallback),
             "status" => self.status.to_string(),
             "outcome" => self.outcome.as_str().to_string(),
         )
@@ -4961,6 +4993,7 @@ mod tests {
             provider: "p",
             status: 200,
             streaming: false,
+            details: Default::default(),
         };
         let variants = [
             LatencyLabels {
@@ -5843,6 +5876,7 @@ mod tests {
             provider: "openai",
             status: 200,
             streaming: false,
+            details: Default::default(),
         };
         m.record_request_e2e_latency(labels, Duration::from_millis(1500));
         m.record_request_ttft(
@@ -5903,6 +5937,7 @@ mod tests {
                 provider: "anthropic",
                 status: 502,
                 streaming: false,
+                details: Default::default(),
             },
             Duration::from_millis(1500),
         );
@@ -5936,6 +5971,7 @@ mod tests {
             provider: "openai",
             status: 200,
             streaming: true,
+            details: Default::default(),
         };
         m.record_request_ttft(labels, Duration::ZERO);
         assert!(
@@ -5982,6 +6018,7 @@ mod tests {
             provider: "openai",
             status: 200,
             streaming: true,
+            details: Default::default(),
         };
         m.record_request_e2e_latency(labels, Duration::from_millis(1500));
         m.record_request_ttft(labels, Duration::from_millis(1500));
@@ -6015,6 +6052,7 @@ mod tests {
                 provider: "anthropic",
                 status: 200,
                 streaming: true,
+                details: Default::default(),
             },
             Duration::from_millis(1500),
         );
@@ -6051,6 +6089,7 @@ mod tests {
             provider: "openai",
             status: 200,
             streaming: true,
+            details: Default::default(),
         };
         m.record_request_e2e_latency(labels, Duration::from_millis(1500));
         m.record_request_ttft(labels, Duration::from_millis(1500));

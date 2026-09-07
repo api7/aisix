@@ -932,6 +932,13 @@ impl ObservabilityConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct MetricsConfig {
     pub prometheus: PrometheusConfig,
+    /// Complete label selections by metric family name. An omitted family
+    /// keeps its default labels; an empty list selects no business labels.
+    /// Histogram buckets and summary quantiles keep their generated labels.
+    /// Validated at startup; changing a selection requires a restart.
+    /// Environment variables accept the whole map as one JSON object.
+    #[serde(default, deserialize_with = "deserialize_metric_labels")]
+    pub labels: std::collections::BTreeMap<String, Vec<String>>,
     /// Retired; see [`OtlpConfig`]. `Option` for the same reason as
     /// [`ObservabilityConfig::tracing`].
     pub otlp: Option<OtlpConfig>,
@@ -953,6 +960,24 @@ pub struct MetricsConfig {
     /// own Prometheus scrape surface. Validated at boot (fail-fast),
     /// never hot-reloaded.
     pub buckets: HistogramBucketsConfig,
+}
+
+fn deserialize_metric_labels<'de, D>(
+    deserializer: D,
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Labels {
+        Map(std::collections::BTreeMap<String, Vec<String>>),
+        Json(String),
+    }
+    match Labels::deserialize(deserializer)? {
+        Labels::Map(labels) => Ok(labels),
+        Labels::Json(raw) => serde_json::from_str(&raw).map_err(serde::de::Error::custom),
+    }
 }
 
 /// Per-metric bucket-edge overrides, in seconds. An unset field keeps that
@@ -1804,6 +1829,29 @@ admin:
         assert!(!cfg.proxy.real_ip.recursive);
         assert_eq!(cfg.proxy.real_ip.header, "x-forwarded-for");
         assert!(cfg.proxy.real_ip.parse_trusted().unwrap().is_empty());
+    }
+
+    #[test]
+    fn loads_metric_labels_from_yaml_and_json() {
+        for labels in [
+            "{aisix_request_ttft_seconds: [model, provider_key_name], aisix_requests_total: []}",
+            r#"'{"aisix_request_ttft_seconds":["model","provider_key_name"],"aisix_requests_total":[]}'"#,
+        ] {
+            let file = write_yaml(&format!(
+                "etcd:\n  endpoints: [\"http://127.0.0.1:2379\"]\nproxy:\n  addr: \"127.0.0.1:3000\"\nadmin:\n  admin_keys: [\"test\"]\nobservability:\n  metrics:\n    labels: {labels}\n"
+            ));
+            let cfg = Config::load_from_path(Some(file.path())).unwrap();
+            assert_eq!(
+                cfg.observability.metrics.labels["aisix_request_ttft_seconds"],
+                ["model", "provider_key_name"]
+            );
+            assert!(cfg.observability.metrics.labels["aisix_requests_total"].is_empty());
+            assert!(!cfg
+                .observability
+                .metrics
+                .labels
+                .contains_key("aisix_llm_requests_total"));
+        }
     }
 
     #[test]

@@ -119,6 +119,9 @@ pub struct UsageEvent {
     /// the absent-or-zero case identically.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub cached_prompt_tokens: u32,
+    /// Raw OpenAI cache-write count; it is not additive to prompt tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u32>,
 
     /// OpenAI o1/o3 reasoning tokens. Subset of `completion_tokens`.
     #[serde(default, skip_serializing_if = "is_zero_u32")]

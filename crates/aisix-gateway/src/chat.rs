@@ -316,6 +316,9 @@ pub struct UsageStats {
     /// OpenAI prompt-cache hit count. Subset of `prompt_tokens`.
     #[serde(default)]
     pub cached_prompt_tokens: u32,
+    /// Raw OpenAI cache-write count; it is not additive to prompt tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u32>,
     /// OpenAI o1/o3 reasoning tokens. Subset of `completion_tokens`.
     #[serde(default)]
     pub reasoning_tokens: u32,
@@ -399,6 +402,7 @@ impl UsageStats {
             cached_prompt_tokens: self
                 .cached_prompt_tokens
                 .saturating_add(other.cached_prompt_tokens),
+            cache_write_tokens: add_opt(self.cache_write_tokens, other.cache_write_tokens),
             reasoning_tokens: self.reasoning_tokens.saturating_add(other.reasoning_tokens),
             cache_creation_tokens: self
                 .cache_creation_tokens
@@ -502,8 +506,8 @@ impl UsageStats {
             .saturating_add(self.cached_prompt_tokens)
     }
 
-    /// Anthropic `usage.cache_creation_input_tokens`. No OpenAI-shape
-    /// upstream reports a cache write, so there is nothing to fold in.
+    /// Anthropic `usage.cache_creation_input_tokens`. OpenAI cache writes
+    /// keep their own raw field; they do not use this additive accounting.
     pub fn anthropic_cache_creation_input_tokens(&self) -> u32 {
         self.cache_creation_tokens
     }
@@ -917,10 +921,8 @@ mod tests {
         for u in [anthropic_shape(), openai_shape()] {
             assert_eq!(u.anthropic_cache_read_input_tokens(), R);
         }
-        // The cache WRITE does not: OpenAI accounting has no such
-        // bucket, so an OpenAI upstream's non-hit input is all plain
-        // input. Fabricating a write to make the two shapes look alike
-        // would invent a number the upstream never sent.
+        // OpenAI's raw write count is not Anthropic's additive creation
+        // count. Non-hit OpenAI input remains plain Anthropic input.
         let ant = anthropic_shape();
         assert_eq!(ant.anthropic_input_tokens(), N);
         assert_eq!(ant.anthropic_cache_creation_input_tokens(), W);
@@ -1018,9 +1020,9 @@ mod tests {
         assert_eq!(mixed.openai_total_tokens(), 2 * (N + W + R + O));
 
         // The Anthropic side sums to the same 2 × 140 of input, but
-        // splits it differently, and correctly so: OpenAI accounting has
-        // no cache-WRITE bucket, so that member's non-hit input is all
-        // plain input. Only the Anthropic member contributes a write.
+        // splits it differently: that OpenAI member's non-hit input is
+        // all plain input. Only the Anthropic member contributes an
+        // additive cache-creation count.
         assert_eq!(mixed.anthropic_input_tokens(), N + (W + N));
         assert_eq!(mixed.anthropic_cache_read_input_tokens(), 2 * R);
         assert_eq!(mixed.anthropic_cache_creation_input_tokens(), W);
@@ -1039,6 +1041,7 @@ mod tests {
             completion_tokens: 5,
             total_tokens: 15,
             cached_prompt_tokens: 2,
+            cache_write_tokens: Some(3),
             reasoning_tokens: 3,
             cache_creation_tokens: 1,
             cache_read_tokens: 4,
@@ -1050,6 +1053,7 @@ mod tests {
             completion_tokens: 7,
             total_tokens: 27,
             cached_prompt_tokens: 1,
+            cache_write_tokens: Some(5),
             reasoning_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 6,
@@ -1061,6 +1065,7 @@ mod tests {
         assert_eq!(sum.completion_tokens, 12);
         assert_eq!(sum.total_tokens, 42);
         assert_eq!(sum.cached_prompt_tokens, 3);
+        assert_eq!(sum.cache_write_tokens, Some(8));
         assert_eq!(sum.reasoning_tokens, 3);
         assert_eq!(sum.cache_creation_tokens, 1);
         assert_eq!(sum.cache_read_tokens, 10);

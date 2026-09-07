@@ -14,6 +14,7 @@
 #![deny(rust_2018_idioms)]
 
 pub mod access_log;
+pub mod metric_labels;
 pub mod metrics;
 pub mod otlp_http_sink;
 pub mod sink;

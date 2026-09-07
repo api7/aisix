@@ -929,14 +929,17 @@ fn emit_a2a_usage(
     // the unary, quota-rejected and failed-to-open paths are in the sample
     // too — a streaming-only series would report `/a2a` as having no failures
     // at all.
-    state.metrics.record_request_e2e_latency(
-        aisix_obs::LatencyLabels {
-            endpoint: "/a2a",
-            model: A2A_MODEL_LABEL,
+    crate::request_metrics::record_e2e_latency(
+        state,
+        "/a2a",
+        crate::request_metrics::Caller::new(auth),
+        crate::request_metrics::Upstream {
             provider: "a2a",
-            status: status_code,
-            streaming: is_streaming_operation(call.operation),
+            model: A2A_MODEL_LABEL,
+            stream: is_streaming_operation(call.operation),
+            ..Default::default()
         },
+        status_code,
         latency,
     );
     // The `aisix_a2a_*` family rides on the same chokepoint as the usage

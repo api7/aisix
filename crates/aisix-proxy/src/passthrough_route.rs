@@ -1396,6 +1396,7 @@ struct PassthroughUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
     cached_prompt_tokens: u32,
+    cache_write_tokens: Option<u32>,
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
@@ -1414,6 +1415,7 @@ impl PassthroughUsage {
         self.prompt_tokens = self.prompt_tokens.max(other.prompt_tokens);
         self.completion_tokens = self.completion_tokens.max(other.completion_tokens);
         self.cached_prompt_tokens = self.cached_prompt_tokens.max(other.cached_prompt_tokens);
+        self.cache_write_tokens = self.cache_write_tokens.max(other.cache_write_tokens);
         self.reasoning_tokens = self.reasoning_tokens.max(other.reasoning_tokens);
         self.cache_creation_tokens = self.cache_creation_tokens.max(other.cache_creation_tokens);
         self.cache_read_tokens = self.cache_read_tokens.max(other.cache_read_tokens);
@@ -1462,6 +1464,8 @@ fn usage_of(usage: &serde_json::Value) -> Option<PassthroughUsage> {
         .filter(|&n| n > 0)
         .or_else(|| nested("input_tokens_details", "cached_tokens").filter(|&n| n > 0))
         .or_else(|| flat(&["prompt_cache_hit_tokens", "cached_tokens"]));
+    let cache_write = nested("prompt_tokens_details", "cache_write_tokens")
+        .or_else(|| nested("input_tokens_details", "cache_write_tokens"));
     let reasoning = nested("completion_tokens_details", "reasoning_tokens")
         .filter(|&n| n > 0)
         .or_else(|| nested("output_tokens_details", "reasoning_tokens").filter(|&n| n > 0))
@@ -1475,6 +1479,7 @@ fn usage_of(usage: &serde_json::Value) -> Option<PassthroughUsage> {
         prompt,
         completion,
         cached_prompt,
+        cache_write,
         reasoning,
         cache_creation,
         cache_read,
@@ -1486,6 +1491,7 @@ fn usage_of(usage: &serde_json::Value) -> Option<PassthroughUsage> {
         prompt_tokens: prompt.unwrap_or(0),
         completion_tokens: completion.unwrap_or(0),
         cached_prompt_tokens: cached_prompt.unwrap_or(0),
+        cache_write_tokens: cache_write,
         reasoning_tokens: reasoning.unwrap_or(0),
         cache_creation_tokens: cache_creation.unwrap_or(0),
         cache_read_tokens: cache_read.unwrap_or(0),
@@ -2258,6 +2264,7 @@ impl RouteTelemetry {
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
             cached_prompt_tokens: usage.cached_prompt_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
             reasoning_tokens: usage.reasoning_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
             cache_read_tokens: usage.cache_read_tokens,

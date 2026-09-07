@@ -342,9 +342,11 @@ fn build_output_items(text: Option<&str>, tool_calls: Option<&Vec<Value>>) -> Ve
 /// `cached_tokens > input_tokens` (AISIX-Cloud#1447).
 fn responses_usage_json(u: &UsageStats) -> Value {
     let mut input_details = json!({"cached_tokens": u.openai_cached_tokens()});
-    // A cache WRITE is billed input with no OpenAI field of its own, so
-    // name it beside the hit rather than leave it as an unexplained part
-    // of `input_tokens`. Present only when the upstream reported one.
+    if let Some(cache_write) = u.cache_write_tokens {
+        input_details["cache_write_tokens"] = cache_write.into();
+    }
+    // Preserve the additive Anthropic counter separately from OpenAI's
+    // raw cache_write_tokens value. Their accounting is different.
     let cache_creation = u.anthropic_cache_creation_input_tokens();
     if cache_creation > 0 {
         input_details["cache_creation_tokens"] = cache_creation.into();
@@ -444,6 +446,7 @@ pub struct ResponsesSseEncoder {
     total_tokens: u32,
     reasoning_tokens: u32,
     cached_prompt_tokens: u32,
+    cache_write_tokens: Option<u32>,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
 }
@@ -475,6 +478,7 @@ impl ResponsesSseEncoder {
             total_tokens: 0,
             reasoning_tokens: 0,
             cached_prompt_tokens: 0,
+            cache_write_tokens: None,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
         }
@@ -509,6 +513,7 @@ impl ResponsesSseEncoder {
             self.total_tokens = self.total_tokens.max(u.total_tokens);
             self.reasoning_tokens = self.reasoning_tokens.max(u.reasoning_tokens);
             self.cached_prompt_tokens = self.cached_prompt_tokens.max(u.cached_prompt_tokens);
+            self.cache_write_tokens = self.cache_write_tokens.max(u.cache_write_tokens);
             self.cache_creation_tokens = self.cache_creation_tokens.max(u.cache_creation_tokens);
             self.cache_read_tokens = self.cache_read_tokens.max(u.cache_read_tokens);
         }
@@ -522,6 +527,7 @@ impl ResponsesSseEncoder {
             completion_tokens: self.completion_tokens,
             total_tokens: self.total_tokens,
             cached_prompt_tokens: self.cached_prompt_tokens,
+            cache_write_tokens: self.cache_write_tokens,
             reasoning_tokens: self.reasoning_tokens,
             cache_creation_tokens: self.cache_creation_tokens,
             cache_read_tokens: self.cache_read_tokens,
@@ -913,6 +919,7 @@ pub struct ResponsesStreamCompletion {
     pub completion_tokens: u32,
     pub reasoning_tokens: u32,
     pub cached_prompt_tokens: u32,
+    pub cache_write_tokens: Option<u32>,
     pub cache_creation_tokens: u32,
     pub cache_read_tokens: u32,
     pub finish_reason: String,
@@ -1126,6 +1133,7 @@ pub fn build_responses_bridge_stream(
                             comp.completion_tokens = comp.completion_tokens.max(u.completion_tokens);
                             comp.reasoning_tokens = comp.reasoning_tokens.max(u.reasoning_tokens);
                             comp.cached_prompt_tokens = comp.cached_prompt_tokens.max(u.cached_prompt_tokens);
+                            comp.cache_write_tokens = comp.cache_write_tokens.max(u.cache_write_tokens);
                             comp.cache_creation_tokens = comp.cache_creation_tokens.max(u.cache_creation_tokens);
                             comp.cache_read_tokens = comp.cache_read_tokens.max(u.cache_read_tokens);
                         }

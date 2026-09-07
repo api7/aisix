@@ -413,6 +413,43 @@ pub(crate) fn record(
     }
 }
 
+pub(crate) fn record_e2e_latency(
+    state: &ProxyState,
+    endpoint: &'static str,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    status: u16,
+    elapsed: Duration,
+) {
+    let snap = state.snapshot.load();
+    let (model, upstream_model) =
+        crate::usage_attr::metric_model_label_pair(&snap, upstream.model, upstream.upstream_model);
+    state.metrics.record_request_e2e_latency(
+        aisix_obs::LatencyLabels {
+            endpoint,
+            model: model.as_ref(),
+            provider: upstream.provider,
+            status,
+            streaming: upstream.stream,
+            details: UsageLabels {
+                endpoint,
+                inbound_protocol: crate::inbound_protocol_for_endpoint(endpoint),
+                upstream_protocol: upstream.pk.protocol(),
+                provider: upstream.provider,
+                model: model.as_ref(),
+                upstream_model: upstream_model.as_ref(),
+                provider_key_id: upstream.pk.id(),
+                provider_key_name: upstream.pk.name(),
+                api_key_id: caller.api_key_id,
+                team_id: caller.team_id,
+                user_id: caller.user_id,
+                user_name: caller.user_name,
+            },
+        },
+        elapsed,
+    );
+}
+
 /// What one request consumed. Every counter below no-ops on an all-zero
 /// value, so the zero-token paths — a failed attempt, a 501, `/v1/files` —
 /// cost nothing and create no series.

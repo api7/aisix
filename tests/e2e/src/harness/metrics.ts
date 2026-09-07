@@ -25,7 +25,7 @@ export async function scrapeMetrics(
   }
   const out: MetricSample[] = [];
   for (const line of (await res.text()).split("\n")) {
-    const m = /^([a-z_]+)(\{(.*)\})? ([0-9.e+-]+)$/.exec(line.trim());
+    const m = /^([a-z_][a-z0-9_]*)(\{(.*)\})? ([0-9.e+-]+)$/.exec(line.trim());
     if (!m) continue;
     const labels: Record<string, string> = {};
     for (const pair of m[3]?.match(/[a-z_]+="[^"]*"/g) ?? []) {
