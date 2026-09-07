@@ -216,16 +216,19 @@ pub async fn messages(
             // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only —
             // a stream records its full duration at completion instead.
             if !stream_requested {
-                let bounded_model =
-                    crate::usage_attr::metric_model_label(&state.snapshot.load(), &model_name);
-                state.metrics.record_request_e2e_latency(
-                    LatencyLabels {
-                        endpoint: "/v1/messages",
-                        model: bounded_model.as_ref(),
+                crate::request_metrics::record_e2e_latency(
+                    &state,
+                    "/v1/messages",
+                    crate::request_metrics::Caller::new(&auth),
+                    crate::request_metrics::Upstream {
                         provider: &provider_label,
-                        status,
-                        streaming: false,
+                        model: &model_name,
+                        upstream_model: &upstream_model,
+                        pk: pk.labels(),
+                        stream: false,
+                        ..Default::default()
                     },
+                    status,
                     elapsed,
                 );
             }
@@ -292,6 +295,7 @@ pub async fn messages(
                     &api_key_id,
                     &provider_label,
                     &model_name,
+                    &model_name,
                     &upstream_model,
                     auth.key().team_id.as_deref(),
                     auth.key().user_id.as_deref(),
@@ -350,14 +354,16 @@ pub async fn messages(
                 status,
                 elapsed,
             );
-            state.metrics.record_request_e2e_latency(
-                LatencyLabels {
-                    endpoint: "/v1/messages",
-                    model: metric_model.as_ref(),
-                    provider: last_target.provider(),
-                    status,
-                    streaming: stream_requested,
-                },
+            crate::request_metrics::record_e2e_latency(
+                &state,
+                "/v1/messages",
+                crate::request_metrics::Caller::new(&auth),
+                last_target.upstream(
+                    metric_model.as_ref(),
+                    stream_requested,
+                    routing.fallback_count() > 0,
+                ),
+                status,
                 elapsed,
             );
             // AISIX-Cloud#1428: a guardrail refusal IS this failure, so the
@@ -435,6 +441,7 @@ pub async fn messages(
                     &model_id,
                     &api_key_id,
                     "unknown",
+                    &model_name,
                     &model_name,
                     "unknown",
                     auth.key().team_id.as_deref(),
@@ -532,6 +539,7 @@ fn emit_failed_attempts_anthropic(
             &rec.target_model_id,
             api_key_id,
             provider,
+            model,
             model,
             upstream_model,
             team_id,
@@ -1445,12 +1453,13 @@ async fn anthropic_passthrough_dispatch(
         let api_key_id_c = api_key_id.to_string();
         let provider_c = provider_label.clone();
         let model_name_c = model_name.to_string();
-        // Bounded twin for the latency-histogram label (emit-chokepoint
-        // rule) — usage events keep the raw requested string.
-        let bounded_model_c =
-            crate::usage_attr::metric_model_label(&state.snapshot.load(), model_name).into_owned();
         let provider_key_id_c = pk_id.to_string();
         let upstream_model_c = upstream_model.clone();
+        let (metric_model, metric_upstream_model) =
+            crate::usage_attr::metric_model_label_pair(snapshot, model_name, &upstream_model_c);
+        let metric_caller = crate::request_metrics::Caller::from_api_key_id(snapshot, api_key_id);
+        let metric_model = metric_model.into_owned();
+        let metric_upstream_model = metric_upstream_model.into_owned();
         let team_id_c = team_id.clone();
         let user_id_c = user_id.clone();
         let user_name_c = user_name.clone();
@@ -1548,6 +1557,7 @@ async fn anthropic_passthrough_dispatch(
                     // Anthropic upstream: the cache hit arrives as
                     // `cache_read_input_tokens`, never the OpenAI-shape subset.
                     cached_prompt_tokens: 0,
+                    cache_write_tokens: None,
                     cache_creation_tokens: usage.cache_creation_tokens,
                     cache_read_tokens: usage.cache_read_tokens,
                     usage_estimated: usage.usage_estimated,
@@ -1557,21 +1567,26 @@ async fn anthropic_passthrough_dispatch(
                     upstream_ttft_ms: usage.upstream_ttft_ms,
                     downstream_latency_ms: usage.downstream_latency_ms,
                 };
-                state_c.metrics.record_request_e2e_latency(
-                    LatencyLabels {
-                        endpoint: "/v1/messages",
-                        model: &bounded_model_c,
+                let snap_c = state_c.snapshot.load();
+                let pk_c = crate::usage_attr::ResolvedPk::resolve(&snap_c, &provider_key_id_c);
+                crate::request_metrics::record_e2e_latency(
+                    &state_c,
+                    "/v1/messages",
+                    metric_caller.as_caller(),
+                    crate::request_metrics::Upstream {
                         provider: &provider_c,
-                        status: 200,
-                        streaming: true,
+                        model: &metric_model,
+                        upstream_model: &metric_upstream_model,
+                        pk: pk_c.labels(),
+                        stream: true,
+                        ..Default::default()
                     },
+                    200,
                     started.elapsed(),
                 );
                 // A stream can outlive several config generations, so the
                 // end-of-stream emit reads a FRESH snapshot rather than the
                 // one the request started on (#941).
-                let snap_c = state_c.snapshot.load();
-                let pk_c = crate::usage_attr::ResolvedPk::resolve(&snap_c, &provider_key_id_c);
                 emit_anthropic_usage_event(
                     &state_c,
                     &snap_c,
@@ -1582,7 +1597,8 @@ async fn anthropic_passthrough_dispatch(
                     &api_key_id_c,
                     &provider_c,
                     &model_name_c,
-                    &upstream_model_c,
+                    &metric_model,
+                    &metric_upstream_model,
                     team_id_c.as_deref(),
                     user_id_c.as_deref(),
                     user_name_c.as_deref(),
@@ -1941,6 +1957,7 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
         usage_estimated: false,
         // Anthropic upstream: see the streaming sibling — no OpenAI-shape subset.
         cached_prompt_tokens: 0,
+        cache_write_tokens: None,
         prompt_tokens: usage
             .and_then(|u| u.get("input_tokens"))
             .and_then(Value::as_u64)
@@ -2146,10 +2163,16 @@ async fn cross_provider_dispatch(
         let api_key_id_for_telem = api_key_id.to_string();
         let provider_for_telem = provider_label.clone();
         let model_for_telem = model_name.to_string();
-        let bounded_model_for_telem =
-            crate::usage_attr::metric_model_label(&state.snapshot.load(), model_name).into_owned();
         let provider_key_id_for_telem = provider_key_id.to_string();
         let upstream_model_for_telem = upstream_model.clone();
+        let (metric_model, metric_upstream_model) = crate::usage_attr::metric_model_label_pair(
+            snapshot,
+            model_name,
+            &upstream_model_for_telem,
+        );
+        let metric_caller = crate::request_metrics::Caller::from_api_key_id(snapshot, api_key_id);
+        let metric_model = metric_model.into_owned();
+        let metric_upstream_model = metric_upstream_model.into_owned();
         let team_id_for_telem = team_id;
         let user_id_for_telem = user_id;
         let user_name_for_telem = user_name;
@@ -2236,6 +2259,7 @@ async fn cross_provider_dispatch(
                     prompt_tokens: comp.prompt_tokens,
                     completion_tokens: comp.completion_tokens,
                     cached_prompt_tokens: comp.cached_prompt_tokens,
+                    cache_write_tokens: comp.cache_write_tokens,
                     cache_creation_tokens: comp.cache_creation_tokens,
                     cache_read_tokens: comp.cache_read_tokens,
                     usage_estimated: comp.usage_estimated,
@@ -2245,20 +2269,25 @@ async fn cross_provider_dispatch(
                     upstream_ttft_ms: comp.upstream_ttft_ms,
                     downstream_latency_ms: comp.downstream_latency_ms,
                 };
-                state_for_telem.metrics.record_request_e2e_latency(
-                    LatencyLabels {
-                        endpoint: "/v1/messages",
-                        model: &bounded_model_for_telem,
-                        provider: &provider_for_telem,
-                        status: 200,
-                        streaming: true,
-                    },
-                    started_for_telem.elapsed(),
-                );
-                // Fresh snapshot at stream end — see the passthrough path.
                 let snap_telem = state_for_telem.snapshot.load();
                 let pk_telem =
                     crate::usage_attr::ResolvedPk::resolve(&snap_telem, &provider_key_id_for_telem);
+                crate::request_metrics::record_e2e_latency(
+                    &state_for_telem,
+                    "/v1/messages",
+                    metric_caller.as_caller(),
+                    crate::request_metrics::Upstream {
+                        provider: &provider_for_telem,
+                        model: &metric_model,
+                        upstream_model: &metric_upstream_model,
+                        pk: pk_telem.labels(),
+                        stream: true,
+                        ..Default::default()
+                    },
+                    200,
+                    started_for_telem.elapsed(),
+                );
+                // Fresh snapshot at stream end — see the passthrough path.
                 emit_anthropic_usage_event(
                     &state_for_telem,
                     &snap_telem,
@@ -2270,7 +2299,8 @@ async fn cross_provider_dispatch(
                     &api_key_id_for_telem,
                     &provider_for_telem,
                     &model_for_telem,
-                    &upstream_model_for_telem,
+                    &metric_model,
+                    &metric_upstream_model,
                     team_id_for_telem.as_deref(),
                     user_id_for_telem.as_deref(),
                     user_name_for_telem.as_deref(),
@@ -2413,6 +2443,7 @@ async fn cross_provider_dispatch(
         prompt_tokens: resp.usage.prompt_tokens,
         completion_tokens: resp.usage.completion_tokens,
         cached_prompt_tokens: resp.usage.cached_prompt_tokens,
+        cache_write_tokens: resp.usage.cache_write_tokens,
         cache_creation_tokens: resp.usage.cache_creation_tokens,
         cache_read_tokens: resp.usage.cache_read_tokens,
         usage_estimated: false,
@@ -2565,6 +2596,7 @@ fn build_anthropic_sse_stream(
                     if let Some(u) = chunk.usage.as_ref() {
                         comp.prompt_tokens = comp.prompt_tokens.max(u.prompt_tokens);
                         comp.completion_tokens = comp.completion_tokens.max(u.completion_tokens);
+                        comp.cache_write_tokens = comp.cache_write_tokens.max(u.cache_write_tokens);
                         comp.cached_prompt_tokens =
                             comp.cached_prompt_tokens.max(u.cached_prompt_tokens);
                         comp.cache_creation_tokens =
@@ -2833,6 +2865,7 @@ struct AnthropicStreamCompletion {
     completion_tokens: u32,
     /// See [`AnthropicUsageMetrics::cached_prompt_tokens`].
     cached_prompt_tokens: u32,
+    cache_write_tokens: Option<u32>,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
     /// True when the Drop guard filled any token counter from the local
@@ -2996,6 +3029,7 @@ struct AnthropicUsageMetrics {
     /// double-count it, unlike the two Anthropic-shape counters below,
     /// which sit ON TOP of `prompt_tokens`.
     cached_prompt_tokens: u32,
+    cache_write_tokens: Option<u32>,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
     /// True when any token counter was filled by the local estimator
@@ -3040,6 +3074,7 @@ fn emit_anthropic_usage_event(
     api_key_id: &str,
     provider: &str,
     model: &str,
+    metric_model: &str,
     upstream_model: &str,
     team_id: Option<&str>,
     user_id: Option<&str>,
@@ -3094,6 +3129,7 @@ fn emit_anthropic_usage_event(
         prompt_tokens: metrics.prompt_tokens,
         completion_tokens: metrics.completion_tokens,
         cached_prompt_tokens: metrics.cached_prompt_tokens,
+        cache_write_tokens: metrics.cache_write_tokens,
         cache_creation_tokens: metrics.cache_creation_tokens,
         cache_read_tokens: metrics.cache_read_tokens,
         usage_estimated: metrics.usage_estimated,
@@ -3175,7 +3211,7 @@ fn emit_anthropic_usage_event(
         },
         crate::request_metrics::Upstream {
             provider,
-            model,
+            model: metric_model,
             upstream_model,
             pk: pk.labels(),
             ..Default::default()
@@ -3193,8 +3229,11 @@ fn emit_anthropic_usage_event(
     );
     if metrics.upstream_ttft_ms > 0 {
         let snap_for_labels = state.snapshot.load();
-        let (bounded_model, bounded_upstream) =
-            crate::usage_attr::metric_model_label_pair(&snap_for_labels, model, upstream_model);
+        let (bounded_model, bounded_upstream) = crate::usage_attr::metric_model_label_pair(
+            &snap_for_labels,
+            metric_model,
+            upstream_model,
+        );
         state.metrics.record_request_ttft(
             LatencyLabels {
                 endpoint: "/v1/messages",
@@ -3202,6 +3241,20 @@ fn emit_anthropic_usage_event(
                 provider,
                 status: status_code,
                 streaming: true,
+                details: UsageLabels {
+                    endpoint: "/v1/messages",
+                    inbound_protocol: "anthropic",
+                    upstream_protocol,
+                    provider,
+                    model: bounded_model.as_ref(),
+                    upstream_model: bounded_upstream.as_ref(),
+                    provider_key_id: pk.labels().id(),
+                    provider_key_name: pk.labels().name(),
+                    api_key_id,
+                    team_id: team_id.unwrap_or("unknown"),
+                    user_id: user_id.unwrap_or("unknown"),
+                    user_name: user_name.unwrap_or("unknown"),
+                },
             },
             Duration::from_millis(u64::from(metrics.upstream_ttft_ms)),
         );

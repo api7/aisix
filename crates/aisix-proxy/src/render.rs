@@ -104,14 +104,10 @@ pub struct Usage {
 pub struct PromptTokensDetails {
     /// Prompt tokens served from the provider's prompt cache.
     pub cached_tokens: u32,
-    /// Prompt tokens the provider WROTE into its cache this turn.
-    ///
-    /// Not an OpenAI field — OpenAI has no cache-write concept — but
-    /// without it an Anthropic/Bedrock cache write is an unexplained
-    /// increase in `prompt_tokens` that the caller cannot price, and
-    /// Anthropic bills a write above the plain input rate. Emitted only
-    /// when the upstream reported one, so an OpenAI upstream's usage is
-    /// byte-identical to before. LiteLLM surfaces the same counter here.
+    /// Raw OpenAI cache-write counter, kept separate from additive cache creation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u32>,
+    /// Cache creation reported by an Anthropic-shape upstream.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_tokens: Option<u32>,
 }
@@ -153,13 +149,14 @@ impl Usage {
             prompt_tokens: u.openai_prompt_tokens(),
             completion_tokens: u.completion_tokens,
             total_tokens: u.openai_total_tokens(),
-            prompt_tokens_details: (cached_tokens > 0 || cache_creation_tokens > 0).then_some(
-                PromptTokensDetails {
-                    cached_tokens,
-                    cache_creation_tokens: (cache_creation_tokens > 0)
-                        .then_some(cache_creation_tokens),
-                },
-            ),
+            prompt_tokens_details: (cached_tokens > 0
+                || cache_creation_tokens > 0
+                || u.cache_write_tokens.is_some())
+            .then_some(PromptTokensDetails {
+                cached_tokens,
+                cache_write_tokens: u.cache_write_tokens,
+                cache_creation_tokens: (cache_creation_tokens > 0).then_some(cache_creation_tokens),
+            }),
             completion_tokens_details: (u.reasoning_tokens > 0).then_some(
                 CompletionTokensDetails {
                     reasoning_tokens: u.reasoning_tokens,

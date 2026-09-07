@@ -857,10 +857,14 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     let histogram_buckets =
         aisix_obs::HistogramBuckets::from_config(&cfg.observability.metrics.buckets)
             .map_err(|e| anyhow::anyhow!(e))?;
-    let metrics = Arc::new(Metrics::new_with_buckets(
-        &cfg.etcd.env_id,
-        &histogram_buckets,
-    ));
+    let metrics = Arc::new(
+        Metrics::new_with_labels(
+            &cfg.etcd.env_id,
+            &histogram_buckets,
+            &cfg.observability.metrics.labels,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?,
+    );
     // Built before the stores below because each Redis-backed store takes
     // the handle: their failures are fail-open by design, so the counter
     // is the only place the degradation shows (#1060).

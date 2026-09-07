@@ -247,6 +247,8 @@ pub struct OpenAiPromptDetails {
     /// Tokens served from the prompt cache (50% of prompt rate).
     #[serde(default)]
     pub cached_tokens: u32,
+    #[serde(default)]
+    pub cache_write_tokens: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -364,6 +366,10 @@ fn into_usage(u: OpenAiUsage) -> UsageStats {
             .filter(|&n| n > 0)
             .or(u.prompt_cache_hit_tokens)
             .unwrap_or(0),
+        cache_write_tokens: u
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cache_write_tokens),
         reasoning_tokens: u
             .completion_tokens_details
             .as_ref()
@@ -592,6 +598,33 @@ pub(crate) fn embed_response_into(raw: OpenAiEmbedResponse) -> EmbeddingResponse
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_write_preserves_raw_values_and_presence() {
+        for value in [Some(37), Some(0), None] {
+            let mut details = serde_json::json!({"cached_tokens": 19});
+            if let Some(value) = value {
+                details["cache_write_tokens"] = value.into();
+            }
+            let wire: OpenAiUsage = serde_json::from_value(serde_json::json!({
+                "prompt_tokens": 101,
+                "completion_tokens": 11,
+                "total_tokens": 112,
+                "prompt_tokens_details": details,
+            }))
+            .unwrap();
+            let usage = into_usage(wire);
+            assert_eq!(usage.cache_write_tokens, value);
+            assert_eq!(usage.prompt_tokens, 101);
+            assert_eq!(usage.total_tokens, 112);
+            assert_eq!(usage.cache_creation_tokens, 0);
+            let serialized = serde_json::to_value(&usage).unwrap();
+            assert_eq!(
+                serialized.get("cache_write_tokens"),
+                value.map(serde_json::Value::from).as_ref()
+            );
+        }
+    }
 
     #[test]
     fn non_streaming_response_parses_into_chat_response() {

@@ -258,6 +258,7 @@ pub async fn chat_completions(
                     success.completion_tokens.unwrap_or(0) as u32,
                     UsageExtras {
                         cached_prompt_tokens: success.cached_prompt_tokens,
+                        cache_write_tokens: success.cache_write_tokens,
                         reasoning_tokens: success.reasoning_tokens,
                         cache_creation_tokens: success.cache_creation_tokens,
                         cache_read_tokens: success.cache_read_tokens,
@@ -437,14 +438,16 @@ pub async fn chat_completions(
                 status,
                 elapsed,
             );
-            state.metrics.record_request_e2e_latency(
-                LatencyLabels {
-                    endpoint: "/v1/chat/completions",
-                    model: metric_model.as_ref(),
-                    provider: last_target.provider(),
-                    status,
-                    streaming: req.is_streaming(),
-                },
+            crate::request_metrics::record_e2e_latency(
+                &state,
+                "/v1/chat/completions",
+                crate::request_metrics::Caller::new(&auth),
+                last_target.upstream(
+                    metric_model.as_ref(),
+                    req.is_streaming(),
+                    routing.fallback_count() > 0,
+                ),
+                status,
                 elapsed,
             );
             emit_access_log(
@@ -564,6 +567,7 @@ pub async fn chat_completions(
                         c.completion_tokens,
                         UsageExtras {
                             cached_prompt_tokens: c.cached_prompt_tokens,
+                            cache_write_tokens: c.cache_write_tokens,
                             reasoning_tokens: c.reasoning_tokens,
                             cache_creation_tokens: c.cache_creation_tokens,
                             cache_read_tokens: c.cache_read_tokens,
@@ -684,6 +688,7 @@ struct Success {
     /// for providers that don't expose them; cp-api falls back to the
     /// standard prompt / completion rate when these are 0.
     cached_prompt_tokens: u32,
+    cache_write_tokens: Option<u32>,
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
@@ -1247,6 +1252,7 @@ struct UpstreamCharge {
     /// carried no usage block.
     usage_estimated: bool,
     cached_prompt_tokens: u32,
+    cache_write_tokens: Option<u32>,
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
@@ -2119,6 +2125,7 @@ async fn dispatch(
                     comp.completion_tokens,
                     UsageExtras {
                         cached_prompt_tokens: comp.cached_prompt_tokens,
+                        cache_write_tokens: comp.cache_write_tokens,
                         reasoning_tokens: comp.reasoning_tokens,
                         cache_creation_tokens: comp.cache_creation_tokens,
                         cache_read_tokens: comp.cache_read_tokens,
@@ -2230,6 +2237,20 @@ async fn dispatch(
                         provider: &provider_for_metrics,
                         status: 200,
                         streaming: true,
+                        details: UsageLabels {
+                            endpoint: "/v1/chat/completions",
+                            inbound_protocol: "openai",
+                            upstream_protocol: pk.labels().protocol(),
+                            provider: &provider_for_metrics,
+                            model: &bounded_model_for_metrics,
+                            upstream_model: &bounded_upstream_for_metrics,
+                            provider_key_id: pk.labels().id(),
+                            provider_key_name: pk.labels().name(),
+                            api_key_id: &api_key_id_for_telem,
+                            team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
+                            user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
+                            user_name: user_name_for_metrics.as_deref().unwrap_or("unknown"),
+                        },
                     },
                     started.elapsed(),
                 );
@@ -2240,6 +2261,20 @@ async fn dispatch(
                         provider: &provider_for_metrics,
                         status: 200,
                         streaming: true,
+                        details: UsageLabels {
+                            endpoint: "/v1/chat/completions",
+                            inbound_protocol: "openai",
+                            upstream_protocol: pk.labels().protocol(),
+                            provider: &provider_for_metrics,
+                            model: &bounded_model_for_metrics,
+                            upstream_model: &bounded_upstream_for_metrics,
+                            provider_key_id: pk.labels().id(),
+                            provider_key_name: pk.labels().name(),
+                            api_key_id: &api_key_id_for_telem,
+                            team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
+                            user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
+                            user_name: user_name_for_metrics.as_deref().unwrap_or("unknown"),
+                        },
                     },
                     Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
                 );
@@ -2287,6 +2322,7 @@ async fn dispatch(
             total_tokens: None,
             cost_usd: 0.0,
             cached_prompt_tokens: 0,
+            cache_write_tokens: None,
             reasoning_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
@@ -2558,6 +2594,7 @@ async fn dispatch(
                 // "of which N were cache hits" stat reflects the
                 // original event accurately.
                 let cached_prompt_tokens = cached.usage.cached_prompt_tokens;
+                let cache_write_tokens = cached.usage.cache_write_tokens;
                 let reasoning_tokens = cached.usage.reasoning_tokens;
                 let cache_creation_tokens = cached.usage.cache_creation_tokens;
                 let cache_read_tokens = cached.usage.cache_read_tokens;
@@ -2665,6 +2702,7 @@ async fn dispatch(
                     total_tokens: Some(total),
                     usage_estimated,
                     cached_prompt_tokens,
+                    cache_write_tokens,
                     reasoning_tokens,
                     cache_creation_tokens,
                     cache_read_tokens,
@@ -3079,6 +3117,7 @@ async fn dispatch(
     // the upstream gets moved into render_response below — we need them
     // on the Success struct for telemetry.
     let cached_prompt_tokens = upstream.usage.cached_prompt_tokens;
+    let cache_write_tokens = upstream.usage.cache_write_tokens;
     let reasoning_tokens = upstream.usage.reasoning_tokens;
     let cache_creation_tokens = upstream.usage.cache_creation_tokens;
     let cache_read_tokens = upstream.usage.cache_read_tokens;
@@ -3136,6 +3175,7 @@ async fn dispatch(
                 completion_tokens: completion_tokens_u32,
                 usage_estimated,
                 cached_prompt_tokens,
+                cache_write_tokens,
                 reasoning_tokens,
                 cache_creation_tokens,
                 cache_read_tokens,
@@ -3298,6 +3338,7 @@ async fn dispatch(
         total_tokens: Some(total),
         usage_estimated,
         cached_prompt_tokens,
+        cache_write_tokens,
         reasoning_tokens,
         cache_creation_tokens,
         cache_read_tokens,
@@ -3465,6 +3506,7 @@ async fn dispatch_ensemble(
             effective.usage.completion_tokens,
             UsageExtras {
                 cached_prompt_tokens: effective.usage.cached_prompt_tokens,
+                cache_write_tokens: effective.usage.cache_write_tokens,
                 reasoning_tokens: effective.usage.reasoning_tokens,
                 cache_creation_tokens: effective.usage.cache_creation_tokens,
                 cache_read_tokens: effective.usage.cache_read_tokens,
@@ -3760,6 +3802,7 @@ async fn dispatch_ensemble(
         let client_model_for_telem = req.model.clone();
         let bounded_model_for_telem =
             crate::usage_attr::metric_model_label(snapshot, &req.model).into_owned();
+        let metric_caller = crate::request_metrics::Caller::from_api_key_id(snapshot, api_key_id);
         let api_key_id_for_telem = api_key_id.to_string();
         let applied_guardrails_for_telem = applied_guardrails.to_vec();
         // See the single-upstream streaming path.
@@ -3865,6 +3908,7 @@ async fn dispatch_ensemble(
                         member.usage.completion_tokens,
                         UsageExtras {
                             cached_prompt_tokens: member.usage.cached_prompt_tokens,
+                            cache_write_tokens: member.usage.cache_write_tokens,
                             reasoning_tokens: member.usage.reasoning_tokens,
                             cache_creation_tokens: member.usage.cache_creation_tokens,
                             cache_read_tokens: member.usage.cache_read_tokens,
@@ -3902,6 +3946,7 @@ async fn dispatch_ensemble(
                     comp.completion_tokens,
                     UsageExtras {
                         cached_prompt_tokens: comp.cached_prompt_tokens,
+                        cache_write_tokens: comp.cache_write_tokens,
                         reasoning_tokens: comp.reasoning_tokens,
                         cache_creation_tokens: comp.cache_creation_tokens,
                         cache_read_tokens: comp.cache_read_tokens,
@@ -3953,9 +3998,7 @@ async fn dispatch_ensemble(
                 // so record the client-visible panel+judge aggregate against
                 // the ensemble alias rather than dropping the request from
                 // those series entirely.
-                let owned_caller =
-                    crate::request_metrics::Caller::from_api_key_id(&snap, &api_key_id_for_telem);
-                let caller = owned_caller.as_caller();
+                let caller = metric_caller.as_caller();
                 let ensemble_pk =
                     crate::usage_attr::ResolvedPk::resolve(&snap, crate::request_metrics::UNKNOWN);
                 crate::request_metrics::record_usage(
@@ -3995,6 +4038,20 @@ async fn dispatch_ensemble(
                         provider: "ensemble",
                         status: 200,
                         streaming: true,
+                        details: UsageLabels {
+                            endpoint: "/v1/chat/completions",
+                            inbound_protocol: "openai",
+                            upstream_protocol: ensemble_pk.labels().protocol(),
+                            provider: "ensemble",
+                            model: &bounded_model_for_telem,
+                            upstream_model: crate::request_metrics::UNKNOWN,
+                            provider_key_id: ensemble_pk.labels().id(),
+                            provider_key_name: ensemble_pk.labels().name(),
+                            api_key_id: caller.api_key_id,
+                            team_id: caller.team_id,
+                            user_id: caller.user_id,
+                            user_name: caller.user_name,
+                        },
                     },
                     started.elapsed(),
                 );
@@ -4005,6 +4062,20 @@ async fn dispatch_ensemble(
                         provider: "ensemble",
                         status: 200,
                         streaming: true,
+                        details: UsageLabels {
+                            endpoint: "/v1/chat/completions",
+                            inbound_protocol: "openai",
+                            upstream_protocol: ensemble_pk.labels().protocol(),
+                            provider: "ensemble",
+                            model: &bounded_model_for_telem,
+                            upstream_model: crate::request_metrics::UNKNOWN,
+                            provider_key_id: ensemble_pk.labels().id(),
+                            provider_key_name: ensemble_pk.labels().name(),
+                            api_key_id: caller.api_key_id,
+                            team_id: caller.team_id,
+                            user_id: caller.user_id,
+                            user_name: caller.user_name,
+                        },
                     },
                     Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
                 );
@@ -4049,6 +4120,7 @@ async fn dispatch_ensemble(
             usage_estimated: false,
             cost_usd: 0.0,
             cached_prompt_tokens: 0,
+            cache_write_tokens: None,
             reasoning_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
@@ -4184,6 +4256,7 @@ async fn dispatch_ensemble(
             effective_judge.usage.completion_tokens,
             UsageExtras {
                 cached_prompt_tokens: effective_judge.usage.cached_prompt_tokens,
+                cache_write_tokens: effective_judge.usage.cache_write_tokens,
                 reasoning_tokens: effective_judge.usage.reasoning_tokens,
                 cache_creation_tokens: effective_judge.usage.cache_creation_tokens,
                 cache_read_tokens: effective_judge.usage.cache_read_tokens,
@@ -4333,6 +4406,7 @@ async fn dispatch_ensemble(
         total_tokens: Some(u64::from(metric_usage.total_tokens)),
         usage_estimated: false,
         cached_prompt_tokens: metric_usage.cached_prompt_tokens,
+        cache_write_tokens: metric_usage.cache_write_tokens,
         reasoning_tokens: metric_usage.reasoning_tokens,
         cache_creation_tokens: metric_usage.cache_creation_tokens,
         cache_read_tokens: metric_usage.cache_read_tokens,
@@ -4390,7 +4464,6 @@ fn record_success(
     s: &Success,
     elapsed: Duration,
 ) {
-    let metrics = &state.metrics;
     let caller = crate::request_metrics::Caller::new(auth);
     crate::request_metrics::record(
         state,
@@ -4411,15 +4484,19 @@ fn record_success(
     // `elapsed` for a stream is time-to-response-start; the stream's
     // on_complete records the full duration instead.
     if !stream {
-        let bounded_model = crate::usage_attr::metric_model_label(&state.snapshot.load(), model);
-        metrics.record_request_e2e_latency(
-            LatencyLabels {
-                endpoint: "/v1/chat/completions",
-                model: bounded_model.as_ref(),
+        crate::request_metrics::record_e2e_latency(
+            state,
+            "/v1/chat/completions",
+            caller,
+            crate::request_metrics::Upstream {
                 provider,
-                status,
-                streaming: false,
+                model,
+                upstream_model: &s.upstream_model,
+                pk: pk.labels(),
+                stream: false,
+                ..Default::default()
             },
+            status,
             elapsed,
         );
     }
@@ -4535,6 +4612,7 @@ fn emit_usage_event(
         prompt_tokens,
         completion_tokens,
         cached_prompt_tokens: extras.cached_prompt_tokens,
+        cache_write_tokens: extras.cache_write_tokens,
         reasoning_tokens: extras.reasoning_tokens,
         cache_creation_tokens: extras.cache_creation_tokens,
         cache_read_tokens: extras.cache_read_tokens,
@@ -4664,6 +4742,7 @@ pub(crate) fn sanitize_tag(s: String) -> String {
 #[derive(Default)]
 struct UsageExtras {
     cached_prompt_tokens: u32,
+    cache_write_tokens: Option<u32>,
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
@@ -4918,6 +4997,7 @@ struct StreamCompletion {
     /// cumulative-tokens accounting can overflow u32 over a long key.
     total_tokens: u64,
     cached_prompt_tokens: u32,
+    cache_write_tokens: Option<u32>,
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
@@ -5374,6 +5454,7 @@ where
                         if t > comp.total_tokens {
                             comp.total_tokens = t;
                         }
+                        comp.cache_write_tokens = comp.cache_write_tokens.max(u.cache_write_tokens);
                         if u.cached_prompt_tokens > comp.cached_prompt_tokens {
                             comp.cached_prompt_tokens = u.cached_prompt_tokens;
                         }

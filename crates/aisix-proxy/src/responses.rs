@@ -145,6 +145,7 @@ struct ResponseUsage {
     /// OpenAI prompt-cache hit count, subset of `prompt_tokens`,
     /// surfaced via `usage.input_tokens_details.cached_tokens`.
     cached_prompt_tokens: u32,
+    cache_write_tokens: Option<u32>,
     /// Anthropic `cache_creation_input_tokens` (cache write). Always 0 on
     /// the verbatim OpenAI path; carried for the cross-provider bridge
     /// path (#825) so an Anthropic-backed /v1/responses call bills cache
@@ -319,16 +320,19 @@ pub async fn responses(
                 // SLO e2e histogram (AISIX-Cloud#1011): recorded even when
                 // the upstream response carried no parseable usage block —
                 // latency observation must not depend on token accounting.
-                let bounded_model =
-                    crate::usage_attr::metric_model_label(&state.snapshot.load(), &model_name);
-                state.metrics.record_request_e2e_latency(
-                    LatencyLabels {
-                        endpoint: "/v1/responses",
-                        model: bounded_model.as_ref(),
+                crate::request_metrics::record_e2e_latency(
+                    &state,
+                    "/v1/responses",
+                    crate::request_metrics::Caller::new(&auth),
+                    crate::request_metrics::Upstream {
                         provider: &success.provider,
-                        status,
-                        streaming: stream_requested,
+                        model: &model_name,
+                        upstream_model: &success.upstream_model,
+                        pk: pk.labels(),
+                        stream: stream_requested,
+                        ..Default::default()
                     },
+                    status,
                     elapsed,
                 );
                 if let Some(mut usage) = success.usage {
@@ -355,7 +359,8 @@ pub async fn responses(
                         &request_id,
                         &success.model_id,
                         &model_name,
-                        &api_key_id,
+                        &model_name,
+                        crate::request_metrics::Caller::new(&auth),
                         &success.provider,
                         &success.upstream_model,
                         status,
@@ -411,14 +416,16 @@ pub async fn responses(
                 status,
                 elapsed,
             );
-            state.metrics.record_request_e2e_latency(
-                LatencyLabels {
-                    endpoint: "/v1/responses",
-                    model: metric_model.as_ref(),
-                    provider: last_target.provider(),
-                    status,
-                    streaming: stream_requested,
-                },
+            crate::request_metrics::record_e2e_latency(
+                &state,
+                "/v1/responses",
+                crate::request_metrics::Caller::new(&auth),
+                last_target.upstream(
+                    metric_model.as_ref(),
+                    stream_requested,
+                    routing.fallback_count() > 0,
+                ),
+                status,
                 elapsed,
             );
             // AISIX-Cloud#1428: a guardrail refusal IS this failure, so the
@@ -1724,13 +1731,17 @@ async fn responses_to_target(
         let request_id_c = request_id.to_string();
         let model_id_c = model_id.to_string();
         let requested_model_c = requested_model.to_string();
-        let bounded_model_c =
-            crate::usage_attr::metric_model_label(&state.snapshot.load(), requested_model)
-                .into_owned();
-        let api_key_id_c = api_key_id.to_string();
         let provider_key_id_c = provider_key_id.clone();
         let provider_c = provider_label.clone();
         let upstream_model_c = upstream_model.clone();
+        let (metric_model, metric_upstream_model) = crate::usage_attr::metric_model_label_pair(
+            snapshot,
+            requested_model,
+            &upstream_model_c,
+        );
+        let metric_caller = crate::request_metrics::Caller::from_api_key_id(snapshot, api_key_id);
+        let metric_model = metric_model.into_owned();
+        let metric_upstream_model = metric_upstream_model.into_owned();
         let client_c = client_ctx.clone();
         // #688: carry the reservation into the end-of-stream guard — keys drive
         // post-stream TPM/TPD accounting, the hold keeps the concurrency slot(s)
@@ -1817,14 +1828,21 @@ async fn responses_to_target(
                     _ => None,
                 };
                 // SLO e2e histogram: full stream duration (verbatim path).
-                state_c.metrics.record_request_e2e_latency(
-                    LatencyLabels {
-                        endpoint: "/v1/responses",
-                        model: &bounded_model_c,
+                let snap_c = state_c.snapshot.load();
+                let pk_c = ResolvedPk::resolve(&snap_c, &provider_key_id_c);
+                crate::request_metrics::record_e2e_latency(
+                    &state_c,
+                    "/v1/responses",
+                    metric_caller.as_caller(),
+                    crate::request_metrics::Upstream {
                         provider: &provider_c,
-                        status: 200,
-                        streaming: true,
+                        model: &metric_model,
+                        upstream_model: &metric_upstream_model,
+                        pk: pk_c.labels(),
+                        stream: true,
+                        ..Default::default()
                     },
+                    200,
                     started.elapsed(),
                 );
                 // Live-forward path: no output masking possible (a masking
@@ -1837,8 +1855,6 @@ async fn responses_to_target(
                 // A stream can outlive several config generations, so the
                 // end-of-stream emit reads a FRESH snapshot rather than the
                 // one the request started on (#941).
-                let snap_c = state_c.snapshot.load();
-                let pk_c = ResolvedPk::resolve(&snap_c, &provider_key_id_c);
                 emit_usage_event(
                     &state_c,
                     &snap_c,
@@ -1846,9 +1862,10 @@ async fn responses_to_target(
                     &request_id_c,
                     &model_id_c,
                     &requested_model_c,
-                    &api_key_id_c,
+                    &metric_model,
+                    metric_caller.as_caller(),
                     &provider_c,
-                    &upstream_model_c,
+                    &metric_upstream_model,
                     // A stream the consumer abandoned mid-flight is reported
                     // as 499, matching LiteLLM. The upstream work still
                     // happened, so the event is emitted either way — only
@@ -2244,13 +2261,17 @@ async fn responses_cross_provider_to_target(
         let request_id_c = request_id.to_string();
         let model_id_c = model_id.to_string();
         let requested_model_c = requested_model.to_string();
-        let bounded_model_c =
-            crate::usage_attr::metric_model_label(&state.snapshot.load(), requested_model)
-                .into_owned();
-        let api_key_id_c = api_key_id.to_string();
         let provider_key_id_c = provider_key_id.clone();
         let provider_c = provider_label.clone();
         let upstream_model_c = model.upstream_model().unwrap_or("unknown").to_string();
+        let (metric_model, metric_upstream_model) = crate::usage_attr::metric_model_label_pair(
+            snapshot,
+            requested_model,
+            &upstream_model_c,
+        );
+        let metric_caller = crate::request_metrics::Caller::from_api_key_id(snapshot, api_key_id);
+        let metric_model = metric_model.into_owned();
+        let metric_upstream_model = metric_upstream_model.into_owned();
         let client_c = client_ctx.clone();
         let attempt_c = attempt.clone();
         // #688: carry the reservation into the end-of-stream guard — keys drive
@@ -2312,6 +2333,7 @@ async fn responses_cross_provider_to_target(
                     completion_tokens: comp.completion_tokens,
                     reasoning_tokens: comp.reasoning_tokens,
                     cached_prompt_tokens: comp.cached_prompt_tokens,
+                    cache_write_tokens: comp.cache_write_tokens,
                     cache_creation_tokens: comp.cache_creation_tokens,
                     cache_read_tokens: comp.cache_read_tokens,
                     usage_estimated: comp.usage_estimated,
@@ -2336,21 +2358,26 @@ async fn responses_cross_provider_to_target(
                 };
                 // SLO e2e histogram: full stream duration (bridge path).
                 // Blocked streams keep this guard's 422 status.
-                state_c.metrics.record_request_e2e_latency(
-                    LatencyLabels {
-                        endpoint: "/v1/responses",
-                        model: &bounded_model_c,
+                let snap_c = state_c.snapshot.load();
+                let pk_c = ResolvedPk::resolve(&snap_c, &provider_key_id_c);
+                crate::request_metrics::record_e2e_latency(
+                    &state_c,
+                    "/v1/responses",
+                    metric_caller.as_caller(),
+                    crate::request_metrics::Upstream {
                         provider: &provider_c,
-                        status,
-                        streaming: true,
+                        model: &metric_model,
+                        upstream_model: &metric_upstream_model,
+                        pk: pk_c.labels(),
+                        stream: true,
+                        ..Default::default()
                     },
+                    status,
                     started.elapsed(),
                 );
                 // A stream can outlive several config generations, so the
                 // end-of-stream emit reads a FRESH snapshot rather than the
                 // one the request started on (#941).
-                let snap_c = state_c.snapshot.load();
-                let pk_c = ResolvedPk::resolve(&snap_c, &provider_key_id_c);
                 emit_usage_event(
                     &state_c,
                     &snap_c,
@@ -2358,9 +2385,10 @@ async fn responses_cross_provider_to_target(
                     &request_id_c,
                     &model_id_c,
                     &requested_model_c,
-                    &api_key_id_c,
+                    &metric_model,
+                    metric_caller.as_caller(),
                     &provider_c,
-                    &upstream_model_c,
+                    &metric_upstream_model,
                     status,
                     // Attempt-scoped — see the sibling verbatim path.
                     attempt_started.elapsed(),
@@ -2439,6 +2467,7 @@ async fn responses_cross_provider_to_target(
             completion_tokens: resp.usage.completion_tokens,
             reasoning_tokens: resp.usage.reasoning_tokens,
             cached_prompt_tokens: resp.usage.cached_prompt_tokens,
+            cache_write_tokens: resp.usage.cache_write_tokens,
             cache_creation_tokens: resp.usage.cache_creation_tokens,
             cache_read_tokens: resp.usage.cache_read_tokens,
             usage_estimated: false,
@@ -2613,6 +2642,10 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         .and_then(|d| d.get("cached_tokens"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
+    let cache_write_tokens = usage
+        .pointer("/input_tokens_details/cache_write_tokens")
+        .and_then(Value::as_u64)
+        .map(|n| n.min(u32::MAX as u64) as u32);
     Some(ResponseUsage {
         // Parsed from a fully buffered response body, so by definition the
         // response was delivered in full.
@@ -2622,6 +2655,7 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         usage_estimated: false,
         reasoning_tokens,
         cached_prompt_tokens,
+        cache_write_tokens,
         // OpenAI verbatim path: no Anthropic-style cache counters.
         cache_creation_tokens: 0,
         cache_read_tokens: 0,
@@ -3316,7 +3350,8 @@ fn emit_usage_event(
     request_id: &str,
     model_id: &str,
     requested_model: &str,
-    api_key_id: &str,
+    metric_model: &str,
+    caller: crate::request_metrics::Caller<'_>,
     // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
     // follow-up): the wire struct is the CP contract, so they ride
     // alongside rather than in it.
@@ -3350,11 +3385,12 @@ fn emit_usage_event(
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         model_id: model_id.to_string(),
-        api_key_id: api_key_id.to_string(),
+        api_key_id: caller.api_key_id.to_string(),
         requested_model: requested_model.to_string(),
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
         cached_prompt_tokens: usage.cached_prompt_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
         reasoning_tokens: usage.reasoning_tokens,
         // Anthropic cache counters (#825 cross-provider path); 0 on the
         // verbatim OpenAI path.
@@ -3422,15 +3458,13 @@ fn emit_usage_event(
         usage.cache_creation_tokens,
         usage.cache_read_tokens,
     );
-    let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
-    let caller = owned_caller.as_caller();
     crate::request_metrics::record_usage(
         state,
         "/v1/responses",
         caller,
         crate::request_metrics::Upstream {
             provider,
-            model: requested_model,
+            model: metric_model,
             upstream_model,
             pk: pk.labels(),
             ..Default::default()
@@ -3448,7 +3482,7 @@ fn emit_usage_event(
     );
     if usage.upstream_ttft_ms > 0 {
         let (bounded_model, bounded_upstream) =
-            crate::usage_attr::metric_model_label_pair(snap, requested_model, upstream_model);
+            crate::usage_attr::metric_model_label_pair(snap, metric_model, upstream_model);
         let ttft = Duration::from_millis(u64::from(usage.upstream_ttft_ms));
         state.metrics.record_request_ttft(
             LatencyLabels {
@@ -3457,6 +3491,20 @@ fn emit_usage_event(
                 provider,
                 status: status_code,
                 streaming: true,
+                details: UsageLabels {
+                    endpoint: "/v1/responses",
+                    inbound_protocol: "openai",
+                    upstream_protocol: pk.labels().protocol(),
+                    provider,
+                    model: bounded_model.as_ref(),
+                    upstream_model: bounded_upstream.as_ref(),
+                    provider_key_id: pk.labels().id(),
+                    provider_key_name: pk.labels().name(),
+                    api_key_id: caller.api_key_id,
+                    team_id: caller.team_id,
+                    user_id: caller.user_id,
+                    user_name: caller.user_name,
+                },
             },
             ttft,
         );
