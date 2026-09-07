@@ -921,49 +921,88 @@ fn published_strict_schemas_are_what_the_write_path_compiles() {
     }
 }
 
-/// Resources whose read contract relaxes something BEYOND unknown fields,
-/// with the relaxation named. Every other published pair must differ by
-/// closures alone.
+/// Where the two published sets differ BEYOND unknown fields, pinned as the
+/// exhaustive list of JSON paths at which the strict file (with every
+/// `additionalProperties: false` stripped) and the lenient file disagree.
 ///
-/// A consumer that treats the lenient set as "the strict set with
-/// `additionalProperties` stripped" is wrong for exactly these four, and the
-/// difference is not cosmetic — the loader accepts an `mcp_policy` with no
-/// `allow`, or a semantic guardrail with no `embedding_model`, and then reads
-/// the field's default. This table is what keeps `schemas/README.md` honest;
-/// a new relaxation has to be registered here before the suite goes green.
-const EXTRA_RELAXATIONS: &[(&str, &str)] = &[
-    (
-        "api_key",
-        "McpAccess.allow is required on write only; a stored key without it \
-         loads and adds no constraint of its own",
-    ),
+/// A consumer that models the lenient set as "the strict set with the
+/// closures removed" is wrong for these four, and the difference is not
+/// cosmetic: the loader accepts an `mcp_policy` with no `allow` and reads the
+/// field's default. Registering the paths rather than a prose reason is what
+/// makes the table checkable — a claim that some OTHER field relaxed, or that
+/// one of these stopped relaxing, moves a path and fails.
+///
+/// Two shapes appear here, and `schemas/README.md` must keep telling them
+/// apart:
+///
+/// - a `required` / `not` change, which really does let the loader accept a
+///   document the write path rejects (`api_key`, `mcp_policy`, `model`, and
+///   the `semantic` guardrail branch);
+/// - a `default` annotation the STRICT producer strips on purpose and the
+///   lenient one keeps, which changes nothing about what validates but does
+///   feed a schema-driven form generator a value the same branch would refuse
+///   (the `custom` guardrail's `script`, whose `default: ""` sits beside
+///   `minLength: 1`; the semantic thresholds' `default: 0.75`). `script`
+///   itself is required on BOTH sets.
+const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
+    ("api_key", &["/definitions/McpAccess/required"]),
     (
         "guardrail",
-        "the semantic kind requires embedding_model and a threshold beside each \
-         example list on write only; on read both take their defaults, as does \
-         the custom kind's script",
+        &[
+            "/oneOf/10/allOf",
+            "/oneOf/10/properties/allow_threshold/default",
+            "/oneOf/10/properties/deny_threshold/default",
+            "/oneOf/10/required",
+            "/oneOf/11/properties/script/default",
+        ],
     ),
-    (
-        "mcp_policy",
-        "allow is required on write only; a stored policy without it loads as \
-         the empty allow-list",
-    ),
+    ("mcp_policy", &["/required"]),
     (
         "model",
-        "the per-kind `not/anyOf` lists that forbid a knob a kind never resolves \
-         are shorter on read — a stored row keeps loading and \
-         Model::strip_kind_inapplicable drops the dead knob instead",
+        &[
+            "/oneOf/0/not/anyOf",
+            "/oneOf/1/not/anyOf",
+            "/oneOf/2/not/anyOf",
+            "/oneOf/3/not/anyOf",
+        ],
     ),
 ];
 
+/// The published files are exactly the ones `dump-schema` emits today.
+///
+/// `dump-schema` only ever writes, so a file it STOPPED emitting would sit in
+/// the tree, keep matching its twin, and go on being vendored as a contract
+/// this build no longer has. Every other check here is driven off `RESOURCES`
+/// or off the directory itself, and neither can see such an orphan.
+#[test]
+fn published_directories_hold_exactly_what_the_dump_emits() {
+    // The nested struct types `dump-schema` publishes beside the resources.
+    // They have no runtime validator, so `RESOURCES` does not name them.
+    const NESTED: [&str; 5] = ["embedding", "ensemble", "rate_limit", "routing", "semantic"];
+
+    let mut expected: Vec<String> = RESOURCES
+        .iter()
+        .chain(NESTED.iter())
+        .map(|n| format!("{n}.schema.json"))
+        .collect();
+    expected.sort();
+    for dir in ["resources", "resources-lenient"] {
+        assert_eq!(
+            published_file_names(dir),
+            expected,
+            "schemas/{dir}/ holds a file dump-schema no longer emits, or is \
+             missing one it does"
+        );
+    }
+}
+
 /// The two published sets differ ONLY by `additionalProperties: false`,
-/// except where [`EXTRA_RELAXATIONS`] says otherwise.
+/// except at the paths [`EXTRA_RELAXATIONS`] registers.
 ///
 /// Strips every closure out of the strict file and requires the result to
 /// equal the lenient one. This is the claim `schemas/README.md` makes to
-/// downstream consumers, and the claim the control plane's own
-/// strict-to-lenient relaxation table exists because it cannot be made
-/// unconditionally.
+/// downstream consumers, and the claim the control plane cannot make
+/// unconditionally when it derives one set from the other.
 #[test]
 fn published_sets_differ_only_where_registered() {
     fn without_closures(node: &Value) -> Value {
@@ -979,25 +1018,65 @@ fn published_sets_differ_only_where_registered() {
         }
     }
 
-    let mut differ: Vec<String> = Vec::new();
+    /// Every JSON path at which `a` and `b` disagree, deepest name that still
+    /// differs. A length mismatch reports the array itself.
+    fn diff_paths(a: &Value, b: &Value, at: &str, out: &mut Vec<String>) {
+        match (a, b) {
+            (Value::Object(x), Value::Object(y)) => {
+                let mut keys: Vec<&String> = x.keys().chain(y.keys()).collect();
+                keys.sort();
+                keys.dedup();
+                for k in keys {
+                    match (x.get(k), y.get(k)) {
+                        (Some(l), Some(r)) => diff_paths(l, r, &format!("{at}/{k}"), out),
+                        _ => out.push(format!("{at}/{k}")),
+                    }
+                }
+            }
+            (Value::Array(x), Value::Array(y)) if x.len() == y.len() => {
+                for (i, (l, r)) in x.iter().zip(y).enumerate() {
+                    diff_paths(l, r, &format!("{at}/{i}"), out);
+                }
+            }
+            _ if a != b => out.push(at.to_string()),
+            _ => {}
+        }
+    }
+
+    let mut found: Vec<(String, Vec<String>)> = Vec::new();
     for name in published_file_names("resources-lenient") {
         let resource = name.trim_end_matches(".schema.json").to_string();
         let opened = without_closures(&published_schema("resources", &resource));
-        if opened != published_schema("resources-lenient", &resource) {
-            differ.push(resource);
+        let mut paths = Vec::new();
+        diff_paths(
+            &opened,
+            &published_schema("resources-lenient", &resource),
+            "",
+            &mut paths,
+        );
+        paths.sort();
+        if !paths.is_empty() {
+            found.push((resource, paths));
         }
     }
-    differ.sort();
-    let mut registered: Vec<String> = EXTRA_RELAXATIONS
+    found.sort();
+
+    let mut registered: Vec<(String, Vec<String>)> = EXTRA_RELAXATIONS
         .iter()
-        .map(|(r, _)| (*r).to_string())
+        .map(|(r, paths)| {
+            (
+                (*r).to_string(),
+                paths.iter().map(|p| (*p).to_string()).collect(),
+            )
+        })
         .collect();
     registered.sort();
     assert_eq!(
-        differ, registered,
-        "the published sets differ beyond `additionalProperties: false` for a \
-         resource EXTRA_RELAXATIONS does not name (or name one that no longer \
-         differs). schemas/README.md documents this list — update both."
+        found, registered,
+        "the published sets differ beyond `additionalProperties: false` at a \
+         path EXTRA_RELAXATIONS does not register (or register one that no \
+         longer differs). schemas/README.md describes this list in prose — \
+         update both."
     );
 }
 

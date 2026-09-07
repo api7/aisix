@@ -56,10 +56,12 @@ Four top-level resources intentionally **omit**
 - `cache_policy.schema.json` — historically open on write as well.
 - `guardrail_attachment.schema.json` — likewise.
 - `observability_exporter.schema.json` — the top level is open, but the
-  per-`kind` branches stay closed on both paths: an unknown field there
-  could smuggle a plaintext credential past the `credential_ref`
-  indirection, and serde cannot report ignored fields inside the
-  tagged union, so an open branch would be a silent tolerance.
+  per-`kind` branches stay closed on the write path, so a misspelled
+  field is rejected rather than dropped. On the read path they open like
+  every other closure (see `resources-lenient/` below); the tolerance is
+  not silent there because serde cannot report ignored fields inside a
+  tagged union, so the loader takes this resource's unknown-field report
+  from the strict schema instead (`unknown_field_paths`).
 
 Two write paths sit outside this enforcement: the AISIX Cloud control
 plane validates requests against its own API schema before writing
@@ -104,25 +106,41 @@ That is the tolerance the split exists for: an optional field a newer
 control plane adds inside a nested config object is ignored and reported,
 instead of taking the whole row down.
 
-For **four** resources the read contract relaxes something further, and
-a consumer that models the lenient set as "the strict set with
+For **four** resources the read contract relaxes a requirement as well,
+so a consumer that models the lenient set as "the strict set with
 `additionalProperties` stripped" is wrong about them:
 
 | resource | additionally relaxed on read |
 | --- | --- |
 | `api_key` | `McpAccess.allow` is not required |
-| `guardrail` | the `semantic` kind does not require `embedding_model`, nor a threshold beside each example list; the `custom` kind does not require `script` |
+| `guardrail` | the `semantic` kind requires neither `embedding_model` nor a threshold beside each example list |
 | `mcp_policy` | `allow` is not required |
 | `model` | the per-kind `not`/`anyOf` lists that forbid a knob a kind never resolves are shorter — a stored row keeps loading and `Model::strip_kind_inapplicable` drops the dead knob |
 
+Note what is NOT in that table: the `custom` guardrail's `script` is
+required on **both** sets. A scriptless `custom` row screens nothing
+either way, so rejecting it is what makes it visible in
+`GET /status/config`'s `rejected[]`.
+
 These come from the four producers that take a `strict` flag in
-`crates/aisix-core/src/models/schema.rs` and are deliberate. The list is
-pinned by `published_sets_differ_only_where_registered` in
+`crates/aisix-core/src/models/schema.rs` and are deliberate.
+
+Separately, the lenient files keep three `default` annotations the
+strict producer strips on purpose — `default: 0.75` on the `semantic`
+guardrail's `allow_threshold`/`deny_threshold`, and `default: ""` on the
+`custom` kind's `script`, which sits beside `minLength: 1`. They change
+nothing about what validates, but a form generator that honours them
+pre-fills a threshold the operator was deliberately asked to choose, or
+a script value the same branch refuses. Generate forms from
+`resources/`.
+
+The exact paths at which the two sets diverge are pinned by
+`published_sets_differ_only_where_registered` in
 `crates/aisix-core/tests/resource_schema_characterization.rs`, so a new
-divergence has to be registered before the suite goes green. Everything
-else — field names, types, ranges, enum value sets, the
-`$ref`/`definitions` layout, the `if`/`then`/`oneOf` structure — is
-identical.
+divergence — or a change to one of these — has to be registered before
+the suite goes green. Everything else is identical: field names, types,
+ranges, enum value sets, the `$ref`/`definitions` layout, and the
+`if`/`then`/`oneOf` structure.
 
 ### Two gates sit behind the lenient schema
 
@@ -188,9 +206,11 @@ configured in the repository.
   against the same shape the data plane consumes from etcd, and pin
   `resources-lenient/` to reason about what an already-deployed gateway
   release will still load — never the other way round.
-- Dashboards can render forms from these schemas with
+- Dashboards can render forms from `resources/` with
   [RJSF](https://github.com/rjsf-team/react-jsonschema-form) or
-  equivalent, instead of hand-coded validators.
+  equivalent, instead of hand-coded validators — from `resources/` and
+  not its lenient twin, which keeps `default` annotations the write
+  contract deliberately drops (above).
 
 Refs api7/ai-gateway#304 item #1 (canonical JSON Schema as config
 source of truth).
