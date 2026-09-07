@@ -1425,6 +1425,11 @@ impl Resource for Guardrail {
 /// A `Model`-scoped guardrail therefore never inspects MCP or passthrough
 /// traffic, an `McpServer`-scoped one never inspects model traffic, and a
 /// `PassthroughRoute`-scoped one inspects only the traffic of that route.
+///
+/// Scope follows the entry the caller addresses: a guardrail attached to a
+/// model runs only for requests addressed to that model. When the model is
+/// reached as a member of a routing, semantic, or ensemble group, its
+/// guardrails do not run — attach the guardrail to the group instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardrailScopeType {

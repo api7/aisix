@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use aisix_core::RedisConnConfig;
 use aisix_gateway::ChatResponse;
+use aisix_obs::metrics::Metrics;
 use aisix_redis::RedisConn;
 use async_trait::async_trait;
 use redis::AsyncCommands;
@@ -34,6 +35,10 @@ pub struct RedisCache {
     conn: RedisConn,
     ttl_secs: u64,
     prefix: String,
+    /// Prometheus handle for `aisix_redis_failures_total`. A failed read
+    /// degrades to a cache miss, which the outcome counter cannot tell
+    /// apart from a cold cache — this is where a failing backend shows.
+    metrics: Option<Metrics>,
 }
 
 impl std::fmt::Debug for RedisCache {
@@ -57,7 +62,20 @@ impl RedisCache {
             conn,
             ttl_secs: DEFAULT_TTL.as_secs(),
             prefix: DEFAULT_PREFIX.into(),
+            metrics: None,
         })
+    }
+
+    /// Count Redis operation failures on `metrics` (#1060).
+    pub fn with_metrics(mut self, metrics: Metrics) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    fn note_failure(&self, op: &str) {
+        if let Some(m) = &self.metrics {
+            m.record_redis_failure(op);
+        }
     }
 
     /// Override the instance **default** TTL — the fallback `put` uses
@@ -97,15 +115,18 @@ impl RedisCache {
 #[async_trait]
 impl Cache for RedisCache {
     async fn get(&self, key: &str) -> Result<Option<ChatResponse>, CacheError> {
-        let mut conn = self
-            .conn
-            .acquire()
-            .await
-            .map_err(|e| CacheError::Backend(format!("redis acquire: {e}")))?;
+        let mut conn = match self.conn.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                self.note_failure("cache_get");
+                return Err(CacheError::Backend(format!("redis acquire: {e}")));
+            }
+        };
         let full = self.full_key(key);
         let raw: Option<String> = match conn.get(&full).await {
             Ok(v) => v,
             Err(e) => {
+                self.note_failure("cache_get");
                 self.conn.note_error().await;
                 return Err(CacheError::Backend(format!("redis GET: {e}")));
             }
@@ -137,14 +158,17 @@ impl Cache for RedisCache {
     ) -> Result<(), CacheError> {
         let json = serde_json::to_string(&value)
             .map_err(|e| CacheError::Backend(format!("redis encode: {e}")))?;
-        let mut conn = self
-            .conn
-            .acquire()
-            .await
-            .map_err(|e| CacheError::Backend(format!("redis acquire: {e}")))?;
+        let mut conn = match self.conn.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                self.note_failure("cache_put");
+                return Err(CacheError::Backend(format!("redis acquire: {e}")));
+            }
+        };
         let full = self.full_key(key);
         let secs = ttl.as_secs().max(1);
         if let Err(e) = conn.set_ex::<_, _, ()>(&full, json, secs).await {
+            self.note_failure("cache_put");
             self.conn.note_error().await;
             return Err(CacheError::Backend(format!("redis SET EX: {e}")));
         }

@@ -312,6 +312,7 @@ impl ProxyState {
         )));
         #[cfg(not(test))]
         let limiter = Arc::new(Limiter::new());
+        let fan_out = OtlpHttpFanOut::with_metrics((*metrics).clone());
         Self::from_inner(ProxyStateInner {
             snapshot,
             hub,
@@ -327,7 +328,7 @@ impl ProxyState {
             config_apply_age: None,
             runtime_status: Arc::new(ModelRuntimeStatusTracker::new()),
             usage_sink: UsageSink::disabled(),
-            otlp_fan_out: OtlpHttpFanOut::new(),
+            otlp_fan_out: fan_out,
             request_body_limit_bytes: cfg.request_body_limit_bytes,
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
             request_id_accept: cfg
@@ -359,6 +360,7 @@ impl ProxyState {
             Some(metrics.clone()),
             guardrail_embedder_slot(&hub, &snapshot, &semantic_cache),
         );
+        let fan_out = OtlpHttpFanOut::with_metrics((*metrics).clone());
         Self::from_inner(ProxyStateInner {
             snapshot,
             hub,
@@ -374,7 +376,7 @@ impl ProxyState {
             config_apply_age: None,
             runtime_status: Arc::new(ModelRuntimeStatusTracker::new()),
             usage_sink: UsageSink::disabled(),
-            otlp_fan_out: OtlpHttpFanOut::new(),
+            otlp_fan_out: fan_out,
             request_body_limit_bytes: cfg.request_body_limit_bytes,
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
             request_id_accept: cfg
@@ -420,6 +422,7 @@ impl ProxyState {
             snapshot.clone(),
             Arc::clone(&bookkeeping_flags),
         ));
+        let fan_out = OtlpHttpFanOut::with_metrics((*metrics).clone());
         Self::from_inner(ProxyStateInner {
             snapshot,
             hub,
@@ -435,7 +438,7 @@ impl ProxyState {
             config_apply_age: None,
             runtime_status,
             usage_sink: UsageSink::disabled(),
-            otlp_fan_out: OtlpHttpFanOut::new(),
+            otlp_fan_out: fan_out,
             request_body_limit_bytes: cfg.request_body_limit_bytes,
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
             request_id_accept: cfg

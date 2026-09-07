@@ -51,6 +51,7 @@ use aisix_core::models::{
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::metrics::Metrics;
 use crate::sink::{
     build_object_store_sink, resolve_datadog_credential, resolve_sls_credential, AliyunSlsSink,
     BatchUnit, CapturedContent, DatadogSink, EventBatch, ExporterPipelines, IdempotencyMarker,
@@ -105,6 +106,18 @@ fn exporter_pipeline_config() -> PipelineConfig {
 
 impl OtlpHttpFanOut {
     pub fn new() -> Self {
+        Self::build(None)
+    }
+
+    /// As [`Self::new`], emitting the per-exporter fan-out drop and
+    /// failure counters on `metrics`. Without it the fan-out still runs
+    /// and still accounts drops in [`SinkStatsSnapshot`] — but nothing
+    /// reaches `GET /metrics`, which is the gap #1060 names.
+    pub fn with_metrics(metrics: Metrics) -> Self {
+        Self::build(Some(metrics))
+    }
+
+    fn build(metrics: Option<Metrics>) -> Self {
         let client = aisix_gateway::client_builder()
             .timeout(REQUEST_TIMEOUT)
             .user_agent(USER_AGENT)
@@ -114,7 +127,13 @@ impl OtlpHttpFanOut {
             .expect("reqwest::Client default config is valid");
         Self {
             inner: Arc::new(FanOutInner {
-                exporters: ExporterPipelines::new(exporter_pipeline_config()),
+                exporters: {
+                    let p = ExporterPipelines::new(exporter_pipeline_config());
+                    match metrics {
+                        Some(m) => p.with_metrics(m),
+                        None => p,
+                    }
+                },
                 client,
             }),
         }

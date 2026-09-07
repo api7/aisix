@@ -11,6 +11,7 @@ description = "aisix: response cache (in-memory / Redis / semantic)"
 [dependencies]
 aisix-gateway = { path = "../aisix-gateway" }
 aisix-core = { path = "../aisix-core" }
+aisix-obs = { path = "../aisix-obs" }
 aisix-redis = { path = "../aisix-redis", optional = true }
 tokio.workspace = true
 async-trait.workspace = true

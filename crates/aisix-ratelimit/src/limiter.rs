@@ -497,6 +497,37 @@ mod tests {
         let _r2 = limiter.pre_commit("k1", &l).await.unwrap();
     }
 
+    /// #950: the boundary case the overshoot test above does not reach.
+    /// Committed usage landing EXACTLY on the cap means the budget is
+    /// gone; admitting there let the next request spend a further whole
+    /// response on top of the overshoot post-paid accounting already
+    /// implies.
+    #[tokio::test]
+    async fn tpm_blocks_the_next_request_at_exactly_the_limit() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::local_with_clock(clock.clone());
+        let l = limits(Some(10), Some(1_000), None);
+
+        let r1 = limiter.pre_commit("k1", &l).await.unwrap();
+        r1.commit_tokens(1_000).await; // the whole minute's budget, exactly
+
+        let err = limiter.pre_commit("k1", &l).await.unwrap_err();
+        match err {
+            RateLimitError::Tokens { detail, .. } => {
+                assert_eq!(detail.dimension, "tpm");
+                assert_eq!(detail.limit, 1_000);
+                assert_eq!(detail.remaining, 0);
+            }
+            other => panic!("expected Tokens, got {other:?}"),
+        }
+
+        // One token short of the cap still admits — the check is the
+        // budget being spent, not merely being close.
+        let r2 = limiter.pre_commit("k2", &l).await.unwrap();
+        r2.commit_tokens(999).await;
+        let _r3 = limiter.pre_commit("k2", &l).await.unwrap();
+    }
+
     #[tokio::test]
     async fn reservations_for_different_keys_do_not_collide() {
         let clock = TestClock::new(0);

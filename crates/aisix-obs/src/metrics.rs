@@ -2342,6 +2342,16 @@ impl Metrics {
         self.cached_budget_gauge(M_BUDGET_DETAILS_PRESENT, labels, 0.0);
     }
 
+    /// Count one failed operation against a Redis-backed store, by
+    /// `operation`. The label names the subsystem as well as the call
+    /// (`ratelimit_acquire`, `cache_get`, …) because a deployment points
+    /// several stores at the same Redis and an operator's first question
+    /// is which of them is degraded.
+    ///
+    /// Every one of these failures degrades silently by design — the
+    /// shared rate limiter falls back to per-replica counting, a cache
+    /// read becomes a miss — so this counter is the only place the
+    /// degradation is visible.
     pub fn record_redis_failure(&self, operation: &str) {
         self.cached_counter(
             M_REDIS_FAILURES_TOTAL,
@@ -2457,10 +2467,17 @@ impl Metrics {
         );
     }
 
-    pub fn record_otlp_fanout_drop(&self, exporter: &str, reason: &str) {
+    /// Count `records` telemetry records the fan-out lost, by exporter
+    /// and by `reason` (`queue_full` / `worker_stopped` /
+    /// `retries_exhausted` / `permanent_error`).
+    ///
+    /// A record count rather than a batch count, so it is comparable with
+    /// what the exporter did deliver: one failed batch loses as many
+    /// records as it carried.
+    pub fn record_otlp_fanout_drop(&self, exporter: &str, reason: &str, records: u64) {
         self.cached_counter(
             M_OTLP_FANOUT_DROPS_TOTAL,
-            1,
+            records,
             |k| {
                 k.label(exporter);
                 k.label(reason);
@@ -2475,6 +2492,10 @@ impl Metrics {
         );
     }
 
+    /// Count one failed export ATTEMPT against `exporter`. Every retry
+    /// that failed counts, so a sink that only ever succeeds on its third
+    /// try is visible here even though it never drops a record — which is
+    /// the distinction from [`Metrics::record_otlp_fanout_drop`].
     pub fn record_otlp_fanout_failure(&self, exporter: &str) {
         self.cached_counter(
             M_OTLP_FANOUT_FAILURES_TOTAL,

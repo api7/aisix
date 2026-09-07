@@ -19,6 +19,7 @@ use parking_lot::Mutex;
 use tokio::sync::{mpsc, watch};
 
 use super::{EventBatch, IdempotencyMarker, ObservabilitySink, SinkError, SinkRecord};
+use crate::metrics::Metrics;
 
 /// Tuning for a [`SinkPipeline`]. Defaults mirror the telemetry worker
 /// (100-record batches, 5s flush, 1024-deep queue) plus a bounded retry.
@@ -157,6 +158,11 @@ pub struct SinkHandle {
     name: Arc<str>,
     tx: mpsc::Sender<Arc<SinkRecord>>,
     stats: Arc<SinkStats>,
+    /// Prometheus view of the drop counters below. `SinkStats` is the
+    /// heartbeat's view and resets whenever an exporter is reconfigured
+    /// (see its lifetime note), so it cannot answer "has this exporter
+    /// ever lost data" across a config change; the counter family can.
+    metrics: Option<Metrics>,
 }
 
 impl SinkHandle {
@@ -168,13 +174,21 @@ impl SinkHandle {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.stats.add_dropped(1);
+                self.record_drop("queue_full");
                 tracing::debug!(sink = %self.name, "sink queue full; record dropped");
                 false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.stats.add_dropped(1);
+                self.record_drop("worker_stopped");
                 false
             }
+        }
+    }
+
+    fn record_drop(&self, reason: &str) {
+        if let Some(m) = &self.metrics {
+            m.record_otlp_fanout_drop(&self.name, reason, 1);
         }
     }
 
@@ -197,6 +211,7 @@ pub struct SinkPipeline {
     cfg: PipelineConfig,
     rx: mpsc::Receiver<Arc<SinkRecord>>,
     stats: Arc<SinkStats>,
+    metrics: Option<Metrics>,
 }
 
 impl SinkPipeline {
@@ -206,18 +221,31 @@ impl SinkPipeline {
         sink: Arc<dyn ObservabilitySink>,
         cfg: PipelineConfig,
     ) -> (SinkHandle, SinkPipeline) {
+        Self::with_metrics(sink, cfg, None)
+    }
+
+    /// As [`Self::new`], with the Prometheus handle the fan-out counters
+    /// are emitted on. `None` keeps the pipeline usable from tests and
+    /// from any caller that has no recorder.
+    pub fn with_metrics(
+        sink: Arc<dyn ObservabilitySink>,
+        cfg: PipelineConfig,
+        metrics: Option<Metrics>,
+    ) -> (SinkHandle, SinkPipeline) {
         let (tx, rx) = mpsc::channel(cfg.queue_capacity);
         let stats = Arc::new(SinkStats::default());
         let handle = SinkHandle {
             name: Arc::from(sink.name()),
             tx,
             stats: Arc::clone(&stats),
+            metrics: metrics.clone(),
         };
         let worker = SinkPipeline {
             sink,
             cfg,
             rx,
             stats,
+            metrics,
         };
         (handle, worker)
     }
@@ -300,6 +328,12 @@ impl SinkPipeline {
                 }
                 Err(err) => {
                     let detail = masked(&err);
+                    // One count per failed EXPORT ATTEMPT, so a sink that
+                    // only ever succeeds on its third try is visible even
+                    // though it never drops a record.
+                    if let Some(m) = &self.metrics {
+                        m.record_otlp_fanout_failure(self.sink.name());
+                    }
                     if err.is_transient() && attempt < self.cfg.max_retries {
                         attempt += 1;
                         self.stats.add_retries(1);
@@ -316,6 +350,14 @@ impl SinkPipeline {
                     }
                     self.stats.record_batch_failed();
                     self.stats.add_dropped(count as u64);
+                    if let Some(m) = &self.metrics {
+                        let reason = if err.is_transient() {
+                            "retries_exhausted"
+                        } else {
+                            "permanent_error"
+                        };
+                        m.record_otlp_fanout_drop(self.sink.name(), reason, count as u64);
+                    }
                     self.stats.set_error(detail.clone());
                     tracing::warn!(
                         sink = %self.sink.name(),

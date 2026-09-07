@@ -19,6 +19,7 @@
 //! .redacted_entity_counts`.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 use aisix_gateway::{ChatChunk, ChatFormat, ChatResponse};
 use aisix_guardrails::Guardrail;
@@ -1066,18 +1067,42 @@ fn last_frame_end(raw: &[u8]) -> usize {
 /// how such a frame used to be invisible to the scan and rendered down to
 /// its first line by the redactor (#1100).
 pub(crate) fn frame_payload(frame_raw: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(frame_raw);
-    let mut lines = text.split('\n').filter_map(|l| {
-        let l = l.strip_suffix('\r').unwrap_or(l);
-        let l = l.strip_prefix("data:")?;
-        Some(l.strip_prefix(' ').unwrap_or(l))
-    });
-    let mut payload = lines.next()?.to_owned();
-    for l in lines {
+    let ranges = data_line_ranges(frame_raw);
+    let (first, rest) = ranges.split_first()?;
+    let mut payload = String::from_utf8_lossy(&frame_raw[first.clone()]).into_owned();
+    for r in rest {
         payload.push('\n');
-        payload.push_str(l);
+        payload.push_str(&String::from_utf8_lossy(&frame_raw[r.clone()]));
     }
     Some(payload)
+}
+
+/// Each `data:` line's payload, as a byte range into `frame_raw`, in order.
+///
+/// The same scan [`frame_payload`] joins, kept as offsets for the one
+/// consumer that must write BACK into the frame rather than only read it:
+/// `model_echo::restamp_sse_frame` splices the caller's alias in place and
+/// needs to know which bytes to replace. Two readers of the same framing
+/// would be free to disagree about where a payload starts, which is how
+/// the restamp came to see only the first line of a multi-line frame
+/// (#1105) while every other consumer saw all of it (#1100).
+pub(crate) fn data_line_ranges(frame_raw: &[u8]) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    for line in frame_raw.split(|&b| b == b'\n') {
+        let start = offset;
+        offset += line.len() + 1; // the split consumed one `\n`
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(after_colon) = line.strip_prefix(b"data:") else {
+            continue;
+        };
+        let mut from = start + b"data:".len();
+        if after_colon.first() == Some(&b' ') {
+            from += 1;
+        }
+        out.push(from..start + line.len());
+    }
+    out
 }
 
 /// The `data:` payload of every frame in a buffered SSE body, in order,
@@ -2747,6 +2772,56 @@ mod tests {
         );
         // No `data:` line at all: a comment or keepalive, nothing to read.
         assert_eq!(frame_payload(b": ping"), None);
+    }
+
+    /// `data_line_ranges` is what the model restamp splices into, so an
+    /// off-by-one in its arithmetic would rewrite the wrong bytes. The
+    /// ranges are checked against the payload lines they must select on
+    /// every framing variant a provider is allowed to emit.
+    #[test]
+    fn data_line_ranges_select_exactly_the_payload_lines() {
+        for (frame, want) in [
+            // Canonical: labelled event, LF terminators, one space after the colon.
+            (
+                &b"event: message_start\ndata: {\"a\":1}\n\n"[..],
+                vec![&b"{\"a\":1}"[..]],
+            ),
+            // CRLF: the `\r` belongs to the framing, not the payload.
+            (
+                &b"event: x\r\ndata: {\"a\":1}\r\n\r\n"[..],
+                vec![&b"{\"a\":1}"[..]],
+            ),
+            // No space after the colon — the spec makes it optional.
+            (&b"data:{\"a\":1}\n\n"[..], vec![&b"{\"a\":1}"[..]]),
+            // A comment/keepalive line ahead of the data line.
+            (&b": ping\ndata: {\"a\":1}\n\n"[..], vec![&b"{\"a\":1}"[..]]),
+            // Terminal sentinel.
+            (&b"data: [DONE]\n\n"[..], vec![&b"[DONE]"[..]]),
+            // Empty payload: a zero-width range, not a panic and not the tail.
+            (&b"data:\n\n"[..], vec![&b""[..]]),
+            // No data line at all.
+            (&b"event: ping\n\n"[..], vec![]),
+            // A value containing the delimiter bytes must not confuse the scan.
+            (
+                &b"event: e\ndata: {\"t\":\"a: b\"}\n\n"[..],
+                vec![&b"{\"t\":\"a: b\"}"[..]],
+            ),
+            // One document over several lines: every line is selected, and a
+            // non-data line between two of them is not (#1105).
+            (
+                &b"event: e\ndata: {\"a\":1,\nid: 7\ndata: \"b\":2}\n\n"[..],
+                vec![&b"{\"a\":1,"[..], &b"\"b\":2}"[..]],
+            ),
+        ] {
+            let ranges = data_line_ranges(frame);
+            let got: Vec<&[u8]> = ranges.iter().map(|r| &frame[r.clone()]).collect();
+            assert_eq!(
+                got,
+                want,
+                "ranges select the payload lines for {:?}",
+                String::from_utf8_lossy(frame),
+            );
+        }
     }
 
     #[test]

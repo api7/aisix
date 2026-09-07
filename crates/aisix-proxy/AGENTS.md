@@ -272,24 +272,24 @@ is a statement about that model, and reaching it through a group must not strip 
 The only deliberately entry-scoped gate is the group's own copy of any of the
 above. Anything else that only checks `model_entry` / `virtual_entry` is a bug.
 
-Guardrail attachment is the **known open exception, not a settled design**: the
-chain resolves from `RequestContext.model_id` before dispatch, so a guardrail
-scoped to a member never runs for group traffic (measured: direct 422, via group
-200). It is unfixed because the semantics are undecided, not because entry scope
-is correct — input guardrails run before a target is picked, and under failover
-there is no single "winning member" to resolve against. Tracked in
-AISIX-Cloud#1090; do not cite it as precedent for scoping a new gate to the entry.
-The 2026-08 model-kind audit re-confirmed the same gap for **ensemble panel/judge
-sub-calls and semantic-router targets**, and the ruling (project decision) is that
-all three kinds stay under #1090's one unified design pass: the operator can
-attach the guardrail to the parent entry, so member scope is a mitigable gap, not
-an unavoidable bypass. Do not piecemeal-fix one kind ahead of that decision, and
-do not re-audit it as a new finding. The same project ruling holds for the OTHER
-member gates on **ensemble** sub-calls (member `allowed_cidrs`, cooldown/health
-consumption, Prometheus usage, caching): ensemble is an experimental surface and
-its parity gaps are deliberate TODOs, not fresh findings — semantic-router
-targets got these gates first because they share the single-winner dispatch
-shape; graduate ensemble deliberately, in one pass.
+**Guardrail attachment is the one deliberate exception, and it is settled
+design.** Its scope follows the entry the caller addresses: a guardrail attached
+to a model runs only for requests addressed to that model. When the model is
+reached as a member of a routing, semantic, or ensemble group, its guardrails do
+not run — the operator attaches the guardrail to the group instead. The chain is
+resolved once from the addressed entry before a target is picked, which is what
+makes an input guardrail's verdict independent of which member a failover lands
+on. Do not "fix" a member-scoped guardrail into running for group traffic, do not
+re-audit it as a finding, and do not cite it as precedent for scoping any OTHER
+per-model gate to the entry — it is the exception because the decision is
+about which entry the caller addressed, not about a member's own configuration.
+
+The OTHER member gates on **ensemble** sub-calls (member `allowed_cidrs`,
+cooldown/health consumption, Prometheus usage, caching) are a separate matter:
+ensemble is an experimental surface and its parity gaps are deliberate TODOs,
+not fresh findings — semantic-router targets got these gates first because they
+share the single-winner dispatch shape; graduate ensemble deliberately, in one
+pass.
 
 Two shapes, both already implemented — copy the nearest one:
 

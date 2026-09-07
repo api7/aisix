@@ -99,22 +99,56 @@ pub(crate) fn splice_model_value(
 /// the selected path (the common case — most frames in a stream have no
 /// `model` at all) or when its payload is not splice-able JSON. A `None`
 /// caller forwards the original bytes.
+///
+/// A frame may spell its payload over SEVERAL `data:` lines, which the
+/// event-stream spec joins with `\n` into one document. The splice reads the
+/// joined payload — the same one every other consumer reads, via
+/// [`crate::redact::data_line_ranges`] — and writes each rewritten line back
+/// into the line it came from, so the framing around it survives byte for
+/// byte. Reading only the first line left such a frame un-restamped, and the
+/// client saw the upstream's own model id (#1105).
 pub(crate) fn restamp_sse_frame(
     frame: &[u8],
     client_facing_model: &str,
     selects_model: fn(&[PathSeg]) -> bool,
 ) -> Option<Vec<u8>> {
-    let range = crate::messages::extract_sse_data_range(frame)?;
-    let payload = &frame[range.clone()];
+    let ranges = crate::redact::data_line_ranges(frame);
+    if ranges.is_empty() {
+        return None;
+    }
+    let mut payload: Vec<u8> = Vec::new();
+    for (i, r) in ranges.iter().enumerate() {
+        // Separated by POSITION, not by whether anything has been written
+        // yet: a frame whose first `data:` line is empty contributes a
+        // leading newline, and skipping it would join one line fewer than
+        // there are ranges — which the line-count guard below then turns
+        // back into the un-restamped frame this fix exists to remove.
+        if i > 0 {
+            payload.push(b'\n');
+        }
+        payload.extend_from_slice(&frame[r.clone()]);
+    }
     // The terminal `[DONE]` sentinel is not JSON.
     if payload == b"[DONE]" {
         return None;
     }
-    let spliced = restamp_json_bytes(payload, client_facing_model, selects_model)?;
+    let spliced = restamp_json_bytes(&payload, client_facing_model, selects_model)?;
+    // The splice re-encodes the value as a JSON string, so it can never
+    // introduce a raw newline and the line count is preserved. Forward
+    // verbatim if that ever stops holding: the module's failure policy is
+    // to leak one frame's model id rather than corrupt the stream.
+    let lines: Vec<&[u8]> = spliced.split(|&b| b == b'\n').collect();
+    if lines.len() != ranges.len() {
+        return None;
+    }
     let mut out = Vec::with_capacity(frame.len() - payload.len() + spliced.len());
-    out.extend_from_slice(&frame[..range.start]);
-    out.extend_from_slice(&spliced);
-    out.extend_from_slice(&frame[range.end..]);
+    let mut cursor = 0usize;
+    for (r, line) in ranges.iter().zip(lines) {
+        out.extend_from_slice(&frame[cursor..r.start]);
+        out.extend_from_slice(line);
+        cursor = r.end;
+    }
+    out.extend_from_slice(&frame[cursor..]);
     Some(out)
 }
 
@@ -234,6 +268,67 @@ mod tests {
         assert!(out.starts_with("event: message_start\ndata: {\"type\":\"message_start\""));
         assert!(out.contains("\"input_tokens\":1e2"));
         assert!(out.ends_with("}}}\n\n"));
+    }
+
+    /// #1105: one JSON document written over several `data:` lines is
+    /// still one payload — the spec joins them with `\n`. Reading only the
+    /// first line left the frame un-parseable, so it forwarded verbatim and
+    /// the client saw the upstream's own model id instead of the alias it
+    /// addressed.
+    #[test]
+    fn restamp_sse_frame_rewrites_a_payload_split_over_several_data_lines() {
+        let frame = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\n\
+                      data: \"model\":\"claude-x-20250101\",\"usage\":{\"input_tokens\":1e2}}}\n\n";
+        let out = restamp_sse_frame(frame, "my-claude", anthropic_message_model)
+            .expect("a multi-line message_start still carries message.model");
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("\"model\":\"my-claude\""), "{out}");
+        assert!(!out.contains("claude-x-20250101"), "{out}");
+        // The framing survives: both `data:` lines stay lines, and every
+        // byte the splice did not replace is as the provider wrote it.
+        assert_eq!(out.matches("\ndata: ").count(), 2, "{out}");
+        assert!(out.starts_with("event: message_start\ndata: {\"type\":\"message_start\""));
+        assert!(out.contains("\"input_tokens\":1e2"));
+        assert!(out.ends_with("}}}\n\n"));
+    }
+
+    /// A frame that opens with an EMPTY `data:` line still joins to the
+    /// payload every other reader sees, so it restamps like any other.
+    #[test]
+    fn restamp_sse_frame_rewrites_a_payload_whose_first_data_line_is_empty() {
+        let frame = b"event: message_start\ndata:\n\
+                      data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-x\"}}\n\n";
+        let out = restamp_sse_frame(frame, "my-claude", anthropic_message_model)
+            .expect("the empty first line is part of the payload, not a reason to skip it");
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("\"model\":\"my-claude\""), "{out}");
+        assert!(
+            out.starts_with("event: message_start\ndata:\ndata: "),
+            "{out}"
+        );
+        // And the joined payload is exactly what every other consumer reads.
+        assert_eq!(
+            crate::redact::frame_payload(frame).as_deref(),
+            Some("\n{\"type\":\"message_start\",\"message\":{\"model\":\"claude-x\"}}"),
+        );
+    }
+
+    /// The same frame, restamped from the buffered pass rather than the
+    /// streaming relay — a block-capable output guardrail takes that branch.
+    #[test]
+    fn restamp_sse_buffer_rewrites_a_payload_split_over_several_data_lines() {
+        let buf = b"event: response.created\ndata: {\"type\":\"response.created\",\n\
+                    data: \"response\":{\"model\":\"up-1\"}}\n\n\
+                    data: [DONE]\n\n";
+        let out = String::from_utf8(restamp_sse_buffer(
+            buf,
+            "my-alias",
+            responses_snapshot_model,
+        ))
+        .unwrap();
+        assert!(out.contains("\"model\":\"my-alias\""), "{out}");
+        assert!(!out.contains("up-1"), "{out}");
+        assert!(out.ends_with("data: [DONE]\n\n"), "{out}");
     }
 
     #[test]
