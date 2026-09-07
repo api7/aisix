@@ -93,6 +93,12 @@ pub struct A2aAgent {
     /// method served at `/a2a/<name>`, so an agent receives them on
     /// `message/send`, `message/stream` and every task operation alike.
     ///
+    /// A header the caller sends more than once is forwarded with its first
+    /// value only; the upstream receives one well-formed header rather than a
+    /// list this gateway never interpreted. An HTTP/2 caller may split
+    /// `cookie` across several header fields, and only the first of them is
+    /// forwarded.
+    ///
     /// A header named here reaches the agent whatever the gateway would
     /// otherwise do with it. Naming the credential slot `auth_type` would
     /// fill — `authorization` for `bearer`, `x-api-key` for `api_key` — hands

@@ -370,6 +370,12 @@ pub struct RequestOverrides {
     /// default — forwards nothing, which is the behavior of every
     /// standard-protocol endpoint before AISIX-Cloud#1167.
     ///
+    /// A header the caller sends more than once is forwarded with its
+    /// first value only; the upstream receives one well-formed header
+    /// rather than a list this gateway never interpreted. An HTTP/2
+    /// caller may split `cookie` across several header fields, and only
+    /// the first of them is forwarded.
+    ///
     /// A header named here reaches the upstream whatever the gateway would
     /// otherwise do with it. Naming a credential slot — `authorization`,
     /// `proxy-authorization`, `x-api-key`, `api-key`, `x-goog-api-key`,
