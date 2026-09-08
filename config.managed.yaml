@@ -28,6 +28,13 @@
 # (api7/AISIX-Cloud#798):
 #   AISIX_RATELIMIT__BACKEND=redis
 #   AISIX_RATELIMIT__REDIS__URL=redis://<host>:6379
+#   AISIX_RATELIMIT__REDIS__TIMEOUT_SECS=5   # optional; this is the default
+#
+# `timeout_secs` bounds one Redis round trip and one connection attempt.
+# The limiter fails open to per-replica counting when Redis errors, but an
+# unreachable Redis produces no error at all until something times out, so
+# without the bound a rate-limited request waits on TCP retransmission for
+# minutes. Lower it for a Redis on the same node; it must be >= 1.
 #
 # Subsequent boots re-use the mTLS bundle written under
 # `managed.mtls_dir`.

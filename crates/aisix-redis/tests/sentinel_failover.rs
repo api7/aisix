@@ -97,8 +97,14 @@ async fn sentinel_reresolves_master_after_failover() {
     // A write must succeed again — proving acquire followed the promotion.
     // Retry briefly: the freshly promoted master may take a moment to
     // accept writes after role change.
+    //
+    // The budget is deliberately longer than the role change needs. The
+    // failure that triggered the failover also opened the connection
+    // layer's cool-off, so the first `BREAKER_WINDOW` of this loop is
+    // spent short-circuiting rather than re-resolving; sizing the loop to
+    // the role change alone would leave it racing the window.
     let mut wrote = false;
-    for _ in 0..40 {
+    for _ in 0..80 {
         // acquire itself can fail transiently right after a failover (the
         // sentinel master lookup may briefly error); retry rather than
         // abort, since absorbing that instability is the loop's whole job.
