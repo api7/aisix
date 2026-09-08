@@ -135,9 +135,21 @@ impl RedisSemanticCache {
             .query_async::<()>(&mut conn)
             .await
             .map_err(|e| {
-                CacheError::Backend(format!(
-                    "vector search unsupported (requires Redis 8+ or the search module): {e}"
-                ))
+                // An I/O error — a command timeout, a dropped connection,
+                // the connection layer's cool-off — says nothing about
+                // whether the server has the search module. The probe runs
+                // once per process and its verdict is permanent, so a
+                // wrong attribution here is what the operator reads for
+                // the life of the pod.
+                if e.is_io_error() {
+                    CacheError::Backend(format!(
+                        "vector-search probe did not complete (cache.redis unreachable or                          too slow; this does not mean the server lacks vector search): {e}"
+                    ))
+                } else {
+                    CacheError::Backend(format!(
+                        "vector search unsupported (requires Redis 8+ or the search module): {e}"
+                    ))
+                }
             })
     }
 

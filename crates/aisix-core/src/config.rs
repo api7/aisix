@@ -1160,7 +1160,7 @@ pub enum RedisMode {
 ///
 /// To keep secrets out of the config file, supply `password` via the
 /// matching env var instead, e.g. `AISIX_RATELIMIT__REDIS__PASSWORD`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct RedisConnConfig {
     pub mode: RedisMode,
@@ -1187,6 +1187,42 @@ pub struct RedisConnConfig {
     /// Only consulted for `rediss://` URLs; a plaintext `redis://`
     /// connection never negotiates TLS regardless of what is set here.
     pub tls: OutboundTlsConfig,
+    /// Seconds a single Redis round trip, and a single connection
+    /// attempt, may take before it is abandoned. Default
+    /// [`DEFAULT_REDIS_TIMEOUT_SECS`].
+    ///
+    /// Every consumer of this connection fails **open** on a Redis error
+    /// (the rate limiter falls back to per-replica counters, the caches
+    /// to a miss), but that only helps if the error actually arrives.
+    /// A peer that stops answering without closing the socket — host
+    /// down, network partition, a stopped container — leaves the command
+    /// blocked on TCP retransmission for minutes, so without a bound the
+    /// request hangs instead of degrading.
+    ///
+    /// Must be at least 1; there is deliberately no "unbounded" setting.
+    pub timeout_secs: u64,
+}
+
+/// Default bound on one Redis round trip / connection attempt.
+/// Generous enough that a healthy in-cluster Redis never trips it, short
+/// enough that an unreachable one degrades a request instead of hanging it.
+pub const DEFAULT_REDIS_TIMEOUT_SECS: u64 = 5;
+
+impl Default for RedisConnConfig {
+    fn default() -> Self {
+        Self {
+            mode: RedisMode::default(),
+            url: None,
+            nodes: Vec::new(),
+            sentinels: Vec::new(),
+            master_name: None,
+            username: None,
+            password: None,
+            database: None,
+            tls: OutboundTlsConfig::default(),
+            timeout_secs: DEFAULT_REDIS_TIMEOUT_SECS,
+        }
+    }
 }
 
 impl RedisConnConfig {
@@ -1219,6 +1255,12 @@ impl RedisConnConfig {
                     ));
                 }
             }
+        }
+        if self.timeout_secs == 0 {
+            return Err(format!(
+                "{ctx}.timeout_secs must be at least 1 second (an unbounded Redis \
+                 command blocks the request instead of failing open)"
+            ));
         }
         match (&self.tls.client_cert_file, &self.tls.client_key_file) {
             (Some(_), None) => {
@@ -2864,6 +2906,36 @@ ratelimit:
         let redis = cfg.ratelimit.redis.unwrap();
         assert_eq!(redis.mode, RedisMode::Single);
         assert_eq!(redis.url.as_deref(), Some("redis://127.0.0.1:6379"));
+    }
+
+    /// The bound exists because every consumer of the Redis connection
+    /// fails open on an *error*, and a peer that stops answering without
+    /// closing the socket never produces one — the request hangs instead
+    /// of degrading. So it has to be on by default, not opt-in.
+    #[test]
+    fn redis_timeout_defaults_to_five_seconds() {
+        let f = redis_backend_yaml("    url: \"redis://127.0.0.1:6379\"");
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.ratelimit.redis.unwrap().timeout_secs, 5);
+        assert_eq!(RedisConnConfig::default().timeout_secs, 5);
+    }
+
+    #[test]
+    fn redis_timeout_is_configurable_per_block() {
+        let f = redis_backend_yaml("    url: \"redis://127.0.0.1:6379\"\n    timeout_secs: 2");
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.ratelimit.redis.unwrap().timeout_secs, 2);
+    }
+
+    /// `0` would mean "wait forever", which is the defect this field was
+    /// added to remove — so it is rejected rather than silently accepted.
+    #[test]
+    fn redis_timeout_of_zero_is_rejected() {
+        let f = redis_backend_yaml("    url: \"redis://127.0.0.1:6379\"\n    timeout_secs: 0");
+        let err = Config::load_from_path(Some(f.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ratelimit.redis.timeout_secs"), "{err}");
     }
 
     #[test]
