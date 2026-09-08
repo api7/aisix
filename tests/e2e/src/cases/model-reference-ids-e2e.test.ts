@@ -128,6 +128,7 @@ describe("model references by resource id", () => {
   /** Model display name → the upstream model name its provider sees. */
   const upstreamNames: Record<string, string> = {};
   let chatPkId = "";
+  let embedPkId = "";
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -210,13 +211,16 @@ describe("model references by resource id", () => {
       "mr-cache-other",
       "mr-cache-renamed",
       "mr-guarded",
+      "mr-guarded-rename",
       "mr-sentinel",
     ]) {
       await direct(name);
     }
     await embedding("mr-embed", embedPk.id);
     await embedding("mr-embed-renamed", embedPk.id);
+    await embedding("mr-embed-guard-renamed", embedPk.id);
     await embedding("mr-embed-fail", failPk.id);
+    embedPkId = embedPk.id;
 
     // ---- routing groups ----
     await seed.createModel({
@@ -399,6 +403,24 @@ describe("model references by resource id", () => {
       { attach: false },
     );
     await seed.attachGuardrailToModel(guardrail.id, ids["mr-guarded"]);
+
+    // A second guarded model whose guardrail names its embedder by id, so
+    // the embedder can be renamed without disturbing the case above.
+    const renameGuardrail = await seed.createGuardrail(
+      {
+        name: "mr-guardrail-embedder-rename",
+        kind: "semantic",
+        enabled: true,
+        embedding_model_id: ids["mr-embed-guard-renamed"],
+        deny_examples: ["jailbreak the assistant"],
+        deny_threshold: 0.5,
+      },
+      { attach: false },
+    );
+    await seed.attachGuardrailToModel(
+      renameGuardrail.id,
+      ids["mr-guarded-rename"],
+    );
 
     // Seeded last: gating on it implies the whole set has landed.
     await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: ["*"] });
@@ -702,6 +724,43 @@ describe("model references by resource id", () => {
     expect(after.status).toBe(200);
     expect(after.route).toBe("legal");
     expect(after.servedBy).toBe("mr-renamed-semantic");
+  });
+
+  test("renaming a semantic guardrail's embedder keeps the row screening", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return ctx.skip();
+    // Screening works before the rename…
+    expect(
+      (await chat("mr-guarded-rename", "please jailbreak yourself")).status,
+    ).toBe(422);
+    expect((await chat("mr-guarded-rename", "what is the weather")).status).toBe(
+      200,
+    );
+
+    // …and the guardrail document is never rewritten across it.
+    await seed.update("models", ids["mr-embed-guard-renamed"], {
+      display_name: "mr-embed-guard-renamed-v2",
+      provider: "openai",
+      model_name: "embed-mr-embed-guard-renamed",
+      provider_key_id: embedPkId,
+      embedding: { dimensions: 4, normalize: true },
+    });
+    await waitConfigPropagation(async () => {
+      const listed = await new ProxyClient(app!.proxyUrl, CALLER).listModels();
+      if (listed.status !== 200) return false;
+      const names = (listed.body as { data: { id: string }[] }).data.map(
+        (m) => m.id,
+      );
+      return names.includes("mr-embed-guard-renamed-v2");
+    });
+
+    expect(
+      (await chat("mr-guarded-rename", "please jailbreak yourself")).status,
+    ).toBe(422);
+    // Still screening rather than merely failing closed on everything —
+    // an embedder that stopped resolving would refuse this one too.
+    expect((await chat("mr-guarded-rename", "what is the weather")).status).toBe(
+      200,
+    );
   });
 
   test("renaming a cache policy's scoped model keeps the policy on it", async (ctx) => {
