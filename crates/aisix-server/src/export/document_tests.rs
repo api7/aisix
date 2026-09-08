@@ -528,6 +528,19 @@ fn export_output_reloads_through_the_real_file_loader() {
         serde_json::from_value(attachment("g-1", "env", None)).unwrap(),
         1,
     ));
+    // A routing group whose target is named by RESOURCE ID — the form a
+    // control plane writes and the resources file refuses outright. The
+    // export has to hand back the name spelling or this file does not
+    // load at all: the loader cross-checks every routing target against
+    // the models it defines, and a raw etcd id matches none of them.
+    snap.models.insert(ResourceEntry::new(
+        "m-group",
+        model_value(json!({
+            "display_name": "group",
+            "routing": {"strategy": "failover", "targets": [{"model_id": "m-1"}]}
+        })),
+        1,
+    ));
     // A claim mapping whose `resolve.api_key_id` must resugar to the
     // key's (synthetic) file name and re-resolve on load — plus the key
     // and trust provider it references, so the loader's cross-checks
@@ -578,13 +591,25 @@ fn export_output_reloads_through_the_real_file_loader() {
     // Same resource set, and the reference resugared then re-resolved to
     // the same derived id the loader assigns.
     assert_eq!(loaded.provider_keys.len(), 1);
-    assert_eq!(loaded.models.len(), 1);
+    assert_eq!(loaded.models.len(), 2);
     assert_eq!(loaded.guardrails.len(), 1);
     let model = loaded.models.get_by_name("gpt-4o").unwrap();
     assert_eq!(
         model.value.provider_key_id.as_deref(),
         Some(derive_id("provider_keys", "openai-prod").as_str())
     );
+    // The id-named routing target came back as the name the file keys
+    // its models by. Reaching this line at all is most of the assertion:
+    // the load above would have failed had the id been emitted raw.
+    let group = loaded.models.get_by_name("group").unwrap();
+    assert_eq!(
+        group.value.routing.as_ref().unwrap().targets[0].model,
+        "gpt-4o"
+    );
+    assert!(group.value.routing.as_ref().unwrap().targets[0]
+        .model_id
+        .is_none());
+
     // The `${jndi:ldap}` literal came back byte-for-byte — not
     // interpolated, not corrupted.
     let guardrail = loaded.guardrails.get_by_name("log4shell").unwrap();
