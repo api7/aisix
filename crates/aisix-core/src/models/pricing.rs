@@ -21,6 +21,7 @@ use std::sync::Arc;
 use crate::models::model::{Model, ModelCost};
 use crate::models::snapshot::AisixSnapshot;
 use crate::resource::Resource;
+use crate::snapshot::ResourceTable;
 
 /// A per-1,000-token price shared by every model that names it.
 ///
@@ -81,13 +82,10 @@ impl PricingIndex {
     /// Flatten both tables, environment documents last so one of them
     /// replaces the global document carrying the same `key`.
     pub fn build(snap: &AisixSnapshot) -> Self {
-        let mut by_key = HashMap::new();
-        for entry in snap.global_pricing.entries() {
-            by_key.insert(entry.value.key.clone(), cost_of(&entry.value));
-        }
-        for entry in snap.pricing.entries() {
-            by_key.insert(entry.value.key.clone(), cost_of(&entry.value));
-        }
+        let global = flatten(&snap.global_pricing);
+        let mut by_key: HashMap<String, ModelCost> =
+            global.into_iter().map(|(k, v)| (k, v.2)).collect();
+        by_key.extend(flatten(&snap.pricing).into_iter().map(|(k, v)| (k, v.2)));
         Self { by_key }
     }
 
@@ -117,6 +115,30 @@ impl PricingIndex {
     pub fn is_empty(&self) -> bool {
         self.by_key.is_empty()
     }
+}
+
+/// One table's prices by `key`, carrying the revision and id that won.
+///
+/// Nothing constrains `key` to be unique within a table, and the control
+/// plane writes a replacement before deleting the row it replaces — so
+/// two documents can carry one key for a window. Picking by highest
+/// revision, then by id, makes the effective price the later write
+/// rather than whichever row the table happened to iterate first: an
+/// order that is not stable across rebuilds would otherwise let the
+/// price flip back and forth while the window is open, changing both
+/// `least_cost` ordering and the cost on emitted usage events.
+fn flatten(table: &ResourceTable<Pricing>) -> HashMap<String, (i64, String, ModelCost)> {
+    let mut out: HashMap<String, (i64, String, ModelCost)> = HashMap::new();
+    for entry in table.entries() {
+        let candidate = (entry.revision, entry.id.clone(), cost_of(&entry.value));
+        match out.get(&entry.value.key) {
+            Some(current) if (current.0, &current.1) >= (candidate.0, &candidate.1) => {}
+            _ => {
+                out.insert(entry.value.key.clone(), candidate);
+            }
+        }
+    }
+    out
 }
 
 fn cost_of(p: &Pricing) -> ModelCost {
@@ -226,6 +248,26 @@ mod tests {
         let index = PricingIndex::build(&snap);
         assert_eq!(index.len(), 1);
         assert_eq!(index.get("k").unwrap().input_per_1k, 9.0);
+    }
+
+    #[test]
+    fn two_documents_with_one_key_resolve_to_the_later_write() {
+        // The control plane writes a replacement before deleting the row
+        // it replaces, so one key can name two documents for a window.
+        // Whichever the table iterates first is not stable across
+        // rebuilds; the price must not flip while the window is open.
+        let snap = AisixSnapshot::new();
+        snap.global_pricing
+            .insert(ResourceEntry::new("old", price("k", 1.0, 1.0), 4));
+        snap.global_pricing
+            .insert(ResourceEntry::new("new", price("k", 9.0, 9.0), 7));
+
+        for _ in 0..20 {
+            assert_eq!(
+                PricingIndex::build(&snap).get("k").unwrap().input_per_1k,
+                9.0
+            );
+        }
     }
 
     #[test]
