@@ -248,7 +248,10 @@ pub fn load_from_str(
         // other environment reads. Set `cost` on the model instead.
         if key == "pricing" {
             errors.push(file_error(
-                "the resources file does not accept a `pricing` collection — pricing documents                  are written by the control plane and shared across environments, which a file                  cannot express; set `cost` on each model instead"
+                "the resources file does not accept a `pricing` collection — pricing \
+                 documents are written by the control plane and shared across \
+                 environments, which a file cannot express; set `cost` on each model \
+                 instead"
                     .to_string(),
             ));
             continue;
@@ -419,7 +422,9 @@ pub fn load_from_str(
         if entry.kind == "models" && entry.doc.get("pricing_key").is_some() {
             errors.push(LoadError {
                 scope,
-                message: "the resources file does not accept `pricing_key` — it names a                           pricing document written by the control plane, which a file cannot                           declare; set the price inline with `cost`"
+                message: "the resources file does not accept `pricing_key` — it names a \
+                          pricing document written by the control plane, which a file \
+                          cannot declare; set the price inline with `cost`"
                     .into(),
             });
             continue;
@@ -428,7 +433,9 @@ pub fn load_from_str(
         if entry.kind == "api_keys" && entry.doc.get("allowed_model_ids").is_some() {
             errors.push(LoadError {
                 scope,
-                message: "the resources file does not accept `allowed_model_ids` — it names                           models by control-plane id, which a file cannot resolve; grant                           models by name with `allowed_models`"
+                message: "the resources file does not accept `allowed_model_ids` — it \
+                          names models by control-plane id, which a file cannot resolve; \
+                          grant models by name with `allowed_models`"
                     .into(),
             });
             continue;

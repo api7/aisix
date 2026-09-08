@@ -342,7 +342,18 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// maximum across prefixes, and readiness waits for every prefix's
     /// initial range read (a tolerated refusal on the shared catalog
     /// counts as read-and-empty — see [`PrefixSource::tolerates`]).
-    pub fn with_sources(sources: Vec<(WatchedPrefix, Arc<P>)>, cache: SnapshotCache) -> Self {
+    pub fn with_sources(mut sources: Vec<(WatchedPrefix, Arc<P>)>, cache: SnapshotCache) -> Self {
+        // Environment prefixes are read FIRST, and that ordering is load
+        // bearing rather than cosmetic: [`PrefixSource::tolerates`] is
+        // only safe because credentials etcd genuinely refuses are
+        // refused for the environment prefix too, and that refusal has
+        // to be the one that surfaces. Reading the tolerant prefix first
+        // would let a wrong password come back as a tolerated catalog
+        // refusal followed by a second, redundant failure.
+        sources.sort_by_key(|(p, _)| match p.scope {
+            PrefixScope::Environment => 0,
+            PrefixScope::Global => 1,
+        });
         let prefixes = PrefixSet::new(sources.iter().map(|(p, _)| p.clone()).collect());
         let sources = sources
             .into_iter()
@@ -1440,13 +1451,18 @@ impl<P: ConfigProvider> Supervisor<P> {
                 Err(err) => return Err(SupervisorError::Provider(err)),
             }
         }
-        let mut stream = futures::stream::select_all(streams);
+        // Each stream is tagged so its END is delivered as an item
+        // rather than absorbed by `select_all`. See [`Watched`].
+        let mut stream = futures::stream::select_all(streams.into_iter().map(|s| {
+            s.map(Watched::Event)
+                .chain(futures::stream::iter([Watched::Ended]))
+        }));
 
         // An event the drain below pulled off the stream but could not
         // add to its batch (a resync, a stream error, the end of the
         // stream). Held here so the next loop iteration handles it
         // exactly as if it had just arrived.
-        let mut pushed_back: Option<Option<Result<WatchEvent, ProviderError>>> = None;
+        let mut pushed_back: Option<Option<Watched>> = None;
 
         loop {
             if *cancel.borrow() {
@@ -1464,16 +1480,19 @@ impl<P: ConfigProvider> Supervisor<P> {
             };
 
             match next {
-                None => return Ok(()),
-                Some(Err(ProviderError::Compacted)) => {
+                // Every stream exhausted, or any ONE of them ended:
+                // either way this cycle is over and the next one re-reads
+                // and re-watches every prefix.
+                None | Some(Watched::Ended) => return Ok(()),
+                Some(Watched::Event(Err(ProviderError::Compacted))) => {
                     tracing::warn!("etcd compaction detected — resyncing");
                     // Break out so `run` re-enters `cycle` cleanly; the
                     // next iteration re-loads from scratch. We don't want
                     // to treat compaction as a backoff-worthy failure.
                     return Ok(());
                 }
-                Some(Err(err)) => return Err(SupervisorError::Provider(err)),
-                Some(Ok(WatchEvent::Resync { entries, revision })) => {
+                Some(Watched::Event(Err(err))) => return Err(SupervisorError::Provider(err)),
+                Some(Watched::Event(Ok(WatchEvent::Resync { entries, revision }))) => {
                     self.apply_resync(&entries);
                     // The resync's header revision is the "consistent as
                     // of" point even when the entry set is empty or only
@@ -1483,7 +1502,9 @@ impl<P: ConfigProvider> Supervisor<P> {
                 // Explicit over the two batchable variants rather than a
                 // catch-all: a new `WatchEvent` must fail to compile here
                 // instead of falling into a batch that cannot carry it.
-                Some(Ok(first @ (WatchEvent::Put(_) | WatchEvent::Delete { .. }))) => {
+                Some(Watched::Event(Ok(
+                    first @ (WatchEvent::Put(_) | WatchEvent::Delete { .. }),
+                ))) => {
                     // Coalesce: hold the batch open for a short bounded
                     // window and apply the whole run as one
                     // copy-on-write cycle. The window closes on the first
@@ -1532,9 +1553,9 @@ impl<P: ConfigProvider> Supervisor<P> {
                             _ = tokio::time::sleep(COALESCE_QUIET_PERIOD) => break,
                         };
                         match item {
-                            Some(Ok(event @ (WatchEvent::Put(_) | WatchEvent::Delete { .. }))) => {
-                                batch.push(event)
-                            }
+                            Some(Watched::Event(Ok(
+                                event @ (WatchEvent::Put(_) | WatchEvent::Delete { .. }),
+                            ))) => batch.push(event),
                             other => {
                                 pushed_back = Some(other);
                                 break;
@@ -1593,6 +1614,23 @@ impl PrefixLoad {
     fn max_revision(&self) -> i64 {
         self.revisions.iter().flatten().copied().max().unwrap_or(0)
     }
+}
+
+/// One item off the merged watch.
+///
+/// `select_all` drops an exhausted stream and keeps polling the
+/// survivors, so a stream that ends cleanly is otherwise invisible — and
+/// a cleanly ended watch is precisely the signal [`Supervisor::cycle`]
+/// runs on: it returns, and `watch_loop` re-reads and re-opens both
+/// prefixes. With one stream that came for free. With two, on two
+/// connections, swallowing it would leave the cycle polling the
+/// survivor while the ended prefix's configuration froze for the life
+/// of the process — no resync, no error, and `/status/config` still
+/// reporting connected.
+enum Watched {
+    Event(Result<WatchEvent, ProviderError>),
+    /// The stream this item came from has ended.
+    Ended,
 }
 
 #[derive(Debug)]
@@ -2139,6 +2177,9 @@ mod tests {
         refuse: bool,
         /// The `start_revision` this provider's watch was opened with.
         watched_from: Mutex<Option<i64>>,
+        /// Hand back a stream that never ends and never yields, the way
+        /// a healthy watch on a prefix nobody is writing behaves.
+        never_ends: bool,
     }
 
     impl ScopedProvider {
@@ -2148,6 +2189,20 @@ mod tests {
                 revision,
                 refuse: false,
                 watched_from: Mutex::new(None),
+                never_ends: false,
+            })
+        }
+
+        /// Serves its rows, then holds a watch open forever — the
+        /// catalog's normal steady state, since nobody writes prices
+        /// most of the time.
+        fn quiet(entries: Vec<RawEntry>, revision: i64) -> Arc<Self> {
+            Arc::new(Self {
+                entries,
+                revision,
+                refuse: false,
+                watched_from: Mutex::new(None),
+                never_ends: true,
             })
         }
 
@@ -2157,6 +2212,7 @@ mod tests {
                 revision: 0,
                 refuse: true,
                 watched_from: Mutex::new(None),
+                never_ends: false,
             })
         }
     }
@@ -2184,6 +2240,9 @@ mod tests {
                 return Err(ProviderError::Rejected(
                     "etcdserver: permission denied: outside env env-1 prefix".into(),
                 ));
+            }
+            if self.never_ends {
+                return Ok(Box::new(stream::pending()));
             }
             Ok(Box::new(stream::iter(Vec::new())))
         }
@@ -2325,6 +2384,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_watch_ending_ends_the_cycle() {
+        // The reconnect trigger is a watch stream ending; `watch_loop`
+        // re-enters `cycle`, which re-reads and re-opens every prefix.
+        // `select_all` drops an exhausted stream and keeps polling the
+        // survivors, so without the end being delivered as an item the
+        // cycle would sit on the catalog's idle stream forever while the
+        // environment's configuration froze — no resync, no error, and
+        // nothing in `/status/config` to show it.
+        //
+        // The catalog stream here never yields and never ends, which is
+        // its normal state: nobody writes prices most of the time. That
+        // is what makes the bug reachable rather than theoretical.
+        let sup = scoped_supervisor(
+            ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 1)], 7),
+            ScopedProvider::quiet(vec![entry("/aisix/global/pricing/g", VALID_PRICE, 1)], 7),
+        );
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+
+        let cycle = tokio::time::timeout(Duration::from_secs(5), sup.cycle(&rx)).await;
+        assert!(
+            matches!(cycle, Ok(Ok(()))),
+            "the environment watch ended, so the cycle must return and let \
+             watch_loop reconnect; got {cycle:?}",
+        );
+        // Both prefixes did load before the cycle ended.
+        let snap = sup.handle().load();
+        assert_eq!(snap.models.len(), 1);
+        assert_eq!(snap.global_pricing.len(), 1);
+    }
+
+    #[tokio::test]
     async fn each_prefix_resumes_from_its_own_read() {
         // The range reads run in sequence, so the later prefix reports a
         // higher revision. Resuming BOTH watches from the maximum would
@@ -2367,6 +2457,32 @@ mod tests {
         // as SupervisorError::Provider.
         sup.cycle(&rx).await.expect("cycle survives the refusal");
         assert_eq!(sup.handle().load().models.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_environment_prefix_is_always_read_first() {
+        // `tolerates` swallows a refusal on the catalog, so a refusal
+        // that is really about credentials must reach the environment
+        // prefix first — that one is not tolerated and is what fails the
+        // cycle. Constructed catalog-first to prove the supervisor
+        // reorders rather than trusting its caller.
+        let sup = Arc::new(Supervisor::with_sources(
+            vec![
+                (
+                    WatchedPrefix::global(GLOBAL_PREFIX),
+                    ScopedProvider::refusing(),
+                ),
+                (
+                    WatchedPrefix::environment(ENV_PREFIX),
+                    ScopedProvider::refusing(),
+                ),
+            ],
+            SnapshotCache::disabled(),
+        ));
+        assert!(
+            matches!(sup.load_once().await, Err(ProviderError::Rejected(_))),
+            "a refusal on both prefixes must surface as the environment's",
+        );
     }
 
     #[tokio::test]

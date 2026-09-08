@@ -2526,13 +2526,31 @@ mod tests {
     fn no_one_reads_a_models_price_off_the_field() {
         use std::path::Path;
 
+        /// The two places allowed to touch the field, by PATH rather
+        /// than by file name: excluding a bare name would also excuse a
+        /// same-named file in another crate, and excluding a whole file
+        /// is how the first version of this census stopped covering
+        /// `cost_key`.
+        const AUTHORIZED: [&str; 2] = [
+            // Defines `ModelCost` and clears it in strip_kind_inapplicable.
+            "aisix-core/src/models/model.rs",
+            // The resolver every other reader must go through.
+            "aisix-core/src/models/pricing.rs",
+        ];
+
         fn walk(dir: &Path, needle: &str, out: &mut Vec<(String, usize, String)>) {
-            for e in std::fs::read_dir(dir).expect("crate src is readable") {
+            for e in std::fs::read_dir(dir).expect("crates dir is readable") {
                 let path = e.expect("dir entry").path();
                 if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
                     walk(&path, needle, out);
                 } else if path.extension().is_some_and(|x| x == "rs") {
-                    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                    let name = path.to_string_lossy().replace('\\', "/");
+                    if AUTHORIZED.iter().any(|ok| name.ends_with(ok)) {
+                        continue;
+                    }
                     let src = std::fs::read_to_string(&path).expect("source is utf-8");
                     for (i, line) in src.lines().enumerate() {
                         // `.cost` as a field access, not `cost_usd` /
@@ -2566,15 +2584,25 @@ mod tests {
         // lives here and is the reader most likely to regress.
         let needle = format!(".{}", "cost");
         let mut hits = Vec::new();
-        walk(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("src").as_path(),
-            &needle,
-            &mut hits,
-        );
+        // The whole workspace, not just this crate: a usage event is
+        // assembled in more than one of them, and a direct read added
+        // anywhere else would be just as silent.
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the crate lives under crates/")
+            .to_path_buf();
+        walk(&crates, &needle, &mut hits);
         assert!(
             hits.is_empty(),
             "these read a model's price off the field instead of through \
              PricingIndex::resolve, so `pricing_key` is ignored there: {hits:#?}",
+        );
+        // The census is worthless if it scans nothing; prove it reached
+        // the crates it is meant to cover.
+        assert!(
+            crates.join("aisix-server/src").is_dir() && crates.join("aisix-obs/src").is_dir(),
+            "the census did not reach the other crates: {}",
+            crates.display(),
         );
     }
 
