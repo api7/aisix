@@ -152,8 +152,17 @@ struct Guard {
 /// semantic write. With a breaker per connection each of those four
 /// operations found a breaker that no earlier operation had opened, so
 /// one request against a black-holed Redis paid the budget four times
-/// (measured: 20s at the default 5s budget) instead of once. Sharing the
-/// policy makes the first failure short-circuit the rest of the request.
+/// (measured: 20s at the default 5s budget). Sharing the policy makes the
+/// first failure short-circuit the operations that follow it inside the
+/// cool-off window.
+///
+/// That is not the same as "once per request", and the difference is
+/// worth knowing: the two lookups run back to back, but the two writes
+/// run after the upstream call, so a request whose upstream leg outlives
+/// [`BREAKER_WINDOW`] finds the window expired and its write is admitted
+/// as the next probe. Such a request pays two budgets rather than four.
+/// Closing that last gap needs either a window longer than an upstream
+/// call or per-request degradation state; neither is decided here.
 ///
 /// Sharing the policy does NOT share the connection: the two cache
 /// connections stay separate so they do not serialize on one pipeline.
@@ -863,8 +872,10 @@ mod guard_tests {
     #[tokio::test]
     async fn the_window_dates_from_when_the_command_returned() {
         // Window shorter than the budget, so "from start" and "from
-        // return" give opposite answers.
-        let g = guard(200, 100);
+        // return" give opposite answers. Both are generous: the margin
+        // between them is the whole tolerance for scheduling delay on a
+        // loaded CI runner.
+        let g = guard(400, 300);
         g.run(pending::<RedisResult<()>>())
             .await
             .expect_err("the command spends its budget and gives up");
@@ -900,7 +911,8 @@ mod guard_tests {
             .expect_err("the second connection short-circuits on the shared cool-off");
         assert!(
             started.elapsed() < Duration::from_millis(40),
-            "a second connection of the same subsystem must not pay the              budget again, took {:?}",
+            "a second connection of the same subsystem must not pay the budget \
+             again, took {:?}",
             started.elapsed()
         );
     }

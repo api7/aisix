@@ -159,7 +159,9 @@ impl RedisSemanticCache {
                 // the life of the pod.
                 if e.is_io_error() {
                     CacheError::Backend(format!(
-                        "vector-search probe did not complete (cache.redis unreachable or                          too slow; this does not mean the server lacks vector search): {e}"
+                        "vector-search probe did not complete (cache.redis unreachable \
+                         or too slow; this does not mean the server lacks vector \
+                         search): {e}"
                     ))
                 } else {
                     CacheError::Backend(format!(

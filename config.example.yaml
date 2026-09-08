@@ -265,8 +265,12 @@ cache:
   #   # The cool-off is per SUBSYSTEM, not per connection. This cache
   #   # opens two connections to this Redis — the exact-KV one and, for
   #   # policies with a `semantic` block, the vector-search one — and they
-  #   # share one cool-off, so a request that uses both pays this budget at
-  #   # most once rather than once per operation.
+  #   # share one cool-off, so CONSECUTIVE cache operations pay this budget
+  #   # once between them rather than once each. A request whose upstream
+  #   # call outlives the cool-off can still pay it a second time on the
+  #   # cache write that follows, because the window will have expired by
+  #   # then: expect one budget when the upstream answers quickly and two
+  #   # when it does not.
   #   #
   #   # In sentinel mode, discovering the master is not one round trip —
   #   # the client walks the sentinels one at a time — so that step gets
