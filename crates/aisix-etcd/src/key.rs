@@ -279,6 +279,93 @@ mod tests {
         assert!(matches!(err, KeyError::EmptySegment(_)));
     }
 
+    fn set(env: &str, global: &str) -> PrefixSet {
+        PrefixSet::new(vec![
+            WatchedPrefix::environment(env),
+            WatchedPrefix::global(global),
+        ])
+    }
+
+    #[test]
+    fn a_key_resolves_to_the_prefix_that_holds_it() {
+        let s = set("/aisix/env-1/", "/aisix/global/");
+        let env = s.resolve("/aisix/env-1/models/m-1").unwrap();
+        assert_eq!(env.scope, PrefixScope::Environment);
+        assert_eq!((env.kind, env.id), ("models", "m-1"));
+
+        let global = s.resolve("/aisix/global/pricing/p-1").unwrap();
+        assert_eq!(global.scope, PrefixScope::Global);
+        assert_eq!((global.kind, global.id), ("pricing", "p-1"));
+    }
+
+    #[test]
+    fn the_global_prefix_wins_when_it_nests_inside_a_bare_environment_prefix() {
+        // The pre-`env_id` shape a self-managed deployment still uses:
+        // the environment prefix is the bare base, so `<base>/global/`
+        // sits INSIDE it. Resolved against the outer prefix the key would
+        // parse as kind `global` and be rejected, silently costing every
+        // model its catalog price.
+        let s = set("/aisix", "/aisix/global/");
+        let k = s.resolve("/aisix/global/pricing/p-1").unwrap();
+        assert_eq!(k.scope, PrefixScope::Global);
+        assert_eq!((k.kind, k.id), ("pricing", "p-1"));
+
+        // A sibling of `global` under the same base is still the
+        // environment's.
+        let m = s.resolve("/aisix/models/m-1").unwrap();
+        assert_eq!(m.scope, PrefixScope::Environment);
+        assert_eq!(m.kind, "models");
+    }
+
+    #[test]
+    fn a_key_under_no_watched_prefix_is_a_mismatch() {
+        let s = set("/aisix/env-1/", "/aisix/global/");
+        let err = s.resolve("/aisix/env-2/models/m-1").unwrap_err();
+        assert!(matches!(err, KeyError::PrefixMismatch { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_malformed_suffix_under_a_watched_prefix_is_not_retried_elsewhere() {
+        let s = set("/aisix/env-1/", "/aisix/global/");
+        assert!(matches!(
+            s.resolve("/aisix/env-1/models").unwrap_err(),
+            KeyError::MissingSuffix(_)
+        ));
+        assert!(matches!(
+            s.resolve("/aisix/global/pricing/").unwrap_err(),
+            KeyError::EmptySegment(_)
+        ));
+    }
+
+    #[test]
+    fn only_global_pricing_takes_a_different_table_than_its_kind() {
+        let s = set("/aisix/env-1/", "/aisix/global/");
+        assert_eq!(
+            s.resolve("/aisix/global/pricing/p-1").unwrap().table_kind(),
+            "global_pricing"
+        );
+        // The same kind under the environment keeps its own table, which
+        // is what lets an environment document override a catalog one.
+        assert_eq!(
+            s.resolve("/aisix/env-1/pricing/p-1").unwrap().table_kind(),
+            "pricing"
+        );
+        assert_eq!(
+            s.resolve("/aisix/env-1/models/m-1").unwrap().table_kind(),
+            "models"
+        );
+    }
+
+    #[test]
+    fn a_single_prefix_set_is_environment_scoped() {
+        let s = PrefixSet::single("/aisix");
+        assert_eq!(s.len(), 1);
+        assert_eq!(
+            s.resolve("/aisix/models/m-1").unwrap().scope,
+            PrefixScope::Environment
+        );
+    }
+
     #[test]
     fn display_is_kind_slash_id() {
         let k = ResourceKey {

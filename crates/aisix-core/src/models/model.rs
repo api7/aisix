@@ -539,7 +539,12 @@ fn model_one_of_variant(strict: bool) -> Value {
         // stay direct-only.
         extend(
             &mut arr[3],
-            &["auto_prompt_caching", "cost", "pricing_key", "effort_mapping"],
+            &[
+                "auto_prompt_caching",
+                "cost",
+                "pricing_key",
+                "effort_mapping",
+            ],
         );
     }
     variants

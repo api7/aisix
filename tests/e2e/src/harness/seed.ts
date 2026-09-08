@@ -47,6 +47,25 @@ export class SeedClient {
     return this.put("provider_keys", { provider: "openai", adapter: "openai", ...pk });
   }
 
+  /**
+   * Seeds a `pricing` document under this client's prefix.
+   *
+   * Which prefix the client was built with is the whole point: an
+   * environment-prefix client writes the environment's own price, a
+   * client built on `<prefix>/global` writes the shared catalog entry.
+   * The gateway prefers the former.
+   */
+  async createPricing(
+    pricing: Record<string, unknown>,
+  ): Promise<{ id: string; value: Record<string, unknown> }> {
+    return this.put("pricing", pricing);
+  }
+
+  /** The raw etcd bytes of a seeded document, for round-trip checks. */
+  async raw(kind: string, id: string): Promise<string | undefined> {
+    return this.etcd.get(`${this.prefix}/${kind}/${id}`);
+  }
+
   async createObservabilityExporter(
     exporter: Record<string, unknown>,
   ): Promise<{ id: string; value: Record<string, unknown> }> {

@@ -941,8 +941,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         dirty: &mut Dirty,
     ) -> bool {
         // Build a tiny snapshot out of just the new entry, then merge.
-        let (tiny, mut stats) =
-            loader::build_snapshot(&self.prefixes, std::slice::from_ref(entry));
+        let (tiny, mut stats) = loader::build_snapshot(&self.prefixes, std::slice::from_ref(entry));
         if stats.accepted == 0 {
             // The previous good value keeps serving. Pin it now (#871):
             // the next resync rebuilds from the rejected etcd bytes and
@@ -2067,6 +2066,196 @@ mod tests {
         "kind": "keyword",
         "patterns": [{"kind": "literal", "value": "AKIA"}]
     }"#;
+
+    // ── multi-prefix supervision (AISIX-Cloud#1546) ───────────────
+
+    const ENV_PREFIX: &str = "/aisix/env-1/";
+    const GLOBAL_PREFIX: &str = "/aisix/global/";
+    const VALID_PRICE: &[u8] =
+        br#"{"key":"openai/gpt-4o","input_per_1k":0.005,"output_per_1k":0.015}"#;
+
+    /// A provider that either serves entries or refuses every call the
+    /// way a control plane predating the shared catalog does — its kine
+    /// ACL answers `PermissionDenied` for a Range outside the
+    /// environment's own prefix, which reaches the supervisor as
+    /// [`ProviderError::Rejected`].
+    struct ScopedProvider {
+        entries: Vec<RawEntry>,
+        revision: i64,
+        refuse: bool,
+    }
+
+    impl ScopedProvider {
+        fn serving(entries: Vec<RawEntry>, revision: i64) -> Arc<Self> {
+            Arc::new(Self {
+                entries,
+                revision,
+                refuse: false,
+            })
+        }
+
+        fn refusing() -> Arc<Self> {
+            Arc::new(Self {
+                entries: Vec::new(),
+                revision: 0,
+                refuse: true,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ConfigProvider for ScopedProvider {
+        async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
+            if self.refuse {
+                return Err(ProviderError::Rejected(
+                    "etcdserver: permission denied: outside env env-1 prefix".into(),
+                ));
+            }
+            Ok((self.entries.clone(), self.revision))
+        }
+
+        async fn watch(
+            &self,
+            _start_revision: i64,
+        ) -> Result<
+            Box<dyn futures::Stream<Item = Result<WatchEvent, ProviderError>> + Send + Unpin>,
+            ProviderError,
+        > {
+            if self.refuse {
+                return Err(ProviderError::Rejected(
+                    "etcdserver: permission denied: outside env env-1 prefix".into(),
+                ));
+            }
+            Ok(Box::new(stream::iter(Vec::new())))
+        }
+    }
+
+    fn scoped_supervisor(
+        env: Arc<ScopedProvider>,
+        global: Arc<ScopedProvider>,
+    ) -> Arc<Supervisor<ScopedProvider>> {
+        Arc::new(Supervisor::with_sources(
+            vec![
+                (WatchedPrefix::environment(ENV_PREFIX), env),
+                (WatchedPrefix::global(GLOBAL_PREFIX), global),
+            ],
+            SnapshotCache::disabled(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn both_prefixes_land_in_one_snapshot() {
+        let sup = scoped_supervisor(
+            ScopedProvider::serving(
+                vec![
+                    entry("/aisix/env-1/models/m-1", VALID_MODEL, 7),
+                    entry("/aisix/env-1/pricing/env-p", VALID_PRICE, 8),
+                ],
+                8,
+            ),
+            ScopedProvider::serving(
+                vec![entry("/aisix/global/pricing/global-p", VALID_PRICE, 5)],
+                5,
+            ),
+        );
+        sup.load_once().await.unwrap();
+        let snap = sup.handle().load();
+        assert_eq!(snap.models.len(), 1);
+        assert_eq!(snap.pricing.len(), 1);
+        assert_eq!(snap.global_pricing.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn applied_revision_is_the_maximum_across_prefixes() {
+        // kine revisions are cluster-global, so the point the whole read
+        // is consistent as of is the highest either prefix reported —
+        // whichever one that is. Both orders, because taking the LAST
+        // prefix's revision (or the FIRST, or the environment's) passes
+        // one of them by accident.
+        //
+        // Every entry is written at revision 1 so the header revisions
+        // are the only thing that can produce the expected value: the
+        // resync raises the floor to the highest entry revision first,
+        // and entries at 7 / 42 / 99 would supply the answer by
+        // themselves — which is how the first version of this case
+        // stayed green against a last-prefix-wins mutation.
+        let global_ahead = scoped_supervisor(
+            ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 1)], 7),
+            ScopedProvider::serving(vec![entry("/aisix/global/pricing/g", VALID_PRICE, 1)], 42),
+        );
+        global_ahead.load_once().await.unwrap();
+        assert_eq!(global_ahead.watch_status().snapshot().revision, 42);
+
+        let env_ahead = scoped_supervisor(
+            ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 1)], 99),
+            ScopedProvider::serving(vec![entry("/aisix/global/pricing/g", VALID_PRICE, 1)], 5),
+        );
+        env_ahead.load_once().await.unwrap();
+        assert_eq!(env_ahead.watch_status().snapshot().revision, 99);
+    }
+
+    #[tokio::test]
+    async fn a_refused_catalog_leaves_the_environment_serving() {
+        // The old-control-plane case: the catalog prefix is denied, the
+        // environment's is not. The gateway must come up on the
+        // environment's configuration rather than fail its cycle — the
+        // alternative is serving nothing at all instead of serving
+        // without prices.
+        let sup = scoped_supervisor(
+            ScopedProvider::serving(
+                vec![
+                    entry("/aisix/env-1/models/m-1", VALID_MODEL, 11),
+                    entry("/aisix/env-1/api_keys/k-1", VALID_APIKEY, 12),
+                ],
+                12,
+            ),
+            ScopedProvider::refusing(),
+        );
+
+        // Completes rather than erroring — readiness is not held back by
+        // the refused prefix.
+        let stats = sup.load_once().await.expect("environment load succeeds");
+        assert_eq!(stats.accepted, 2);
+        let snap = sup.handle().load();
+        assert_eq!(snap.models.len(), 1);
+        assert_eq!(snap.apikeys.len(), 1);
+        // Read as empty, not as an error: no rejection is reported for a
+        // prefix the gateway was never allowed to read.
+        assert_eq!(snap.global_pricing.len(), 0);
+        assert!(sup.recent_rejections().is_empty());
+        // The revision floor comes from the prefix that did answer.
+        assert_eq!(sup.watch_status().snapshot().revision, 12);
+    }
+
+    #[tokio::test]
+    async fn a_refused_catalog_does_not_stop_the_watch_cycle() {
+        // The watch half of the case above: the catalog's watch create is
+        // refused too, and the cycle still runs to a clean end on the
+        // environment's stream alone.
+        let sup = scoped_supervisor(
+            ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 3)], 3),
+            ScopedProvider::refusing(),
+        );
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        // The environment stream is empty, so the cycle drains it and
+        // returns Ok — a refusal on the catalog would have surfaced here
+        // as SupervisorError::Provider.
+        sup.cycle(&rx).await.expect("cycle survives the refusal");
+        assert_eq!(sup.handle().load().models.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refused_environment_prefix_still_fails_the_cycle() {
+        // The tolerance is scoped to the catalog. Credentials etcd
+        // refuses outright must still stop the cycle and reach the
+        // backoff loop's error path, or a misconfigured gateway would
+        // quietly serve an empty configuration forever.
+        let sup = scoped_supervisor(ScopedProvider::refusing(), ScopedProvider::refusing());
+        assert!(matches!(
+            sup.load_once().await,
+            Err(ProviderError::Rejected(_))
+        ));
+    }
 
     /// The two config digests must stay byte-identical to what the
     /// unchanged `hash_entries` produces over the same served set: cp-api

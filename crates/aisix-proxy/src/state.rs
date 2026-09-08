@@ -16,10 +16,10 @@
 
 use aisix_cache::{Cache, MemoryCache, MemorySemanticCache, SemanticCacheStore};
 use aisix_core::models::CacheBackend;
+use aisix_core::models::LivePricingIndex;
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, ProxyConfig};
 use aisix_gateway::Hub;
-use aisix_core::models::LivePricingIndex;
 use aisix_guardrails::LiveGuardrailIndex;
 use aisix_obs::{ClientTypeClassifier, Metrics, OtlpHttpFanOut, UsageSink};
 use aisix_ratelimit::Limiter;

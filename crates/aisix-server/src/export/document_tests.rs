@@ -672,6 +672,53 @@ fn a_team_scope_is_carried_through_verbatim() {
 }
 
 #[test]
+fn model_pricing_key_is_dropped_from_the_export() {
+    let snap = AisixSnapshot::new();
+    snap.provider_keys
+        .insert(ResourceEntry::new("pk", provider_key("pk", "sk"), 1));
+    snap.models.insert(ResourceEntry::new(
+        "m-1",
+        model_value(json!({
+            "display_name": "priced-by-catalog",
+            "provider": "openai",
+            "model_name": "x",
+            "provider_key_id": "pk",
+            "pricing_key": "openai/x"
+        })),
+        1,
+    ));
+    snap.models.insert(ResourceEntry::new(
+        "m-2",
+        model_value(json!({
+            "display_name": "priced-inline-too",
+            "provider": "openai",
+            "model_name": "x",
+            "provider_key_id": "pk",
+            "pricing_key": "openai/x",
+            "cost": {"input_per_1k": 1.0, "output_per_1k": 2.0}
+        })),
+        1,
+    ));
+
+    let doc = build_export_document(&snap, false);
+    let models = find(&doc, "models");
+    // The reference has no file form, so neither model keeps it — the
+    // file source rejects the field outright.
+    for m in models {
+        assert!(m.get("pricing_key").is_none(), "{m:?}");
+    }
+    // Losing it costs the first model its price entirely, which is worth
+    // saying; the second still carries `cost`, so nothing is lost there.
+    assert_eq!(doc.warnings.len(), 1, "{:?}", doc.warnings);
+    assert!(
+        doc.warnings[0].contains("priced-by-catalog") && doc.warnings[0].contains("least_cost"),
+        "{:?}",
+        doc.warnings
+    );
+    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
+}
+
+#[test]
 fn api_key_allowed_model_ids_resugar_to_names() {
     let snap = AisixSnapshot::new();
     snap.provider_keys

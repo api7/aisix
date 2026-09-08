@@ -192,4 +192,137 @@ mod tests {
     fn resource_kind_matches_kine_path_segment() {
         assert_eq!(<Pricing as Resource>::kind(), "pricing");
     }
+
+    use crate::resource::ResourceEntry;
+
+    fn price(key: &str, input: f64, output: f64) -> Pricing {
+        Pricing {
+            key: key.into(),
+            input_per_1k: input,
+            output_per_1k: output,
+            runtime_id: String::new(),
+        }
+    }
+
+    fn model(json: &str) -> Model {
+        serde_json::from_str(json).unwrap()
+    }
+
+    fn direct(extra: &str) -> Model {
+        model(&format!(
+            r#"{{"display_name":"m","provider":"openai","model_name":"gpt-4o",
+                "provider_key_id":"11111111-1111-1111-1111-111111111111"{extra}}}"#
+        ))
+    }
+
+    #[test]
+    fn an_environment_document_wins_over_the_global_one() {
+        let snap = AisixSnapshot::new();
+        snap.global_pricing
+            .insert(ResourceEntry::new("g", price("k", 1.0, 1.0), 1));
+        snap.pricing
+            .insert(ResourceEntry::new("e", price("k", 9.0, 9.0), 2));
+
+        let index = PricingIndex::build(&snap);
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.get("k").unwrap().input_per_1k, 9.0);
+    }
+
+    #[test]
+    fn a_global_document_applies_where_the_environment_has_none() {
+        let snap = AisixSnapshot::new();
+        snap.global_pricing
+            .insert(ResourceEntry::new("g", price("k", 1.0, 2.0), 1));
+        snap.pricing
+            .insert(ResourceEntry::new("e", price("other", 9.0, 9.0), 2));
+
+        let index = PricingIndex::build(&snap);
+        assert_eq!(index.get("k").unwrap().output_per_1k, 2.0);
+    }
+
+    #[test]
+    fn resolution_falls_through_pricing_key_then_inline_cost() {
+        let snap = AisixSnapshot::new();
+        snap.global_pricing
+            .insert(ResourceEntry::new("g", price("k", 1.0, 1.0), 1));
+        let index = PricingIndex::build(&snap);
+
+        // A resolving key wins over the inline cost sitting next to it,
+        // which is what makes the reference authoritative rather than
+        // advisory.
+        let keyed =
+            direct(r#","pricing_key":"k","cost":{"input_per_1k":50.0,"output_per_1k":50.0}"#);
+        assert_eq!(index.resolve(&keyed).unwrap().input_per_1k, 1.0);
+
+        // A key naming no document falls through to the inline cost.
+        let missing =
+            direct(r#","pricing_key":"absent","cost":{"input_per_1k":7.0,"output_per_1k":7.0}"#);
+        assert_eq!(index.resolve(&missing).unwrap().input_per_1k, 7.0);
+
+        // No key at all: unchanged behaviour for every model written
+        // before this feature existed.
+        let inline = direct(r#","cost":{"input_per_1k":3.0,"output_per_1k":3.0}"#);
+        assert_eq!(index.resolve(&inline).unwrap().input_per_1k, 3.0);
+
+        // Neither: no price, which ranks last rather than free.
+        let none = direct(r#","pricing_key":"absent""#);
+        assert!(index.resolve(&none).is_none());
+        assert!(index.resolve(&direct("")).is_none());
+    }
+
+    #[test]
+    fn the_live_index_rebuilds_when_a_pricing_table_changes() {
+        let snap = AisixSnapshot::new();
+        snap.global_pricing
+            .insert(ResourceEntry::new("g", price("k", 1.0, 1.0), 1));
+        let live = LivePricingIndex::new();
+
+        let first = live.for_snapshot(&snap);
+        assert!(Arc::ptr_eq(&first, &live.for_snapshot(&snap)));
+
+        // A write to an unrelated table must NOT invalidate: that is the
+        // difference between keying on the table generation and keying on
+        // the snapshot version (AISIX-Cloud#1542).
+        snap.apikeys.insert(ResourceEntry::new(
+            "k-1",
+            serde_json::from_str::<crate::models::ApiKey>(
+                r#"{"key_hash":"91ed2dbc407561556f3e7be98ba0bd2a57986d6a868c482d867d19c6d40d201c"}"#,
+            )
+            .unwrap(),
+            1,
+        ));
+        assert!(Arc::ptr_eq(&first, &live.for_snapshot(&snap)));
+
+        // A price edit does invalidate, and the new price is what the
+        // next reader sees — with no model document involved.
+        snap.global_pricing
+            .insert(ResourceEntry::new("g", price("k", 5.0, 5.0), 2));
+        let second = live.for_snapshot(&snap);
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.get("k").unwrap().input_per_1k, 5.0);
+
+        // The environment table is the other half of the invalidation
+        // key; a write there must invalidate too.
+        snap.pricing
+            .insert(ResourceEntry::new("e", price("k", 8.0, 8.0), 3));
+        let third = live.for_snapshot(&snap);
+        assert!(!Arc::ptr_eq(&second, &third));
+        assert_eq!(third.get("k").unwrap().input_per_1k, 8.0);
+    }
+
+    #[test]
+    fn pricing_key_is_direct_only_like_cost() {
+        // `pricing_key` and `cost` are two spellings of the same knob, so
+        // a kind that strips one must strip the other — otherwise a
+        // routing group could carry a price the runtime never reads.
+        let mut group: Model = serde_json::from_str(
+            r#"{"display_name":"g","routing":{"targets":[{"model":"a"}]},
+                "cost":{"input_per_1k":1.0,"output_per_1k":1.0},"pricing_key":"k"}"#,
+        )
+        .unwrap();
+        let stripped = group.strip_kind_inapplicable();
+        assert!(stripped.contains(&"pricing_key"), "{stripped:?}");
+        assert!(stripped.contains(&"cost"), "{stripped:?}");
+        assert!(group.pricing_key.is_none() && group.cost.is_none());
+    }
 }

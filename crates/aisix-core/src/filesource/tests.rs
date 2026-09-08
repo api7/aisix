@@ -444,6 +444,63 @@ models:
 }
 
 #[test]
+fn pricing_key_is_rejected_by_the_file_source() {
+    // The reference names a document only the control plane writes, and
+    // the shared catalog is not even under the prefix a standalone
+    // gateway reads. A file that carried it would leave the model with no
+    // price at all — silently, with `cost` the only thing that could have
+    // supplied one.
+    let contents = r#"
+_format_version: "1"
+models:
+  - display_name: m
+    provider: openai
+    model_name: x
+    provider_key: pk
+    pricing_key: openai/x
+provider_keys:
+  - display_name: pk
+    api_key: sk-x
+"#;
+    let env = env_of(&[]);
+    let errs = errors_of(load(contents, &env));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("does not accept `pricing_key`") && errs[0].contains("cost"),
+        "{errs:?}"
+    );
+
+    // The same file without the field loads, so the rejection is the
+    // field and not anything else in the fixture.
+    let ok = contents.replace("    pricing_key: openai/x\n", "");
+    load(&ok, &env).expect("the same file without the field loads");
+}
+
+#[test]
+fn a_pricing_collection_is_rejected_by_the_file_source() {
+    // Named rather than swept into the generic unknown-key error: it is a
+    // real collection the gateway loads from etcd, so "unknown top-level
+    // key" would read as a typo rather than as the answer it is.
+    let contents = r#"
+_format_version: "1"
+pricing:
+  - key: openai/x
+    input_per_1k: 1.0
+    output_per_1k: 2.0
+provider_keys:
+  - display_name: pk
+    api_key: sk-x
+"#;
+    let env = env_of(&[]);
+    let errs = errors_of(load(contents, &env));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("does not accept a `pricing` collection") && errs[0].contains("cost"),
+        "{errs:?}"
+    );
+}
+
+#[test]
 fn allowed_model_ids_is_rejected_by_the_file_source() {
     // A file's ids are derived from entry names, so no id written here
     // resolves to a model — the key would silently grant nothing, with

@@ -1167,6 +1167,7 @@ fn targets_allowed_for_ip(
 ///
 /// Shared by `/v1/chat/completions` and `/v1/messages` so both endpoints
 /// dispatch Model Groups identically (ai-gateway#471).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_attempt_models(
     routing_registry: &RoutingRegistry,
     runtime_status: &crate::ModelRuntimeStatusTracker,
@@ -2467,6 +2468,92 @@ mod tests {
     }
 
     // ── order_attempts_by_metric (least_cost) ─────────────────────
+
+    /// A snapshot with no pricing documents — the cases below rank by
+    /// the models' own inline `cost`, which is what every deployment
+    /// written before pricing documents existed still does.
+    fn unpriced() -> AisixSnapshot {
+        AisixSnapshot::new()
+    }
+
+    /// A snapshot whose shared catalog prices `key` at `input`/`output`.
+    fn priced(key: &str, input: f64, output: f64) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.global_pricing.insert(aisix_core::ResourceEntry::new(
+            "p-1",
+            serde_json::from_str(&format!(
+                r#"{{"key":"{key}","input_per_1k":{input},"output_per_1k":{output}}}"#
+            ))
+            .unwrap(),
+            1,
+        ));
+        snap
+    }
+
+    /// A target priced only by reference — no inline `cost` to fall back
+    /// on, so a resolution that does not happen ranks it last.
+    fn am_with_pricing_key(id: &str, key: &str) -> AttemptModel {
+        let model: Model = serde_json::from_str(&format!(
+            r#"{{
+              "display_name": "{id}",
+              "provider": "openai",
+              "model_name": "gpt-4o-mini",
+              "provider_key_id": "pk-{id}",
+              "pricing_key": "{key}"
+            }}"#
+        ))
+        .unwrap();
+        AttemptModel {
+            id: id.to_string(),
+            model,
+            priority: 0,
+            weight: 1,
+        }
+    }
+
+    #[test]
+    fn least_cost_ranks_a_referenced_price_against_an_inline_one() {
+        let t = crate::ModelRuntimeStatusTracker::new();
+        // The referenced price (2/1K) undercuts the inline one (6/1K).
+        // Reversed against the same models with no catalog, below, so
+        // neither ordering can be the accidental one.
+        let snap = priced("vendor/x", 1.0, 1.0);
+        let mut attempts = vec![
+            am_with_cost("inline", 3.0, 3.0),
+            am_with_pricing_key("referenced", "vendor/x"),
+        ];
+        order_attempts_by_metric(
+            RoutingStrategy::LeastCost,
+            &mut attempts,
+            &t,
+            &snap,
+            &LivePricingIndex::new(),
+        );
+        let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["referenced", "inline"]);
+    }
+
+    #[test]
+    fn least_cost_ranks_an_unresolved_reference_last() {
+        let t = crate::ModelRuntimeStatusTracker::new();
+        // Same two targets, no catalog: the reference resolves to
+        // nothing and the model carries no inline cost, so it is +∞ and
+        // sorts behind the priced one.
+        let mut attempts = vec![
+            am_with_pricing_key("referenced", "vendor/x"),
+            am_with_cost("inline", 3.0, 3.0),
+        ];
+        order_attempts_by_metric(
+            RoutingStrategy::LeastCost,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
+        let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["inline", "referenced"]);
+    }
+
     fn am_with_cost(id: &str, input_per_1k: f64, output_per_1k: f64) -> AttemptModel {
         let model: Model = serde_json::from_str(&format!(
             r#"{{
@@ -2494,7 +2581,13 @@ mod tests {
             am_with_cost("cheap", 1.0, 2.0),    // 3 / 1K
             am_with_cost("mid", 5.0, 5.0),      // 10 / 1K
         ];
-        order_attempts_by_metric(RoutingStrategy::LeastCost, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::LeastCost,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["cheap", "mid", "pricey"]);
     }
@@ -2507,7 +2600,13 @@ mod tests {
             am_with_cost("cheap", 1.0, 1.0), // 2 / 1K
             am("no-cost-b"),                 // +∞
         ];
-        order_attempts_by_metric(RoutingStrategy::LeastCost, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::LeastCost,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         // Priced target first; equal (missing-cost) targets keep their
         // declaration order thanks to the stable sort.
@@ -2518,7 +2617,13 @@ mod tests {
     fn non_metric_strategy_leaves_order_untouched() {
         let t = crate::ModelRuntimeStatusTracker::new();
         let mut attempts = vec![am_with_cost("b", 9.0, 9.0), am_with_cost("a", 1.0, 1.0)];
-        order_attempts_by_metric(RoutingStrategy::Failover, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::Failover,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["b", "a"]);
     }
@@ -2531,7 +2636,13 @@ mod tests {
         t.record_latency("fast", 50);
         t.record_latency("mid", 300);
         let mut attempts = vec![am("slow"), am("fast"), am("mid")];
-        order_attempts_by_metric(RoutingStrategy::LeastLatency, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::LeastLatency,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["fast", "mid", "slow"]);
     }
@@ -2543,7 +2654,13 @@ mod tests {
         // "unseen-a"/"unseen-b" have no samples → rank first (−∞), keeping
         // their declaration order via the stable sort.
         let mut attempts = vec![am("measured"), am("unseen-a"), am("unseen-b")];
-        order_attempts_by_metric(RoutingStrategy::LeastLatency, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::LeastLatency,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["unseen-a", "unseen-b", "measured"]);
     }
@@ -2568,7 +2685,13 @@ mod tests {
         let _m1 = t.begin_in_flight("mid"); // 1 in-flight
                                             // "idle" has 0 in-flight.
         let mut attempts = vec![am("busy"), am("idle"), am("mid")];
-        order_attempts_by_metric(RoutingStrategy::LeastBusy, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::LeastBusy,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["idle", "mid", "busy"]);
     }
@@ -2578,7 +2701,13 @@ mod tests {
         let t = crate::ModelRuntimeStatusTracker::new();
         // All idle (0 in-flight) → stable sort preserves declaration order.
         let mut attempts = vec![am("a"), am("b"), am("c")];
-        order_attempts_by_metric(RoutingStrategy::LeastBusy, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::LeastBusy,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b", "c"]);
     }
