@@ -1361,21 +1361,24 @@ impl<P: ConfigProvider> Supervisor<P> {
                         }
                         let item = tokio::select! {
                             biased;
+                            // FIRST, ahead of the stream: `biased` gives
+                            // the window to whichever branch is ready
+                            // earliest in this list, and during a bulk
+                            // edit the stream has an event ready on every
+                            // poll — so ordered after it, this branch
+                            // would never be reached and shutdown would
+                            // keep consuming the backlog until the max
+                            // wait or MAX_APPLY_BATCH ended the window.
+                            // The batch collected so far is still applied
+                            // below: those events are already off the
+                            // stream, so that apply is the only thing
+                            // that can still serve and persist them. The
+                            // ones still on the stream are untouched and
+                            // come back from etcd on the next start.
+                            _ = wait_for_cancel(cancel.clone()) => break,
                             item = stream.next() => item,
                             _ = tokio::time::sleep_until(deadline) => break,
                             _ = tokio::time::sleep(COALESCE_QUIET_PERIOD) => break,
-                            // Leave the window early on shutdown rather
-                            // than sit out a wait for events that are no
-                            // longer coming. Bounded by the max wait, not
-                            // immediate: `biased` means a stream with an
-                            // event ready wins this branch every time.
-                            // Either way the batch collected so far is
-                            // still applied below — those events are
-                            // already off the stream, so this apply is
-                            // the only thing that can still serve and
-                            // persist them — and the outer loop then sees
-                            // the flag.
-                            _ = wait_for_cancel(cancel.clone()) => break,
                         };
                         match item {
                             Some(Ok(event @ (WatchEvent::Put(_) | WatchEvent::Delete { .. }))) => {
@@ -2479,6 +2482,68 @@ mod tests {
             sup.handle().load().models.len(),
             1,
             "the batch already taken off the stream was dropped on shutdown",
+        );
+    }
+
+    /// ...and it must stop taking new ones. A bulk edit leaves an event
+    /// ready on the stream at every poll, which is the one case where
+    /// `biased` ordering decides whether the cancel branch is ever
+    /// reached at all: ordered after the stream it never is, and
+    /// shutdown keeps draining the backlog until the max wait or
+    /// MAX_APPLY_BATCH closes the window.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_stops_the_window_from_draining_a_ready_backlog() {
+        const BACKLOG: i64 = 60;
+
+        let (provider, tx) = LiveProvider::new(0);
+        let sup = Arc::new(Supervisor::new(provider, "/aisix"));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let watcher = tokio::spawn({
+            let sup = sup.clone();
+            async move { sup.cycle(&cancel_rx).await }
+        });
+        let load_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while sup.handle().version() == 0 {
+            assert!(
+                tokio::time::Instant::now() < load_deadline,
+                "the initial resync never published",
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // Open a window with one event, then queue the rest without ever
+        // yielding, so they are all ready when the watcher next polls.
+        tx.unbounded_send(Ok(WatchEvent::Put(entry(
+            "/aisix/models/m-1",
+            VALID_MODEL,
+            2,
+        ))))
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        for i in 2..=BACKLOG {
+            tx.unbounded_send(Ok(WatchEvent::Put(entry(
+                &format!("/aisix/models/m-{i}"),
+                VALID_MODEL,
+                i + 1,
+            ))))
+            .unwrap();
+        }
+        cancel_tx.send(true).unwrap();
+
+        assert!(matches!(
+            watcher.await.unwrap(),
+            Err(SupervisorError::Cancelled)
+        ));
+        let applied = sup.handle().load().models.len();
+        assert!(
+            applied >= 1,
+            "the event already taken off the stream was dropped on shutdown",
+        );
+        assert!(
+            (applied as i64) < BACKLOG,
+            "shutdown drained the whole ready backlog ({applied} events) instead of leaving the \
+             window at the first cancel check",
         );
     }
 
