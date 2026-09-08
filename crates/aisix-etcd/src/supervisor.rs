@@ -96,6 +96,21 @@ impl WatchStatus {
         *self.inner.last_apply_at.lock().unwrap() = Some(Instant::now());
     }
 
+    /// [`Self::record_apply`] for a completed READ, which knows the exact
+    /// point its result is consistent as of and therefore ASSIGNS rather
+    /// than raising.
+    ///
+    /// A read of several prefixes can land below what the resync just
+    /// stamped from the entry set — a row in the later-read prefix may
+    /// have been written after the earlier prefix was read, while a write
+    /// to the earlier prefix in that interval is missing from the union
+    /// altogether. Keeping the higher number would go on claiming a write
+    /// the gateway has not seen.
+    pub(crate) fn record_read(&self, revision: i64) {
+        self.inner.revision.store(revision, Ordering::Relaxed);
+        *self.inner.last_apply_at.lock().unwrap() = Some(Instant::now());
+    }
+
     /// Snapshot the current freshness state. Returns the revision and
     /// the age (wall-clock duration since last apply); `None` for age
     /// means the supervisor has not yet successfully completed a cycle.
@@ -306,8 +321,9 @@ impl<P: ConfigProvider> PrefixSource<P> {
         tracing::warn!(
             prefix = %self.prefix.prefix,
             error = %err,
-            "etcd refused the shared pricing catalog; serving without it — a model with \
-             `pricing_key` falls back to its inline `cost` until the control plane grants \
+            "etcd refused the shared pricing catalog; keeping the prices last read from it, \
+             or serving without prices if it was never read — a model with `pricing_key` and \
+             no catalog entry falls back to its inline `cost` until the control plane grants \
              read access to this prefix",
         );
     }
@@ -337,11 +353,12 @@ impl<P: ConfigProvider> Supervisor<P> {
 
     /// Construct over several prefixes, each with its own provider.
     ///
-    /// All of them feed ONE snapshot and one revision floor: kine
-    /// revisions are cluster-global, so the applied revision is the
-    /// maximum across prefixes, and readiness waits for every prefix's
-    /// initial range read (a tolerated refusal on the shared catalog
-    /// counts as read-and-empty — see [`PrefixSource::tolerates`]).
+    /// All of them feed ONE snapshot and one revision floor: the applied
+    /// revision is the MINIMUM across prefixes, because sequential reads
+    /// make the union consistent only as far as the earliest of them (see
+    /// [`PrefixLoad::applied_revision`]), and readiness waits for every
+    /// prefix's initial range read (a tolerated refusal on the shared
+    /// catalog counts as read-and-kept — see [`PrefixSource::tolerates`]).
     pub fn with_sources(mut sources: Vec<(WatchedPrefix, Arc<P>)>, cache: SnapshotCache) -> Self {
         // Environment prefixes are read FIRST, and that ordering is load
         // bearing rather than cosmetic: [`PrefixSource::tolerates`] is
@@ -736,12 +753,12 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// decides whether to backoff and retry.
     pub async fn load_once(&self) -> Result<BuildStats, ProviderError> {
         let load = self.load_all_prefixes().await?;
-        let revision = load.max_revision();
-        let stats = self.apply_resync(&load.entries);
+        let revision = load.applied_revision();
+        let stats = self.apply_resync_at(&load.entries, Some(revision));
         // apply_resync uses max(entry revisions); bump to the etcd
         // load_all revision so the cache file records the true "as
         // of" point, not just the max entry write.
-        self.set_revision_floor(revision);
+        self.record_read_revision(revision);
         tracing::info!(
             accepted = stats.accepted,
             rejected = stats.schema_rejected + stats.parse_rejected,
@@ -752,11 +769,11 @@ impl<P: ConfigProvider> Supervisor<P> {
     }
 
     /// Range-read every watched prefix and return the union of their
-    /// entries with the highest revision any of them reported.
+    /// entries, plus the revision each one's own read was consistent as of.
     ///
-    /// Kine revisions are cluster-global, so the maximum is the point the
-    /// whole read is consistent as of, and it is what the heartbeat
-    /// reports as `applied_revision`.
+    /// The reads run in sequence, so the union as a whole is consistent
+    /// only as far as the EARLIEST of them — see
+    /// [`PrefixLoad::applied_revision`].
     async fn load_all_prefixes(&self) -> Result<PrefixLoad, ProviderError> {
         // Deduplicated by key, because the prefixes can nest: when the
         // gateway has no `env_id` the environment prefix is the bare base
@@ -773,10 +790,15 @@ impl<P: ConfigProvider> Supervisor<P> {
         // would skip every write to it in between — absent from that
         // read and never delivered to that watch.
         let mut revisions: Vec<Option<i64>> = Vec::with_capacity(self.sources.len());
+        // Retention (below) runs in a second pass so it can see the WHOLE
+        // read, not just the prefixes that came before the refusal.
+        let mut read_ok: Vec<&str> = Vec::new();
+        let mut refused: Vec<&PrefixSource<P>> = Vec::new();
         for source in &self.sources {
             match source.provider.load_all().await {
                 Ok((entries, rev)) => {
                     source.clear_refusal();
+                    read_ok.push(&source.prefix.prefix);
                     for entry in entries {
                         match all.entry(entry.key.clone()) {
                             std::collections::btree_map::Entry::Occupied(mut slot) => {
@@ -794,12 +816,40 @@ impl<P: ConfigProvider> Supervisor<P> {
                     revisions.push(Some(rev));
                 }
                 Err(err) if source.tolerates(&err) => {
-                    // Read as empty: the prefix contributes no rows and no
-                    // revision, and readiness is not held back.
+                    // Read as refused: the prefix contributes no revision,
+                    // has no revision to resume its watch from, and does not
+                    // hold readiness back — as before. Its rows are carried
+                    // over in the pass below.
                     source.log_refusal(&err);
+                    refused.push(source);
                     revisions.push(None);
                 }
                 Err(err) => return Err(err),
+            }
+        }
+
+        // A refusal is not a deletion. The rows a refused prefix
+        // contributed to the last successful union are carried into this
+        // one unchanged, and replaced only when a read of it succeeds
+        // again — so a control plane that starts refusing the shared
+        // catalog leaves the gateway pricing on the last catalog it was
+        // allowed to read instead of dropping every price at once. Losing
+        // them is not neutral: `least_cost` stops ranking and realtime /
+        // batch usage events lose `cost_usd`, and the WARN above is the
+        // only sign either happened.
+        for source in refused {
+            for entry in self.entries_last_read_from(&source.prefix) {
+                // Only where nothing else answered for the key. On a
+                // deployment with no `env_id` the environment prefix is the
+                // bare base, so a SUCCESSFUL read of it already covers the
+                // catalog — and that read is authoritative about the key
+                // being gone, which carrying the old row over would undo.
+                // A deleted price would come back to life, priced at
+                // whatever it used to cost.
+                if read_ok.iter().any(|p| entry.key.starts_with(p)) {
+                    continue;
+                }
+                all.entry(entry.key.clone()).or_insert(entry);
             }
         }
         Ok(PrefixLoad {
@@ -808,20 +858,41 @@ impl<P: ConfigProvider> Supervisor<P> {
         })
     }
 
-    /// Bump the recorded revision floor. Used by the cycle path to
-    /// stamp the cache with the etcd `load_all` revision even when the
-    /// resulting entry set is empty (so the file still reflects when
-    /// the DP last successfully reached the CP). Also stamps
-    /// `WatchStatus.last_apply_at` so `/admin/v1/health` reflects the
-    /// successful round-trip with etcd even on an empty config.
-    fn set_revision_floor(&self, revision: i64) {
-        {
-            let mut rev = self.revision.lock().unwrap();
-            if revision > *rev {
-                *rev = revision;
-            }
-        }
-        self.status.record_apply(revision);
+    /// The rows the last applied union carried under `prefix`.
+    ///
+    /// Attribution is by key prefix, which is exact for the only caller:
+    /// [`PrefixSource::tolerates`] admits the shared catalog alone, and the
+    /// catalog prefix is the longest one a supervisor watches, so no key
+    /// under it belongs to another source.
+    fn entries_last_read_from(&self, prefix: &WatchedPrefix) -> Vec<RawEntry> {
+        let state = self.state.lock().unwrap();
+        state
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix.prefix))
+            .map(|(_, held)| held.entry.clone())
+            .collect()
+    }
+
+    /// Record the revision a completed read was consistent as of, replacing
+    /// whatever the preceding `apply_resync` derived from the entry set.
+    /// Used by the cycle path so the cache and the heartbeat reflect when
+    /// the DP last successfully reached the CP even when the resulting
+    /// entry set is empty. Also stamps `WatchStatus.last_apply_at` so
+    /// `/admin/v1/health` reflects the successful round-trip with etcd.
+    ///
+    /// **Assigns, rather than raising a floor.** `apply_resync` stamps
+    /// `max(entry revision)`, which across several prefixes read in
+    /// sequence can exceed the point the union as a whole is consistent as
+    /// of: a row written to the later-read prefix after the earlier one was
+    /// read carries a revision above the earlier read's header, while a
+    /// write to the earlier prefix in that same interval is missing from
+    /// the union entirely. Raising a floor would keep that overstatement
+    /// and go on claiming a write the gateway has not seen — the one thing
+    /// `applied_revision` exists to answer. The caller's value is the
+    /// authoritative one and is never lower than honest.
+    fn record_read_revision(&self, revision: i64) {
+        *self.revision.lock().unwrap() = revision;
+        self.status.record_read(revision);
         // Reflect the finalised revision on the status view (the preceding
         // apply_resync synced with the entry-max revision; this corrects it to
         // the load/watch header revision). Not itself a reload event.
@@ -1053,7 +1124,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     }
 
     /// Stage one Delete. `revision` carries the watch header revision the
-    /// cycle loop would otherwise pass to [`Self::set_revision_floor`]
+    /// cycle loop would otherwise pass to [`Self::record_read_revision`]
     /// immediately afterwards; `None` (the standalone
     /// [`Self::apply_delete`] entry point) leaves the floor alone.
     #[allow(clippy::too_many_arguments)]
@@ -1133,12 +1204,18 @@ impl<P: ConfigProvider> Supervisor<P> {
         }
     }
 
-    /// In-batch form of [`Self::set_revision_floor`]: bump the floor and
-    /// mark the batch as needing a status publish, deferring the single
+    /// In-batch form for the watch-event path: raise the floor and mark
+    /// the batch as needing a status publish, deferring the single
     /// `record_apply` / `sync_config_status` to the end of the batch.
     ///
+    /// A floor here, not an assignment as in [`Self::record_read_revision`]:
+    /// these are individual watch events, delivered in revision order and
+    /// each carrying only its own write's revision, so the highest seen is
+    /// the point the configuration reflects. Only a completed READ knows a
+    /// consistent-as-of point that can be lower than what came before.
+    ///
     /// Status only — the floor is not part of the observed entry set, and
-    /// `set_revision_floor` never wrote the cache file either.
+    /// `record_read_revision` never wrote the cache file either.
     fn raise_revision_floor(
         &self,
         revision: Option<i64>,
@@ -1167,6 +1244,22 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// write that broke it. Retention ends when the key loads cleanly
     /// again or leaves etcd.
     pub fn apply_resync(&self, entries: &[RawEntry]) -> BuildStats {
+        self.apply_resync_at(entries, None)
+    }
+
+    /// [`Self::apply_resync`] told the revision the entry set was read at.
+    ///
+    /// A completed read knows the exact point its result is consistent as
+    /// of, and that point can be BELOW the highest revision in the entry
+    /// set — see [`Self::record_read_revision`]. The caller's value has to
+    /// land BEFORE the cache flush at the end of this function, because the
+    /// cache refuses a write below the revision it has already committed:
+    /// commit the entry maximum here and every apply between the two
+    /// numbers is silently dropped from the cache — precisely the events
+    /// carrying the writes the read could not see. A restart during an etcd
+    /// outage would then serve a cache claiming a revision whose changes it
+    /// does not contain.
+    pub fn apply_resync_at(&self, entries: &[RawEntry], read_revision: Option<i64>) -> BuildStats {
         let (snap, mut stats) = loader::build_snapshot(&self.prefixes, entries);
 
         // Reconcile the last-known-good state against this build, then
@@ -1259,14 +1352,21 @@ impl<P: ConfigProvider> Supervisor<P> {
                 state.insert(e.key.clone(), StateEntry::new(e.clone()));
             }
         }
-        // Resync revision is the max of any entry; if the caller has a
-        // separate "load_all revision" they pass it via the cycle path
-        // (see `cycle`), this branch just covers the watch Resync event.
-        let max_rev = entries.iter().map(|e| e.revision).max();
-        if let Some(rev_val) = max_rev {
-            let mut rev = self.revision.lock().unwrap();
-            if rev_val > *rev {
-                *rev = rev_val;
+        match read_revision {
+            // The caller read the entry set and knows what it is
+            // consistent as of. Assigned, not raised, for the reason in
+            // this function's doc comment.
+            Some(revision) => *self.revision.lock().unwrap() = revision,
+            // No read behind this one — the standalone entry point, used
+            // by tests and by callers replaying an entry set. The max of
+            // any entry is the best available answer.
+            None => {
+                if let Some(rev_val) = entries.iter().map(|e| e.revision).max() {
+                    let mut rev = self.revision.lock().unwrap();
+                    if rev_val > *rev {
+                        *rev = rev_val;
+                    }
+                }
             }
         }
         // /admin/v1/health: stamp freshness on every resync, even when the
@@ -1424,14 +1524,14 @@ impl<P: ConfigProvider> Supervisor<P> {
             .load_all_prefixes()
             .await
             .map_err(SupervisorError::Provider)?;
-        let revision = load.max_revision();
+        let revision = load.applied_revision();
 
         // ONE resync over the union: the snapshot is published only after
         // every prefix has been read, so readiness means every prefix's
         // initial load completed and no request can observe the
         // environment loaded and the catalog not.
-        self.apply_resync(&load.entries);
-        self.set_revision_floor(revision);
+        self.apply_resync_at(&load.entries, Some(revision));
+        self.record_read_revision(revision);
 
         let mut streams = Vec::with_capacity(self.sources.len());
         for (source, from) in self.sources.iter().zip(&load.revisions) {
@@ -1493,11 +1593,11 @@ impl<P: ConfigProvider> Supervisor<P> {
                 }
                 Some(Watched::Event(Err(err))) => return Err(SupervisorError::Provider(err)),
                 Some(Watched::Event(Ok(WatchEvent::Resync { entries, revision }))) => {
-                    self.apply_resync(&entries);
+                    self.apply_resync_at(&entries, Some(revision));
                     // The resync's header revision is the "consistent as
                     // of" point even when the entry set is empty or only
                     // contains older mod_revisions.
-                    self.set_revision_floor(revision);
+                    self.record_read_revision(revision);
                 }
                 // Explicit over the two batchable variants rather than a
                 // catch-all: a new `WatchEvent` must fail to compile here
@@ -1607,12 +1707,25 @@ struct PrefixLoad {
 }
 
 impl PrefixLoad {
-    /// The revision the snapshot as a whole reflects. kine revisions are
-    /// cluster-global, so the highest any prefix reported is the point
-    /// the combined read is consistent as of, and it is what the
+    /// The revision the snapshot as a whole reflects, and what the
     /// heartbeat reports as `applied_revision`.
-    fn max_revision(&self) -> i64 {
-        self.revisions.iter().flatten().copied().max().unwrap_or(0)
+    ///
+    /// The LOWEST any prefix reported, not the highest. kine revisions are
+    /// cluster-global, but the range reads run in sequence: a write landing
+    /// between the first prefix's read and the last one's is below the last
+    /// read's header revision and absent from the union all the same. So
+    /// the union is consistent as of the EARLIEST point any part of it was
+    /// read at, and claiming the highest would tell the control plane the
+    /// gateway had applied a write it has not seen — the one thing
+    /// `applied_revision` exists to answer.
+    ///
+    /// A prefix whose read was refused reports no revision and does not
+    /// lower the answer: it contributed no rows this cycle, so nothing in
+    /// the union came from it. With no prefix reporting one at all the
+    /// answer is 0, which the caller treats as a floor and never lowers an
+    /// earlier one with.
+    fn applied_revision(&self) -> i64 {
+        self.revisions.iter().flatten().copied().min().unwrap_or(0)
     }
 }
 
@@ -2166,6 +2279,10 @@ mod tests {
     const VALID_PRICE: &[u8] =
         br#"{"key":"openai/gpt-4o","input_per_1k":0.005,"output_per_1k":0.015}"#;
 
+    /// One scripted `load_all` answer: `Some((rows, revision))` serves,
+    /// `None` refuses.
+    type ScriptedRead = Option<(Vec<RawEntry>, i64)>;
+
     /// A provider that either serves entries or refuses every call the
     /// way a control plane predating the shared catalog does — its kine
     /// ACL answers `PermissionDenied` for a Range outside the
@@ -2180,6 +2297,10 @@ mod tests {
         /// Hand back a stream that never ends and never yields, the way
         /// a healthy watch on a prefix nobody is writing behaves.
         never_ends: bool,
+        /// Successive `load_all` answers, one popped per call, `None`
+        /// refusing. Empty — every constructor but `scripted` — means the
+        /// provider answers the same way every time.
+        script: Mutex<std::collections::VecDeque<ScriptedRead>>,
     }
 
     impl ScopedProvider {
@@ -2190,6 +2311,7 @@ mod tests {
                 refuse: false,
                 watched_from: Mutex::new(None),
                 never_ends: false,
+                script: Mutex::new(std::collections::VecDeque::new()),
             })
         }
 
@@ -2203,6 +2325,7 @@ mod tests {
                 refuse: false,
                 watched_from: Mutex::new(None),
                 never_ends: true,
+                script: Mutex::new(std::collections::VecDeque::new()),
             })
         }
 
@@ -2213,6 +2336,21 @@ mod tests {
                 refuse: true,
                 watched_from: Mutex::new(None),
                 never_ends: false,
+                script: Mutex::new(std::collections::VecDeque::new()),
+            })
+        }
+
+        /// Answers each `load_all` from `steps` in order — `Some((rows,
+        /// revision))` serves, `None` refuses — so one test can walk a
+        /// prefix through success, refusal and success again.
+        fn scripted(steps: Vec<ScriptedRead>) -> Arc<Self> {
+            Arc::new(Self {
+                entries: Vec::new(),
+                revision: 0,
+                refuse: true,
+                watched_from: Mutex::new(None),
+                never_ends: false,
+                script: Mutex::new(steps.into()),
             })
         }
     }
@@ -2220,10 +2358,17 @@ mod tests {
     #[async_trait]
     impl ConfigProvider for ScopedProvider {
         async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
-            if self.refuse {
-                return Err(ProviderError::Rejected(
+            let refusal = || {
+                ProviderError::Rejected(
                     "etcdserver: permission denied: outside env env-1 prefix".into(),
-                ));
+                )
+            };
+            let step = self.script.lock().unwrap().pop_front();
+            if let Some(step) = step {
+                return step.map(Ok).unwrap_or_else(|| Err(refusal()));
+            }
+            if self.refuse {
+                return Err(refusal());
             }
             Ok((self.entries.clone(), self.revision))
         }
@@ -2322,17 +2467,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn applied_revision_is_the_maximum_across_prefixes() {
-        // kine revisions are cluster-global, so the point the whole read
-        // is consistent as of is the highest either prefix reported —
-        // whichever one that is. Both orders, because taking the LAST
-        // prefix's revision (or the FIRST, or the environment's) passes
-        // one of them by accident.
+    async fn applied_revision_is_the_minimum_across_prefixes() {
+        // The prefixes are read in sequence, so the union is consistent
+        // only as far as the EARLIEST read: a write that landed between
+        // the two reads is missing from the union while sitting below the
+        // later read's header revision. Reporting the higher one would
+        // claim a write the gateway has not applied. Both orders, because
+        // taking the LAST prefix's revision (or the FIRST, or the
+        // environment's) passes one of them by accident.
         //
         // Every entry is written at revision 1 so the header revisions
         // are the only thing that can produce the expected value: the
         // resync raises the floor to the highest entry revision first,
-        // and entries at 7 / 42 / 99 would supply the answer by
+        // and entries at 5 / 7 / 42 / 99 would supply the answer by
         // themselves — which is how the first version of this case
         // stayed green against a last-prefix-wins mutation.
         let global_ahead = scoped_supervisor(
@@ -2340,14 +2487,142 @@ mod tests {
             ScopedProvider::serving(vec![entry("/aisix/global/pricing/g", VALID_PRICE, 1)], 42),
         );
         global_ahead.load_once().await.unwrap();
-        assert_eq!(global_ahead.watch_status().snapshot().revision, 42);
+        assert_eq!(global_ahead.watch_status().snapshot().revision, 7);
 
         let env_ahead = scoped_supervisor(
             ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 1)], 99),
             ScopedProvider::serving(vec![entry("/aisix/global/pricing/g", VALID_PRICE, 1)], 5),
         );
         env_ahead.load_once().await.unwrap();
-        assert_eq!(env_ahead.watch_status().snapshot().revision, 99);
+        assert_eq!(env_ahead.watch_status().snapshot().revision, 5);
+    }
+
+    #[tokio::test]
+    async fn a_later_prefixs_newer_row_does_not_raise_the_applied_revision() {
+        // The resync stamps `max(entry revision)` from the union, and the
+        // later-read prefix can legitimately hold a row written AFTER the
+        // earlier prefix was read — while a write to the earlier prefix in
+        // that same interval is missing from the union entirely. Letting
+        // the entry-max stand would keep claiming a revision the gateway
+        // has not seen, which is exactly what taking the minimum header is
+        // for. Distinct from the case above: here the overstatement comes
+        // from an ENTRY, not from a header.
+        let sup = scoped_supervisor(
+            ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 90)], 100),
+            ScopedProvider::serving(
+                vec![entry("/aisix/global/pricing/g", VALID_PRICE, 103)],
+                105,
+            ),
+        );
+        sup.load_once().await.unwrap();
+        assert_eq!(
+            sup.watch_status().snapshot().revision,
+            100,
+            "the union is consistent as of the earliest read, whatever revision \
+             a later prefix's rows carry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_prefix_does_not_lower_the_applied_revision() {
+        // A refusal contributes no rows, so nothing in the union came
+        // from that prefix and it has no earliest-read point to impose.
+        // Reading its missing revision as 0 would freeze
+        // `applied_revision` at the floor for the life of the deployment.
+        let sup = scoped_supervisor(
+            ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 1)], 31),
+            ScopedProvider::refusing(),
+        );
+        sup.load_once().await.unwrap();
+        assert_eq!(sup.watch_status().snapshot().revision, 31);
+    }
+
+    #[tokio::test]
+    async fn a_refused_catalog_keeps_the_prices_it_last_read() {
+        // A denial is not a deletion. Once the catalog HAS been read, a
+        // later refusal must leave those prices in place: dropping them
+        // silently stops `least_cost` ranking and empties `cost_usd` on
+        // realtime and batch usage events, with only the WARN to show for
+        // it. A successful read replaces them; only a successful read does.
+        const OTHER_PRICE: &[u8] =
+            br#"{"key":"openai/gpt-4o","input_per_1k":0.001,"output_per_1k":0.002}"#;
+        let sup = scoped_supervisor(
+            ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 1)], 5),
+            ScopedProvider::scripted(vec![
+                Some((vec![entry("/aisix/global/pricing/g-1", VALID_PRICE, 3)], 3)),
+                None,
+                Some((vec![entry("/aisix/global/pricing/g-2", OTHER_PRICE, 9)], 9)),
+            ]),
+        );
+
+        sup.load_once().await.unwrap();
+        let priced = sup.handle().load();
+        assert_eq!(priced.global_pricing.len(), 1);
+        assert!(priced.global_pricing.get_by_id("g-1").is_some());
+
+        // Denied: the rows stay, and the environment is untouched.
+        sup.load_once().await.unwrap();
+        let denied = sup.handle().load();
+        assert_eq!(
+            denied.global_pricing.len(),
+            1,
+            "a refusal must not clear the catalog"
+        );
+        assert!(denied.global_pricing.get_by_id("g-1").is_some());
+        assert_eq!(denied.models.len(), 1);
+
+        // Allowed again with different content: the retained rows are
+        // replaced by what the read returned, not merged with it.
+        sup.load_once().await.unwrap();
+        let replaced = sup.handle().load();
+        assert_eq!(replaced.global_pricing.len(), 1);
+        assert!(
+            replaced.global_pricing.get_by_id("g-1").is_none(),
+            "a successful read replaces the retained rows"
+        );
+        assert!(replaced.global_pricing.get_by_id("g-2").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_broader_successful_read_still_deletes_a_retained_row() {
+        // The nesting case again: with no `env_id` the environment prefix
+        // is the bare base, so a SUCCESSFUL read of it already answers for
+        // the catalog's keys — including answering that one is gone. The
+        // catalog prefix being refused must not undo that: carrying the
+        // old row over would bring a deleted price back to life, at
+        // whatever it used to cost.
+        let priced = entry("/aisix/global/pricing/p-1", VALID_PRICE, 4);
+        let sup = Arc::new(Supervisor::with_sources(
+            vec![
+                (
+                    WatchedPrefix::environment("/aisix"),
+                    ScopedProvider::scripted(vec![
+                        Some((
+                            vec![entry("/aisix/models/m-1", VALID_MODEL, 3), priced.clone()],
+                            4,
+                        )),
+                        // The price is deleted; the environment read that
+                        // covers it comes back without it.
+                        Some((vec![entry("/aisix/models/m-1", VALID_MODEL, 3)], 9)),
+                    ]),
+                ),
+                (
+                    WatchedPrefix::global("/aisix/global/"),
+                    ScopedProvider::scripted(vec![Some((vec![priced], 4)), None]),
+                ),
+            ],
+            SnapshotCache::disabled(),
+        ));
+
+        sup.load_once().await.unwrap();
+        assert_eq!(sup.handle().load().global_pricing.len(), 1);
+
+        sup.load_once().await.unwrap();
+        assert_eq!(
+            sup.handle().load().global_pricing.len(),
+            0,
+            "a deleted price must stay deleted when a read that covers it succeeded"
+        );
     }
 
     #[tokio::test]
@@ -2437,9 +2712,11 @@ mod tests {
             "the environment watch must resume from its OWN read (7), not from the maximum (42)",
         );
         assert_eq!(*global.watched_from.lock().unwrap(), Some(43));
-        // The reported applied revision is still the maximum: it is what
-        // the whole combined read is consistent as of.
-        assert_eq!(sup.watch_status().snapshot().revision, 42);
+        // The reported applied revision is the MINIMUM, for the same
+        // reason the resume points differ: the union is only consistent
+        // as far as the earliest read (`applied_revision_is_the_minimum_
+        // across_prefixes`).
+        assert_eq!(sup.watch_status().snapshot().revision, 7);
     }
 
     #[tokio::test]
@@ -3595,6 +3872,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_event_below_a_later_prefixs_entry_still_reaches_the_cache() {
+        // The multi-prefix load reports the EARLIEST read as its revision
+        // (`applied_revision_is_the_minimum_across_prefixes`), and that can
+        // be below the highest revision in the entry set — a row in the
+        // later-read prefix may have been written after the earlier prefix
+        // was read. The resync's cache flush has to carry the read's number
+        // rather than the entry maximum, because the cache refuses a write
+        // below what it has committed: commit 103 here and every apply
+        // between 100 and 103 is silently dropped from the cache — exactly
+        // the events carrying the writes the read could not see. A restart
+        // during an etcd outage would then serve a cache claiming 103 whose
+        // changes it does not contain.
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("snap.json");
+
+        {
+            let sup = Arc::new(Supervisor::with_sources(
+                vec![
+                    (
+                        WatchedPrefix::environment(ENV_PREFIX),
+                        ScopedProvider::serving(
+                            vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 90)],
+                            100,
+                        ),
+                    ),
+                    (
+                        WatchedPrefix::global(GLOBAL_PREFIX),
+                        ScopedProvider::serving(
+                            vec![entry("/aisix/global/pricing/g", VALID_PRICE, 103)],
+                            105,
+                        ),
+                    ),
+                ],
+                SnapshotCache::new(&cache_path),
+            ));
+            sup.load_once().await.unwrap();
+            sup.await_pending_cache_writes().await;
+
+            // The watch on the environment prefix resumes at 101 and
+            // delivers a write the load could not have seen.
+            assert!(sup.apply_put(&entry("/aisix/env-1/models/m-2", VALID_MODEL, 101)));
+            sup.await_pending_cache_writes().await;
+        }
+
+        // A restart that cannot reach etcd serves the cache: both models
+        // must be there. Same prefixes, so the cached keys resolve to the
+        // same kinds they were stored under.
+        let restarted = Supervisor::with_sources(
+            vec![
+                (
+                    WatchedPrefix::environment(ENV_PREFIX),
+                    ScopedProvider::refusing(),
+                ),
+                (
+                    WatchedPrefix::global(GLOBAL_PREFIX),
+                    ScopedProvider::refusing(),
+                ),
+            ],
+            SnapshotCache::new(&cache_path),
+        );
+        restarted.restore_from_cache();
+        assert_eq!(
+            restarted.handle().load().models.len(),
+            2,
+            "the applied write at revision 101 must be in the cache"
+        );
+    }
+
+    #[tokio::test]
     async fn resync_writes_to_disk_cache_then_restore_replays_it() {
         let dir = tempfile::tempdir().unwrap();
         let cache_path = dir.path().join("snap.json");
@@ -3759,7 +4105,7 @@ mod tests {
         ));
         let sup = Supervisor::new(provider, "/aisix");
 
-        // load_once → set_revision_floor(7) → record_apply(7)
+        // load_once → record_read_revision(7) → record_apply(7)
         sup.load_once().await.unwrap();
         let snap = sup.watch_status().snapshot();
         assert_eq!(

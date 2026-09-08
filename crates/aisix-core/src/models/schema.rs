@@ -995,14 +995,91 @@ pub fn apply_model_ref_alternatives(schema: &mut Value) {
 pub fn apikey_root_schema(strict: bool) -> Value {
     let mut schema = struct_root_schema::<crate::models::ApiKey>(true);
     if strict {
-        require_property(
-            schema
-                .pointer_mut("/definitions/McpAccess")
-                .expect("api_key schema defines McpAccess"),
-            "allow",
+        require_mcp_tool_ref(&mut schema);
+        let access = schema
+            .pointer_mut("/definitions/McpAccess")
+            .expect("api_key schema defines McpAccess");
+        require_property(access, "allow");
+        insert_all_of(access, vec![require_name_form_beside_ids("deny", "array")]);
+        insert_all_of(
+            &mut schema,
+            vec![require_name_form_beside_ids("mcp_rate_limits", "object")],
         );
     }
     schema
+}
+
+/// The write-path shape of one [`McpToolRef`](crate::models::McpToolRef)
+/// entry: both halves present and non-empty.
+///
+/// It lives here rather than on the type because the runtime loader must
+/// keep DESERIALIZING a malformed entry — a row it cannot deserialize is
+/// skipped whole, and for an `api_key` that means the key stops
+/// authenticating every kind of traffic rather than merely losing MCP
+/// access. The write path still refuses to guess.
+fn require_mcp_tool_ref(schema: &mut Value) {
+    let Some(def) = schema.pointer_mut("/definitions/McpToolRef") else {
+        return;
+    };
+    for field in ["server_id", "tool"] {
+        require_property(def, field);
+        if let Some(property) = def.pointer_mut(&format!("/properties/{field}")) {
+            let property = property
+                .as_object_mut()
+                .expect("McpToolRef property is a JSON object");
+            property.insert("minLength".to_string(), json!(1));
+            // The `#[serde(default)]` the loader needs renders as
+            // `default: ""`, which beside `minLength: 1` is a value this
+            // very schema refuses — a form generator that honours defaults
+            // would pre-fill a field and then fail to save it. The lenient
+            // set keeps the annotation, where it is the truth about what
+            // the loader does with an omitted half.
+            property.remove("default");
+        }
+    }
+}
+
+/// A subschema requiring `<name_field>` whenever the id spelling that
+/// shadows it, `<name_field>_ids` (or `<name_field>_by_id` for a map), is
+/// written as a real value.
+///
+/// The id spelling is invisible to a gateway one release behind the
+/// control plane, and the name spelling is the only thing such a gateway
+/// can read. Left optional, a control plane could write a deny — or a
+/// per-server limit — that simply does not exist on that gateway for the
+/// length of the upgrade window: a restriction failing OPEN, silently.
+/// Requiring the pair keeps the older reading conservative and unchanged,
+/// the same reason `allow` is required outright.
+///
+/// The `type` guard matters: `required` alone would also fire on an
+/// explicit `null`, which means the same as omitting the field.
+fn require_name_form_beside_ids(name_field: &str, id_type: &str) -> Value {
+    let id_field = match id_type {
+        "object" => format!("{name_field}_by_id"),
+        _ => format!("{name_field}_ids"),
+    };
+    json!({
+        "if": {
+            "required": [id_field],
+            "properties": { id_field: { "type": id_type } }
+        },
+        "then": { "required": [name_field] }
+    })
+}
+
+/// Append `subschemas` to a schema node's `allOf`, creating it when absent.
+/// Never overwrites: a producer may inject more than one overlay, and
+/// `close_unknown_fields` deliberately does not descend into them.
+fn insert_all_of(schema: &mut Value, subschemas: Vec<Value>) {
+    let obj = schema
+        .as_object_mut()
+        .expect("schema fragment is a JSON object");
+    match obj.get_mut("allOf").and_then(Value::as_array_mut) {
+        Some(list) => list.extend(subschemas),
+        None => {
+            obj.insert("allOf".to_string(), Value::Array(subschemas));
+        }
+    }
 }
 
 /// Add `name` to a schema object's `required` list, creating the list
@@ -1401,24 +1478,21 @@ pub fn mcp_auth_settings_root_schema() -> Value {
 /// environment layer).
 pub fn mcp_policy_root_schema(strict: bool) -> Value {
     let mut schema = struct_root_schema::<crate::models::McpPolicy>(true);
+    let mut overlays = vec![json!({
+        "if": {
+            "properties": { "scope": { "const": "team" } }
+        },
+        "then": {
+            "required": ["scope_ref"],
+            "properties": { "scope_ref": { "type": "string", "minLength": 1 } }
+        }
+    })];
     if strict {
         require_property(&mut schema, "allow");
+        require_mcp_tool_ref(&mut schema);
+        overlays.push(require_name_form_beside_ids("deny", "array"));
     }
-    schema
-        .as_object_mut()
-        .expect("mcp_policy root schema is a JSON object")
-        .insert(
-            "allOf".to_string(),
-            json!([{
-                "if": {
-                    "properties": { "scope": { "const": "team" } }
-                },
-                "then": {
-                    "required": ["scope_ref"],
-                    "properties": { "scope_ref": { "type": "string", "minLength": 1 } }
-                }
-            }]),
-        );
+    insert_all_of(&mut schema, overlays);
     schema
 }
 
@@ -3087,6 +3161,143 @@ mod tests {
         let policy = json!({"scope": "env", "mode": "all"});
         validate_mcp_policy_lenient(&policy).unwrap();
         assert!(validate_mcp_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn mcp_id_form_sides_are_accepted_on_both_paths() {
+        let hash = "9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20";
+        let entry = json!({"server_id": "s-1", "tool": "create_issue"});
+
+        for ids in [json!([entry.clone()]), json!([]), json!(null)] {
+            let policy = json!({
+                "scope": "env", "allow": ["*"], "deny": [],
+                "allow_ids": ids, "deny_ids": ids,
+            });
+            validate_mcp_policy(&policy).unwrap();
+            validate_mcp_policy_lenient(&policy).unwrap();
+
+            let key = json!({
+                "key_hash": hash,
+                "mcp_access": {"allow": ["*"], "deny": [], "allow_ids": ids, "deny_ids": ids},
+                "mcp_rate_limits": {},
+                "mcp_rate_limits_by_id": {"s-1": {"rpm": 1}},
+            });
+            validate_apikey(&key).unwrap();
+            validate_apikey_lenient(&key).unwrap();
+        }
+
+        // Both spellings may be written together; the runtime lets the ids
+        // decide.
+        validate_mcp_policy(&json!({
+            "scope": "env",
+            "allow": ["github__create_issue"],
+            "allow_ids": [entry],
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn mcp_id_form_entries_must_name_a_server_and_a_tool_on_the_write_path() {
+        let bad = [
+            json!({"tool": "create_issue"}),
+            json!({"server_id": "s-1"}),
+            json!({"server_id": "", "tool": "create_issue"}),
+            json!({"server_id": "s-1", "tool": ""}),
+            json!({"server_id": "s-1", "tool": "x", "rogue": 1}),
+            json!("s-1__create_issue"),
+        ];
+        for entry in bad {
+            assert!(
+                validate_mcp_policy(&json!({
+                    "scope": "env", "allow": ["*"], "allow_ids": [entry.clone()]
+                }))
+                .is_err(),
+                "allow_ids entry {entry} must be rejected on the write path"
+            );
+        }
+    }
+
+    #[test]
+    fn a_half_written_mcp_tool_ref_still_loads_leniently() {
+        // Pins the split, and requiredness is exactly what has to be
+        // pinned on BOTH sets: the loader deserializes what it validates,
+        // and a row it cannot deserialize is skipped whole — for an
+        // `api_key` that means the key stops authenticating every kind of
+        // traffic, not just losing MCP access. So one malformed entry in
+        // one `allow_ids` array must degrade to an entry matching nothing,
+        // never to a dead key.
+        let hash = "9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20";
+        for entry in [
+            json!({"tool": "create_issue"}),
+            json!({"server_id": "s-1"}),
+            json!({"server_id": "", "tool": ""}),
+        ] {
+            let key = json!({
+                "key_hash": hash,
+                "mcp_access": {"allow": [], "allow_ids": [entry.clone()]},
+            });
+            validate_apikey_lenient(&key).unwrap();
+            assert!(validate_apikey(&key).is_err());
+            // And it really deserializes — validating leniently is only
+            // half of what the loader does with the row.
+            let parsed: crate::models::ApiKey = serde_json::from_value(key).unwrap();
+            let refs = parsed.mcp_access.unwrap().allow_ids.unwrap();
+            assert_eq!(refs.len(), 1);
+        }
+    }
+
+    #[test]
+    fn the_write_path_requires_the_name_form_beside_every_id_form() {
+        // The id spelling is invisible to a gateway one release behind the
+        // control plane, and the name spelling is the only thing such a
+        // gateway can read. Writing a deny — or a per-server limit — in
+        // the id spelling ALONE would leave that restriction simply absent
+        // there for the length of the upgrade window: a restriction
+        // failing open, silently. `allow` is required outright for the
+        // same reason.
+        let hash = "9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20";
+        let entry = json!({"server_id": "s-1", "tool": "delete_repo"});
+
+        // allow: required outright, so the id spelling alone is refused.
+        assert!(validate_mcp_policy(&json!({
+            "scope": "env", "allow_ids": [entry],
+        }))
+        .is_err());
+
+        // deny, on a policy and on a key's own layer.
+        let policy = json!({"scope": "env", "allow": ["*"], "deny_ids": [entry]});
+        assert!(validate_mcp_policy(&policy).is_err());
+        validate_mcp_policy(&json!({
+            "scope": "env", "allow": ["*"], "deny": ["github__delete_repo"],
+            "deny_ids": [entry],
+        }))
+        .unwrap();
+
+        let key_only_ids =
+            json!({"key_hash": hash, "mcp_access": {"allow": ["*"], "deny_ids": [entry]}});
+        assert!(validate_apikey(&key_only_ids).is_err());
+
+        // Per-server limits.
+        let limits_only_ids =
+            json!({"key_hash": hash, "mcp_rate_limits_by_id": {"s-1": {"rpm": 1}}});
+        assert!(validate_apikey(&limits_only_ids).is_err());
+        validate_apikey(&json!({
+            "key_hash": hash,
+            "mcp_rate_limits": {"github": {"rpm": 1}},
+            "mcp_rate_limits_by_id": {"s-1": {"rpm": 1}},
+        }))
+        .unwrap();
+
+        // An explicit `null` means the same as omitted, so it demands
+        // nothing — only a real value does.
+        validate_mcp_policy(&json!({"scope": "env", "allow": ["*"], "deny_ids": null})).unwrap();
+        validate_apikey(&json!({"key_hash": hash, "mcp_rate_limits_by_id": null})).unwrap();
+
+        // The loader takes every one of these rows regardless: the guard
+        // is a write contract, never a reason to drop a stored row.
+        validate_mcp_policy_lenient(&policy).unwrap();
+        validate_apikey_lenient(&key_only_ids).unwrap();
+        validate_apikey_lenient(&limits_only_ids).unwrap();
     }
 
     #[test]

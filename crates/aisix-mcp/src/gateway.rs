@@ -40,7 +40,10 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{RoleServer, ServerHandler};
 
-use aisix_core::models::{ApiKey, McpPolicy, McpPolicyScope, McpServerType};
+use aisix_core::models::{
+    ApiKey, LiveMcpServerIndex, McpPolicy, McpPolicyScope, McpServerIndex, McpServerType,
+    McpToolRef,
+};
 use aisix_core::{AisixSnapshot, ResourceEntry};
 
 use crate::bridge::{
@@ -100,13 +103,25 @@ pub fn strip_server_prefix<'a>(server: &str, name: &'a str) -> Option<&'a str> {
 /// widen what another one already narrowed. A layer that is absent or
 /// disabled contributes nothing; with no allow layer at all the ACL grants
 /// nothing, so MCP access is always granted explicitly.
+///
+/// Each side of each layer is written EITHER as `<server>__<tool>` name
+/// patterns or as `{server_id, tool}` entries naming the server by resource
+/// id ([`McpToolRef`]); the id spelling wins for the side that carries it.
+/// The two decide the same question, so the ACL keeps a resolved
+/// name → id index of the registered servers and evaluates whichever
+/// spelling a layer used against the one tool name the caller addressed.
 #[derive(Clone)]
 pub struct ToolAcl {
     /// Conjunctive allow layers: a tool must match every layer.
     allow: Vec<AllowLayer>,
-    /// Deny patterns; any match rejects the tool, overriding every allow
+    /// Deny rules; any match rejects the tool, overriding every allow
     /// layer.
-    deny: Vec<String>,
+    deny: Vec<DenyRule>,
+    /// The registered servers this ACL resolves ids against, as of the
+    /// snapshot it was built from. Empty for the ACLs built without one
+    /// ([`ToolAcl::allow_all`], [`ToolAcl::from_allowed`]), which carry no
+    /// id-form entry to resolve.
+    servers: Arc<McpServerIndex>,
 }
 
 #[derive(Clone)]
@@ -115,6 +130,29 @@ enum AllowLayer {
     All,
     /// The layer admits tools matching any of these single-`*` glob patterns.
     Patterns(Vec<String>),
+    /// The layer admits tools named by server id plus a tool-name glob. An
+    /// empty list admits nothing, exactly as an empty pattern list does.
+    Refs(Vec<McpToolRef>),
+}
+
+/// One deny entry, in whichever spelling its layer used.
+#[derive(Clone)]
+enum DenyRule {
+    Pattern(String),
+    Ref(McpToolRef),
+}
+
+/// Whether `entry` names the tool the caller addressed, which
+/// [`McpServerIndex::address`] has resolved to `(server id, bare tool)`.
+///
+/// The server half is compared as an exact id, never glob-matched: a
+/// registered name may legally contain a `*`, so pasting the resolved name
+/// into a pattern would let one server's grant reach another's tools.
+fn ref_matches(entry: &McpToolRef, addressed: Option<(&str, &str)>) -> bool {
+    let Some((server_id, tool)) = addressed else {
+        return false;
+    };
+    entry.server_id == server_id && aisix_core::wildcard::wildcard_matches(&entry.tool, tool)
 }
 
 impl AllowLayer {
@@ -129,12 +167,40 @@ impl AllowLayer {
         }
     }
 
-    fn admits(&self, namespaced_tool: &str) -> bool {
+    /// The layer for one `allow` / `allow_ids` pair: the id spelling decides
+    /// whenever it is present, an empty array included.
+    fn from_sides(patterns: &[String], ids: Option<&Vec<McpToolRef>>) -> Self {
+        match ids {
+            Some(refs) => Self::Refs(refs.clone()),
+            None => Self::from_patterns(patterns),
+        }
+    }
+
+    fn admits(&self, namespaced_tool: &str, addressed: Option<(&str, &str)>) -> bool {
         match self {
             Self::All => true,
             Self::Patterns(patterns) => patterns
                 .iter()
                 .any(|p| aisix_core::wildcard::wildcard_matches(p, namespaced_tool)),
+            Self::Refs(refs) => refs.iter().any(|r| ref_matches(r, addressed)),
+        }
+    }
+}
+
+impl DenyRule {
+    /// The deny rules for one `deny` / `deny_ids` pair, in the spelling the
+    /// layer used.
+    fn from_sides(patterns: &[String], ids: Option<&Vec<McpToolRef>>) -> Vec<Self> {
+        match ids {
+            Some(refs) => refs.iter().cloned().map(Self::Ref).collect(),
+            None => patterns.iter().cloned().map(Self::Pattern).collect(),
+        }
+    }
+
+    fn matches(&self, namespaced_tool: &str, addressed: Option<(&str, &str)>) -> bool {
+        match self {
+            Self::Pattern(p) => aisix_core::wildcard::wildcard_matches(p, namespaced_tool),
+            Self::Ref(r) => ref_matches(r, addressed),
         }
     }
 }
@@ -146,6 +212,7 @@ impl ToolAcl {
         Self {
             allow: vec![AllowLayer::All],
             deny: Vec::new(),
+            servers: Arc::new(McpServerIndex::default()),
         }
     }
 
@@ -185,6 +252,7 @@ impl ToolAcl {
         Self {
             allow: vec![AllowLayer::from_patterns(allowed.unwrap_or(&[]))],
             deny: Vec::new(),
+            servers: Arc::new(McpServerIndex::default()),
         }
     }
 
@@ -198,9 +266,16 @@ impl ToolAcl {
     /// is absent — no row, a disabled row, or no `mcp_access` block —
     /// contributes neither side.
     ///
+    /// Each layer writes each of its two sides either as `<server>__<tool>`
+    /// name patterns or as `{server_id, tool}` entries; a side that carries
+    /// the id spelling is decided by it alone, an empty array included. The
+    /// two spellings mix freely across layers and across the two sides of
+    /// one layer, because every layer is resolved against the same
+    /// addressed tool.
+    ///
     /// With no allow layer at all the ACL grants nothing: MCP access is
     /// granted explicitly, never by the absence of configuration.
-    pub fn resolve(snapshot: &AisixSnapshot, key: &ApiKey) -> Self {
+    pub fn resolve(snapshot: &AisixSnapshot, servers: &LiveMcpServerIndex, key: &ApiKey) -> Self {
         // Grant side: pick the governing row per scope deterministically
         // (lowest id wins) so a duplicated row — the writer enforces
         // uniqueness — can only ever produce a stable outcome. Deny side:
@@ -209,7 +284,7 @@ impl ToolAcl {
         // tie-break.
         let mut env_policy: Option<Arc<ResourceEntry<McpPolicy>>> = None;
         let mut team_policy: Option<Arc<ResourceEntry<McpPolicy>>> = None;
-        let mut deny: Vec<String> = Vec::new();
+        let mut deny: Vec<DenyRule> = Vec::new();
         for entry in snapshot.mcp_policies.entries() {
             if !entry.value.enabled {
                 continue;
@@ -225,7 +300,10 @@ impl ToolAcl {
                     &mut team_policy
                 }
             };
-            deny.extend(entry.value.deny.iter().cloned());
+            deny.extend(DenyRule::from_sides(
+                &entry.value.deny,
+                entry.value.deny_ids.as_ref(),
+            ));
             match slot {
                 Some(current) if current.id <= entry.id => {}
                 _ => *slot = Some(entry),
@@ -237,11 +315,17 @@ impl ToolAcl {
             .into_iter()
             .flatten()
         {
-            allow.push(AllowLayer::from_patterns(&policy.value.allow));
+            allow.push(AllowLayer::from_sides(
+                &policy.value.allow,
+                policy.value.allow_ids.as_ref(),
+            ));
         }
         if let Some(access) = &key.mcp_access {
-            allow.push(AllowLayer::from_patterns(&access.allow));
-            deny.extend(access.deny.iter().cloned());
+            allow.push(AllowLayer::from_sides(
+                &access.allow,
+                access.allow_ids.as_ref(),
+            ));
+            deny.extend(DenyRule::from_sides(&access.deny, access.deny_ids.as_ref()));
         }
         // Deny-by-default: an unconfigured key in an unconfigured
         // environment has no MCP access, rather than the empty conjunction's
@@ -249,20 +333,38 @@ impl ToolAcl {
         if allow.is_empty() {
             allow.push(AllowLayer::Patterns(Vec::new()));
         }
-        Self { allow, deny }
+        Self {
+            allow,
+            deny,
+            servers: servers.for_snapshot(snapshot),
+        }
     }
 
     /// Whether `namespaced_tool` is permitted: every allow layer must admit
-    /// it and no deny pattern may match it. Patterns are single-`*` globs:
+    /// it and no deny rule may match it. Name patterns are single-`*` globs:
     /// `"<server>__*"` covers every tool on that server, a pattern without a
-    /// `*` matches exactly, and a bare `"*"` covers everything. Uses the same
-    /// matcher as `ApiKey::can_access_tool`.
+    /// `*` matches exactly, and a bare `"*"` covers everything.
+    ///
+    /// An id-form entry is decided against the server the addressed tool
+    /// actually belongs to: the `<server>__<tool>` name is split as it always
+    /// was, the server half is resolved through the registered-server index,
+    /// and the entry matches when its `server_id` equals that server's id and
+    /// its `tool` glob covers the bare tool name. A tool naming no registered
+    /// server, and an entry whose `server_id` names no registered server,
+    /// therefore match no id-form entry at all — the fail-closed answer for
+    /// an allow side, and one that leaves the layer's other entries intact.
     pub fn permits(&self, namespaced_tool: &str) -> bool {
-        self.allow.iter().all(|layer| layer.admits(namespaced_tool))
+        // Resolved once per decision and shared by both sides: with only
+        // name patterns configured nothing reads it, and `address` is one
+        // split plus one hash lookup when something does.
+        let addressed = self.servers.address(namespaced_tool);
+        self.allow
+            .iter()
+            .all(|layer| layer.admits(namespaced_tool, addressed))
             && !self
                 .deny
                 .iter()
-                .any(|p| aisix_core::wildcard::wildcard_matches(p, namespaced_tool))
+                .any(|rule| rule.matches(namespaced_tool, addressed))
     }
 }
 

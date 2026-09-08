@@ -1060,3 +1060,184 @@ fn guardrail_embedder_id_resugars_to_a_name() {
         doc.warnings
     );
 }
+
+/// Register `(id, name)` MCP servers on `snap`.
+fn register_mcp_servers(snap: &AisixSnapshot, servers: &[(&str, &str)]) {
+    for (id, name) in servers {
+        snap.mcp_servers.insert(ResourceEntry::new(
+            *id,
+            serde_json::from_value(json!({"name": name, "url": "https://example.test/mcp"}))
+                .unwrap(),
+            1,
+        ));
+    }
+}
+
+#[test]
+fn api_key_mcp_reference_ids_resugar_to_names() {
+    let snap = AisixSnapshot::new();
+    register_mcp_servers(&snap, &[("s-uuid-1", "github"), ("s-uuid-2", "slack")]);
+    snap.apikeys.insert(ResourceEntry::new(
+        "k-uuid-1",
+        serde_json::from_value(json!({
+            "key_hash": "aa".repeat(32),
+            "allowed_models": [],
+            "mcp_rate_limits": {"stale-name": {"rpm": 9}},
+            "mcp_rate_limits_by_id": {"s-uuid-2": {"rpm": 1}},
+            "mcp_access": {
+                "allow": ["stale-name__*"],
+                "allow_ids": [{"server_id": "s-uuid-1", "tool": "create_issue"}],
+                "deny": ["stale-name__drop"],
+                "deny_ids": [{"server_id": "s-uuid-1", "tool": "delete_*"}]
+            }
+        }))
+        .unwrap(),
+        1,
+    ));
+
+    let doc = build_export_document(&snap, false);
+    let keys = find(&doc, "api_keys");
+    // The file source names its MCP servers: the id form never reaches it,
+    // and each name it resolves to replaces the shadowed name field
+    // wholesale — keeping the stale one would export a different ACL than
+    // the gateway is enforcing.
+    assert!(keys[0].get("mcp_rate_limits_by_id").is_none());
+    assert_eq!(keys[0]["mcp_rate_limits"], json!({"slack": {"rpm": 1}}));
+    assert!(keys[0]["mcp_access"].get("allow_ids").is_none());
+    assert!(keys[0]["mcp_access"].get("deny_ids").is_none());
+    assert_eq!(
+        keys[0]["mcp_access"]["allow"],
+        json!(["github__create_issue"])
+    );
+    assert_eq!(keys[0]["mcp_access"]["deny"], json!(["github__delete_*"]));
+    assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
+}
+
+#[test]
+fn api_key_unresolvable_mcp_server_ids_are_dropped_and_warned() {
+    let snap = AisixSnapshot::new();
+    register_mcp_servers(&snap, &[("s-uuid-1", "github")]);
+    snap.apikeys.insert(ResourceEntry::new(
+        "k-uuid-1",
+        serde_json::from_value(json!({
+            "key_hash": "aa".repeat(32),
+            "allowed_models": [],
+            "mcp_rate_limits_by_id": {"s-uuid-1": {"rpm": 1}, "s-gone": {"rpm": 2}},
+            "mcp_access": {
+                "allow": [],
+                "allow_ids": [
+                    {"server_id": "s-uuid-1", "tool": "*"},
+                    {"server_id": "s-gone", "tool": "*"}
+                ]
+            }
+        }))
+        .unwrap(),
+        1,
+    ));
+
+    let doc = build_export_document(&snap, false);
+    let keys = find(&doc, "api_keys");
+    assert_eq!(keys[0]["mcp_rate_limits"], json!({"github": {"rpm": 1}}));
+    assert_eq!(keys[0]["mcp_access"]["allow"], json!(["github__*"]));
+    assert_eq!(
+        doc.warnings.iter().filter(|w| w.contains("s-gone")).count(),
+        2,
+        "one warning for the dropped limit and one for the dropped grant: {:?}",
+        doc.warnings
+    );
+    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
+}
+
+#[test]
+fn api_key_empty_mcp_id_forms_export_as_no_grant_and_no_limit() {
+    let snap = AisixSnapshot::new();
+    register_mcp_servers(&snap, &[("s-uuid-1", "github")]);
+    snap.apikeys.insert(ResourceEntry::new(
+        "k-uuid-1",
+        serde_json::from_value(json!({
+            "key_hash": "aa".repeat(32),
+            "allowed_models": [],
+            "mcp_rate_limits": {"github": {"rpm": 9}},
+            "mcp_rate_limits_by_id": {},
+            "mcp_access": {"allow": ["*"], "allow_ids": []}
+        }))
+        .unwrap(),
+        1,
+    ));
+
+    let doc = build_export_document(&snap, false);
+    let keys = find(&doc, "api_keys");
+    // Both empty id forms are authoritative at runtime, so the exported
+    // file must not resurrect the ignored name forms.
+    assert_eq!(keys[0]["mcp_rate_limits"], json!({}));
+    assert_eq!(keys[0]["mcp_access"]["allow"], json!([]));
+}
+
+#[test]
+fn a_server_name_containing_a_star_gets_no_name_form_grant() {
+    // A registered name may legally contain a `*`. The runtime compares
+    // the server id exactly, so an id grant on `gh*` reaches `gh*` alone —
+    // but `gh*__read` as a name-form pattern also matches `ghost__read`.
+    // The export must not manufacture that grant.
+    let snap = AisixSnapshot::new();
+    register_mcp_servers(&snap, &[("s-star", "gh*"), ("s-other", "ghost")]);
+    snap.apikeys.insert(ResourceEntry::new(
+        "k-uuid-1",
+        serde_json::from_value(json!({
+            "key_hash": "aa".repeat(32),
+            "allowed_models": [],
+            "mcp_access": {
+                "allow": [],
+                "allow_ids": [
+                    {"server_id": "s-star", "tool": "read"},
+                    {"server_id": "s-other", "tool": "read"}
+                ]
+            }
+        }))
+        .unwrap(),
+        1,
+    ));
+
+    let doc = build_export_document(&snap, false);
+    let keys = find(&doc, "api_keys");
+    assert_eq!(keys[0]["mcp_access"]["allow"], json!(["ghost__read"]));
+    assert!(
+        doc.warnings.iter().any(|w| w.contains("gh*")),
+        "{:?}",
+        doc.warnings
+    );
+    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
+}
+
+#[test]
+fn a_star_named_server_on_the_deny_side_blocks_the_export() {
+    // Dropping the entry would leave the exported file permitting a tool
+    // the gateway blocks, and emitting `gh*__delete` would deny one it
+    // allows. Neither is a file that reproduces the gateway, so the export
+    // says so instead of picking.
+    let snap = AisixSnapshot::new();
+    register_mcp_servers(&snap, &[("s-star", "gh*")]);
+    snap.apikeys.insert(ResourceEntry::new(
+        "k-uuid-1",
+        serde_json::from_value(json!({
+            "key_hash": "aa".repeat(32),
+            "allowed_models": [],
+            "mcp_access": {
+                "allow": ["*"],
+                "deny_ids": [{"server_id": "s-star", "tool": "delete"}]
+            }
+        }))
+        .unwrap(),
+        1,
+    ));
+
+    let doc = build_export_document(&snap, false);
+    assert!(
+        doc.blocking.iter().any(|b| b.contains("gh*")),
+        "{:?}",
+        doc.blocking
+    );
+    let keys = find(&doc, "api_keys");
+    assert_eq!(keys[0]["mcp_access"]["deny"], json!([]));
+}

@@ -25,6 +25,7 @@ pub mod ensemble;
 pub mod guardrail;
 pub mod mcp_auth_settings;
 pub mod mcp_policy;
+pub mod mcp_ref;
 pub mod mcp_server;
 pub mod model;
 pub mod model_ref;
@@ -42,7 +43,7 @@ pub mod semantic;
 pub mod snapshot;
 
 pub use a2a_agent::{A2aAgent, A2aAuthType, A2aProtocolVersion};
-pub use apikey::ApiKey;
+pub use apikey::{ApiKey, McpServerLimit};
 pub use cache_policy::{AppliesTo, CacheBackend, CachePolicy, CacheScope, SemanticCacheConfig};
 pub use claim_mapping::{ClaimMapping, ClaimMatch, ClaimMatchOp, ClaimResolve};
 pub use embedding::EmbeddingConfig;
@@ -58,6 +59,7 @@ pub use guardrail::{
 };
 pub use mcp_auth_settings::McpAuthSettings;
 pub use mcp_policy::{McpAccess, McpPolicy, McpPolicyScope};
+pub use mcp_ref::{LiveMcpServerIndex, McpServerIndex, McpToolRef};
 pub use mcp_server::{McpAuthType, McpProtocolVersion, McpServer, McpServerType, McpTransport};
 pub use model::{
     Adapter, BackgroundModelCheck, CooldownConfig, Model, DEFAULT_COOLDOWN_TRIGGER_STATUSES,

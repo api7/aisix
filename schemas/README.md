@@ -112,10 +112,20 @@ so a consumer that models the lenient set as "the strict set with
 
 | resource | additionally relaxed on read |
 | --- | --- |
-| `api_key` | `McpAccess.allow` is not required |
+| `api_key` | `McpAccess.allow` is not required; an `McpToolRef` entry needs neither half, and neither has to be non-empty; the write-path guards requiring `deny` beside `deny_ids` and `mcp_rate_limits` beside `mcp_rate_limits_by_id` are absent |
 | `guardrail` | the `semantic` kind requires neither an embedding model (under either spelling) nor a threshold beside each example list |
-| `mcp_policy` | `allow` is not required |
+| `mcp_policy` | `allow` is not required; the `McpToolRef` relaxations above apply here too, as does the absent `deny`-beside-`deny_ids` guard (its team-scope guard is on both sets) |
 | `model` | the per-kind `not`/`anyOf` lists that forbid a knob a kind never resolves are shorter — a stored row keeps loading and `Model::strip_kind_inapplicable` drops the dead knob |
+
+Two of those are worth spelling out. A half-written `McpToolRef` entry
+has to keep DESERIALIZING, not merely validating: the loader skips a row
+it cannot deserialize whole, and for an `api_key` that stops the key
+authenticating every kind of traffic rather than costing it MCP access.
+The malformed entry matches no server and no tool instead. And the
+name-form guards are a write contract only — a stored row that carries
+just the id spelling still loads, it is only new writes that must carry
+both, so that a gateway one release behind the control plane can still
+read the restriction.
 
 Note what is NOT in that table: the `custom` guardrail's `script` is
 required on **both** sets. A scriptless `custom` row screens nothing
@@ -125,10 +135,11 @@ either way, so rejecting it is what makes it visible in
 These come from the four producers that take a `strict` flag in
 `crates/aisix-core/src/models/schema.rs` and are deliberate.
 
-Separately, the lenient files keep three `default` annotations the
+Separately, the lenient files keep five `default` annotations the
 strict producer strips on purpose — `default: 0.75` on the `semantic`
 guardrail's `allow_threshold`/`deny_threshold`, and `default: ""` on the
-`custom` kind's `script`, which sits beside `minLength: 1`. They change
+`custom` kind's `script` and on both halves of `McpToolRef`, each of
+which sits beside `minLength: 1`. They change
 nothing about what validates, but a form generator that honours them
 pre-fills a threshold the operator was deliberately asked to choose, or
 a script value the same branch refuses. Generate forms from

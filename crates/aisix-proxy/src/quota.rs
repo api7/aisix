@@ -353,12 +353,19 @@ async fn reserve_layers(
 
     // Layer 3: per-MCP-server limit carried by this key. Bucketed on
     // `mcp:<api_key_id>:<server>` so each server the key reaches counts
-    // independently — of the other servers, and of every other key.
+    // independently — of the other servers, and of every other key. The
+    // `<server>` half is whichever identity selected the limit (see
+    // `McpServerLimit`), so a rename does not silently hand the key a
+    // fresh window on a limit that was attached by id.
     if let Some(server) = mcp_server {
-        if let Some(limits) = auth.key().mcp_rate_limit(server) {
-            let rl = RateLimit::from(limits);
+        // Through the same registered-server index the tool ACL resolves
+        // against, so a key that names its limits by server id and its
+        // grants by server id sees one rename take effect at one instant.
+        let servers = state.mcp_servers.for_snapshot(snapshot);
+        if let Some(limit) = auth.key().mcp_rate_limit(&servers, server) {
+            let rl = RateLimit::from(limit.limits);
             if !rl.is_unrestricted() {
-                let key = format!("mcp:{}:{}", auth.entry.id, server);
+                let key = format!("mcp:{}:{}", auth.entry.id, limit.bucket);
                 let r = state
                     .limiter
                     .pre_commit(&key, &rl)
