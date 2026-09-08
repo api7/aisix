@@ -87,7 +87,10 @@ async function startGuardMock(): Promise<GuardMock> {
     });
   });
   const port = await pickFreePort();
-  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", resolve);
+  });
   return {
     baseUrl: `http://127.0.0.1:${port}`,
     get calls() {
@@ -117,6 +120,24 @@ describe("guardrail index invalidation", () => {
   async function chat(model: string, content: string): Promise<number> {
     return (await proxy!.chat({ model, messages: [{ role: "user", content }] }))
       .status;
+  }
+
+  // Gate on a caller key seeded AFTER the write under test: etcd delivers
+  // in revision order, so that key authenticating implies the write ahead
+  // of it is in the snapshot. Gating on the enforcement itself would turn
+  // a broken invalidation into a 30s timeout instead of an assertion, and
+  // `listModels` resolves no guardrail, so the gate cannot consume the
+  // rebuild the next assertion counts.
+  async function propagated(tag: string): Promise<void> {
+    const plaintext = `sk-guardrail-index-gate-${tag}`;
+    await seed!.createApiKey({
+      key_hash: hash(plaintext),
+      allowed_models: [SCREENED_MODEL],
+    });
+    const gate = new ProxyClient(app!.proxyUrl, plaintext);
+    await waitConfigPropagation(
+      async () => (await gate.listModels()).status === 200,
+    );
   }
 
   beforeAll(async () => {
@@ -237,16 +258,14 @@ describe("guardrail index invalidation", () => {
     // rebuild — and the new scope must actually be enforced, which is
     // what separates a correct cache key from one that never invalidates.
     const attachment = await seed!.attachGuardrailToModel(guardrailID, lateModelID);
-    await waitConfigPropagation(
-      async () => (await chat(LATE_MODEL, BLOCK_MARKER)) === 422,
-    );
+    await propagated("attached");
+    expect(await chat(LATE_MODEL, BLOCK_MARKER)).toBe(422);
     expect(rebuilds()).toBe(afterWarm + 1);
 
     // And removing it stops the enforcement.
     await seed!.delete("guardrail_attachments", attachment.id);
-    await waitConfigPropagation(
-      async () => (await chat(LATE_MODEL, BLOCK_MARKER)) === 200,
-    );
+    await propagated("detached");
+    expect(await chat(LATE_MODEL, BLOCK_MARKER)).toBe(200);
     expect(rebuilds()).toBe(afterWarm + 2);
     // The scope that was configured all along is untouched by either.
     expect(await chat(SCREENED_MODEL, BLOCK_MARKER)).toBe(422);

@@ -161,23 +161,22 @@ impl OpenApiBridge {
         let spec = self.server().spec.as_ref().ok_or_else(|| {
             McpError::Request("openapi server has no spec configured".to_string())
         })?;
-        // Generation runs under the lock. It is one lock for every
-        // registered server, so the first concurrent burst after a spec
-        // changes serialises on it — still strictly less total work than
-        // regenerating per request, which is what happened before, and a
-        // generate-outside-then-double-check dance would trade that for
-        // duplicate generations under the same race.
-        let mut cache = tool_cache();
-        if let Some(cached) = cache.by_id.get(&self.entry.id) {
-            // Row identity is the snapshot's `Arc`: a copy-on-write
-            // publish shares rows it did not change, so the same
-            // allocation means the same spec. The cache keeps its own
-            // `Arc`, so the address cannot be recycled underneath it.
-            if Arc::ptr_eq(&cached.row, &self.entry) {
-                return Ok(Arc::clone(&cached.tools));
-            }
+        // Row identity is the snapshot's `Arc`: a copy-on-write publish
+        // shares rows it did not change, so the same allocation means the
+        // same spec. The cache keeps its own `Arc`, so the address cannot
+        // be recycled underneath it.
+        if let Some(hit) = lookup_tools(&self.entry) {
+            return Ok(hit);
         }
+        // Generated with the lock RELEASED. One lock serves every
+        // registered server, so holding it across the spec walk would
+        // make one server's miss block every other server's hit — and a
+        // write that replaces one row makes the aggregating endpoint's
+        // concurrent requests all miss at once. The cost is that a race
+        // may generate the same tool set twice; the second insert simply
+        // replaces the first, and both are equal.
         let tools = Arc::new(generate_tools(spec)?);
+        let mut cache = tool_cache();
         cache.by_id.insert(
             self.entry.id.clone(),
             CachedTools {
@@ -340,6 +339,14 @@ struct ToolCache {
 struct CachedTools {
     row: Arc<ResourceEntry<McpServer>>,
     tools: Arc<Vec<GeneratedTool>>,
+}
+
+/// The cached tool set for `entry`, if this exact row version has one.
+/// Holds the lock only long enough to read it.
+fn lookup_tools(entry: &Arc<ResourceEntry<McpServer>>) -> Option<Arc<Vec<GeneratedTool>>> {
+    let cache = tool_cache();
+    let cached = cache.by_id.get(&entry.id)?;
+    Arc::ptr_eq(&cached.row, entry).then(|| Arc::clone(&cached.tools))
 }
 
 fn tool_cache() -> std::sync::MutexGuard<'static, ToolCache> {
