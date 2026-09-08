@@ -103,6 +103,14 @@ enum ConnKind {
 pub struct SentinelPool {
     client: Arc<Mutex<SentinelClient>>,
     cached: Arc<Mutex<Option<MultiplexedConnection>>>,
+    /// Budget for one master discovery, which is NOT one round trip: the
+    /// client library walks the sentinels **serially** and applies no
+    /// timeout of its own to the sentinel hops, so a single budget for
+    /// the whole walk would let one unreachable sentinel consume it and
+    /// starve the healthy ones — they would never be tried, and the
+    /// master would never resolve even with quorum intact. One budget per
+    /// sentinel, plus one for the master connection that follows.
+    discovery_timeout: Duration,
 }
 
 /// A live connection usable for one or more operations. Implements
@@ -140,28 +148,45 @@ impl Guard {
         &self,
         fut: impl std::future::Future<Output = RedisResult<T>>,
     ) -> RedisResult<T> {
-        if self.breaker.is_open() {
+        self.run_with(self.timeout, fut).await
+    }
+
+    /// [`Guard::run`] with a budget other than the per-command one. Only
+    /// sentinel master discovery uses it — see [`SentinelPool`].
+    async fn run_with<T>(
+        &self,
+        budget: Duration,
+        fut: impl std::future::Future<Output = RedisResult<T>>,
+    ) -> RedisResult<T> {
+        // `admit` both decides and, when it lets a probe through, re-arms
+        // the window behind it. The generation it returns is read before
+        // the await, because a command already in flight when the outage
+        // began can land its success after a *concurrent* command opened
+        // the breaker, and closing on that stale evidence would send the
+        // requests behind it back into the full budget.
+        let Some(seen) = self.breaker.admit() else {
             return Err(breaker_open_error());
-        }
-        // Read before awaiting: a command already in flight when the
-        // outage began can land its success after a *concurrent* command
-        // has opened the breaker, and closing on that stale evidence
-        // would send the requests behind it back into the full timeout.
-        let seen = self.breaker.generation();
-        match tokio::time::timeout(self.timeout, fut).await {
+        };
+        match tokio::time::timeout(budget, fut).await {
             Ok(Ok(v)) => {
                 self.breaker.close_unless_reopened(seen);
                 Ok(v)
             }
             Ok(Err(e)) => {
-                if e.is_io_error() || e.is_timeout() || e.is_connection_dropped() {
+                // `is_io_error` is the whole test: `is_timeout` and
+                // `is_connection_dropped` are strict subsets of it, and
+                // the connectivity errors that are NOT io errors —
+                // `ClusterConnectionNotFound`, `MasterNameNotFoundBySentinel`
+                // — return instantly, so the caller already failed open
+                // without paying anything and has nothing to cool off from.
+                if e.is_io_error() {
                     self.breaker.open();
                 }
                 Err(e)
             }
             Err(_) => {
                 self.breaker.open();
-                Err(timed_out_error(self.timeout))
+                Err(timed_out_error(budget))
             }
         }
     }
@@ -206,8 +231,26 @@ impl Breaker {
             .is_some_and(|until| Instant::now() < until)
     }
 
-    fn generation(&self) -> u64 {
-        self.lock().generation
+    /// Decide whether this command reaches Redis, and hand back the
+    /// generation it is allowed to close.
+    ///
+    /// `None` short-circuits. Once the window expires, exactly ONE caller
+    /// is admitted as the probe and the window is re-armed behind it:
+    /// without that, every command arriving while the probe is in flight
+    /// is admitted too and pays the full budget, which during a sustained
+    /// outage is most of them. A probe whose caller is dropped rather
+    /// than finishing leaves nothing stuck — the re-armed window simply
+    /// expires and the next caller probes.
+    fn admit(&self) -> Option<u64> {
+        let mut st = self.lock();
+        match st.open_until {
+            None => Some(st.generation),
+            Some(until) if Instant::now() < until => None,
+            Some(_) => {
+                st.open_until = Some(Instant::now() + self.window);
+                Some(st.generation)
+            }
+        }
     }
 
     fn open(&self) {
@@ -274,7 +317,10 @@ impl RedisConn {
                         let cfg = conn_config(self.guard.timeout);
                         let conn = self
                             .guard
-                            .run(client.get_async_connection_with_config(&cfg))
+                            .run_with(
+                                pool.discovery_timeout,
+                                client.get_async_connection_with_config(&cfg),
+                            )
                             .await?;
                         *pool.cached.lock().await = Some(conn.clone());
                         HandleKind::Sentinel(conn)
@@ -291,6 +337,13 @@ impl RedisConn {
     /// Invalidate any cached connection after an operation error. Only
     /// meaningful for `sentinel`, where it forces the next [`acquire`] to
     /// re-resolve the master (the prior one may have failed over).
+    ///
+    /// Re-resolution is not immediate any more: the failure that prompted
+    /// this call also opened the breaker, so the next `acquire` inside
+    /// [`BREAKER_WINDOW`] short-circuits and the master is re-discovered
+    /// by the first probe after it. A failover therefore costs up to one
+    /// window of per-replica counting / cache misses — fail-open, and the
+    /// alternative is every request racing to re-walk the sentinels.
     ///
     /// [`acquire`]: RedisConn::acquire
     pub async fn note_error(&self) {
@@ -424,6 +477,7 @@ pub async fn connect(cfg: &RedisConnConfig) -> RedisResult<RedisConn> {
                 .filter(|s| !s.is_empty())
                 .map(|s| insecure_url(s, cfg))
                 .collect();
+            let sentinels_len = sentinels.len().max(1) as u32;
             let master_name = cfg.master_name.clone().unwrap_or_default();
             // The master/data node may need its own auth and TLS; the
             // sentinels themselves carry theirs in `sentinels` URLs. Derive
@@ -484,12 +538,13 @@ pub async fn connect(cfg: &RedisConnConfig) -> RedisResult<RedisConn> {
             // connect attempts inside it — so the whole exchange gets an
             // outer budget too, or an unreachable sentinel stalls the
             // boot attempt indefinitely.
+            let discovery_timeout = timeout * (sentinels_len + 1);
             let conn = tokio::time::timeout(
-                timeout,
+                discovery_timeout,
                 client.get_async_connection_with_config(&conn_config(timeout)),
             )
             .await
-            .map_err(|_| timed_out_error(timeout))??;
+            .map_err(|_| timed_out_error(discovery_timeout))??;
             tracing::info!(
                 target: "aisix::redis",
                 mode = "sentinel",
@@ -500,6 +555,7 @@ pub async fn connect(cfg: &RedisConnConfig) -> RedisResult<RedisConn> {
             ConnKind::Sentinel(SentinelPool {
                 client: Arc::new(Mutex::new(client)),
                 cached: Arc::new(Mutex::new(Some(conn))),
+                discovery_timeout,
             })
         }
     };
@@ -746,6 +802,52 @@ mod guard_tests {
             .await
             .expect("the probe reaches Redis again");
         assert!(!g.breaker.is_open(), "a success closes the breaker");
+    }
+
+    /// A cool-off that only gates the window itself still lets every
+    /// command that arrives while the probe is in flight pay the full
+    /// budget — during a sustained outage that is most of them, and no
+    /// serial test can see it.
+    #[tokio::test]
+    async fn only_one_command_probes_when_the_window_expires() {
+        let g = Arc::new(guard(2_000, 60));
+        g.run(async { Err::<(), _>(dropped_connection()) })
+            .await
+            .expect_err("the failure opens the breaker");
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(!g.breaker.is_open(), "the window has expired");
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let probe = tokio::spawn({
+            let g = Arc::clone(&g);
+            async move {
+                g.run(async move {
+                    let _ = rx.await;
+                    Ok::<_, redis::RedisError>(1)
+                })
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let started = Instant::now();
+        let err = g
+            .run(pending::<RedisResult<()>>())
+            .await
+            .expect_err("only the probe reaches Redis");
+        assert!(
+            started.elapsed() < Duration::from_millis(40),
+            "a command behind the probe must not pay the budget, took {:?}",
+            started.elapsed()
+        );
+        assert!(err.to_string().contains("cool-off"), "{err}");
+
+        tx.send(()).expect("the probe is still waiting");
+        probe.await.expect("join").expect("the probe succeeds");
+        assert!(
+            !g.breaker.is_open(),
+            "a successful probe closes the breaker"
+        );
     }
 
     /// A command that was already in flight when the outage began can

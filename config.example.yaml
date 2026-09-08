@@ -258,8 +258,13 @@ cache:
   #   # A Redis that stops answering without closing the socket (host down,
   #   # network partition, stopped container) would otherwise block the
   #   # request for minutes instead of degrading it. After a failure,
-  #   # commands short-circuit for a few seconds so the outage costs this
-  #   # budget once rather than once per request. Must be >= 1.
+  #   # commands short-circuit for about five seconds and then ONE request
+  #   # probes, so an outage costs this budget roughly once per five
+  #   # seconds rather than once per request. Must be >= 1.
+  #   #
+  #   # In sentinel mode, discovering the master is not one round trip —
+  #   # the client walks the sentinels one at a time — so that step gets
+  #   # this budget once per configured sentinel, plus one for the master.
   #   # timeout_secs: 5
 
 # Rate-limit counter backend (api7/AISIX-Cloud#798).
@@ -286,6 +291,9 @@ ratelimit:
   #   # counting. Same field and same meaning as cache.redis above; without
   #   # it an unreachable Redis blocks every rate-limited request for
   #   # minutes instead of degrading it. Must be >= 1.
+  #   #
+  #   # The cache and the limiter cool off independently, so a request that
+  #   # uses both can pay one budget for each while a shared Redis is down.
   #   # timeout_secs: 5
   # Seconds before an unreleased concurrency slot (crashed replica /
   # hung upstream) is reclaimed. Redis backend only.
