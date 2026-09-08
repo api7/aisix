@@ -161,6 +161,12 @@ impl OpenApiBridge {
         let spec = self.server().spec.as_ref().ok_or_else(|| {
             McpError::Request("openapi server has no spec configured".to_string())
         })?;
+        // Generation runs under the lock. It is one lock for every
+        // registered server, so the first concurrent burst after a spec
+        // changes serialises on it — still strictly less total work than
+        // regenerating per request, which is what happened before, and a
+        // generate-outside-then-double-check dance would trade that for
+        // duplicate generations under the same race.
         let mut cache = tool_cache();
         if let Some(cached) = cache.by_id.get(&self.entry.id) {
             // Row identity is the snapshot's `Arc`: a copy-on-write
@@ -934,6 +940,11 @@ mod tests {
     /// per REQUEST, and both `tools/list` and `tools/call` ask for the
     /// tool set — so regenerating it from the spec each time made one
     /// call cost a walk of every registered document (AISIX-Cloud#1542).
+    // Uses ids of its own: `TOOL_CACHE` is process-wide, and
+    // `sweep_tool_cache` with a table that does not carry a row evicts it.
+    // A second test in THIS crate's lib-test binary that reaches the cache
+    // (anything going through `McpGateway::from_snapshot*`) would have to
+    // coordinate with this one; today there is none.
     #[test]
     fn tool_generation_is_cached_per_row_and_evicted_with_it() {
         let row = openapi_server("cache-row-1", "/items");

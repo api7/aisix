@@ -129,6 +129,7 @@ fn build_chain_from_snapshot_reported(
         }
     }
 
+    instances.retain_present(table);
     (GuardrailChain::new_with_applied(chain, applied), rejected)
 }
 
@@ -1000,17 +1001,16 @@ impl Guardrail for MonitorGuardrail {
     }
 }
 
-/// Adapter that wraps a snapshot handle and rebuilds the runtime
-/// chain whenever the snapshot pointer changes. The chat handler
-/// holds an `Arc<dyn Guardrail>` pointing at this; it never sees
-/// the rebuild.
+/// Adapter that wraps a snapshot handle and rebuilds the runtime chain
+/// whenever the `guardrails` table changes. The chat handler holds an
+/// `Arc<dyn Guardrail>` pointing at this; it never sees the rebuild.
 ///
-/// Cheap path (cache hit): one atomic load + one pointer compare,
-/// then a clone of an `Arc<GuardrailChain>`. Rebuild path (cache
-/// miss): runs through the entries table and recompiles regexes.
-/// Compilation only happens on the first call after each snapshot
-/// store from the etcd supervisor — typical run is one or zero
-/// rebuilds per minute even on a chatty configuration.
+/// Cheap path (cache hit): one snapshot load + one generation compare,
+/// then a clone of an `Arc<GuardrailChain>`. Rebuild path (cache miss):
+/// runs through the entries table, reusing the runtime instance of every
+/// row whose content did not change. Keyed on
+/// [`ResourceTable::generation`] and NOT on the snapshot version, so a
+/// write to any other resource kind rebuilds nothing (AISIX-Cloud#1542).
 ///
 /// `bedrock_endpoint_url` is captured at construct time and reused
 /// on every rebuild; this is a deployment-wide setting (sourced
@@ -1547,10 +1547,12 @@ fn presence_timestamps(
 ///     so nothing rebuilds, so nothing is said.
 ///
 /// Riding the build also put the emit on the request path, where
-/// `LiveGuardrailIndex::current()` builds outside the lock and every request
-/// arriving during one rebuild runs its own — which is how the original
+/// `LiveGuardrailIndex::current()` built outside the lock and every request
+/// arriving during one rebuild ran its own — which is how the original
 /// "seen in two consecutive builds" rule managed to see two builds inside a
-/// single snapshot version.
+/// single snapshot version. That build is single-flighted now
+/// (AISIX-Cloud#1542), but the timer is what makes the two cases above
+/// reportable at all, so it stays.
 pub fn sweep_unattached_guardrails(
     guardrails: &ResourceTable<DomainGuardrail>,
     attachments: &ResourceTable<GuardrailAttachment>,
@@ -1585,14 +1587,17 @@ pub fn sweep_unattached_guardrails(
 // LiveGuardrailIndex — lazy-rebuild adapter over a snapshot handle
 // ---------------------------------------------------------------------------
 
-/// Wraps a snapshot handle and rebuilds the runtime index whenever the
-/// snapshot pointer changes. The proxy chat handler calls `resolve(ctx)`
-/// on each request to get the applicable `GuardrailChain`.
+/// Wraps a snapshot handle and rebuilds the runtime index when — and only
+/// when — the `guardrails` or `guardrail_attachments` table changes. The
+/// endpoint handlers call `resolve(ctx)` on each request to get the
+/// applicable `GuardrailChain`.
 ///
-/// Rebuild semantics are identical to `LiveGuardrailChain`: one atomic
-/// load + one version compare on the hot path; a full index build (linear
-/// in the number of attachment rows) only on the first call after each
-/// snapshot swap.
+/// Hot path: one snapshot load, one generation-pair compare, one `Arc`
+/// clone. A rebuild walks the attachment rows and constructs a runtime
+/// instance only for guardrail rows whose content changed, single-flighted
+/// across every worker thread. Keying on the tables the build reads,
+/// rather than on the snapshot version, is what keeps an unrelated
+/// configuration write off the request path (AISIX-Cloud#1542).
 pub struct LiveGuardrailIndex {
     snapshot: SnapshotHandle<AisixSnapshot>,
     bedrock_endpoint_url: Option<String>,

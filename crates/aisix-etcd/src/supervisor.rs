@@ -767,10 +767,11 @@ impl<P: ConfigProvider> Supervisor<P> {
         // stamped one. `record_apply` keeps the max, so one call with the
         // batch's max is what N calls would have left behind.
         let mut apply_stamp: Option<i64> = None;
-        // Whether any event changed something `/status/config` or the
-        // on-disk cache reports. A batch of deletes for keys that were
-        // never there publishes nothing, exactly as each delete would not.
-        let mut changed = false;
+        // What the batch has to publish. Split, because the two are not
+        // the same set of events: a delete's revision-floor bump moves
+        // what `/status/config` reports without changing a byte of the
+        // observed state the cache file holds, and used to write nothing.
+        let mut dirty = Dirty::default();
 
         for event in events {
             let outcome = match event {
@@ -780,7 +781,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                     &mut view,
                     &mut mutations,
                     &mut apply_stamp,
-                    &mut changed,
+                    &mut dirty,
                 ),
                 PendingEvent::Delete { key, revision } => self.stage_delete(
                     key,
@@ -789,7 +790,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                     &mut view,
                     &mut mutations,
                     &mut apply_stamp,
-                    &mut changed,
+                    &mut dirty,
                 ),
             };
             outcomes.push(outcome);
@@ -817,8 +818,10 @@ impl<P: ConfigProvider> Supervisor<P> {
             // `last_apply_age` resets on every event we process.
             self.status.record_apply(revision);
         }
-        if changed {
+        if dirty.status {
             self.sync_config_status(false);
+        }
+        if dirty.cache {
             self.flush_cache();
         }
         outcomes
@@ -833,7 +836,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         view: &mut BatchView,
         mutations: &mut Vec<SnapshotMutation>,
         apply_stamp: &mut Option<i64>,
-        changed: &mut bool,
+        dirty: &mut Dirty,
     ) -> bool {
         // Build a tiny snapshot out of just the new entry, then merge.
         let (tiny, mut stats) = loader::build_snapshot(&self.prefix, std::slice::from_ref(entry));
@@ -863,13 +866,27 @@ impl<P: ConfigProvider> Supervisor<P> {
                 self.push_rejection(r);
             }
             // A rejected watch event still changes the reported state
-            // (rejected[] gains this entry; last_reload flips unsuccessful).
-            *changed = true;
+            // (rejected[] gains this entry; last_reload flips unsuccessful),
+            // and its bytes are now part of the observed state on disk.
+            dirty.status = true;
+            dirty.cache = true;
             return false;
         }
 
         view.record_put(&self.prefix, &entry.key);
-        mutations.push(SnapshotMutation::Merge(Box::new(tiny)));
+        // Fold a run of puts into ONE staged snapshot rather than keeping a
+        // `Box<AisixSnapshot>` per event alive until the commit: the loader
+        // hands back a full fifteen-table snapshot for the single row it
+        // parsed, and every one of those tables eagerly allocates a DashMap
+        // shard array sized by the core count — hundreds of kilobytes per
+        // event on a large host, for one row. Merging is order-preserving:
+        // a later insert of the same id replaces the earlier one, which is
+        // what applying the two puts in sequence does. A delete breaks the
+        // run, so the ordering across kinds is kept too.
+        match mutations.last_mut() {
+            Some(SnapshotMutation::Merge(accumulated)) => merge_snapshot(accumulated, &tiny),
+            _ => mutations.push(SnapshotMutation::Merge(Box::new(tiny))),
+        }
         self.remove_rejection_for_key(&entry.key);
         // The key's latest bytes load again — retention ends (#871).
         self.stale_serving.lock().unwrap().remove(&entry.key);
@@ -886,7 +903,8 @@ impl<P: ConfigProvider> Supervisor<P> {
         // monotonic.
         self.store_observed(entry);
         stamp_max(apply_stamp, entry.revision);
-        *changed = true;
+        dirty.status = true;
+        dirty.cache = true;
         true
     }
 
@@ -903,13 +921,13 @@ impl<P: ConfigProvider> Supervisor<P> {
         view: &mut BatchView,
         mutations: &mut Vec<SnapshotMutation>,
         apply_stamp: &mut Option<i64>,
-        changed: &mut bool,
+        dirty: &mut Dirty,
     ) -> bool {
         let parsed = match key::parse(&self.prefix, key_str) {
             Ok(k) => k,
             Err(err) => {
                 tracing::warn!(key = %key_str, error = %err, "ignoring delete with bad key");
-                self.raise_revision_floor(revision, apply_stamp, changed);
+                self.raise_revision_floor(revision, apply_stamp, dirty);
                 return false;
             }
         };
@@ -939,9 +957,10 @@ impl<P: ConfigProvider> Supervisor<P> {
                 // No per-event revision rides a wire delete, so stamp
                 // freshness with the current floor.
                 stamp_max(apply_stamp, *self.revision.lock().unwrap());
-                *changed = true;
+                dirty.status = true;
+                dirty.cache = true;
             }
-            self.raise_revision_floor(revision, apply_stamp, changed);
+            self.raise_revision_floor(revision, apply_stamp, dirty);
             return removed_rejection;
         }
 
@@ -951,8 +970,9 @@ impl<P: ConfigProvider> Supervisor<P> {
             id: parsed.id.to_string(),
         });
         stamp_max(apply_stamp, *self.revision.lock().unwrap());
-        *changed = true;
-        self.raise_revision_floor(revision, apply_stamp, changed);
+        dirty.status = true;
+        dirty.cache = true;
+        self.raise_revision_floor(revision, apply_stamp, dirty);
         true
     }
 
@@ -972,11 +992,14 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// In-batch form of [`Self::set_revision_floor`]: bump the floor and
     /// mark the batch as needing a status publish, deferring the single
     /// `record_apply` / `sync_config_status` to the end of the batch.
+    ///
+    /// Status only — the floor is not part of the observed entry set, and
+    /// `set_revision_floor` never wrote the cache file either.
     fn raise_revision_floor(
         &self,
         revision: Option<i64>,
         apply_stamp: &mut Option<i64>,
-        changed: &mut bool,
+        dirty: &mut Dirty,
     ) {
         let Some(revision) = revision else {
             return;
@@ -988,7 +1011,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             }
         }
         stamp_max(apply_stamp, revision);
-        *changed = true;
+        dirty.status = true;
     }
 
     /// Replace the current snapshot with a freshly loaded set (resync).
@@ -1306,7 +1329,10 @@ impl<P: ConfigProvider> Supervisor<P> {
                     // contains older mod_revisions.
                     self.set_revision_floor(revision);
                 }
-                Some(Ok(first)) => {
+                // Explicit over the two batchable variants rather than a
+                // catch-all: a new `WatchEvent` must fail to compile here
+                // instead of falling into a batch that cannot carry it.
+                Some(Ok(first @ (WatchEvent::Put(_) | WatchEvent::Delete { .. }))) => {
                     // Coalesce: take every Put/Delete that is ALREADY
                     // waiting on the stream and apply the run as one
                     // copy-on-write cycle. `now_or_never` never waits, so
@@ -1351,6 +1377,9 @@ impl<P: ConfigProvider> Supervisor<P> {
                                 key,
                                 revision: Some(*revision),
                             },
+                            // Unreachable by the arm above and the drain's
+                            // own filter, both of which are exhaustive over
+                            // `WatchEvent`.
                             WatchEvent::Resync { .. } => {
                                 unreachable!("a resync is never added to a coalesced batch")
                             }
@@ -1465,6 +1494,16 @@ impl BatchView {
         }
         snapshot_has(base, kind, id)
     }
+}
+
+/// What one coalesced apply still owes when its events are staged.
+#[derive(Debug, Default)]
+struct Dirty {
+    /// `/status/config` and the `aisix_config_*` series.
+    status: bool,
+    /// The on-disk snapshot cache, whose content is the observed entry
+    /// set — so a bump of the revision floor alone does not dirty it.
+    cache: bool,
 }
 
 /// Keep the larger of `slot` and `revision`.
@@ -1600,55 +1639,75 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
     }
 }
 
-/// Remove `(kind, id)` from `snap`. An unknown kind is a no-op —
-/// [`snapshot_has`] already read it as absent, so nothing staged a
-/// removal for it.
+/// Remove `(kind, id)` from `snap`.
+///
+/// Exhaustively destructured for the same drift-guard reason as
+/// [`merge_snapshot`] and [`snapshot_has`]: a kind added to the snapshot
+/// but missed here would be found present by `snapshot_has`, stage a
+/// removal, and then silently no-op — the row would never be deletable.
 fn remove_from_snapshot(snap: &AisixSnapshot, kind: &str, id: &str) {
+    let AisixSnapshot {
+        models,
+        apikeys,
+        provider_keys,
+        guardrails,
+        guardrail_attachments,
+        cache_policies,
+        observability_exporters,
+        rate_limit_policies,
+        mcp_servers,
+        mcp_policies,
+        a2a_agents,
+        oidc_providers,
+        claim_mappings,
+        passthrough_routes,
+        mcp_auth_settings,
+    } = snap;
     match kind {
         "models" => {
-            snap.models.remove(id);
+            models.remove(id);
         }
         "api_keys" => {
-            snap.apikeys.remove(id);
+            apikeys.remove(id);
         }
         "provider_keys" => {
-            snap.provider_keys.remove(id);
+            provider_keys.remove(id);
         }
         "guardrails" => {
-            snap.guardrails.remove(id);
+            guardrails.remove(id);
         }
         "guardrail_attachments" => {
-            snap.guardrail_attachments.remove(id);
+            guardrail_attachments.remove(id);
         }
         "cache_policies" => {
-            snap.cache_policies.remove(id);
+            cache_policies.remove(id);
         }
         "observability_exporters" => {
-            snap.observability_exporters.remove(id);
+            observability_exporters.remove(id);
         }
         "rate_limit_policies" => {
-            snap.rate_limit_policies.remove(id);
+            rate_limit_policies.remove(id);
         }
         "mcp_servers" => {
-            snap.mcp_servers.remove(id);
+            mcp_servers.remove(id);
         }
         "mcp_policies" => {
-            snap.mcp_policies.remove(id);
+            mcp_policies.remove(id);
         }
         "a2a_agents" => {
-            snap.a2a_agents.remove(id);
+            a2a_agents.remove(id);
         }
         "oidc_providers" => {
-            snap.oidc_providers.remove(id);
+            oidc_providers.remove(id);
         }
         "claim_mappings" => {
-            snap.claim_mappings.remove(id);
+            claim_mappings.remove(id);
         }
         "passthrough_routes" => {
-            snap.passthrough_routes.remove(id);
+            passthrough_routes.remove(id);
         }
         "mcp_auth_settings" => {
-            snap.mcp_auth_settings.remove(id);
+            mcp_auth_settings.remove(id);
         }
         _ => {}
     }
@@ -2010,8 +2069,6 @@ mod tests {
             2,
             "the queued run should be one publish on top of the resync",
         );
-        // Every model row shares one generation stamp — they were merged
-        // into a single table mutation cycle, not six.
         assert_eq!(
             sup.config_status().metrics().reloads_total - reloads_before,
             1,
@@ -2019,9 +2076,85 @@ mod tests {
         );
     }
 
-    /// Coalescing must not change what the individual events decided.
+    /// A put after a delete of the same id must not be folded into the
+    /// staged snapshot that preceded the delete — the delete would then
+    /// remove the row the later put re-added, and it would be gone.
     #[tokio::test]
-    async fn a_batch_decides_exactly_what_the_events_decide_alone() {
+    async fn a_delete_breaks_the_run_of_puts_it_sits_between() {
+        let events: Vec<Result<WatchEvent, ProviderError>> = vec![
+            Ok(WatchEvent::Put(entry("/aisix/models/m-1", VALID_MODEL, 2))),
+            Ok(WatchEvent::Put(entry(
+                "/aisix/api_keys/k-1",
+                VALID_APIKEY,
+                3,
+            ))),
+            Ok(WatchEvent::Delete {
+                key: "/aisix/models/m-1".into(),
+                revision: 4,
+            }),
+            Ok(WatchEvent::Put(entry("/aisix/models/m-1", VALID_MODEL, 5))),
+            Ok(WatchEvent::Put(entry(
+                "/aisix/guardrails/g-1",
+                VALID_GUARDRAIL,
+                6,
+            ))),
+        ];
+        let provider = Arc::new(FakeProvider::new(vec![], 0).with_events(events));
+        let sup = Arc::new(Supervisor::new(provider, "/aisix"));
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let _ = sup.cycle(&rx).await;
+
+        let snap = sup.handle().load();
+        assert_eq!(snap.models.len(), 1, "the put after the delete survived");
+        assert_eq!(snap.apikeys.len(), 1);
+        assert_eq!(snap.guardrails.len(), 1);
+    }
+
+    /// A delete for a key the gateway never held changes what
+    /// `/status/config` reports (the revision floor moved) and nothing
+    /// about the observed entry set — so it must not rewrite the on-disk
+    /// snapshot cache, which is what it did before the two were split.
+    #[tokio::test]
+    async fn a_delete_of_an_unknown_key_publishes_status_without_writing_the_cache() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+        sup.await_pending_cache_writes().await;
+
+        assert!(
+            !sup.apply_events(&[PendingEvent::Delete {
+                key: "/aisix/models/never-existed",
+                revision: Some(99),
+            }])[0]
+        );
+
+        assert!(
+            sup.pending_writes.lock().unwrap().is_empty(),
+            "a cache write was spawned for a key that changed no state",
+        );
+        // Status WAS published: the revision floor the delete carried is
+        // what `/status/config` and the heartbeat now report.
+        let view = sup.config_status().view();
+        assert_eq!(view.source.observed_revision, Some(99));
+        assert_eq!(view.applied.unwrap().applied_revision, Some(99));
+
+        // A delete that DOES change state still writes.
+        assert!(sup.apply_put(&entry("/aisix/models/m-1", VALID_MODEL, 100)));
+        sup.await_pending_cache_writes().await;
+        assert!(
+            sup.apply_events(&[PendingEvent::Delete {
+                key: "/aisix/models/m-1",
+                revision: Some(101),
+            }])[0]
+        );
+        assert!(!sup.pending_writes.lock().unwrap().is_empty());
+    }
+
+    /// A decision that asks "does this row serve right now?" must see the
+    /// batch's own earlier events, which have not been published yet —
+    /// otherwise coalescing silently changes what the same events decide.
+    #[tokio::test]
+    async fn a_rejected_put_pins_the_accepted_put_before_it_in_the_same_batch() {
         let events: Vec<Result<WatchEvent, ProviderError>> = vec![
             Ok(WatchEvent::Put(entry("/aisix/models/m-1", VALID_MODEL, 2))),
             Ok(WatchEvent::Put(entry(
