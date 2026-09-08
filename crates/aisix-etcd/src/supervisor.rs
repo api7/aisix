@@ -1350,8 +1350,12 @@ impl<P: ConfigProvider> Supervisor<P> {
                     while batch.len() < MAX_APPLY_BATCH {
                         // Checked here as well as in the select: with a
                         // stream that always has an event ready the
-                        // `sleep_until` branch would never be polled, and
-                        // the max wait would not bound anything.
+                        // `sleep_until` branch is never polled (`biased`),
+                        // and the window would then be bounded by
+                        // MAX_APPLY_BATCH alone rather than by time. That
+                        // is a real shape, not a hypothetical — the etcd
+                        // stream flattens one `WatchResponse` into many
+                        // consecutively ready items.
                         if tokio::time::Instant::now() >= deadline {
                             break;
                         }
@@ -1360,9 +1364,17 @@ impl<P: ConfigProvider> Supervisor<P> {
                             item = stream.next() => item,
                             _ = tokio::time::sleep_until(deadline) => break,
                             _ = tokio::time::sleep(COALESCE_QUIET_PERIOD) => break,
-                            // Shutdown must not wait out the window. The
-                            // batch collected so far is still applied
-                            // below; the outer loop then sees the flag.
+                            // Leave the window early on shutdown rather
+                            // than sit out a wait for events that are no
+                            // longer coming. Bounded by the max wait, not
+                            // immediate: `biased` means a stream with an
+                            // event ready wins this branch every time.
+                            // Either way the batch collected so far is
+                            // still applied below — those events are
+                            // already off the stream, so this apply is
+                            // the only thing that can still serve and
+                            // persist them — and the outer loop then sees
+                            // the flag.
                             _ = wait_for_cancel(cancel.clone()) => break,
                         };
                         match item {
@@ -2323,24 +2335,48 @@ mod tests {
 
         let snap = sup.handle().load();
         assert_eq!(snap.models.len(), N as usize, "every event was applied");
+        let version_after = sup.handle().version();
+        assert!(
+            version_after > version_before,
+            "the resync alone should have published once",
+        );
         // One publish for the initial resync, then one per coalesced
-        // apply. Un-coalesced this burst is 250 of them; the window caps
-        // it at ceil(burst / COALESCE_MAX_WAIT) plus the trailing batch.
-        let publishes = sup.handle().version() - version_before - 1;
+        // apply. Un-coalesced this burst is 250 of them.
+        let publishes = version_after - version_before - 1;
+        let burst_ms = (N as u128) * SPACING.as_millis();
         assert!(
             publishes <= 3,
-            "a {N}-event burst spread over {}ms should coalesce into at most 3 applies, got \
-             {publishes}",
-            (N as u128) * SPACING.as_millis(),
+            "a {N}-event burst spread over {burst_ms}ms should coalesce into at most 3 applies, \
+             got {publishes}",
         );
-        assert!(publishes >= 1);
+        // Both ends matter, and the lower one is what pins
+        // COALESCE_MAX_WAIT. Every gap here is under the quiet period, so
+        // if the max wait stopped bounding the batch the whole burst
+        // would collapse into a single apply and the upper bound above
+        // would happily pass — while config-change visibility during a
+        // sustained burst grew without limit. The burst spans more than
+        // one max wait, so at least one window has to close mid-burst.
+        assert!(
+            burst_ms > COALESCE_MAX_WAIT.as_millis(),
+            "the burst has to outlast one window or the bound below proves nothing",
+        );
+        assert!(
+            publishes >= 2,
+            "the maximum wait did not bound the batch: {publishes} apply(s) for a {burst_ms}ms \
+             burst of events spaced under the quiet period",
+        );
     }
 
     /// The window must not strand a lone write waiting for company that
     /// never comes: a single event on an otherwise idle stream is applied
-    /// within the maximum wait.
+    /// well inside the maximum wait, because the QUIET period is what
+    /// releases it.
     #[tokio::test(start_paused = true)]
-    async fn a_lone_event_is_applied_within_the_maximum_wait() {
+    async fn a_lone_event_is_applied_within_the_quiet_period() {
+        /// Slack for the 1 ms poll below, which can only overshoot the
+        /// moment the apply landed by one of its own ticks.
+        const POLL_SLACK: Duration = Duration::from_millis(5);
+
         let (provider, tx) = LiveProvider::new(0);
         let sup = Arc::new(Supervisor::new(provider, "/aisix"));
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -2353,8 +2389,15 @@ mod tests {
         });
 
         // Let the initial load land before starting the clock, so what is
-        // measured is the coalescing window and nothing else.
+        // measured is the coalescing window and nothing else. Bounded:
+        // virtual time auto-advances forever, so an unbounded spin here
+        // would hang rather than fail if the resync stopped publishing.
+        let load_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while sup.handle().version() == 0 {
+            assert!(
+                tokio::time::Instant::now() < load_deadline,
+                "the initial resync never published",
+            );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
@@ -2367,11 +2410,18 @@ mod tests {
         .unwrap();
 
         // The sender stays alive, so the stream never ends and only the
-        // window can trigger the apply.
+        // window can trigger the apply. Bounded by the quiet period
+        // rather than by the maximum wait: a lone event has no company
+        // coming, so the quiet period is the branch that has to release
+        // it, and a bound of COALESCE_MAX_WAIT would still pass with that
+        // branch deleted — at 7x the latency on the commonest path of
+        // all.
         while sup.handle().load().models.is_empty() {
             assert!(
-                sent_at.elapsed() <= COALESCE_MAX_WAIT,
-                "a lone event was not applied within the maximum wait",
+                sent_at.elapsed() <= COALESCE_QUIET_PERIOD + POLL_SLACK,
+                "a lone event waited {:?} — past the quiet period, so only the maximum wait \
+                 released it",
+                sent_at.elapsed(),
             );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -2379,6 +2429,57 @@ mod tests {
 
         drop(tx);
         watcher.await.unwrap();
+    }
+
+    /// Shutdown must not throw away what the window already took off the
+    /// stream. Those events are gone from the watch, so the apply that
+    /// follows the cancelled window is the only thing that can still put
+    /// them in the served snapshot and the on-disk cache — the same
+    /// invariant `an_apply_immediately_before_shutdown_reaches_the_on_disk_cache`
+    /// protects, reached by the second path the window opened.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_inside_the_window_still_applies_what_it_collected() {
+        let (provider, tx) = LiveProvider::new(0);
+        let sup = Arc::new(Supervisor::new(provider, "/aisix"));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let watcher = tokio::spawn({
+            let sup = sup.clone();
+            async move { sup.cycle(&cancel_rx).await }
+        });
+        let load_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while sup.handle().version() == 0 {
+            assert!(
+                tokio::time::Instant::now() < load_deadline,
+                "the initial resync never published",
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        tx.unbounded_send(Ok(WatchEvent::Put(entry(
+            "/aisix/models/m-1",
+            VALID_MODEL,
+            2,
+        ))))
+        .unwrap();
+        // Long enough for the watcher to take the event into its batch,
+        // far short of the quiet period that would close the window.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(
+            sup.handle().load().models.is_empty(),
+            "the window must still be open here or this test proves nothing",
+        );
+
+        cancel_tx.send(true).unwrap();
+        assert!(matches!(
+            watcher.await.unwrap(),
+            Err(SupervisorError::Cancelled)
+        ));
+        assert_eq!(
+            sup.handle().load().models.len(),
+            1,
+            "the batch already taken off the stream was dropped on shutdown",
+        );
     }
 
     #[tokio::test]
