@@ -2543,7 +2543,7 @@ mod tests {
                             continue;
                         }
                         let mut rest = line;
-                        while let Some(at) = rest.find(&needle) {
+                        while let Some(at) = rest.find(needle) {
                             let after = &rest[at + needle.len()..];
                             let boundary = after
                                 .chars()
