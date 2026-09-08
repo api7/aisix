@@ -47,8 +47,11 @@ pub struct ApiKey {
     /// that model's pattern covers — including a name an exact-match model
     /// of its own serves, which is how the name form behaves too. An id
     /// matching no model grants nothing.
+    ///
     /// Set to `null` it means the same as omitted: the key falls back to
-    /// `allowed_models`.
+    /// `allowed_models`. A producer must therefore write `[]`, never
+    /// `null`, for a key that is meant to grant no model — the two are
+    /// opposite grants, and an empty list is the one that is authoritative.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_model_ids: Option<Vec<String>>,
 
