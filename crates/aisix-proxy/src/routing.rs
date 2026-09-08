@@ -1524,12 +1524,7 @@ mod tests {
             &group,
             RoutingRequest::default(),
         )
-        .map(|attempts| {
-            attempts
-                .into_iter()
-                .map(|a| a.model.display_name)
-                .collect()
-        })
+        .map(|attempts| attempts.into_iter().map(|a| a.model.display_name).collect())
     }
 
     #[test]
@@ -1565,7 +1560,10 @@ mod tests {
             priority: None,
             tags: None,
         };
-        assert_eq!(resolve_group(&snap, vec![conflicting]).unwrap(), vec!["beta"]);
+        assert_eq!(
+            resolve_group(&snap, vec![conflicting]).unwrap(),
+            vec!["beta"]
+        );
     }
 
     #[test]
