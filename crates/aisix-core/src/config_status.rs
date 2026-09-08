@@ -898,23 +898,57 @@ fn bounded_rejection_error(error: String) -> String {
 /// Hash an etcd entry set: `sha256` over `key '\0' canonical_value '\n'` for
 /// each entry, in ascending key order. See the module docs for the exact
 /// definition. `entries` is `(key, raw_value_bytes)`.
+///
+/// The digest is a published contract — the control plane stores what the
+/// gateway reports and never recomputes it, and the algorithm is documented
+/// in the public Admin API reference — so its output must stay byte-identical
+/// across releases.
 pub fn hash_entries<'a, I>(entries: I) -> String
 where
     I: IntoIterator<Item = (&'a str, &'a [u8])>,
 {
     let mut sorted: Vec<(&str, &[u8])> = entries.into_iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
+    hash_records(
+        sorted
+            .into_iter()
+            .map(|(key, value)| hash_record(key, value)),
+    )
+}
+
+/// The exact bytes one entry contributes to [`hash_entries`]:
+/// `key '\0' canonical_value '\n'`.
+///
+/// Split out so a caller that hashes the same entry set repeatedly can
+/// compute this once per entry version and keep it — the JSON parse and
+/// canonical re-serialisation are what make a full-config digest
+/// expensive, and re-running them for every unchanged row on every watch
+/// event is the cost AISIX-Cloud#1542 measured.
+pub fn hash_record(key: &str, value: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(key.len() + value.len() + 2);
+    out.extend_from_slice(key.as_bytes());
+    out.push(0u8);
+    match serde_json::from_slice::<serde_json::Value>(value) {
+        Ok(v) => out.extend_from_slice(canonical_json(&v).as_bytes()),
+        // Not JSON (rejected as non_json): hash the raw bytes so the
+        // observed hash still changes deterministically with the input.
+        Err(_) => out.extend_from_slice(value),
+    }
+    out.push(b'\n');
+    out
+}
+
+/// Digest pre-computed [`hash_record`]s. The caller supplies them in
+/// ascending key order — the ordering [`hash_entries`] establishes by
+/// sorting.
+pub fn hash_records<I, R>(records: I) -> String
+where
+    I: IntoIterator<Item = R>,
+    R: AsRef<[u8]>,
+{
     let mut hasher = Sha256::new();
-    for (key, value) in sorted {
-        hasher.update(key.as_bytes());
-        hasher.update([0u8]);
-        match serde_json::from_slice::<serde_json::Value>(value) {
-            Ok(v) => hasher.update(canonical_json(&v).as_bytes()),
-            // Not JSON (rejected as non_json): hash the raw bytes so the
-            // observed hash still changes deterministically with the input.
-            Err(_) => hasher.update(value),
-        }
-        hasher.update([b'\n']);
+    for record in records {
+        hasher.update(record.as_ref());
     }
     hex(hasher.finalize().as_slice())
 }
@@ -1714,5 +1748,67 @@ mod tests {
             ReloadReason::from_error_kind("unknown_kind"),
             ReloadReason::Validate
         );
+    }
+
+    // The digest is a published contract (see `hash_entries`): cp-api stores
+    // what the gateway reports and never recomputes it, and the algorithm is
+    // rendered into the public Admin API reference. These two constants were
+    // produced by the implementation as it stood before the record cache was
+    // introduced (AISIX-Cloud#1542); they must never change. The fixture
+    // deliberately carries what the canonicalisation actually has to get
+    // right: nested objects whose keys arrive unsorted, an array of objects
+    // (arrays keep their order, the objects inside them do not), a `null`,
+    // a value that is not JSON at all, and keys whose etcd order differs
+    // from their sorted order.
+    const HASH_FIXTURE: &[(&str, &str)] = &[
+        (
+            "/aisix/env/models/b",
+            r#"{"z":1,"a":{"d":[3,1],"c":"x"},"m":null}"#,
+        ),
+        (
+            "/aisix/env/api_keys/a",
+            r#"{"key_hash":"deadbeef","allowed_models":["m2","m1"]}"#,
+        ),
+        ("/aisix/env/guardrails/c", "not json at all"),
+        (
+            "/aisix/env/models/z",
+            r#"{"nested":{"y":{"b":2,"a":1}},"arr":[{"q":1,"p":2}]}"#,
+        ),
+    ];
+    const HASH_FIXTURE_ALL: &str =
+        "19ad332bd0ec12bd419a56786f81ca90b17d9796ac60f46545b9f77642427129";
+    /// The same fixture minus `/aisix/env/models/z` — the shape
+    /// `config_hash` takes when a key is rejected with nothing to serve,
+    /// so the two digests differ.
+    const HASH_FIXTURE_ACCEPTED: &str =
+        "f0b4b0cdc9ae4da988e11b3e64b47e802212859e6ed2d08b64434967a9d41308";
+
+    #[test]
+    fn hash_entries_output_is_pinned() {
+        let all = hash_entries(HASH_FIXTURE.iter().map(|(k, v)| (*k, v.as_bytes())));
+        let accepted = hash_entries(
+            HASH_FIXTURE
+                .iter()
+                .filter(|(k, _)| *k != "/aisix/env/models/z")
+                .map(|(k, v)| (*k, v.as_bytes())),
+        );
+        assert_eq!(all, HASH_FIXTURE_ALL);
+        assert_eq!(accepted, HASH_FIXTURE_ACCEPTED);
+        assert_ne!(all, accepted);
+    }
+
+    #[test]
+    fn hash_records_reproduces_hash_entries() {
+        // Records supplied in ascending key order, the ordering
+        // `hash_entries` establishes by sorting its own input.
+        let mut sorted: Vec<(&str, &str)> = HASH_FIXTURE.to_vec();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        let from_records = hash_records(
+            sorted
+                .iter()
+                .map(|(k, v)| hash_record(k, v.as_bytes()))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(from_records, HASH_FIXTURE_ALL);
     }
 }

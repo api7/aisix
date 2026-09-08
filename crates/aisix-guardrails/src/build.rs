@@ -81,13 +81,20 @@ pub fn build_chain_from_snapshot(
     bedrock_endpoint_url: Option<&str>,
     embedder: &GuardrailEmbedderSlot,
 ) -> GuardrailChain {
-    build_chain_from_snapshot_reported(table, bedrock_endpoint_url, embedder).0
+    build_chain_from_snapshot_reported(
+        table,
+        bedrock_endpoint_url,
+        embedder,
+        &mut GuardrailInstances::default(),
+    )
+    .0
 }
 
 fn build_chain_from_snapshot_reported(
     table: &ResourceTable<DomainGuardrail>,
     bedrock_endpoint_url: Option<&str>,
     embedder: &GuardrailEmbedderSlot,
+    instances: &mut GuardrailInstances,
 ) -> (GuardrailChain, Vec<GuardrailBuildRejection>) {
     let mut chain: Vec<(String, Arc<dyn Guardrail>)> = Vec::new();
     // `applied` mirrors `chain` 1:1 — the `{kind, hook}` of each member that
@@ -103,7 +110,12 @@ fn build_chain_from_snapshot_reported(
         if !row.enabled {
             continue;
         }
-        match build_one(row, bedrock_endpoint_url, embedder) {
+        match instances.instance(
+            entry,
+            bedrock_endpoint_url,
+            embedder,
+            &mut BuildReuse::default(),
+        ) {
             Ok(Some(g)) => {
                 chain.push((row.name.clone(), g));
                 applied.push(applied_for(row));
@@ -113,21 +125,11 @@ fn build_chain_from_snapshot_reported(
                 // keyword list). Skip silently — operators see this
                 // shape when they're staging a rule.
             }
-            Err(err) => {
-                tracing::warn!(
-                    name = %row.name,
-                    id = %entry.id,
-                    error = %err,
-                    "skipping guardrail with invalid config",
-                );
-                rejected.push(GuardrailBuildRejection {
-                    id: entry.id.clone(),
-                    reason: err.status_reason(),
-                });
-            }
+            Err(rejection) => rejected.push(rejection),
         }
     }
 
+    instances.retain_present(table);
     (GuardrailChain::new_with_applied(chain, applied), rejected)
 }
 
@@ -185,6 +187,88 @@ fn applied_for(row: &DomainGuardrail) -> AppliedGuardrail {
     AppliedGuardrail {
         kind: row.config.kind_str().to_owned(),
         hook: row.hook_point.as_str().to_owned(),
+    }
+}
+
+/// Runtime guardrail instances kept across index/chain rebuilds.
+///
+/// One instance per guardrail ROW, shared by every attachment that
+/// references it and reused by the next build unless the row itself
+/// changed. Constructing a network-backed guardrail builds a
+/// `reqwest::Client`, and every one of those reloads the operating
+/// system's CA store; doing that once per attachment on every rebuild is
+/// what a rebuild actually costs (AISIX-Cloud#1542).
+///
+/// Row identity is the `Arc` the snapshot holds, not the etcd revision:
+/// the copy-on-write publish shares row `Arc`s with the previous
+/// snapshot, so an unchanged row is literally the same allocation, and
+/// that holds for the declarative resources file too, where revisions
+/// carry no meaning. The memo keeps its own `Arc` on each row it
+/// remembers, so an address can never be recycled underneath it.
+#[derive(Default)]
+struct GuardrailInstances {
+    by_id: std::collections::HashMap<String, MemoSlot>,
+}
+
+struct MemoSlot {
+    row: Arc<aisix_core::resource::ResourceEntry<DomainGuardrail>>,
+    outcome: Result<Option<Arc<dyn Guardrail>>, GuardrailBuildRejection>,
+}
+
+/// How much of a build was construction and how much was reuse. Logged so
+/// an operator (and the e2e suite) can see that an unrelated
+/// configuration write did not reconstruct anything.
+#[derive(Debug, Default, Clone, Copy)]
+struct BuildReuse {
+    constructed: usize,
+    reused: usize,
+}
+
+impl GuardrailInstances {
+    fn instance(
+        &mut self,
+        entry: &Arc<aisix_core::resource::ResourceEntry<DomainGuardrail>>,
+        bedrock_endpoint_url: Option<&str>,
+        embedder: &GuardrailEmbedderSlot,
+        reuse: &mut BuildReuse,
+    ) -> Result<Option<Arc<dyn Guardrail>>, GuardrailBuildRejection> {
+        if let Some(slot) = self.by_id.get(&entry.id) {
+            if Arc::ptr_eq(&slot.row, entry) {
+                reuse.reused += 1;
+                return slot.outcome.clone();
+            }
+        }
+        reuse.constructed += 1;
+        let outcome = match build_one(&entry.value, bedrock_endpoint_url, embedder) {
+            Ok(built) => Ok(built),
+            Err(err) => {
+                tracing::warn!(
+                    guardrail_id = %entry.id,
+                    name = %entry.value.name,
+                    error = %err,
+                    "skipping guardrail with invalid config",
+                );
+                Err(GuardrailBuildRejection {
+                    id: entry.id.clone(),
+                    reason: err.status_reason(),
+                })
+            }
+        };
+        self.by_id.insert(
+            entry.id.clone(),
+            MemoSlot {
+                row: Arc::clone(entry),
+                outcome: outcome.clone(),
+            },
+        );
+        outcome
+    }
+
+    /// Forget rows the snapshot no longer carries, so create/delete churn
+    /// cannot grow the memo without bound.
+    fn retain_present(&mut self, guardrails: &ResourceTable<DomainGuardrail>) {
+        self.by_id
+            .retain(|id, _| guardrails.get_by_id(id).is_some());
     }
 }
 
@@ -917,17 +1001,16 @@ impl Guardrail for MonitorGuardrail {
     }
 }
 
-/// Adapter that wraps a snapshot handle and rebuilds the runtime
-/// chain whenever the snapshot pointer changes. The chat handler
-/// holds an `Arc<dyn Guardrail>` pointing at this; it never sees
-/// the rebuild.
+/// Adapter that wraps a snapshot handle and rebuilds the runtime chain
+/// whenever the `guardrails` table changes. The chat handler holds an
+/// `Arc<dyn Guardrail>` pointing at this; it never sees the rebuild.
 ///
-/// Cheap path (cache hit): one atomic load + one pointer compare,
-/// then a clone of an `Arc<GuardrailChain>`. Rebuild path (cache
-/// miss): runs through the entries table and recompiles regexes.
-/// Compilation only happens on the first call after each snapshot
-/// store from the etcd supervisor — typical run is one or zero
-/// rebuilds per minute even on a chatty configuration.
+/// Cheap path (cache hit): one snapshot load + one generation compare,
+/// then a clone of an `Arc<GuardrailChain>`. Rebuild path (cache miss):
+/// runs through the entries table, reusing the runtime instance of every
+/// row whose content did not change. Keyed on
+/// [`ResourceTable::generation`] and NOT on the snapshot version, so a
+/// write to any other resource kind rebuilds nothing (AISIX-Cloud#1542).
 ///
 /// `bedrock_endpoint_url` is captured at construct time and reused
 /// on every rebuild; this is a deployment-wide setting (sourced
@@ -942,8 +1025,12 @@ pub struct LiveGuardrailChain {
 }
 
 struct Cache {
-    last_version: u64,
+    /// The `guardrails` table generation the cached chain was built
+    /// from — NOT the snapshot version, which moves on every published
+    /// write of any kind. See [`ResourceTable::generation`].
+    last_generation: u64,
     chain: Arc<GuardrailChain>,
+    instances: GuardrailInstances,
 }
 
 impl LiveGuardrailChain {
@@ -964,15 +1051,17 @@ impl LiveGuardrailChain {
         embedder: GuardrailEmbedderSlot,
         config_status: Option<ConfigStatus>,
     ) -> Arc<Self> {
-        // Read version before load so that a concurrent store() between
-        // the two reads causes current() to see a version bump and rebuild,
-        // rather than caching stale data under the new version.
-        let last_version = snapshot.version();
+        // The generation is read from the snapshot that is built from, so
+        // the two can never disagree — unlike a version read beside the
+        // load, which has to be ordered by hand.
         let snap = snapshot.load();
+        let last_generation = snap.guardrails.generation();
+        let mut instances = GuardrailInstances::default();
         let (chain, rejected) = build_chain_from_snapshot_reported(
             &snap.guardrails,
             bedrock_endpoint_url.as_deref(),
             &embedder,
+            &mut instances,
         );
         publish_build_rejections(config_status.as_ref(), rejected);
         Arc::new(Self {
@@ -981,28 +1070,33 @@ impl LiveGuardrailChain {
             embedder,
             config_status,
             cache: Mutex::new(Cache {
-                last_version,
+                last_generation,
                 chain: Arc::new(chain),
+                instances,
             }),
         })
     }
 
     fn current(&self) -> Arc<GuardrailChain> {
-        let cur_version = self.snapshot.version();
         let mut cache = self
             .cache
             .lock()
             .expect("LiveGuardrailChain mutex poisoned");
-        if cache.last_version != cur_version {
-            let snap = self.snapshot.load();
+        // Loaded under the lock, so the chain installed is always the one
+        // built from the newest snapshot any caller has seen and an older
+        // build can never replace a newer one.
+        let snap = self.snapshot.load();
+        let generation = snap.guardrails.generation();
+        if cache.last_generation != generation {
             let (chain, rejected) = build_chain_from_snapshot_reported(
                 &snap.guardrails,
                 self.bedrock_endpoint_url.as_deref(),
                 &self.embedder,
+                &mut cache.instances,
             );
             publish_build_rejections(self.config_status.as_ref(), rejected);
             cache.chain = Arc::new(chain);
-            cache.last_version = cur_version;
+            cache.last_generation = generation;
         }
         Arc::clone(&cache.chain)
     }
@@ -1111,7 +1205,14 @@ pub fn build_index_from_snapshot(
     bedrock_endpoint_url: Option<&str>,
     embedder: &GuardrailEmbedderSlot,
 ) -> GuardrailIndex {
-    build_index_from_snapshot_reported(guardrails, attachments, bedrock_endpoint_url, embedder).0
+    build_index_from_snapshot_reported(
+        guardrails,
+        attachments,
+        bedrock_endpoint_url,
+        embedder,
+        &mut GuardrailInstances::default(),
+    )
+    .0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1128,9 +1229,11 @@ fn build_index_from_snapshot_reported(
     attachments: &ResourceTable<GuardrailAttachment>,
     bedrock_endpoint_url: Option<&str>,
     embedder: &GuardrailEmbedderSlot,
-) -> (GuardrailIndex, Vec<GuardrailBuildRejection>) {
+    instances: &mut GuardrailInstances,
+) -> (GuardrailIndex, Vec<GuardrailBuildRejection>, BuildReuse) {
     let mut entries = Vec::new();
     let mut rejected = BTreeMap::<String, GuardrailBuildRejection>::new();
+    let mut reuse = BuildReuse::default();
 
     // Deterministic attachment order: `GuardrailIndex::new` sorts by
     // (priority desc, scope-specificity desc) with a STABLE sort, so
@@ -1165,24 +1268,18 @@ fn build_index_from_snapshot_reported(
             continue;
         }
 
-        let runtime_guardrail = match build_one(row, bedrock_endpoint_url, embedder) {
-            Ok(Some(g)) => g,
-            Ok(None) => continue, // inert (e.g. empty keyword list)
-            Err(err) => {
-                tracing::warn!(
-                    guardrail_id = %gid,
-                    error = %err,
-                    "skipping guardrail with invalid config in index build",
-                );
-                rejected
-                    .entry(gid.clone())
-                    .or_insert_with(|| GuardrailBuildRejection {
-                        id: gid.clone(),
-                        reason: err.status_reason(),
-                    });
-                continue;
-            }
-        };
+        // One instance per ROW, shared by all its attachments: `build_one`
+        // reads only the row, and everything the attachment contributes
+        // (scope, priority) lands on the index entry below.
+        let runtime_guardrail =
+            match instances.instance(&guardrail_arc, bedrock_endpoint_url, embedder, &mut reuse) {
+                Ok(Some(g)) => g,
+                Ok(None) => continue, // inert (e.g. empty keyword list)
+                Err(rejection) => {
+                    rejected.entry(gid.clone()).or_insert(rejection);
+                    continue;
+                }
+            };
 
         let scope_kind = match attachment.scope_type {
             GuardrailScopeType::Env => ScopeKind::Env,
@@ -1204,9 +1301,11 @@ fn build_index_from_snapshot_reported(
         ));
     }
 
+    instances.retain_present(guardrails);
     (
         GuardrailIndex::from_entries(entries),
         rejected.into_values().collect(),
+        reuse,
     )
 }
 
@@ -1448,10 +1547,12 @@ fn presence_timestamps(
 ///     so nothing rebuilds, so nothing is said.
 ///
 /// Riding the build also put the emit on the request path, where
-/// `LiveGuardrailIndex::current()` builds outside the lock and every request
-/// arriving during one rebuild runs its own — which is how the original
+/// `LiveGuardrailIndex::current()` built outside the lock and every request
+/// arriving during one rebuild ran its own — which is how the original
 /// "seen in two consecutive builds" rule managed to see two builds inside a
-/// single snapshot version.
+/// single snapshot version. That build is single-flighted now
+/// (AISIX-Cloud#1542), but the timer is what makes the two cases above
+/// reportable at all, so it stays.
 pub fn sweep_unattached_guardrails(
     guardrails: &ResourceTable<DomainGuardrail>,
     attachments: &ResourceTable<GuardrailAttachment>,
@@ -1486,14 +1587,17 @@ pub fn sweep_unattached_guardrails(
 // LiveGuardrailIndex — lazy-rebuild adapter over a snapshot handle
 // ---------------------------------------------------------------------------
 
-/// Wraps a snapshot handle and rebuilds the runtime index whenever the
-/// snapshot pointer changes. The proxy chat handler calls `resolve(ctx)`
-/// on each request to get the applicable `GuardrailChain`.
+/// Wraps a snapshot handle and rebuilds the runtime index when — and only
+/// when — the `guardrails` or `guardrail_attachments` table changes. The
+/// endpoint handlers call `resolve(ctx)` on each request to get the
+/// applicable `GuardrailChain`.
 ///
-/// Rebuild semantics are identical to `LiveGuardrailChain`: one atomic
-/// load + one version compare on the hot path; a full index build (linear
-/// in the number of attachment rows) only on the first call after each
-/// snapshot swap.
+/// Hot path: one snapshot load, one generation-pair compare, one `Arc`
+/// clone. A rebuild walks the attachment rows and constructs a runtime
+/// instance only for guardrail rows whose content changed, single-flighted
+/// across every worker thread. Keying on the tables the build reads,
+/// rather than on the snapshot version, is what keeps an unrelated
+/// configuration write off the request path (AISIX-Cloud#1542).
 pub struct LiveGuardrailIndex {
     snapshot: SnapshotHandle<AisixSnapshot>,
     bedrock_endpoint_url: Option<String>,
@@ -1507,11 +1611,32 @@ pub struct LiveGuardrailIndex {
     /// `/status/config` and the managed heartbeat.
     config_status: Option<ConfigStatus>,
     cache: Mutex<IndexCache>,
+    /// Index builds this instance has run. The observable behind the
+    /// invalidation and single-flight contracts — "an unrelated
+    /// configuration write did not rebuild anything" has no other
+    /// externally visible form.
+    rebuilds: std::sync::atomic::AtomicU64,
 }
 
 struct IndexCache {
-    last_version: u64,
+    /// The `(guardrails, guardrail_attachments)` table generations the
+    /// cached index was built from. Keying on these instead of the
+    /// snapshot version is the whole point: the version moves on every
+    /// published write of ANY kind, so an API-key edit used to invalidate
+    /// the index and make the next request on each worker thread rebuild
+    /// every enabled attachment synchronously (AISIX-Cloud#1542).
+    last_key: (u64, u64),
     index: Arc<GuardrailIndex>,
+    instances: GuardrailInstances,
+}
+
+/// The invalidation key for [`IndexCache`]: the generations of exactly
+/// the two tables [`build_index_from_snapshot_reported`] reads.
+fn index_key(snap: &AisixSnapshot) -> (u64, u64) {
+    (
+        snap.guardrails.generation(),
+        snap.guardrail_attachments.generation(),
+    )
 }
 
 impl LiveGuardrailIndex {
@@ -1548,14 +1673,15 @@ impl LiveGuardrailIndex {
         embedder: GuardrailEmbedderSlot,
         config_status: Option<ConfigStatus>,
     ) -> Arc<Self> {
-        // Read version before load — same ordering discipline as LiveGuardrailChain.
-        let last_version = snapshot.version();
         let snap = snapshot.load();
-        let (index, rejected) = build_index_from_snapshot_reported(
+        let last_key = index_key(&snap);
+        let mut instances = GuardrailInstances::default();
+        let (index, rejected, _) = build_index_from_snapshot_reported(
             &snap.guardrails,
             &snap.guardrail_attachments,
             bedrock_endpoint_url.as_deref(),
             &embedder,
+            &mut instances,
         );
         publish_build_rejections(config_status.as_ref(), rejected);
         Arc::new(Self {
@@ -1565,66 +1691,79 @@ impl LiveGuardrailIndex {
             metrics_sink,
             config_status,
             cache: Mutex::new(IndexCache {
-                last_version,
+                last_key,
                 index: Arc::new(index),
+                instances,
             }),
+            rebuilds: std::sync::atomic::AtomicU64::new(1),
         })
     }
 
-    fn current(&self) -> Arc<GuardrailIndex> {
-        loop {
-            let build_version = self.snapshot.version();
-
-            // Fast path: return cached index without building.
-            {
-                let cache = self
-                    .cache
-                    .lock()
-                    .expect("LiveGuardrailIndex mutex poisoned");
-                if cache.last_version >= build_version {
-                    return Arc::clone(&cache.index);
-                }
-            }
-
-            // Build outside the lock. A snapshot swap during this work makes
-            // the result obsolete; try_install_index rejects it and the loop
-            // retries from the newer version.
-            let snap = self.snapshot.load();
-            if self.snapshot.version() != build_version {
-                continue;
-            }
-            let (new_index, rejected) = build_index_from_snapshot_reported(
-                &snap.guardrails,
-                &snap.guardrail_attachments,
-                self.bedrock_endpoint_url.as_deref(),
-                &self.embedder,
-            );
-            if let Some(index) = self.try_install_index(build_version, new_index, rejected) {
-                return index;
-            }
-        }
+    /// Index builds run so far, the first (in the constructor) included.
+    #[cfg(test)]
+    fn rebuilds(&self) -> u64 {
+        self.rebuilds.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Install a completed build only when it is still the newest snapshot.
-    /// Publishing status while holding the same cache lock makes cache and
-    /// rejection state advance in one monotonic version order.
-    fn try_install_index(
-        &self,
-        build_version: u64,
-        new_index: GuardrailIndex,
-        rejected: Vec<GuardrailBuildRejection>,
-    ) -> Option<Arc<GuardrailIndex>> {
+    /// The index for the current snapshot, rebuilding it only when the
+    /// guardrail or attachment tables actually changed.
+    ///
+    /// Bounded: one build per call at most, and no retry loop. The build
+    /// runs under the cache lock, which single-flights it — concurrent
+    /// callers on every worker thread used to each run their own — and
+    /// makes the install trivially monotonic, because the snapshot a
+    /// build reads is loaded while holding that same lock and `load`
+    /// never goes backwards. The previous shape read the version outside
+    /// the lock, discarded any build whose snapshot moved underneath it,
+    /// and started over with no bound on the number of attempts; a bulk
+    /// configuration edit kept that loop going while the worker's
+    /// current-thread runtime could not schedule anything else, `/livez`
+    /// included (AISIX-Cloud#1542).
+    fn current(&self) -> Arc<GuardrailIndex> {
+        let key = index_key(&self.snapshot.load());
+        {
+            let cache = self
+                .cache
+                .lock()
+                .expect("LiveGuardrailIndex mutex poisoned");
+            if cache.last_key == key {
+                return Arc::clone(&cache.index);
+            }
+        }
+
         let mut cache = self
             .cache
             .lock()
             .expect("LiveGuardrailIndex mutex poisoned");
-        if cache.last_version >= build_version || self.snapshot.version() != build_version {
-            return None;
+        let snap = self.snapshot.load();
+        let key = index_key(&snap);
+        if cache.last_key == key {
+            return Arc::clone(&cache.index);
         }
+        let cache = &mut *cache;
+        let (new_index, rejected, reuse) = build_index_from_snapshot_reported(
+            &snap.guardrails,
+            &snap.guardrail_attachments,
+            self.bedrock_endpoint_url.as_deref(),
+            &self.embedder,
+            &mut cache.instances,
+        );
+        tracing::info!(
+            guardrails = snap.guardrails.len(),
+            attachments = snap.guardrail_attachments.len(),
+            entries = new_index.len(),
+            constructed = reuse.constructed,
+            reused = reuse.reused,
+            "guardrail index rebuilt",
+        );
         cache.index = Arc::new(new_index);
-        cache.last_version = build_version;
+        cache.last_key = key;
+        self.rebuilds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Published under the same lock so the cache and the reported
+        // rejection state advance together.
         publish_build_rejections(self.config_status.as_ref(), rejected);
-        Some(Arc::clone(&cache.index))
+        Arc::clone(&cache.index)
     }
 
     /// Resolve the guardrail chain applicable to `ctx`.
@@ -3676,7 +3815,14 @@ mod tests {
     }
 
     #[test]
-    fn older_index_build_cannot_restore_a_superseded_rejection() {
+    fn concurrent_resolves_run_one_build_and_publish_the_newest_snapshot() {
+        // Every worker thread resolves through the same index. Before
+        // AISIX-Cloud#1542 each of them ran its own build on the first
+        // request after any snapshot change, and a build whose snapshot
+        // moved underneath it was thrown away and restarted with no
+        // bound — which is also how an obsolete rejection could be
+        // republished over a newer one. The build now runs under the
+        // cache lock, from a snapshot loaded while holding it.
         let broken = AisixSnapshot::new();
         broken.guardrails.insert(entry(
             "broken",
@@ -3688,7 +3834,6 @@ mod tests {
             parse_attachment(r#"{"guardrail_id":"g-1","scope_type":"env","priority":0}"#),
         ));
         let handle = SnapshotHandle::new(broken);
-        let old_version = handle.version();
         let status = ConfigStatus::new(aisix_core::SourceKind::Etcd);
         status.record_load(aisix_core::LoadObservation {
             source_hash: "old".into(),
@@ -3713,6 +3858,7 @@ mod tests {
             Some(status.clone()),
         );
         assert_eq!(status.view().rejected.len(), 1);
+        assert_eq!(live.rebuilds(), 1);
 
         let fixed = AisixSnapshot::new();
         fixed.guardrails.insert(entry(
@@ -3727,7 +3873,6 @@ mod tests {
             parse_attachment(r#"{"guardrail_id":"g-1","scope_type":"env","priority":0}"#),
         ));
         handle.store(fixed);
-        let new_version = handle.version();
         status.record_load(aisix_core::LoadObservation {
             source_hash: "new".into(),
             observed_revision: Some(2),
@@ -3744,41 +3889,149 @@ mod tests {
             wholly_rejected: false,
         });
 
-        // Hold the old result until the newer build has installed, then let
-        // it race the cache/status publication in the previously-buggy order.
-        let (release_old, wait_old) = std::sync::mpsc::channel();
-        let old_live = Arc::clone(&live);
-        let old = std::thread::spawn(move || {
-            wait_old.recv().unwrap();
-            old_live.try_install_index(
-                old_version,
-                GuardrailIndex::from_entries(Vec::new()),
-                vec![GuardrailBuildRejection {
-                    id: "g-1".into(),
-                    reason: "obsolete rejection".into(),
-                }],
-            )
-        });
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let live = Arc::clone(&live);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    live.current().len()
+                })
+            })
+            .collect();
+        for t in threads {
+            assert_eq!(t.join().unwrap(), 1);
+        }
 
-        let snap = handle.load();
-        let (new_index, new_rejected) = build_index_from_snapshot_reported(
-            &snap.guardrails,
-            &snap.guardrail_attachments,
-            None,
-            &GuardrailEmbedderSlot::none(),
-        );
-        assert!(live
-            .try_install_index(new_version, new_index, new_rejected)
-            .is_some());
-        release_old.send(()).unwrap();
-        assert!(old.join().unwrap().is_none());
-
+        // Eight callers, one build.
+        assert_eq!(live.rebuilds(), 2);
         let view = status.view();
         assert!(
             view.rejected.is_empty(),
             "obsolete result restored: {view:?}"
         );
         assert_eq!(view.applied.unwrap().config_hash, "new");
+    }
+
+    #[test]
+    fn a_write_to_an_unrelated_table_does_not_rebuild_the_index() {
+        // The bug AISIX-Cloud#1542 reported: one API key edit bumped the
+        // single global snapshot version, so the next request on every
+        // worker thread rebuilt every enabled attachment's runtime
+        // instance — one `reqwest::Client` each, each reloading the
+        // system CA store.
+        let snap = AisixSnapshot::new();
+        snap.guardrails.insert(entry(
+            "kw",
+            "g-1",
+            parse(
+                r#"{"name":"kw","kind":"keyword","patterns":[{"kind":"literal","value":"AKIA"}]}"#,
+            ),
+        ));
+        snap.guardrail_attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(r#"{"guardrail_id":"g-1","scope_type":"env","priority":0}"#),
+        ));
+        let handle = SnapshotHandle::new(snap);
+        let live = LiveGuardrailIndex::new(handle.clone(), None);
+        let first = live.current();
+        assert_eq!(live.rebuilds(), 1);
+
+        // A published write to a table the index does not read. The
+        // structural clone shares the guardrail rows, so their table's
+        // generation rides along unchanged.
+        for _ in 0..5 {
+            let next = handle.load().as_ref().clone();
+            next.apikeys
+                .insert(aisix_core::resource::ResourceEntry::new(
+                    "k-1",
+                    serde_json::from_str::<aisix_core::models::ApiKey>(
+                        r#"{"key_hash":"abc","allowed_models":["m"]}"#,
+                    )
+                    .unwrap(),
+                    1,
+                ));
+            handle.store(next);
+        }
+
+        assert!(handle.version() > 0);
+        assert!(Arc::ptr_eq(&first, &live.current()));
+        assert_eq!(live.rebuilds(), 1);
+    }
+
+    #[test]
+    fn an_attachment_write_rebuilds_the_index_but_reuses_unchanged_instances() {
+        let snap = AisixSnapshot::new();
+        for i in 1..=3 {
+            snap.guardrails.insert(entry(
+                &format!("kw-{i}"),
+                &format!("g-{i}"),
+                parse(&format!(
+                    r#"{{"name":"kw-{i}","kind":"keyword","patterns":[{{"kind":"literal","value":"AKIA{i}"}}]}}"#
+                )),
+            ));
+            snap.guardrail_attachments.insert(attachment_entry(
+                &format!("a-{i}"),
+                parse_attachment(&format!(
+                    r#"{{"guardrail_id":"g-{i}","scope_type":"env","priority":0}}"#
+                )),
+            ));
+        }
+        let handle = SnapshotHandle::new(snap);
+        let live = LiveGuardrailIndex::new(handle.clone(), None);
+        let before = live.current();
+        assert_eq!(before.len(), 3);
+        let members_before = before.instances();
+
+        // A fourth attachment onto an existing guardrail: the index has
+        // to change, the three instances behind it must not.
+        let next = handle.load().as_ref().clone();
+        next.guardrail_attachments.insert(attachment_entry(
+            "a-4",
+            parse_attachment(r#"{"guardrail_id":"g-1","scope_type":"env","priority":1}"#),
+        ));
+        handle.store(next);
+
+        let after = live.current();
+        assert_eq!(after.len(), 4);
+        assert_eq!(live.rebuilds(), 2);
+        let members_after = after.instances();
+        for member in &members_before {
+            assert!(
+                members_after.iter().any(|m| Arc::ptr_eq(m, member)),
+                "an unchanged guardrail row was reconstructed",
+            );
+        }
+
+        // Now change one row's content: that one — and only that one —
+        // is reconstructed.
+        let next = handle.load().as_ref().clone();
+        next.guardrails.insert(entry(
+            "kw-2",
+            "g-2",
+            parse(r#"{"name":"kw-2","kind":"keyword","patterns":[{"kind":"literal","value":"SECRET"}]}"#),
+        ));
+        handle.store(next);
+
+        let changed = live.current();
+        let changed_members = changed.instances();
+        let g2_before = before
+            .instance_for("g-2")
+            .expect("g-2 in the pre-change index")
+            .clone();
+        assert!(
+            !changed_members.iter().any(|m| Arc::ptr_eq(m, &g2_before)),
+            "the changed guardrail row kept its old instance",
+        );
+        let g1_before = before
+            .instance_for("g-1")
+            .expect("g-1 in the pre-change index")
+            .clone();
+        assert!(
+            changed_members.iter().any(|m| Arc::ptr_eq(m, &g1_before)),
+            "an unchanged guardrail row was reconstructed",
+        );
     }
 
     #[tokio::test]

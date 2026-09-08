@@ -19,10 +19,11 @@
 //! runtime): the control plane validates and materializes it at write time, so
 //! the tool set only changes when the resource does.
 
-use std::collections::HashSet;
-use std::sync::{Arc, OnceLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use aisix_core::snapshot::ResourceTable;
 use aisix_core::{McpAuthType, McpServer, ResourceEntry};
 use async_trait::async_trait;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
@@ -149,11 +150,41 @@ impl OpenApiBridge {
         &self.entry.value
     }
 
-    fn tools(&self) -> Result<Vec<GeneratedTool>, McpError> {
+    /// This server's tool set, generated once per row version.
+    ///
+    /// The aggregating `/mcp` endpoint builds a bridge per enabled server
+    /// per request, and both `tools/list` and `tools/call` ask for the
+    /// tools — so without this every call walked every registered
+    /// server's whole OpenAPI document, resolving `$ref`s and building a
+    /// JSON Schema per operation (AISIX-Cloud#1542).
+    fn tools(&self) -> Result<Arc<Vec<GeneratedTool>>, McpError> {
         let spec = self.server().spec.as_ref().ok_or_else(|| {
             McpError::Request("openapi server has no spec configured".to_string())
         })?;
-        generate_tools(spec)
+        // Row identity is the snapshot's `Arc`: a copy-on-write publish
+        // shares rows it did not change, so the same allocation means the
+        // same spec. The cache keeps its own `Arc`, so the address cannot
+        // be recycled underneath it.
+        if let Some(hit) = lookup_tools(&self.entry) {
+            return Ok(hit);
+        }
+        // Generated with the lock RELEASED. One lock serves every
+        // registered server, so holding it across the spec walk would
+        // make one server's miss block every other server's hit — and a
+        // write that replaces one row makes the aggregating endpoint's
+        // concurrent requests all miss at once. The cost is that a race
+        // may generate the same tool set twice; the second insert simply
+        // replaces the first, and both are equal.
+        let tools = Arc::new(generate_tools(spec)?);
+        let mut cache = tool_cache();
+        cache.by_id.insert(
+            self.entry.id.clone(),
+            CachedTools {
+                row: Arc::clone(&self.entry),
+                tools: Arc::clone(&tools),
+            },
+        );
+        Ok(tools)
     }
 
     /// Inject the gateway-held credential for this server. For `oauth2` this
@@ -294,16 +325,62 @@ fn tool_error(text: String) -> McpToolResult {
     }
 }
 
+/// Tool sets generated from `type: openapi` rows, keyed by the row's
+/// etcd id and shared across every per-request bridge in the process.
+static TOOL_CACHE: OnceLock<Mutex<ToolCache>> = OnceLock::new();
+
+#[derive(Default)]
+struct ToolCache {
+    /// The `mcp_servers` table generation the map was last swept against.
+    swept: Option<u64>,
+    by_id: HashMap<String, CachedTools>,
+}
+
+struct CachedTools {
+    row: Arc<ResourceEntry<McpServer>>,
+    tools: Arc<Vec<GeneratedTool>>,
+}
+
+/// The cached tool set for `entry`, if this exact row version has one.
+/// Holds the lock only long enough to read it.
+fn lookup_tools(entry: &Arc<ResourceEntry<McpServer>>) -> Option<Arc<Vec<GeneratedTool>>> {
+    let cache = tool_cache();
+    let cached = cache.by_id.get(&entry.id)?;
+    Arc::ptr_eq(&cached.row, entry).then(|| Arc::clone(&cached.tools))
+}
+
+fn tool_cache() -> std::sync::MutexGuard<'static, ToolCache> {
+    TOOL_CACHE
+        .get_or_init(|| Mutex::new(ToolCache::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Forget cached tool sets for servers the snapshot no longer carries.
+///
+/// Called where a snapshot is in hand — the bridge itself only ever sees
+/// its own row. Cheap when nothing changed: a create/delete moves the
+/// `mcp_servers` generation and nothing else does.
+pub(crate) fn sweep_tool_cache(servers: &ResourceTable<McpServer>) {
+    let generation = servers.generation();
+    let mut cache = tool_cache();
+    if cache.swept == Some(generation) {
+        return;
+    }
+    cache.by_id.retain(|id, _| servers.get_by_id(id).is_some());
+    cache.swept = Some(generation);
+}
+
 #[async_trait]
 impl McpBridge for OpenApiBridge {
     async fn list_tools(&self) -> Result<Vec<McpTool>, McpError> {
         Ok(self
             .tools()?
-            .into_iter()
+            .iter()
             .map(|t| McpTool {
-                name: t.name,
-                description: Some(t.description),
-                input_schema: t.input_schema,
+                name: t.name.clone(),
+                description: Some(t.description.clone()),
+                input_schema: t.input_schema.clone(),
             })
             .collect())
     }
@@ -842,6 +919,65 @@ mod tests {
             .iter()
             .find(|t| t.name == name)
             .unwrap_or_else(|| panic!("tool {name} not generated"))
+    }
+
+    fn openapi_server(id: &str, path: &str) -> Arc<ResourceEntry<McpServer>> {
+        let server: McpServer = serde_json::from_value(json!({
+            "name": format!("srv-{id}"),
+            "type": "openapi",
+            "url": "http://127.0.0.1:1/",
+            "spec": {
+                "openapi": "3.0.0",
+                "paths": { path: { "get": { "operationId": "listItems" } } }
+            }
+        }))
+        .expect("test mcp_server");
+        Arc::new(ResourceEntry::new(id, server, 1))
+    }
+
+    fn server_table(entries: &[Arc<ResourceEntry<McpServer>>]) -> ResourceTable<McpServer> {
+        let table = ResourceTable::new();
+        for e in entries {
+            table.insert_arc(Arc::clone(e));
+        }
+        table
+    }
+
+    /// The aggregating `/mcp` endpoint builds a bridge per enabled server
+    /// per REQUEST, and both `tools/list` and `tools/call` ask for the
+    /// tool set — so regenerating it from the spec each time made one
+    /// call cost a walk of every registered document (AISIX-Cloud#1542).
+    // Uses ids of its own: `TOOL_CACHE` is process-wide, and
+    // `sweep_tool_cache` with a table that does not carry a row evicts it.
+    // A second test in THIS crate's lib-test binary that reaches the cache
+    // (anything going through `McpGateway::from_snapshot*`) would have to
+    // coordinate with this one; today there is none.
+    #[test]
+    fn tool_generation_is_cached_per_row_and_evicted_with_it() {
+        let row = openapi_server("cache-row-1", "/items");
+        let table = server_table(&[Arc::clone(&row)]);
+        sweep_tool_cache(&table);
+
+        // Two bridges, as two requests would build them.
+        let first = OpenApiBridge::new(Arc::clone(&row)).tools().unwrap();
+        let second = OpenApiBridge::new(Arc::clone(&row)).tools().unwrap();
+        assert!(Arc::ptr_eq(&first, &second), "the tool set was regenerated");
+        assert_eq!(first[0].name, "listitems");
+
+        // A rewritten row is a different `Arc`: regenerate.
+        let rewritten = openapi_server("cache-row-1", "/things");
+        let after_write = OpenApiBridge::new(Arc::clone(&rewritten)).tools().unwrap();
+        assert!(!Arc::ptr_eq(&first, &after_write));
+        assert_eq!(after_write[0].path, "/things");
+
+        // Deleting the row evicts it, so the map cannot grow under
+        // create/delete churn.
+        sweep_tool_cache(&server_table(&[]));
+        let after_delete = OpenApiBridge::new(Arc::clone(&rewritten)).tools().unwrap();
+        assert!(
+            !Arc::ptr_eq(&after_write, &after_delete),
+            "the deleted row was still cached",
+        );
     }
 
     #[test]

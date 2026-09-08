@@ -235,6 +235,28 @@ impl GuardrailIndex {
     pub(crate) fn from_entries(entries: Vec<IndexEntry>) -> Self {
         Self::new(entries)
     }
+
+    /// The runtime instance behind the first entry for `guardrail_id`.
+    /// Instance identity is what proves a row was, or was not,
+    /// reconstructed across an index rebuild.
+    #[cfg(test)]
+    pub(crate) fn instance_for(&self, guardrail_id: &str) -> Option<&Arc<dyn Guardrail>> {
+        self.entries
+            .iter()
+            .find(|e| e.guardrail_id == guardrail_id)
+            .map(|e| &e.guardrail)
+    }
+
+    /// One entry per attachment, so a guardrail with several attachments
+    /// appears several times — deliberately: sharing ONE instance across
+    /// them is the property under test.
+    #[cfg(test)]
+    pub(crate) fn instances(&self) -> Vec<Arc<dyn Guardrail>> {
+        self.entries
+            .iter()
+            .map(|e| Arc::clone(&e.guardrail))
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------

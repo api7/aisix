@@ -89,6 +89,20 @@ export class SeedClient {
     });
   }
 
+  /** Model-scope attachment: the guardrail applies to one model's traffic. */
+  async attachGuardrailToModel(
+    guardrailID: string,
+    modelID: string,
+    priority = 100,
+  ): Promise<{ id: string; value: Record<string, unknown> }> {
+    return this.put("guardrail_attachments", {
+      guardrail_id: guardrailID,
+      scope_type: "model",
+      scope_id: modelID,
+      priority,
+    });
+  }
+
   async createCachePolicy(
     policy: Record<string, unknown>,
   ): Promise<{ id: string; value: Record<string, unknown> }> {

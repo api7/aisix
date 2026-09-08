@@ -433,16 +433,29 @@ impl Entry {
 /// byte-identical behavior. Only when none holds do the trackers take the
 /// cheap read-first paths — writes whose consumers provably don't exist.
 ///
-/// The predicate set is recomputed at most once per snapshot version
-/// (packed with the version into one atomic so the pair can never be
-/// observed torn). A racing store between the version read and the table
-/// walk can cache bits against a stale version; the next call detects the
-/// mismatch and recomputes, so the value converges immediately.
+/// Two tiers, both packed with their key into one atomic so a pair can
+/// never be observed torn. The hot tier is keyed on the snapshot version:
+/// one relaxed load answers "nothing has changed at all". When that
+/// misses, the `models` table generation answers "nothing THIS reads has
+/// changed" — a write to any other resource kind then costs one snapshot
+/// load and restamps the hot tier rather than rescanning every model.
+/// Before AISIX-Cloud#1542 the version was the only key, so every API-key
+/// edit rescanned the whole model table on the next request.
+///
+/// A racing store between a key read and the table walk can cache bits
+/// against a stale key; the next call detects the mismatch and
+/// recomputes, so the value converges immediately.
 #[derive(Debug)]
 pub struct BookkeepingFlags {
     snapshot: SnapshotHandle<AisixSnapshot>,
     /// `(snapshot version << 3) | predicate bits`, or [`UNCOMPUTED`].
     packed: AtomicU64,
+    /// `(models table generation << 3) | predicate bits`, or
+    /// [`UNCOMPUTED`].
+    packed_by_generation: AtomicU64,
+    /// Walks of the model table. The observable behind "an unrelated
+    /// configuration write does not rescan every model".
+    scans: AtomicU64,
 }
 
 const FLAG_LEAST_BUSY: u64 = 1;
@@ -456,6 +469,8 @@ impl BookkeepingFlags {
         Arc::new(Self {
             snapshot,
             packed: AtomicU64::new(UNCOMPUTED),
+            packed_by_generation: AtomicU64::new(UNCOMPUTED),
+            scans: AtomicU64::new(0),
         })
     }
 
@@ -465,6 +480,12 @@ impl BookkeepingFlags {
         self.bits() != 0
     }
 
+    /// Model-table walks run so far.
+    #[cfg(test)]
+    fn scans(&self) -> u64 {
+        self.scans.load(Ordering::Relaxed)
+    }
+
     fn bits(&self) -> u64 {
         let ver = self.snapshot.version();
         let packed = self.packed.load(Ordering::Relaxed);
@@ -472,6 +493,17 @@ impl BookkeepingFlags {
             return packed & FLAG_BITS;
         }
         let snap = self.snapshot.load();
+        let generation = snap.models.generation();
+        let by_generation = self.packed_by_generation.load(Ordering::Relaxed);
+        if by_generation != UNCOMPUTED && by_generation >> 3 == generation {
+            // Some other table moved. The predicates read `models` only,
+            // so the answer stands — restamp it under the new version so
+            // the next call takes the one-load path again.
+            let bits = by_generation & FLAG_BITS;
+            self.packed.store((ver << 3) | bits, Ordering::Relaxed);
+            return bits;
+        }
+        self.scans.fetch_add(1, Ordering::Relaxed);
         let mut bits = 0;
         for entry in snap.models.entries() {
             let m = &entry.value;
@@ -486,6 +518,8 @@ impl BookkeepingFlags {
                 bits |= FLAG_HEALTH_CHECKS;
             }
         }
+        self.packed_by_generation
+            .store((generation << 3) | bits, Ordering::Relaxed);
         self.packed.store((ver << 3) | bits, Ordering::Relaxed);
         bits
     }
@@ -1011,6 +1045,42 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use std::thread;
+
+    fn an_api_key() -> aisix_core::ApiKey {
+        serde_json::from_str(r#"{"key_hash":"abc","allowed_models":["vg"]}"#).expect("test key")
+    }
+
+    #[test]
+    fn a_write_to_an_unrelated_table_does_not_rescan_the_models() {
+        // The predicates read `models` and nothing else, but they used to
+        // be keyed on the snapshot version, which moves on every
+        // published write of any kind — so a bulk API-key edit rescanned
+        // the whole model table on the next request (AISIX-Cloud#1542).
+        let handle =
+            SnapshotHandle::new(snapshot_with(Some(model_json(Some("least_busy"), false))));
+        let flags = BookkeepingFlags::new(handle.clone());
+        assert!(flags.any_active());
+        assert_eq!(flags.scans(), 1);
+
+        for i in 0..5 {
+            let next = handle.load().as_ref().clone();
+            next.apikeys.insert(aisix_core::ResourceEntry::new(
+                format!("k-{i}"),
+                an_api_key(),
+                1,
+            ));
+            handle.store(next);
+            assert!(flags.any_active(), "the answer must not change");
+        }
+        assert_eq!(flags.scans(), 1, "the model table was walked again");
+
+        // A write that DOES touch models rescans.
+        let next = handle.load().as_ref().clone();
+        next.models.remove("m-1");
+        handle.store(next);
+        assert!(!flags.any_active());
+        assert_eq!(flags.scans(), 2);
+    }
 
     #[test]
     fn new_model_is_healthy() {
