@@ -38,6 +38,7 @@ const KEYS = {
   partial: "sk-mcp-ids-partial",
   unresolvedOnly: "sk-mcp-ids-unresolved-only",
   denyIds: "sk-mcp-ids-deny",
+  envPolicy: "sk-mcp-ids-env-policy",
   rename: "sk-mcp-ids-rename",
   capped: "sk-mcp-ids-capped",
   cappedRename: "sk-mcp-ids-capped-rename",
@@ -281,6 +282,24 @@ describe("mcp server reference ids: grants follow the server id, not its name", 
         mcp_rate_limits_by_id: { [renameId]: { rpm: CAP_RPM } },
       }),
     );
+    // The environment MCP access policy, written by id. Its own key, and
+    // an `mcp_policies` row rather than a key field, because a policy row
+    // travels a different path from etcd to the ACL than a key's own
+    // `mcp_access` block does and only this layer proves it arrives.
+    await seed.createApiKey(
+      key(KEYS.envPolicy, {
+        team_id: "team-mcp-ids",
+        mcp_access: { allow: ["*"] },
+      }),
+    );
+    await seed.update("mcp_policies", randomUUID(), {
+      scope: "team",
+      scope_ref: "team-mcp-ids",
+      allow: [],
+      allow_ids: [{ server_id: alphaId, tool: "echo" }],
+      enabled: true,
+    });
+
     // Seeded last and unrestricted: gating on it implies the whole seed
     // set has landed without exercising any behavior under test.
     await seed.createApiKey(
@@ -360,6 +379,21 @@ describe("mcp server reference ids: grants follow the server id, not its name", 
     expect(names).not.toContain("alpha__reverse");
     expect(await refused(KEYS.denyIds, "alpha__reverse")).toBe(true);
     expect(await served(KEYS.denyIds, "beta__reverse")).toBe(true);
+  });
+
+  test("a policy layer may write its allow side by id too", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+
+    // The key's own layer is wide open, so everything below is the team
+    // policy's id-spelled allow side narrowing it.
+    expect(await listToolNames(KEYS.envPolicy)).toEqual(["alpha__echo"]);
+    expect(await served(KEYS.envPolicy, "alpha__echo")).toBe(true);
+    expect(await refused(KEYS.envPolicy, "alpha__reverse")).toBe(true);
+    expect(await refused(KEYS.envPolicy, "beta__echo")).toBe(true);
+
+    // A key outside that team is not narrowed by it, so the policy really
+    // is what produced the result above.
+    expect(await served(KEYS.sentinel, "beta__echo")).toBe(true);
   });
 
   test("a per-server limit keyed by id binds on that server alone", async (ctx) => {

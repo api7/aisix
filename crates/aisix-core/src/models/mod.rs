@@ -43,7 +43,7 @@ pub mod semantic;
 pub mod snapshot;
 
 pub use a2a_agent::{A2aAgent, A2aAuthType, A2aProtocolVersion};
-pub use apikey::ApiKey;
+pub use apikey::{ApiKey, McpServerLimit};
 pub use cache_policy::{AppliesTo, CacheBackend, CachePolicy, CacheScope, SemanticCacheConfig};
 pub use claim_mapping::{ClaimMapping, ClaimMatch, ClaimMatchOp, ClaimResolve};
 pub use embedding::EmbeddingConfig;

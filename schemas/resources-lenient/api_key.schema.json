@@ -13,7 +13,7 @@
           "type": "array"
         },
         "allow_ids": {
-          "description": "This key's allow side written by MCP server resource id instead of by server name, so renaming a server does not change what the key may reach. Present — including as an empty array — it is authoritative and `allow` is ignored; an empty array therefore allows nothing. Absent or `null`, the key falls back to `allow`.",
+          "description": "This key's allow side written by MCP server resource id instead of by server name, so renaming a server does not change what the key may reach. Present — including as an empty array — it is authoritative and `allow` is ignored; an empty array therefore allows nothing. Absent or `null`, the key falls back to `allow`.\n\nIt cannot express \"every server\": each entry names one server exactly and `server_id` is never a glob, so an enumeration of the servers registered today silently fails to cover one registered tomorrow. To allow (or deny) every server, present and future, leave this absent and use the name form's `\"*\"`.",
           "items": {
             "$ref": "#/definitions/McpToolRef"
           },
@@ -30,7 +30,7 @@
           "type": "array"
         },
         "deny_ids": {
-          "description": "This key's deny side written by MCP server resource id instead of by server name. Present — including as an empty array — it is authoritative and `deny` is ignored; an empty array subtracts nothing. Absent or `null`, the key falls back to `deny`.",
+          "description": "This key's deny side written by MCP server resource id instead of by server name. Present — including as an empty array — it is authoritative and `deny` is ignored; an empty array subtracts nothing. Absent or `null`, the key falls back to `deny`.\n\nIt cannot express \"every server\": each entry names one server exactly and `server_id` is never a glob, so an enumeration of the servers registered today silently fails to cover one registered tomorrow. To allow (or deny) every server, present and future, leave this absent and use the name form's `\"*\"`.",
           "items": {
             "$ref": "#/definitions/McpToolRef"
           },
@@ -94,23 +94,19 @@
       "type": "object"
     },
     "McpToolRef": {
-      "description": "One tool on one MCP server, the server named by its resource id and the tool by name.\n\nThe tool half is matched with the same single-`*` glob rule the name form uses, so `tool: \"*\"` is the id spelling of `<server>__*`. The server half is an exact id: it is compared against the id of the server the addressed tool actually belongs to, never glob-matched, so a server whose *name* happens to contain a `*` cannot widen a grant.",
+      "description": "One tool on one MCP server, the server named by its resource id and the tool by name.\n\nThe tool half is matched with the same single-`*` glob rule the name form uses, so `tool: \"*\"` is the id spelling of `<server>__*`. The server half is an exact id: it is compared against the id of the server the addressed tool actually belongs to, never glob-matched, so a server whose *name* happens to contain a `*` cannot widen a grant.\n\nBoth halves are required on the WRITE path and defaulted by the runtime loader — the strict schemas add them to this definition's `required`, the types do not. An entry these were required of at the type level would fail to deserialize, and the loader skips a row it cannot deserialize whole: one malformed entry in one `allow_ids` array would stop the entire `api_key` from authenticating any traffic at all, not merely lose it MCP access. Defaulted, the malformed entry matches nothing instead — an empty `server_id` names no registered server, and an empty `tool` glob covers no tool name the gateway exposes.",
       "properties": {
         "server_id": {
+          "default": "",
           "description": "Resource id of the registered MCP server (`mcp_servers/<id>`) this entry refers to. An id matching no registered server refers to nothing: the entry never matches, and the other entries are unaffected.",
-          "minLength": 1,
           "type": "string"
         },
         "tool": {
+          "default": "",
           "description": "Tool on that server, matched as a single-`*` glob against the bare tool name — the part after the `<server>__` namespace prefix. `\"*\"` covers every tool the server exposes.",
-          "minLength": 1,
           "type": "string"
         }
       },
-      "required": [
-        "server_id",
-        "tool"
-      ],
       "type": "object"
     },
     "RateLimit": {
@@ -286,7 +282,7 @@
       "additionalProperties": {
         "$ref": "#/definitions/McpRateLimit"
       },
-      "description": "The same per-server limits, keyed by the MCP server's resource id (`mcp_servers/<id>`) rather than by its name, so renaming a server does not detach the limit that was set for it.\n\nPresent — including as an empty object — it is authoritative and `mcp_rate_limits` is ignored; an empty object therefore leaves every server bounded by `rate_limit` alone. A key naming no registered server imposes nothing, and the other entries are unaffected. Set to `null` it means the same as omitted: the key falls back to `mcp_rate_limits`.",
+      "description": "The same per-server limits, keyed by the MCP server's resource id (`mcp_servers/<id>`) rather than by its name, so renaming a server does not detach the limit that was set for it.\n\nPresent — including as an empty object — it is authoritative and `mcp_rate_limits` is ignored; an empty object therefore leaves every server bounded by `rate_limit` alone. A key naming no registered server imposes nothing, and the other entries are unaffected. Set to `null` it means the same as omitted: the key falls back to `mcp_rate_limits`.\n\nEach key names one server exactly; there is no \"every server\" key, which is the same as today — a server with no entry is bounded by `rate_limit` alone.",
       "type": [
         "object",
         "null"

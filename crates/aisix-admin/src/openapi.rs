@@ -1593,7 +1593,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
                 "items": {
                   "$ref": "#/components/schemas/McpToolRef"
                 },
-                "description": "The same allow side written by MCP server resource id instead of by server name, so renaming a server does not change what the key may reach. An array here, `[]` included, is authoritative and `allow` is ignored. Omitted or null falls back to `allow`."
+                "description": "The same allow side written by MCP server resource id instead of by server name, so renaming a server does not change what the key may reach. An array here, `[]` included, is authoritative and `allow` is ignored. Omitted or null falls back to `allow`. Cannot express \"every server\": each entry names one server exactly and `server_id` is never a glob, so an enumeration of the servers registered today silently fails to cover one registered tomorrow — to cover every server, present and future, omit this and use the name form's `\"*\"`."
               },
               "deny": {
                 "type": "array",
@@ -1610,7 +1610,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
                 "items": {
                   "$ref": "#/components/schemas/McpToolRef"
                 },
-                "description": "The same deny side written by MCP server resource id instead of by server name. An array here, `[]` included, is authoritative and `deny` is ignored. Omitted or null falls back to `deny`."
+                "description": "The same deny side written by MCP server resource id instead of by server name. An array here, `[]` included, is authoritative and `deny` is ignored. Omitted or null falls back to `deny`. Writing it requires `deny` beside it, so a gateway one release behind the control plane still reads the denial. Cannot express \"every server\": each entry names one server exactly and `server_id` is never a glob, so an enumeration of the servers registered today silently fails to cover one registered tomorrow — to cover every server, present and future, omit this and use the name form's `\"*\"`."
               }
             },
             "required": [

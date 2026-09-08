@@ -131,6 +131,10 @@ pub struct ApiKey {
     /// server imposes nothing, and the other entries are unaffected. Set to
     /// `null` it means the same as omitted: the key falls back to
     /// `mcp_rate_limits`.
+    ///
+    /// Each key names one server exactly; there is no "every server" key,
+    /// which is the same as today — a server with no entry is bounded by
+    /// `rate_limit` alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_rate_limits_by_id: Option<BTreeMap<String, McpRateLimit>>,
 
@@ -245,14 +249,30 @@ impl ApiKey {
     /// Resolution is done per request against the live table rather than
     /// cached, so a server rename takes effect on the next request with no
     /// rewrite of any key document.
-    pub fn mcp_rate_limit(
-        &self,
-        servers: &super::McpServerIndex,
-        server: &str,
-    ) -> Option<&McpRateLimit> {
+    pub fn mcp_rate_limit<'a>(
+        &'a self,
+        servers: &'a super::McpServerIndex,
+        server: &'a str,
+    ) -> Option<McpServerLimit<'a>> {
         match &self.mcp_rate_limits_by_id {
-            Some(by_id) => by_id.get(servers.id_of(server)?),
-            None => self.mcp_rate_limits.as_ref()?.get(server),
+            Some(by_id) => {
+                // Bucketed on the id, not the name: a rename must not hand
+                // the key a fresh window, which is the whole reason the
+                // limit was attached by id.
+                let id = servers.id_of(server)?;
+                Some(McpServerLimit {
+                    bucket: id,
+                    limits: by_id.get(id)?,
+                })
+            }
+            // Bucketed on the name, which is also what selected it: a
+            // rename detaches a name-keyed limit outright, so there is no
+            // window to carry over, and keying these on the id instead
+            // would reset every counter in the fleet at upgrade.
+            None => Some(McpServerLimit {
+                bucket: server,
+                limits: self.mcp_rate_limits.as_ref()?.get(server)?,
+            }),
         }
     }
 
@@ -301,6 +321,17 @@ impl ApiKey {
             .filter(|name| self.can_access(snapshot, name))
             .collect()
     }
+}
+
+/// One key's limits for one MCP server, with the identity its counter is
+/// bucketed on — the server's resource id when the limit was attached by
+/// id, its name when it was attached by name.
+///
+/// The two must not be confused: a counter that changes bucket resets the
+/// window it was in the middle of.
+pub struct McpServerLimit<'a> {
+    pub bucket: &'a str,
+    pub limits: &'a McpRateLimit,
 }
 
 impl Resource for ApiKey {
@@ -840,6 +871,39 @@ mod tests {
         .unwrap();
         assert!(k.mcp_rate_limit(&servers, "slack").is_some());
         assert!(k.mcp_rate_limit(&servers, "s-gone").is_none());
+    }
+
+    #[test]
+    fn the_counter_bucket_is_whichever_identity_selected_the_limit() {
+        // A rename detaches a name-keyed limit outright, so its counter has
+        // no window to carry over — but an id-keyed limit survives the
+        // rename, and bucketing it on the name would hand the key a fresh
+        // window at the exact moment the feature exists to be transparent.
+        let servers = server_index(&[("s-github", "github")]);
+
+        let by_name: ApiKey = serde_json::from_str(&format!(
+            r#"{{"key_hash":"h","mcp_rate_limits":{{"github":{ONE_RPM}}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            by_name.mcp_rate_limit(&servers, "github").unwrap().bucket,
+            "github"
+        );
+
+        let by_id: ApiKey = serde_json::from_str(&format!(
+            r#"{{"key_hash":"h","mcp_rate_limits_by_id":{{"s-github":{ONE_RPM}}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            by_id.mcp_rate_limit(&servers, "github").unwrap().bucket,
+            "s-github"
+        );
+        // And it stays that bucket across the rename.
+        let renamed = server_index(&[("s-github", "github-v2")]);
+        assert_eq!(
+            by_id.mcp_rate_limit(&renamed, "github-v2").unwrap().bucket,
+            "s-github"
+        );
     }
 
     #[test]

@@ -96,6 +96,21 @@ impl WatchStatus {
         *self.inner.last_apply_at.lock().unwrap() = Some(Instant::now());
     }
 
+    /// [`Self::record_apply`] for a completed READ, which knows the exact
+    /// point its result is consistent as of and therefore ASSIGNS rather
+    /// than raising.
+    ///
+    /// A read of several prefixes can land below what the resync just
+    /// stamped from the entry set — a row in the later-read prefix may
+    /// have been written after the earlier prefix was read, while a write
+    /// to the earlier prefix in that interval is missing from the union
+    /// altogether. Keeping the higher number would go on claiming a write
+    /// the gateway has not seen.
+    pub(crate) fn record_read(&self, revision: i64) {
+        self.inner.revision.store(revision, Ordering::Relaxed);
+        *self.inner.last_apply_at.lock().unwrap() = Some(Instant::now());
+    }
+
     /// Snapshot the current freshness state. Returns the revision and
     /// the age (wall-clock duration since last apply); `None` for age
     /// means the supervisor has not yet successfully completed a cycle.
@@ -743,7 +758,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         // apply_resync uses max(entry revisions); bump to the etcd
         // load_all revision so the cache file records the true "as
         // of" point, not just the max entry write.
-        self.set_revision_floor(revision);
+        self.record_read_revision(revision);
         tracing::info!(
             accepted = stats.accepted,
             rejected = stats.schema_rejected + stats.parse_rejected,
@@ -775,10 +790,15 @@ impl<P: ConfigProvider> Supervisor<P> {
         // would skip every write to it in between — absent from that
         // read and never delivered to that watch.
         let mut revisions: Vec<Option<i64>> = Vec::with_capacity(self.sources.len());
+        // Retention (below) runs in a second pass so it can see the WHOLE
+        // read, not just the prefixes that came before the refusal.
+        let mut read_ok: Vec<&str> = Vec::new();
+        let mut refused: Vec<&PrefixSource<P>> = Vec::new();
         for source in &self.sources {
             match source.provider.load_all().await {
                 Ok((entries, rev)) => {
                     source.clear_refusal();
+                    read_ok.push(&source.prefix.prefix);
                     for entry in entries {
                         match all.entry(entry.key.clone()) {
                             std::collections::btree_map::Entry::Occupied(mut slot) => {
@@ -796,30 +816,40 @@ impl<P: ConfigProvider> Supervisor<P> {
                     revisions.push(Some(rev));
                 }
                 Err(err) if source.tolerates(&err) => {
-                    // A refusal is not a deletion. The rows this prefix
-                    // contributed to the last successful union are carried
-                    // into this one unchanged, and replaced only when a read
-                    // of it succeeds again — so a control plane that starts
-                    // refusing the shared catalog leaves the gateway pricing
-                    // on the last catalog it was allowed to read instead of
-                    // dropping every price at once. Losing them is not
-                    // neutral: `least_cost` stops ranking and realtime /
-                    // batch usage events lose `cost_usd`, and the WARN above
-                    // is the only sign either happened. Readiness is not held
-                    // back and the prefix has no revision to resume from, as
-                    // before; the cycle keeps retrying it at the normal
-                    // cadence.
+                    // Read as refused: the prefix contributes no revision,
+                    // has no revision to resume its watch from, and does not
+                    // hold readiness back — as before. Its rows are carried
+                    // over in the pass below.
                     source.log_refusal(&err);
-                    for entry in self.entries_last_read_from(&source.prefix) {
-                        // Never over a row this cycle DID read: the
-                        // environment prefix is the bare base on a
-                        // deployment with no `env_id`, so a fresh copy of a
-                        // catalog row can already be in `all`.
-                        all.entry(entry.key.clone()).or_insert(entry);
-                    }
+                    refused.push(source);
                     revisions.push(None);
                 }
                 Err(err) => return Err(err),
+            }
+        }
+
+        // A refusal is not a deletion. The rows a refused prefix
+        // contributed to the last successful union are carried into this
+        // one unchanged, and replaced only when a read of it succeeds
+        // again — so a control plane that starts refusing the shared
+        // catalog leaves the gateway pricing on the last catalog it was
+        // allowed to read instead of dropping every price at once. Losing
+        // them is not neutral: `least_cost` stops ranking and realtime /
+        // batch usage events lose `cost_usd`, and the WARN above is the
+        // only sign either happened.
+        for source in refused {
+            for entry in self.entries_last_read_from(&source.prefix) {
+                // Only where nothing else answered for the key. On a
+                // deployment with no `env_id` the environment prefix is the
+                // bare base, so a SUCCESSFUL read of it already covers the
+                // catalog — and that read is authoritative about the key
+                // being gone, which carrying the old row over would undo.
+                // A deleted price would come back to life, priced at
+                // whatever it used to cost.
+                if read_ok.iter().any(|p| entry.key.starts_with(p)) {
+                    continue;
+                }
+                all.entry(entry.key.clone()).or_insert(entry);
             }
         }
         Ok(PrefixLoad {
@@ -843,20 +873,26 @@ impl<P: ConfigProvider> Supervisor<P> {
             .collect()
     }
 
-    /// Bump the recorded revision floor. Used by the cycle path to
-    /// stamp the cache with the etcd `load_all` revision even when the
-    /// resulting entry set is empty (so the file still reflects when
-    /// the DP last successfully reached the CP). Also stamps
-    /// `WatchStatus.last_apply_at` so `/admin/v1/health` reflects the
-    /// successful round-trip with etcd even on an empty config.
-    fn set_revision_floor(&self, revision: i64) {
-        {
-            let mut rev = self.revision.lock().unwrap();
-            if revision > *rev {
-                *rev = revision;
-            }
-        }
-        self.status.record_apply(revision);
+    /// Record the revision a completed read was consistent as of, replacing
+    /// whatever the preceding `apply_resync` derived from the entry set.
+    /// Used by the cycle path so the cache and the heartbeat reflect when
+    /// the DP last successfully reached the CP even when the resulting
+    /// entry set is empty. Also stamps `WatchStatus.last_apply_at` so
+    /// `/admin/v1/health` reflects the successful round-trip with etcd.
+    ///
+    /// **Assigns, rather than raising a floor.** `apply_resync` stamps
+    /// `max(entry revision)`, which across several prefixes read in
+    /// sequence can exceed the point the union as a whole is consistent as
+    /// of: a row written to the later-read prefix after the earlier one was
+    /// read carries a revision above the earlier read's header, while a
+    /// write to the earlier prefix in that same interval is missing from
+    /// the union entirely. Raising a floor would keep that overstatement
+    /// and go on claiming a write the gateway has not seen — the one thing
+    /// `applied_revision` exists to answer. The caller's value is the
+    /// authoritative one and is never lower than honest.
+    fn record_read_revision(&self, revision: i64) {
+        *self.revision.lock().unwrap() = revision;
+        self.status.record_read(revision);
         // Reflect the finalised revision on the status view (the preceding
         // apply_resync synced with the entry-max revision; this corrects it to
         // the load/watch header revision). Not itself a reload event.
@@ -1088,7 +1124,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     }
 
     /// Stage one Delete. `revision` carries the watch header revision the
-    /// cycle loop would otherwise pass to [`Self::set_revision_floor`]
+    /// cycle loop would otherwise pass to [`Self::record_read_revision`]
     /// immediately afterwards; `None` (the standalone
     /// [`Self::apply_delete`] entry point) leaves the floor alone.
     #[allow(clippy::too_many_arguments)]
@@ -1168,12 +1204,18 @@ impl<P: ConfigProvider> Supervisor<P> {
         }
     }
 
-    /// In-batch form of [`Self::set_revision_floor`]: bump the floor and
-    /// mark the batch as needing a status publish, deferring the single
+    /// In-batch form for the watch-event path: raise the floor and mark
+    /// the batch as needing a status publish, deferring the single
     /// `record_apply` / `sync_config_status` to the end of the batch.
     ///
+    /// A floor here, not an assignment as in [`Self::record_read_revision`]:
+    /// these are individual watch events, delivered in revision order and
+    /// each carrying only its own write's revision, so the highest seen is
+    /// the point the configuration reflects. Only a completed READ knows a
+    /// consistent-as-of point that can be lower than what came before.
+    ///
     /// Status only — the floor is not part of the observed entry set, and
-    /// `set_revision_floor` never wrote the cache file either.
+    /// `record_read_revision` never wrote the cache file either.
     fn raise_revision_floor(
         &self,
         revision: Option<i64>,
@@ -1466,7 +1508,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         // initial load completed and no request can observe the
         // environment loaded and the catalog not.
         self.apply_resync(&load.entries);
-        self.set_revision_floor(revision);
+        self.record_read_revision(revision);
 
         let mut streams = Vec::with_capacity(self.sources.len());
         for (source, from) in self.sources.iter().zip(&load.revisions) {
@@ -1532,7 +1574,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                     // The resync's header revision is the "consistent as
                     // of" point even when the entry set is empty or only
                     // contains older mod_revisions.
-                    self.set_revision_floor(revision);
+                    self.record_read_revision(revision);
                 }
                 // Explicit over the two batchable variants rather than a
                 // catch-all: a new `WatchEvent` must fail to compile here
@@ -2433,6 +2475,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_later_prefixs_newer_row_does_not_raise_the_applied_revision() {
+        // The resync stamps `max(entry revision)` from the union, and the
+        // later-read prefix can legitimately hold a row written AFTER the
+        // earlier prefix was read — while a write to the earlier prefix in
+        // that same interval is missing from the union entirely. Letting
+        // the entry-max stand would keep claiming a revision the gateway
+        // has not seen, which is exactly what taking the minimum header is
+        // for. Distinct from the case above: here the overstatement comes
+        // from an ENTRY, not from a header.
+        let sup = scoped_supervisor(
+            ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 90)], 100),
+            ScopedProvider::serving(
+                vec![entry("/aisix/global/pricing/g", VALID_PRICE, 103)],
+                105,
+            ),
+        );
+        sup.load_once().await.unwrap();
+        assert_eq!(
+            sup.watch_status().snapshot().revision,
+            100,
+            "the union is consistent as of the earliest read, whatever revision \
+             a later prefix's rows carry"
+        );
+    }
+
+    #[tokio::test]
     async fn a_refused_prefix_does_not_lower_the_applied_revision() {
         // A refusal contributes no rows, so nothing in the union came
         // from that prefix and it has no earliest-read point to impose.
@@ -2490,6 +2558,48 @@ mod tests {
             "a successful read replaces the retained rows"
         );
         assert!(replaced.global_pricing.get_by_id("g-2").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_broader_successful_read_still_deletes_a_retained_row() {
+        // The nesting case again: with no `env_id` the environment prefix
+        // is the bare base, so a SUCCESSFUL read of it already answers for
+        // the catalog's keys — including answering that one is gone. The
+        // catalog prefix being refused must not undo that: carrying the
+        // old row over would bring a deleted price back to life, at
+        // whatever it used to cost.
+        let priced = entry("/aisix/global/pricing/p-1", VALID_PRICE, 4);
+        let sup = Arc::new(Supervisor::with_sources(
+            vec![
+                (
+                    WatchedPrefix::environment("/aisix"),
+                    ScopedProvider::scripted(vec![
+                        Some((
+                            vec![entry("/aisix/models/m-1", VALID_MODEL, 3), priced.clone()],
+                            4,
+                        )),
+                        // The price is deleted; the environment read that
+                        // covers it comes back without it.
+                        Some((vec![entry("/aisix/models/m-1", VALID_MODEL, 3)], 9)),
+                    ]),
+                ),
+                (
+                    WatchedPrefix::global("/aisix/global/"),
+                    ScopedProvider::scripted(vec![Some((vec![priced], 4)), None]),
+                ),
+            ],
+            SnapshotCache::disabled(),
+        ));
+
+        sup.load_once().await.unwrap();
+        assert_eq!(sup.handle().load().global_pricing.len(), 1);
+
+        sup.load_once().await.unwrap();
+        assert_eq!(
+            sup.handle().load().global_pricing.len(),
+            0,
+            "a deleted price must stay deleted when a read that covers it succeeded"
+        );
     }
 
     #[tokio::test]
@@ -3903,7 +4013,7 @@ mod tests {
         ));
         let sup = Supervisor::new(provider, "/aisix");
 
-        // load_once → set_revision_floor(7) → record_apply(7)
+        // load_once → record_read_revision(7) → record_apply(7)
         sup.load_once().await.unwrap();
         let snap = sup.watch_status().snapshot();
         assert_eq!(

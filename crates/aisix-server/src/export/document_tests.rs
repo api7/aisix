@@ -1173,3 +1173,71 @@ fn api_key_empty_mcp_id_forms_export_as_no_grant_and_no_limit() {
     assert_eq!(keys[0]["mcp_rate_limits"], json!({}));
     assert_eq!(keys[0]["mcp_access"]["allow"], json!([]));
 }
+
+#[test]
+fn a_server_name_containing_a_star_gets_no_name_form_grant() {
+    // A registered name may legally contain a `*`. The runtime compares
+    // the server id exactly, so an id grant on `gh*` reaches `gh*` alone —
+    // but `gh*__read` as a name-form pattern also matches `ghost__read`.
+    // The export must not manufacture that grant.
+    let snap = AisixSnapshot::new();
+    register_mcp_servers(&snap, &[("s-star", "gh*"), ("s-other", "ghost")]);
+    snap.apikeys.insert(ResourceEntry::new(
+        "k-uuid-1",
+        serde_json::from_value(json!({
+            "key_hash": "aa".repeat(32),
+            "allowed_models": [],
+            "mcp_access": {
+                "allow": [],
+                "allow_ids": [
+                    {"server_id": "s-star", "tool": "read"},
+                    {"server_id": "s-other", "tool": "read"}
+                ]
+            }
+        }))
+        .unwrap(),
+        1,
+    ));
+
+    let doc = build_export_document(&snap, false);
+    let keys = find(&doc, "api_keys");
+    assert_eq!(keys[0]["mcp_access"]["allow"], json!(["ghost__read"]));
+    assert!(
+        doc.warnings.iter().any(|w| w.contains("gh*")),
+        "{:?}",
+        doc.warnings
+    );
+    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
+}
+
+#[test]
+fn a_star_named_server_on_the_deny_side_blocks_the_export() {
+    // Dropping the entry would leave the exported file permitting a tool
+    // the gateway blocks, and emitting `gh*__delete` would deny one it
+    // allows. Neither is a file that reproduces the gateway, so the export
+    // says so instead of picking.
+    let snap = AisixSnapshot::new();
+    register_mcp_servers(&snap, &[("s-star", "gh*")]);
+    snap.apikeys.insert(ResourceEntry::new(
+        "k-uuid-1",
+        serde_json::from_value(json!({
+            "key_hash": "aa".repeat(32),
+            "allowed_models": [],
+            "mcp_access": {
+                "allow": ["*"],
+                "deny_ids": [{"server_id": "s-star", "tool": "delete"}]
+            }
+        }))
+        .unwrap(),
+        1,
+    ));
+
+    let doc = build_export_document(&snap, false);
+    assert!(
+        doc.blocking.iter().any(|b| b.contains("gh*")),
+        "{:?}",
+        doc.blocking
+    );
+    let keys = find(&doc, "api_keys");
+    assert_eq!(keys[0]["mcp_access"]["deny"], json!([]));
+}

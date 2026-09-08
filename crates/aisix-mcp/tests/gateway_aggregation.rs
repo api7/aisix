@@ -1251,3 +1251,88 @@ fn an_id_layer_admits_nothing_for_a_tool_outside_every_namespace() {
     assert!(!acl.permits("create_issue"), "no namespace prefix at all");
     assert!(!acl.permits("unregistered__create_issue"));
 }
+
+#[test]
+fn an_env_policy_may_write_its_allow_side_by_id() {
+    // The policy layers carry the id spelling too, and nothing else in
+    // this suite exercises a policy's `allow_ids`: the key layer is where
+    // every other id case above puts it.
+    let snapshot = with_servers(
+        policy_snapshot(&[(
+            "p-env",
+            serde_json::json!({
+                "scope": "env", "allow": [],
+                "allow_ids": [{"server_id": "s-github", "tool": "create_issue"}]
+            }),
+        )]),
+        &[("s-github", "github"), ("s-slack", "slack")],
+    );
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"mcp_access":{"allow":["*"]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(acl.permits("github__create_issue"));
+    assert!(!acl.permits("github__delete_repo"));
+    assert!(
+        !acl.permits("slack__post_message"),
+        "the env layer's id grant narrows the key's `*`"
+    );
+}
+
+#[test]
+fn a_team_policy_may_write_its_allow_side_by_id() {
+    let snapshot = with_servers(
+        policy_snapshot(&[
+            ("p-env", serde_json::json!({"scope": "env", "allow": ["*"]})),
+            (
+                "p-team",
+                serde_json::json!({
+                    "scope": "team", "scope_ref": "team-1", "allow": [],
+                    "allow_ids": [{"server_id": "s-github", "tool": "*"}]
+                }),
+            ),
+        ]),
+        &[("s-github", "github"), ("s-slack", "slack")],
+    );
+    let member = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"team_id":"team-1",
+        "mcp_access":{"allow":["*"]}
+    }));
+    let acl = resolve_now(&snapshot, &member);
+    assert!(acl.permits("github__create_issue"));
+    assert!(!acl.permits("slack__post_message"));
+
+    // A key outside the team is not narrowed by it, so the id-spelled
+    // team layer really is what produced the result above.
+    let outsider = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"team_id":"team-2",
+        "mcp_access":{"allow":["*"]}
+    }));
+    assert!(resolve_now(&snapshot, &outsider).permits("slack__post_message"));
+}
+
+#[test]
+fn a_policy_id_grant_survives_a_server_rename() {
+    let policy_row = serde_json::json!({
+        "scope": "env", "allow": ["github__create_issue"],
+        "allow_ids": [{"server_id": "s-github", "tool": "create_issue"}]
+    });
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"mcp_access":{"allow":["*"]}
+    }));
+
+    let before = with_servers(
+        policy_snapshot(&[("p-env", policy_row.clone())]),
+        &[("s-github", "github")],
+    );
+    assert!(resolve_now(&before, &key).permits("github__create_issue"));
+
+    // Same policy document, same key document, renamed server.
+    let after = with_servers(
+        policy_snapshot(&[("p-env", policy_row)]),
+        &[("s-github", "github-v2")],
+    );
+    let acl = resolve_now(&after, &key);
+    assert!(acl.permits("github-v2__create_issue"));
+    assert!(!acl.permits("github__create_issue"));
+}

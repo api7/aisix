@@ -71,6 +71,12 @@ pub struct McpPolicy {
     /// Present — including as an empty array — it is authoritative and
     /// `allow` is ignored; an empty array therefore allows nothing. Set to
     /// `null` it means the same as omitted: the layer falls back to `allow`.
+    ///
+    /// It cannot express "every server": each entry names one server
+    /// exactly and `server_id` is never a glob, so an enumeration of the
+    /// servers registered today silently fails to cover one registered
+    /// tomorrow. To allow (or deny) every server, present and future,
+    /// leave this absent and use the name form's `"*"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_ids: Option<Vec<McpToolRef>>,
 
@@ -88,6 +94,12 @@ pub struct McpPolicy {
     /// by server name. Present — including as an empty array — it is
     /// authoritative and `deny` is ignored; an empty array subtracts
     /// nothing. Absent or `null`, the layer falls back to `deny`.
+    ///
+    /// It cannot express "every server": each entry names one server
+    /// exactly and `server_id` is never a glob, so an enumeration of the
+    /// servers registered today silently fails to cover one registered
+    /// tomorrow. To allow (or deny) every server, present and future,
+    /// leave this absent and use the name form's `"*"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny_ids: Option<Vec<McpToolRef>>,
 
@@ -129,6 +141,12 @@ pub struct McpAccess {
     /// reach. Present — including as an empty array — it is authoritative
     /// and `allow` is ignored; an empty array therefore allows nothing.
     /// Absent or `null`, the key falls back to `allow`.
+    ///
+    /// It cannot express "every server": each entry names one server
+    /// exactly and `server_id` is never a glob, so an enumeration of the
+    /// servers registered today silently fails to cover one registered
+    /// tomorrow. To allow (or deny) every server, present and future,
+    /// leave this absent and use the name form's `"*"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_ids: Option<Vec<McpToolRef>>,
 
@@ -142,6 +160,12 @@ pub struct McpAccess {
     /// server name. Present — including as an empty array — it is
     /// authoritative and `deny` is ignored; an empty array subtracts
     /// nothing. Absent or `null`, the key falls back to `deny`.
+    ///
+    /// It cannot express "every server": each entry names one server
+    /// exactly and `server_id` is never a glob, so an enumeration of the
+    /// servers registered today silently fails to cover one registered
+    /// tomorrow. To allow (or deny) every server, present and future,
+    /// leave this absent and use the name form's `"*"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny_ids: Option<Vec<McpToolRef>>,
 }

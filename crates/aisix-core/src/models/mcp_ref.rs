@@ -31,19 +31,29 @@ use crate::snapshot::ResourceTable;
 /// is an exact id: it is compared against the id of the server the addressed
 /// tool actually belongs to, never glob-matched, so a server whose *name*
 /// happens to contain a `*` cannot widen a grant.
+///
+/// Both halves are required on the WRITE path and defaulted by the runtime
+/// loader — the strict schemas add them to this definition's `required`,
+/// the types do not. An entry these were required of at the type level
+/// would fail to deserialize, and the loader skips a row it cannot
+/// deserialize whole: one malformed entry in one `allow_ids` array would
+/// stop the entire `api_key` from authenticating any traffic at all, not
+/// merely lose it MCP access. Defaulted, the malformed entry matches
+/// nothing instead — an empty `server_id` names no registered server, and
+/// an empty `tool` glob covers no tool name the gateway exposes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct McpToolRef {
     /// Resource id of the registered MCP server (`mcp_servers/<id>`) this
     /// entry refers to. An id matching no registered server refers to
     /// nothing: the entry never matches, and the other entries are
     /// unaffected.
-    #[schemars(length(min = 1))]
+    #[serde(default)]
     pub server_id: String,
 
     /// Tool on that server, matched as a single-`*` glob against the bare
     /// tool name — the part after the `<server>__` namespace prefix. `"*"`
     /// covers every tool the server exposes.
-    #[schemars(length(min = 1))]
+    #[serde(default)]
     pub tool: String,
 }
 

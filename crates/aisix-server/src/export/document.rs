@@ -830,6 +830,10 @@ fn resugar_model_refs(
 /// gateway already takes for an unresolvable id; for a limit it means the
 /// exported key is bounded by its own `rate_limit` alone, which is why that
 /// case warns too.
+///
+/// An entry whose server's NAME contains a `*` gets no name form at all: see
+/// the comment at the match below. The per-server limits are unaffected —
+/// they key a map by the exact name rather than building a glob.
 fn resugar_mcp_refs(
     doc: &mut Value,
     api_key: &str,
@@ -873,6 +877,33 @@ fn resugar_mcp_refs(
                 continue;
             };
             match mcp_server_names.get(id) {
+                // A registered name may legally contain a `*` — the name
+                // pattern only forbids `__` and a trailing `_` — and the
+                // name form is glob-matched, so `gh*__read` built from a
+                // server named `gh*` would also cover `ghost__read`. The
+                // runtime never does this (it compares the server id
+                // exactly); neither may the export. The name form simply
+                // cannot express such a reference, so the entry does not
+                // get one — dropped on the allow side, where reaching less
+                // is the safe direction, and blocking on the deny side,
+                // where dropping it would let the file permit what the
+                // gateway forbids.
+                Some(name) if name.contains('*') => {
+                    let note = format!(
+                        "api key {api_key:?} names MCP server {name:?} under \
+                         `mcp_access.{id_field}`, whose name contains `*`; a \
+                         `<server>__<tool>` pattern built from it would match a different \
+                         server"
+                    );
+                    if name_field == "deny" {
+                        diag.blocking.push(format!(
+                            "{note} — the exported file cannot express this denial and would \
+                             permit a tool the gateway blocks"
+                        ));
+                    } else {
+                        diag.warnings.push(format!("{note} — the entry is dropped"));
+                    }
+                }
                 Some(name) => patterns.push(Value::String(format!("{name}__{tool}"))),
                 None => diag.warnings.push(format!(
                     "api key {api_key:?} names MCP server id {id:?} under \
