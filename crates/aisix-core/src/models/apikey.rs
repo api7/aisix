@@ -43,8 +43,10 @@ pub struct ApiKey {
     /// including as an empty array — it is authoritative and `allowed_models`
     /// is ignored; each id is resolved against the current models in the
     /// snapshot and the resolved name is matched with the same single-`*`
-    /// glob rule, so an id naming a wildcard model still grants every name
-    /// that model's pattern covers. An id matching no model grants nothing.
+    /// glob rule. An id naming a wildcard model therefore grants every name
+    /// that model's pattern covers — including a name an exact-match model
+    /// of its own serves, which is how the name form behaves too. An id
+    /// matching no model grants nothing.
     /// Set to `null` it means the same as omitted: the key falls back to
     /// `allowed_models`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -20,6 +20,11 @@ use crate::state::AdminState;
 pub struct PublicApiKey {
     pub key_hash: String,
     pub allowed_models: Vec<String>,
+    /// Shown whenever the stored key carries it, because it is then the
+    /// field that decides access and `allowed_models` is ignored — an
+    /// operator reading only the names would misread the key's ACL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_model_ids: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<aisix_core::models::RateLimit>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -37,6 +42,7 @@ impl From<ApiKey> for PublicApiKey {
         Self {
             key_hash: value.key_hash,
             allowed_models: value.allowed_models,
+            allowed_model_ids: value.allowed_model_ids,
             rate_limit: value.rate_limit,
             mcp_access: value.mcp_access,
             allowed_agents: value.allowed_agents,

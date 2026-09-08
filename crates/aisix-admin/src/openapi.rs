@@ -1528,9 +1528,22 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "items": {
               "type": "string"
             },
-            "description": "Model aliases this caller API key may use.",
+            "description": "Model names this caller API key may use, matched as single-`*` globs. Read only when `allowed_model_ids` is absent.",
             "example": [
               "gpt-4o"
+            ]
+          },
+          "allowed_model_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Models this caller API key may use, named by resource id. Present, it decides access and `allowed_models` is ignored.",
+            "example": [
+              "9b1b6d9c-1f5e-4c1e-9f8f-2f5f5b9d1c11"
             ]
           },
           "rate_limit": {

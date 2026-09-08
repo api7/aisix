@@ -142,7 +142,21 @@ fn apikey_corpus() {
                 true,
                 json!({"key_hash": "h", "allowed_models": []}),
             ),
-            ("missing allowed_models", false, json!({"key_hash": "h"})),
+            // Neither grant field: a key may grant models by name
+            // (`allowed_models`) or by resource id (`allowed_model_ids`),
+            // so neither is required — carrying neither is a valid
+            // document that grants no model access.
+            ("no grant field at all", true, json!({"key_hash": "h"})),
+            (
+                "allowed_model_ids alone",
+                true,
+                json!({"key_hash": "h", "allowed_model_ids": ["m-1"]}),
+            ),
+            (
+                "allowed_model_ids of non-strings",
+                false,
+                json!({"key_hash": "h", "allowed_model_ids": [1]}),
+            ),
             ("missing key_hash", false, json!({"allowed_models": ["a"]})),
             (
                 "empty key_hash",
