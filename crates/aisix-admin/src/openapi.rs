@@ -3368,6 +3368,19 @@ mod tests {
                 for key in ["oneOf", "anyOf"] {
                     if let Some(serde_json::Value::Array(variants)) = map.get(key) {
                         for (index, variant) in variants.iter().enumerate() {
+                            // A branch that declares nothing but `required`
+                            // is a cross-field CONSTRAINT, not a shape a
+                            // reader picks between — the "name or id" pairs
+                            // on every model reference are written this way.
+                            // ReDoc gives it no tab, so a title on it would
+                            // name something nobody sees. Same exemption the
+                            // `not` subschemas get below.
+                            if variant
+                                .as_object()
+                                .is_some_and(|b| b.len() == 1 && b.contains_key("required"))
+                            {
+                                continue;
+                            }
                             if variant["title"].as_str().is_none_or(str::is_empty) {
                                 missing.push(format!("{path}/{key}/{index}"));
                             }
