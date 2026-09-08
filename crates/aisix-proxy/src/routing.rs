@@ -1499,6 +1499,122 @@ mod tests {
         );
     }
 
+    // ───────────────── targets named by resource id ─────────────────
+
+    /// A routing model whose targets are named by `model_id`. Every stage
+    /// downstream of the normalization keys on `target.model`, so the
+    /// assertion that matters is what the whole resolution walk hands back.
+    fn resolve_group(
+        snapshot: &AisixSnapshot,
+        targets: Vec<RoutingTarget>,
+    ) -> Result<Vec<String>, ProxyError> {
+        let group: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "group",
+            "routing": {"strategy": "failover", "targets": []},
+        }))
+        .unwrap();
+        let mut group = group;
+        group.routing = Some(r(RoutingStrategy::Failover, targets, None));
+        resolve_attempt_models(
+            &RoutingRegistry::new(),
+            &crate::ModelRuntimeStatusTracker::new(),
+            snapshot,
+            "group",
+            "g-1",
+            &group,
+            RoutingRequest::default(),
+        )
+        .map(|attempts| {
+            attempts
+                .into_iter()
+                .map(|a| a.model.display_name)
+                .collect()
+        })
+    }
+
+    #[test]
+    fn a_target_named_by_id_resolves_to_that_model() {
+        // `ip_snapshot` assigns ids `m-0`, `m-1`, … in declaration order.
+        let snap = ip_snapshot(&[("alpha", None), ("beta", None)]);
+        assert_eq!(
+            resolve_group(&snap, vec![RoutingTarget::by_id("m-1")]).unwrap(),
+            vec!["beta"]
+        );
+    }
+
+    #[test]
+    fn a_target_named_by_id_follows_a_rename() {
+        let target = vec![RoutingTarget::by_id("m-0")];
+        let before = ip_snapshot(&[("alpha", None)]);
+        assert_eq!(
+            resolve_group(&before, target.clone()).unwrap(),
+            vec!["alpha"]
+        );
+        // Same id, new display name; the routing document is untouched.
+        let after = ip_snapshot(&[("alpha-v2", None)]);
+        assert_eq!(resolve_group(&after, target).unwrap(), vec!["alpha-v2"]);
+    }
+
+    #[test]
+    fn an_id_target_wins_over_the_name_beside_it() {
+        let snap = ip_snapshot(&[("alpha", None), ("beta", None)]);
+        let conflicting = RoutingTarget {
+            model: "alpha".into(),
+            model_id: Some("m-1".into()),
+            weight: None,
+            priority: None,
+            tags: None,
+        };
+        assert_eq!(resolve_group(&snap, vec![conflicting]).unwrap(), vec!["beta"]);
+    }
+
+    #[test]
+    fn an_unresolvable_id_target_fails_like_an_unresolvable_name() {
+        let snap = ip_snapshot(&[("alpha", None)]);
+        let by_id = resolve_group(&snap, vec![RoutingTarget::by_id("m-gone")]).unwrap_err();
+        let by_name = resolve_group(&snap, vec![RoutingTarget::new("m-gone")]).unwrap_err();
+        assert!(
+            matches!(by_id, ProxyError::InvalidRequest(_)),
+            "expected the same config error a dangling name raises, got {by_id:?}"
+        );
+        assert_eq!(by_id.to_string(), by_name.to_string());
+    }
+
+    /// The per-target IP allowlist keys on the target's Model, so it has to
+    /// see the resolved one — a group that gated only name-form targets
+    /// would let an id-form target through a restriction the operator set.
+    #[test]
+    fn an_id_target_is_still_subject_to_its_own_ip_allowlist() {
+        let snap = ip_snapshot(&[("restricted", Some(vec!["10.0.0.0/8"]))]);
+        let group: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "group",
+            "routing": {"strategy": "failover", "targets": []},
+        }))
+        .unwrap();
+        let mut group = group;
+        group.routing = Some(r(
+            RoutingStrategy::Failover,
+            vec![RoutingTarget::by_id("m-0")],
+            None,
+        ));
+        let out_of_range = resolve_attempt_models(
+            &RoutingRegistry::new(),
+            &crate::ModelRuntimeStatusTracker::new(),
+            &snap,
+            "group",
+            "g-1",
+            &group,
+            RoutingRequest {
+                source_ip: "8.8.8.8",
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            out_of_range,
+            Err(ProxyError::ModelIpRestricted(_))
+        ));
+    }
+
     // ───────────────── per-target client-IP allowlist ─────────────────
 
     fn ip_snapshot(models: &[(&str, Option<Vec<&str>>)]) -> AisixSnapshot {
