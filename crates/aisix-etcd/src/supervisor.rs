@@ -16,13 +16,13 @@
 //! read path reading a fully-formed `Arc<Snapshot>` the whole time.
 
 use aisix_core::config_status::{
-    hash_entries, AppliedSnapshot, ConfigStatus, IncomingRejection, LoadObservation,
+    hash_record, hash_records, AppliedSnapshot, ConfigStatus, IncomingRejection, LoadObservation,
     PartialCompatResource, SourceKind,
 };
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::AisixSnapshot;
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -166,6 +166,24 @@ pub struct StaleServing {
     pub since_unix_secs: u64,
 }
 
+/// One observed etcd entry plus the bytes it contributes to the config
+/// digests, computed once when the entry is stored.
+#[derive(Debug, Clone)]
+struct StateEntry {
+    entry: RawEntry,
+    /// [`aisix_core::config_status::hash_record`] of `entry`. A pure
+    /// function of `(key, value)`, so it is valid for exactly as long as
+    /// this map holds these bytes.
+    record: Arc<[u8]>,
+}
+
+impl StateEntry {
+    fn new(entry: RawEntry) -> Self {
+        let record: Arc<[u8]> = hash_record(&entry.key, &entry.value).into();
+        Self { entry, record }
+    }
+}
+
 /// One supervisor instance. Consumers call [`Supervisor::run`] once and
 /// drop the returned handle on shutdown.
 pub struct Supervisor<P: ConfigProvider> {
@@ -175,8 +193,15 @@ pub struct Supervisor<P: ConfigProvider> {
 
     // Last-known etcd state, kept in `key → RawEntry` form so deltas
     // (Put/Delete) can update it incrementally and the whole map can
-    // be flushed to disk via `cache.store`.
-    state: Mutex<HashMap<String, RawEntry>>,
+    // be flushed to disk via `cache.store`. Each entry carries its
+    // pre-computed [`hash_record`] so the two full-config digests
+    // `sync_config_status` publishes cost a SHA-256 pass over cached
+    // bytes rather than a JSON parse and canonical re-serialisation of
+    // every row in the configuration on every watch event
+    // (AISIX-Cloud#1542). `BTreeMap`, not `HashMap`, so the records are
+    // already in the ascending-key order the digest is defined over and
+    // no sort runs per call.
+    state: Mutex<BTreeMap<String, StateEntry>>,
     revision: Mutex<i64>,
     cache: SnapshotCache,
 
@@ -256,7 +281,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             provider,
             prefix: prefix.into(),
             handle: SnapshotHandle::new(AisixSnapshot::new()),
-            state: Mutex::new(HashMap::new()),
+            state: Mutex::new(BTreeMap::new()),
             revision: Mutex::new(0),
             cache,
             status: WatchStatus::new(),
@@ -303,9 +328,11 @@ impl<P: ConfigProvider> Supervisor<P> {
             // etcd write lands here, including rejected ones (a resync
             // inserts them wholesale; a rejected live Put mirrors its
             // bytes in too, #871), so source_hash always covers the
-            // observed etcd state.
-            source_hash =
-                hash_entries(state.values().map(|e| (e.key.as_str(), e.value.as_slice())));
+            // observed etcd state. It is a `BTreeMap`, so iterating it
+            // already yields the ascending-key order the digest is
+            // defined over, and each value carries its record from the
+            // one time its bytes were stored.
+            source_hash = hash_records(state.values().map(|e| &e.record));
             let rejected_keys: HashSet<&str> = rejections.iter().map(|r| r.key.as_str()).collect();
             // config_hash covers the bytes each key ACTUALLY serves: the
             // observed etcd bytes for accepted keys, the pinned last-known-
@@ -314,19 +341,16 @@ impl<P: ConfigProvider> Supervisor<P> {
             // map — not the capped rejection buffer — decides which keys
             // substitute, so buffer overflow can never flip a served key's
             // hash contribution to the rejected bytes.
-            config_hash = hash_entries(
-                state
-                    .values()
-                    .filter(|e| {
-                        !rejected_keys.contains(e.key.as_str()) && !stale.contains_key(&e.key)
-                    })
-                    .map(|e| (e.key.as_str(), e.value.as_slice()))
-                    .chain(
-                        stale
-                            .values()
-                            .map(|s| (s.entry.key.as_str(), s.entry.value.as_slice())),
-                    ),
-            );
+            //
+            // With nothing rejected and nothing pinned the filter admits
+            // every key and the chain adds none, so the two digests are
+            // over the identical record sequence — the overwhelmingly
+            // common case, and one full SHA-256 pass to skip.
+            config_hash = if rejected_keys.is_empty() && stale.is_empty() {
+                source_hash.clone()
+            } else {
+                hash_records(served_records(&state, &rejected_keys, &stale))
+            };
             rejected = rejections
                 .iter()
                 .map(|r| self.map_rejection(r, &stale))
@@ -672,17 +696,27 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// mirroring the rejected bytes into `state`, and a resync that
     /// rejects a key either stale-tracks it or drops it from the
     /// snapshot).
-    fn capture_last_good(&self, key_str: &str) {
+    fn capture_last_good(&self, key_str: &str, base: &AisixSnapshot, view: &BatchView) {
         if self.stale_serving.lock().unwrap().contains_key(key_str) {
             return;
         }
         let Ok(parsed) = key::parse(&self.prefix, key_str) else {
             return;
         };
-        if !snapshot_has(&self.handle.load(), parsed.kind, parsed.id) {
+        // The presence probe reads through the batch's own staged
+        // mutations: within one coalesced apply a row put earlier in the
+        // batch is serving as far as this decision is concerned, even
+        // though the snapshot carrying it has not been published yet.
+        if !view.present(base, parsed.kind, parsed.id) {
             return;
         }
-        let Some(good) = self.state.lock().unwrap().get(key_str).cloned() else {
+        let Some(good) = self
+            .state
+            .lock()
+            .unwrap()
+            .get(key_str)
+            .map(|e| e.entry.clone())
+        else {
             return;
         };
         // entry().or_insert_with keeps the original pin (and its `since`)
@@ -700,6 +734,107 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// Apply a single Put event on top of the current snapshot.
     /// Returns `true` if the apply succeeded (schema + parse passed).
     pub fn apply_put(&self, entry: &RawEntry) -> bool {
+        self.apply_events(&[PendingEvent::Put(entry)])[0]
+    }
+
+    /// Apply a Delete event. Returns `true` if anything was actually
+    /// removed (the kind/id was present).
+    pub fn apply_delete(&self, key_str: &str) -> bool {
+        self.apply_events(&[PendingEvent::Delete {
+            key: key_str,
+            revision: None,
+        }])[0]
+    }
+
+    /// Apply a coalesced run of Put/Delete events as ONE copy-on-write
+    /// cycle: one snapshot clone, one publish, one configuration-status
+    /// sync, one cache flush. Returns each event's outcome, in order.
+    ///
+    /// Per-event work — schema validation, rejection bookkeeping,
+    /// last-known-good pinning, the partial-compatibility signal, the
+    /// observed-state map and the revision floor — still runs once per
+    /// event and in order, so a batch decides exactly what the same
+    /// events decided one at a time. What is shared is the work whose
+    /// cost is the size of the WHOLE configuration rather than the size
+    /// of the event: a bulk edit that lands 14 writes a second used to
+    /// pay all of it 14 times a second (AISIX-Cloud#1542).
+    fn apply_events(&self, events: &[PendingEvent<'_>]) -> Vec<bool> {
+        let base = self.handle.load();
+        let mut view = BatchView::default();
+        let mut mutations: Vec<SnapshotMutation> = Vec::new();
+        let mut outcomes = Vec::with_capacity(events.len());
+        // The revision to stamp freshness with, if any event would have
+        // stamped one. `record_apply` keeps the max, so one call with the
+        // batch's max is what N calls would have left behind.
+        let mut apply_stamp: Option<i64> = None;
+        // Whether any event changed something `/status/config` or the
+        // on-disk cache reports. A batch of deletes for keys that were
+        // never there publishes nothing, exactly as each delete would not.
+        let mut changed = false;
+
+        for event in events {
+            let outcome = match event {
+                PendingEvent::Put(entry) => self.stage_put(
+                    entry,
+                    &base,
+                    &mut view,
+                    &mut mutations,
+                    &mut apply_stamp,
+                    &mut changed,
+                ),
+                PendingEvent::Delete { key, revision } => self.stage_delete(
+                    key,
+                    *revision,
+                    &base,
+                    &mut view,
+                    &mut mutations,
+                    &mut apply_stamp,
+                    &mut changed,
+                ),
+            };
+            outcomes.push(outcome);
+        }
+        drop(base);
+
+        if !mutations.is_empty() {
+            // RCU: load → clone → mutate → CAS, retrying the closure if a
+            // concurrent apply raced our CAS. The previous implementation
+            // used a bare load-mutate-store sequence which silently
+            // dropped events under concurrency (see issue #112). The
+            // closure body must be idempotent w.r.t. its input — the
+            // staged mutations are a fixed ordered list replayed onto a
+            // fresh clone each attempt.
+            self.handle.rcu(|current| {
+                let new = clone_snapshot(current);
+                for mutation in &mutations {
+                    mutation.apply_to(&new);
+                }
+                new
+            });
+        }
+        if let Some(revision) = apply_stamp {
+            // /admin/v1/health reads this — record the apply so
+            // `last_apply_age` resets on every event we process.
+            self.status.record_apply(revision);
+        }
+        if changed {
+            self.sync_config_status(false);
+            self.flush_cache();
+        }
+        outcomes
+    }
+
+    /// Stage one Put. See [`Self::apply_events`] for what is per-event
+    /// and what is shared.
+    fn stage_put(
+        &self,
+        entry: &RawEntry,
+        base: &AisixSnapshot,
+        view: &mut BatchView,
+        mutations: &mut Vec<SnapshotMutation>,
+        apply_stamp: &mut Option<i64>,
+        changed: &mut bool,
+    ) -> bool {
         // Build a tiny snapshot out of just the new entry, then merge.
         let (tiny, mut stats) = loader::build_snapshot(&self.prefix, std::slice::from_ref(entry));
         if stats.accepted == 0 {
@@ -708,7 +843,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             // needs the pinned bytes to keep this row alive. Must run
             // BEFORE the state-map update below, which overwrites the
             // serving bytes with the rejected ones.
-            self.capture_last_good(&entry.key);
+            self.capture_last_good(&entry.key, base, view);
             // Mirror the rejected bytes into the observed-state map and
             // the cache like any other observed etcd write: source_hash
             // reflects the observed etcd state immediately, and a
@@ -716,16 +851,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             // rejected-bytes + pinned-value shape a post-resync restart
             // would — keeping the staleness clock continuous instead of
             // resetting it at the next boot.
-            {
-                let mut state = self.state.lock().unwrap();
-                state.insert(entry.key.clone(), entry.clone());
-            }
-            {
-                let mut rev = self.revision.lock().unwrap();
-                if entry.revision > *rev {
-                    *rev = entry.revision;
-                }
-            }
+            self.store_observed(entry);
             // Note: a previously retained partially-compatible entry for
             // this key is deliberately kept — the row's last-good value
             // (loaded with those fields ignored) is still what serves.
@@ -738,29 +864,12 @@ impl<P: ConfigProvider> Supervisor<P> {
             }
             // A rejected watch event still changes the reported state
             // (rejected[] gains this entry; last_reload flips unsuccessful).
-            self.sync_config_status(false);
-            self.flush_cache();
+            *changed = true;
             return false;
         }
 
-        // RCU: load → clone → mutate → CAS, retrying the closure if a
-        // concurrent apply_put / apply_delete / apply_resync raced our
-        // CAS. The previous implementation used a bare load-mutate-
-        // store sequence which silently dropped events under
-        // concurrency (see issue #112). The closure body must be
-        // idempotent w.r.t. its input — `tiny` is captured by reference
-        // and the same delta is applied each retry, which is fine
-        // because the operation is "merge tiny into current".
-        self.handle.rcu(|current| {
-            let new = clone_snapshot(current);
-            // Move any entries from `tiny` into `new`. `merge_snapshot`
-            // must cover every ResourceTable on AisixSnapshot — a
-            // missing kind there means a watch event silently drops on
-            // the floor and the snapshot never sees the new entry, even
-            // though the loader and the proxy both know about it.
-            merge_snapshot(&new, &tiny);
-            new
-        });
+        view.record_put(&self.prefix, &entry.key);
+        mutations.push(SnapshotMutation::Merge(Box::new(tiny)));
         self.remove_rejection_for_key(&entry.key);
         // The key's latest bytes load again — retention ends (#871).
         self.stale_serving.lock().unwrap().remove(&entry.key);
@@ -772,48 +881,45 @@ impl<P: ConfigProvider> Supervisor<P> {
             .drain(..)
             .find(|row| row.key == entry.key);
         self.update_partial_row(&entry.key, partial);
-
-        // Mirror the put into the cache-tracking map and flush.
-        // Track the highest revision we've observed so the cache file
-        // records something monotonic.
-        {
-            let mut state = self.state.lock().unwrap();
-            state.insert(entry.key.clone(), entry.clone());
-        }
-        {
-            let mut rev = self.revision.lock().unwrap();
-            if entry.revision > *rev {
-                *rev = entry.revision;
-            }
-        }
-        // /admin/v1/health reads this — record the apply so `last_apply_age`
-        // resets on every event we successfully process.
-        self.status.record_apply(entry.revision);
-        self.sync_config_status(false);
-        self.flush_cache();
+        // Mirror the put into the cache-tracking map. Track the highest
+        // revision we've observed so the cache file records something
+        // monotonic.
+        self.store_observed(entry);
+        stamp_max(apply_stamp, entry.revision);
+        *changed = true;
         true
     }
 
-    /// Apply a Delete event. Returns `true` if anything was actually
-    /// removed (the kind/id was present).
-    pub fn apply_delete(&self, key_str: &str) -> bool {
+    /// Stage one Delete. `revision` carries the watch header revision the
+    /// cycle loop would otherwise pass to [`Self::set_revision_floor`]
+    /// immediately afterwards; `None` (the standalone
+    /// [`Self::apply_delete`] entry point) leaves the floor alone.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_delete(
+        &self,
+        key_str: &str,
+        revision: Option<i64>,
+        base: &AisixSnapshot,
+        view: &mut BatchView,
+        mutations: &mut Vec<SnapshotMutation>,
+        apply_stamp: &mut Option<i64>,
+        changed: &mut bool,
+    ) -> bool {
         let parsed = match key::parse(&self.prefix, key_str) {
             Ok(k) => k,
             Err(err) => {
                 tracing::warn!(key = %key_str, error = %err, "ignoring delete with bad key");
+                self.raise_revision_floor(revision, apply_stamp, changed);
                 return false;
             }
         };
 
-        // Probe first — if the key isn't present in the current
-        // snapshot we have nothing to do and don't want to take the
-        // RCU CAS path (which would still publish a no-op clone and
-        // race against concurrent applies). The probe + RCU cycle
-        // produces an idempotent "removed" return value: a parallel
-        // delete that wins the race observes the same key already
-        // gone, so this caller returns false (nothing left to remove).
-        let snap = self.handle.load();
-        let present = snapshot_has(&snap, parsed.kind, parsed.id);
+        // Probe first — if the key isn't present we have nothing to
+        // remove and don't want to stage a no-op mutation. The probe
+        // reads through the batch's staged mutations as well as the
+        // published snapshot, so a delete that follows a put of the same
+        // key inside one batch sees the row the put staged.
+        let present = view.present(base, parsed.kind, parsed.id);
         let removed_rejection = self.remove_rejection_for_key(key_str);
         // A deleted key no longer serves, so its partially-compatible
         // signal (if any) goes with it — and so does its last-known-good
@@ -827,86 +933,62 @@ impl<P: ConfigProvider> Supervisor<P> {
         // in source_hash until the next resync and persist the deleted
         // document in the cache file.
         let removed_state = self.state.lock().unwrap().remove(key_str).is_some();
-        drop(snap);
         if !present {
             if removed_rejection || removed_state {
-                let cur_rev = *self.revision.lock().unwrap();
-                self.status.record_apply(cur_rev);
                 // Clearing a rejected key changes the reported state.
-                self.sync_config_status(false);
-                self.flush_cache();
+                // No per-event revision rides a wire delete, so stamp
+                // freshness with the current floor.
+                stamp_max(apply_stamp, *self.revision.lock().unwrap());
+                *changed = true;
             }
+            self.raise_revision_floor(revision, apply_stamp, changed);
             return removed_rejection;
         }
 
-        // RCU: load → clone → remove → CAS, retrying under contention.
-        // The closure body re-checks `removed` from its own clone so
-        // the eventual CAS reflects the latest snapshot's state — if a
-        // sibling apply_delete won the race, the kind.remove on our
-        // clone returns None and we still publish a coherent (no-op)
-        // result.
-        self.handle.rcu(|current| {
-            let new = clone_snapshot(current);
-            match parsed.kind {
-                "models" => {
-                    new.models.remove(parsed.id);
-                }
-                "api_keys" => {
-                    new.apikeys.remove(parsed.id);
-                }
-                "provider_keys" => {
-                    new.provider_keys.remove(parsed.id);
-                }
-                "guardrails" => {
-                    new.guardrails.remove(parsed.id);
-                }
-                "guardrail_attachments" => {
-                    new.guardrail_attachments.remove(parsed.id);
-                }
-                "cache_policies" => {
-                    new.cache_policies.remove(parsed.id);
-                }
-                "observability_exporters" => {
-                    new.observability_exporters.remove(parsed.id);
-                }
-                "rate_limit_policies" => {
-                    new.rate_limit_policies.remove(parsed.id);
-                }
-                "mcp_servers" => {
-                    new.mcp_servers.remove(parsed.id);
-                }
-                "mcp_policies" => {
-                    new.mcp_policies.remove(parsed.id);
-                }
-                "a2a_agents" => {
-                    new.a2a_agents.remove(parsed.id);
-                }
-                "oidc_providers" => {
-                    new.oidc_providers.remove(parsed.id);
-                }
-                "claim_mappings" => {
-                    new.claim_mappings.remove(parsed.id);
-                }
-                "passthrough_routes" => {
-                    new.passthrough_routes.remove(parsed.id);
-                }
-                "mcp_auth_settings" => {
-                    new.mcp_auth_settings.remove(parsed.id);
-                }
-                _ => {}
-            }
-            new
+        view.record_delete(parsed.kind, parsed.id);
+        mutations.push(SnapshotMutation::Remove {
+            kind: parsed.kind.to_string(),
+            id: parsed.id.to_string(),
         });
-        // Stamp /admin/v1/health freshness on a successful delete. We
-        // don't have a per-event revision on the wire delete
-        // (the etcd watch revision is held at the cycle level);
-        // call record_apply with the current revision so age
-        // resets even if the revision number doesn't move.
-        let cur_rev = *self.revision.lock().unwrap();
-        self.status.record_apply(cur_rev);
-        self.sync_config_status(false);
-        self.flush_cache();
+        stamp_max(apply_stamp, *self.revision.lock().unwrap());
+        *changed = true;
+        self.raise_revision_floor(revision, apply_stamp, changed);
         true
+    }
+
+    /// Record an observed etcd write in the state map, with its digest
+    /// record, and advance the revision floor to it.
+    fn store_observed(&self, entry: &RawEntry) {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.insert(entry.key.clone(), StateEntry::new(entry.clone()));
+        }
+        let mut rev = self.revision.lock().unwrap();
+        if entry.revision > *rev {
+            *rev = entry.revision;
+        }
+    }
+
+    /// In-batch form of [`Self::set_revision_floor`]: bump the floor and
+    /// mark the batch as needing a status publish, deferring the single
+    /// `record_apply` / `sync_config_status` to the end of the batch.
+    fn raise_revision_floor(
+        &self,
+        revision: Option<i64>,
+        apply_stamp: &mut Option<i64>,
+        changed: &mut bool,
+    ) {
+        let Some(revision) = revision else {
+            return;
+        };
+        {
+            let mut rev = self.revision.lock().unwrap();
+            if revision > *rev {
+                *rev = revision;
+            }
+        }
+        stamp_max(apply_stamp, revision);
+        *changed = true;
     }
 
     /// Replace the current snapshot with a freshly loaded set (resync).
@@ -933,7 +1015,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             stats
                 .rejections
                 .iter()
-                .filter_map(|r| state.get(&r.key).map(|e| (r.key.clone(), e.clone())))
+                .filter_map(|r| state.get(&r.key).map(|e| (r.key.clone(), e.entry.clone())))
                 .collect()
         };
         let prev_snap = self.handle.load();
@@ -1007,7 +1089,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             let mut state = self.state.lock().unwrap();
             state.clear();
             for e in entries {
-                state.insert(e.key.clone(), e.clone());
+                state.insert(e.key.clone(), StateEntry::new(e.clone()));
             }
         }
         // Resync revision is the max of any entry; if the caller has a
@@ -1047,7 +1129,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     fn flush_cache(&self) {
         let entries: Vec<RawEntry> = {
             let state = self.state.lock().unwrap();
-            state.values().cloned().collect()
+            state.values().map(|e| e.entry.clone()).collect()
         };
         let stale: Vec<StaleServing> = {
             let guard = self.stale_serving.lock().unwrap();
@@ -1186,16 +1268,25 @@ impl<P: ConfigProvider> Supervisor<P> {
             .await
             .map_err(SupervisorError::Provider)?;
 
+        // An event the drain below pulled off the stream but could not
+        // add to its batch (a resync, a stream error, the end of the
+        // stream). Held here so the next loop iteration handles it
+        // exactly as if it had just arrived.
+        let mut pushed_back: Option<Option<Result<WatchEvent, ProviderError>>> = None;
+
         loop {
             if *cancel.borrow() {
                 return Err(SupervisorError::Cancelled);
             }
 
-            let next = tokio::select! {
-                item = stream.next() => item,
-                _ = wait_for_cancel(cancel.clone()) => {
-                    return Err(SupervisorError::Cancelled);
-                }
+            let next = match pushed_back.take() {
+                Some(item) => item,
+                None => tokio::select! {
+                    item = stream.next() => item,
+                    _ = wait_for_cancel(cancel.clone()) => {
+                        return Err(SupervisorError::Cancelled);
+                    }
+                },
             };
 
             match next {
@@ -1208,25 +1299,64 @@ impl<P: ConfigProvider> Supervisor<P> {
                     return Ok(());
                 }
                 Some(Err(err)) => return Err(SupervisorError::Provider(err)),
-                Some(Ok(WatchEvent::Put(raw))) => {
-                    self.apply_put(&raw);
-                }
-                Some(Ok(WatchEvent::Delete { key, revision })) => {
-                    self.apply_delete(&key);
-                    // Advance the applied-revision floor to the delete's
-                    // mod_revision even when the key wasn't present —
-                    // "processed everything up to rev X" must cover
-                    // deletes, otherwise the heartbeat-reported
-                    // applied_revision (#519 B.3) stalls after a CP
-                    // delete until the next put arrives.
-                    self.set_revision_floor(revision);
-                }
                 Some(Ok(WatchEvent::Resync { entries, revision })) => {
                     self.apply_resync(&entries);
-                    // Same rationale: the resync's header revision is the
-                    // "consistent as of" point even when the entry set
-                    // is empty or only contains older mod_revisions.
+                    // The resync's header revision is the "consistent as
+                    // of" point even when the entry set is empty or only
+                    // contains older mod_revisions.
                     self.set_revision_floor(revision);
+                }
+                Some(Ok(first)) => {
+                    // Coalesce: take every Put/Delete that is ALREADY
+                    // waiting on the stream and apply the run as one
+                    // copy-on-write cycle. `now_or_never` never waits, so
+                    // an idle stream still applies each event on its own
+                    // and nothing is delayed to fill a batch. A bulk edit,
+                    // which is where a full-configuration pass per event
+                    // hurts (AISIX-Cloud#1542), arrives faster than the
+                    // apply and coalesces.
+                    let mut batch = vec![first];
+                    while batch.len() < MAX_APPLY_BATCH {
+                        let Some(item) = stream.next().now_or_never() else {
+                            break;
+                        };
+                        match item {
+                            Some(Ok(event @ (WatchEvent::Put(_) | WatchEvent::Delete { .. }))) => {
+                                batch.push(event)
+                            }
+                            other => {
+                                pushed_back = Some(other);
+                                break;
+                            }
+                        }
+                    }
+                    if batch.len() > 1 {
+                        tracing::debug!(
+                            events = batch.len(),
+                            "coalescing watch events into one snapshot publish",
+                        );
+                    }
+                    let staged: Vec<PendingEvent<'_>> = batch
+                        .iter()
+                        .map(|event| match event {
+                            WatchEvent::Put(raw) => PendingEvent::Put(raw),
+                            // Advance the applied-revision floor to the
+                            // delete's mod_revision even when the key
+                            // wasn't present — "processed everything up
+                            // to rev X" must cover deletes, otherwise the
+                            // heartbeat-reported applied_revision (#519
+                            // B.3) stalls after a CP delete until the next
+                            // put arrives.
+                            WatchEvent::Delete { key, revision } => PendingEvent::Delete {
+                                key,
+                                revision: Some(*revision),
+                            },
+                            WatchEvent::Resync { .. } => {
+                                unreachable!("a resync is never added to a coalesced batch")
+                            }
+                        })
+                        .collect();
+                    self.apply_events(&staged);
                 }
             }
         }
@@ -1251,15 +1381,156 @@ async fn wait_for_cancel(mut rx: tokio::sync::watch::Receiver<bool>) {
     }
 }
 
-/// Shallow clone of every [`Arc<ResourceEntry>`] — fast and, importantly,
-/// it doesn't materialise a deep copy of the `T` payload.
-fn clone_snapshot(src: &AisixSnapshot) -> AisixSnapshot {
-    let out = AisixSnapshot::new();
-    merge_snapshot(&out, src);
+/// Largest number of watch events one coalesced apply may cover.
+///
+/// The drain only takes events that are ALREADY queued, so this is not a
+/// latency knob — an idle stream applies each event on its own. It bounds
+/// how long one apply can hold off the publish when the control plane
+/// pushes a bulk edit, so a slow batch cannot make the served snapshot
+/// arbitrarily stale.
+const MAX_APPLY_BATCH: usize = 512;
+
+/// One watch event staged for a coalesced apply.
+enum PendingEvent<'a> {
+    Put(&'a RawEntry),
+    Delete {
+        key: &'a str,
+        /// The watch header revision. `None` leaves the revision floor
+        /// alone, which is what the standalone `apply_delete` entry point
+        /// has always done.
+        revision: Option<i64>,
+    },
+}
+
+/// One staged change to the snapshot, replayed onto a fresh structural
+/// clone inside the RCU closure.
+enum SnapshotMutation {
+    /// Merge an accepted put's single-entry snapshot. Boxed: an
+    /// `AisixSnapshot` is fifteen tables wide and the delete variant is
+    /// two strings.
+    Merge(Box<AisixSnapshot>),
+    Remove {
+        kind: String,
+        id: String,
+    },
+}
+
+impl SnapshotMutation {
+    fn apply_to(&self, dst: &AisixSnapshot) {
+        match self {
+            // `merge_snapshot` must cover every ResourceTable on
+            // AisixSnapshot — a missing kind there means a watch event
+            // silently drops on the floor and the snapshot never sees the
+            // new entry, even though the loader and the proxy both know
+            // about it.
+            Self::Merge(src) => merge_snapshot(dst, src),
+            Self::Remove { kind, id } => remove_from_snapshot(dst, kind, id),
+        }
+    }
+}
+
+/// The staged mutations of a batch, as a presence overlay on the snapshot
+/// the batch started from. Lets the per-event decisions that ask "does
+/// this row serve right now?" see the batch's own earlier events, which
+/// have not been published yet.
+#[derive(Debug, Default)]
+struct BatchView {
+    added: HashSet<(String, String)>,
+    removed: HashSet<(String, String)>,
+}
+
+impl BatchView {
+    fn record_put(&mut self, prefix: &str, key_str: &str) {
+        let Ok(parsed) = key::parse(prefix, key_str) else {
+            return;
+        };
+        let id = (parsed.kind.to_string(), parsed.id.to_string());
+        self.removed.remove(&id);
+        self.added.insert(id);
+    }
+
+    fn record_delete(&mut self, kind: &str, id: &str) {
+        let id = (kind.to_string(), id.to_string());
+        self.added.remove(&id);
+        self.removed.insert(id);
+    }
+
+    fn present(&self, base: &AisixSnapshot, kind: &str, id: &str) -> bool {
+        let probe = (kind.to_string(), id.to_string());
+        if self.removed.contains(&probe) {
+            return false;
+        }
+        if self.added.contains(&probe) {
+            return true;
+        }
+        snapshot_has(base, kind, id)
+    }
+}
+
+/// Keep the larger of `slot` and `revision`.
+fn stamp_max(slot: &mut Option<i64>, revision: i64) {
+    *slot = Some(match *slot {
+        Some(current) if current >= revision => current,
+        _ => revision,
+    });
+}
+
+/// The digest records for the bytes each key ACTUALLY serves, in the
+/// ascending-key order `hash_records` is defined over: the observed etcd
+/// bytes for an accepted key, the pinned last-known-good bytes for a
+/// stale-serving one (#871), and nothing for a key rejected with no last
+/// good. `state` is already sorted, so the pinned records are merged into
+/// the walk rather than sorted with it.
+fn served_records(
+    state: &BTreeMap<String, StateEntry>,
+    rejected_keys: &HashSet<&str>,
+    stale: &HashMap<String, StaleServing>,
+) -> Vec<Arc<[u8]>> {
+    let mut pinned: Vec<(&str, Arc<[u8]>)> = stale
+        .values()
+        .map(|s| {
+            let record: Arc<[u8]> = hash_record(&s.entry.key, &s.entry.value).into();
+            (s.entry.key.as_str(), record)
+        })
+        .collect();
+    pinned.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut out: Vec<Arc<[u8]>> = Vec::with_capacity(state.len() + pinned.len());
+    let mut next_pinned = 0usize;
+    for (key, entry) in state {
+        // A pinned key etcd no longer reports still serves — emit it in
+        // its own place in the ordering rather than at the end.
+        while next_pinned < pinned.len() && pinned[next_pinned].0 < key.as_str() {
+            out.push(pinned[next_pinned].1.clone());
+            next_pinned += 1;
+        }
+        if next_pinned < pinned.len() && pinned[next_pinned].0 == key.as_str() {
+            out.push(pinned[next_pinned].1.clone());
+            next_pinned += 1;
+            continue;
+        }
+        if rejected_keys.contains(key.as_str()) {
+            continue;
+        }
+        out.push(entry.record.clone());
+    }
+    for (_, record) in &pinned[next_pinned..] {
+        out.push(record.clone());
+    }
     out
 }
 
-/// Insert every entry of `src` into `dst` (replacing same-id entries).
+/// Structural clone: the new snapshot shares every
+/// [`Arc<ResourceEntry>`][aisix_core::ResourceEntry] with `src` and copies
+/// each table's generation, so the copy-on-write cycle behind one watch
+/// event costs a per-row `Arc` bump rather than a deep copy of every
+/// payload in the configuration, and leaves every derived cache valid.
+fn clone_snapshot(src: &AisixSnapshot) -> AisixSnapshot {
+    src.clone()
+}
+
+/// Insert every entry of `src` into `dst` (replacing same-id entries),
+/// sharing the `Arc` rather than copying the payload.
 /// The exhaustive destructuring makes adding a ResourceTable to
 /// [`AisixSnapshot`] a compile error here — a missing kind would mean
 /// entries silently drop on the floor when a watch put merges or a
@@ -1283,49 +1554,103 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
         mcp_auth_settings,
     } = src;
     for e in models.entries() {
-        dst.models.insert(clone_entry(&e));
+        dst.models.insert_arc(e);
     }
     for e in apikeys.entries() {
-        dst.apikeys.insert(clone_entry(&e));
+        dst.apikeys.insert_arc(e);
     }
     for e in provider_keys.entries() {
-        dst.provider_keys.insert(clone_entry(&e));
+        dst.provider_keys.insert_arc(e);
     }
     for e in guardrails.entries() {
-        dst.guardrails.insert(clone_entry(&e));
+        dst.guardrails.insert_arc(e);
     }
     for e in guardrail_attachments.entries() {
-        dst.guardrail_attachments.insert(clone_entry(&e));
+        dst.guardrail_attachments.insert_arc(e);
     }
     for e in cache_policies.entries() {
-        dst.cache_policies.insert(clone_entry(&e));
+        dst.cache_policies.insert_arc(e);
     }
     for e in observability_exporters.entries() {
-        dst.observability_exporters.insert(clone_entry(&e));
+        dst.observability_exporters.insert_arc(e);
     }
     for e in rate_limit_policies.entries() {
-        dst.rate_limit_policies.insert(clone_entry(&e));
+        dst.rate_limit_policies.insert_arc(e);
     }
     for e in mcp_servers.entries() {
-        dst.mcp_servers.insert(clone_entry(&e));
+        dst.mcp_servers.insert_arc(e);
     }
     for e in mcp_policies.entries() {
-        dst.mcp_policies.insert(clone_entry(&e));
+        dst.mcp_policies.insert_arc(e);
     }
     for e in a2a_agents.entries() {
-        dst.a2a_agents.insert(clone_entry(&e));
+        dst.a2a_agents.insert_arc(e);
     }
     for e in oidc_providers.entries() {
-        dst.oidc_providers.insert(clone_entry(&e));
+        dst.oidc_providers.insert_arc(e);
     }
     for e in claim_mappings.entries() {
-        dst.claim_mappings.insert(clone_entry(&e));
+        dst.claim_mappings.insert_arc(e);
     }
     for e in passthrough_routes.entries() {
-        dst.passthrough_routes.insert(clone_entry(&e));
+        dst.passthrough_routes.insert_arc(e);
     }
     for e in mcp_auth_settings.entries() {
-        dst.mcp_auth_settings.insert(clone_entry(&e));
+        dst.mcp_auth_settings.insert_arc(e);
+    }
+}
+
+/// Remove `(kind, id)` from `snap`. An unknown kind is a no-op —
+/// [`snapshot_has`] already read it as absent, so nothing staged a
+/// removal for it.
+fn remove_from_snapshot(snap: &AisixSnapshot, kind: &str, id: &str) {
+    match kind {
+        "models" => {
+            snap.models.remove(id);
+        }
+        "api_keys" => {
+            snap.apikeys.remove(id);
+        }
+        "provider_keys" => {
+            snap.provider_keys.remove(id);
+        }
+        "guardrails" => {
+            snap.guardrails.remove(id);
+        }
+        "guardrail_attachments" => {
+            snap.guardrail_attachments.remove(id);
+        }
+        "cache_policies" => {
+            snap.cache_policies.remove(id);
+        }
+        "observability_exporters" => {
+            snap.observability_exporters.remove(id);
+        }
+        "rate_limit_policies" => {
+            snap.rate_limit_policies.remove(id);
+        }
+        "mcp_servers" => {
+            snap.mcp_servers.remove(id);
+        }
+        "mcp_policies" => {
+            snap.mcp_policies.remove(id);
+        }
+        "a2a_agents" => {
+            snap.a2a_agents.remove(id);
+        }
+        "oidc_providers" => {
+            snap.oidc_providers.remove(id);
+        }
+        "claim_mappings" => {
+            snap.claim_mappings.remove(id);
+        }
+        "passthrough_routes" => {
+            snap.passthrough_routes.remove(id);
+        }
+        "mcp_auth_settings" => {
+            snap.mcp_auth_settings.remove(id);
+        }
+        _ => {}
     }
 }
 
@@ -1411,14 +1736,6 @@ fn resource_counts(snap: &AisixSnapshot) -> BTreeMap<String, usize> {
     counts
 }
 
-fn clone_entry<T: Clone>(src: &Arc<aisix_core::ResourceEntry<T>>) -> aisix_core::ResourceEntry<T> {
-    aisix_core::ResourceEntry {
-        id: src.id.clone(),
-        value: src.value.clone(),
-        revision: src.revision,
-    }
-}
-
 /// Total time the supervisor will wait across its full 1→60s backoff
 /// ladder before saturating. Exposed as a constant for tests and docs.
 pub const BACKOFF_SATURATE_AFTER: Duration = Duration::from_secs(63);
@@ -1483,6 +1800,262 @@ mod tests {
             value: v.to_vec(),
             revision: rev,
         }
+    }
+
+    const VALID_APIKEY: &[u8] = br#"{
+        "key_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "allowed_models": ["my-gpt4"]
+    }"#;
+
+    const VALID_GUARDRAIL: &[u8] = br#"{
+        "name": "kw",
+        "kind": "keyword",
+        "patterns": [{"kind": "literal", "value": "AKIA"}]
+    }"#;
+
+    /// The two config digests must stay byte-identical to what the
+    /// unchanged `hash_entries` produces over the same served set: cp-api
+    /// stores `config_hash` verbatim and never recomputes it, and the
+    /// algorithm is documented in the public Admin API reference. The
+    /// fixture drives the three shapes the cached-record path has to get
+    /// right at once — an accepted row, a row rejected with nothing to
+    /// serve, and a row serving its pinned last known good while etcd
+    /// holds bytes that do not load.
+    #[tokio::test]
+    async fn config_digests_match_the_reference_algorithm() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+
+        assert!(sup.apply_put(&entry("/aisix/models/m-1", VALID_MODEL, 2)));
+        assert!(sup.apply_put(&entry("/aisix/api_keys/k-1", VALID_APIKEY, 3)));
+        assert!(sup.apply_put(&entry("/aisix/guardrails/g-1", VALID_GUARDRAIL, 4)));
+        // Rejected with no previous good value: serves nothing.
+        assert!(!sup.apply_put(&entry("/aisix/models/m-2", b"{\"display_name\": 7}", 5)));
+        // Rejected over a row that WAS serving: keeps serving the pin.
+        // Deliberately a key that sorts in the MIDDLE of the served set —
+        // the pinned record has to take the key's own place in the
+        // ordering, and a digest over the right bytes in the wrong order
+        // is a different digest.
+        assert!(!sup.apply_put(&entry("/aisix/guardrails/g-1", b"not json at all", 6)));
+
+        let view = sup.config_status().view();
+        let state: Vec<(String, Vec<u8>)> = sup
+            .state
+            .lock()
+            .unwrap()
+            .values()
+            .map(|e| (e.entry.key.clone(), e.entry.value.clone()))
+            .collect();
+        let stale = sup.stale_serving.lock().unwrap().clone();
+        assert_eq!(
+            stale.len(),
+            1,
+            "the pinned row is what makes the two differ"
+        );
+        let rejected: HashSet<String> = sup
+            .rejections
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.key.clone())
+            .collect();
+        assert_eq!(rejected.len(), 2);
+
+        let expected_source = aisix_core::config_status::hash_entries(
+            state.iter().map(|(k, v)| (k.as_str(), v.as_slice())),
+        );
+        let expected_config = aisix_core::config_status::hash_entries(
+            state
+                .iter()
+                .filter(|(k, _)| !rejected.contains(k) && !stale.contains_key(k))
+                .map(|(k, v)| (k.as_str(), v.as_slice()))
+                .chain(
+                    stale
+                        .values()
+                        .map(|s| (s.entry.key.as_str(), s.entry.value.as_slice())),
+                ),
+        );
+        assert_eq!(
+            view.source.source_hash.as_deref(),
+            Some(expected_source.as_str())
+        );
+        assert_eq!(view.applied.as_ref().unwrap().config_hash, expected_config);
+        assert_ne!(expected_source, expected_config);
+
+        // The STALE map, not the capped rejection buffer, decides which
+        // keys substitute their pinned bytes. Drop the pinned key's
+        // rejection — what a buffer overflow does — and the served bytes
+        // must not flip to the ones that do not load.
+        assert!(sup.remove_rejection_for_key("/aisix/guardrails/g-1"));
+        sup.sync_config_status(false);
+        let expected_overflow = aisix_core::config_status::hash_entries(
+            state
+                .iter()
+                .filter(|(k, _)| k != "/aisix/models/m-2" && !stale.contains_key(k))
+                .map(|(k, v)| (k.as_str(), v.as_slice()))
+                .chain(
+                    stale
+                        .values()
+                        .map(|s| (s.entry.key.as_str(), s.entry.value.as_slice())),
+                ),
+        );
+        assert_eq!(expected_overflow, expected_config);
+        assert_eq!(
+            sup.config_status()
+                .view()
+                .applied
+                .as_ref()
+                .unwrap()
+                .config_hash,
+            expected_overflow,
+        );
+    }
+
+    /// A watch event must not deep-copy the configuration. The published
+    /// snapshot shares every row it did not change with its predecessor —
+    /// which is also what makes a derived cache able to tell an unchanged
+    /// row from a rewritten one by `Arc` identity.
+    #[tokio::test]
+    async fn a_put_shares_every_untouched_row_with_the_previous_snapshot() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+        assert!(sup.apply_put(&entry("/aisix/models/m-1", VALID_MODEL, 2)));
+        assert!(sup.apply_put(&entry("/aisix/guardrails/g-1", VALID_GUARDRAIL, 3)));
+
+        let before = sup.handle().load();
+        let model_before = before.models.get_by_id("m-1").unwrap();
+        let guardrail_before = before.guardrails.get_by_id("g-1").unwrap();
+
+        assert!(sup.apply_put(&entry("/aisix/api_keys/k-1", VALID_APIKEY, 4)));
+
+        let after = sup.handle().load();
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "a new snapshot was published"
+        );
+        assert!(Arc::ptr_eq(
+            &model_before,
+            &after.models.get_by_id("m-1").unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &guardrail_before,
+            &after.guardrails.get_by_id("g-1").unwrap()
+        ));
+    }
+
+    /// A write bumps the generation of the table it touched and of no
+    /// other, across the copy-on-write publish. This is the invalidation
+    /// key every derived cache reads (AISIX-Cloud#1542).
+    #[tokio::test]
+    async fn only_the_written_table_changes_generation() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+        assert!(sup.apply_put(&entry("/aisix/guardrails/g-1", VALID_GUARDRAIL, 2)));
+
+        let before = sup.handle().load();
+        let (g0, m0) = (before.guardrails.generation(), before.models.generation());
+
+        assert!(sup.apply_put(&entry("/aisix/api_keys/k-1", VALID_APIKEY, 3)));
+        let after = sup.handle().load();
+        assert!(after.apikeys.generation() > before.apikeys.generation());
+        assert_eq!(after.guardrails.generation(), g0);
+        assert_eq!(after.models.generation(), m0);
+        assert!(
+            sup.handle().version() > 0,
+            "the global version still moves on every publish"
+        );
+
+        assert!(sup.apply_put(&entry("/aisix/models/m-1", VALID_MODEL, 4)));
+        let latest = sup.handle().load();
+        assert!(latest.models.generation() > m0);
+        assert_eq!(latest.guardrails.generation(), g0);
+
+        // A delete moves it too.
+        assert!(sup.apply_delete("/aisix/guardrails/g-1"));
+        assert!(sup.handle().load().guardrails.generation() > g0);
+    }
+
+    /// A run of watch events that is already queued is applied as ONE
+    /// copy-on-write cycle: one publish, one status sync, one cache
+    /// flush. Per-event decisions still run per event and in order.
+    #[tokio::test]
+    async fn a_queued_run_of_events_publishes_once() {
+        let events: Vec<Result<WatchEvent, ProviderError>> = (1..=6)
+            .map(|i| {
+                Ok(WatchEvent::Put(entry(
+                    &format!("/aisix/models/m-{i}"),
+                    VALID_MODEL,
+                    i,
+                )))
+            })
+            .collect();
+        let provider = Arc::new(FakeProvider::new(vec![], 0).with_events(events));
+        let sup = Arc::new(Supervisor::new(provider, "/aisix"));
+        let version_before = sup.handle().version();
+        let reloads_before = sup.config_status().metrics().reloads_total;
+
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        // One cycle: load_all, then drain the whole prepared stream.
+        let _ = sup.cycle(&rx).await;
+
+        let snap = sup.handle().load();
+        assert_eq!(snap.models.len(), 6);
+        // The initial resync publishes once; the six puts publish once
+        // between them. Before the coalescing they published six times.
+        assert_eq!(
+            sup.handle().version() - version_before,
+            2,
+            "the queued run should be one publish on top of the resync",
+        );
+        // Every model row shares one generation stamp — they were merged
+        // into a single table mutation cycle, not six.
+        assert_eq!(
+            sup.config_status().metrics().reloads_total - reloads_before,
+            1,
+            "only the resync counts as a reload",
+        );
+    }
+
+    /// Coalescing must not change what the individual events decided.
+    #[tokio::test]
+    async fn a_batch_decides_exactly_what_the_events_decide_alone() {
+        let events: Vec<Result<WatchEvent, ProviderError>> = vec![
+            Ok(WatchEvent::Put(entry("/aisix/models/m-1", VALID_MODEL, 2))),
+            Ok(WatchEvent::Put(entry(
+                "/aisix/api_keys/k-1",
+                VALID_APIKEY,
+                3,
+            ))),
+            // Rejected AFTER the accepted put of the same key: the row is
+            // serving as far as this decision goes, even though the
+            // snapshot carrying it has not been published yet, so its
+            // bytes are pinned as the last known good.
+            Ok(WatchEvent::Put(entry(
+                "/aisix/models/m-1",
+                b"not json at all",
+                4,
+            ))),
+            Ok(WatchEvent::Delete {
+                key: "/aisix/api_keys/k-1".into(),
+                revision: 5,
+            }),
+        ];
+        let provider = Arc::new(FakeProvider::new(vec![], 0).with_events(events));
+        let sup = Arc::new(Supervisor::new(provider, "/aisix"));
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let _ = sup.cycle(&rx).await;
+
+        let snap = sup.handle().load();
+        assert_eq!(snap.models.len(), 1, "the pinned last known good serves");
+        assert_eq!(snap.apikeys.len(), 0, "the delete landed");
+        let stale = sup.stale_serving.lock().unwrap();
+        assert!(
+            stale.contains_key("/aisix/models/m-1"),
+            "the earlier put in the same batch counted as serving",
+        );
     }
 
     #[tokio::test]

@@ -365,6 +365,7 @@ impl McpGateway {
         snapshot: &AisixSnapshot,
         client_headers: Option<&http::HeaderMap>,
     ) -> Self {
+        crate::openapi::sweep_tool_cache(&snapshot.mcp_servers);
         let upstreams = snapshot
             .mcp_servers
             .entries()
@@ -408,6 +409,7 @@ impl McpGateway {
         server: &str,
         client_headers: Option<&http::HeaderMap>,
     ) -> Option<Self> {
+        crate::openapi::sweep_tool_cache(&snapshot.mcp_servers);
         let entry = snapshot.mcp_servers.get_by_name(server)?;
         if !entry.value.enabled {
             return None;
