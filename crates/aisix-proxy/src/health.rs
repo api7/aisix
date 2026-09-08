@@ -721,12 +721,20 @@ impl ModelRuntimeStatusTracker {
         model_id: &str,
         reason: &'static str,
     ) -> bool {
-        let now = Instant::now();
         let key = (virtual_name.to_string(), model_id.to_string(), reason);
-        match self.exclusion_log.get(&key) {
-            Some(at) if now.duration_since(*at) < EXCLUSION_LOG_INTERVAL => false,
-            _ => {
-                self.exclusion_log.insert(key, now);
+        // Decide and update under one guard. A get() guard held by a match
+        // scrutinee would survive into insert() and deadlock on expiration.
+        match self.exclusion_log.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let now = Instant::now();
+                if now.duration_since(*entry.get()) < EXCLUSION_LOG_INTERVAL {
+                    return false;
+                }
+                entry.insert(now);
+                true
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(Instant::now());
                 true
             }
         }
@@ -1633,6 +1641,68 @@ mod tests {
         // its own operator reading it.
         assert!(t.should_log_exclusion("g-2", "m-1", "cooling"));
         assert!(!t.should_log_exclusion("g-2", "m-1", "cooling"));
+    }
+
+    #[test]
+    fn exclusion_log_gate_reopens_after_the_interval_without_blocking() {
+        let t = Arc::new(ModelRuntimeStatusTracker::new());
+        t.exclusion_log.insert(
+            ("g-1".to_string(), "m-1".to_string(), "cooling"),
+            Instant::now() - EXCLUSION_LOG_INTERVAL,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let reopened = t.should_log_exclusion("g-1", "m-1", "cooling");
+            let repeated = t.should_log_exclusion("g-1", "m-1", "cooling");
+            tx.send((reopened, repeated)).unwrap();
+        });
+        // A synchronous lock deadlock cannot be bounded by a Tokio timeout
+        // on the same worker. Keep the watchdog on the test thread.
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("exclusion logging blocked after its throttle expired"),
+            (true, false),
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn exclusion_log_gate_allows_one_concurrent_writer_per_window() {
+        for expired in [false, true] {
+            let t = Arc::new(ModelRuntimeStatusTracker::new());
+            if expired {
+                t.exclusion_log.insert(
+                    ("g-1".to_string(), "m-1".to_string(), "cooling"),
+                    Instant::now() - EXCLUSION_LOG_INTERVAL,
+                );
+            }
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    let t = t.clone();
+                    let barrier = barrier.clone();
+                    let tx = tx.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        tx.send(t.should_log_exclusion("g-1", "m-1", "cooling"))
+                            .unwrap();
+                    })
+                })
+                .collect();
+            let allowed = (0..8)
+                .map(|_| {
+                    usize::from(
+                        rx.recv_timeout(Duration::from_secs(2))
+                            .expect("concurrent exclusion logging blocked"),
+                    )
+                })
+                .sum::<usize>();
+            assert_eq!(allowed, 1, "expired={expired}");
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        }
     }
 
     #[test]
