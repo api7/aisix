@@ -3483,6 +3483,7 @@ mod tests {
         async fn embed(
             &self,
             _model_alias: &str,
+            _model_id: Option<&str>,
             texts: &[String],
             _cacheable: bool,
             _timeout: std::time::Duration,

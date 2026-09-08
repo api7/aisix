@@ -29,10 +29,31 @@
       ]
     },
     "SemanticCacheConfig": {
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "required": [
+                "embedding_model"
+              ]
+            },
+            {
+              "required": [
+                "embedding_model_id"
+              ]
+            }
+          ]
+        }
+      ],
       "description": "Embedding-similarity matching for a cache policy. When present, a request that misses the exact layer is embedded and compared against stored entries; the nearest entry at or above `threshold` cosine similarity is served. Only requests whose messages are entirely text participate — requests containing images or audio never match by similarity.\n\nOn `backend: redis`, similarity matching requires a Redis server with vector search (Redis 8 or later, or the search module) in `single` or `sentinel` mode; without it — or in `cluster` mode — the policy keeps serving exact matches only and a warning is logged.",
       "properties": {
         "embedding_model": {
-          "description": "Name of the `embedding` model used to embed requests. The model must exist in the same environment and carry an `embedding` block; its `dimensions` value fixes the vector size for this policy's entries.",
+          "description": "Name of the `embedding` model used to embed requests. The model must exist in the same environment and carry an `embedding` block; its `dimensions` value fixes the vector size for this policy's entries. Read only when `embedding_model_id` is absent.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "embedding_model_id": {
+          "description": "Resource id of the `embedding` model used to embed requests. Present, it is authoritative and `embedding_model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this policy pointing at it with no edit to this document. An id resolving to no model leaves similarity matching off for the policy, exactly as an `embedding_model` naming no model does.",
           "minLength": 1,
           "type": "string"
         },
@@ -59,7 +80,6 @@
         }
       },
       "required": [
-        "embedding_model",
         "threshold"
       ],
       "type": "object"
@@ -69,8 +89,13 @@
   "properties": {
     "applies_to": {
       "default": "all",
-      "description": "Free-form scope. Supports `\"all\"`, `\"model:<name>\"`, and `\"api_key:<id>\"`. See `parsed_applies_to`.",
+      "description": "Free-form scope. Supports `\"all\"`, `\"model:<name>\"`, and `\"api_key:<id>\"`. Read only when `applies_to_model_id` is absent. See `parsed_applies_to`.",
       "maxLength": 255,
+      "minLength": 1,
+      "type": "string"
+    },
+    "applies_to_model_id": {
+      "description": "Scopes the policy to one model, named by resource id. Present, it is authoritative and `applies_to` is ignored entirely — the policy applies to the model this id resolves to and to nothing else. The id is resolved against the models in the current configuration, so renaming that model keeps the policy scoped to it with no edit to this document. An id resolving to no model makes the policy match nothing, exactly as `\"model:<name>\"` naming no model does.",
       "minLength": 1,
       "type": "string"
     },

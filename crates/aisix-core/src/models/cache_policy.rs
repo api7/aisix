@@ -61,9 +61,21 @@ pub struct SemanticCacheConfig {
     /// Name of the `embedding` model used to embed requests. The model
     /// must exist in the same environment and carry an `embedding`
     /// block; its `dimensions` value fixes the vector size for this
-    /// policy's entries.
+    /// policy's entries. Read only when `embedding_model_id` is absent.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     #[schemars(length(min = 1))]
     pub embedding_model: String,
+
+    /// Resource id of the `embedding` model used to embed requests.
+    /// Present, it is authoritative and `embedding_model` is ignored: the
+    /// id is resolved against the models in the current configuration, so
+    /// renaming that model keeps this policy pointing at it with no edit
+    /// to this document. An id resolving to no model leaves similarity
+    /// matching off for the policy, exactly as an `embedding_model` naming
+    /// no model does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub embedding_model_id: Option<String>,
 
     /// Minimum cosine similarity for a stored entry to be served, in
     /// `[0, 1]`. Higher is stricter. Values below `0.9` noticeably
@@ -127,10 +139,22 @@ pub struct CachePolicy {
     pub ttl_seconds: u32,
 
     /// Free-form scope. Supports `"all"`, `"model:<name>"`, and
-    /// `"api_key:<id>"`. See `parsed_applies_to`.
+    /// `"api_key:<id>"`. Read only when `applies_to_model_id` is absent.
+    /// See `parsed_applies_to`.
     #[serde(default = "default_applies_to")]
     #[schemars(length(min = 1, max = 255))]
     pub applies_to: String,
+
+    /// Scopes the policy to one model, named by resource id. Present, it
+    /// is authoritative and `applies_to` is ignored entirely — the policy
+    /// applies to the model this id resolves to and to nothing else. The
+    /// id is resolved against the models in the current configuration, so
+    /// renaming that model keeps the policy scoped to it with no edit to
+    /// this document. An id resolving to no model makes the policy match
+    /// nothing, exactly as `"model:<name>"` naming no model does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub applies_to_model_id: Option<String>,
 
     /// Sharing boundary for entries created under this policy:
     /// `api_key` (default) keeps entries private to the caller that
@@ -193,7 +217,11 @@ impl CachePolicy {
         self
     }
 
-    /// Parse `applies_to` into a typed matcher. Stage 3 understands:
+    /// Parse this policy's scope into a typed matcher.
+    ///
+    /// `applies_to_model_id`, when present, decides on its own: the policy
+    /// is scoped to the model that id resolves to, and `applies_to` is not
+    /// read. Otherwise `applies_to` is parsed. Stage 3 understands:
     ///
     ///   - `"all"`            → matches every request in the env
     ///   - `"model:<name>"`   → matches requests targeting that model alias
@@ -205,7 +233,13 @@ impl CachePolicy {
     /// cp-api validation prevents the empty-string case at write time
     /// (see internal/cpapi/resources/cache_policies.go::validateCachePolicyShape),
     /// so the conservative branch is dead in practice.
-    pub fn parsed_applies_to(&self) -> AppliesTo {
+    pub fn parsed_applies_to(&self, snapshot: &super::AisixSnapshot) -> AppliesTo {
+        if let Some(id) = self.applies_to_model_id.as_deref() {
+            // `resolve_model_ref` hands back the id itself when it names no
+            // model, which matches no request's model name — the same
+            // no-op an `applies_to: "model:<gone>"` already is.
+            return AppliesTo::Model(super::resolve_model_ref(snapshot, "", Some(id)).into_owned());
+        }
         let raw = self.applies_to.trim();
         if let Some(rest) = raw.strip_prefix("model:") {
             return AppliesTo::Model(rest.trim().to_string());
@@ -252,7 +286,31 @@ impl AppliesTo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resource::ResourceEntry;
     use serde_json::json;
+
+    /// A snapshot holding one model per `(id, display_name)` pair, so an
+    /// `applies_to_model_id` has something to resolve against.
+    fn snapshot_with_models(models: &[(&str, &str)]) -> crate::models::AisixSnapshot {
+        let snap = crate::models::AisixSnapshot::default();
+        for (id, display_name) in models {
+            let model: crate::models::Model = serde_json::from_str(&format!(
+                r#"{{
+                  "display_name": "{display_name}",
+                  "provider": "openai",
+                  "model_name": "gpt-4o",
+                  "provider_key_id": "11111111-1111-1111-1111-111111111111"
+                }}"#
+            ))
+            .unwrap();
+            snap.models.insert(ResourceEntry::new(*id, model, 1));
+        }
+        snap
+    }
+
+    fn empty_snapshot() -> crate::models::AisixSnapshot {
+        crate::models::AisixSnapshot::default()
+    }
 
     #[test]
     fn deserialises_minimal_memory_policy() {
@@ -301,17 +359,26 @@ mod tests {
     fn applies_to_all_matches_anything() {
         let p: CachePolicy =
             serde_json::from_value(json!({"name": "x", "applies_to": "all"})).unwrap();
-        assert_eq!(p.parsed_applies_to(), AppliesTo::All);
-        assert!(p.parsed_applies_to().matches("any-model", "any-key"));
+        assert_eq!(p.parsed_applies_to(&empty_snapshot()), AppliesTo::All);
+        assert!(p
+            .parsed_applies_to(&empty_snapshot())
+            .matches("any-model", "any-key"));
     }
 
     #[test]
     fn applies_to_model_matches_only_named_model() {
         let p: CachePolicy =
             serde_json::from_value(json!({"name": "x", "applies_to": "model:gpt-4o"})).unwrap();
-        assert_eq!(p.parsed_applies_to(), AppliesTo::Model("gpt-4o".into()));
-        assert!(p.parsed_applies_to().matches("gpt-4o", "any-key"));
-        assert!(!p.parsed_applies_to().matches("claude-3-opus", "any-key"));
+        assert_eq!(
+            p.parsed_applies_to(&empty_snapshot()),
+            AppliesTo::Model("gpt-4o".into())
+        );
+        assert!(p
+            .parsed_applies_to(&empty_snapshot())
+            .matches("gpt-4o", "any-key"));
+        assert!(!p
+            .parsed_applies_to(&empty_snapshot())
+            .matches("claude-3-opus", "any-key"));
     }
 
     #[test]
@@ -322,9 +389,100 @@ mod tests {
             "applies_to": format!("api_key:{kid}")
         }))
         .unwrap();
-        assert_eq!(p.parsed_applies_to(), AppliesTo::ApiKey(kid.into()));
-        assert!(p.parsed_applies_to().matches("gpt-4o", kid));
-        assert!(!p.parsed_applies_to().matches("gpt-4o", "different-key-id"));
+        assert_eq!(
+            p.parsed_applies_to(&empty_snapshot()),
+            AppliesTo::ApiKey(kid.into())
+        );
+        assert!(p
+            .parsed_applies_to(&empty_snapshot())
+            .matches("gpt-4o", kid));
+        assert!(!p
+            .parsed_applies_to(&empty_snapshot())
+            .matches("gpt-4o", "different-key-id"));
+    }
+
+    #[test]
+    fn applies_to_model_id_scopes_the_policy_by_resource_id() {
+        let snap = snapshot_with_models(&[("m-1", "gpt-4o"), ("m-2", "claude")]);
+        let p: CachePolicy = serde_json::from_value(json!({
+            "name": "x",
+            "applies_to_model_id": "m-1"
+        }))
+        .unwrap();
+        assert_eq!(
+            p.parsed_applies_to(&snap),
+            AppliesTo::Model("gpt-4o".into())
+        );
+        assert!(p.parsed_applies_to(&snap).matches("gpt-4o", "any-key"));
+        assert!(!p.parsed_applies_to(&snap).matches("claude", "any-key"));
+    }
+
+    #[test]
+    fn applies_to_model_id_follows_a_rename() {
+        let p: CachePolicy =
+            serde_json::from_value(json!({"name": "x", "applies_to_model_id": "m-1"})).unwrap();
+        let before = snapshot_with_models(&[("m-1", "gpt-4o")]);
+        assert!(p.parsed_applies_to(&before).matches("gpt-4o", "k"));
+        // Same id, new name; the policy document is untouched.
+        let after = snapshot_with_models(&[("m-1", "gpt-4o-v2")]);
+        assert!(p.parsed_applies_to(&after).matches("gpt-4o-v2", "k"));
+        assert!(!p.parsed_applies_to(&after).matches("gpt-4o", "k"));
+    }
+
+    #[test]
+    fn applies_to_model_id_wins_over_applies_to() {
+        let snap = snapshot_with_models(&[("m-1", "gpt-4o")]);
+        // Even the widest `applies_to` loses to an explicit model id.
+        let p: CachePolicy = serde_json::from_value(json!({
+            "name": "x",
+            "applies_to": "all",
+            "applies_to_model_id": "m-1"
+        }))
+        .unwrap();
+        assert!(p.parsed_applies_to(&snap).matches("gpt-4o", "k"));
+        assert!(!p.parsed_applies_to(&snap).matches("claude", "k"));
+    }
+
+    /// An id that resolves to no model scopes the policy to a model name
+    /// nothing answers to — byte-for-byte the matcher a dangling
+    /// `applies_to: "model:<gone>"` already produces, so the policy stops
+    /// matching real traffic rather than falling back to `all`.
+    #[test]
+    fn unresolvable_applies_to_model_id_matches_what_a_dangling_name_matches() {
+        let snap = snapshot_with_models(&[("m-1", "gpt-4o")]);
+        let by_id: CachePolicy = serde_json::from_value(json!({
+            "name": "x",
+            "applies_to": "all",
+            "applies_to_model_id": "m-gone"
+        }))
+        .unwrap();
+        let by_name: CachePolicy =
+            serde_json::from_value(json!({"name": "x", "applies_to": "model:m-gone"})).unwrap();
+        assert_eq!(
+            by_id.parsed_applies_to(&snap),
+            by_name.parsed_applies_to(&snap)
+        );
+        assert!(!by_id.parsed_applies_to(&snap).matches("gpt-4o", "k"));
+    }
+
+    #[test]
+    fn semantic_embedding_model_id_is_carried_through() {
+        let p: CachePolicy = serde_json::from_value(json!({
+            "name": "faq",
+            "semantic": {"embedding_model_id": "m-e", "threshold": 0.9}
+        }))
+        .unwrap();
+        let sem = p.semantic.as_ref().unwrap();
+        assert_eq!(sem.embedding_model_id.as_deref(), Some("m-e"));
+        assert!(sem.embedding_model.is_empty());
+    }
+
+    #[test]
+    fn absent_id_fields_stay_off_the_wire() {
+        let p: CachePolicy =
+            serde_json::from_value(json!({"name": "x", "applies_to": "all"})).unwrap();
+        let v = serde_json::to_value(&p).unwrap();
+        assert!(v.get("applies_to_model_id").is_none());
     }
 
     #[test]
@@ -334,7 +492,7 @@ mod tests {
         // All rather than disabling caching on an unknown discriminator.
         let p: CachePolicy =
             serde_json::from_value(json!({"name": "x", "applies_to": "team:eng"})).unwrap();
-        assert_eq!(p.parsed_applies_to(), AppliesTo::All);
+        assert_eq!(p.parsed_applies_to(&empty_snapshot()), AppliesTo::All);
     }
 
     #[test]

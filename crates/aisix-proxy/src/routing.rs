@@ -1186,6 +1186,26 @@ pub(crate) fn resolve_attempt_models(
             req.tags
         )));
     }
+    // Normalize each target's model reference to the display name the
+    // models table is keyed by, before ANY of the machinery below looks one
+    // up: the IP pre-filter, the balancing state (WRR fingerprints, hash
+    // rings) and the resolution loop all key on `target.model`, so
+    // resolving once here is what keeps a `model_id` target from having to
+    // be handled at each of them. A target written as `model_id` follows a
+    // rename of the model it points at; one whose id resolves to nothing
+    // keeps the id as its name and is reported below as the missing target
+    // it is — the same outcome a dangling `model` gets.
+    let eligible: Vec<RoutingTarget> = eligible
+        .into_iter()
+        .map(|t| {
+            let model = t.model_ref(snapshot).into_owned();
+            RoutingTarget {
+                model,
+                model_id: None,
+                ..t
+            }
+        })
+        .collect();
     // Client-IP pre-filter (AISIX-Cloud#1087 follow-up): a target whose own
     // `allowed_cidrs` excludes this caller is not a candidate. Applied BEFORE
     // the strategy picks, so `max_fallbacks` budgets attempts across the

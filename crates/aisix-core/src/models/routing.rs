@@ -153,12 +153,31 @@ impl RoutingStrategy {
     }
 }
 
-/// One destination in a routing configuration. `model` references a direct model alias.
+/// One destination in a routing configuration. The target model is named
+/// either by `model` (its display name) or by `model_id` (its resource
+/// id); a target must carry at least one of the two.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 pub struct RoutingTarget {
     /// Model alias for a direct model that can receive routed traffic.
+    /// Read only when `model_id` is absent.
+    ///
+    /// Defaulted at the type level and required by the schemas instead —
+    /// as one half of a "`model` or `model_id`" alternative, so a target
+    /// naming its model by id alone validates while one naming it neither
+    /// way is still rejected.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     #[schemars(length(min = 1))]
     pub model: String,
+    /// Resource id of the direct model that can receive routed traffic.
+    /// Present, it is authoritative and `model` is ignored: the id is
+    /// resolved against the models in the current configuration and the
+    /// name it resolves to is the target, so renaming that model keeps
+    /// this target pointing at it with no edit to this document. An id
+    /// resolving to no model is a target that does not exist, exactly as
+    /// a `model` naming no model is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub model_id: Option<String>,
     /// Target weight, default `1`. Used by `round_robin` (rotation share),
     /// `consistent_hash` (share of the hash ring), and `least_busy`
     /// (in-flight divided by weight). `failover`, `least_cost`, and
@@ -190,6 +209,18 @@ impl RoutingTarget {
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
+            model_id: None,
+            weight: None,
+            priority: None,
+            tags: None,
+        }
+    }
+
+    /// A target that names its model by resource id instead of by name.
+    pub fn by_id(model_id: impl Into<String>) -> Self {
+        Self {
+            model: String::new(),
+            model_id: Some(model_id.into()),
             weight: None,
             priority: None,
             tags: None,
@@ -209,6 +240,15 @@ impl RoutingTarget {
     pub fn with_tags(mut self, tags: Vec<String>) -> Self {
         self.tags = Some(tags);
         self
+    }
+
+    /// The display name of the model this target points at, resolved
+    /// against the current configuration: `model_id` when it is set (so a
+    /// rename of the target model needs no edit here), `model` otherwise.
+    /// See [`crate::models::resolve_model_ref`] for what an unresolvable
+    /// id yields.
+    pub fn model_ref<'a>(&'a self, snapshot: &super::AisixSnapshot) -> std::borrow::Cow<'a, str> {
+        super::resolve_model_ref(snapshot, &self.model, self.model_id.as_deref())
     }
 
     pub fn weight_or_default(&self) -> u32 {

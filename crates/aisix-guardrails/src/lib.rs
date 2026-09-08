@@ -257,8 +257,15 @@ impl EmbedFailure {
 /// implementation keeps only the hub plus a snapshot handle.
 #[async_trait]
 pub trait GuardrailEmbedder: Send + Sync + 'static {
-    /// Embed `texts` with the `embedding`-kind Model aliased
-    /// `model_alias`, returning one vector per input, in input order.
+    /// Embed `texts` with the `embedding`-kind Model the row names,
+    /// returning one vector per input, in input order.
+    ///
+    /// The model is named by alias, by resource id, or by both. `model_id`
+    /// decides whenever it is `Some` and `model_alias` is then ignored, so
+    /// a row that names its embedder by id keeps working after that model
+    /// is renamed. Neither spelling resolving to an `embedding`-kind Model
+    /// is [`EmbedFailure::Unresolved`] — an id naming nothing behaves as a
+    /// dangling alias does, and the row degrades per its `fail_open`.
     ///
     /// `cacheable` marks CONFIG-derived text — the example prototypes,
     /// which are fixed per row and worth memoising process-wide so a
@@ -268,6 +275,7 @@ pub trait GuardrailEmbedder: Send + Sync + 'static {
     async fn embed(
         &self,
         model_alias: &str,
+        model_id: Option<&str>,
         texts: &[String],
         cacheable: bool,
         timeout: std::time::Duration,

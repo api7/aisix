@@ -764,3 +764,219 @@ fn api_key_empty_allowed_model_ids_export_as_no_grant() {
     // must not resurrect the ignored `allowed_models: ["*"]`.
     assert_eq!(keys[0]["allowed_models"], json!([]));
 }
+
+/// Every id-form model reference in a model document leaves the export as
+/// the name form the resources file accepts — the file refuses the id
+/// form outright, so an export that kept it would not reload.
+#[test]
+fn model_reference_ids_resugar_to_names() {
+    let snap = AisixSnapshot::new();
+    snap.provider_keys
+        .insert(ResourceEntry::new("pk-1", provider_key("pk", "sk-x"), 1));
+    for (id, name) in [("m-a", "alpha"), ("m-b", "beta"), ("m-c", "gamma")] {
+        snap.models.insert(ResourceEntry::new(
+            id,
+            model_value(json!({
+                "display_name": name,
+                "provider": "openai",
+                "model_name": "gpt-4o",
+                "provider_key_id": "pk-1"
+            })),
+            1,
+        ));
+    }
+    snap.models.insert(ResourceEntry::new(
+        "m-embed",
+        model_value(json!({
+            "display_name": "embedder",
+            "provider": "openai",
+            "model_name": "text-embedding-3-small",
+            "provider_key_id": "pk-1",
+            "embedding": {"dimensions": 4}
+        })),
+        1,
+    ));
+    snap.models.insert(ResourceEntry::new(
+        "m-group",
+        model_value(json!({
+            "display_name": "group",
+            "routing": {"targets": [{"model_id": "m-a"}, {"model": "beta"}]}
+        })),
+        1,
+    ));
+    snap.models.insert(ResourceEntry::new(
+        "m-panel",
+        model_value(json!({
+            "display_name": "panel",
+            "ensemble": {
+                "panel": [{"model_id": "m-a"}, {"model_id": "m-b"}],
+                "judge": {"model_id": "m-c"}
+            }
+        })),
+        1,
+    ));
+    snap.models.insert(ResourceEntry::new(
+        "m-router",
+        model_value(json!({
+            "display_name": "router",
+            "semantic": {
+                "embedding_model_id": "m-embed",
+                "routes": [{"name": "r", "target_id": "m-a", "examples": ["hi"]}],
+                "default_id": "m-b",
+                "match": {"threshold": 0.5},
+                "on_embedding_failure": {"target_id": "m-c"}
+            }
+        })),
+        1,
+    ));
+
+    let doc = build_export_document(&snap, false);
+    let by_name = |name: &str| -> Value {
+        find(&doc, "models")
+            .iter()
+            .find(|m| m["display_name"] == json!(name))
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} exported"))
+    };
+
+    let group = by_name("group");
+    assert_eq!(group["routing"]["targets"][0]["model"], json!("alpha"));
+    assert!(group["routing"]["targets"][0].get("model_id").is_none());
+    assert_eq!(group["routing"]["targets"][1]["model"], json!("beta"));
+
+    let panel = by_name("panel");
+    assert_eq!(panel["ensemble"]["panel"][0]["model"], json!("alpha"));
+    assert_eq!(panel["ensemble"]["panel"][1]["model"], json!("beta"));
+    assert_eq!(panel["ensemble"]["judge"]["model"], json!("gamma"));
+    assert!(panel["ensemble"]["judge"].get("model_id").is_none());
+
+    let router = by_name("router");
+    assert_eq!(router["semantic"]["embedding_model"], json!("embedder"));
+    assert_eq!(router["semantic"]["routes"][0]["target"], json!("alpha"));
+    assert_eq!(router["semantic"]["default"], json!("beta"));
+    assert_eq!(
+        router["semantic"]["on_embedding_failure"]["target"],
+        json!("gamma")
+    );
+    assert!(router["semantic"].get("embedding_model_id").is_none());
+    assert!(router["semantic"].get("default_id").is_none());
+
+    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
+}
+
+/// An id no exported model answers to is emitted under the name field as
+/// itself — the same dangling reference the gateway already sees. For a
+/// model the loader cross-checks it, so it is blocking.
+#[test]
+fn dangling_model_reference_id_is_emitted_as_a_name_and_blocking() {
+    let snap = AisixSnapshot::new();
+    snap.models.insert(ResourceEntry::new(
+        "m-group",
+        model_value(json!({
+            "display_name": "group",
+            "routing": {"targets": [{"model_id": "m-gone"}]}
+        })),
+        1,
+    ));
+    let doc = build_export_document(&snap, false);
+    let group = &find(&doc, "models")[0];
+    assert_eq!(group["routing"]["targets"][0]["model"], json!("m-gone"));
+    assert!(group["routing"]["targets"][0].get("model_id").is_none());
+    assert!(
+        doc.blocking
+            .iter()
+            .any(|b| b.contains("dangling") && b.contains("m-gone")),
+        "{:?}",
+        doc.blocking
+    );
+}
+
+/// A cache policy's model scope collapses into the `applies_to` string the
+/// file understands, overriding whatever that string held — the same
+/// precedence the gateway applies.
+#[test]
+fn cache_policy_model_scope_id_resugars_into_applies_to() {
+    let snap = AisixSnapshot::new();
+    snap.provider_keys
+        .insert(ResourceEntry::new("pk-1", provider_key("pk", "sk-x"), 1));
+    snap.models.insert(ResourceEntry::new(
+        "m-embed",
+        model_value(json!({
+            "display_name": "embedder",
+            "provider": "openai",
+            "model_name": "text-embedding-3-small",
+            "provider_key_id": "pk-1",
+            "embedding": {"dimensions": 4}
+        })),
+        1,
+    ));
+    let policy: aisix_core::models::CachePolicy = serde_json::from_value(json!({
+        "name": "faq",
+        "applies_to": "all",
+        "applies_to_model_id": "m-embed",
+        "semantic": {"embedding_model_id": "m-embed", "threshold": 0.9}
+    }))
+    .unwrap();
+    snap.cache_policies
+        .insert(ResourceEntry::new("cp-1", policy, 1));
+
+    let doc = build_export_document(&snap, false);
+    let exported = &find(&doc, "cache_policies")[0];
+    assert_eq!(exported["applies_to"], json!("model:embedder"));
+    assert!(exported.get("applies_to_model_id").is_none());
+    assert_eq!(exported["semantic"]["embedding_model"], json!("embedder"));
+    assert!(exported["semantic"].get("embedding_model_id").is_none());
+}
+
+/// A semantic guardrail's embedder id becomes the name form. The loader
+/// does not cross-check it, so a dangling one is a warning and the file
+/// still loads (screening then refuses, fail-closed, as it already did).
+#[test]
+fn guardrail_embedder_id_resugars_to_a_name() {
+    let snap = AisixSnapshot::new();
+    snap.provider_keys
+        .insert(ResourceEntry::new("pk-1", provider_key("pk", "sk-x"), 1));
+    snap.models.insert(ResourceEntry::new(
+        "m-embed",
+        model_value(json!({
+            "display_name": "embedder",
+            "provider": "openai",
+            "model_name": "text-embedding-3-small",
+            "provider_key_id": "pk-1",
+            "embedding": {"dimensions": 4}
+        })),
+        1,
+    ));
+    let row = |name: &str, id: &str| -> aisix_core::models::Guardrail {
+        serde_json::from_value(json!({
+            "name": name,
+            "kind": "semantic",
+            "embedding_model_id": id,
+            "deny_examples": ["x"],
+            "deny_threshold": 0.8
+        }))
+        .unwrap()
+    };
+    snap.guardrails
+        .insert(ResourceEntry::new("g-1", row("resolved", "m-embed"), 1));
+    snap.guardrails
+        .insert(ResourceEntry::new("g-2", row("dangling", "m-gone"), 1));
+
+    let doc = build_export_document(&snap, false);
+    let by_name = |name: &str| -> Value {
+        find(&doc, "guardrails")
+            .iter()
+            .find(|g| g["name"] == json!(name))
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} exported"))
+    };
+    assert_eq!(by_name("resolved")["embedding_model"], json!("embedder"));
+    assert!(by_name("resolved").get("embedding_model_id").is_none());
+    assert_eq!(by_name("dangling")["embedding_model"], json!("m-gone"));
+    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
+    assert!(
+        doc.warnings.iter().any(|w| w.contains("m-gone")),
+        "{:?}",
+        doc.warnings
+    );
+}

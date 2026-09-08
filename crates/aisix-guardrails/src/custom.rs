@@ -978,7 +978,9 @@ async fn host_embed(
         Ok(t) => t,
         Err(e) => return embed_error(format!("invalid texts argument: {e}")),
     };
-    match embedder.embed(&model, &texts, false, budget).await {
+    // The script names the model by alias — `aisix.embed(name, texts)` is
+    // the whole surface — so there is no id spelling to pass here.
+    match embedder.embed(&model, None, &texts, false, budget).await {
         Ok(vectors) => serde_json::to_string(&EmbedResult {
             error: None,
             vectors,
@@ -1812,6 +1814,7 @@ mod tests {
             async fn embed(
                 &self,
                 _model: &str,
+                _model_id: Option<&str>,
                 texts: &[String],
                 _cacheable: bool,
                 _timeout: Duration,

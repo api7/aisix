@@ -83,6 +83,26 @@ fn cache_policy_corpus() {
                 true,
                 json!({"name": "k", "applies_to": "api_key:11111111-1111-1111-1111-111111111111"}),
             ),
+            (
+                "model scope by resource id",
+                true,
+                json!({"name": "k", "applies_to_model_id": "m-1"}),
+            ),
+            (
+                "similarity embedder named by resource id alone",
+                true,
+                json!({"name": "k", "semantic": {"embedding_model_id": "m-e", "threshold": 0.9}}),
+            ),
+            (
+                "similarity embedder named neither way",
+                false,
+                json!({"name": "k", "semantic": {"threshold": 0.9}}),
+            ),
+            (
+                "empty applies_to_model_id",
+                false,
+                json!({"name": "k", "applies_to_model_id": ""}),
+            ),
             // CachePolicy has no deny_unknown_fields → forward-compat fields tolerated.
             (
                 "unknown field tolerated",
@@ -649,6 +669,24 @@ fn guardrail_corpus() {
                 false,
                 json!({"name": "k", "kind": "keyword", "patterns": [{"kind": "literal", "value": "x", "extra": 1}]}),
             ),
+            (
+                "semantic embedder named by resource id alone",
+                true,
+                json!({"name": "s", "kind": "semantic", "embedding_model_id": "m-e",
+                       "deny_examples": ["x"], "deny_threshold": 0.8}),
+            ),
+            (
+                "semantic embedder named neither way",
+                false,
+                json!({"name": "s", "kind": "semantic",
+                       "deny_examples": ["x"], "deny_threshold": 0.8}),
+            ),
+            (
+                "semantic embedder id present but empty",
+                false,
+                json!({"name": "s", "kind": "semantic", "embedding_model_id": "",
+                       "deny_examples": ["x"], "deny_threshold": 0.8}),
+            ),
             // top-level / kind discriminator
             (
                 "missing name",
@@ -966,7 +1004,6 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
             "/oneOf/10/allOf",
             "/oneOf/10/properties/allow_threshold/default",
             "/oneOf/10/properties/deny_threshold/default",
-            "/oneOf/10/required",
             "/oneOf/11/properties/script/default",
         ],
     ),

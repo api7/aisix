@@ -134,7 +134,10 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             |m| m.display_name.clone(),
             "models",
             &mut diag,
-            |doc, identity, diag| resugar_provider_key(doc, identity, &provider_key_names, diag),
+            |doc, identity, diag| {
+                resugar_provider_key(doc, identity, &provider_key_names, diag);
+                resugar_model_refs(doc, "models", "model", identity, &model_names, diag);
+            },
             |_, _| {},
         ),
     );
@@ -172,7 +175,9 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
         |g| g.name.clone(),
         "guardrails",
         &mut diag,
-        |_, _, _| {},
+        |doc, identity, diag| {
+            resugar_model_refs(doc, "guardrails", "guardrail", identity, &model_names, diag)
+        },
         |doc, identity| {
             let mut ctx = RedactionCtx {
                 kind_token: "GUARDRAIL",
@@ -255,7 +260,17 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             |c| c.name.clone(),
             "cache_policies",
             &mut diag,
-            |doc, identity, diag| resugar_cache_applies_to(doc, identity, &api_key_names, diag),
+            |doc, identity, diag| {
+                resugar_cache_applies_to(doc, identity, &api_key_names, diag);
+                resugar_model_refs(
+                    doc,
+                    "cache_policies",
+                    "cache policy",
+                    identity,
+                    &model_names,
+                    diag,
+                );
+            },
             |_, _| {},
         ),
     );
@@ -686,6 +701,70 @@ fn resugar_allowed_models(
         }
     }
     map.insert("allowed_models".into(), Value::Array(names));
+}
+
+/// Every id-form model reference in `doc` → its name-form spelling.
+///
+/// The id form is a control-plane projection: it names a model by the id
+/// the control plane assigned it, and a file's ids are derived from its
+/// entry names, so the export resolves each id to the identity the models
+/// collection is keyed by and emits the name the document already has a
+/// field for. The fields and the places they can appear come from
+/// `aisix_core::filesource`, the same pair of tables the file source
+/// refuses them by, so the two cannot drift.
+///
+/// An id naming no exported model is emitted as the name form carrying the
+/// raw id, which is exactly how the gateway already treats it — the id
+/// stands in as a name that resolves to nothing. That keeps the export
+/// honest about a reference that was already dangling instead of inventing
+/// or silently dropping one. It is blocking for a model, whose targets the
+/// loader cross-checks (the file will not load until it is fixed), and a
+/// warning where the loader does not (the reference is simply inert, as it
+/// already was).
+fn resugar_model_refs(
+    doc: &mut Value,
+    kind: &'static str,
+    label: &str,
+    identity: &str,
+    model_names: &BTreeMap<String, String>,
+    diag: &mut Diagnostics,
+) {
+    let fields = aisix_core::filesource::model_ref_id_fields(kind);
+    let mut blocking: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    aisix_core::filesource::for_each_model_ref_node(kind, doc, &mut |node| {
+        for (id_field, name_field) in fields {
+            let Some(Value::String(id)) = node.remove(*id_field) else {
+                continue;
+            };
+            let resolved = model_names.get(&id).cloned();
+            if resolved.is_none() {
+                let message = format!(
+                    "{label} {identity:?} references model id {id:?} in `{id_field}`, which is \
+                     not among the exported models — emitted under `{name_field}` as a name \
+                     that resolves to nothing (dangling reference in the source data)"
+                );
+                if kind == "models" {
+                    blocking.push(message);
+                } else {
+                    warnings.push(message);
+                }
+            }
+            let name = resolved.unwrap_or(id);
+            // A cache policy's model scope folds into the free-form
+            // `applies_to` string rather than a field of its own, and
+            // overrides whatever that string held — the same precedence
+            // the gateway applies.
+            let value = if *id_field == "applies_to_model_id" {
+                format!("model:{name}")
+            } else {
+                name
+            };
+            node.insert((*name_field).to_string(), Value::String(value));
+        }
+    });
+    diag.blocking.extend(blocking);
+    diag.warnings.extend(warnings);
 }
 
 /// `claim_mapping.resolve.api_key_id` (etcd id) → `resolve.api_key`

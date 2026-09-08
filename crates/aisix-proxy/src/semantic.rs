@@ -12,11 +12,12 @@
 //! ([`SemanticVectorCache`]) are pure and unit-tested in isolation; the
 //! async embedding call lives in [`resolve`].
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use dashmap::DashMap;
 
-use aisix_core::models::{EmbeddingFailureMode, OnEmbeddingFailure, Semantic};
+use aisix_core::models::{resolve_model_ref, EmbeddingFailureMode, OnEmbeddingFailure, Semantic};
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{AisixSnapshot, Model};
 use aisix_gateway::{EmbeddingRequest, EmbeddingVector};
@@ -75,11 +76,23 @@ pub(crate) fn decide(
 /// Direct-model alias to dispatch to when the embedding call fails, per
 /// `on_embedding_failure`. `None` means the policy is `fail` — the caller
 /// returns `503`.
-pub(crate) fn embedding_failure_target(semantic: &Semantic) -> Option<&str> {
+///
+/// Each of the two aliases it can return is a model reference in its own
+/// right, so both are resolved against the snapshot: an id spelling follows
+/// a rename, and an id that resolves to nothing comes back as itself and
+/// dispatches nowhere, exactly as a dangling alias does.
+pub(crate) fn embedding_failure_target<'a>(
+    snapshot: &AisixSnapshot,
+    semantic: &'a Semantic,
+) -> Option<Cow<'a, str>> {
     match &semantic.on_embedding_failure {
-        OnEmbeddingFailure::Mode(EmbeddingFailureMode::Default) => Some(&semantic.default),
+        OnEmbeddingFailure::Mode(EmbeddingFailureMode::Default) => {
+            Some(semantic.default_ref(snapshot))
+        }
         OnEmbeddingFailure::Mode(EmbeddingFailureMode::Fail) => None,
-        OnEmbeddingFailure::Target { target } => Some(target),
+        OnEmbeddingFailure::Target { target, target_id } => {
+            Some(resolve_model_ref(snapshot, target, target_id.as_deref()))
+        }
     }
 }
 
@@ -142,21 +155,27 @@ pub(crate) async fn resolve(
     // No user text to classify (e.g. a system-only or tool-only request):
     // route to `default` without an embedding call rather than embedding an
     // empty string, which could spuriously match a route.
+    // Every alias below is resolved through the model reference helpers:
+    // a router that names its targets by id keeps working across a rename
+    // of any of them, and an id that resolves to nothing behaves as the
+    // dangling alias it stands in for.
+    let default_target = semantic.default_ref(snapshot);
     if prompt.trim().is_empty() {
         let (attempt, _) =
-            select_eligible(state, snapshot, router, source_ip, &semantic.default, None)?;
+            select_eligible(state, snapshot, router, source_ip, &default_target, None)?;
         return Ok((vec![attempt], None));
     }
 
     // Resolve the embedding model + its modality metadata. A dangling or
     // wrong-kind reference is a config error; degrade via the failure
     // policy rather than 500.
-    let embed_entry = match snapshot.models.get_by_name(&semantic.embedding_model) {
+    let embedding_model = semantic.embedding_model_ref(snapshot);
+    let embed_entry = match snapshot.models.get_by_name(&embedding_model) {
         Some(e) if e.value.is_embedding() => e,
         other => {
             tracing::warn!(
                 router = %router_entry.value.display_name,
-                embedding_model = %semantic.embedding_model,
+                embedding_model = %embedding_model,
                 found = other.is_some(),
                 "semantic router references a missing or non-embedding embedding_model; \
                  applying on_embedding_failure",
@@ -250,8 +269,8 @@ pub(crate) async fn resolve(
                 snapshot,
                 router,
                 source_ip,
-                semantic.routes[i].target.as_str(),
-                Some(semantic.default.as_str()),
+                &semantic.routes[i].target_ref(snapshot),
+                Some(&default_target),
             )?;
             // `x-aisix-route` reports the route that actually served the
             // request: a winner displaced by its target's gates is a
@@ -260,14 +279,8 @@ pub(crate) async fn resolve(
             (attempt, name)
         }
         None => {
-            let (attempt, _) = select_eligible(
-                state,
-                snapshot,
-                router,
-                source_ip,
-                semantic.default.as_str(),
-                None,
-            )?;
+            let (attempt, _) =
+                select_eligible(state, snapshot, router, source_ip, &default_target, None)?;
             (attempt, None)
         }
     };
@@ -289,9 +302,9 @@ fn fallback(
     source_ip: &str,
     semantic: &Semantic,
 ) -> Result<(Vec<AttemptModel>, Option<String>), ProxyError> {
-    match embedding_failure_target(semantic) {
+    match embedding_failure_target(snapshot, semantic) {
         Some(alias) => {
-            let (attempt, _) = select_eligible(state, snapshot, router, source_ip, alias, None)?;
+            let (attempt, _) = select_eligible(state, snapshot, router, source_ip, &alias, None)?;
             Ok((vec![attempt], None))
         }
         None => Err(ProxyError::ProviderUnavailable),
@@ -479,6 +492,7 @@ pub(crate) async fn embed_texts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aisix_core::resource::ResourceEntry;
 
     fn semantic(json: &str) -> Semantic {
         serde_json::from_str(json).unwrap()
@@ -559,20 +573,73 @@ mod tests {
 
     #[test]
     fn embedding_failure_target_maps_each_policy() {
+        let snap = AisixSnapshot::default();
         let default_policy = router();
-        assert_eq!(embedding_failure_target(&default_policy), Some("gpt-4o"));
+        assert_eq!(
+            embedding_failure_target(&snap, &default_policy).as_deref(),
+            Some("gpt-4o")
+        );
 
         let fail = semantic(
             r#"{"embedding_model":"e","routes":[{"name":"a","target":"m","examples":["x"]}],
                 "default":"d","match":{"threshold":0.5},"on_embedding_failure":"fail"}"#,
         );
-        assert_eq!(embedding_failure_target(&fail), None);
+        assert!(embedding_failure_target(&snap, &fail).is_none());
 
         let target = semantic(
             r#"{"embedding_model":"e","routes":[{"name":"a","target":"m","examples":["x"]}],
                 "default":"d","match":{"threshold":0.5},"on_embedding_failure":{"target":"safe"}}"#,
         );
-        assert_eq!(embedding_failure_target(&target), Some("safe"));
+        assert_eq!(
+            embedding_failure_target(&snap, &target).as_deref(),
+            Some("safe")
+        );
+    }
+
+    /// The id spelling decides at both `on_embedding_failure` shapes, and
+    /// resolves against the live table — so a rename of the fallback model
+    /// needs no edit to the router.
+    #[test]
+    fn embedding_failure_target_follows_the_id_spelling() {
+        let snap = AisixSnapshot::default();
+        snap.models.insert(ResourceEntry::new(
+            "m-safe",
+            serde_json::from_str::<Model>(
+                r#"{"display_name":"safe-v2","provider":"openai","model_name":"gpt-4o",
+                    "provider_key_id":"11111111-1111-1111-1111-111111111111"}"#,
+            )
+            .unwrap(),
+            1,
+        ));
+
+        let explicit = semantic(
+            r#"{"embedding_model":"e","routes":[{"name":"a","target":"m","examples":["x"]}],
+                "default":"d","match":{"threshold":0.5},
+                "on_embedding_failure":{"target":"stale","target_id":"m-safe"}}"#,
+        );
+        assert_eq!(
+            embedding_failure_target(&snap, &explicit).as_deref(),
+            Some("safe-v2")
+        );
+
+        let by_default = semantic(
+            r#"{"embedding_model":"e","routes":[{"name":"a","target":"m","examples":["x"]}],
+                "default":"stale","default_id":"m-safe","match":{"threshold":0.5}}"#,
+        );
+        assert_eq!(
+            embedding_failure_target(&snap, &by_default).as_deref(),
+            Some("safe-v2")
+        );
+
+        // An id that resolves to nothing stands in as its own name, which
+        // dispatches nowhere — what a dangling alias already does.
+        let dangling = semantic(
+            r#"{"embedding_model":"e","routes":[{"name":"a","target":"m","examples":["x"]}],
+                "default":"d","default_id":"m-gone","match":{"threshold":0.5}}"#,
+        );
+        let resolved = embedding_failure_target(&snap, &dangling).unwrap();
+        assert_eq!(resolved, "m-gone");
+        assert!(snap.models.get_by_name(&resolved).is_none());
     }
 
     #[test]

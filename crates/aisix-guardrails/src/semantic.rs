@@ -105,7 +105,20 @@ struct SemanticParams {
     /// The kind's static `name()` is `"semantic"` for every row, which
     /// would make two rows' scores indistinguishable.
     row_name: String,
+    /// The embedder as configured: the alias, plus the resource id when
+    /// the row names its model that way. `embedding_model_identity` is
+    /// what telemetry reports.
     embedding_model: String,
+    embedding_model_id: Option<String>,
+    /// What a [`GuardrailScore`] names as the model that produced it: the
+    /// id when the row names its embedder by one, the alias otherwise.
+    /// Cosine scores are not comparable across embedding models, so a
+    /// score is unreadable without knowing which model produced it — and
+    /// under an id-form reference the alias is not that model (it is
+    /// ignored, and may be empty). Neither spelling changes across
+    /// requests, so the identity in a stored event stays stable even
+    /// though the model's display name may not.
+    embedding_model_identity: String,
     deny_examples: Vec<String>,
     allow_examples: Vec<String>,
     deny_threshold: f32,
@@ -147,6 +160,11 @@ impl SemanticGuardrail {
                 embedder,
                 row_name: row_name.into(),
                 embedding_model: cfg.embedding_model.clone(),
+                embedding_model_id: cfg.embedding_model_id.clone(),
+                embedding_model_identity: cfg
+                    .embedding_model_id
+                    .clone()
+                    .unwrap_or_else(|| cfg.embedding_model.clone()),
                 deny_examples: cfg.deny_examples.clone(),
                 allow_examples: cfg.allow_examples.clone(),
                 deny_threshold: cfg.deny_threshold,
@@ -197,6 +215,7 @@ impl SemanticGuardrail {
             .embedder
             .embed(
                 &self.cfg.embedding_model,
+                self.cfg.embedding_model_id.as_deref(),
                 &prototypes,
                 true,
                 self.cfg.timeout,
@@ -211,7 +230,13 @@ impl SemanticGuardrail {
         let candidate_vecs = match self
             .cfg
             .embedder
-            .embed(&self.cfg.embedding_model, &texts, false, self.cfg.timeout)
+            .embed(
+                &self.cfg.embedding_model,
+                self.cfg.embedding_model_id.as_deref(),
+                &texts,
+                false,
+                self.cfg.timeout,
+            )
             .await
         {
             Ok(v) if v.len() == texts.len() => v,
@@ -275,7 +300,7 @@ impl SemanticGuardrail {
             threshold,
             matched: score >= threshold,
             top_example_index: index as u32,
-            embedding_model: self.cfg.embedding_model.clone(),
+            embedding_model: self.cfg.embedding_model_identity.clone(),
         });
     }
 
@@ -323,7 +348,7 @@ impl SemanticGuardrail {
         let tag = failure.as_str();
         tracing::warn!(
             guardrail = "semantic",
-            embedding_model = %self.cfg.embedding_model,
+            embedding_model = %self.cfg.embedding_model_identity,
             failure = tag,
             fail_open,
             "semantic guardrail could not embed"
@@ -528,6 +553,7 @@ mod tests {
         async fn embed(
             &self,
             _model_alias: &str,
+            _model_id: Option<&str>,
             texts: &[String],
             _cacheable: bool,
             _timeout: Duration,
@@ -548,6 +574,7 @@ mod tests {
     fn cfg(deny: &[&str], allow: &[&str]) -> SemanticConfig {
         SemanticConfig {
             embedding_model: "embed-1".into(),
+            embedding_model_id: None,
             deny_examples: deny.iter().map(|s| (*s).to_string()).collect(),
             allow_examples: allow.iter().map(|s| (*s).to_string()).collect(),
             deny_threshold: 0.75,

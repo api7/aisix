@@ -848,9 +848,24 @@ pub fn model_root_schema(strict: bool) -> Value {
             if branch.get("type").and_then(Value::as_str) == Some("object") {
                 if let Some(obj) = branch.as_object_mut() {
                     obj.insert("additionalProperties".to_string(), json!(false));
+                    require_name_or_id(obj, "target", "target_id");
                 }
             }
         }
+    }
+    // Every place a model document points at ANOTHER model accepts the
+    // reference as a name or as a resource id. Applied to both contracts:
+    // these fields were required on the read path too, so relaxing only the
+    // write path would leave a stored id-only reference dropping its row.
+    for (definition, name, id) in [
+        ("RoutingTarget", "model", "model_id"),
+        ("PanelMember", "model", "model_id"),
+        ("Judge", "model", "model_id"),
+        ("SemanticRoute", "target", "target_id"),
+        ("Semantic", "embedding_model", "embedding_model_id"),
+        ("Semantic", "default", "default_id"),
+    ] {
+        require_name_or_id_in(&mut schema, definition, name, id);
     }
     schema
 }
@@ -906,6 +921,45 @@ fn require_branch_property(branch: &mut serde_json::Map<String, Value>, name: &s
             branch.insert("required".to_string(), json!([name]));
         }
     }
+}
+
+/// Turn a required model-reference field into a "name **or** id" pair.
+///
+/// Every document that points at a Model may name it by display name or by
+/// resource id ([`crate::models::resolve_model_ref`]). Requiredness moves
+/// off the name alone and onto the alternative: `name` is dropped from
+/// `required` and an `allOf` member `{"anyOf": [{"required": [name]},
+/// {"required": [id]}]}` is added, so a document naming the model either
+/// way validates while one naming it NEITHER way is rejected exactly as a
+/// missing name was.
+///
+/// Appends to `allOf` rather than replacing it — the `semantic` guardrail
+/// branch already carries threshold rules there, and one object can need
+/// two alternatives (a semantic router names both an embedding model and a
+/// default).
+fn require_name_or_id(node: &mut serde_json::Map<String, Value>, name: &str, id: &str) {
+    if let Some(list) = node.get_mut("required").and_then(Value::as_array_mut) {
+        list.retain(|v| v.as_str() != Some(name));
+        if list.is_empty() {
+            node.remove("required");
+        }
+    }
+    let clause = json!({"anyOf": [{"required": [name]}, {"required": [id]}]});
+    match node.get_mut("allOf").and_then(Value::as_array_mut) {
+        Some(list) => list.push(clause),
+        None => {
+            node.insert("allOf".to_string(), json!([clause]));
+        }
+    }
+}
+
+/// [`require_name_or_id`] addressed at one `definitions` entry.
+fn require_name_or_id_in(schema: &mut Value, definition: &str, name: &str, id: &str) {
+    let node = schema
+        .pointer_mut(&format!("/definitions/{definition}"))
+        .and_then(Value::as_object_mut)
+        .unwrap_or_else(|| panic!("schema defines {definition}"));
+    require_name_or_id(node, name, id);
 }
 
 /// Canonical JSON Schema for the `provider_key` resource, derived from the
@@ -1464,10 +1518,6 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                     // field defaulting. What an operator may save is the
                     // stricter question, and it is asked here.
                     if strict {
-                        // A row saved without an embedding model would
-                        // screen every request against a model that
-                        // resolves to nothing.
-                        require_branch_property(b, "embedding_model");
                         // …and the type-level default goes with them. It
                         // exists so a STORED row without the key still
                         // loads; advertised on the write contract it reads
@@ -1508,6 +1558,13 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                                 }
                             ]),
                         );
+                        // A row saved without an embedding model would
+                        // screen every request against a model that
+                        // resolves to nothing. Either spelling satisfies
+                        // it — the id form survives a rename of the model.
+                        // AFTER the `allOf` above, which is written rather
+                        // than appended to.
+                        require_name_or_id(b, "embedding_model", "embedding_model_id");
                     }
                 }
                 "custom" => {
@@ -1746,7 +1803,17 @@ fn set_property_additional_properties_description(
 /// has no `deny_unknown_fields`, so the schema omits `additionalProperties`
 /// (i.e. `true`) — forward-compat fields from a newer cp-api are tolerated.
 pub fn cache_policy_root_schema() -> Value {
-    struct_root_schema::<crate::models::CachePolicy>(false)
+    let mut schema = struct_root_schema::<crate::models::CachePolicy>(false);
+    // The similarity layer's embedding model is named either way, like
+    // every other model reference. `applies_to` needs no alternative: it
+    // has a default, and `applies_to_model_id` simply overrides it.
+    require_name_or_id_in(
+        &mut schema,
+        "SemanticCacheConfig",
+        "embedding_model",
+        "embedding_model_id",
+    );
+    schema
 }
 
 /// Canonical JSON Schema for the `observability_exporter` resource, derived
@@ -2039,6 +2106,172 @@ mod tests {
             }
         });
         assert!(validate_model(&v).is_err());
+    }
+
+    // ---- model references by resource id (`<field>_id`) ----
+
+    /// Every place a model document points at another model takes the id
+    /// spelling on BOTH contracts. The lenient half is the one that
+    /// matters most: a stored document the read schema rejects is a row
+    /// the loader skips whole.
+    #[test]
+    fn model_references_accept_the_id_spelling() {
+        let cases = [
+            json!({"display_name": "g", "routing": {"targets": [{"model_id": "m-1"}]}}),
+            json!({"display_name": "g", "routing": {
+                "targets": [{"model": "a", "model_id": "m-1"}, {"model": "b"}]}}),
+            json!({"display_name": "e", "ensemble": {
+                "panel": [{"model_id": "m-1"}], "judge": {"model_id": "m-2"}}}),
+            json!({"display_name": "s", "semantic": {
+                "embedding_model_id": "m-e",
+                "routes": [{"name": "r", "target_id": "m-1", "examples": ["x"]}],
+                "default_id": "m-2",
+                "match": {"threshold": 0.5}}}),
+            json!({"display_name": "s", "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "r", "target": "t", "examples": ["x"]}],
+                "default": "d",
+                "match": {"threshold": 0.5},
+                "on_embedding_failure": {"target_id": "m-9"}}}),
+        ];
+        for case in cases {
+            validate_model(&case).unwrap_or_else(|e| panic!("strict rejected {case}: {e}"));
+            validate_model_lenient(&case)
+                .unwrap_or_else(|e| panic!("lenient rejected {case}: {e}"));
+        }
+    }
+
+    /// A field the strict schema does not declare is reported as unknown
+    /// on every row that carries it, and `model` takes its partial-compat
+    /// report from the schema rather than from `serde_ignored` (untagged
+    /// and flattened content is invisible to that). So the id spellings
+    /// have to be visible to the walk, not merely accepted by the
+    /// validator.
+    #[test]
+    fn model_reference_ids_are_not_reported_as_unknown_fields() {
+        let v = json!({
+            "display_name": "everything",
+            "semantic": {
+                "embedding_model_id": "m-e",
+                "routes": [{"name": "r", "target_id": "m-1", "examples": ["x"]}],
+                "default_id": "m-2",
+                "match": {"threshold": 0.5},
+                "on_embedding_failure": {"target_id": "m-3"}
+            }
+        });
+        assert!(unknown_field_paths("model", &v).is_empty());
+
+        let group = json!({
+            "display_name": "g",
+            "routing": {"targets": [{"model_id": "m-1", "weight": 2}]}
+        });
+        assert!(unknown_field_paths("model", &group).is_empty());
+
+        let panel = json!({
+            "display_name": "e",
+            "ensemble": {"panel": [{"model_id": "m-1"}], "judge": {"model_id": "m-2"}}
+        });
+        assert!(unknown_field_paths("model", &panel).is_empty());
+
+        // The walk still works: a genuinely unknown sibling is reported.
+        let bogus = json!({
+            "display_name": "g",
+            "routing": {"targets": [{"model_id": "m-1", "bogus_id": "x"}]}
+        });
+        assert_eq!(
+            unknown_field_paths("model", &bogus),
+            vec!["routing.targets.0.bogus_id"]
+        );
+    }
+
+    /// Relaxing the name field must not make "names the model no way at
+    /// all" valid — that is the same missing reference it always was, and
+    /// it stays rejected on both contracts.
+    #[test]
+    fn model_reference_naming_neither_field_is_still_rejected() {
+        let cases = [
+            json!({"display_name": "g", "routing": {"targets": [{"weight": 2}]}}),
+            json!({"display_name": "e", "ensemble": {
+                "panel": [{"temperature": 0.5}], "judge": {"model": "j"}}}),
+            json!({"display_name": "e", "ensemble": {
+                "panel": [{"model": "a"}], "judge": {"synthesis_prompt": "x"}}}),
+            json!({"display_name": "s", "semantic": {
+                "routes": [{"name": "r", "target": "t", "examples": ["x"]}],
+                "default": "d", "match": {"threshold": 0.5}}}),
+            json!({"display_name": "s", "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "r", "target": "t", "examples": ["x"]}],
+                "match": {"threshold": 0.5}}}),
+            json!({"display_name": "s", "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "r", "examples": ["x"]}],
+                "default": "d", "match": {"threshold": 0.5}}}),
+            json!({"display_name": "s", "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "r", "target": "t", "examples": ["x"]}],
+                "default": "d", "match": {"threshold": 0.5},
+                "on_embedding_failure": {"synthesis_prompt": "not a target"}}}),
+        ];
+        for case in cases {
+            assert!(
+                validate_model(&case).is_err(),
+                "strict accepted a reference naming no model: {case}"
+            );
+            assert!(
+                validate_model_lenient(&case).is_err(),
+                "lenient accepted a reference naming no model: {case}"
+            );
+        }
+    }
+
+    /// A cache policy's model scope and its similarity embedder both take
+    /// the id spelling; the embedder's requirement moves onto the pair.
+    #[test]
+    fn cache_policy_model_references_accept_the_id_spelling() {
+        let scoped = json!({"name": "p", "applies_to_model_id": "m-1"});
+        validate_cache_policy(&scoped).unwrap();
+        validate_cache_policy_lenient(&scoped).unwrap();
+
+        let embedder = json!({
+            "name": "p",
+            "semantic": {"embedding_model_id": "m-e", "threshold": 0.9}
+        });
+        validate_cache_policy(&embedder).unwrap();
+        validate_cache_policy_lenient(&embedder).unwrap();
+
+        let neither = json!({"name": "p", "semantic": {"threshold": 0.9}});
+        assert!(validate_cache_policy(&neither).is_err());
+        assert!(validate_cache_policy_lenient(&neither).is_err());
+    }
+
+    /// The guardrail embedder keeps its strict/lenient split: the write
+    /// path demands one of the two spellings, the read path neither — a
+    /// screening row that fails to load is fail-OPEN.
+    #[test]
+    fn guardrail_semantic_embedder_accepts_the_id_spelling() {
+        let by_id = json!({
+            "name": "g", "kind": "semantic",
+            "embedding_model_id": "m-e",
+            "deny_examples": ["x"], "deny_threshold": 0.8
+        });
+        validate_guardrail(&by_id).unwrap();
+        validate_guardrail_lenient(&by_id).unwrap();
+
+        // Neither spelling: refused on write, still loaded on read.
+        let neither = json!({
+            "name": "g", "kind": "semantic",
+            "deny_examples": ["x"], "deny_threshold": 0.8
+        });
+        assert!(validate_guardrail(&neither).is_err());
+        validate_guardrail_lenient(&neither).unwrap();
+
+        // The threshold coupling still fires alongside the new
+        // alternative — both live in the same `allOf`.
+        let unthresholded = json!({
+            "name": "g", "kind": "semantic",
+            "embedding_model_id": "m-e", "deny_examples": ["x"]
+        });
+        assert!(validate_guardrail(&unthresholded).is_err());
     }
 
     // ---- semantic-routing + embedding-modality schema tests (#641) ----

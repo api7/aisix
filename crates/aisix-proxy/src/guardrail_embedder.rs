@@ -64,6 +64,7 @@ impl GuardrailEmbedder for ProxyGuardrailEmbedder {
     async fn embed(
         &self,
         model_alias: &str,
+        model_id: Option<&str>,
         texts: &[String],
         cacheable: bool,
         timeout: Duration,
@@ -72,7 +73,11 @@ impl GuardrailEmbedder for ProxyGuardrailEmbedder {
             return Ok(Vec::new());
         }
         let snapshot = self.snapshot.load();
-        let Some(entry) = snapshot.models.get_by_name(model_alias) else {
+        // Resolved per call against the live table, so a rename of the
+        // embedding model takes effect on the next screened request
+        // without the guardrail row being rewritten or its chain rebuilt.
+        let alias = aisix_core::models::resolve_model_ref(&snapshot, model_alias, model_id);
+        let Some(entry) = snapshot.models.get_by_name(&alias) else {
             return Err(EmbedFailure::Unresolved);
         };
         // The alias must name an EMBEDDING model. A chat model would
