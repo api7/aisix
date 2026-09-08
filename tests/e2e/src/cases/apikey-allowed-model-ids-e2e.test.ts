@@ -29,6 +29,8 @@ const KEYS = {
   rename: "sk-ami-e2e-rename",
   conflict: "sk-ami-e2e-conflict",
   partial: "sk-ami-e2e-partial",
+  emptyIds: "sk-ami-e2e-empty-ids",
+  unresolvedOnly: "sk-ami-e2e-unresolved-only",
   nothing: "sk-ami-e2e-nothing",
   sentinel: "sk-ami-e2e-sentinel",
 };
@@ -103,6 +105,16 @@ describe("api key allowed_model_ids: grants follow the model id, not its name", 
       key_hash: hash(KEYS.partial),
       allowed_model_ids: [alpha.id, randomUUID()],
     });
+    await seed.createApiKey({
+      key_hash: hash(KEYS.emptyIds),
+      allowed_models: ["*"],
+      allowed_model_ids: [],
+    });
+    await seed.createApiKey({
+      key_hash: hash(KEYS.unresolvedOnly),
+      allowed_models: ["*"],
+      allowed_model_ids: [randomUUID()],
+    });
     await seed.createApiKey({ key_hash: hash(KEYS.nothing) });
     await seed.createApiKey({
       key_hash: hash(KEYS.sentinel),
@@ -150,6 +162,27 @@ describe("api key allowed_model_ids: grants follow the model id, not its name", 
     // The key itself still authenticates — an unusable entry must not
     // cost the caller its credential.
     expect((await proxy(KEYS.partial).listModels()).status).toBe(200);
+  });
+
+  test("an empty id list is an authoritative deny, not a fallback to the names", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+
+    const listed = await proxy(KEYS.emptyIds).listModels();
+    expect(listed.status).toBe(200);
+    expect((listed.body as { data: unknown[] }).data).toEqual([]);
+    // `allowed_models: ["*"]` would grant everything if the empty id list
+    // fell back to it.
+    expect((await chat(KEYS.emptyIds, "ami-alpha")).status).toBe(403);
+  });
+
+  test("a list of only unresolvable ids grants nothing at all", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+
+    const listed = await proxy(KEYS.unresolvedOnly).listModels();
+    expect(listed.status).toBe(200);
+    expect((listed.body as { data: unknown[] }).data).toEqual([]);
+    expect((await chat(KEYS.unresolvedOnly, "ami-alpha")).status).toBe(403);
+    expect((await chat(KEYS.unresolvedOnly, "ami-beta")).status).toBe(403);
   });
 
   test("a key granting no models at all still authenticates and reaches nothing", async (ctx) => {

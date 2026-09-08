@@ -20,9 +20,10 @@ use crate::state::AdminState;
 pub struct PublicApiKey {
     pub key_hash: String,
     pub allowed_models: Vec<String>,
-    /// Shown whenever the stored key carries it, because it is then the
-    /// field that decides access and `allowed_models` is ignored — an
-    /// operator reading only the names would misread the key's ACL.
+    /// Shown whenever the stored key carries it, because an array here —
+    /// `[]` included — decides access on its own and `allowed_models` is
+    /// ignored, so an operator reading only the names would misread the
+    /// key's ACL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_model_ids: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
