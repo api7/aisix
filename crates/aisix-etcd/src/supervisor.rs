@@ -754,7 +754,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     pub async fn load_once(&self) -> Result<BuildStats, ProviderError> {
         let load = self.load_all_prefixes().await?;
         let revision = load.applied_revision();
-        let stats = self.apply_resync(&load.entries);
+        let stats = self.apply_resync_at(&load.entries, Some(revision));
         // apply_resync uses max(entry revisions); bump to the etcd
         // load_all revision so the cache file records the true "as
         // of" point, not just the max entry write.
@@ -1244,6 +1244,22 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// write that broke it. Retention ends when the key loads cleanly
     /// again or leaves etcd.
     pub fn apply_resync(&self, entries: &[RawEntry]) -> BuildStats {
+        self.apply_resync_at(entries, None)
+    }
+
+    /// [`Self::apply_resync`] told the revision the entry set was read at.
+    ///
+    /// A completed read knows the exact point its result is consistent as
+    /// of, and that point can be BELOW the highest revision in the entry
+    /// set — see [`Self::record_read_revision`]. The caller's value has to
+    /// land BEFORE the cache flush at the end of this function, because the
+    /// cache refuses a write below the revision it has already committed:
+    /// commit the entry maximum here and every apply between the two
+    /// numbers is silently dropped from the cache — precisely the events
+    /// carrying the writes the read could not see. A restart during an etcd
+    /// outage would then serve a cache claiming a revision whose changes it
+    /// does not contain.
+    pub fn apply_resync_at(&self, entries: &[RawEntry], read_revision: Option<i64>) -> BuildStats {
         let (snap, mut stats) = loader::build_snapshot(&self.prefixes, entries);
 
         // Reconcile the last-known-good state against this build, then
@@ -1336,14 +1352,21 @@ impl<P: ConfigProvider> Supervisor<P> {
                 state.insert(e.key.clone(), StateEntry::new(e.clone()));
             }
         }
-        // Resync revision is the max of any entry; if the caller has a
-        // separate "load_all revision" they pass it via the cycle path
-        // (see `cycle`), this branch just covers the watch Resync event.
-        let max_rev = entries.iter().map(|e| e.revision).max();
-        if let Some(rev_val) = max_rev {
-            let mut rev = self.revision.lock().unwrap();
-            if rev_val > *rev {
-                *rev = rev_val;
+        match read_revision {
+            // The caller read the entry set and knows what it is
+            // consistent as of. Assigned, not raised, for the reason in
+            // this function's doc comment.
+            Some(revision) => *self.revision.lock().unwrap() = revision,
+            // No read behind this one — the standalone entry point, used
+            // by tests and by callers replaying an entry set. The max of
+            // any entry is the best available answer.
+            None => {
+                if let Some(rev_val) = entries.iter().map(|e| e.revision).max() {
+                    let mut rev = self.revision.lock().unwrap();
+                    if rev_val > *rev {
+                        *rev = rev_val;
+                    }
+                }
             }
         }
         // /admin/v1/health: stamp freshness on every resync, even when the
@@ -1507,7 +1530,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         // every prefix has been read, so readiness means every prefix's
         // initial load completed and no request can observe the
         // environment loaded and the catalog not.
-        self.apply_resync(&load.entries);
+        self.apply_resync_at(&load.entries, Some(revision));
         self.record_read_revision(revision);
 
         let mut streams = Vec::with_capacity(self.sources.len());
@@ -1570,7 +1593,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                 }
                 Some(Watched::Event(Err(err))) => return Err(SupervisorError::Provider(err)),
                 Some(Watched::Event(Ok(WatchEvent::Resync { entries, revision }))) => {
-                    self.apply_resync(&entries);
+                    self.apply_resync_at(&entries, Some(revision));
                     // The resync's header revision is the "consistent as
                     // of" point even when the entry set is empty or only
                     // contains older mod_revisions.
@@ -3845,6 +3868,75 @@ mod tests {
         assert!(
             started.elapsed() >= CACHE_WRITE_DRAIN,
             "the drain must actually wait out its bound before giving up",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_event_below_a_later_prefixs_entry_still_reaches_the_cache() {
+        // The multi-prefix load reports the EARLIEST read as its revision
+        // (`applied_revision_is_the_minimum_across_prefixes`), and that can
+        // be below the highest revision in the entry set — a row in the
+        // later-read prefix may have been written after the earlier prefix
+        // was read. The resync's cache flush has to carry the read's number
+        // rather than the entry maximum, because the cache refuses a write
+        // below what it has committed: commit 103 here and every apply
+        // between 100 and 103 is silently dropped from the cache — exactly
+        // the events carrying the writes the read could not see. A restart
+        // during an etcd outage would then serve a cache claiming 103 whose
+        // changes it does not contain.
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("snap.json");
+
+        {
+            let sup = Arc::new(Supervisor::with_sources(
+                vec![
+                    (
+                        WatchedPrefix::environment(ENV_PREFIX),
+                        ScopedProvider::serving(
+                            vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 90)],
+                            100,
+                        ),
+                    ),
+                    (
+                        WatchedPrefix::global(GLOBAL_PREFIX),
+                        ScopedProvider::serving(
+                            vec![entry("/aisix/global/pricing/g", VALID_PRICE, 103)],
+                            105,
+                        ),
+                    ),
+                ],
+                SnapshotCache::new(&cache_path),
+            ));
+            sup.load_once().await.unwrap();
+            sup.await_pending_cache_writes().await;
+
+            // The watch on the environment prefix resumes at 101 and
+            // delivers a write the load could not have seen.
+            assert!(sup.apply_put(&entry("/aisix/env-1/models/m-2", VALID_MODEL, 101)));
+            sup.await_pending_cache_writes().await;
+        }
+
+        // A restart that cannot reach etcd serves the cache: both models
+        // must be there. Same prefixes, so the cached keys resolve to the
+        // same kinds they were stored under.
+        let restarted = Supervisor::with_sources(
+            vec![
+                (
+                    WatchedPrefix::environment(ENV_PREFIX),
+                    ScopedProvider::refusing(),
+                ),
+                (
+                    WatchedPrefix::global(GLOBAL_PREFIX),
+                    ScopedProvider::refusing(),
+                ),
+            ],
+            SnapshotCache::new(&cache_path),
+        );
+        restarted.restore_from_cache();
+        assert_eq!(
+            restarted.handle().load().models.len(),
+            2,
+            "the applied write at revision 101 must be in the cache"
         );
     }
 

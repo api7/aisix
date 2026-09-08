@@ -1024,10 +1024,17 @@ fn require_mcp_tool_ref(schema: &mut Value) {
     for field in ["server_id", "tool"] {
         require_property(def, field);
         if let Some(property) = def.pointer_mut(&format!("/properties/{field}")) {
-            property
+            let property = property
                 .as_object_mut()
-                .expect("McpToolRef property is a JSON object")
-                .insert("minLength".to_string(), json!(1));
+                .expect("McpToolRef property is a JSON object");
+            property.insert("minLength".to_string(), json!(1));
+            // The `#[serde(default)]` the loader needs renders as
+            // `default: ""`, which beside `minLength: 1` is a value this
+            // very schema refuses — a form generator that honours defaults
+            // would pre-fill a field and then fail to save it. The lenient
+            // set keeps the annotation, where it is the truth about what
+            // the loader does with an omitted half.
+            property.remove("default");
         }
     }
 }

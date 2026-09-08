@@ -989,11 +989,11 @@ fn published_strict_schemas_are_what_the_write_path_compiles() {
 ///
 /// - a `required` / `minLength` / `not` change, which really does let the
 ///   loader accept a document the write path rejects (`api_key`,
-///   `mcp_policy`, `model`, and the `semantic` guardrail branch). Every
-///   `McpToolRef` path is this shape: a half-written entry has to keep
-///   deserializing, because the loader skips a row it cannot deserialize
-///   whole and for an `api_key` that costs the key every kind of traffic,
-///   not just MCP access;
+///   `mcp_policy`, `model`, and the `semantic` guardrail branch). The
+///   `McpToolRef` `required` / `minLength` paths are this shape: a
+///   half-written entry has to keep deserializing, because the loader
+///   skips a row it cannot deserialize whole and for an `api_key` that
+///   costs the key every kind of traffic, not just MCP access;
 /// - an `allOf` overlay the STRICT producer injects and the lenient one
 ///   does not. `mcp_policy`'s `/allOf` holds both the team-scope guard,
 ///   which is on both sets, and the strict-only "write the name form beside
@@ -1003,8 +1003,9 @@ fn published_strict_schemas_are_what_the_write_path_compiles() {
 ///   lenient one keeps, which changes nothing about what validates but does
 ///   feed a schema-driven form generator a value the same branch would refuse
 ///   (the `custom` guardrail's `script`, whose `default: ""` sits beside
-///   `minLength: 1`; the semantic thresholds' `default: 0.75`). `script`
-///   itself is required on BOTH sets.
+///   `minLength: 1`; both halves of `McpToolRef`, for the same reason; the
+///   semantic thresholds' `default: 0.75`). `script` itself is required on
+///   BOTH sets.
 const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
     (
         "api_key",
@@ -1012,7 +1013,9 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
             "/allOf",
             "/definitions/McpAccess/allOf",
             "/definitions/McpAccess/required",
+            "/definitions/McpToolRef/properties/server_id/default",
             "/definitions/McpToolRef/properties/server_id/minLength",
+            "/definitions/McpToolRef/properties/tool/default",
             "/definitions/McpToolRef/properties/tool/minLength",
             "/definitions/McpToolRef/required",
         ],
@@ -1030,7 +1033,9 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
         "mcp_policy",
         &[
             "/allOf",
+            "/definitions/McpToolRef/properties/server_id/default",
             "/definitions/McpToolRef/properties/server_id/minLength",
+            "/definitions/McpToolRef/properties/tool/default",
             "/definitions/McpToolRef/properties/tool/minLength",
             "/definitions/McpToolRef/required",
             "/required",
