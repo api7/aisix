@@ -2511,6 +2511,69 @@ mod tests {
         }
     }
 
+    /// Every reader of a model's price must go through
+    /// [`PricingIndex::resolve`], so ranking and billing cannot disagree
+    /// about what a model costs.
+    ///
+    /// A census rather than a list of the three known sites, for the
+    /// reason `guardrail_coverage.rs` gives: the readers here come in a
+    /// family (`least_cost` ordering, the realtime session's `cost_usd`,
+    /// the batch attribution's), a fourth is added by writing one more
+    /// `.cost`, and a hand-written list agrees with itself forever. The
+    /// symptom of missing one is silent — a model priced by reference
+    /// bills zero on the site that still reads the field.
+    #[test]
+    fn no_one_reads_a_models_price_off_the_field() {
+        use std::path::Path;
+
+        fn walk(dir: &Path, out: &mut Vec<(String, usize, String)>) {
+            for e in std::fs::read_dir(dir).expect("crate src is readable") {
+                let path = e.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                    let src = std::fs::read_to_string(&path).expect("source is utf-8");
+                    for (i, line) in src.lines().enumerate() {
+                        // `.cost` as a field access, not `cost_usd` /
+                        // `cost_saved_usd` / a local named `*_cost`, and
+                        // not a comment.
+                        let trimmed = line.trim_start();
+                        if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                            continue;
+                        }
+                        let mut rest = line;
+                        while let Some(at) = rest.find(".cost") {
+                            let after = &rest[at + 5..];
+                            let boundary = after
+                                .chars()
+                                .next()
+                                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+                            if boundary {
+                                out.push((name.clone(), i + 1, line.trim().to_string()));
+                                break;
+                            }
+                            rest = after;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut hits = Vec::new();
+        walk(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src").as_path(),
+            &mut hits,
+        );
+        // The census itself quotes the pattern it looks for.
+        hits.retain(|(file, _, _)| file != "routing.rs");
+        assert!(
+            hits.is_empty(),
+            "these read a model's price off the field instead of through \
+             PricingIndex::resolve, so `pricing_key` is ignored there: {hits:#?}",
+        );
+    }
+
     #[test]
     fn least_cost_ranks_a_referenced_price_against_an_inline_one() {
         let t = crate::ModelRuntimeStatusTracker::new();
