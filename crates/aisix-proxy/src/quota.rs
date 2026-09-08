@@ -355,7 +355,11 @@ async fn reserve_layers(
     // `mcp:<api_key_id>:<server>` so each server the key reaches counts
     // independently — of the other servers, and of every other key.
     if let Some(server) = mcp_server {
-        if let Some(limits) = auth.key().mcp_rate_limit(server) {
+        // Through the same registered-server index the tool ACL resolves
+        // against, so a key that names its limits by server id and its
+        // grants by server id sees one rename take effect at one instant.
+        let servers = state.mcp_servers.for_snapshot(snapshot);
+        if let Some(limits) = auth.key().mcp_rate_limit(&servers, server) {
             let rl = RateLimit::from(limits);
             if !rl.is_unrestricted() {
                 let key = format!("mcp:{}:{}", auth.entry.id, server);

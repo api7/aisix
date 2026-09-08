@@ -221,6 +221,80 @@ pub fn model_ref_id_fields(kind: &str) -> &'static [ModelRefIdField] {
     }
 }
 
+/// One id-form MCP server reference a document can carry: where it sits,
+/// the field, and the name-form field that replaces it.
+///
+/// The name form spells the server as the `<server>` half of a namespaced
+/// `<server>__<tool>` pattern (an ACL side) or as a map key (the per-server
+/// rate limits); either way the file names the server, and the id form is
+/// what a file cannot express.
+pub struct McpRefIdField {
+    /// Object path from the document root to the object carrying `field`.
+    pub path: &'static [&'static str],
+    pub field: &'static str,
+    pub name_field: &'static str,
+}
+
+impl McpRefIdField {
+    /// Dotted path an operator sees in the error, e.g. `mcp_access.allow_ids`.
+    fn display_path(&self) -> String {
+        let mut out = String::new();
+        for segment in self.path {
+            out.push_str(segment);
+            out.push('.');
+        }
+        out.push_str(self.field);
+        out
+    }
+}
+
+/// The id-form MCP server references a document of `kind` can carry.
+///
+/// Same contract as [`model_ref_id_fields`], for the other reference that
+/// has an id spelling: the resources file refuses it (see [`load_from_str`])
+/// and `aisix export` rewrites it back to the name form, and a field one of
+/// them knows about and the other does not is a silent round-trip loss.
+///
+/// `mcp_policies` is deliberately absent — the file source carries no such
+/// collection, so there is no document of that kind for a file to reject.
+pub fn mcp_ref_id_fields(kind: &str) -> &'static [McpRefIdField] {
+    const API_KEYS: [McpRefIdField; 3] = [
+        McpRefIdField {
+            path: &[],
+            field: "mcp_rate_limits_by_id",
+            name_field: "mcp_rate_limits",
+        },
+        McpRefIdField {
+            path: &["mcp_access"],
+            field: "allow_ids",
+            name_field: "allow",
+        },
+        McpRefIdField {
+            path: &["mcp_access"],
+            field: "deny_ids",
+            name_field: "deny",
+        },
+    ];
+    match kind {
+        "api_keys" => &API_KEYS,
+        _ => &[],
+    }
+}
+
+/// The first id-form MCP reference `doc` carries, if any.
+fn mcp_ref_id_field(kind: &str, doc: &Value) -> Option<&'static McpRefIdField> {
+    mcp_ref_id_fields(kind).iter().find(|f| {
+        let mut node = doc;
+        for segment in f.path {
+            match node.get(segment) {
+                Some(next) => node = next,
+                None => return false,
+            }
+        }
+        node.get(f.field).is_some()
+    })
+}
+
 /// Call `f` on every object in `doc` that may carry one of
 /// [`model_ref_id_fields`]'s fields, for a document of `kind`.
 ///
@@ -572,6 +646,25 @@ pub fn load_from_str(
                     "the resources file does not accept `{field}` — it names a model by \
                      control-plane id, which a file cannot resolve; name the model with \
                      `{hint}` instead"
+                ),
+            });
+            continue;
+        }
+
+        // The same rule for the other reference with an id spelling: an
+        // MCP server named by the id the control plane assigned it. A file
+        // registers its servers by name and derives their ids from those
+        // names, so an id a file carries resolves to nothing — the grant
+        // would silently cover no tool, or the limit bind to no server,
+        // with the name spelling ignored on top.
+        if let Some(reference) = mcp_ref_id_field(entry.kind, &entry.doc) {
+            let (path, name_field) = (reference.display_path(), reference.name_field);
+            errors.push(LoadError {
+                scope,
+                message: format!(
+                    "the resources file does not accept `{path}` — it names an MCP server by \
+                     control-plane id, which a file cannot resolve; name the server with \
+                     `{name_field}` instead"
                 ),
             });
             continue;

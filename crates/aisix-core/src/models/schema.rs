@@ -3090,6 +3090,70 @@ mod tests {
     }
 
     #[test]
+    fn mcp_id_form_sides_are_accepted_on_both_paths() {
+        let hash = "9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20";
+        let entry = json!({"server_id": "s-1", "tool": "create_issue"});
+
+        for ids in [json!([entry.clone()]), json!([]), json!(null)] {
+            let policy = json!({"scope": "env", "allow": ["*"], "allow_ids": ids, "deny_ids": ids});
+            validate_mcp_policy(&policy).unwrap();
+            validate_mcp_policy_lenient(&policy).unwrap();
+
+            let key = json!({
+                "key_hash": hash,
+                "mcp_access": {"allow": ["*"], "allow_ids": ids, "deny_ids": ids},
+                "mcp_rate_limits_by_id": {"s-1": {"rpm": 1}},
+            });
+            validate_apikey(&key).unwrap();
+            validate_apikey_lenient(&key).unwrap();
+        }
+
+        // Both spellings may be written together; the runtime lets the ids
+        // decide.
+        validate_mcp_policy(&json!({
+            "scope": "env",
+            "allow": ["github__create_issue"],
+            "allow_ids": [entry],
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn mcp_id_form_entries_must_name_a_server_and_a_tool() {
+        let bad = [
+            json!({"tool": "create_issue"}),
+            json!({"server_id": "s-1"}),
+            json!({"server_id": "", "tool": "create_issue"}),
+            json!({"server_id": "s-1", "tool": ""}),
+            json!({"server_id": "s-1", "tool": "x", "rogue": 1}),
+            json!("s-1__create_issue"),
+        ];
+        for entry in bad {
+            assert!(
+                validate_mcp_policy(&json!({
+                    "scope": "env", "allow": ["*"], "allow_ids": [entry.clone()]
+                }))
+                .is_err(),
+                "allow_ids entry {entry} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn the_write_path_still_requires_the_name_form_allow_side() {
+        // Deliberately unchanged by the id spelling. A control plane
+        // writing `allow_ids` writes `allow` beside it, and a gateway one
+        // release behind — which cannot see `allow_ids` at all — then keeps
+        // reading the grant it always did instead of losing MCP access at
+        // the moment the control plane is upgraded.
+        assert!(validate_mcp_policy(&json!({
+            "scope": "env",
+            "allow_ids": [{"server_id": "s-1", "tool": "*"}],
+        }))
+        .is_err());
+    }
+
+    #[test]
     fn mcp_policy_requires_an_explicit_allow_side() {
         assert!(validate_mcp_policy(&json!({"scope": "env"})).is_err());
         assert!(validate_mcp_policy(&json!({"scope": "env", "deny": ["github__*"]})).is_err());

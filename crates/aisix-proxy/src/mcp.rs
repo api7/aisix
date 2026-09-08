@@ -587,7 +587,7 @@ async fn dispatch(
     // from the key together with the environment/team MCP access policies —
     // so MCP tool access is governed by the same key object as LLM access.
     let acl = {
-        let resolved = aisix_mcp::ToolAcl::resolve(&snapshot, auth.key());
+        let resolved = aisix_mcp::ToolAcl::resolve(&snapshot, &state.mcp_servers, auth.key());
         // The anonymous allowlist is a CEILING on the bound principal,
         // not just the entry gate. Applied here — one layer on the ACL
         // both endpoints share — it constrains `tools/list` and

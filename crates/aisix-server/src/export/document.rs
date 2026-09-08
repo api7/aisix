@@ -84,6 +84,7 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
     let provider_key_names = id_to_name(&snapshot.provider_keys, |pk| pk.display_name.clone());
     let model_names = id_to_name(&snapshot.models, |m| m.display_name.clone());
     let api_key_names = id_to_name(&snapshot.apikeys, |k| synthetic_api_key_name(&k.key_hash));
+    let mcp_server_names = id_to_name(&snapshot.mcp_servers, |s| s.name.clone());
 
     let mut collections: Vec<(&'static str, Vec<Value>)> = Vec::new();
 
@@ -157,6 +158,7 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
                     map.insert("display_name".into(), Value::String(identity.to_string()));
                 }
                 resugar_allowed_models(doc, identity, &model_names, diag);
+                resugar_mcp_refs(doc, identity, &mcp_server_names, diag);
             },
             |_, _| {},
         ),
@@ -808,6 +810,79 @@ fn resugar_model_refs(
     });
     diag.blocking.extend(blocking);
     diag.warnings.extend(warnings);
+}
+
+/// An API key's MCP references (etcd server ids) → the name form.
+///
+/// Three fields carry a server by id: `mcp_rate_limits_by_id`, and the
+/// `allow_ids` / `deny_ids` sides of `mcp_access`. The file source grants
+/// and limits MCP servers by name, so each is resolved to the identity the
+/// `mcp_servers` collection is keyed by and re-emitted under the name field
+/// it shadows. The id form is a control-plane projection and is never
+/// written to a resources file.
+///
+/// The id form is authoritative at runtime, so the name form it shadows is
+/// REPLACED rather than merged: keeping both would export a key whose stored
+/// grant and exported grant differ.
+///
+/// An entry naming no exported server is dropped with a warning. For a grant
+/// that makes the key reach LESS, which is the safe direction and the one the
+/// gateway already takes for an unresolvable id; for a limit it means the
+/// exported key is bounded by its own `rate_limit` alone, which is why that
+/// case warns too.
+fn resugar_mcp_refs(
+    doc: &mut Value,
+    api_key: &str,
+    mcp_server_names: &BTreeMap<String, String>,
+    diag: &mut Diagnostics,
+) {
+    let Some(map) = doc.as_object_mut() else {
+        return;
+    };
+
+    if let Some(Value::Object(by_id)) = map.remove("mcp_rate_limits_by_id") {
+        let mut by_name = serde_json::Map::new();
+        for (id, limits) in by_id {
+            match mcp_server_names.get(&id) {
+                Some(name) => {
+                    by_name.insert(name.clone(), limits);
+                }
+                None => diag.warnings.push(format!(
+                    "api key {api_key:?} limits MCP server id {id:?}, which is not among the \
+                     exported MCP servers — the limit is dropped (the gateway already treats it \
+                     as imposing nothing)"
+                )),
+            }
+        }
+        map.insert("mcp_rate_limits".into(), Value::Object(by_name));
+    }
+
+    let Some(Value::Object(access)) = map.get_mut("mcp_access") else {
+        return;
+    };
+    for (id_field, name_field) in [("allow_ids", "allow"), ("deny_ids", "deny")] {
+        let Some(Value::Array(refs)) = access.remove(id_field) else {
+            continue;
+        };
+        let mut patterns = Vec::with_capacity(refs.len());
+        for entry in &refs {
+            let (Some(id), Some(tool)) = (
+                entry.get("server_id").and_then(Value::as_str),
+                entry.get("tool").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            match mcp_server_names.get(id) {
+                Some(name) => patterns.push(Value::String(format!("{name}__{tool}"))),
+                None => diag.warnings.push(format!(
+                    "api key {api_key:?} names MCP server id {id:?} under \
+                     `mcp_access.{id_field}`, which is not among the exported MCP servers — the \
+                     entry is dropped (the gateway already treats it as matching nothing)"
+                )),
+            }
+        }
+        access.insert(name_field.into(), Value::Array(patterns));
+    }
 }
 
 /// `claim_mapping.resolve.api_key_id` (etcd id) → `resolve.api_key`

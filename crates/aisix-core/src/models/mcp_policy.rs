@@ -17,6 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::mcp_ref::McpToolRef;
 use crate::resource::Resource;
 
 /// Which API keys an MCP access policy applies to.
@@ -55,15 +56,40 @@ pub struct McpPolicy {
     /// a document written before the layered shape would otherwise fail
     /// to deserialize, and a skipped `api_key` row stops authenticating
     /// altogether rather than merely losing MCP access.
+    ///
+    /// Read only when `allow_ids` is absent; ignored entirely when it is
+    /// present.
     #[serde(default)]
     pub allow: Vec<String>,
+
+    /// This layer's allow side written by MCP server resource id instead of
+    /// by server name, so renaming a server does not change what the layer
+    /// allows. Each entry names one MCP server by the id it is registered
+    /// under and one tool by name, the tool matched as a single-`*` glob
+    /// against the bare tool name.
+    ///
+    /// Present — including as an empty array — it is authoritative and
+    /// `allow` is ignored; an empty array therefore allows nothing. Set to
+    /// `null` it means the same as omitted: the layer falls back to `allow`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_ids: Option<Vec<McpToolRef>>,
 
     /// Namespaced `<server>__<tool>` patterns subtracted from the effective
     /// grant of every key the policy applies to, using the same single-`*`
     /// glob matching as `allow`. Deny always wins: a tool matched here stays
     /// unavailable however the other layers allow it.
+    ///
+    /// Read only when `deny_ids` is absent; ignored entirely when it is
+    /// present.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
+
+    /// This layer's deny side written by MCP server resource id instead of
+    /// by server name. Present — including as an empty array — it is
+    /// authoritative and `deny` is ignored; an empty array subtracts
+    /// nothing. Absent or `null`, the layer falls back to `deny`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_ids: Option<Vec<McpToolRef>>,
 
     /// Whether the policy is applied. A disabled policy is kept but
     /// contributes neither its allow nor its deny side. Treated as `true`
@@ -93,14 +119,31 @@ pub struct McpAccess {
     /// and `["*"]` narrows nothing (useful with `deny` alone).
     ///
     /// Required on the write path and defaulted by the runtime loader,
-    /// for the reason given on [`McpPolicy::allow`].
+    /// for the reason given on [`McpPolicy::allow`]. Read only when
+    /// `allow_ids` is absent; ignored entirely when it is present.
     #[serde(default)]
     pub allow: Vec<String>,
 
+    /// This key's allow side written by MCP server resource id instead of by
+    /// server name, so renaming a server does not change what the key may
+    /// reach. Present — including as an empty array — it is authoritative
+    /// and `allow` is ignored; an empty array therefore allows nothing.
+    /// Absent or `null`, the key falls back to `allow`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_ids: Option<Vec<McpToolRef>>,
+
     /// Namespaced `<server>__<tool>` patterns subtracted from this key's
     /// effective grant, using the same single-`*` glob matching as `allow`.
+    /// Read only when `deny_ids` is absent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
+
+    /// This key's deny side written by MCP server resource id instead of by
+    /// server name. Present — including as an empty array — it is
+    /// authoritative and `deny` is ignored; an empty array subtracts
+    /// nothing. Absent or `null`, the key falls back to `deny`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_ids: Option<Vec<McpToolRef>>,
 }
 
 impl Resource for McpPolicy {

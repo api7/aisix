@@ -539,6 +539,55 @@ api_keys:
     load(&ok, &env).expect("the same file without the field loads");
 }
 
+/// The MCP server references with an id spelling are refused the same way,
+/// each at the nesting site it appears at. Each is asserted twice: once
+/// with the id field (one error naming it and the name-form field that
+/// replaces it) and once without (the file loads), so the rejection is
+/// pinned to the field rather than to anything else in the fixture.
+#[test]
+fn mcp_server_reference_ids_are_rejected_by_the_file_source() {
+    const PRELUDE: &str = r#"
+_format_version: "1"
+mcp_servers:
+  - name: github
+    url: https://example.test/mcp
+api_keys:
+  - display_name: k
+    key_env: CALLER_KEY
+    allowed_models: []
+"#;
+    // (id-form line, the dotted path the error names, the name-form field)
+    let cases = [
+        (
+            "    mcp_rate_limits_by_id:\n      \"11111111-1111-1111-1111-111111111111\": {rpm: 1}\n",
+            "mcp_rate_limits_by_id",
+            "mcp_rate_limits",
+        ),
+        (
+            "    mcp_access:\n      allow: []\n      allow_ids: [{server_id: \"s-1\", tool: \"*\"}]\n",
+            "mcp_access.allow_ids",
+            "allow",
+        ),
+        (
+            "    mcp_access:\n      allow: [\"*\"]\n      deny_ids: [{server_id: \"s-1\", tool: \"x\"}]\n",
+            "mcp_access.deny_ids",
+            "deny",
+        ),
+    ];
+    let env = env_of(&[("CALLER_KEY", "sk-caller")]);
+    for (line, path, name_field) in cases {
+        let contents = format!("{PRELUDE}{line}");
+        let errs = errors_of(load(&contents, &env));
+        assert_eq!(errs.len(), 1, "{path}: {errs:?}");
+        assert!(
+            errs[0].contains(&format!("does not accept `{path}`")) && errs[0].contains(name_field),
+            "{path}: {errs:?}"
+        );
+
+        load(PRELUDE, &env).expect("the same file without the field loads");
+    }
+}
+
 /// Every other id-form model reference is refused the same way, at every
 /// nesting site it can appear. Each fixture is asserted twice: once with
 /// the id field (one error naming it and the name-form field that

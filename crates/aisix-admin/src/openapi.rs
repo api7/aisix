@@ -1512,6 +1512,28 @@ const OPENAPI_JSON_BASE: &str = r##"{
         },
         "description": "Admin API error response envelope."
       },
+      "McpToolRef": {
+        "type": "object",
+        "required": [
+          "server_id",
+          "tool"
+        ],
+        "properties": {
+          "server_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Resource id of the registered MCP server this entry refers to. An id matching no registered server refers to nothing: the entry never matches, and the other entries are unaffected.",
+            "example": "9b1b6d9c-1f5e-4c1e-9f8f-2f5f5b9d1c11"
+          },
+          "tool": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Tool on that server, matched as a single-`*` glob against the bare tool name \u2014 the part after the `<server>__` namespace prefix. `\"*\"` covers every tool the server exposes.",
+            "example": "create_issue"
+          }
+        },
+        "description": "One tool on one MCP server, the server named by its resource id and the tool by name. The server half is compared as an exact id, never glob-matched."
+      },
       "PublicApiKey": {
         "type": "object",
         "required": [
@@ -1561,20 +1583,40 @@ const OPENAPI_JSON_BASE: &str = r##"{
                 "items": {
                   "type": "string"
                 },
-                "description": "Namespaced `<server>__<tool>` glob patterns this key allows, intersected with the environment and team layers."
+                "description": "Namespaced `<server>__<tool>` glob patterns this key allows, intersected with the environment and team layers. Read only when `allow_ids` is omitted or null; an array there, `[]` included, takes over entirely."
+              },
+              "allow_ids": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "$ref": "#/components/schemas/McpToolRef"
+                },
+                "description": "The same allow side written by MCP server resource id instead of by server name, so renaming a server does not change what the key may reach. An array here, `[]` included, is authoritative and `allow` is ignored. Omitted or null falls back to `allow`."
               },
               "deny": {
                 "type": "array",
                 "items": {
                   "type": "string"
                 },
-                "description": "Namespaced `<server>__<tool>` glob patterns subtracted from this key's effective grant. Deny always wins."
+                "description": "Namespaced `<server>__<tool>` glob patterns subtracted from this key's effective grant. Deny always wins. Read only when `deny_ids` is omitted or null."
+              },
+              "deny_ids": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "$ref": "#/components/schemas/McpToolRef"
+                },
+                "description": "The same deny side written by MCP server resource id instead of by server name. An array here, `[]` included, is authoritative and `deny` is ignored. Omitted or null falls back to `deny`."
               }
             },
             "required": [
               "allow"
             ],
-            "description": "This key's own layer of the MCP tool ACL, as namespaced `<server>__<tool>` glob patterns. Intersected with the environment and team MCP access policies: every present layer must allow a tool and no layer may deny it. When omitted the key adds no constraint of its own; with no layer present anywhere the grant is empty."
+            "description": "This key's own layer of the MCP tool ACL, as namespaced `<server>__<tool>` glob patterns or as `allow_ids` / `deny_ids` entries naming the server by resource id. Intersected with the environment and team MCP access policies: every present layer must allow a tool and no layer may deny it. When omitted the key adds no constraint of its own; with no layer present anywhere the grant is empty."
           },
           "allowed_agents": {
             "type": [

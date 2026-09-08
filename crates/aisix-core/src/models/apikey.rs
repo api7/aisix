@@ -99,7 +99,8 @@ pub struct ApiKey {
     pub jwt_provider: Option<String>,
 
     /// This key's own layer of the MCP tool ACL, as namespaced
-    /// `<server>__<tool>` glob patterns. It is intersected with the
+    /// `<server>__<tool>` glob patterns, or as `allow_ids` / `deny_ids`
+    /// entries naming the server by resource id. It is intersected with the
     /// environment and team MCP access policies: every present layer must
     /// allow a tool and no layer may deny it. When omitted the key adds no
     /// constraint of its own — but with no layer present anywhere the grant
@@ -114,8 +115,24 @@ pub struct ApiKey {
     /// a burst against one server never consumes another's budget. A server
     /// with no entry here is bounded by `rate_limit` alone. Only tool calls
     /// are metered; the `initialize` / `tools/list` handshake is not.
+    ///
+    /// Read only when `mcp_rate_limits_by_id` is absent; ignored entirely
+    /// when it is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_rate_limits: Option<BTreeMap<String, McpRateLimit>>,
+
+    /// The same per-server limits, keyed by the MCP server's resource id
+    /// (`mcp_servers/<id>`) rather than by its name, so renaming a server
+    /// does not detach the limit that was set for it.
+    ///
+    /// Present — including as an empty object — it is authoritative and
+    /// `mcp_rate_limits` is ignored; an empty object therefore leaves every
+    /// server bounded by `rate_limit` alone. A key naming no registered
+    /// server imposes nothing, and the other entries are unaffected. Set to
+    /// `null` it means the same as omitted: the key falls back to
+    /// `mcp_rate_limits`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_rate_limits_by_id: Option<BTreeMap<String, McpRateLimit>>,
 
     /// A2A agents this key may reach, named by their registered names. Entries
     /// are matched as single-`*` globs, mirroring `allowed_models`: `"*"` grants
@@ -213,8 +230,30 @@ impl ApiKey {
     /// The limits this key carries for one MCP server, named as it is
     /// registered (the `<server>` namespace of a `<server>__<tool>` call).
     /// `None` when the key sets no limit for that server.
-    pub fn mcp_rate_limit(&self, server: &str) -> Option<&McpRateLimit> {
-        self.mcp_rate_limits.as_ref()?.get(server)
+    ///
+    /// **The single chokepoint for the key→MCP-server limit.** The key
+    /// carries the limits one of two ways and this decides between them, so
+    /// no caller can read one shape and miss the other:
+    ///
+    /// - `mcp_rate_limits_by_id` present (an empty object included): the
+    ///   server's registered name is resolved to the resource id it is
+    ///   stored under and the limit is looked up by that id, so a rename
+    ///   keeps the limit attached. `mcp_rate_limits` is not read at all.
+    /// - `mcp_rate_limits_by_id` absent: `mcp_rate_limits` is looked up by
+    ///   the server's name, as before.
+    ///
+    /// Resolution is done per request against the live table rather than
+    /// cached, so a server rename takes effect on the next request with no
+    /// rewrite of any key document.
+    pub fn mcp_rate_limit(
+        &self,
+        servers: &super::McpServerIndex,
+        server: &str,
+    ) -> Option<&McpRateLimit> {
+        match &self.mcp_rate_limits_by_id {
+            Some(by_id) => by_id.get(servers.id_of(server)?),
+            None => self.mcp_rate_limits.as_ref()?.get(server),
+        }
     }
 
     /// True if this key may reach the given A2A agent, named by its registered
@@ -364,6 +403,7 @@ mod tests {
             mcp_access: None,
             allowed_routes: None,
             mcp_rate_limits: None,
+            mcp_rate_limits_by_id: None,
             allowed_agents: None,
             expires_at: None,
             disabled: false,
@@ -709,6 +749,110 @@ mod tests {
             serde_json::from_str(r#"{"key_hash":"h","allowed_model_ids":["m-1"]}"#).unwrap();
         let v = serde_json::to_value(&k).unwrap();
         assert_eq!(v["allowed_model_ids"], serde_json::json!(["m-1"]));
+    }
+
+    /// A registered-server index over one `(id, name)` pair per server.
+    fn server_index(servers: &[(&str, &str)]) -> super::super::McpServerIndex {
+        let snap = super::super::AisixSnapshot::default();
+        for (id, name) in servers {
+            let server: crate::models::McpServer = serde_json::from_str(&format!(
+                r#"{{"name":"{name}","url":"https://example.test/mcp"}}"#
+            ))
+            .unwrap();
+            snap.mcp_servers
+                .insert(crate::resource::ResourceEntry::new(*id, server, 1));
+        }
+        super::super::McpServerIndex::build(&snap.mcp_servers)
+    }
+
+    const ONE_RPM: &str = r#"{"rpm":1}"#;
+
+    #[test]
+    fn mcp_rate_limits_are_looked_up_by_server_name_by_default() {
+        let servers = server_index(&[("s-github", "github")]);
+        let k: ApiKey = serde_json::from_str(&format!(
+            r#"{{"key_hash":"h","mcp_rate_limits":{{"github":{ONE_RPM}}}}}"#
+        ))
+        .unwrap();
+        assert!(k.mcp_rate_limit(&servers, "github").is_some());
+        assert!(k.mcp_rate_limit(&servers, "slack").is_none());
+    }
+
+    #[test]
+    fn mcp_rate_limits_by_id_are_looked_up_through_the_server_index() {
+        let servers = server_index(&[("s-github", "github"), ("s-slack", "slack")]);
+        let k: ApiKey = serde_json::from_str(&format!(
+            r#"{{"key_hash":"h","mcp_rate_limits_by_id":{{"s-github":{ONE_RPM}}}}}"#
+        ))
+        .unwrap();
+        assert!(k.mcp_rate_limit(&servers, "github").is_some());
+        assert!(k.mcp_rate_limit(&servers, "slack").is_none());
+    }
+
+    #[test]
+    fn mcp_rate_limits_by_id_follow_a_rename() {
+        let k: ApiKey = serde_json::from_str(&format!(
+            r#"{{"key_hash":"h","mcp_rate_limits_by_id":{{"s-github":{ONE_RPM}}}}}"#
+        ))
+        .unwrap();
+        assert!(k
+            .mcp_rate_limit(&server_index(&[("s-github", "github")]), "github")
+            .is_some());
+
+        // Same id, new name: the key document is untouched.
+        let renamed = server_index(&[("s-github", "github-v2")]);
+        assert!(k.mcp_rate_limit(&renamed, "github-v2").is_some());
+        assert!(k.mcp_rate_limit(&renamed, "github").is_none());
+    }
+
+    #[test]
+    fn mcp_rate_limits_by_id_win_over_the_name_form() {
+        let servers = server_index(&[("s-github", "github"), ("s-slack", "slack")]);
+        let k: ApiKey = serde_json::from_str(&format!(
+            r#"{{"key_hash":"h",
+                 "mcp_rate_limits":{{"slack":{ONE_RPM}}},
+                 "mcp_rate_limits_by_id":{{"s-github":{ONE_RPM}}}}}"#
+        ))
+        .unwrap();
+        assert!(k.mcp_rate_limit(&servers, "github").is_some());
+        assert!(
+            k.mcp_rate_limit(&servers, "slack").is_none(),
+            "the name form is not read at all once the id form is present"
+        );
+
+        // An empty object is authoritative too: every server is bounded by
+        // `rate_limit` alone.
+        let emptied: ApiKey = serde_json::from_str(&format!(
+            r#"{{"key_hash":"h",
+                 "mcp_rate_limits":{{"github":{ONE_RPM}}},
+                 "mcp_rate_limits_by_id":{{}}}}"#
+        ))
+        .unwrap();
+        assert!(emptied.mcp_rate_limit(&servers, "github").is_none());
+    }
+
+    #[test]
+    fn an_unresolvable_server_id_imposes_no_limit_and_spares_its_neighbours() {
+        let servers = server_index(&[("s-slack", "slack")]);
+        let k: ApiKey = serde_json::from_str(&format!(
+            r#"{{"key_hash":"h","mcp_rate_limits_by_id":{{"s-gone":{ONE_RPM},"s-slack":{ONE_RPM}}}}}"#
+        ))
+        .unwrap();
+        assert!(k.mcp_rate_limit(&servers, "slack").is_some());
+        assert!(k.mcp_rate_limit(&servers, "s-gone").is_none());
+    }
+
+    #[test]
+    fn mcp_rate_limits_by_id_stays_off_the_wire_when_absent() {
+        let v = serde_json::to_value(sample()).unwrap();
+        assert!(v.get("mcp_rate_limits_by_id").is_none());
+
+        let k: ApiKey = serde_json::from_str(&format!(
+            r#"{{"key_hash":"h","mcp_rate_limits_by_id":{{"s-1":{ONE_RPM}}}}}"#
+        ))
+        .unwrap();
+        let v = serde_json::to_value(&k).unwrap();
+        assert!(v["mcp_rate_limits_by_id"]["s-1"].is_object());
     }
 
     #[test]

@@ -6,18 +6,38 @@
       "properties": {
         "allow": {
           "default": [],
-          "description": "Namespaced `<server>__<tool>` patterns this key allows, intersected with the environment and team layers. Same single-`*` glob matching a policy's `allow` uses; an empty list leaves the key no MCP access, and `[\"*\"]` narrows nothing (useful with `deny` alone).\n\nRequired on the write path and defaulted by the runtime loader, for the reason given on [`McpPolicy::allow`].",
+          "description": "Namespaced `<server>__<tool>` patterns this key allows, intersected with the environment and team layers. Same single-`*` glob matching a policy's `allow` uses; an empty list leaves the key no MCP access, and `[\"*\"]` narrows nothing (useful with `deny` alone).\n\nRequired on the write path and defaulted by the runtime loader, for the reason given on [`McpPolicy::allow`]. Read only when `allow_ids` is absent; ignored entirely when it is present.",
           "items": {
             "type": "string"
           },
           "type": "array"
         },
+        "allow_ids": {
+          "description": "This key's allow side written by MCP server resource id instead of by server name, so renaming a server does not change what the key may reach. Present — including as an empty array — it is authoritative and `allow` is ignored; an empty array therefore allows nothing. Absent or `null`, the key falls back to `allow`.",
+          "items": {
+            "$ref": "#/definitions/McpToolRef"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "deny": {
-          "description": "Namespaced `<server>__<tool>` patterns subtracted from this key's effective grant, using the same single-`*` glob matching as `allow`.",
+          "description": "Namespaced `<server>__<tool>` patterns subtracted from this key's effective grant, using the same single-`*` glob matching as `allow`. Read only when `deny_ids` is absent.",
           "items": {
             "type": "string"
           },
           "type": "array"
+        },
+        "deny_ids": {
+          "description": "This key's deny side written by MCP server resource id instead of by server name. Present — including as an empty array — it is authoritative and `deny` is ignored; an empty array subtracts nothing. Absent or `null`, the key falls back to `deny`.",
+          "items": {
+            "$ref": "#/definitions/McpToolRef"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -71,6 +91,26 @@
           ]
         }
       },
+      "type": "object"
+    },
+    "McpToolRef": {
+      "description": "One tool on one MCP server, the server named by its resource id and the tool by name.\n\nThe tool half is matched with the same single-`*` glob rule the name form uses, so `tool: \"*\"` is the id spelling of `<server>__*`. The server half is an exact id: it is compared against the id of the server the addressed tool actually belongs to, never glob-matched, so a server whose *name* happens to contain a `*` cannot widen a grant.",
+      "properties": {
+        "server_id": {
+          "description": "Resource id of the registered MCP server (`mcp_servers/<id>`) this entry refers to. An id matching no registered server refers to nothing: the entry never matches, and the other entries are unaffected.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "tool": {
+          "description": "Tool on that server, matched as a single-`*` glob against the bare tool name — the part after the `<server>__` namespace prefix. `\"*\"` covers every tool the server exposes.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "server_id",
+        "tool"
+      ],
       "type": "object"
     },
     "RateLimit": {
@@ -230,13 +270,23 @@
           "type": "null"
         }
       ],
-      "description": "This key's own layer of the MCP tool ACL, as namespaced `<server>__<tool>` glob patterns. It is intersected with the environment and team MCP access policies: every present layer must allow a tool and no layer may deny it. When omitted the key adds no constraint of its own — but with no layer present anywhere the grant is empty, so MCP access is always granted explicitly."
+      "description": "This key's own layer of the MCP tool ACL, as namespaced `<server>__<tool>` glob patterns, or as `allow_ids` / `deny_ids` entries naming the server by resource id. It is intersected with the environment and team MCP access policies: every present layer must allow a tool and no layer may deny it. When omitted the key adds no constraint of its own — but with no layer present anywhere the grant is empty, so MCP access is always granted explicitly."
     },
     "mcp_rate_limits": {
       "additionalProperties": {
         "$ref": "#/definitions/McpRateLimit"
       },
-      "description": "Per-MCP-server limits for this key, keyed by the registered MCP server name — the `<server>` half of the `<server>__<tool>` names the gateway exposes. A `tools/call` is metered against the entry for the server it targets **and** the key's own `rate_limit`, each in its own counter, so a burst against one server never consumes another's budget. A server with no entry here is bounded by `rate_limit` alone. Only tool calls are metered; the `initialize` / `tools/list` handshake is not.",
+      "description": "Per-MCP-server limits for this key, keyed by the registered MCP server name — the `<server>` half of the `<server>__<tool>` names the gateway exposes. A `tools/call` is metered against the entry for the server it targets **and** the key's own `rate_limit`, each in its own counter, so a burst against one server never consumes another's budget. A server with no entry here is bounded by `rate_limit` alone. Only tool calls are metered; the `initialize` / `tools/list` handshake is not.\n\nRead only when `mcp_rate_limits_by_id` is absent; ignored entirely when it is present.",
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "mcp_rate_limits_by_id": {
+      "additionalProperties": {
+        "$ref": "#/definitions/McpRateLimit"
+      },
+      "description": "The same per-server limits, keyed by the MCP server's resource id (`mcp_servers/<id>`) rather than by its name, so renaming a server does not detach the limit that was set for it.\n\nPresent — including as an empty object — it is authoritative and `mcp_rate_limits` is ignored; an empty object therefore leaves every server bounded by `rate_limit` alone. A key naming no registered server imposes nothing, and the other entries are unaffected. Set to `null` it means the same as omitted: the key falls back to `mcp_rate_limits`.",
       "type": [
         "object",
         "null"

@@ -560,7 +560,29 @@ fn policy_snapshot(rows: &[(&str, serde_json::Value)]) -> AisixSnapshot {
 }
 
 fn resolve_now(snapshot: &AisixSnapshot, key: &aisix_core::models::ApiKey) -> ToolAcl {
-    ToolAcl::resolve(snapshot, key)
+    // A fresh index per call: these tests build one snapshot each, and a
+    // shared one would hide a rebuild the generation key is meant to force.
+    ToolAcl::resolve(
+        snapshot,
+        &aisix_core::models::LiveMcpServerIndex::new(),
+        key,
+    )
+}
+
+/// Register the given `(id, name)` MCP servers on `snapshot`, so an
+/// id-form ACL entry has something to resolve against.
+fn with_servers(snapshot: AisixSnapshot, servers: &[(&str, &str)]) -> AisixSnapshot {
+    for (id, name) in servers {
+        let server: aisix_core::models::McpServer = serde_json::from_value(serde_json::json!({
+            "name": name,
+            "url": "https://example.test/mcp",
+        }))
+        .unwrap();
+        snapshot
+            .mcp_servers
+            .insert(ResourceEntry::new(*id, server, 1));
+    }
+    snapshot
 }
 
 #[test]
@@ -1024,4 +1046,208 @@ async fn policy_resolved_acl_filters_list_and_rejects_calls() {
 fn call(name: &'static str, text: &str) -> CallToolRequestParams {
     let args = serde_json::json!({ "text": text });
     CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone())
+}
+
+// ---- the id spelling of a layer's two sides (`allow_ids` / `deny_ids`) ----
+
+#[test]
+fn allow_ids_grant_by_server_resource_id() {
+    let snapshot = with_servers(
+        policy_snapshot(&[]),
+        &[("s-github", "github"), ("s-slack", "slack")],
+    );
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],
+        "mcp_access":{"allow":[],"allow_ids":[{"server_id":"s-github","tool":"create_issue"}]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(acl.permits("github__create_issue"));
+    assert!(!acl.permits("github__delete_repo"));
+    assert!(!acl.permits("slack__post_message"));
+}
+
+#[test]
+fn an_allow_id_tool_glob_covers_the_whole_server() {
+    let snapshot = with_servers(policy_snapshot(&[]), &[("s-github", "github")]);
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],
+        "mcp_access":{"allow":[],"allow_ids":[{"server_id":"s-github","tool":"*"}]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(acl.permits("github__create_issue"));
+    assert!(acl.permits("github__anything_at_all"));
+    assert!(!acl.permits("slack__post_message"));
+}
+
+#[test]
+fn an_id_grant_survives_a_server_rename() {
+    // The whole point: the key document is byte-identical across the
+    // rename, and the grant follows the id to the server's new namespace.
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],
+        "mcp_access":{"allow":["github__create_issue"],
+                      "allow_ids":[{"server_id":"s-github","tool":"create_issue"}]}
+    }));
+
+    let before = with_servers(policy_snapshot(&[]), &[("s-github", "github")]);
+    assert!(resolve_now(&before, &key).permits("github__create_issue"));
+
+    let after = with_servers(policy_snapshot(&[]), &[("s-github", "github-v2")]);
+    let acl = resolve_now(&after, &key);
+    assert!(
+        acl.permits("github-v2__create_issue"),
+        "the grant follows the id into the server's new namespace"
+    );
+    assert!(
+        !acl.permits("github__create_issue"),
+        "and does not linger on the old one, which now names no server"
+    );
+}
+
+#[test]
+fn allow_ids_win_over_allow_on_the_same_layer() {
+    let snapshot = with_servers(
+        policy_snapshot(&[]),
+        &[("s-github", "github"), ("s-slack", "slack")],
+    );
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],
+        "mcp_access":{"allow":["slack__*"],
+                      "allow_ids":[{"server_id":"s-github","tool":"create_issue"}]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(acl.permits("github__create_issue"));
+    assert!(
+        !acl.permits("slack__post_message"),
+        "the name side is not read at all once the id side is present"
+    );
+
+    // Even a wide-open name side loses to an empty id side.
+    let widened = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],
+        "mcp_access":{"allow":["*"],"allow_ids":[]}
+    }));
+    assert!(!resolve_now(&snapshot, &widened).permits("github__create_issue"));
+}
+
+#[test]
+fn an_unresolvable_server_id_matches_nothing_and_spares_its_neighbours() {
+    let snapshot = with_servers(
+        policy_snapshot(&[]),
+        &[("s-github", "github"), ("s-slack", "slack")],
+    );
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],
+        "mcp_access":{"allow":[],"allow_ids":[
+            {"server_id":"s-gone","tool":"*"},
+            {"server_id":"s-slack","tool":"post_message"}
+        ]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(acl.permits("slack__post_message"));
+    assert!(!acl.permits("github__create_issue"));
+    assert!(!acl.permits("s-gone__anything"));
+}
+
+#[test]
+fn deny_ids_subtract_and_win_over_every_allow_layer() {
+    let snapshot = with_servers(
+        policy_snapshot(&[(
+            "p-env",
+            serde_json::json!({
+                "scope":"env","allow":["*"],"deny":[],
+                "deny_ids":[{"server_id":"s-github","tool":"delete_repo"}]
+            }),
+        )]),
+        &[("s-github", "github")],
+    );
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"mcp_access":{"allow":["*"]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(acl.permits("github__create_issue"));
+    assert!(!acl.permits("github__delete_repo"));
+}
+
+#[test]
+fn deny_ids_win_over_deny_on_the_same_layer() {
+    let snapshot = with_servers(
+        policy_snapshot(&[(
+            "p-env",
+            serde_json::json!({
+                "scope":"env","allow":["*"],
+                "deny":["github__create_issue"],
+                "deny_ids":[{"server_id":"s-github","tool":"delete_repo"}]
+            }),
+        )]),
+        &[("s-github", "github")],
+    );
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"mcp_access":{"allow":["*"]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(
+        acl.permits("github__create_issue"),
+        "the name side of deny is not read once the id side is present"
+    );
+    assert!(!acl.permits("github__delete_repo"));
+}
+
+#[test]
+fn the_two_spellings_mix_across_layers() {
+    // An env layer written by name, a key layer written by id: both are
+    // resolved against the same addressed tool, so the intersection holds.
+    let snapshot = with_servers(
+        policy_snapshot(&[(
+            "p-env",
+            serde_json::json!({"scope":"env","allow":["github__*","slack__*"]}),
+        )]),
+        &[("s-github", "github"), ("s-slack", "slack")],
+    );
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],
+        "mcp_access":{"allow":[],"allow_ids":[{"server_id":"s-github","tool":"*"}]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(acl.permits("github__create_issue"));
+    assert!(
+        !acl.permits("slack__post_message"),
+        "the id-spelled key layer still narrows the name-spelled env layer"
+    );
+    assert!(!acl.permits("jira__create_ticket"));
+}
+
+#[test]
+fn a_server_id_is_never_glob_matched_through_its_name() {
+    // A registered name may legally contain a `*` (only `__` and a
+    // trailing `_` are forbidden). Resolving an id to that name and
+    // pasting it into a `<name>__<tool>` pattern would let one server's
+    // grant reach another server's tools, so the server half is compared
+    // as an exact id instead.
+    let snapshot = with_servers(
+        policy_snapshot(&[]),
+        &[("s-star", "gh*"), ("s-other", "ghost")],
+    );
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],
+        "mcp_access":{"allow":[],"allow_ids":[{"server_id":"s-star","tool":"*"}]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(acl.permits("gh*__read"));
+    assert!(
+        !acl.permits("ghost__read"),
+        "the grant must not spread to a server whose name the other's matches as a glob"
+    );
+}
+
+#[test]
+fn an_id_layer_admits_nothing_for_a_tool_outside_every_namespace() {
+    let snapshot = with_servers(policy_snapshot(&[]), &[("s-github", "github")]);
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],
+        "mcp_access":{"allow":[],"allow_ids":[{"server_id":"s-github","tool":"*"}]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(!acl.permits("create_issue"), "no namespace prefix at all");
+    assert!(!acl.permits("unregistered__create_issue"));
 }
