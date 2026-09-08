@@ -2526,11 +2526,11 @@ mod tests {
     fn no_one_reads_a_models_price_off_the_field() {
         use std::path::Path;
 
-        fn walk(dir: &Path, out: &mut Vec<(String, usize, String)>) {
+        fn walk(dir: &Path, needle: &str, out: &mut Vec<(String, usize, String)>) {
             for e in std::fs::read_dir(dir).expect("crate src is readable") {
                 let path = e.expect("dir entry").path();
                 if path.is_dir() {
-                    walk(&path, out);
+                    walk(&path, needle, out);
                 } else if path.extension().is_some_and(|x| x == "rs") {
                     let name = path.file_name().unwrap().to_string_lossy().into_owned();
                     let src = std::fs::read_to_string(&path).expect("source is utf-8");
@@ -2543,8 +2543,8 @@ mod tests {
                             continue;
                         }
                         let mut rest = line;
-                        while let Some(at) = rest.find(".cost") {
-                            let after = &rest[at + 5..];
+                        while let Some(at) = rest.find(&needle) {
+                            let after = &rest[at + needle.len()..];
                             let boundary = after
                                 .chars()
                                 .next()
@@ -2560,13 +2560,17 @@ mod tests {
             }
         }
 
+        // Assembled rather than written out, so this file is scanned
+        // like every other one: excluding it to stop the census matching
+        // its own text would also stop it covering `cost_key`, which
+        // lives here and is the reader most likely to regress.
+        let needle = format!(".{}", "cost");
         let mut hits = Vec::new();
         walk(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("src").as_path(),
+            &needle,
             &mut hits,
         );
-        // The census itself quotes the pattern it looks for.
-        hits.retain(|(file, _, _)| file != "routing.rs");
         assert!(
             hits.is_empty(),
             "these read a model's price off the field instead of through \
