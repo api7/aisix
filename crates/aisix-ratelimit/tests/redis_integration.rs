@@ -596,10 +596,16 @@ impl RedisCutoff {
                             }
                             n = server.read(&mut from_server) => {
                                 let Ok(n) = n else { return };
+                                // EOF first: a closed upstream read stays
+                                // ready forever, so `continue`-ing on it
+                                // would spin the relay task.
+                                if n == 0 {
+                                    return;
+                                }
                                 if hole_flag.load(std::sync::atomic::Ordering::Relaxed) {
                                     continue;
                                 }
-                                if n == 0 || client.write_all(&from_server[..n]).await.is_err() {
+                                if client.write_all(&from_server[..n]).await.is_err() {
                                     return;
                                 }
                             }
@@ -707,8 +713,12 @@ async fn a_silent_redis_fails_open_within_the_command_budget() {
         return;
     };
     let relay = RedisCutoff::start(&url).await;
+    // Below the 5s default on purpose: a bound of 6s would pass whether or
+    // not the per-block field reached the connection, so it would not be a
+    // check at all.
+    const BUDGET_SECS: u64 = 2;
     let cfg = RedisConnConfig {
-        timeout_secs: 2,
+        timeout_secs: BUDGET_SECS,
         ..single(&relay.url())
     };
     let store = RedisStore::connect(&cfg)
@@ -734,8 +744,14 @@ async fn a_silent_redis_fails_open_within_the_command_budget() {
         .expect("fail-open still admits");
     let first = started.elapsed();
     assert!(
-        first < Duration::from_secs(6),
-        "the first silent command must give up on its budget, took {first:?}",
+        first >= Duration::from_secs(BUDGET_SECS),
+        "the budget is what makes it give up; a faster return means the \
+         blackhole was not reached, took {first:?}",
+    );
+    assert!(
+        first < Duration::from_millis(BUDGET_SECS * 1000 + 1_500),
+        "the first silent command must give up on its own budget, not the \
+         default, took {first:?}",
     );
 
     // Behind it the breaker is open, so this one costs nothing at all —

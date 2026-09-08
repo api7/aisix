@@ -58,7 +58,6 @@
 //! consumers' existing `aisix_redis_failures_total{operation=...}` calls
 //! with no new metric.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -144,9 +143,14 @@ impl Guard {
         if self.breaker.is_open() {
             return Err(breaker_open_error());
         }
+        // Read before awaiting: a command already in flight when the
+        // outage began can land its success after a *concurrent* command
+        // has opened the breaker, and closing on that stale evidence
+        // would send the requests behind it back into the full timeout.
+        let seen = self.breaker.generation();
         match tokio::time::timeout(self.timeout, fut).await {
             Ok(Ok(v)) => {
-                self.breaker.close();
+                self.breaker.close_unless_reopened(seen);
                 Ok(v)
             }
             Ok(Err(e)) => {
@@ -163,40 +167,61 @@ impl Guard {
     }
 }
 
-/// A fixed-window cool-off. Open until `open_until_ms` has passed, then
-/// the next command probes Redis for real.
+/// A fixed-window cool-off. Open until `open_until` has passed, then the
+/// next command probes Redis for real.
+///
+/// `generation` counts openings, so a success can tell "the breaker I saw
+/// closed when I started" from "a breaker something else opened while I
+/// was in flight". A plain timestamp comparison cannot: the two events
+/// are microseconds apart.
 struct Breaker {
-    origin: Instant,
     window: Duration,
-    /// Milliseconds since `origin` until which commands short-circuit.
-    /// `0` means closed.
-    open_until_ms: AtomicU64,
+    state: std::sync::Mutex<BreakerState>,
+}
+
+#[derive(Default)]
+struct BreakerState {
+    open_until: Option<Instant>,
+    generation: u64,
 }
 
 impl Breaker {
     fn new(window: Duration) -> Self {
         Self {
-            origin: Instant::now(),
             window,
-            open_until_ms: AtomicU64::new(0),
+            state: std::sync::Mutex::new(BreakerState::default()),
         }
     }
 
-    fn now_ms(&self) -> u64 {
-        self.origin.elapsed().as_millis() as u64
+    fn lock(&self) -> std::sync::MutexGuard<'_, BreakerState> {
+        // Nothing under this lock can panic, so it cannot be poisoned;
+        // taking the value through a poisoned guard would be equally
+        // correct if it ever were.
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn is_open(&self) -> bool {
-        self.open_until_ms.load(Ordering::Relaxed) > self.now_ms()
+        self.lock()
+            .open_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    fn generation(&self) -> u64 {
+        self.lock().generation
     }
 
     fn open(&self) {
-        let until = self.now_ms() + self.window.as_millis() as u64;
-        self.open_until_ms.store(until, Ordering::Relaxed);
+        let mut st = self.lock();
+        st.open_until = Some(Instant::now() + self.window);
+        st.generation = st.generation.wrapping_add(1);
     }
 
-    fn close(&self) {
-        self.open_until_ms.store(0, Ordering::Relaxed);
+    /// Close the breaker unless it was opened after `seen` was read.
+    fn close_unless_reopened(&self, seen: u64) {
+        let mut st = self.lock();
+        if st.generation == seen {
+            st.open_until = None;
+        }
     }
 }
 
@@ -657,6 +682,10 @@ mod guard_tests {
         }
     }
 
+    fn dropped_connection() -> redis::RedisError {
+        redis::RedisError::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+    }
+
     fn server_side_error() -> redis::RedisError {
         // What a live Redis returns for, say, a bad script: it answered,
         // so it is not a connectivity failure.
@@ -717,6 +746,44 @@ mod guard_tests {
             .await
             .expect("the probe reaches Redis again");
         assert!(!g.breaker.is_open(), "a success closes the breaker");
+    }
+
+    /// A command that was already in flight when the outage began can
+    /// land its success *after* another command has opened the breaker.
+    /// Closing on that stale evidence puts every request behind it back
+    /// on the full budget.
+    #[tokio::test]
+    async fn a_success_that_started_first_does_not_wipe_a_newer_cool_off() {
+        let g = Arc::new(guard(2_000, 5_000));
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+        let inflight = tokio::spawn({
+            let g = Arc::clone(&g);
+            async move {
+                g.run(async move {
+                    let _ = rx.await;
+                    Ok::<_, redis::RedisError>(1)
+                })
+                .await
+            }
+        });
+        // Let it enter `run` and read the generation before anything fails.
+        tokio::task::yield_now().await;
+
+        g.run(async { Err::<(), _>(dropped_connection()) })
+            .await
+            .expect_err("the concurrent command fails");
+        assert!(g.breaker.is_open());
+
+        tx.send(()).expect("the in-flight command is still waiting");
+        inflight
+            .await
+            .expect("join")
+            .expect("the in-flight command succeeds");
+        assert!(
+            g.breaker.is_open(),
+            "a success from before the failure must not clear the cool-off"
+        );
     }
 
     /// A reply from a live Redis — a script error, `WRONGTYPE`, an ACL

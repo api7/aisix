@@ -415,6 +415,9 @@ describe("an unreachable Redis degrades the limiter instead of hanging the reque
   const model = "rl-redis-blackhole";
   // Short enough that the assertions below fit a normal test timeout, and
   // still long enough that no healthy round trip on this host trips it.
+  // It is also deliberately below the 5s default: the first-request bound
+  // is what shows the per-block field reached the connection, and a bound
+  // above the default would pass either way.
   const TIMEOUT_SECS = 2;
 
   beforeAll(async () => {
@@ -460,9 +463,12 @@ describe("an unreachable Redis degrades the limiter instead of hanging the reque
     const firstMs = Date.now() - firstStarted;
     expect(first.status).toBe(200);
     await first.body?.cancel();
-    // Before the budget existed this never returned at all; the bound is
-    // the budget plus room for the mock upstream and process scheduling.
-    expect(firstMs).toBeLessThan((TIMEOUT_SECS + 8) * 1000);
+    // Before the budget existed this never returned at all. The bound is
+    // the configured budget plus room for the mock upstream and process
+    // scheduling, and stays under the 5s default so a gateway that ignored
+    // `timeout_secs` fails here.
+    expect(firstMs).toBeGreaterThanOrEqual(TIMEOUT_SECS * 1000);
+    expect(firstMs).toBeLessThan(TIMEOUT_SECS * 1000 + 2000);
 
     // And the one behind it short-circuits: without the cool-off every
     // request for the length of the outage carries the budget as added
@@ -472,6 +478,6 @@ describe("an unreachable Redis degrades the limiter instead of hanging the reque
     const secondMs = Date.now() - secondStarted;
     expect(second.status).toBe(200);
     await second.body?.cancel();
-    expect(secondMs).toBeLessThan(TIMEOUT_SECS * 1000);
+    expect(secondMs).toBeLessThan(1000);
   });
 });
