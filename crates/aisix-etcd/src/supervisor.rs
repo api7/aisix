@@ -22,7 +22,7 @@ use aisix_core::config_status::{
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::AisixSnapshot;
 use chrono::{DateTime, Utc};
-use futures::{FutureExt, StreamExt};
+use futures::StreamExt;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -1333,18 +1333,52 @@ impl<P: ConfigProvider> Supervisor<P> {
                 // catch-all: a new `WatchEvent` must fail to compile here
                 // instead of falling into a batch that cannot carry it.
                 Some(Ok(first @ (WatchEvent::Put(_) | WatchEvent::Delete { .. }))) => {
-                    // Coalesce: take every Put/Delete that is ALREADY
-                    // waiting on the stream and apply the run as one
-                    // copy-on-write cycle. `now_or_never` never waits, so
-                    // an idle stream still applies each event on its own
-                    // and nothing is delayed to fill a batch. A bulk edit,
-                    // which is where a full-configuration pass per event
-                    // hurts (AISIX-Cloud#1542), arrives faster than the
-                    // apply and coalesces.
+                    // Coalesce: hold the batch open for a short bounded
+                    // window and apply the whole run as one
+                    // copy-on-write cycle. The window closes on the first
+                    // of three conditions — COALESCE_QUIET_PERIOD with no
+                    // new event, COALESCE_MAX_WAIT since the first event,
+                    // or MAX_APPLY_BATCH events — so a bulk edit costs a
+                    // bounded number of whole-configuration passes no
+                    // matter how the source spaces its deliveries
+                    // (AISIX-Cloud#1542). Draining only what was already
+                    // buffered made that number depend on how the etcd
+                    // endpoint happened to batch its watch deliveries and
+                    // on how long the previous apply took.
                     let mut batch = vec![first];
+                    let deadline = tokio::time::Instant::now() + COALESCE_MAX_WAIT;
                     while batch.len() < MAX_APPLY_BATCH {
-                        let Some(item) = stream.next().now_or_never() else {
+                        // Checked here as well as in the select: with a
+                        // stream that always has an event ready the
+                        // `sleep_until` branch is never polled (`biased`),
+                        // and the window would then be bounded by
+                        // MAX_APPLY_BATCH alone rather than by time. That
+                        // is a real shape, not a hypothetical — the etcd
+                        // stream flattens one `WatchResponse` into many
+                        // consecutively ready items.
+                        if tokio::time::Instant::now() >= deadline {
                             break;
+                        }
+                        let item = tokio::select! {
+                            biased;
+                            // FIRST, ahead of the stream: `biased` gives
+                            // the window to whichever branch is ready
+                            // earliest in this list, and during a bulk
+                            // edit the stream has an event ready on every
+                            // poll — so ordered after it, this branch
+                            // would never be reached and shutdown would
+                            // keep consuming the backlog until the max
+                            // wait or MAX_APPLY_BATCH ended the window.
+                            // The batch collected so far is still applied
+                            // below: those events are already off the
+                            // stream, so that apply is the only thing
+                            // that can still serve and persist them. The
+                            // ones still on the stream are untouched and
+                            // come back from etcd on the next start.
+                            _ = wait_for_cancel(cancel.clone()) => break,
+                            item = stream.next() => item,
+                            _ = tokio::time::sleep_until(deadline) => break,
+                            _ = tokio::time::sleep(COALESCE_QUIET_PERIOD) => break,
                         };
                         match item {
                             Some(Ok(event @ (WatchEvent::Put(_) | WatchEvent::Delete { .. }))) => {
@@ -1412,12 +1446,33 @@ async fn wait_for_cancel(mut rx: tokio::sync::watch::Receiver<bool>) {
 
 /// Largest number of watch events one coalesced apply may cover.
 ///
-/// The drain only takes events that are ALREADY queued, so this is not a
-/// latency knob — an idle stream applies each event on its own. It bounds
-/// how long one apply can hold off the publish when the control plane
-/// pushes a bulk edit, so a slow batch cannot make the served snapshot
-/// arbitrarily stale.
+/// Bounds how much one apply can hold off the publish when the control
+/// plane pushes a bulk edit, so a slow batch cannot make the served
+/// snapshot arbitrarily stale.
 const MAX_APPLY_BATCH: usize = 512;
+
+/// How long a coalescing window stays open after the last event before
+/// the batch is applied.
+///
+/// This is the delay a lone write pays in full — measured, it moves the
+/// etcd-write-to-`applied_revision` median from 21 ms to 42 ms — so it
+/// buys nothing by being larger than it has to be. It only has to clear
+/// the gap between consecutive deliveries of one control-plane burst,
+/// which measured 1–3 ms against a local etcd and stays in single-digit
+/// milliseconds for an outbox relay writing a row per transaction.
+const COALESCE_QUIET_PERIOD: Duration = Duration::from_millis(20);
+
+/// Hard cap on how long the first event of a batch waits for company.
+///
+/// Without it a control plane writing faster than the quiet period would
+/// hold a batch open for the whole edit and the served snapshot would
+/// never catch up, so this — not the quiet period — is what bounds
+/// config-change visibility during a sustained burst. Everything above
+/// roughly a tenth of a second is indistinguishable to an operator
+/// watching a save land, and each further step up buys proportionally
+/// less: a 1500-row burst costs 12 applies here and would cost 9 at the
+/// 200 ms this was picked under.
+const COALESCE_MAX_WAIT: Duration = Duration::from_millis(150);
 
 /// One watch event staged for a coalesced apply.
 enum PendingEvent<'a> {
@@ -2188,6 +2243,307 @@ mod tests {
         assert!(
             stale.contains_key("/aisix/models/m-1"),
             "the earlier put in the same batch counted as serving",
+        );
+    }
+
+    /// A provider whose watch stream stays OPEN and delivers whatever the
+    /// test feeds it, one event at a time. `FakeProvider` hands over a
+    /// finished `stream::iter`, so every event on it is ready at once and
+    /// no coalescing decision is ever exercised — which is exactly the
+    /// shape a real etcd/kine watch does NOT have.
+    struct LiveProvider {
+        entries: Vec<RawEntry>,
+        revision: i64,
+        rx: Mutex<Option<futures::channel::mpsc::UnboundedReceiver<WatchItem>>>,
+    }
+
+    type WatchItem = Result<WatchEvent, ProviderError>;
+
+    impl LiveProvider {
+        fn new(
+            revision: i64,
+        ) -> (
+            Arc<Self>,
+            futures::channel::mpsc::UnboundedSender<WatchItem>,
+        ) {
+            let (tx, rx) = futures::channel::mpsc::unbounded();
+            (
+                Arc::new(Self {
+                    entries: Vec::new(),
+                    revision,
+                    rx: Mutex::new(Some(rx)),
+                }),
+                tx,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl ConfigProvider for LiveProvider {
+        async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
+            Ok((self.entries.clone(), self.revision))
+        }
+
+        async fn watch(
+            &self,
+            _start_revision: i64,
+        ) -> Result<
+            Box<dyn futures::Stream<Item = Result<WatchEvent, ProviderError>> + Send + Unpin>,
+            ProviderError,
+        > {
+            Ok(Box::new(
+                self.rx.lock().unwrap().take().expect("watched twice"),
+            ))
+        }
+    }
+
+    /// A burst that arrives one event at a time — how the control plane's
+    /// outbox relay actually reaches a data plane, since it writes each
+    /// row as its own transaction — must still cost a bounded number of
+    /// whole-configuration passes. The window, not the endpoint's
+    /// buffering, is what decides how many.
+    ///
+    /// Virtual time (`start_paused`) is what makes the count exact: the
+    /// runtime advances the clock only when every task is parked on a
+    /// timer, so the 1 ms spacing below is honoured precisely and the
+    /// assertion is not a race against a loaded CI box.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_delivered_one_event_at_a_time_still_coalesces() {
+        const N: i64 = 250;
+        const SPACING: Duration = Duration::from_millis(1);
+
+        let (provider, tx) = LiveProvider::new(0);
+        let sup = Arc::new(Supervisor::new(provider, "/aisix"));
+        let version_before = sup.handle().version();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let watcher = tokio::spawn({
+            let sup = sup.clone();
+            async move {
+                let _ = sup.cycle(&cancel_rx).await;
+            }
+        });
+
+        for i in 1..=N {
+            tokio::time::sleep(SPACING).await;
+            tx.unbounded_send(Ok(WatchEvent::Put(entry(
+                &format!("/aisix/models/m-{i}"),
+                VALID_MODEL,
+                i + 1,
+            ))))
+            .unwrap();
+        }
+        drop(tx);
+        watcher.await.unwrap();
+
+        let snap = sup.handle().load();
+        assert_eq!(snap.models.len(), N as usize, "every event was applied");
+        let version_after = sup.handle().version();
+        assert!(
+            version_after > version_before,
+            "the resync alone should have published once",
+        );
+        // One publish for the initial resync, then one per coalesced
+        // apply. Un-coalesced this burst is 250 of them.
+        let publishes = version_after - version_before - 1;
+        let burst_ms = (N as u128) * SPACING.as_millis();
+        assert!(
+            publishes <= 3,
+            "a {N}-event burst spread over {burst_ms}ms should coalesce into at most 3 applies, \
+             got {publishes}",
+        );
+        // Both ends matter, and the lower one is what pins
+        // COALESCE_MAX_WAIT. Every gap here is under the quiet period, so
+        // if the max wait stopped bounding the batch the whole burst
+        // would collapse into a single apply and the upper bound above
+        // would happily pass — while config-change visibility during a
+        // sustained burst grew without limit. The burst spans more than
+        // one max wait, so at least one window has to close mid-burst.
+        assert!(
+            burst_ms > COALESCE_MAX_WAIT.as_millis(),
+            "the burst has to outlast one window or the bound below proves nothing",
+        );
+        assert!(
+            publishes >= 2,
+            "the maximum wait did not bound the batch: {publishes} apply(s) for a {burst_ms}ms \
+             burst of events spaced under the quiet period",
+        );
+    }
+
+    /// The window must not strand a lone write waiting for company that
+    /// never comes: a single event on an otherwise idle stream is applied
+    /// well inside the maximum wait, because the QUIET period is what
+    /// releases it.
+    #[tokio::test(start_paused = true)]
+    async fn a_lone_event_is_applied_within_the_quiet_period() {
+        /// Slack for the 1 ms poll below, which can only overshoot the
+        /// moment the apply landed by one of its own ticks.
+        const POLL_SLACK: Duration = Duration::from_millis(5);
+
+        let (provider, tx) = LiveProvider::new(0);
+        let sup = Arc::new(Supervisor::new(provider, "/aisix"));
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let watcher = tokio::spawn({
+            let sup = sup.clone();
+            async move {
+                let _ = sup.cycle(&cancel_rx).await;
+            }
+        });
+
+        // Let the initial load land before starting the clock, so what is
+        // measured is the coalescing window and nothing else. Bounded:
+        // virtual time auto-advances forever, so an unbounded spin here
+        // would hang rather than fail if the resync stopped publishing.
+        let load_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while sup.handle().version() == 0 {
+            assert!(
+                tokio::time::Instant::now() < load_deadline,
+                "the initial resync never published",
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        let sent_at = tokio::time::Instant::now();
+        tx.unbounded_send(Ok(WatchEvent::Put(entry(
+            "/aisix/models/m-1",
+            VALID_MODEL,
+            2,
+        ))))
+        .unwrap();
+
+        // The sender stays alive, so the stream never ends and only the
+        // window can trigger the apply. Bounded by the quiet period
+        // rather than by the maximum wait: a lone event has no company
+        // coming, so the quiet period is the branch that has to release
+        // it, and a bound of COALESCE_MAX_WAIT would still pass with that
+        // branch deleted — at 7x the latency on the commonest path of
+        // all.
+        while sup.handle().load().models.is_empty() {
+            assert!(
+                sent_at.elapsed() <= COALESCE_QUIET_PERIOD + POLL_SLACK,
+                "a lone event waited {:?} — past the quiet period, so only the maximum wait \
+                 released it",
+                sent_at.elapsed(),
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(sent_at.elapsed() >= COALESCE_QUIET_PERIOD);
+
+        drop(tx);
+        watcher.await.unwrap();
+    }
+
+    /// Shutdown must not throw away what the window already took off the
+    /// stream. Those events are gone from the watch, so the apply that
+    /// follows the cancelled window is the only thing that can still put
+    /// them in the served snapshot and the on-disk cache — the same
+    /// invariant `an_apply_immediately_before_shutdown_reaches_the_on_disk_cache`
+    /// protects, reached by the second path the window opened.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_inside_the_window_still_applies_what_it_collected() {
+        let (provider, tx) = LiveProvider::new(0);
+        let sup = Arc::new(Supervisor::new(provider, "/aisix"));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let watcher = tokio::spawn({
+            let sup = sup.clone();
+            async move { sup.cycle(&cancel_rx).await }
+        });
+        let load_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while sup.handle().version() == 0 {
+            assert!(
+                tokio::time::Instant::now() < load_deadline,
+                "the initial resync never published",
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        tx.unbounded_send(Ok(WatchEvent::Put(entry(
+            "/aisix/models/m-1",
+            VALID_MODEL,
+            2,
+        ))))
+        .unwrap();
+        // Long enough for the watcher to take the event into its batch,
+        // far short of the quiet period that would close the window.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(
+            sup.handle().load().models.is_empty(),
+            "the window must still be open here or this test proves nothing",
+        );
+
+        cancel_tx.send(true).unwrap();
+        assert!(matches!(
+            watcher.await.unwrap(),
+            Err(SupervisorError::Cancelled)
+        ));
+        assert_eq!(
+            sup.handle().load().models.len(),
+            1,
+            "the batch already taken off the stream was dropped on shutdown",
+        );
+    }
+
+    /// ...and it must stop taking new ones. A bulk edit leaves an event
+    /// ready on the stream at every poll, which is the one case where
+    /// `biased` ordering decides whether the cancel branch is ever
+    /// reached at all: ordered after the stream it never is, and
+    /// shutdown keeps draining the backlog until the max wait or
+    /// MAX_APPLY_BATCH closes the window.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_stops_the_window_from_draining_a_ready_backlog() {
+        const BACKLOG: i64 = 60;
+
+        let (provider, tx) = LiveProvider::new(0);
+        let sup = Arc::new(Supervisor::new(provider, "/aisix"));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let watcher = tokio::spawn({
+            let sup = sup.clone();
+            async move { sup.cycle(&cancel_rx).await }
+        });
+        let load_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while sup.handle().version() == 0 {
+            assert!(
+                tokio::time::Instant::now() < load_deadline,
+                "the initial resync never published",
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // Open a window with one event, then queue the rest without ever
+        // yielding, so they are all ready when the watcher next polls.
+        tx.unbounded_send(Ok(WatchEvent::Put(entry(
+            "/aisix/models/m-1",
+            VALID_MODEL,
+            2,
+        ))))
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        for i in 2..=BACKLOG {
+            tx.unbounded_send(Ok(WatchEvent::Put(entry(
+                &format!("/aisix/models/m-{i}"),
+                VALID_MODEL,
+                i + 1,
+            ))))
+            .unwrap();
+        }
+        cancel_tx.send(true).unwrap();
+
+        assert!(matches!(
+            watcher.await.unwrap(),
+            Err(SupervisorError::Cancelled)
+        ));
+        let applied = sup.handle().load().models.len();
+        assert!(
+            applied >= 1,
+            "the event already taken off the stream was dropped on shutdown",
+        );
+        assert!(
+            (applied as i64) < BACKLOG,
+            "shutdown drained the whole ready backlog ({applied} events) instead of leaving the \
+             window at the first cancel check",
         );
     }
 

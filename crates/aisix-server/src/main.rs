@@ -928,10 +928,28 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     if cfg.cache.backend == CacheBackend::Redis && cfg.cache.redis.is_none() {
         anyhow::bail!("cache.backend = redis but cache.redis missing");
     }
-    let redis_cache: Option<Arc<dyn Cache>> = match cfg.cache.redis.as_ref() {
-        Some(redis_cfg) => {
+    // ONE failure policy for the whole cache subsystem. The exact-KV and
+    // vector-search stores below open separate connections to the same
+    // `cache.redis` — deliberately, so they do not serialize on one
+    // pipeline — but a single chat request touches both twice (lookup,
+    // lookup, write, write). A breaker per connection therefore let one
+    // request pay the command budget four times over while Redis was
+    // black-holed; sharing the policy makes the first failure
+    // short-circuit the rest of the request. The rate-limit store reads
+    // a different config block and keeps its own.
+    //
+    // The config and its policy travel as one value so the two stores
+    // cannot be built from the same block under different policies —
+    // which is the whole defect, and it reads as ordinary wiring.
+    let cache_redis = cfg
+        .cache
+        .redis
+        .as_ref()
+        .map(|c| (c, aisix_cache::FailurePolicy::new(c)));
+    let redis_cache: Option<Arc<dyn Cache>> = match &cache_redis {
+        Some((redis_cfg, policy)) => {
             tracing::info!(target: "aisix::cache", backend = "redis", "connecting cache backend");
-            let redis = RedisCache::connect(redis_cfg)
+            let redis = RedisCache::connect_with(redis_cfg, policy)
                 .await
                 .map_err(|e| {
                     // Deliberately no URL in the message: redis URLs carry
@@ -950,75 +968,77 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // Redis 6/7 (or cluster mode, unsupported yet) degrades those
     // policies to exact-only, loudly, HERE at boot rather than
     // silently per request.
-    let semantic_redis: Option<Arc<dyn aisix_cache::SemanticCacheStore>> =
-        match cfg.cache.redis.as_ref() {
-            Some(redis_cfg) if redis_cfg.mode == aisix_core::RedisMode::Cluster => {
-                tracing::warn!(
-                    target: "aisix::cache",
-                    "cache.redis is in cluster mode; semantic matching on backend=redis \
-                     policies is not supported yet and stays exact-only"
-                );
-                None
-            }
-            Some(redis_cfg) => {
-                // Degrade (never abort) on any failure here: the exact
-                // redis cache above is the load-bearing connection; the
-                // semantic store is an optimization layer.
-                match aisix_cache::RedisSemanticCache::connect(redis_cfg).await {
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "aisix::cache",
-                            error = %e,
-                            "redis semantic cache connect failed; semantic matching \
-                             on backend=redis policies stays exact-only"
-                        );
-                        None
-                    }
-                    Ok(store) => {
-                        let store = store
-                            .with_env_namespace(&cfg.etcd.env_id)
-                            .with_metrics((*metrics).clone());
-                        match store.probe().await {
-                            Ok(()) => {
-                                match store.sweep_empty_indexes().await {
-                                    Ok(dropped) if dropped > 0 => {
-                                        tracing::info!(
-                                            target: "aisix::cache",
-                                            dropped,
-                                            "reclaimed empty semantic-cache indexes"
-                                        );
-                                    }
-                                    Ok(_) => {}
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            target: "aisix::cache",
-                                            error = %e,
-                                            "semantic-cache index sweep failed; continuing"
-                                        );
-                                    }
+    let semantic_redis: Option<Arc<dyn aisix_cache::SemanticCacheStore>> = match &cache_redis {
+        Some((redis_cfg, _)) if redis_cfg.mode == aisix_core::RedisMode::Cluster => {
+            tracing::warn!(
+                target: "aisix::cache",
+                "cache.redis is in cluster mode; semantic matching on backend=redis \
+                 policies is not supported yet and stays exact-only"
+            );
+            None
+        }
+        Some((redis_cfg, policy)) => {
+            // Degrade (never abort) on any failure here: the exact
+            // redis cache above is the load-bearing connection; the
+            // semantic store is an optimization layer.
+            //
+            // `connect_with`, on the policy the exact cache is already
+            // running under: separate connection, one shared cool-off.
+            match aisix_cache::RedisSemanticCache::connect_with(redis_cfg, policy).await {
+                Err(e) => {
+                    tracing::warn!(
+                        target: "aisix::cache",
+                        error = %e,
+                        "redis semantic cache connect failed; semantic matching \
+                         on backend=redis policies stays exact-only"
+                    );
+                    None
+                }
+                Ok(store) => {
+                    let store = store
+                        .with_env_namespace(&cfg.etcd.env_id)
+                        .with_metrics((*metrics).clone());
+                    match store.probe().await {
+                        Ok(()) => {
+                            match store.sweep_empty_indexes().await {
+                                Ok(dropped) if dropped > 0 => {
+                                    tracing::info!(
+                                        target: "aisix::cache",
+                                        dropped,
+                                        "reclaimed empty semantic-cache indexes"
+                                    );
                                 }
-                                tracing::info!(
-                                    target: "aisix::cache",
-                                    "cache.redis supports vector search; semantic matching \
-                                     enabled for backend=redis policies"
-                                );
-                                Some(Arc::new(store) as Arc<dyn aisix_cache::SemanticCacheStore>)
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!(
+                                        target: "aisix::cache",
+                                        error = %e,
+                                        "semantic-cache index sweep failed; continuing"
+                                    );
+                                }
                             }
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "aisix::cache",
-                                    error = %e,
-                                    "cache.redis has no vector-search support; semantic matching \
-                                     on backend=redis policies stays exact-only"
-                                );
-                                None
-                            }
+                            tracing::info!(
+                                target: "aisix::cache",
+                                "cache.redis supports vector search; semantic matching \
+                                 enabled for backend=redis policies"
+                            );
+                            Some(Arc::new(store) as Arc<dyn aisix_cache::SemanticCacheStore>)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "aisix::cache",
+                                error = %e,
+                                "cache.redis has no vector-search support; semantic matching \
+                                 on backend=redis policies stays exact-only"
+                            );
+                            None
                         }
                     }
                 }
             }
-            None => None,
-        };
+        }
+        None => None,
+    };
     let mut cache_backends =
         CacheBackends::new(Arc::new(MemoryCache::with_defaults()), redis_cache);
     if let Some(store) = semantic_redis {
