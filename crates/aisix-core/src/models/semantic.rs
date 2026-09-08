@@ -55,8 +55,19 @@ pub struct SemanticRoute {
     #[schemars(length(min = 1))]
     pub name: String,
     /// Direct model alias that receives traffic matching this route.
+    /// Read only when `target_id` is absent.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     #[schemars(length(min = 1))]
     pub target: String,
+    /// Resource id of the direct model that receives traffic matching this
+    /// route. Present, it is authoritative and `target` is ignored: the id
+    /// is resolved against the models in the current configuration, so
+    /// renaming that model keeps this route pointing at it with no edit to
+    /// this document. An id resolving to no model is a route target that
+    /// does not exist, exactly as a `target` naming no model is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub target_id: Option<String>,
     /// Human-facing description. Documentation only — v1 matches on
     /// `examples`, not on this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -73,6 +84,15 @@ pub struct SemanticRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0.0, max = 1.0))]
     pub threshold: Option<f32>,
+}
+
+impl SemanticRoute {
+    /// The display name of the model this route dispatches to, resolved
+    /// against the current configuration: `target_id` when it is set,
+    /// `target` otherwise.
+    pub fn target_ref<'a>(&'a self, snapshot: &super::AisixSnapshot) -> std::borrow::Cow<'a, str> {
+        super::resolve_model_ref(snapshot, &self.target, self.target_id.as_deref())
+    }
 }
 
 /// Matching parameters shared across every route in a semantic router.
@@ -113,11 +133,21 @@ pub enum EmbeddingFailureMode {
 pub enum OnEmbeddingFailure {
     /// `"default"` or `"fail"`.
     Mode(EmbeddingFailureMode),
-    /// `{ "target": "<direct alias>" }` — route to a specific safe model.
+    /// `{ "target": "<direct alias>" }` (or `{ "target_id": "<id>" }`) —
+    /// route to a specific safe model.
     Target {
-        /// Direct-model alias to route to when embedding fails.
+        /// Direct-model alias to route to when embedding fails. Read only
+        /// when `target_id` is absent.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         #[schemars(length(min = 1))]
         target: String,
+        /// Resource id of the direct model to route to when embedding
+        /// fails. Present, it is authoritative and `target` is ignored, so
+        /// renaming that model keeps this fallback pointing at it with no
+        /// edit to this document.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(min = 1))]
+        target_id: Option<String>,
     },
 }
 
@@ -131,15 +161,37 @@ impl Default for OnEmbeddingFailure {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct Semantic {
     /// Alias of an `embedding`-modality Model used to embed the request
-    /// and (at apply time) the route examples.
+    /// and (at apply time) the route examples. Read only when
+    /// `embedding_model_id` is absent.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     #[schemars(length(min = 1))]
     pub embedding_model: String,
+    /// Resource id of the `embedding`-modality Model used to embed the
+    /// request and the route examples. Present, it is authoritative and
+    /// `embedding_model` is ignored: the id is resolved against the models
+    /// in the current configuration, so renaming that model keeps this
+    /// router pointing at it with no edit to this document. An id
+    /// resolving to no model is an embedding model that does not exist,
+    /// exactly as an `embedding_model` naming no model is — the router
+    /// applies `on_embedding_failure`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub embedding_model_id: Option<String>,
     /// Routes evaluated for each request. At least one is required.
     #[schemars(length(min = 1))]
     pub routes: Vec<SemanticRoute>,
-    /// Direct model alias used when no route clears its threshold.
+    /// Direct model alias used when no route clears its threshold. Read
+    /// only when `default_id` is absent.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     #[schemars(length(min = 1))]
     pub default: String,
+    /// Resource id of the direct model used when no route clears its
+    /// threshold. Present, it is authoritative and `default` is ignored,
+    /// so renaming that model keeps this router pointing at it with no
+    /// edit to this document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub default_id: Option<String>,
     /// Shared matching parameters (metric, aggregation, default threshold).
     pub r#match: SemanticMatch,
     /// Per-call deadline for the embedding request in milliseconds. `0` or
@@ -157,6 +209,27 @@ fn is_default_failure(p: &OnEmbeddingFailure) -> bool {
 }
 
 impl Semantic {
+    /// The display name of the embedding model this router uses, resolved
+    /// against the current configuration: `embedding_model_id` when it is
+    /// set, `embedding_model` otherwise.
+    pub fn embedding_model_ref<'a>(
+        &'a self,
+        snapshot: &super::AisixSnapshot,
+    ) -> std::borrow::Cow<'a, str> {
+        super::resolve_model_ref(
+            snapshot,
+            &self.embedding_model,
+            self.embedding_model_id.as_deref(),
+        )
+    }
+
+    /// The display name of the model this router falls through to,
+    /// resolved against the current configuration: `default_id` when it is
+    /// set, `default` otherwise.
+    pub fn default_ref<'a>(&'a self, snapshot: &super::AisixSnapshot) -> std::borrow::Cow<'a, str> {
+        super::resolve_model_ref(snapshot, &self.default, self.default_id.as_deref())
+    }
+
     /// Effective threshold for a route: its own `threshold` if set,
     /// otherwise the router-level `match.threshold`.
     pub fn route_threshold(&self, route: &SemanticRoute) -> f32 {
@@ -171,9 +244,11 @@ impl Semantic {
             .map(std::time::Duration::from_millis)
     }
 
-    /// Every direct-model alias this router can dispatch to: each route's
-    /// `target` plus `default`. Used by the loader for reference-integrity
-    /// checks and the runtime for resolution.
+    /// Every direct-model alias this router can dispatch to, as CONFIGURED:
+    /// each route's `target` plus `default`. Name form only — a reference
+    /// written as `target_id` / `default_id` is not reported here, so this
+    /// is usable only where the id form cannot appear (the resources file,
+    /// which rejects it).
     pub fn referenced_targets(&self) -> impl Iterator<Item = &str> {
         self.routes
             .iter()
@@ -228,7 +303,8 @@ mod tests {
         assert_eq!(
             s.on_embedding_failure,
             OnEmbeddingFailure::Target {
-                target: "gpt-4o-mini".into()
+                target: "gpt-4o-mini".into(),
+                target_id: None,
             }
         );
     }
@@ -316,6 +392,7 @@ mod tests {
         // Target round-trips as { "target": "alias" }, not a nested object.
         let target = OnEmbeddingFailure::Target {
             target: "safe".into(),
+            target_id: None,
         };
         assert_eq!(
             serde_json::to_value(&target).unwrap(),

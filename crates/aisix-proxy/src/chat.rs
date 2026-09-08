@@ -2380,7 +2380,7 @@ async fn dispatch(
             entry.value.enabled
                 && entry
                     .value
-                    .parsed_applies_to()
+                    .parsed_applies_to(snapshot)
                     .matches(&req.model, &auth.entry.id)
         })
         .cloned();
@@ -2454,7 +2454,12 @@ async fn dispatch(
                     .semantic_for_policy_backend(entry.value.backend, &entry.id, &entry.value.name)?
                     .clone();
                 let text = semantic_prompt_text(req)?;
-                let embed_entry = match snapshot.models.get_by_name(&cfg.embedding_model) {
+                let embedding_model = aisix_core::models::resolve_model_ref(
+                    snapshot,
+                    &cfg.embedding_model,
+                    cfg.embedding_model_id.as_deref(),
+                );
+                let embed_entry = match snapshot.models.get_by_name(&embedding_model) {
                     Some(e) if e.value.is_embedding() => e.clone(),
                     other => {
                         // A stable config error, not a per-request one:
@@ -2467,7 +2472,7 @@ async fn dispatch(
                             tracing::warn!(
                                 target: "aisix::cache",
                                 policy_name = %entry.value.name,
-                                embedding_model = %cfg.embedding_model,
+                                embedding_model = %embedding_model,
                                 found = other.is_some(),
                                 "cache policy references a missing or non-embedding \
                                  embedding_model; semantic matching is skipped until \
@@ -3441,6 +3446,13 @@ async fn dispatch_ensemble(
             "model is not an ensemble".into(),
         ))
     })?;
+    // Resolve the panel's and the judge's model references once, here, so
+    // every read below sees one spelling. A member or judge written as
+    // `model_id` follows a rename of the model it points at; one whose id
+    // resolves to nothing keeps the id as its name and is reported as the
+    // missing member it is, exactly as a dangling `model` is.
+    let ensemble_cfg = ensemble_cfg.with_refs_resolved(snapshot);
+    let ensemble_cfg = &ensemble_cfg;
 
     // Resolve a sub-call's target by display_name → (model_id, provider_key_id,
     // upstream_model). The first two are telemetry attribution; the third is

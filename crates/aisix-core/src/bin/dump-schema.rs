@@ -106,25 +106,27 @@ fn dump<T: JsonSchema>(out_dir: &Path, lenient_dir: &Path, name: &str) {
     // and the enforced copy is the embedding resource's `definitions` entry.
     let mut lenient = serde_json::to_value(&root).expect("serialize schema");
     schema::open_unknown_fields(&mut lenient);
+    schema::apply_model_ref_alternatives(&mut lenient);
     dump_value(lenient_dir, name, lenient);
 
-    // Serialize the `RootSchema` directly to preserve schemars' native key
-    // ordering. (Routing through `serde_json::Value` would re-sort keys.)
     // These nested types belong to closed resources, so re-close the root
-    // and every struct-shaped definition on the typed schema — the same
-    // strictness `schema::close_unknown_fields` applies to the resource
-    // documents, kept typed here so the key order stays schemars-native.
+    // and every struct-shaped definition — the same strictness
+    // `schema::close_unknown_fields` applies to the resource documents.
     close_object_schema(&mut root.schema);
     for def in root.definitions.values_mut() {
         if let schemars::schema::Schema::Object(obj) = def {
             close_object_schema(obj);
         }
     }
-    let mut json = serde_json::to_string_pretty(&root).expect("serialize schema");
-    json.push('\n');
-    let path = out_dir.join(format!("{name}.schema.json"));
-    fs::write(&path, json).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-    println!("wrote {}", path.display());
+    // A model reference is "name OR id", and `schemars` cannot express
+    // that from the struct — the name field carries a serde default, so a
+    // bare derive would publish it as simply optional and these files
+    // would say a routing target may name no model at all. Applied to the
+    // JSON, which is also why these two files sort their keys like the
+    // resource ones rather than in schemars' emission order.
+    let mut strict = serde_json::to_value(&root).expect("serialize schema");
+    schema::apply_model_ref_alternatives(&mut strict);
+    dump_value(out_dir, name, strict);
 }
 
 /// Insert `additionalProperties: false` on a struct-shaped schema object

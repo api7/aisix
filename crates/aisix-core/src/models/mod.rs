@@ -27,6 +27,7 @@ pub mod mcp_auth_settings;
 pub mod mcp_policy;
 pub mod mcp_server;
 pub mod model;
+pub mod model_ref;
 pub mod observability_exporter;
 pub mod oidc_provider;
 pub mod passthrough_route;
@@ -60,6 +61,7 @@ pub use mcp_server::{McpAuthType, McpProtocolVersion, McpServer, McpServerType, 
 pub use model::{
     Adapter, BackgroundModelCheck, CooldownConfig, Model, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
+pub use model_ref::resolve_model_ref;
 pub use observability_exporter::{
     AliyunSlsConfig, DatadogConfig, ExporterKind, ObjectStoreCompression, ObjectStoreConfig,
     ObjectStoreProvider, ObservabilityExporter, OtlpHttpConfig, SlsContentMode,

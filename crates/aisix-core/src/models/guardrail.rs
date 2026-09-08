@@ -758,6 +758,22 @@ pub struct SemanticConfig {
     #[serde(default)]
     #[schemars(length(min = 1))]
     pub embedding_model: String,
+    /// Resource id of the `embedding`-kind Model used to embed both the
+    /// examples and the screened text. Present, it is authoritative and
+    /// `embedding_model` is ignored: the id is resolved against the models
+    /// in the current configuration, so renaming that model keeps this row
+    /// screening with it and needs no edit here. An id resolving to no
+    /// model is an embedder that cannot be resolved, exactly as an
+    /// `embedding_model` naming no model is — the row degrades per
+    /// `fail_open`, fail-closed by default.
+    ///
+    /// Defaulted at the type level for the same reason `embedding_model`
+    /// is: the strict write schema requires one of the two, the read path
+    /// requires neither, and a screening row that fails to load is
+    /// fail-OPEN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub embedding_model_id: Option<String>,
     /// Example texts whose meaning must be REFUSED. A screened text
     /// scoring at or above `deny_threshold` against any of them blocks.
     #[serde(default)]

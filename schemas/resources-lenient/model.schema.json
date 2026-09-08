@@ -286,12 +286,46 @@
       ]
     },
     "Judge": {
-      "description": "The judge model that synthesizes the panel responses into one answer. `model` references a direct model alias.",
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "model": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model"
+              ]
+            },
+            {
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model_id"
+              ]
+            }
+          ]
+        }
+      ],
+      "description": "The judge model that synthesizes the panel responses into one answer. The judge model is named either by `model` (its display name) or by `model_id` (its resource id); the judge must carry at least one of the two.",
       "properties": {
         "model": {
-          "description": "Model alias for the direct model that synthesizes panel responses.",
+          "description": "Model alias for the direct model that synthesizes panel responses. Read only when `model_id` is absent.",
           "minLength": 1,
           "type": "string"
+        },
+        "model_id": {
+          "description": "Resource id of the direct model that synthesizes panel responses. Present, it is authoritative and `model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps the judge pointing at it with no edit to this document. An id resolving to no model is a judge that does not exist, exactly as a `model` naming no model is.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "synthesis_prompt": {
           "description": "Override for the built-in synthesis prompt template.",
@@ -299,9 +333,6 @@
           "type": "string"
         }
       },
-      "required": [
-        "model"
-      ],
       "type": "object"
     },
     "ModelCost": {
@@ -337,29 +368,94 @@
           "description": "`\"default\"` or `\"fail\"`."
         },
         {
-          "description": "`{ \"target\": \"<direct alias>\" }` — route to a specific safe model.",
+          "allOf": [
+            {
+              "anyOf": [
+                {
+                  "properties": {
+                    "target": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "target"
+                  ]
+                },
+                {
+                  "properties": {
+                    "target_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "target_id"
+                  ]
+                }
+              ]
+            }
+          ],
+          "description": "`{ \"target\": \"<direct alias>\" }` (or `{ \"target_id\": \"<id>\" }`) — route to a specific safe model.",
           "properties": {
             "target": {
-              "description": "Direct-model alias to route to when embedding fails.",
+              "description": "Direct-model alias to route to when embedding fails. Read only when `target_id` is absent.",
               "minLength": 1,
               "type": "string"
+            },
+            "target_id": {
+              "description": "Resource id of the direct model to route to when embedding fails. Present, it is authoritative and `target` is ignored, so renaming that model keeps this fallback pointing at it with no edit to this document.",
+              "minLength": 1,
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
-          "required": [
-            "target"
-          ],
           "type": "object"
         }
       ],
       "description": "What the router does when the embedding call errors or times out. Use `\"default\"` to route to the router's default model, `\"fail\"` to reject the request with `503`, or `{ \"target\": \"<direct alias>\" }` to route to a specific fallback model."
     },
     "PanelMember": {
-      "description": "One member of an ensemble panel. `model` references a direct model alias.",
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "model": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model"
+              ]
+            },
+            {
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model_id"
+              ]
+            }
+          ]
+        }
+      ],
+      "description": "One member of an ensemble panel. The member model is named either by `model` (its display name) or by `model_id` (its resource id); a member must carry at least one of the two.",
       "properties": {
         "model": {
-          "description": "Model alias for a direct model that receives one panel request.",
+          "description": "Model alias for a direct model that receives one panel request. Read only when `model_id` is absent.",
           "minLength": 1,
           "type": "string"
+        },
+        "model_id": {
+          "description": "Resource id of the direct model that receives one panel request. Present, it is authoritative and `model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this member pointing at it with no edit to this document. An id resolving to no model is a panel member that does not exist, exactly as a `model` naming no model is.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "seed": {
           "description": "Sampling seed for this panel member.",
@@ -380,9 +476,6 @@
           "type": "integer"
         }
       },
-      "required": [
-        "model"
-      ],
       "type": "object"
     },
     "RateLimit": {
@@ -546,12 +639,46 @@
       ]
     },
     "RoutingTarget": {
-      "description": "One destination in a routing configuration. `model` references a direct model alias.",
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "model": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model"
+              ]
+            },
+            {
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model_id"
+              ]
+            }
+          ]
+        }
+      ],
+      "description": "One destination in a routing configuration. The target model is named either by `model` (its display name) or by `model_id` (its resource id); a target must carry at least one of the two.",
       "properties": {
         "model": {
-          "description": "Model alias for a direct model that can receive routed traffic.",
+          "description": "Model alias for a direct model that can receive routed traffic. Read only when `model_id` is absent.\n\nDefaulted at the type level and required by the schemas instead — as one half of a \"`model` or `model_id`\" alternative, so a target naming its model by id alone validates while one naming it neither way is still rejected.",
           "minLength": 1,
           "type": "string"
+        },
+        "model_id": {
+          "description": "Resource id of the direct model that can receive routed traffic. Present, it is authoritative and `model` is ignored: the id is resolved against the models in the current configuration and the name it resolves to is the target, so renaming that model keeps this target pointing at it with no edit to this document. An id resolving to no model is a target that does not exist, exactly as a `model` naming no model is.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "priority": {
           "description": "Priority tier, default `0`; a higher value is preferred (the APISIX node-priority convention — give backup targets `-1`). The strategy orders targets within each tier; a lower tier is only tried when every higher-tier target failed or is unavailable.",
@@ -573,23 +700,86 @@
           "type": "integer"
         }
       },
-      "required": [
-        "model"
-      ],
       "type": "object"
     },
     "Semantic": {
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "embedding_model": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "embedding_model"
+              ]
+            },
+            {
+              "properties": {
+                "embedding_model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "embedding_model_id"
+              ]
+            }
+          ]
+        },
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "default": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "default"
+              ]
+            },
+            {
+              "properties": {
+                "default_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "default_id"
+              ]
+            }
+          ]
+        }
+      ],
       "description": "Semantic-routing config: pick a target by request meaning.",
       "properties": {
         "default": {
-          "description": "Direct model alias used when no route clears its threshold.",
+          "description": "Direct model alias used when no route clears its threshold. Read only when `default_id` is absent.",
           "minLength": 1,
           "type": "string"
         },
+        "default_id": {
+          "description": "Resource id of the direct model used when no route clears its threshold. Present, it is authoritative and `default` is ignored, so renaming that model keeps this router pointing at it with no edit to this document.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "embedding_model": {
-          "description": "Alias of an `embedding`-modality Model used to embed the request and (at apply time) the route examples.",
+          "description": "Alias of an `embedding`-modality Model used to embed the request and (at apply time) the route examples. Read only when `embedding_model_id` is absent.",
           "minLength": 1,
           "type": "string"
+        },
+        "embedding_model_id": {
+          "description": "Resource id of the `embedding`-modality Model used to embed the request and the route examples. Present, it is authoritative and `embedding_model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this router pointing at it with no edit to this document. An id resolving to no model is an embedding model that does not exist, exactly as an `embedding_model` naming no model is — the router applies `on_embedding_failure`.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "embedding_timeout_ms": {
           "description": "Per-call deadline for the embedding request in milliseconds. `0` or absent disables the embedding-specific deadline.",
@@ -623,8 +813,6 @@
         }
       },
       "required": [
-        "default",
-        "embedding_model",
         "match",
         "routes"
       ],
@@ -665,6 +853,32 @@
       "type": "object"
     },
     "SemanticRoute": {
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "target": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target"
+              ]
+            },
+            {
+              "properties": {
+                "target_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target_id"
+              ]
+            }
+          ]
+        }
+      ],
       "description": "One semantic route: a labeled set of example utterances whose embeddings define the route. A request that scores high enough against them dispatches to `target`.",
       "properties": {
         "description": {
@@ -687,9 +901,17 @@
           "type": "string"
         },
         "target": {
-          "description": "Direct model alias that receives traffic matching this route.",
+          "description": "Direct model alias that receives traffic matching this route. Read only when `target_id` is absent.",
           "minLength": 1,
           "type": "string"
+        },
+        "target_id": {
+          "description": "Resource id of the direct model that receives traffic matching this route. Present, it is authoritative and `target` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this route pointing at it with no edit to this document. An id resolving to no model is a route target that does not exist, exactly as a `target` naming no model is.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "threshold": {
           "description": "Per-route similarity threshold. A request matches this route only when its aggregated score is `>=` this value. When omitted, the router-level threshold applies.",
@@ -701,8 +923,7 @@
       },
       "required": [
         "examples",
-        "name",
-        "target"
+        "name"
       ],
       "type": "object"
     },

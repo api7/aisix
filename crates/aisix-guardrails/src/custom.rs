@@ -978,10 +978,12 @@ async fn host_embed(
         Ok(t) => t,
         Err(e) => return embed_error(format!("invalid texts argument: {e}")),
     };
-    match embedder.embed(&model, &texts, false, budget).await {
-        Ok(vectors) => serde_json::to_string(&EmbedResult {
+    // The script names the model by alias — `aisix.embed(name, texts)` is
+    // the whole surface — so there is no id spelling to pass here.
+    match embedder.embed(&model, None, &texts, false, budget).await {
+        Ok(embedded) => serde_json::to_string(&EmbedResult {
             error: None,
-            vectors,
+            vectors: embedded.vectors,
         })
         .unwrap_or_else(|e| embed_error(e.to_string())),
         Err(failure) => {
@@ -1812,12 +1814,13 @@ mod tests {
             async fn embed(
                 &self,
                 _model: &str,
+                _model_id: Option<&str>,
                 texts: &[String],
                 _cacheable: bool,
                 _timeout: Duration,
-            ) -> Result<Vec<Vec<f32>>, crate::EmbedFailure> {
+            ) -> Result<crate::Embedded, crate::EmbedFailure> {
                 // "jailbreak" points one way, everything else the other.
-                Ok(texts
+                let vectors = texts
                     .iter()
                     .map(|t| {
                         if t.contains("jailbreak") {
@@ -1826,7 +1829,11 @@ mod tests {
                             vec![0.0, 1.0]
                         }
                     })
-                    .collect())
+                    .collect();
+                Ok(crate::Embedded {
+                    model: "stub-embedder".to_owned(),
+                    vectors,
+                })
             }
         }
         let cfg = config(

@@ -83,6 +83,26 @@ fn cache_policy_corpus() {
                 true,
                 json!({"name": "k", "applies_to": "api_key:11111111-1111-1111-1111-111111111111"}),
             ),
+            (
+                "model scope by resource id",
+                true,
+                json!({"name": "k", "applies_to_model_id": "m-1"}),
+            ),
+            (
+                "similarity embedder named by resource id alone",
+                true,
+                json!({"name": "k", "semantic": {"embedding_model_id": "m-e", "threshold": 0.9}}),
+            ),
+            (
+                "similarity embedder named neither way",
+                false,
+                json!({"name": "k", "semantic": {"threshold": 0.9}}),
+            ),
+            (
+                "empty applies_to_model_id",
+                false,
+                json!({"name": "k", "applies_to_model_id": ""}),
+            ),
             // CachePolicy has no deny_unknown_fields → forward-compat fields tolerated.
             (
                 "unknown field tolerated",
@@ -649,6 +669,24 @@ fn guardrail_corpus() {
                 false,
                 json!({"name": "k", "kind": "keyword", "patterns": [{"kind": "literal", "value": "x", "extra": 1}]}),
             ),
+            (
+                "semantic embedder named by resource id alone",
+                true,
+                json!({"name": "s", "kind": "semantic", "embedding_model_id": "m-e",
+                       "deny_examples": ["x"], "deny_threshold": 0.8}),
+            ),
+            (
+                "semantic embedder named neither way",
+                false,
+                json!({"name": "s", "kind": "semantic",
+                       "deny_examples": ["x"], "deny_threshold": 0.8}),
+            ),
+            (
+                "semantic embedder id present but empty",
+                false,
+                json!({"name": "s", "kind": "semantic", "embedding_model_id": "",
+                       "deny_examples": ["x"], "deny_threshold": 0.8}),
+            ),
             // top-level / kind discriminator
             (
                 "missing name",
@@ -966,7 +1004,6 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
             "/oneOf/10/allOf",
             "/oneOf/10/properties/allow_threshold/default",
             "/oneOf/10/properties/deny_threshold/default",
-            "/oneOf/10/required",
             "/oneOf/11/properties/script/default",
         ],
     ),
@@ -981,6 +1018,141 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
         ],
     ),
 ];
+
+/// Every field the resources file refuses as an id-form model reference
+/// is a field this build's schema actually declares.
+///
+/// The refusal list (`filesource::model_ref_id_fields`) is written by
+/// hand, and `aisix export` rewrites the same list back to name form. A
+/// typo in either half is silent in both directions: the file would
+/// accept an id that resolves to nothing, and the export would leave one
+/// in a file that then refuses to load. Neither shows up as a test
+/// failure anywhere else, because a name nothing declares simply never
+/// matches.
+#[test]
+fn every_refused_model_reference_id_is_a_declared_field() {
+    fn declares(node: &Value, field: &str) -> bool {
+        match node {
+            Value::Object(map) => {
+                map.get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|p| p.contains_key(field))
+                    || map.values().any(|v| declares(v, field))
+            }
+            Value::Array(items) => items.iter().any(|v| declares(v, field)),
+            _ => false,
+        }
+    }
+
+    // (resources-file collection, the resource whose schema declares it)
+    for (kind, resource) in [
+        ("api_keys", "api_key"),
+        ("models", "model"),
+        ("cache_policies", "cache_policy"),
+        ("guardrails", "guardrail"),
+    ] {
+        let schema = resource_root_schema(resource, true);
+        let fields = aisix_core::filesource::model_ref_id_fields(kind);
+        assert!(
+            !fields.is_empty(),
+            "{kind} has model references but refuses none"
+        );
+        for reference in fields {
+            let (id_field, name_field) = (reference.field, reference.name_field);
+            assert!(
+                declares(&schema, id_field),
+                "{kind} refuses `{id_field}`, which the {resource} schema does not declare"
+            );
+            assert!(
+                declares(&schema, name_field),
+                "{kind} rewrites `{id_field}` to `{name_field}`, which the {resource} schema \
+                 does not declare"
+            );
+            // The hint is what an operator is told to write instead, so it
+            // has to START with the name field — a hint naming a different
+            // field would send them somewhere the reference does not live.
+            assert!(
+                reference.hint.starts_with(name_field),
+                "{kind}'s hint for `{id_field}` ({:?}) does not name `{name_field}`",
+                reference.hint
+            );
+        }
+    }
+}
+
+/// Every `<name>` / `<name>_id` pair a resource declares is registered as
+/// a model reference.
+///
+/// The other direction of the check above, and the one that actually
+/// rots: a future site gains an id spelling, nobody adds it to
+/// `filesource::model_ref_id_fields`, and from then on the resources file
+/// SILENTLY accepts an id it can never resolve (with the name spelling
+/// ignored on top) while `aisix export` silently drops it. Nothing else
+/// notices, because a field no table mentions simply never matches.
+///
+/// Detected structurally rather than by name or by prose: a property
+/// ending `_id` (or `_ids`) whose name-form sibling is declared on the
+/// SAME object is the shape every model reference has. Sibling-less ids
+/// — `provider_key_id`, `team_id`, `user_id` — are not pairs and are not
+/// reported. A reference whose name form is spelled differently
+/// (`applies_to_model_id` → `applies_to`) cannot be found this way, which
+/// is why it is registered by hand; this check only ever demands MORE
+/// registration, never less.
+#[test]
+fn every_declared_name_and_id_pair_is_registered_as_a_model_reference() {
+    /// The name-form sibling `field` would pair with, if any.
+    fn name_form(field: &str) -> Option<String> {
+        if let Some(stem) = field.strip_suffix("_ids") {
+            return Some(format!("{stem}s"));
+        }
+        field.strip_suffix("_id").map(str::to_owned)
+    }
+
+    fn collect_pairs(node: &Value, out: &mut Vec<String>) {
+        match node {
+            Value::Object(map) => {
+                if let Some(Value::Object(properties)) = map.get("properties") {
+                    for field in properties.keys() {
+                        if name_form(field).is_some_and(|n| properties.contains_key(&n)) {
+                            out.push(field.clone());
+                        }
+                    }
+                }
+                for child in map.values() {
+                    collect_pairs(child, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    collect_pairs(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (kind, resource) in [
+        ("api_keys", "api_key"),
+        ("models", "model"),
+        ("cache_policies", "cache_policy"),
+        ("guardrails", "guardrail"),
+    ] {
+        let mut found = Vec::new();
+        collect_pairs(&resource_root_schema(resource, true), &mut found);
+        found.sort();
+        found.dedup();
+        let registered = aisix_core::filesource::model_ref_id_fields(kind);
+        for field in found {
+            assert!(
+                registered.iter().any(|r| r.field == field),
+                "the {resource} schema declares `{field}` beside its name form, but \
+                 `filesource::model_ref_id_fields(\"{kind}\")` does not list it — the \
+                 resources file would accept an id it can never resolve, and `aisix export` \
+                 would drop it"
+            );
+        }
+    }
+}
 
 /// The published files are exactly the ones `dump-schema` emits today.
 ///
