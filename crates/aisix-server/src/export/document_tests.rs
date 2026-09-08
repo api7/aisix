@@ -670,3 +670,97 @@ fn a_team_scope_is_carried_through_verbatim() {
         doc.warnings
     );
 }
+
+#[test]
+fn api_key_allowed_model_ids_resugar_to_names() {
+    let snap = AisixSnapshot::new();
+    snap.provider_keys
+        .insert(ResourceEntry::new("pk", provider_key("pk", "sk"), 1));
+    for (id, display_name) in [("m-uuid-1", "gpt-4o"), ("m-uuid-2", "claude")] {
+        snap.models.insert(ResourceEntry::new(
+            id,
+            model_value(json!({
+                "display_name": display_name,
+                "provider": "openai",
+                "model_name": "x",
+                "provider_key_id": "pk"
+            })),
+            1,
+        ));
+    }
+    snap.apikeys.insert(ResourceEntry::new(
+        "k-uuid-1",
+        serde_json::from_value(json!({
+            "key_hash": "aa".repeat(32),
+            "allowed_models": ["stale-name"],
+            "allowed_model_ids": ["m-uuid-2"]
+        }))
+        .unwrap(),
+        1,
+    ));
+
+    let doc = build_export_document(&snap, false);
+    let keys = find(&doc, "api_keys");
+    // The file source grants by name only: the id form never reaches it,
+    // and the name it resolves to replaces whatever `allowed_models` held.
+    assert!(keys[0].get("allowed_model_ids").is_none());
+    assert_eq!(keys[0]["allowed_models"], json!(["claude"]));
+    assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
+}
+
+#[test]
+fn api_key_unresolvable_model_id_is_dropped_and_warned() {
+    let snap = AisixSnapshot::new();
+    snap.provider_keys
+        .insert(ResourceEntry::new("pk", provider_key("pk", "sk"), 1));
+    snap.models.insert(ResourceEntry::new(
+        "m-uuid-1",
+        model_value(
+            json!({"display_name": "gpt-4o", "provider": "openai", "model_name": "x", "provider_key_id": "pk"}),
+        ),
+        1,
+    ));
+    snap.apikeys.insert(ResourceEntry::new(
+        "k-uuid-1",
+        serde_json::from_value(json!({
+            "key_hash": "aa".repeat(32),
+            "allowed_model_ids": ["m-uuid-1", "m-gone"]
+        }))
+        .unwrap(),
+        1,
+    ));
+
+    let doc = build_export_document(&snap, false);
+    let keys = find(&doc, "api_keys");
+    // Emitting "m-gone" as a name would fail the loader's model
+    // cross-reference and take the whole file down; dropping it only
+    // narrows the key, which is what the gateway already does.
+    assert_eq!(keys[0]["allowed_models"], json!(["gpt-4o"]));
+    assert!(
+        doc.warnings.iter().any(|w| w.contains("m-gone")),
+        "{:?}",
+        doc.warnings
+    );
+    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
+}
+
+#[test]
+fn api_key_empty_allowed_model_ids_export_as_no_grant() {
+    let snap = AisixSnapshot::new();
+    snap.apikeys.insert(ResourceEntry::new(
+        "k-uuid-1",
+        serde_json::from_value(json!({
+            "key_hash": "aa".repeat(32),
+            "allowed_models": ["*"],
+            "allowed_model_ids": []
+        }))
+        .unwrap(),
+        1,
+    ));
+    let doc = build_export_document(&snap, false);
+    let keys = find(&doc, "api_keys");
+    // An empty id list is authoritative at runtime, so the exported file
+    // must not resurrect the ignored `allowed_models: ["*"]`.
+    assert_eq!(keys[0]["allowed_models"], json!([]));
+}

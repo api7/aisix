@@ -444,6 +444,45 @@ models:
 }
 
 #[test]
+fn allowed_model_ids_is_rejected_by_the_file_source() {
+    // A file's ids are derived from entry names, so no id written here
+    // resolves to a model — the key would silently grant nothing, with
+    // `allowed_models` ignored on top of that. Fail loudly instead.
+    let contents = r#"
+_format_version: "1"
+models:
+  - display_name: m
+    provider: openai
+    model_name: x
+    provider_key: pk
+provider_keys:
+  - display_name: pk
+    api_key: sk-x
+api_keys:
+  - display_name: k
+    key_env: CALLER_KEY
+    allowed_models: ["m"]
+    allowed_model_ids: ["11111111-1111-1111-1111-111111111111"]
+"#;
+    let env = env_of(&[("CALLER_KEY", "sk-caller")]);
+    let errs = errors_of(load(contents, &env));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("does not accept `allowed_model_ids`")
+            && errs[0].contains("allowed_models"),
+        "{errs:?}"
+    );
+
+    // The same file without the field loads, so the rejection is the
+    // field and not anything else in the fixture.
+    let ok = contents.replace(
+        "    allowed_model_ids: [\"11111111-1111-1111-1111-111111111111\"]\n",
+        "",
+    );
+    load(&ok, &env).expect("the same file without the field loads");
+}
+
+#[test]
 fn canonical_validation_failures_carry_entry_scope() {
     // Empty display_name violates the model schema (minLength 1)…
     // after passing identity extraction? No — identity extraction

@@ -388,6 +388,24 @@ pub fn load_from_str(
             continue;
         }
 
+        // `allowed_model_ids` is a control-plane projection: it names
+        // models by the id the control plane assigned them, while a file's
+        // ids are derived from the entry names, so no id a file can carry
+        // ever resolves. Accepting it would make the key grant nothing at
+        // all — silently, and with `allowed_models` ignored on top — so the
+        // file rejects the field instead. (The etcd path is the opposite:
+        // there an id that resolves to no model simply grants nothing and
+        // must never fail the row, because a rejected api_key stops
+        // authenticating entirely.)
+        if entry.kind == "api_keys" && entry.doc.get("allowed_model_ids").is_some() {
+            errors.push(LoadError {
+                scope,
+                message: "the resources file does not accept `allowed_model_ids` — it names                           models by control-plane id, which a file cannot resolve; grant                           models by name with `allowed_models`"
+                    .into(),
+            });
+            continue;
+        }
+
         let sugar_result = match entry.kind {
             "models" => desugar::desugar_model(&mut entry.doc, &identity_maps),
             "api_keys" => desugar::desugar_api_key(&mut entry.doc, env),

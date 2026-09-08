@@ -160,8 +160,19 @@
         "null"
       ]
     },
+    "allowed_model_ids": {
+      "description": "Models this key may use, named by resource id rather than by name, so renaming a model does not change what this key may reach. Present — including as an empty array — it is authoritative and `allowed_models` is ignored; each id is resolved against the current models in the snapshot and the resolved name is matched with the same single-`*` glob rule. An id naming a wildcard model therefore grants every name that model's pattern covers — including a name an exact-match model of its own serves, which is how the name form behaves too. An id matching no model grants nothing.\n\nSet to `null` it means the same as omitted: the key falls back to `allowed_models`. A producer must therefore write `[]`, never `null`, for a key that is meant to grant no model — the two are opposite grants, and an empty list is the one that is authoritative.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
     "allowed_models": {
-      "description": "Model identifiers this key may use. An empty array denies access to every model.",
+      "default": [],
+      "description": "Model names this key may use, matched as single-`*` globs. Read only when `allowed_model_ids` is absent; ignored entirely when it is present. When both are omitted the key may use no model — model access is granted explicitly.",
       "items": {
         "type": "string"
       },
@@ -274,7 +285,6 @@
     }
   },
   "required": [
-    "allowed_models",
     "key_hash"
   ],
   "title": "ApiKey",

@@ -203,7 +203,7 @@ pub(crate) fn resolve_target(
         Some(name) => {
             let entry = crate::model_resolve::resolve_model(snapshot, name)
                 .ok_or_else(|| ProxyError::ModelNotFound(format!("model {name:?} not found")))?;
-            if !auth.key().can_access(name) {
+            if !auth.key().can_access(snapshot, name) {
                 return Err(ProxyError::ModelForbidden(format!(
                     "api key is not authorized for model {name:?}"
                 )));
@@ -227,7 +227,7 @@ pub(crate) fn resolve_target(
                     && !m.is_ensemble()
                     && !m.is_semantic()
                     && !m.display_name.contains('*')
-                    && auth.key().can_access(&m.display_name)
+                    && auth.key().can_access(snapshot, &m.display_name)
                     && m.provider_key_id
                         .as_deref()
                         .and_then(|id| snapshot.provider_keys.get_by_id(id))

@@ -316,7 +316,7 @@ async fn dispatch(
     let model_entry = crate::model_resolve::resolve_model(snapshot, &body.model)
         .ok_or_else(|| ProxyError::ModelNotFound(body.model.clone()))?;
 
-    if !auth.key().can_access(&body.model) {
+    if !auth.key().can_access(snapshot, &body.model) {
         return Err(ProxyError::ModelForbidden(body.model.clone()));
     }
 

@@ -148,10 +148,11 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             |k| synthetic_api_key_name(&k.key_hash),
             "api_keys",
             &mut diag,
-            |doc, identity, _warnings| {
+            |doc, identity, diag| {
                 if let Value::Object(map) = doc {
                     map.insert("display_name".into(), Value::String(identity.to_string()));
                 }
+                resugar_allowed_models(doc, identity, &model_names, diag);
             },
             |_, _| {},
         ),
@@ -647,6 +648,44 @@ fn resugar_provider_key(
              will not load until it is resolved)"
         )),
     }
+}
+
+/// `api_key.allowed_model_ids` (etcd ids) → `allowed_models` names.
+///
+/// The file source grants models by name, so the export resolves each id to
+/// the identity the models collection is keyed by and emits the name form the
+/// key already carries a field for. The id form is a control-plane projection
+/// and is never written to a resources file.
+///
+/// An id naming no exported model is dropped with a warning rather than kept:
+/// dropping it makes the key reach LESS, while emitting an unresolvable name
+/// would fail the loader's model cross-reference and take the whole file down.
+fn resugar_allowed_models(
+    doc: &mut Value,
+    api_key: &str,
+    model_names: &BTreeMap<String, String>,
+    diag: &mut Diagnostics,
+) {
+    let Some(map) = doc.as_object_mut() else {
+        return;
+    };
+    let Some(Value::Array(ids)) = map.remove("allowed_model_ids") else {
+        return;
+    };
+
+    let mut names = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let Some(id) = id.as_str() else { continue };
+        match model_names.get(id) {
+            Some(name) => names.push(Value::String(name.clone())),
+            None => diag.warnings.push(format!(
+                "api key {api_key:?} grants model id {id:?}, which is not among the exported \
+                 models — the grant is dropped (the gateway already treats it as granting \
+                 nothing)"
+            )),
+        }
+    }
+    map.insert("allowed_models".into(), Value::Array(names));
 }
 
 /// `claim_mapping.resolve.api_key_id` (etcd id) → `resolve.api_key`

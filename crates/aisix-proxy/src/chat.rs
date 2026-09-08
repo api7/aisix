@@ -1341,7 +1341,7 @@ async fn dispatch(
     // (manually, not via this helper).
     let with_model = |e: ProxyError| DispatchFailure::new(Some(model_id.clone()), None, e);
 
-    if !auth.key().can_access(&req.model) {
+    if !auth.key().can_access(snapshot, &req.model) {
         return Err(with_model(ProxyError::ModelForbidden(req.model.clone())));
     }
 

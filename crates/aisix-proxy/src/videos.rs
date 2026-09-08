@@ -1063,7 +1063,7 @@ fn resolve_video_target(
     acl_name: &str,
     client_ctx: &ClientContext,
 ) -> Result<Result<VideoTarget, Response>, ProxyError> {
-    if !auth.key().can_access(acl_name) {
+    if !auth.key().can_access(snapshot, acl_name) {
         return Err(ProxyError::ModelForbidden(acl_name.to_string()));
     }
     crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;

@@ -1528,9 +1528,22 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "items": {
               "type": "string"
             },
-            "description": "Model aliases this caller API key may use.",
+            "description": "Model names this caller API key may use, matched as single-`*` globs. Read only when `allowed_model_ids` is omitted or null; an array there, `[]` included, takes over entirely.",
             "example": [
               "gpt-4o"
+            ]
+          },
+          "allowed_model_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Models this caller API key may use, named by resource id. An array here, `[]` included, is authoritative and `allowed_models` is ignored: each id resolves against the models currently in the configuration and the resolved name is glob-matched, and an id resolving to no model grants nothing. Omitted or null falls back to `allowed_models`, so `[]` and not null is how access is removed.",
+            "example": [
+              "9b1b6d9c-1f5e-4c1e-9f8f-2f5f5b9d1c11"
             ]
           },
           "rate_limit": {
