@@ -99,13 +99,14 @@ async fn sentinel_reresolves_master_after_failover() {
     // accept writes after role change.
     //
     // The budget is deliberately much longer than the role change needs.
-    // The failure that triggered the failover also opened the connection
-    // layer's cool-off, so the first `BREAKER_WINDOW` of this loop is
-    // spent short-circuiting rather than re-resolving. That window is 30s
-    // — sized to outlast an upstream call, not a role change — so the loop
-    // is sized as `BREAKER_WINDOW` plus room for the promotion. Shorten it
-    // and the test starts failing on the cool-off rather than on anything
-    // about failover.
+    // Nothing above has failed a command through THIS connection — the
+    // failover and the promotion poll both use their own clients, and
+    // `note_error` only drops the cached master — so the cool-off is
+    // normally closed here and the first iteration re-resolves straight
+    // away. What the budget is for is the case where it is not: if a write
+    // below lands on a socket the failover dropped, that is an I/O error,
+    // the cool-off opens, and nothing gets through for `BREAKER_WINDOW`
+    // (30s). Sized to outlast one such window rather than to race it.
     let mut wrote = false;
     for _ in 0..200 {
         // acquire itself can fail transiently right after a failover (the

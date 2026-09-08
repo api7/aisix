@@ -121,9 +121,9 @@ async function startRedisBlackhole(upstreamUrl: string): Promise<{
       hole = true;
     },
     close: () =>
-      new Promise<void>((r) => {
+      new Promise<void>((resolve, reject) => {
         for (const s of live) s.destroy();
-        server.close(() => r());
+        server.close((err) => (err ? reject(err) : resolve()));
       }),
   };
 }
@@ -363,6 +363,11 @@ describe("an upstream slower than the old cool-off still costs one budget", () =
 
     const degraded = await timeChat(f.app.proxyUrl, SEMANTIC_MODEL, "alpha cold");
     expect(degraded.status).toBe(200);
+    // Both cache layers are unreachable, so neither can serve this — the
+    // request must have gone upstream, and the timing below is only
+    // meaningful if it did. Asserted on the upstream's own record rather
+    // than inferred from the clock.
+    expect(f.upstream.receivedRequests.length).toBe(2);
     // The exact lookup spends one budget, then the upstream runs; the
     // writes that follow must short-circuit.
     expect(degraded.ms).toBeGreaterThanOrEqual(
