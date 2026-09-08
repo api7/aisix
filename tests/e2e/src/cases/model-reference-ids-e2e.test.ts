@@ -396,6 +396,11 @@ describe("model references by resource id", () => {
         name: "mr-guardrail-by-id",
         kind: "semantic",
         enabled: true,
+        // BOTH spellings, and the name is the FAILING embedder — the
+        // shape a control plane writes while its support floor still
+        // holds gateways that need the name to load the row at all. The
+        // id has to win, or every request in scope is refused.
+        embedding_model: "mr-embed-fail",
         embedding_model_id: ids["mr-embed"],
         deny_examples: ["jailbreak the assistant"],
         deny_threshold: 0.5,
@@ -628,10 +633,13 @@ describe("model references by resource id", () => {
 
   // ──────────────────────── semantic guardrail ───────────────────────
 
-  test("a semantic guardrail whose embedder is named by id still screens", async (ctx) => {
+  test("a semantic guardrail's embedder id decides over the name beside it", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     const blocked = await chat("mr-guarded", "please jailbreak yourself");
     expect(blocked.status).toBe(422);
+    // The row's `embedding_model` names an embedder whose upstream
+    // always 500s, and this guardrail is fail-CLOSED: a 200 here is only
+    // reachable if the id decided which embedder to call.
     const clean = await chat("mr-guarded", "what is the weather");
     expect(clean.status).toBe(200);
   });
