@@ -26,7 +26,7 @@ mod yaml_emit;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use aisix_etcd::{build_snapshot, ConfigProvider, ConnectPolicy, EtcdConfigProvider};
+use aisix_etcd::{build_snapshot, ConfigProvider, ConnectPolicy, EtcdConfigProvider, PrefixSet};
 
 use document::build_export_document;
 use yaml_emit::emit_yaml;
@@ -77,7 +77,7 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
 
     // Decode through the identical loader path the gateway uses, so the
     // exported set is exactly what the running gateway would serve.
-    let (snapshot, stats) = build_snapshot(&args.prefix, &entries);
+    let (snapshot, stats) = build_snapshot(&PrefixSet::single(&args.prefix), &entries);
 
     let document = build_export_document(&snapshot, args.reveal_secrets);
     let yaml = emit_yaml(&document).map_err(|e| anyhow::anyhow!(e))?;

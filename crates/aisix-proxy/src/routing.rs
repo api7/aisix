@@ -34,6 +34,7 @@
 //! - **least_busy**: least-loaded target first, by in-flight requests
 //!   divided by target `weight` (the APISIX least_conn score).
 
+use aisix_core::models::{LivePricingIndex, PricingIndex};
 use aisix_core::{
     AisixSnapshot, HashOnType, Model, Routing, RoutingStrategy, RoutingTarget,
     WhenAllUnavailablePolicy,
@@ -909,12 +910,12 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 /// Combined per-1K unit price used to rank `least_cost` targets. A target
-/// Model without a configured `cost` sorts last (treated as +∞) so a
-/// misconfigured target is deprioritised rather than silently preferred.
-fn cost_key(model: &Model) -> f64 {
-    model
-        .cost
-        .as_ref()
+/// Model with no price at all — no `pricing_key` that resolves, and no
+/// inline `cost` — sorts last (treated as +∞) so a misconfigured target
+/// is deprioritised rather than silently preferred.
+fn cost_key(pricing: &PricingIndex, model: &Model) -> f64 {
+    pricing
+        .resolve(model)
         .map(|c| c.input_per_1k + c.output_per_1k)
         .unwrap_or(f64::INFINITY)
 }
@@ -936,10 +937,18 @@ fn order_attempts_by_metric(
     strategy: RoutingStrategy,
     attempts: &mut [AttemptModel],
     runtime_status: &crate::ModelRuntimeStatusTracker,
+    snapshot: &AisixSnapshot,
+    pricing: &LivePricingIndex,
 ) {
     match strategy {
         RoutingStrategy::LeastCost => {
-            attempts.sort_by(|a, b| cost_key(&a.model).total_cmp(&cost_key(&b.model)));
+            // Built here rather than per comparison: the sort calls the
+            // key function O(n log n) times, and the index is shared with
+            // whatever else prices this snapshot.
+            let pricing = pricing.for_snapshot(snapshot);
+            attempts.sort_by(|a, b| {
+                cost_key(&pricing, &a.model).total_cmp(&cost_key(&pricing, &b.model))
+            });
         }
         RoutingStrategy::LeastLatency => {
             attempts.sort_by(|a, b| {
@@ -1161,6 +1170,7 @@ fn targets_allowed_for_ip(
 pub(crate) fn resolve_attempt_models(
     routing_registry: &RoutingRegistry,
     runtime_status: &crate::ModelRuntimeStatusTracker,
+    pricing: &LivePricingIndex,
     snapshot: &AisixSnapshot,
     virtual_name: &str,
     virtual_id: &str,
@@ -1243,7 +1253,13 @@ pub(crate) fn resolve_attempt_models(
     // metric sort runs first, then a stable sort on priority — so tiers
     // concatenate highest-first with the metric order preserved inside each.
     if routing.strategy.is_metric_based() {
-        order_attempts_by_metric(routing.strategy, &mut resolved, runtime_status);
+        order_attempts_by_metric(
+            routing.strategy,
+            &mut resolved,
+            runtime_status,
+            snapshot,
+            pricing,
+        );
         resolved.sort_by_key(|a| std::cmp::Reverse(a.priority));
         resolved.truncate(routing.max_fallbacks_or_default() + 1);
     }

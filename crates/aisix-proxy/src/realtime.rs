@@ -963,6 +963,10 @@ async fn run_session(
     // usage event and `record_usage` below, where each used to do its own.
     let snap = state.snapshot.load();
     let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &pk_id);
+    // Priced off the same fresh snapshot, through the index every other
+    // reader of a model's price uses: `pricing_key` first, inline `cost`
+    // second.
+    let pricing = state.pricing.for_snapshot(&snap);
     crate::request_metrics::record(
         &state,
         "/v1/realtime",
@@ -994,10 +998,8 @@ async fn run_session(
         // the upstream figure and what the caller waited for coincide.
         upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
-        cost_usd: model_entry
-            .value
-            .cost
-            .as_ref()
+        cost_usd: pricing
+            .resolve(&model_entry.value)
             .map(|c| c.calculate(usage.input_tokens, usage.output_tokens))
             .unwrap_or(0.0),
         inbound_protocol: "realtime".to_string(),

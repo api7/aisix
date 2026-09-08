@@ -74,7 +74,7 @@ use aisix_core::{
     AisixSnapshot, CacheBackend, Config, ConfigStatus, EtcdConfig, EtcdTlsConfig, RateLimitBackend,
     SourceKind,
 };
-use aisix_etcd::{EtcdConfigProvider, SnapshotCache, Supervisor};
+use aisix_etcd::{EtcdConfigProvider, SnapshotCache, Supervisor, WatchedPrefix};
 use aisix_gateway::{Hub, UpstreamHttpConfig};
 use aisix_obs::{init_tracing, Metrics};
 use aisix_provider_anthropic::AnthropicBridge;
@@ -738,6 +738,12 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // (env_id populated from the register response above), bare
             // `<prefix>` in self-hosted dev where env_id is empty.
             let etcd_prefix = cfg.etcd.effective_prefix();
+            // The shared pricing catalog, watched alongside the
+            // environment's own prefix and folded into the same snapshot.
+            // A control plane that does not grant read access to it is
+            // tolerated: the supervisor serves without prices rather than
+            // without configuration.
+            let global_prefix = cfg.etcd.global_prefix();
             // Only a refusal ends the boot here: an etcd that cannot be
             // reached leaves the connection pending and the supervisor
             // dials it again, so the gateway waits for its source instead
@@ -746,6 +752,21 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 EtcdConfigProvider::connect(
                     &cfg.etcd.endpoints,
                     etcd_prefix.clone(),
+                    connect_options.clone(),
+                    cfg.etcd.request_timeout(),
+                    cfg.etcd.dial_timeout(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
+            );
+            // Its own connection, for the same reason the admin surface
+            // has one: the catalog's range read and watch never queue
+            // behind the environment's, and a refusal on one channel does
+            // not disturb the other.
+            let global_provider = Arc::new(
+                EtcdConfigProvider::connect(
+                    &cfg.etcd.endpoints,
+                    global_prefix.clone(),
                     connect_options.clone(),
                     cfg.etcd.request_timeout(),
                     cfg.etcd.dial_timeout(),
@@ -784,9 +805,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 Some(path) => SnapshotCache::new(path),
                 None => SnapshotCache::disabled(),
             };
-            let supervisor = Arc::new(Supervisor::with_cache(
-                provider,
-                etcd_prefix,
+            let supervisor = Arc::new(Supervisor::with_sources(
+                vec![
+                    (WatchedPrefix::environment(etcd_prefix), provider),
+                    (WatchedPrefix::global(global_prefix), global_provider),
+                ],
                 snapshot_cache,
             ));
             // Seed the snapshot from disk before the etcd cycle starts so the

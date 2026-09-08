@@ -441,6 +441,21 @@ impl EtcdConfig {
             format!("{trimmed}/{}/", self.env_id)
         }
     }
+
+    /// The cross-environment key prefix: `<prefix>/global/`.
+    ///
+    /// Holds the shared pricing catalog and nothing else. Not derived
+    /// from `env_id` — every gateway reads the same one — and not
+    /// configurable, since it is one half of a contract with the control
+    /// plane rather than a deployment choice.
+    ///
+    /// Trailing slash for the same reason as [`Self::effective_prefix`]:
+    /// it is what the kine auth interceptor matches the Range key
+    /// against.
+    pub fn global_prefix(&self) -> String {
+        let trimmed = self.prefix.trim_end_matches('/');
+        format!("{trimmed}/global/")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -975,6 +975,10 @@
       "minLength": 1,
       "type": "string"
     },
+    "pricing_key": {
+      "description": "Name of a shared `pricing` document to take the per-token cost from, instead of setting `cost` on this model. The environment's own pricing documents are searched first and the shared catalog second; when the key matches neither, `cost` applies. Editing the pricing document repricies every model naming it, with no change to the models themselves.",
+      "type": "string"
+    },
     "provider": {
       "description": "Upstream vendor identity used for dispatch, compatibility checks, telemetry, and access logs. Routing and ensemble models leave this field unset.",
       "maxLength": 64,

@@ -31,10 +31,11 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
 use crate::backoff::ExpBackoff;
-use crate::key;
+use crate::key::{PrefixScope, PrefixSet, WatchedPrefix};
 use crate::loader::{self, BuildStats, PartialCompatEntry, PartialCompatRow, RejectedEntry};
 use crate::provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
 use crate::snapshot_cache::SnapshotCache;
+use std::sync::atomic::AtomicBool;
 
 /// Cheap clonable handle for the watch supervisor's freshness state —
 /// the etcd revision the snapshot reflects, and how long ago the
@@ -187,8 +188,14 @@ impl StateEntry {
 /// One supervisor instance. Consumers call [`Supervisor::run`] once and
 /// drop the returned handle on shutdown.
 pub struct Supervisor<P: ConfigProvider> {
-    provider: Arc<P>,
-    prefix: String,
+    /// One source per watched prefix: the environment's, and — in a
+    /// managed deployment — the shared `<base>/global/` catalog. Each is
+    /// range-read and watched separately; all of them land in the ONE
+    /// snapshot this supervisor publishes, so a request never sees half
+    /// a configuration.
+    sources: Vec<PrefixSource<P>>,
+    /// The same prefixes, in the form key parsing resolves against.
+    prefixes: PrefixSet,
     handle: SnapshotHandle<AisixSnapshot>,
 
     // Last-known etcd state, kept in `key → RawEntry` form so deltas
@@ -265,6 +272,51 @@ pub struct Supervisor<P: ConfigProvider> {
     pending_writes: Mutex<Vec<JoinHandle<()>>>,
 }
 
+/// One watched prefix and the provider that reads it.
+struct PrefixSource<P: ConfigProvider> {
+    prefix: WatchedPrefix,
+    provider: Arc<P>,
+    /// Set once the tolerated refusal below has been logged, cleared the
+    /// next time the prefix reads successfully — so an old control plane
+    /// produces one WARN, not one per reconnect.
+    refusal_logged: AtomicBool,
+}
+
+impl<P: ConfigProvider> PrefixSource<P> {
+    /// Whether this prefix may be treated as empty when etcd answers
+    /// `err`, instead of failing the cycle.
+    ///
+    /// Only the shared catalog, and only for a refusal. A control plane
+    /// older than the catalog denies reads outside the environment's own
+    /// prefix, and a gateway that failed its cycle over that would serve
+    /// nothing at all rather than serve without prices. Every other
+    /// error, and every error on the environment prefix, is handled as
+    /// before: the cycle fails and the backoff loop retries.
+    ///
+    /// A refusal that is really about credentials cannot hide here — it
+    /// refuses the environment prefix too, which is not tolerated.
+    fn tolerates(&self, err: &ProviderError) -> bool {
+        self.prefix.scope == PrefixScope::Global && matches!(err, ProviderError::Rejected(_))
+    }
+
+    fn log_refusal(&self, err: &ProviderError) {
+        if self.refusal_logged.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        tracing::warn!(
+            prefix = %self.prefix.prefix,
+            error = %err,
+            "etcd refused the shared pricing catalog; serving without it — a model with \
+             `pricing_key` falls back to its inline `cost` until the control plane grants \
+             read access to this prefix",
+        );
+    }
+
+    fn clear_refusal(&self) {
+        self.refusal_logged.store(false, Ordering::Relaxed);
+    }
+}
+
 impl<P: ConfigProvider> Supervisor<P> {
     /// Construct without on-disk persistence. Equivalent to
     /// [`Self::with_cache(provider, prefix, SnapshotCache::disabled())`].
@@ -276,10 +328,33 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// resync / put / delete the supervisor flushes the current entry
     /// set to the cache so a restart that can't reach etcd still has
     /// configuration to serve from.
+    ///
+    /// Watches the environment prefix alone. Use [`Self::with_sources`]
+    /// to add the shared catalog.
     pub fn with_cache(provider: Arc<P>, prefix: impl Into<String>, cache: SnapshotCache) -> Self {
+        Self::with_sources(vec![(WatchedPrefix::environment(prefix), provider)], cache)
+    }
+
+    /// Construct over several prefixes, each with its own provider.
+    ///
+    /// All of them feed ONE snapshot and one revision floor: kine
+    /// revisions are cluster-global, so the applied revision is the
+    /// maximum across prefixes, and readiness waits for every prefix's
+    /// initial range read (a tolerated refusal on the shared catalog
+    /// counts as read-and-empty — see [`PrefixSource::tolerates`]).
+    pub fn with_sources(sources: Vec<(WatchedPrefix, Arc<P>)>, cache: SnapshotCache) -> Self {
+        let prefixes = PrefixSet::new(sources.iter().map(|(p, _)| p.clone()).collect());
+        let sources = sources
+            .into_iter()
+            .map(|(prefix, provider)| PrefixSource {
+                prefix,
+                provider,
+                refusal_logged: AtomicBool::new(false),
+            })
+            .collect();
         Self {
-            provider,
-            prefix: prefix.into(),
+            sources,
+            prefixes,
             handle: SnapshotHandle::new(AisixSnapshot::new()),
             state: Mutex::new(BTreeMap::new()),
             revision: Mutex::new(0),
@@ -362,7 +437,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             self.partial_compat_observation();
         let mut stale_served_rows_by_kind: BTreeMap<String, usize> = BTreeMap::new();
         for key_str in stale.keys() {
-            if let Ok(parsed) = key::parse(&self.prefix, key_str) {
+            if let Ok(parsed) = self.prefixes.resolve(key_str) {
                 *stale_served_rows_by_kind
                     .entry(parsed.kind.to_string())
                     .or_insert(0) += 1;
@@ -399,7 +474,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         r: &RejectedEntry,
         stale: &HashMap<String, StaleServing>,
     ) -> IncomingRejection {
-        let (kind, id) = match key::parse(&self.prefix, &r.key) {
+        let (kind, id) = match self.prefixes.resolve(&r.key) {
             Ok(parsed) => (parsed.kind.to_string(), parsed.id.to_string()),
             Err(_) => (String::new(), String::new()),
         };
@@ -649,7 +724,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// Stops after the first watch error — the outer [`Self::run`] loop
     /// decides whether to backoff and retry.
     pub async fn load_once(&self) -> Result<BuildStats, ProviderError> {
-        let (entries, revision) = self.provider.load_all().await?;
+        let (entries, revision) = self.load_all_prefixes().await?;
         let stats = self.apply_resync(&entries);
         // apply_resync uses max(entry revisions); bump to the etcd
         // load_all revision so the cache file records the true "as
@@ -662,6 +737,33 @@ impl<P: ConfigProvider> Supervisor<P> {
             "initial snapshot built",
         );
         Ok(stats)
+    }
+
+    /// Range-read every watched prefix and return the union of their
+    /// entries with the highest revision any of them reported.
+    ///
+    /// Kine revisions are cluster-global, so the maximum is the point the
+    /// whole read is consistent as of, and it is what the heartbeat
+    /// reports as `applied_revision`.
+    async fn load_all_prefixes(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
+        let mut all = Vec::new();
+        let mut revision = 0i64;
+        for source in &self.sources {
+            match source.provider.load_all().await {
+                Ok((entries, rev)) => {
+                    source.clear_refusal();
+                    all.extend(entries);
+                    revision = revision.max(rev);
+                }
+                Err(err) if source.tolerates(&err) => {
+                    // Read as empty: the prefix contributes no rows and no
+                    // revision, and readiness is not held back.
+                    source.log_refusal(&err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok((all, revision))
     }
 
     /// Bump the recorded revision floor. Used by the cycle path to
@@ -700,14 +802,14 @@ impl<P: ConfigProvider> Supervisor<P> {
         if self.stale_serving.lock().unwrap().contains_key(key_str) {
             return;
         }
-        let Ok(parsed) = key::parse(&self.prefix, key_str) else {
+        let Ok(parsed) = self.prefixes.resolve(key_str) else {
             return;
         };
         // The presence probe reads through the batch's own staged
         // mutations: within one coalesced apply a row put earlier in the
         // batch is serving as far as this decision is concerned, even
         // though the snapshot carrying it has not been published yet.
-        if !view.present(base, parsed.kind, parsed.id) {
+        if !view.present(base, parsed.table_kind(), parsed.id) {
             return;
         }
         let Some(good) = self
@@ -839,7 +941,8 @@ impl<P: ConfigProvider> Supervisor<P> {
         dirty: &mut Dirty,
     ) -> bool {
         // Build a tiny snapshot out of just the new entry, then merge.
-        let (tiny, mut stats) = loader::build_snapshot(&self.prefix, std::slice::from_ref(entry));
+        let (tiny, mut stats) =
+            loader::build_snapshot(&self.prefixes, std::slice::from_ref(entry));
         if stats.accepted == 0 {
             // The previous good value keeps serving. Pin it now (#871):
             // the next resync rebuilds from the rejected etcd bytes and
@@ -873,7 +976,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             return false;
         }
 
-        view.record_put(&self.prefix, &entry.key);
+        view.record_put(&self.prefixes, &entry.key);
         // Fold a run of puts into ONE staged snapshot rather than keeping a
         // `Box<AisixSnapshot>` per event alive until the commit: the loader
         // hands back a full fifteen-table snapshot for the single row it
@@ -923,7 +1026,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         apply_stamp: &mut Option<i64>,
         dirty: &mut Dirty,
     ) -> bool {
-        let parsed = match key::parse(&self.prefix, key_str) {
+        let parsed = match self.prefixes.resolve(key_str) {
             Ok(k) => k,
             Err(err) => {
                 tracing::warn!(key = %key_str, error = %err, "ignoring delete with bad key");
@@ -937,7 +1040,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         // reads through the batch's staged mutations as well as the
         // published snapshot, so a delete that follows a put of the same
         // key inside one batch sees the row the put staged.
-        let present = view.present(base, parsed.kind, parsed.id);
+        let present = view.present(base, parsed.table_kind(), parsed.id);
         let removed_rejection = self.remove_rejection_for_key(key_str);
         // A deleted key no longer serves, so its partially-compatible
         // signal (if any) goes with it — and so does its last-known-good
@@ -964,9 +1067,9 @@ impl<P: ConfigProvider> Supervisor<P> {
             return removed_rejection;
         }
 
-        view.record_delete(parsed.kind, parsed.id);
+        view.record_delete(parsed.table_kind(), parsed.id);
         mutations.push(SnapshotMutation::Remove {
-            kind: parsed.kind.to_string(),
+            kind: parsed.table_kind().to_string(),
             id: parsed.id.to_string(),
         });
         stamp_max(apply_stamp, *self.revision.lock().unwrap());
@@ -1023,7 +1126,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// write that broke it. Retention ends when the key loads cleanly
     /// again or leaves etcd.
     pub fn apply_resync(&self, entries: &[RawEntry]) -> BuildStats {
-        let (snap, mut stats) = loader::build_snapshot(&self.prefix, entries);
+        let (snap, mut stats) = loader::build_snapshot(&self.prefixes, entries);
 
         // Reconcile the last-known-good state against this build, then
         // inject the retained values into the fresh snapshot.
@@ -1056,10 +1159,10 @@ impl<P: ConfigProvider> Supervisor<P> {
                 if stale.contains_key(&r.key) {
                     continue;
                 }
-                let Ok(parsed) = key::parse(&self.prefix, &r.key) else {
+                let Ok(parsed) = self.prefixes.resolve(&r.key) else {
                     continue;
                 };
-                if !snapshot_has(&prev_snap, parsed.kind, parsed.id) {
+                if !snapshot_has(&prev_snap, parsed.table_kind(), parsed.id) {
                     continue;
                 }
                 if let Some(good) = prev_state.get(&r.key) {
@@ -1082,7 +1185,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         // build can no longer parse (e.g. after a DP downgrade) drops
         // its retention with an ERROR — same contract as any RED row.
         if !injected.is_empty() {
-            let (lkg_snap, lkg_stats) = loader::build_snapshot(&self.prefix, &injected);
+            let (lkg_snap, lkg_stats) = loader::build_snapshot(&self.prefixes, &injected);
             if !lkg_stats.rejections.is_empty() {
                 let mut stale = self.stale_serving.lock().unwrap();
                 for r in &lkg_stats.rejections {
@@ -1277,19 +1380,32 @@ impl<P: ConfigProvider> Supervisor<P> {
         cancel: &tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), SupervisorError> {
         let (entries, revision) = self
-            .provider
-            .load_all()
+            .load_all_prefixes()
             .await
             .map_err(SupervisorError::Provider)?;
 
+        // ONE resync over the union: the snapshot is published only after
+        // every prefix has been read, so readiness means every prefix's
+        // initial load completed and no request can observe the
+        // environment loaded and the catalog not.
         self.apply_resync(&entries);
         self.set_revision_floor(revision);
 
-        let mut stream = self
-            .provider
-            .watch(revision + 1)
-            .await
-            .map_err(SupervisorError::Provider)?;
+        let mut streams = Vec::with_capacity(self.sources.len());
+        for source in &self.sources {
+            match source.provider.watch(revision + 1).await {
+                Ok(stream) => streams.push(stream),
+                Err(err) if source.tolerates(&err) => {
+                    // No stream for this prefix this cycle. It is retried
+                    // whenever the cycle restarts — which is what a
+                    // control-plane upgrade causes, since it takes the
+                    // kine connections behind the surviving watch with it.
+                    source.log_refusal(&err);
+                }
+                Err(err) => return Err(SupervisorError::Provider(err)),
+            }
+        }
+        let mut stream = futures::stream::select_all(streams);
 
         // An event the drain below pulled off the stream but could not
         // add to its batch (a resync, a stream error, the end of the
@@ -1524,11 +1640,11 @@ struct BatchView {
 }
 
 impl BatchView {
-    fn record_put(&mut self, prefix: &str, key_str: &str) {
-        let Ok(parsed) = key::parse(prefix, key_str) else {
+    fn record_put(&mut self, prefixes: &PrefixSet, key_str: &str) {
+        let Ok(parsed) = prefixes.resolve(key_str) else {
             return;
         };
-        let id = (parsed.kind.to_string(), parsed.id.to_string());
+        let id = (parsed.table_kind().to_string(), parsed.id.to_string());
         self.removed.remove(&id);
         self.added.insert(id);
     }
@@ -1646,6 +1762,8 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
         claim_mappings,
         passthrough_routes,
         mcp_auth_settings,
+        pricing,
+        global_pricing,
     } = src;
     for e in models.entries() {
         dst.models.insert_arc(e);
@@ -1692,6 +1810,12 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
     for e in mcp_auth_settings.entries() {
         dst.mcp_auth_settings.insert_arc(e);
     }
+    for e in pricing.entries() {
+        dst.pricing.insert_arc(e);
+    }
+    for e in global_pricing.entries() {
+        dst.global_pricing.insert_arc(e);
+    }
 }
 
 /// Remove `(kind, id)` from `snap`.
@@ -1717,6 +1841,8 @@ fn remove_from_snapshot(snap: &AisixSnapshot, kind: &str, id: &str) {
         claim_mappings,
         passthrough_routes,
         mcp_auth_settings,
+        pricing,
+        global_pricing,
     } = snap;
     match kind {
         "models" => {
@@ -1764,6 +1890,15 @@ fn remove_from_snapshot(snap: &AisixSnapshot, kind: &str, id: &str) {
         "mcp_auth_settings" => {
             mcp_auth_settings.remove(id);
         }
+        // Not the `pricing` kind but the table selector — a global-prefix
+        // pricing row arrives here as `global_pricing`. See
+        // [`crate::key::ScopedKey::table_kind`].
+        "pricing" => {
+            pricing.remove(id);
+        }
+        "global_pricing" => {
+            global_pricing.remove(id);
+        }
         _ => {}
     }
 }
@@ -1789,6 +1924,8 @@ fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
         claim_mappings,
         passthrough_routes,
         mcp_auth_settings,
+        pricing,
+        global_pricing,
     } = snap;
     match kind {
         "models" => models.get_by_id(id).is_some(),
@@ -1806,6 +1943,8 @@ fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
         "claim_mappings" => claim_mappings.get_by_id(id).is_some(),
         "passthrough_routes" => passthrough_routes.get_by_id(id).is_some(),
         "mcp_auth_settings" => mcp_auth_settings.get_by_id(id).is_some(),
+        "pricing" => pricing.get_by_id(id).is_some(),
+        "global_pricing" => global_pricing.get_by_id(id).is_some(),
         _ => false,
     }
 }
@@ -1842,6 +1981,8 @@ fn resource_counts(snap: &AisixSnapshot) -> BTreeMap<String, usize> {
         ("claim_mappings", snap.claim_mappings.len()),
         ("passthrough_routes", snap.passthrough_routes.len()),
         ("mcp_auth_settings", snap.mcp_auth_settings.len()),
+        ("pricing", snap.pricing.len()),
+        ("global_pricing", snap.global_pricing.len()),
     ] {
         if n > 0 {
             counts.insert(kind.to_string(), n);

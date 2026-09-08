@@ -34,13 +34,14 @@ use aisix_core::models::{
     McpServer, Model, ObservabilityExporter, OidcProvider, PassthroughRoute, ProviderKey,
     RateLimitPolicy, SchemaError,
 };
+use aisix_core::models::{validate_pricing_lenient, Pricing};
 use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::key::{self, ResourceKey};
+use crate::key::{PrefixScope, PrefixSet, ScopedKey};
 use crate::provider::RawEntry;
 
 /// Why the loader skipped an entry. Surfaced in [`RejectedEntry`] so
@@ -202,14 +203,15 @@ pub struct BuildStats {
 }
 
 /// Build a fresh snapshot from raw entries. Never fails — bad rows are
-/// counted in [`BuildStats`] and skipped. The prefix lets us strip it
-/// before key parsing.
-pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, BuildStats) {
+/// counted in [`BuildStats`] and skipped. The prefix set both strips the
+/// prefix before key parsing and decides which prefix a key came from,
+/// which is what selects the table a `pricing` row lands in.
+pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnapshot, BuildStats) {
     let snapshot = AisixSnapshot::new();
     let mut stats = BuildStats::default();
 
     for raw in entries {
-        let parsed = match key::parse(prefix, &raw.key) {
+        let parsed = match prefixes.resolve(&raw.key) {
             Ok(k) => k,
             Err(err) => {
                 tracing::warn!(key = %raw.key, error = %err, "skipping etcd entry with bad key");
@@ -236,6 +238,30 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                 continue;
             }
         };
+
+        // The shared catalog carries prices and nothing else. Anything
+        // else written there is refused outright rather than loaded into
+        // the environment's tables: the global prefix is written by a
+        // different authority, and every other kind is environment-scoped
+        // by definition.
+        if parsed.scope == PrefixScope::Global && parsed.kind != "pricing" {
+            tracing::warn!(
+                key = %raw.key,
+                kind = %parsed.kind,
+                "rejecting etcd entry: the global prefix carries `pricing` documents only",
+            );
+            stats.unknown_kind += 1;
+            stats.rejections.push(RejectedEntry::new(
+                raw.key.clone(),
+                RejectionKind::UnknownKind,
+                format!(
+                    "kind {:?} is not accepted under the global prefix, which carries \
+                     `pricing` documents only",
+                    parsed.kind
+                ),
+            ));
+            continue;
+        }
 
         match parsed.kind {
             "models" => {
@@ -448,6 +474,24 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     snapshot.mcp_auth_settings.insert(entry);
                 }
             }
+            "pricing" => {
+                if let Some(entry) = validate_and_parse::<Pricing>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_pricing_lenient,
+                    &mut stats,
+                ) {
+                    // Which table follows from the prefix, not the kind:
+                    // an environment document overrides the catalog entry
+                    // carrying the same `key`.
+                    match parsed.scope {
+                        PrefixScope::Environment => snapshot.pricing.insert(entry),
+                        PrefixScope::Global => snapshot.global_pricing.insert(entry),
+                    }
+                }
+            }
             other => {
                 tracing::debug!(key = %raw.key, kind = %other, "unknown etcd kind; skipping");
                 stats.unknown_kind += 1;
@@ -467,7 +511,7 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
 fn validate_and_parse<T>(
     key: &str,
     revision: i64,
-    parsed: ResourceKey<'_>,
+    parsed: ScopedKey<'_>,
     value: &Value,
     validate: fn(&Value) -> Result<(), SchemaError>,
     stats: &mut BuildStats,
@@ -488,7 +532,7 @@ where
 fn validate_and_parse_with_semantics<T>(
     key: &str,
     revision: i64,
-    parsed: ResourceKey<'_>,
+    parsed: ScopedKey<'_>,
     value: &Value,
     validate: fn(&Value) -> Result<(), SchemaError>,
     semantic: fn(&T) -> Result<(), String>,

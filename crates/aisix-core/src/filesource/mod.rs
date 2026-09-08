@@ -239,6 +239,20 @@ pub fn load_from_str(
             )));
             continue;
         };
+        // Named ahead of the generic unknown-key error: `pricing` is a
+        // real collection the gateway loads from etcd, so "unknown
+        // top-level key" would read as a typo rather than as the answer
+        // it is. Pricing documents are a control-plane projection —
+        // shared across environments and keyed by control-plane id — and
+        // a file that declared its own could not be the same document any
+        // other environment reads. Set `cost` on the model instead.
+        if key == "pricing" {
+            errors.push(file_error(
+                "the resources file does not accept a `pricing` collection — pricing documents                  are written by the control plane and shared across environments, which a file                  cannot express; set `cost` on each model instead"
+                    .to_string(),
+            ));
+            continue;
+        }
         if key != "_format_version" && !KINDS.iter().any(|(k, _)| k == key) {
             let known: Vec<&str> = KINDS.iter().map(|(k, _)| *k).collect();
             errors.push(file_error(format!(
@@ -397,6 +411,20 @@ pub fn load_from_str(
         // there an id that resolves to no model simply grants nothing and
         // must never fail the row, because a rejected api_key stops
         // authenticating entirely.)
+        // `pricing_key` is the same class of control-plane projection as
+        // `allowed_model_ids` below: it names a pricing document a file
+        // has no way to declare, so a file that carried it would leave the
+        // model with no price at all — silently, and with `cost` the only
+        // thing that could have supplied one.
+        if entry.kind == "models" && entry.doc.get("pricing_key").is_some() {
+            errors.push(LoadError {
+                scope,
+                message: "the resources file does not accept `pricing_key` — it names a                           pricing document written by the control plane, which a file cannot                           declare; set the price inline with `cost`"
+                    .into(),
+            });
+            continue;
+        }
+
         if entry.kind == "api_keys" && entry.doc.get("allowed_model_ids").is_some() {
             errors.push(LoadError {
                 scope,

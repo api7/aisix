@@ -305,6 +305,10 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<ModelCost>,
 
+    /// Name of a shared `pricing` document to take the per-token cost from, instead of setting `cost` on this model. The environment's own pricing documents are searched first and the shared catalog second; when the key matches neither, `cost` applies. Editing the pricing document repricies every model naming it, with no change to the models themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_key: Option<String>,
+
     /// Direct-model-only background health-check configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_model_check: Option<BackgroundModelCheck>,
@@ -383,6 +387,9 @@ impl Model {
         }
         if self.effort_mapping.take().is_some() {
             stripped.push("effort_mapping");
+        }
+        if self.pricing_key.take().is_some() {
+            stripped.push("pricing_key");
         }
         if (self.is_routing() || self.is_ensemble()) && self.retries.take().is_some() {
             stripped.push("retries");
@@ -477,7 +484,8 @@ pub fn model_one_of() -> Value {
 /// [`Model::strip_kind_inapplicable`]). Kind policy (project decision):
 /// generic call knobs (`timeout`/`stream_timeout`/`retries`) resolve
 /// member → group → deployment default wherever a group slot exists;
-/// model-specific knobs (`auto_prompt_caching`, `cost`) are direct-only.
+/// model-specific knobs (`auto_prompt_caching`, `cost`, `pricing_key`) are
+/// direct-only.
 pub fn model_one_of_strict() -> Value {
     model_one_of_variant(true)
 }
@@ -497,7 +505,13 @@ fn model_one_of_variant(strict: bool) -> Value {
         // top-level value is dead — as are the model-specific knobs.
         extend(
             &mut arr[0],
-            &["retries", "auto_prompt_caching", "cost", "effort_mapping"],
+            &[
+                "retries",
+                "auto_prompt_caching",
+                "cost",
+                "pricing_key",
+                "effort_mapping",
+            ],
         );
         // The direct-shaped branch also carries embedding models. They do
         // not accept generation effort, so forbid the mapping only when the
@@ -516,6 +530,7 @@ fn model_one_of_variant(strict: bool) -> Value {
                 "retries",
                 "auto_prompt_caching",
                 "cost",
+                "pricing_key",
                 "effort_mapping",
             ],
         );
@@ -524,7 +539,7 @@ fn model_one_of_variant(strict: bool) -> Value {
         // stay direct-only.
         extend(
             &mut arr[3],
-            &["auto_prompt_caching", "cost", "effort_mapping"],
+            &["auto_prompt_caching", "cost", "pricing_key", "effort_mapping"],
         );
     }
     variants

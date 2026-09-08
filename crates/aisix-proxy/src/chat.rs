@@ -1492,6 +1492,7 @@ async fn dispatch(
             let attempts = resolve_attempt_models(
                 &state.routing,
                 &state.runtime_status,
+                &state.pricing,
                 snapshot,
                 &req.model,
                 &virtual_entry.id,

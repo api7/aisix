@@ -161,6 +161,10 @@ This repo reads its config from etcd, but users never write etcd directly — th
 - Exactly four divergence axes are registered as intentional and allowed: reference style (names here vs UUIDs in the CP), tenancy scoping (flat here vs org/environment there), credential custody (`key_hash` in documents here vs server-generated plaintext-once there), and CP-derived fields (`cost`, `telemetry_tags`). Anything else that diverges from cp-admin.yaml is drift — the planned cross-plane contract check will fail it.
 - Why the CP spec and not this repo's schemas: the CP is spec-first behind a closed validator (its spec already is the authoritative field shape on that side), the spec renders into the customer-facing API reference, and this repo's schemas are generated from the implementation — a schema that follows the implementation cannot lead it. Naming drift has already cost real churn: #644 (the generated schema advertised `rps`/`rph` the validator rejected) and #657 (a wire-breaking rename because the field was named DP-first).
 
+## A Reference, Not a Copy
+
+**A document references another resource by id and never carries a copy of another resource's mutable data.** The gateway resolves the reference on the read path, through an index keyed on the referenced table's `generation` — never on the snapshot version. Data with its own lifecycle is its own resource kind, under the environment prefix or the global one, never a field inlined into its consumers, even while it has a single reader.
+
 ## Model Kinds Stay in Lockstep — Two Identities, and the Sub-Dispatch Bypasses
 
 **A Model is one table but five kinds (`direct` / `routing` / `ensemble` / `semantic` / `embedding`, plus wildcard display-name aliases), and every request carries TWO model identities: the caller-addressed entry (may be a virtual parent) and the dispatched target. For direct models they coincide, so a mechanism built and tested against direct models silently never decides the composite case — the most-repeated silent-bug class here (#962, #1087, #1237, #1267, #786).**

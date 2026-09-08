@@ -134,7 +134,10 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             |m| m.display_name.clone(),
             "models",
             &mut diag,
-            |doc, identity, diag| resugar_provider_key(doc, identity, &provider_key_names, diag),
+            |doc, identity, diag| {
+                resugar_provider_key(doc, identity, &provider_key_names, diag);
+                drop_pricing_key(doc, identity, diag);
+            },
             |_, _| {},
         ),
     );
@@ -648,6 +651,32 @@ fn resugar_provider_key(
              will not load until it is resolved)"
         )),
     }
+}
+
+/// Drop `model.pricing_key` — a control-plane projection with no file
+/// form.
+///
+/// A pricing document lives in a collection the resources file does not
+/// have, and the shared catalog lives outside the exported prefix
+/// entirely, so the reference cannot be resugared into anything a file
+/// can resolve. Dropping it costs the model its price unless it also
+/// carries an inline `cost`, which is worth saying: the exported model
+/// then ranks last under `least_cost` rather than at its real price.
+fn drop_pricing_key(doc: &mut Value, model: &str, diag: &mut Diagnostics) {
+    let Some(map) = doc.as_object_mut() else {
+        return;
+    };
+    let Some(Value::String(key)) = map.remove("pricing_key") else {
+        return;
+    };
+    if map.contains_key("cost") {
+        return;
+    }
+    diag.warnings.push(format!(
+        "model {model:?} takes its price from the pricing document {key:?}, which a resources \
+         file cannot express — the exported model carries no price and will rank last under \
+         `least_cost`; set `cost` on it if the price matters"
+    ));
 }
 
 /// `api_key.allowed_model_ids` (etcd ids) → `allowed_models` names.

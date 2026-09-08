@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "description": "A per-1,000-token price shared by every model that names it.\n\nA model refers to one of these with `pricing_key`. The gateway looks the price up in the environment's own pricing documents first and in the global catalog second; a model with no `pricing_key`, or one whose key matches no document, falls back to its inline `cost`.",
+  "properties": {
+    "input_per_1k": {
+      "description": "Prompt token price in USD per 1,000 tokens.",
+      "format": "double",
+      "minimum": 0.0,
+      "type": "number"
+    },
+    "key": {
+      "description": "Value a model's `pricing_key` is matched against, compared as an exact string. Conventionally `<provider>/<model_name>`, but the gateway attaches no meaning to its parts.",
+      "maxLength": 255,
+      "minLength": 1,
+      "type": "string"
+    },
+    "output_per_1k": {
+      "description": "Completion token price in USD per 1,000 tokens.",
+      "format": "double",
+      "minimum": 0.0,
+      "type": "number"
+    }
+  },
+  "required": [
+    "input_per_1k",
+    "key",
+    "output_per_1k"
+  ],
+  "title": "Pricing",
+  "type": "object"
+}

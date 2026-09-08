@@ -19,6 +19,7 @@ use aisix_core::models::CacheBackend;
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, ProxyConfig};
 use aisix_gateway::Hub;
+use aisix_core::models::LivePricingIndex;
 use aisix_guardrails::LiveGuardrailIndex;
 use aisix_obs::{ClientTypeClassifier, Metrics, OtlpHttpFanOut, UsageSink};
 use aisix_ratelimit::Limiter;
@@ -182,6 +183,12 @@ pub struct ProxyStateInner {
     /// when the snapshot version changes. Default is an empty index
     /// (no-op); the server bootstrap wires a live handle at startup.
     pub guardrail_index: Arc<LiveGuardrailIndex>,
+    /// Prices by `pricing_key`, derived from the two pricing tables and
+    /// rebuilt only when one of them changes. Every reader of a model's
+    /// price goes through it — `least_cost` ranking and the `cost_usd` on
+    /// the usage events — so ranking and billing cannot disagree about
+    /// what a model costs.
+    pub pricing: Arc<LivePricingIndex>,
     /// Per-request budget gate. Asks cp-api whether the api_key may
     /// proceed; cached for 5s with sticky fallback on cp-api outage.
     pub budgets: Arc<BudgetClient>,
@@ -322,6 +329,7 @@ impl ProxyState {
             routing: Arc::new(RoutingRegistry::new()),
             semantic_cache,
             guardrail_index,
+            pricing: Arc::new(LivePricingIndex::new()),
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
@@ -370,6 +378,7 @@ impl ProxyState {
             routing: Arc::new(RoutingRegistry::new()),
             semantic_cache,
             guardrail_index,
+            pricing: Arc::new(LivePricingIndex::new()),
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
@@ -432,6 +441,7 @@ impl ProxyState {
             routing: Arc::new(RoutingRegistry::new()),
             semantic_cache,
             guardrail_index,
+            pricing: Arc::new(LivePricingIndex::new()),
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::with_flags(bookkeeping_flags)),
             livez: Arc::new(LivezState::new()),
