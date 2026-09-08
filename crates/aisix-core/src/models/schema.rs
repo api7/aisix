@@ -71,6 +71,7 @@ pub struct Schemas {
     pub claim_mapping: Validator,
     pub passthrough_route: Validator,
     pub mcp_auth_settings: Validator,
+    pub pricing: Validator,
 }
 
 pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile(true)));
@@ -84,7 +85,7 @@ pub static LENIENT_SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::
 /// [`resource_root_schema`] takes. The published schema files and the
 /// validator sets are built from this list, so a new resource cannot reach
 /// one without reaching the other.
-pub const RESOURCES: [&str; 15] = [
+pub const RESOURCES: [&str; 16] = [
     "model",
     "api_key",
     "provider_key",
@@ -100,6 +101,7 @@ pub const RESOURCES: [&str; 15] = [
     "claim_mapping",
     "passthrough_route",
     "mcp_auth_settings",
+    "pricing",
 ];
 
 /// Whether a resource's write contract closes unknown top-level fields.
@@ -137,6 +139,7 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "claim_mapping" => claim_mapping_root_schema(),
         "passthrough_route" => passthrough_route_root_schema(),
         "mcp_auth_settings" => mcp_auth_settings_root_schema(),
+        "pricing" => pricing_root_schema(),
         other => panic!("unknown resource {other:?}"),
     };
     if strict {
@@ -172,6 +175,7 @@ impl Schemas {
             claim_mapping: build("claim_mapping"),
             passthrough_route: build("passthrough_route"),
             mcp_auth_settings: build("mcp_auth_settings"),
+            pricing: build("pricing"),
         }
     }
 }
@@ -603,6 +607,10 @@ pub fn validate_cache_policy(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.cache_policy, value)
 }
 
+pub fn validate_pricing(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.pricing, value)
+}
+
 pub fn validate_observability_exporter(value: &Value) -> Result<(), SchemaError> {
     match validate(&SCHEMAS.observability_exporter, value) {
         Ok(()) => Ok(()),
@@ -741,6 +749,10 @@ pub fn validate_guardrail_lenient(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_cache_policy_lenient(value: &Value) -> Result<(), SchemaError> {
     validate(&LENIENT_SCHEMAS.cache_policy, value)
+}
+
+pub fn validate_pricing_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.pricing, value)
 }
 
 pub fn validate_observability_exporter_lenient(value: &Value) -> Result<(), SchemaError> {
@@ -1919,6 +1931,14 @@ pub fn cache_policy_root_schema() -> Value {
     // has a default, and `applies_to_model_id` simply overrides it.
     apply_model_ref_alternatives(&mut schema);
     schema
+}
+
+/// Canonical JSON Schema for the `pricing` resource, derived from the
+/// [`Pricing`](crate::models::Pricing) struct. All three fields are the
+/// document — a row missing one prices nothing — so they are required on
+/// both the write and the read path.
+pub fn pricing_root_schema() -> Value {
+    struct_root_schema::<crate::models::Pricing>(false)
 }
 
 /// Canonical JSON Schema for the `observability_exporter` resource, derived

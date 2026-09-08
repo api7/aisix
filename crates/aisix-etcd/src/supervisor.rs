@@ -31,10 +31,11 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
 use crate::backoff::ExpBackoff;
-use crate::key;
+use crate::key::{PrefixScope, PrefixSet, WatchedPrefix};
 use crate::loader::{self, BuildStats, PartialCompatEntry, PartialCompatRow, RejectedEntry};
 use crate::provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
 use crate::snapshot_cache::SnapshotCache;
+use std::sync::atomic::AtomicBool;
 
 /// Cheap clonable handle for the watch supervisor's freshness state —
 /// the etcd revision the snapshot reflects, and how long ago the
@@ -187,8 +188,14 @@ impl StateEntry {
 /// One supervisor instance. Consumers call [`Supervisor::run`] once and
 /// drop the returned handle on shutdown.
 pub struct Supervisor<P: ConfigProvider> {
-    provider: Arc<P>,
-    prefix: String,
+    /// One source per watched prefix: the environment's, and — in a
+    /// managed deployment — the shared `<base>/global/` catalog. Each is
+    /// range-read and watched separately; all of them land in the ONE
+    /// snapshot this supervisor publishes, so a request never sees half
+    /// a configuration.
+    sources: Vec<PrefixSource<P>>,
+    /// The same prefixes, in the form key parsing resolves against.
+    prefixes: PrefixSet,
     handle: SnapshotHandle<AisixSnapshot>,
 
     // Last-known etcd state, kept in `key → RawEntry` form so deltas
@@ -265,6 +272,51 @@ pub struct Supervisor<P: ConfigProvider> {
     pending_writes: Mutex<Vec<JoinHandle<()>>>,
 }
 
+/// One watched prefix and the provider that reads it.
+struct PrefixSource<P: ConfigProvider> {
+    prefix: WatchedPrefix,
+    provider: Arc<P>,
+    /// Set once the tolerated refusal below has been logged, cleared the
+    /// next time the prefix reads successfully — so an old control plane
+    /// produces one WARN, not one per reconnect.
+    refusal_logged: AtomicBool,
+}
+
+impl<P: ConfigProvider> PrefixSource<P> {
+    /// Whether this prefix may be treated as empty when etcd answers
+    /// `err`, instead of failing the cycle.
+    ///
+    /// Only the shared catalog, and only for a refusal. A control plane
+    /// older than the catalog denies reads outside the environment's own
+    /// prefix, and a gateway that failed its cycle over that would serve
+    /// nothing at all rather than serve without prices. Every other
+    /// error, and every error on the environment prefix, is handled as
+    /// before: the cycle fails and the backoff loop retries.
+    ///
+    /// A refusal that is really about credentials cannot hide here — it
+    /// refuses the environment prefix too, which is not tolerated.
+    fn tolerates(&self, err: &ProviderError) -> bool {
+        self.prefix.scope == PrefixScope::Global && matches!(err, ProviderError::Rejected(_))
+    }
+
+    fn log_refusal(&self, err: &ProviderError) {
+        if self.refusal_logged.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        tracing::warn!(
+            prefix = %self.prefix.prefix,
+            error = %err,
+            "etcd refused the shared pricing catalog; serving without it — a model with \
+             `pricing_key` falls back to its inline `cost` until the control plane grants \
+             read access to this prefix",
+        );
+    }
+
+    fn clear_refusal(&self) {
+        self.refusal_logged.store(false, Ordering::Relaxed);
+    }
+}
+
 impl<P: ConfigProvider> Supervisor<P> {
     /// Construct without on-disk persistence. Equivalent to
     /// [`Self::with_cache(provider, prefix, SnapshotCache::disabled())`].
@@ -276,10 +328,44 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// resync / put / delete the supervisor flushes the current entry
     /// set to the cache so a restart that can't reach etcd still has
     /// configuration to serve from.
+    ///
+    /// Watches the environment prefix alone. Use [`Self::with_sources`]
+    /// to add the shared catalog.
     pub fn with_cache(provider: Arc<P>, prefix: impl Into<String>, cache: SnapshotCache) -> Self {
+        Self::with_sources(vec![(WatchedPrefix::environment(prefix), provider)], cache)
+    }
+
+    /// Construct over several prefixes, each with its own provider.
+    ///
+    /// All of them feed ONE snapshot and one revision floor: kine
+    /// revisions are cluster-global, so the applied revision is the
+    /// maximum across prefixes, and readiness waits for every prefix's
+    /// initial range read (a tolerated refusal on the shared catalog
+    /// counts as read-and-empty — see [`PrefixSource::tolerates`]).
+    pub fn with_sources(mut sources: Vec<(WatchedPrefix, Arc<P>)>, cache: SnapshotCache) -> Self {
+        // Environment prefixes are read FIRST, and that ordering is load
+        // bearing rather than cosmetic: [`PrefixSource::tolerates`] is
+        // only safe because credentials etcd genuinely refuses are
+        // refused for the environment prefix too, and that refusal has
+        // to be the one that surfaces. Reading the tolerant prefix first
+        // would let a wrong password come back as a tolerated catalog
+        // refusal followed by a second, redundant failure.
+        sources.sort_by_key(|(p, _)| match p.scope {
+            PrefixScope::Environment => 0,
+            PrefixScope::Global => 1,
+        });
+        let prefixes = PrefixSet::new(sources.iter().map(|(p, _)| p.clone()).collect());
+        let sources = sources
+            .into_iter()
+            .map(|(prefix, provider)| PrefixSource {
+                prefix,
+                provider,
+                refusal_logged: AtomicBool::new(false),
+            })
+            .collect();
         Self {
-            provider,
-            prefix: prefix.into(),
+            sources,
+            prefixes,
             handle: SnapshotHandle::new(AisixSnapshot::new()),
             state: Mutex::new(BTreeMap::new()),
             revision: Mutex::new(0),
@@ -362,7 +448,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             self.partial_compat_observation();
         let mut stale_served_rows_by_kind: BTreeMap<String, usize> = BTreeMap::new();
         for key_str in stale.keys() {
-            if let Ok(parsed) = key::parse(&self.prefix, key_str) {
+            if let Ok(parsed) = self.prefixes.resolve(key_str) {
                 *stale_served_rows_by_kind
                     .entry(parsed.kind.to_string())
                     .or_insert(0) += 1;
@@ -399,7 +485,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         r: &RejectedEntry,
         stale: &HashMap<String, StaleServing>,
     ) -> IncomingRejection {
-        let (kind, id) = match key::parse(&self.prefix, &r.key) {
+        let (kind, id) = match self.prefixes.resolve(&r.key) {
             Ok(parsed) => (parsed.kind.to_string(), parsed.id.to_string()),
             Err(_) => (String::new(), String::new()),
         };
@@ -649,8 +735,9 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// Stops after the first watch error — the outer [`Self::run`] loop
     /// decides whether to backoff and retry.
     pub async fn load_once(&self) -> Result<BuildStats, ProviderError> {
-        let (entries, revision) = self.provider.load_all().await?;
-        let stats = self.apply_resync(&entries);
+        let load = self.load_all_prefixes().await?;
+        let revision = load.max_revision();
+        let stats = self.apply_resync(&load.entries);
         // apply_resync uses max(entry revisions); bump to the etcd
         // load_all revision so the cache file records the true "as
         // of" point, not just the max entry write.
@@ -662,6 +749,63 @@ impl<P: ConfigProvider> Supervisor<P> {
             "initial snapshot built",
         );
         Ok(stats)
+    }
+
+    /// Range-read every watched prefix and return the union of their
+    /// entries with the highest revision any of them reported.
+    ///
+    /// Kine revisions are cluster-global, so the maximum is the point the
+    /// whole read is consistent as of, and it is what the heartbeat
+    /// reports as `applied_revision`.
+    async fn load_all_prefixes(&self) -> Result<PrefixLoad, ProviderError> {
+        // Deduplicated by key, because the prefixes can nest: when the
+        // gateway has no `env_id` the environment prefix is the bare base
+        // and `<base>/global/` sits inside it, so both range reads return
+        // the catalog's rows. The snapshot and the observed-state map are
+        // both keyed and would absorb the repeat, but the BuildStats are
+        // not — `accepted` and the per-field partially-compatible row
+        // counts are sums, and those numbers are reported.
+        let mut all: BTreeMap<String, RawEntry> = BTreeMap::new();
+        // Per source, and not just the maximum: each prefix's watch has
+        // to start from the revision ITS OWN range read was consistent
+        // as of. The reads run in sequence, so a later prefix reports a
+        // higher revision, and starting an earlier prefix's watch there
+        // would skip every write to it in between — absent from that
+        // read and never delivered to that watch.
+        let mut revisions: Vec<Option<i64>> = Vec::with_capacity(self.sources.len());
+        for source in &self.sources {
+            match source.provider.load_all().await {
+                Ok((entries, rev)) => {
+                    source.clear_refusal();
+                    for entry in entries {
+                        match all.entry(entry.key.clone()) {
+                            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                                // Two reads of one key are two points in
+                                // time; keep the later write.
+                                if entry.revision > slot.get().revision {
+                                    slot.insert(entry);
+                                }
+                            }
+                            std::collections::btree_map::Entry::Vacant(slot) => {
+                                slot.insert(entry);
+                            }
+                        }
+                    }
+                    revisions.push(Some(rev));
+                }
+                Err(err) if source.tolerates(&err) => {
+                    // Read as empty: the prefix contributes no rows and no
+                    // revision, and readiness is not held back.
+                    source.log_refusal(&err);
+                    revisions.push(None);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(PrefixLoad {
+            entries: all.into_values().collect(),
+            revisions,
+        })
     }
 
     /// Bump the recorded revision floor. Used by the cycle path to
@@ -700,14 +844,14 @@ impl<P: ConfigProvider> Supervisor<P> {
         if self.stale_serving.lock().unwrap().contains_key(key_str) {
             return;
         }
-        let Ok(parsed) = key::parse(&self.prefix, key_str) else {
+        let Ok(parsed) = self.prefixes.resolve(key_str) else {
             return;
         };
         // The presence probe reads through the batch's own staged
         // mutations: within one coalesced apply a row put earlier in the
         // batch is serving as far as this decision is concerned, even
         // though the snapshot carrying it has not been published yet.
-        if !view.present(base, parsed.kind, parsed.id) {
+        if !view.present(base, parsed.table_kind(), parsed.id) {
             return;
         }
         let Some(good) = self
@@ -839,7 +983,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         dirty: &mut Dirty,
     ) -> bool {
         // Build a tiny snapshot out of just the new entry, then merge.
-        let (tiny, mut stats) = loader::build_snapshot(&self.prefix, std::slice::from_ref(entry));
+        let (tiny, mut stats) = loader::build_snapshot(&self.prefixes, std::slice::from_ref(entry));
         if stats.accepted == 0 {
             // The previous good value keeps serving. Pin it now (#871):
             // the next resync rebuilds from the rejected etcd bytes and
@@ -873,7 +1017,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             return false;
         }
 
-        view.record_put(&self.prefix, &entry.key);
+        view.record_put(&self.prefixes, &entry.key);
         // Fold a run of puts into ONE staged snapshot rather than keeping a
         // `Box<AisixSnapshot>` per event alive until the commit: the loader
         // hands back a full fifteen-table snapshot for the single row it
@@ -923,7 +1067,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         apply_stamp: &mut Option<i64>,
         dirty: &mut Dirty,
     ) -> bool {
-        let parsed = match key::parse(&self.prefix, key_str) {
+        let parsed = match self.prefixes.resolve(key_str) {
             Ok(k) => k,
             Err(err) => {
                 tracing::warn!(key = %key_str, error = %err, "ignoring delete with bad key");
@@ -937,7 +1081,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         // reads through the batch's staged mutations as well as the
         // published snapshot, so a delete that follows a put of the same
         // key inside one batch sees the row the put staged.
-        let present = view.present(base, parsed.kind, parsed.id);
+        let present = view.present(base, parsed.table_kind(), parsed.id);
         let removed_rejection = self.remove_rejection_for_key(key_str);
         // A deleted key no longer serves, so its partially-compatible
         // signal (if any) goes with it — and so does its last-known-good
@@ -964,9 +1108,9 @@ impl<P: ConfigProvider> Supervisor<P> {
             return removed_rejection;
         }
 
-        view.record_delete(parsed.kind, parsed.id);
+        view.record_delete(parsed.table_kind(), parsed.id);
         mutations.push(SnapshotMutation::Remove {
-            kind: parsed.kind.to_string(),
+            kind: parsed.table_kind().to_string(),
             id: parsed.id.to_string(),
         });
         stamp_max(apply_stamp, *self.revision.lock().unwrap());
@@ -1023,7 +1167,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// write that broke it. Retention ends when the key loads cleanly
     /// again or leaves etcd.
     pub fn apply_resync(&self, entries: &[RawEntry]) -> BuildStats {
-        let (snap, mut stats) = loader::build_snapshot(&self.prefix, entries);
+        let (snap, mut stats) = loader::build_snapshot(&self.prefixes, entries);
 
         // Reconcile the last-known-good state against this build, then
         // inject the retained values into the fresh snapshot.
@@ -1056,10 +1200,10 @@ impl<P: ConfigProvider> Supervisor<P> {
                 if stale.contains_key(&r.key) {
                     continue;
                 }
-                let Ok(parsed) = key::parse(&self.prefix, &r.key) else {
+                let Ok(parsed) = self.prefixes.resolve(&r.key) else {
                     continue;
                 };
-                if !snapshot_has(&prev_snap, parsed.kind, parsed.id) {
+                if !snapshot_has(&prev_snap, parsed.table_kind(), parsed.id) {
                     continue;
                 }
                 if let Some(good) = prev_state.get(&r.key) {
@@ -1082,7 +1226,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         // build can no longer parse (e.g. after a DP downgrade) drops
         // its retention with an ERROR — same contract as any RED row.
         if !injected.is_empty() {
-            let (lkg_snap, lkg_stats) = loader::build_snapshot(&self.prefix, &injected);
+            let (lkg_snap, lkg_stats) = loader::build_snapshot(&self.prefixes, &injected);
             if !lkg_stats.rejections.is_empty() {
                 let mut stale = self.stale_serving.lock().unwrap();
                 for r in &lkg_stats.rejections {
@@ -1276,26 +1420,49 @@ impl<P: ConfigProvider> Supervisor<P> {
         &self,
         cancel: &tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), SupervisorError> {
-        let (entries, revision) = self
-            .provider
-            .load_all()
+        let load = self
+            .load_all_prefixes()
             .await
             .map_err(SupervisorError::Provider)?;
+        let revision = load.max_revision();
 
-        self.apply_resync(&entries);
+        // ONE resync over the union: the snapshot is published only after
+        // every prefix has been read, so readiness means every prefix's
+        // initial load completed and no request can observe the
+        // environment loaded and the catalog not.
+        self.apply_resync(&load.entries);
         self.set_revision_floor(revision);
 
-        let mut stream = self
-            .provider
-            .watch(revision + 1)
-            .await
-            .map_err(SupervisorError::Provider)?;
+        let mut streams = Vec::with_capacity(self.sources.len());
+        for (source, from) in self.sources.iter().zip(&load.revisions) {
+            // Each prefix resumes from its own read, never from the
+            // maximum across prefixes. A prefix whose read was refused
+            // has no revision to resume from and no stream this cycle.
+            let Some(from) = *from else { continue };
+            match source.provider.watch(from + 1).await {
+                Ok(stream) => streams.push(stream),
+                Err(err) if source.tolerates(&err) => {
+                    // No stream for this prefix this cycle. It is retried
+                    // whenever the cycle restarts — which is what a
+                    // control-plane upgrade causes, since it takes the
+                    // kine connections behind the surviving watch with it.
+                    source.log_refusal(&err);
+                }
+                Err(err) => return Err(SupervisorError::Provider(err)),
+            }
+        }
+        // Each stream is tagged so its END is delivered as an item
+        // rather than absorbed by `select_all`. See [`Watched`].
+        let mut stream = futures::stream::select_all(streams.into_iter().map(|s| {
+            s.map(Watched::Event)
+                .chain(futures::stream::iter([Watched::Ended]))
+        }));
 
         // An event the drain below pulled off the stream but could not
         // add to its batch (a resync, a stream error, the end of the
         // stream). Held here so the next loop iteration handles it
         // exactly as if it had just arrived.
-        let mut pushed_back: Option<Option<Result<WatchEvent, ProviderError>>> = None;
+        let mut pushed_back: Option<Option<Watched>> = None;
 
         loop {
             if *cancel.borrow() {
@@ -1313,16 +1480,19 @@ impl<P: ConfigProvider> Supervisor<P> {
             };
 
             match next {
-                None => return Ok(()),
-                Some(Err(ProviderError::Compacted)) => {
+                // Every stream exhausted, or any ONE of them ended:
+                // either way this cycle is over and the next one re-reads
+                // and re-watches every prefix.
+                None | Some(Watched::Ended) => return Ok(()),
+                Some(Watched::Event(Err(ProviderError::Compacted))) => {
                     tracing::warn!("etcd compaction detected — resyncing");
                     // Break out so `run` re-enters `cycle` cleanly; the
                     // next iteration re-loads from scratch. We don't want
                     // to treat compaction as a backoff-worthy failure.
                     return Ok(());
                 }
-                Some(Err(err)) => return Err(SupervisorError::Provider(err)),
-                Some(Ok(WatchEvent::Resync { entries, revision })) => {
+                Some(Watched::Event(Err(err))) => return Err(SupervisorError::Provider(err)),
+                Some(Watched::Event(Ok(WatchEvent::Resync { entries, revision }))) => {
                     self.apply_resync(&entries);
                     // The resync's header revision is the "consistent as
                     // of" point even when the entry set is empty or only
@@ -1332,7 +1502,9 @@ impl<P: ConfigProvider> Supervisor<P> {
                 // Explicit over the two batchable variants rather than a
                 // catch-all: a new `WatchEvent` must fail to compile here
                 // instead of falling into a batch that cannot carry it.
-                Some(Ok(first @ (WatchEvent::Put(_) | WatchEvent::Delete { .. }))) => {
+                Some(Watched::Event(Ok(
+                    first @ (WatchEvent::Put(_) | WatchEvent::Delete { .. }),
+                ))) => {
                     // Coalesce: hold the batch open for a short bounded
                     // window and apply the whole run as one
                     // copy-on-write cycle. The window closes on the first
@@ -1381,9 +1553,9 @@ impl<P: ConfigProvider> Supervisor<P> {
                             _ = tokio::time::sleep(COALESCE_QUIET_PERIOD) => break,
                         };
                         match item {
-                            Some(Ok(event @ (WatchEvent::Put(_) | WatchEvent::Delete { .. }))) => {
-                                batch.push(event)
-                            }
+                            Some(Watched::Event(Ok(
+                                event @ (WatchEvent::Put(_) | WatchEvent::Delete { .. }),
+                            ))) => batch.push(event),
                             other => {
                                 pushed_back = Some(other);
                                 break;
@@ -1424,6 +1596,41 @@ impl<P: ConfigProvider> Supervisor<P> {
             }
         }
     }
+}
+
+/// One pass of [`Supervisor::load_all_prefixes`]: the union of every
+/// watched prefix's rows, plus the revision each prefix's own read was
+/// consistent as of (`None` for a refusal that was tolerated).
+struct PrefixLoad {
+    entries: Vec<RawEntry>,
+    revisions: Vec<Option<i64>>,
+}
+
+impl PrefixLoad {
+    /// The revision the snapshot as a whole reflects. kine revisions are
+    /// cluster-global, so the highest any prefix reported is the point
+    /// the combined read is consistent as of, and it is what the
+    /// heartbeat reports as `applied_revision`.
+    fn max_revision(&self) -> i64 {
+        self.revisions.iter().flatten().copied().max().unwrap_or(0)
+    }
+}
+
+/// One item off the merged watch.
+///
+/// `select_all` drops an exhausted stream and keeps polling the
+/// survivors, so a stream that ends cleanly is otherwise invisible — and
+/// a cleanly ended watch is precisely the signal [`Supervisor::cycle`]
+/// runs on: it returns, and `watch_loop` re-reads and re-opens both
+/// prefixes. With one stream that came for free. With two, on two
+/// connections, swallowing it would leave the cycle polling the
+/// survivor while the ended prefix's configuration froze for the life
+/// of the process — no resync, no error, and `/status/config` still
+/// reporting connected.
+enum Watched {
+    Event(Result<WatchEvent, ProviderError>),
+    /// The stream this item came from has ended.
+    Ended,
 }
 
 #[derive(Debug)]
@@ -1524,11 +1731,11 @@ struct BatchView {
 }
 
 impl BatchView {
-    fn record_put(&mut self, prefix: &str, key_str: &str) {
-        let Ok(parsed) = key::parse(prefix, key_str) else {
+    fn record_put(&mut self, prefixes: &PrefixSet, key_str: &str) {
+        let Ok(parsed) = prefixes.resolve(key_str) else {
             return;
         };
-        let id = (parsed.kind.to_string(), parsed.id.to_string());
+        let id = (parsed.table_kind().to_string(), parsed.id.to_string());
         self.removed.remove(&id);
         self.added.insert(id);
     }
@@ -1646,6 +1853,8 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
         claim_mappings,
         passthrough_routes,
         mcp_auth_settings,
+        pricing,
+        global_pricing,
     } = src;
     for e in models.entries() {
         dst.models.insert_arc(e);
@@ -1692,6 +1901,12 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
     for e in mcp_auth_settings.entries() {
         dst.mcp_auth_settings.insert_arc(e);
     }
+    for e in pricing.entries() {
+        dst.pricing.insert_arc(e);
+    }
+    for e in global_pricing.entries() {
+        dst.global_pricing.insert_arc(e);
+    }
 }
 
 /// Remove `(kind, id)` from `snap`.
@@ -1717,6 +1932,8 @@ fn remove_from_snapshot(snap: &AisixSnapshot, kind: &str, id: &str) {
         claim_mappings,
         passthrough_routes,
         mcp_auth_settings,
+        pricing,
+        global_pricing,
     } = snap;
     match kind {
         "models" => {
@@ -1764,6 +1981,15 @@ fn remove_from_snapshot(snap: &AisixSnapshot, kind: &str, id: &str) {
         "mcp_auth_settings" => {
             mcp_auth_settings.remove(id);
         }
+        // Not the `pricing` kind but the table selector — a global-prefix
+        // pricing row arrives here as `global_pricing`. See
+        // [`crate::key::ScopedKey::table_kind`].
+        "pricing" => {
+            pricing.remove(id);
+        }
+        "global_pricing" => {
+            global_pricing.remove(id);
+        }
         _ => {}
     }
 }
@@ -1789,6 +2015,8 @@ fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
         claim_mappings,
         passthrough_routes,
         mcp_auth_settings,
+        pricing,
+        global_pricing,
     } = snap;
     match kind {
         "models" => models.get_by_id(id).is_some(),
@@ -1806,6 +2034,8 @@ fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
         "claim_mappings" => claim_mappings.get_by_id(id).is_some(),
         "passthrough_routes" => passthrough_routes.get_by_id(id).is_some(),
         "mcp_auth_settings" => mcp_auth_settings.get_by_id(id).is_some(),
+        "pricing" => pricing.get_by_id(id).is_some(),
+        "global_pricing" => global_pricing.get_by_id(id).is_some(),
         _ => false,
     }
 }
@@ -1842,6 +2072,8 @@ fn resource_counts(snap: &AisixSnapshot) -> BTreeMap<String, usize> {
         ("claim_mappings", snap.claim_mappings.len()),
         ("passthrough_routes", snap.passthrough_routes.len()),
         ("mcp_auth_settings", snap.mcp_auth_settings.len()),
+        ("pricing", snap.pricing.len()),
+        ("global_pricing", snap.global_pricing.len()),
     ] {
         if n > 0 {
             counts.insert(kind.to_string(), n);
@@ -1926,6 +2158,345 @@ mod tests {
         "kind": "keyword",
         "patterns": [{"kind": "literal", "value": "AKIA"}]
     }"#;
+
+    // ── multi-prefix supervision (AISIX-Cloud#1546) ───────────────
+
+    const ENV_PREFIX: &str = "/aisix/env-1/";
+    const GLOBAL_PREFIX: &str = "/aisix/global/";
+    const VALID_PRICE: &[u8] =
+        br#"{"key":"openai/gpt-4o","input_per_1k":0.005,"output_per_1k":0.015}"#;
+
+    /// A provider that either serves entries or refuses every call the
+    /// way a control plane predating the shared catalog does — its kine
+    /// ACL answers `PermissionDenied` for a Range outside the
+    /// environment's own prefix, which reaches the supervisor as
+    /// [`ProviderError::Rejected`].
+    struct ScopedProvider {
+        entries: Vec<RawEntry>,
+        revision: i64,
+        refuse: bool,
+        /// The `start_revision` this provider's watch was opened with.
+        watched_from: Mutex<Option<i64>>,
+        /// Hand back a stream that never ends and never yields, the way
+        /// a healthy watch on a prefix nobody is writing behaves.
+        never_ends: bool,
+    }
+
+    impl ScopedProvider {
+        fn serving(entries: Vec<RawEntry>, revision: i64) -> Arc<Self> {
+            Arc::new(Self {
+                entries,
+                revision,
+                refuse: false,
+                watched_from: Mutex::new(None),
+                never_ends: false,
+            })
+        }
+
+        /// Serves its rows, then holds a watch open forever — the
+        /// catalog's normal steady state, since nobody writes prices
+        /// most of the time.
+        fn quiet(entries: Vec<RawEntry>, revision: i64) -> Arc<Self> {
+            Arc::new(Self {
+                entries,
+                revision,
+                refuse: false,
+                watched_from: Mutex::new(None),
+                never_ends: true,
+            })
+        }
+
+        fn refusing() -> Arc<Self> {
+            Arc::new(Self {
+                entries: Vec::new(),
+                revision: 0,
+                refuse: true,
+                watched_from: Mutex::new(None),
+                never_ends: false,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ConfigProvider for ScopedProvider {
+        async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
+            if self.refuse {
+                return Err(ProviderError::Rejected(
+                    "etcdserver: permission denied: outside env env-1 prefix".into(),
+                ));
+            }
+            Ok((self.entries.clone(), self.revision))
+        }
+
+        async fn watch(
+            &self,
+            start_revision: i64,
+        ) -> Result<
+            Box<dyn futures::Stream<Item = Result<WatchEvent, ProviderError>> + Send + Unpin>,
+            ProviderError,
+        > {
+            *self.watched_from.lock().unwrap() = Some(start_revision);
+            if self.refuse {
+                return Err(ProviderError::Rejected(
+                    "etcdserver: permission denied: outside env env-1 prefix".into(),
+                ));
+            }
+            if self.never_ends {
+                return Ok(Box::new(stream::pending()));
+            }
+            Ok(Box::new(stream::iter(Vec::new())))
+        }
+    }
+
+    fn scoped_supervisor(
+        env: Arc<ScopedProvider>,
+        global: Arc<ScopedProvider>,
+    ) -> Arc<Supervisor<ScopedProvider>> {
+        Arc::new(Supervisor::with_sources(
+            vec![
+                (WatchedPrefix::environment(ENV_PREFIX), env),
+                (WatchedPrefix::global(GLOBAL_PREFIX), global),
+            ],
+            SnapshotCache::disabled(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn both_prefixes_land_in_one_snapshot() {
+        let sup = scoped_supervisor(
+            ScopedProvider::serving(
+                vec![
+                    entry("/aisix/env-1/models/m-1", VALID_MODEL, 7),
+                    entry("/aisix/env-1/pricing/env-p", VALID_PRICE, 8),
+                ],
+                8,
+            ),
+            ScopedProvider::serving(
+                vec![entry("/aisix/global/pricing/global-p", VALID_PRICE, 5)],
+                5,
+            ),
+        );
+        sup.load_once().await.unwrap();
+        let snap = sup.handle().load();
+        assert_eq!(snap.models.len(), 1);
+        assert_eq!(snap.pricing.len(), 1);
+        assert_eq!(snap.global_pricing.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_row_both_prefixes_return_is_counted_once() {
+        // The nesting case: with no `env_id` the environment prefix is
+        // the bare base, so `<base>/global/` is inside it and the
+        // catalog's rows come back from BOTH range reads. The snapshot
+        // absorbs the repeat because it is keyed; `accepted` is a sum and
+        // would report two rows where etcd holds one.
+        let shared = entry("/aisix/global/pricing/p-1", VALID_PRICE, 4);
+        let sup = Arc::new(Supervisor::with_sources(
+            vec![
+                (
+                    WatchedPrefix::environment("/aisix"),
+                    ScopedProvider::serving(
+                        vec![entry("/aisix/models/m-1", VALID_MODEL, 3), shared.clone()],
+                        4,
+                    ),
+                ),
+                (
+                    WatchedPrefix::global("/aisix/global/"),
+                    ScopedProvider::serving(vec![shared], 4),
+                ),
+            ],
+            SnapshotCache::disabled(),
+        ));
+
+        let stats = sup.load_once().await.unwrap();
+        assert_eq!(
+            stats.accepted, 2,
+            "one model and one price, counted once each"
+        );
+        let snap = sup.handle().load();
+        assert_eq!(snap.models.len(), 1);
+        // Resolved to the catalog table by the longer prefix, not to the
+        // environment's, even though the outer prefix also returned it.
+        assert_eq!(snap.global_pricing.len(), 1);
+        assert_eq!(snap.pricing.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn applied_revision_is_the_maximum_across_prefixes() {
+        // kine revisions are cluster-global, so the point the whole read
+        // is consistent as of is the highest either prefix reported —
+        // whichever one that is. Both orders, because taking the LAST
+        // prefix's revision (or the FIRST, or the environment's) passes
+        // one of them by accident.
+        //
+        // Every entry is written at revision 1 so the header revisions
+        // are the only thing that can produce the expected value: the
+        // resync raises the floor to the highest entry revision first,
+        // and entries at 7 / 42 / 99 would supply the answer by
+        // themselves — which is how the first version of this case
+        // stayed green against a last-prefix-wins mutation.
+        let global_ahead = scoped_supervisor(
+            ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 1)], 7),
+            ScopedProvider::serving(vec![entry("/aisix/global/pricing/g", VALID_PRICE, 1)], 42),
+        );
+        global_ahead.load_once().await.unwrap();
+        assert_eq!(global_ahead.watch_status().snapshot().revision, 42);
+
+        let env_ahead = scoped_supervisor(
+            ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 1)], 99),
+            ScopedProvider::serving(vec![entry("/aisix/global/pricing/g", VALID_PRICE, 1)], 5),
+        );
+        env_ahead.load_once().await.unwrap();
+        assert_eq!(env_ahead.watch_status().snapshot().revision, 99);
+    }
+
+    #[tokio::test]
+    async fn a_refused_catalog_leaves_the_environment_serving() {
+        // The old-control-plane case: the catalog prefix is denied, the
+        // environment's is not. The gateway must come up on the
+        // environment's configuration rather than fail its cycle — the
+        // alternative is serving nothing at all instead of serving
+        // without prices.
+        let sup = scoped_supervisor(
+            ScopedProvider::serving(
+                vec![
+                    entry("/aisix/env-1/models/m-1", VALID_MODEL, 11),
+                    entry("/aisix/env-1/api_keys/k-1", VALID_APIKEY, 12),
+                ],
+                12,
+            ),
+            ScopedProvider::refusing(),
+        );
+
+        // Completes rather than erroring — readiness is not held back by
+        // the refused prefix.
+        let stats = sup.load_once().await.expect("environment load succeeds");
+        assert_eq!(stats.accepted, 2);
+        let snap = sup.handle().load();
+        assert_eq!(snap.models.len(), 1);
+        assert_eq!(snap.apikeys.len(), 1);
+        // Read as empty, not as an error: no rejection is reported for a
+        // prefix the gateway was never allowed to read.
+        assert_eq!(snap.global_pricing.len(), 0);
+        assert!(sup.recent_rejections().is_empty());
+        // The revision floor comes from the prefix that did answer.
+        assert_eq!(sup.watch_status().snapshot().revision, 12);
+    }
+
+    #[tokio::test]
+    async fn one_watch_ending_ends_the_cycle() {
+        // The reconnect trigger is a watch stream ending; `watch_loop`
+        // re-enters `cycle`, which re-reads and re-opens every prefix.
+        // `select_all` drops an exhausted stream and keeps polling the
+        // survivors, so without the end being delivered as an item the
+        // cycle would sit on the catalog's idle stream forever while the
+        // environment's configuration froze — no resync, no error, and
+        // nothing in `/status/config` to show it.
+        //
+        // The catalog stream here never yields and never ends, which is
+        // its normal state: nobody writes prices most of the time. That
+        // is what makes the bug reachable rather than theoretical.
+        let sup = scoped_supervisor(
+            ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 1)], 7),
+            ScopedProvider::quiet(vec![entry("/aisix/global/pricing/g", VALID_PRICE, 1)], 7),
+        );
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+
+        let cycle = tokio::time::timeout(Duration::from_secs(5), sup.cycle(&rx)).await;
+        assert!(
+            matches!(cycle, Ok(Ok(()))),
+            "the environment watch ended, so the cycle must return and let \
+             watch_loop reconnect; got {cycle:?}",
+        );
+        // Both prefixes did load before the cycle ended.
+        let snap = sup.handle().load();
+        assert_eq!(snap.models.len(), 1);
+        assert_eq!(snap.global_pricing.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn each_prefix_resumes_from_its_own_read() {
+        // The range reads run in sequence, so the later prefix reports a
+        // higher revision. Resuming BOTH watches from the maximum would
+        // skip every write to the earlier prefix made in between: absent
+        // from its read, and before the point its watch begins. The
+        // window is one range read wide and the loss is silent until the
+        // next resync.
+        let env =
+            ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 1)], 7);
+        let global =
+            ScopedProvider::serving(vec![entry("/aisix/global/pricing/g", VALID_PRICE, 1)], 42);
+        let sup = scoped_supervisor(Arc::clone(&env), Arc::clone(&global));
+
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        sup.cycle(&rx).await.expect("cycle completes");
+
+        assert_eq!(
+            *env.watched_from.lock().unwrap(),
+            Some(8),
+            "the environment watch must resume from its OWN read (7), not from the maximum (42)",
+        );
+        assert_eq!(*global.watched_from.lock().unwrap(), Some(43));
+        // The reported applied revision is still the maximum: it is what
+        // the whole combined read is consistent as of.
+        assert_eq!(sup.watch_status().snapshot().revision, 42);
+    }
+
+    #[tokio::test]
+    async fn a_refused_catalog_does_not_stop_the_watch_cycle() {
+        // The watch half of the case above: the catalog's watch create is
+        // refused too, and the cycle still runs to a clean end on the
+        // environment's stream alone.
+        let sup = scoped_supervisor(
+            ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 3)], 3),
+            ScopedProvider::refusing(),
+        );
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        // The environment stream is empty, so the cycle drains it and
+        // returns Ok — a refusal on the catalog would have surfaced here
+        // as SupervisorError::Provider.
+        sup.cycle(&rx).await.expect("cycle survives the refusal");
+        assert_eq!(sup.handle().load().models.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_environment_prefix_is_always_read_first() {
+        // `tolerates` swallows a refusal on the catalog, so a refusal
+        // that is really about credentials must reach the environment
+        // prefix first — that one is not tolerated and is what fails the
+        // cycle. Constructed catalog-first to prove the supervisor
+        // reorders rather than trusting its caller.
+        let sup = Arc::new(Supervisor::with_sources(
+            vec![
+                (
+                    WatchedPrefix::global(GLOBAL_PREFIX),
+                    ScopedProvider::refusing(),
+                ),
+                (
+                    WatchedPrefix::environment(ENV_PREFIX),
+                    ScopedProvider::refusing(),
+                ),
+            ],
+            SnapshotCache::disabled(),
+        ));
+        assert!(
+            matches!(sup.load_once().await, Err(ProviderError::Rejected(_))),
+            "a refusal on both prefixes must surface as the environment's",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_environment_prefix_still_fails_the_cycle() {
+        // The tolerance is scoped to the catalog. Credentials etcd
+        // refuses outright must still stop the cycle and reach the
+        // backoff loop's error path, or a misconfigured gateway would
+        // quietly serve an empty configuration forever.
+        let sup = scoped_supervisor(ScopedProvider::refusing(), ScopedProvider::refusing());
+        assert!(matches!(
+            sup.load_once().await,
+            Err(ProviderError::Rejected(_))
+        ));
+    }
 
     /// The two config digests must stay byte-identical to what the
     /// unchanged `hash_entries` produces over the same served set: cp-api

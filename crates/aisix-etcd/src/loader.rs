@@ -34,13 +34,14 @@ use aisix_core::models::{
     McpServer, Model, ObservabilityExporter, OidcProvider, PassthroughRoute, ProviderKey,
     RateLimitPolicy, SchemaError,
 };
+use aisix_core::models::{validate_pricing_lenient, Pricing};
 use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::key::{self, ResourceKey};
+use crate::key::{PrefixScope, PrefixSet, ScopedKey};
 use crate::provider::RawEntry;
 
 /// Why the loader skipped an entry. Surfaced in [`RejectedEntry`] so
@@ -202,14 +203,15 @@ pub struct BuildStats {
 }
 
 /// Build a fresh snapshot from raw entries. Never fails — bad rows are
-/// counted in [`BuildStats`] and skipped. The prefix lets us strip it
-/// before key parsing.
-pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, BuildStats) {
+/// counted in [`BuildStats`] and skipped. The prefix set both strips the
+/// prefix before key parsing and decides which prefix a key came from,
+/// which is what selects the table a `pricing` row lands in.
+pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnapshot, BuildStats) {
     let snapshot = AisixSnapshot::new();
     let mut stats = BuildStats::default();
 
     for raw in entries {
-        let parsed = match key::parse(prefix, &raw.key) {
+        let parsed = match prefixes.resolve(&raw.key) {
             Ok(k) => k,
             Err(err) => {
                 tracing::warn!(key = %raw.key, error = %err, "skipping etcd entry with bad key");
@@ -236,6 +238,30 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                 continue;
             }
         };
+
+        // The shared catalog carries prices and nothing else. Anything
+        // else written there is refused outright rather than loaded into
+        // the environment's tables: the global prefix is written by a
+        // different authority, and every other kind is environment-scoped
+        // by definition.
+        if parsed.scope == PrefixScope::Global && parsed.kind != "pricing" {
+            tracing::warn!(
+                key = %raw.key,
+                kind = %parsed.kind,
+                "rejecting etcd entry: the global prefix carries `pricing` documents only",
+            );
+            stats.unknown_kind += 1;
+            stats.rejections.push(RejectedEntry::new(
+                raw.key.clone(),
+                RejectionKind::UnknownKind,
+                format!(
+                    "kind {:?} is not accepted under the global prefix, which carries \
+                     `pricing` documents only",
+                    parsed.kind
+                ),
+            ));
+            continue;
+        }
 
         match parsed.kind {
             "models" => {
@@ -448,6 +474,24 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     snapshot.mcp_auth_settings.insert(entry);
                 }
             }
+            "pricing" => {
+                if let Some(entry) = validate_and_parse::<Pricing>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_pricing_lenient,
+                    &mut stats,
+                ) {
+                    // Which table follows from the prefix, not the kind:
+                    // an environment document overrides the catalog entry
+                    // carrying the same `key`.
+                    match parsed.scope {
+                        PrefixScope::Environment => snapshot.pricing.insert(entry),
+                        PrefixScope::Global => snapshot.global_pricing.insert(entry),
+                    }
+                }
+            }
             other => {
                 tracing::debug!(key = %raw.key, kind = %other, "unknown etcd kind; skipping");
                 stats.unknown_kind += 1;
@@ -467,7 +511,7 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
 fn validate_and_parse<T>(
     key: &str,
     revision: i64,
-    parsed: ResourceKey<'_>,
+    parsed: ScopedKey<'_>,
     value: &Value,
     validate: fn(&Value) -> Result<(), SchemaError>,
     stats: &mut BuildStats,
@@ -488,7 +532,7 @@ where
 fn validate_and_parse_with_semantics<T>(
     key: &str,
     revision: i64,
-    parsed: ResourceKey<'_>,
+    parsed: ScopedKey<'_>,
     value: &Value,
     validate: fn(&Value) -> Result<(), SchemaError>,
     semantic: fn(&T) -> Result<(), String>,
@@ -705,6 +749,21 @@ fn warn_partial_compat_deduped(key: &str, kind: &str, fields: &[String]) {
 mod tests {
     use super::*;
 
+    /// The environment prefix alone — what every case below that says
+    /// nothing about scopes is built on.
+    fn env_prefixes() -> PrefixSet {
+        PrefixSet::single("/aisix")
+    }
+
+    /// Environment `/aisix/<env>/` plus the shared catalog
+    /// `/aisix/global/`, the shape a managed gateway watches.
+    fn scoped_prefixes() -> PrefixSet {
+        PrefixSet::new(vec![
+            crate::key::WatchedPrefix::environment("/aisix/env-1/"),
+            crate::key::WatchedPrefix::global("/aisix/global/"),
+        ])
+    }
+
     fn raw(key: &str, value: &[u8], rev: i64) -> RawEntry {
         RawEntry {
             key: key.into(),
@@ -731,7 +790,7 @@ mod tests {
             raw("/aisix/models/m-1", VALID_MODEL, 2),
             raw("/aisix/api_keys/k-1", VALID_APIKEY, 3),
         ];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
 
         assert_eq!(stats.accepted, 2);
         assert_eq!(snap.models.len(), 1);
@@ -753,7 +812,7 @@ mod tests {
             raw("/aisix/models/bad", b"not-json", 1),
             raw("/aisix/models/good", VALID_MODEL, 2),
         ];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.parse_rejected, 1);
         assert_eq!(stats.accepted, 1);
         assert_eq!(snap.models.len(), 1);
@@ -769,15 +828,101 @@ mod tests {
             br#"{"display_name":"","provider":"openai","model_name":"large","provider_key_id":"pk-1"}"#,
             1,
         )];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.schema_rejected, 1);
         assert_eq!(stats.accepted, 0);
+    }
+
+    const PRICE: &[u8] = br#"{"key":"openai/gpt-4o","input_per_1k":0.005,"output_per_1k":0.015}"#;
+
+    #[test]
+    fn a_pricing_document_lands_in_the_table_its_prefix_selects() {
+        let entries = vec![
+            raw("/aisix/env-1/pricing/env-p", PRICE, 1),
+            raw("/aisix/global/pricing/global-p", PRICE, 2),
+        ];
+        let (snap, stats) = build_snapshot(&scoped_prefixes(), &entries);
+        assert_eq!(stats.accepted, 2);
+        assert!(stats.rejections.is_empty(), "{:?}", stats.rejections);
+        // Two tables, not one: the whole point of the split is that an
+        // environment document can win over the catalog document carrying
+        // the same `key`.
+        assert_eq!(snap.pricing.len(), 1);
+        assert_eq!(snap.global_pricing.len(), 1);
+        assert!(snap.pricing.get_by_id("env-p").is_some());
+        assert!(snap.global_pricing.get_by_id("global-p").is_some());
+        // Indexed by `key`, which is what `pricing_key` resolves through.
+        assert_eq!(
+            snap.global_pricing.get_by_name("openai/gpt-4o").unwrap().id,
+            "global-p"
+        );
+    }
+
+    #[test]
+    fn the_global_prefix_refuses_every_kind_but_pricing() {
+        // A well-formed model document — it would load without complaint
+        // under the environment prefix. Written under the global one it
+        // must not reach the snapshot at all: that prefix is written by a
+        // different authority, and every other kind is environment-scoped.
+        let model = br#"{"display_name":"m","provider":"openai","model_name":"gpt-4o","provider_key_id":"11111111-1111-1111-1111-111111111111"}"#;
+        let entries = vec![
+            raw("/aisix/global/models/smuggled", model, 1),
+            raw("/aisix/global/api_keys/smuggled-key", br#"{"key_hash":"91ed2dbc407561556f3e7be98ba0bd2a57986d6a868c482d867d19c6d40d201c"}"#, 2),
+            raw("/aisix/global/pricing/ok", PRICE, 3),
+        ];
+        let (snap, stats) = build_snapshot(&scoped_prefixes(), &entries);
+        assert_eq!(snap.models.len(), 0);
+        assert_eq!(snap.apikeys.len(), 0);
+        assert_eq!(snap.global_pricing.len(), 1);
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(stats.unknown_kind, 2);
+        assert_eq!(stats.rejections.len(), 2);
+        for r in &stats.rejections {
+            assert_eq!(r.kind, RejectionKind::UnknownKind);
+            assert!(
+                r.error.contains("global prefix"),
+                "rejection should say why, got {:?}",
+                r.error
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_kinds_still_load_under_the_environment_prefix() {
+        // The mirror of the case above: the gate is scoped to the global
+        // prefix and must not have narrowed the environment's kinds.
+        let model = br#"{"display_name":"m","provider":"openai","model_name":"gpt-4o","provider_key_id":"11111111-1111-1111-1111-111111111111"}"#;
+        let entries = vec![raw("/aisix/env-1/models/m-1", model, 1)];
+        let (snap, stats) = build_snapshot(&scoped_prefixes(), &entries);
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(snap.models.len(), 1);
+    }
+
+    #[test]
+    fn a_pricing_document_missing_a_price_is_rejected() {
+        // All three fields ARE the document; a row missing one prices
+        // nothing, so the read path refuses it rather than defaulting.
+        let entries = vec![
+            raw(
+                "/aisix/global/pricing/no-out",
+                br#"{"key":"k","input_per_1k":1.0}"#,
+                1,
+            ),
+            raw(
+                "/aisix/global/pricing/no-key",
+                br#"{"input_per_1k":1.0,"output_per_1k":2.0}"#,
+                2,
+            ),
+        ];
+        let (snap, stats) = build_snapshot(&scoped_prefixes(), &entries);
+        assert_eq!(snap.global_pricing.len(), 0);
+        assert_eq!(stats.schema_rejected, 2);
     }
 
     #[test]
     fn unknown_kinds_are_skipped() {
         let entries = vec![raw("/aisix/unknown_kind/x-1", b"{}", 1)];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.unknown_kind, 1);
         assert!(snap.models.is_empty());
         assert!(snap.apikeys.is_empty());
@@ -786,7 +931,7 @@ mod tests {
     #[test]
     fn bad_key_shape_is_counted_separately() {
         let entries = vec![raw("/other/models/a", VALID_MODEL, 1)];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.key_rejected, 1);
     }
 
@@ -800,7 +945,7 @@ mod tests {
     #[test]
     fn rejection_records_bad_key_with_kind_and_error_message() {
         let entries = vec![raw("/wrong/models/x", VALID_MODEL, 1)];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.rejections.len(), 1);
         assert_eq!(stats.rejections[0].kind, RejectionKind::BadKey);
         assert_eq!(stats.rejections[0].key, "/wrong/models/x");
@@ -810,7 +955,7 @@ mod tests {
     #[test]
     fn rejection_records_non_json_payload() {
         let entries = vec![raw("/aisix/models/m1", b"not-json", 1)];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.rejections.len(), 1);
         assert_eq!(stats.rejections[0].kind, RejectionKind::NonJson);
     }
@@ -822,7 +967,7 @@ mod tests {
             br#"{"display_name":"","provider":"openai","model_name":"l","provider_key_id":"pk"}"#,
             1,
         )];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.rejections.len(), 1);
         assert_eq!(stats.rejections[0].kind, RejectionKind::SchemaFailed);
     }
@@ -830,7 +975,7 @@ mod tests {
     #[test]
     fn rejection_records_unknown_kind() {
         let entries = vec![raw("/aisix/unknown_kind/x-1", b"{}", 1)];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.rejections.len(), 1);
         assert_eq!(stats.rejections[0].kind, RejectionKind::UnknownKind);
     }
@@ -838,7 +983,7 @@ mod tests {
     #[test]
     fn happy_entries_have_no_rejections() {
         let entries = vec![raw("/aisix/models/m-1", VALID_MODEL, 1)];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert!(stats.rejections.is_empty());
     }
 
@@ -861,7 +1006,7 @@ mod tests {
     #[test]
     fn provider_key_happy_path_accepts() {
         let entries = vec![raw("/aisix/provider_keys/pk-1", VALID_PROVIDER_KEY, 1)];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1);
         assert_eq!(snap.provider_keys.len(), 1);
         assert!(stats.rejections.is_empty());
@@ -884,7 +1029,7 @@ mod tests {
             br#"{"display_name":"bedrock-pk","secret":"x","provider":"amazon-bedrock","aws_region":"us-east-1"}"#,
             1,
         )];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
         assert!(stats.rejections.is_empty());
         assert!(snap.provider_keys.get_by_id("pk-bedrock").is_some());
@@ -909,7 +1054,7 @@ mod tests {
             br#"{"display_name":"vertex-pk","secret":"x","provider":"google-vertex","gcp_project":"my-proj","gcp_region":"us-central1"}"#,
             1,
         )];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
         assert!(snap.provider_keys.get_by_id("pk-vertex").is_some());
         assert_eq!(
@@ -940,7 +1085,7 @@ mod tests {
             br#"{"display_name":"azure-pk","secret":"x","provider":"azure","azure_resource_name":"my-azure","api_version":"2024-02-01"}"#,
             1,
         )];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
         assert!(snap.provider_keys.get_by_id("pk-azure").is_some());
         assert_eq!(
@@ -980,7 +1125,7 @@ mod tests {
             }"#,
             1,
         )];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
 
         // YELLOW: the row loads and serves with the unknown field ignored.
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
@@ -1026,7 +1171,7 @@ mod tests {
             }"#,
             1,
         )];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
 
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
         assert!(stats.rejections.is_empty());
@@ -1060,7 +1205,7 @@ mod tests {
             }"#,
             1,
         )];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
 
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
         assert_eq!(snap.observability_exporters.len(), 1);
@@ -1091,7 +1236,7 @@ mod tests {
             }"#,
             1,
         )];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
         assert_eq!(
             stats.partially_compatible,
@@ -1118,7 +1263,7 @@ mod tests {
             }"#,
             1,
         )];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
         assert_eq!(
             stats.partially_compatible,
@@ -1139,7 +1284,7 @@ mod tests {
             br#"{"display_name":"r","routing":{"strategy":"quantum","targets":[{"model":"a"}]}}"#,
             1,
         )];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 0);
         assert_eq!(stats.schema_rejected, 1);
         assert_eq!(stats.rejections[0].kind, RejectionKind::SchemaFailed);
@@ -1157,7 +1302,7 @@ mod tests {
             raw("/aisix/api_keys/k-1", doc, 1),
             raw("/aisix/api_keys/k-2", doc, 2),
         ];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 2);
         assert_eq!(
             stats.partially_compatible,
@@ -1193,7 +1338,7 @@ mod tests {
             }"#,
             1,
         )];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
         assert_eq!(snap.guardrail_attachments.len(), 1);
         assert!(
@@ -1217,7 +1362,7 @@ mod tests {
             }"#,
             1,
         )];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
         let m = snap.models.get_by_name("grp").expect("row loaded");
         assert!(m.value.retries.is_none(), "dead knob stripped from struct");
@@ -1242,7 +1387,7 @@ mod tests {
             }"#,
             1,
         )];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
         let rows: Vec<_> = stats
             .partial_rows
@@ -1279,7 +1424,7 @@ mod tests {
             doc.to_string().as_bytes(),
             1,
         )];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1);
         let fields = &stats.partial_rows[0].fields;
         assert_eq!(fields.len(), 65, "64 fields + the truncation sentinel");
@@ -1309,7 +1454,7 @@ mod tests {
                 2,
             ),
         ];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 2, "rejections: {:?}", stats.rejections);
         assert_eq!(snap.provider_keys.len(), 2);
         // Both spellings land on the same typed field.
@@ -1337,7 +1482,7 @@ mod tests {
                 2,
             ),
         ];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.schema_rejected, 0);
         assert_eq!(stats.parse_rejected, 1);
         assert_eq!(stats.accepted, 1);
@@ -1371,7 +1516,7 @@ mod tests {
                 4,
             ),
         ];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 4, "rejections: {:?}", stats.rejections);
         // The name index is fed by the renamed field for both spellings.
         assert!(snap.mcp_servers.get_by_name("gh-former").is_some());
@@ -1388,7 +1533,7 @@ mod tests {
             raw("/aisix/models/m-2", VALID_MODEL, 3), // same name -> update in place
             raw("/aisix/api_keys/k-1", VALID_APIKEY, 4),
         ];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 3);
         assert_eq!(stats.parse_rejected, 1);
         // m-1 and m-2 share the same name; the second insert rebinds the
@@ -1412,7 +1557,7 @@ mod tests {
             VALID_RATE_LIMIT_POLICY,
             5,
         )];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1);
         assert_eq!(snap.rate_limit_policies.len(), 1);
         let entry = snap.rate_limit_policies.get_by_id("rlp-1").unwrap();
@@ -1443,7 +1588,7 @@ mod tests {
             }"#,
             6,
         )];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1);
         let entry = snap.rate_limit_policies.get_by_id("rlp-2").unwrap();
         assert!(entry.value.is_conditional());
@@ -1470,7 +1615,7 @@ mod tests {
             }"#,
             7,
         );
-        let (snap, stats) = build_snapshot("/aisix", std::slice::from_ref(&bad));
+        let (snap, stats) = build_snapshot(&env_prefixes(), std::slice::from_ref(&bad));
         assert_eq!(stats.accepted, 0);
         assert_eq!(stats.schema_rejected, 1);
         assert_eq!(snap.rate_limit_policies.len(), 0);

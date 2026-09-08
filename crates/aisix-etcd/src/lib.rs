@@ -37,7 +37,9 @@ pub use etcd_provider::{
     ConnectPolicy, EtcdConfigProvider, EtcdWatchStream, CONNECT_MAX_ATTEMPTS,
     CONNECT_RETRY_INTERVAL,
 };
-pub use key::{parse as parse_key, KeyError, ResourceKey};
+pub use key::{
+    parse as parse_key, KeyError, PrefixScope, PrefixSet, ResourceKey, ScopedKey, WatchedPrefix,
+};
 pub use loader::{build_snapshot, BuildStats};
 pub use provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
 pub use snapshot_cache::SnapshotCache;

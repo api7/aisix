@@ -27,9 +27,10 @@
 //!
 //! Metric-ordered strategies rank targets by a runtime signal within each
 //! tier and attempt them best-first, falling forward down the ranked order:
-//! - `least_cost`: cheapest target first, by the target model's `cost`
-//!   (combined input+output per-1K price). Targets without a `cost` rank
-//!   last.
+//! - `least_cost`: cheapest target first, by the target model's resolved
+//!   price (combined input+output per-1K) — the `pricing` document its
+//!   `pricing_key` names, or its inline `cost`. Targets with no price at
+//!   all rank last.
 //! - `least_latency`: fastest target first, by a moving average of recent
 //!   observed upstream latency (time-to-first-token for streaming). Targets
 //!   with no latency samples yet rank first so they get probed.
@@ -58,9 +59,11 @@ pub enum RoutingStrategy {
     /// after failure.
     #[default]
     Failover,
-    /// Rank targets cheapest-first by the target model's `cost` (combined
-    /// input+output per-1K price), then fall forward. Targets without a
-    /// configured `cost` rank last.
+    /// Rank targets cheapest-first by the target model's resolved price
+    /// (combined input+output per-1K), then fall forward. A target is
+    /// priced by the `pricing` document its `pricing_key` names, or by
+    /// its inline `cost` when it names none; a target with no price at
+    /// all ranks last.
     LeastCost,
     /// Rank targets fastest-first by a moving average of recent observed
     /// upstream latency (time-to-first-token for streaming), then fall

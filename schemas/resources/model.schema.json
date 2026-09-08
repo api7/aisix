@@ -629,7 +629,7 @@
           "type": "string"
         },
         {
-          "description": "Rank targets cheapest-first by the target model's `cost` (combined input+output per-1K price), then fall forward. Targets without a configured `cost` rank last.",
+          "description": "Rank targets cheapest-first by the target model's resolved price (combined input+output per-1K), then fall forward. A target is priced by the `pricing` document its `pricing_key` names, or by its inline `cost` when it names none; a target with no price at all ranks last.",
           "enum": [
             "least_cost"
           ],
@@ -1025,6 +1025,11 @@
           },
           {
             "required": [
+              "pricing_key"
+            ]
+          },
+          {
+            "required": [
               "effort_mapping"
             ]
           }
@@ -1136,6 +1141,11 @@
           },
           {
             "required": [
+              "pricing_key"
+            ]
+          },
+          {
+            "required": [
               "effort_mapping"
             ]
           }
@@ -1196,6 +1206,11 @@
           {
             "required": [
               "cost"
+            ]
+          },
+          {
+            "required": [
+              "pricing_key"
             ]
           },
           {
@@ -1281,6 +1296,12 @@
     },
     "model_name": {
       "description": "Upstream model identifier sent in provider requests. Routing and ensemble models leave this field unset.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "pricing_key": {
+      "description": "Name of a shared `pricing` document to take the per-token cost from, instead of setting `cost` on this model. The environment's own pricing documents are searched first and the shared catalog second; when the key matches neither, `cost` applies. Editing the pricing document repricies every model naming it, with no change to the models themselves.",
+      "maxLength": 255,
       "minLength": 1,
       "type": "string"
     },

@@ -577,7 +577,8 @@ async fn loader_picks_up_every_direct_write() {
         })
         .collect();
 
-    let (snap, stats) = aisix_etcd::build_snapshot(&prefix, &raw_entries);
+    let (snap, stats) =
+        aisix_etcd::build_snapshot(&aisix_etcd::PrefixSet::single(&prefix), &raw_entries);
     assert_eq!(
         stats.schema_rejected, 0,
         "loader rejected a canonical document: {stats:?}"

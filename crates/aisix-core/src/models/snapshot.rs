@@ -16,6 +16,7 @@ use super::model::Model;
 use super::observability_exporter::ObservabilityExporter;
 use super::oidc_provider::OidcProvider;
 use super::passthrough_route::PassthroughRoute;
+use super::pricing::Pricing;
 use super::provider_key::ProviderKey;
 use super::rate_limit_policy::RateLimitPolicy;
 use crate::snapshot::ResourceTable;
@@ -76,6 +77,15 @@ pub struct AisixSnapshot {
     /// one enabled `oidc_providers` row it activates the `/mcp`
     /// RFC 9728 discovery surface (AISIX-Cloud#1143).
     pub mcp_auth_settings: ResourceTable<McpAuthSettings>,
+    /// The environment's own pricing documents:
+    /// `/aisix/<env>/pricing/<uuid>`. Indexed by `key`, and consulted
+    /// before [`AisixSnapshot::global_pricing`] so an organization can
+    /// override a catalog price.
+    pub pricing: ResourceTable<Pricing>,
+    /// The shared pricing catalog: `/aisix/global/pricing/<uuid>` — the
+    /// one collection the gateway reads from outside its own environment
+    /// prefix, and the only kind accepted there.
+    pub global_pricing: ResourceTable<Pricing>,
 }
 
 impl AisixSnapshot {
@@ -101,6 +111,8 @@ impl AisixSnapshot {
             + self.claim_mappings.len()
             + self.passthrough_routes.len()
             + self.mcp_auth_settings.len()
+            + self.pricing.len()
+            + self.global_pricing.len()
     }
 }
 

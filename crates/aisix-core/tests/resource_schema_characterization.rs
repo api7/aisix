@@ -1420,6 +1420,15 @@ const UNKNOWN_FIELD_TOLERANCE: &[Probe] = &[
                    "provider_key_id": "pk-1"})
         },
     },
+    // A pricing document is closed on write at its root: the three
+    // fields ARE the document, so anything else there is a mistake the
+    // control plane should hear about. The loader still takes the row —
+    // a price it can read is worth more than a field it cannot.
+    Probe {
+        resource: "pricing",
+        pointer: "",
+        document: || json!({"key": "openai/gpt-4o", "input_per_1k": 0.005, "output_per_1k": 0.015}),
+    },
 ];
 
 /// The two resources whose write contract closes NOTHING — not the root, not

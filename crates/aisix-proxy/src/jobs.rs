@@ -1877,7 +1877,17 @@ fn maybe_attribute_batch(
     let jwt = auth.jwt.clone();
     let model_id = target.model_entry.id.clone();
     let display_name = target.display_name().to_string();
-    let cost = target.model_entry.value.cost.clone();
+    // Resolved before the spawn, off the live snapshot, through the same
+    // index `least_cost` ranks with: `pricing_key` first, inline `cost`
+    // second. The completed batch is priced at what the model costs when
+    // its output is collected.
+    let snap = state.snapshot.load();
+    let cost = state
+        .pricing
+        .for_snapshot(&snap)
+        .resolve(&target.model_entry.value)
+        .cloned();
+    drop(snap);
     let pk_id = target.pk_entry.id.to_string();
     let secret = target.secret.clone();
     let adapter = target.adapter;

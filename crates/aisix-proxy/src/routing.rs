@@ -34,6 +34,7 @@
 //! - **least_busy**: least-loaded target first, by in-flight requests
 //!   divided by target `weight` (the APISIX least_conn score).
 
+use aisix_core::models::{LivePricingIndex, PricingIndex};
 use aisix_core::{
     AisixSnapshot, HashOnType, Model, Routing, RoutingStrategy, RoutingTarget,
     WhenAllUnavailablePolicy,
@@ -909,12 +910,12 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 /// Combined per-1K unit price used to rank `least_cost` targets. A target
-/// Model without a configured `cost` sorts last (treated as +∞) so a
-/// misconfigured target is deprioritised rather than silently preferred.
-fn cost_key(model: &Model) -> f64 {
-    model
-        .cost
-        .as_ref()
+/// Model with no price at all — no `pricing_key` that resolves, and no
+/// inline `cost` — sorts last (treated as +∞) so a misconfigured target
+/// is deprioritised rather than silently preferred.
+fn cost_key(pricing: &PricingIndex, model: &Model) -> f64 {
+    pricing
+        .resolve(model)
         .map(|c| c.input_per_1k + c.output_per_1k)
         .unwrap_or(f64::INFINITY)
 }
@@ -936,10 +937,18 @@ fn order_attempts_by_metric(
     strategy: RoutingStrategy,
     attempts: &mut [AttemptModel],
     runtime_status: &crate::ModelRuntimeStatusTracker,
+    snapshot: &AisixSnapshot,
+    pricing: &LivePricingIndex,
 ) {
     match strategy {
         RoutingStrategy::LeastCost => {
-            attempts.sort_by(|a, b| cost_key(&a.model).total_cmp(&cost_key(&b.model)));
+            // Built here rather than per comparison: the sort calls the
+            // key function O(n log n) times, and the index is shared with
+            // whatever else prices this snapshot.
+            let pricing = pricing.for_snapshot(snapshot);
+            attempts.sort_by(|a, b| {
+                cost_key(&pricing, &a.model).total_cmp(&cost_key(&pricing, &b.model))
+            });
         }
         RoutingStrategy::LeastLatency => {
             attempts.sort_by(|a, b| {
@@ -1158,9 +1167,11 @@ fn targets_allowed_for_ip(
 ///
 /// Shared by `/v1/chat/completions` and `/v1/messages` so both endpoints
 /// dispatch Model Groups identically (ai-gateway#471).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_attempt_models(
     routing_registry: &RoutingRegistry,
     runtime_status: &crate::ModelRuntimeStatusTracker,
+    pricing: &LivePricingIndex,
     snapshot: &AisixSnapshot,
     virtual_name: &str,
     virtual_id: &str,
@@ -1281,7 +1292,13 @@ pub(crate) fn resolve_attempt_models(
     // metric sort runs first, then a stable sort on priority — so tiers
     // concatenate highest-first with the metric order preserved inside each.
     if routing.strategy.is_metric_based() {
-        order_attempts_by_metric(routing.strategy, &mut resolved, runtime_status);
+        order_attempts_by_metric(
+            routing.strategy,
+            &mut resolved,
+            runtime_status,
+            snapshot,
+            pricing,
+        );
         resolved.sort_by_key(|a| std::cmp::Reverse(a.priority));
         resolved.truncate(routing.max_fallbacks_or_default() + 1);
     }
@@ -1536,6 +1553,7 @@ mod tests {
         resolve_attempt_models(
             &RoutingRegistry::new(),
             &crate::ModelRuntimeStatusTracker::new(),
+            &LivePricingIndex::new(),
             snapshot,
             "group",
             "g-1",
@@ -1616,6 +1634,7 @@ mod tests {
         let out_of_range = resolve_attempt_models(
             &RoutingRegistry::new(),
             &crate::ModelRuntimeStatusTracker::new(),
+            &LivePricingIndex::new(),
             &snap,
             "group",
             "g-1",
@@ -2603,6 +2622,187 @@ mod tests {
     }
 
     // ── order_attempts_by_metric (least_cost) ─────────────────────
+
+    /// A snapshot with no pricing documents — the cases below rank by
+    /// the models' own inline `cost`, which is what every deployment
+    /// written before pricing documents existed still does.
+    fn unpriced() -> AisixSnapshot {
+        AisixSnapshot::new()
+    }
+
+    /// A snapshot whose shared catalog prices `key` at `input`/`output`.
+    fn priced(key: &str, input: f64, output: f64) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.global_pricing.insert(aisix_core::ResourceEntry::new(
+            "p-1",
+            serde_json::from_str(&format!(
+                r#"{{"key":"{key}","input_per_1k":{input},"output_per_1k":{output}}}"#
+            ))
+            .unwrap(),
+            1,
+        ));
+        snap
+    }
+
+    /// A target priced only by reference — no inline `cost` to fall back
+    /// on, so a resolution that does not happen ranks it last.
+    fn am_with_pricing_key(id: &str, key: &str) -> AttemptModel {
+        let model: Model = serde_json::from_str(&format!(
+            r#"{{
+              "display_name": "{id}",
+              "provider": "openai",
+              "model_name": "gpt-4o-mini",
+              "provider_key_id": "pk-{id}",
+              "pricing_key": "{key}"
+            }}"#
+        ))
+        .unwrap();
+        AttemptModel {
+            id: id.to_string(),
+            model,
+            priority: 0,
+            weight: 1,
+        }
+    }
+
+    /// Every reader of a model's price must go through
+    /// [`PricingIndex::resolve`], so ranking and billing cannot disagree
+    /// about what a model costs.
+    ///
+    /// A census rather than a list of the three known sites, for the
+    /// reason `guardrail_coverage.rs` gives: the readers here come in a
+    /// family (`least_cost` ordering, the realtime session's `cost_usd`,
+    /// the batch attribution's), a fourth is added by writing one more
+    /// `.cost`, and a hand-written list agrees with itself forever. The
+    /// symptom of missing one is silent — a model priced by reference
+    /// bills zero on the site that still reads the field.
+    #[test]
+    fn no_one_reads_a_models_price_off_the_field() {
+        use std::path::Path;
+
+        /// The two places allowed to touch the field, by PATH rather
+        /// than by file name: excluding a bare name would also excuse a
+        /// same-named file in another crate, and excluding a whole file
+        /// is how the first version of this census stopped covering
+        /// `cost_key`.
+        const AUTHORIZED: [&str; 2] = [
+            // Defines `ModelCost` and clears it in strip_kind_inapplicable.
+            "aisix-core/src/models/model.rs",
+            // The resolver every other reader must go through.
+            "aisix-core/src/models/pricing.rs",
+        ];
+
+        fn walk(dir: &Path, needle: &str, out: &mut Vec<(String, usize, String)>) {
+            for e in std::fs::read_dir(dir).expect("crates dir is readable") {
+                let path = e.expect("dir entry").path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    walk(&path, needle, out);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    let name = path.to_string_lossy().replace('\\', "/");
+                    if AUTHORIZED.iter().any(|ok| name.ends_with(ok)) {
+                        continue;
+                    }
+                    let src = std::fs::read_to_string(&path).expect("source is utf-8");
+                    for (i, line) in src.lines().enumerate() {
+                        // `.cost` as a field access, not `cost_usd` /
+                        // `cost_saved_usd` / a local named `*_cost`, and
+                        // not a comment.
+                        let trimmed = line.trim_start();
+                        if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                            continue;
+                        }
+                        let mut rest = line;
+                        while let Some(at) = rest.find(needle) {
+                            let after = &rest[at + needle.len()..];
+                            let boundary = after
+                                .chars()
+                                .next()
+                                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+                            if boundary {
+                                out.push((name.clone(), i + 1, line.trim().to_string()));
+                                break;
+                            }
+                            rest = after;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Assembled rather than written out, so this file is scanned
+        // like every other one: excluding it to stop the census matching
+        // its own text would also stop it covering `cost_key`, which
+        // lives here and is the reader most likely to regress.
+        let needle = format!(".{}", "cost");
+        let mut hits = Vec::new();
+        // The whole workspace, not just this crate: a usage event is
+        // assembled in more than one of them, and a direct read added
+        // anywhere else would be just as silent.
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the crate lives under crates/")
+            .to_path_buf();
+        walk(&crates, &needle, &mut hits);
+        assert!(
+            hits.is_empty(),
+            "these read a model's price off the field instead of through \
+             PricingIndex::resolve, so `pricing_key` is ignored there: {hits:#?}",
+        );
+        // The census is worthless if it scans nothing; prove it reached
+        // the crates it is meant to cover.
+        assert!(
+            crates.join("aisix-server/src").is_dir() && crates.join("aisix-obs/src").is_dir(),
+            "the census did not reach the other crates: {}",
+            crates.display(),
+        );
+    }
+
+    #[test]
+    fn least_cost_ranks_a_referenced_price_against_an_inline_one() {
+        let t = crate::ModelRuntimeStatusTracker::new();
+        // The referenced price (2/1K) undercuts the inline one (6/1K).
+        // Reversed against the same models with no catalog, below, so
+        // neither ordering can be the accidental one.
+        let snap = priced("vendor/x", 1.0, 1.0);
+        let mut attempts = vec![
+            am_with_cost("inline", 3.0, 3.0),
+            am_with_pricing_key("referenced", "vendor/x"),
+        ];
+        order_attempts_by_metric(
+            RoutingStrategy::LeastCost,
+            &mut attempts,
+            &t,
+            &snap,
+            &LivePricingIndex::new(),
+        );
+        let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["referenced", "inline"]);
+    }
+
+    #[test]
+    fn least_cost_ranks_an_unresolved_reference_last() {
+        let t = crate::ModelRuntimeStatusTracker::new();
+        // Same two targets, no catalog: the reference resolves to
+        // nothing and the model carries no inline cost, so it is +∞ and
+        // sorts behind the priced one.
+        let mut attempts = vec![
+            am_with_pricing_key("referenced", "vendor/x"),
+            am_with_cost("inline", 3.0, 3.0),
+        ];
+        order_attempts_by_metric(
+            RoutingStrategy::LeastCost,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
+        let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["inline", "referenced"]);
+    }
+
     fn am_with_cost(id: &str, input_per_1k: f64, output_per_1k: f64) -> AttemptModel {
         let model: Model = serde_json::from_str(&format!(
             r#"{{
@@ -2630,7 +2830,13 @@ mod tests {
             am_with_cost("cheap", 1.0, 2.0),    // 3 / 1K
             am_with_cost("mid", 5.0, 5.0),      // 10 / 1K
         ];
-        order_attempts_by_metric(RoutingStrategy::LeastCost, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::LeastCost,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["cheap", "mid", "pricey"]);
     }
@@ -2643,7 +2849,13 @@ mod tests {
             am_with_cost("cheap", 1.0, 1.0), // 2 / 1K
             am("no-cost-b"),                 // +∞
         ];
-        order_attempts_by_metric(RoutingStrategy::LeastCost, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::LeastCost,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         // Priced target first; equal (missing-cost) targets keep their
         // declaration order thanks to the stable sort.
@@ -2654,7 +2866,13 @@ mod tests {
     fn non_metric_strategy_leaves_order_untouched() {
         let t = crate::ModelRuntimeStatusTracker::new();
         let mut attempts = vec![am_with_cost("b", 9.0, 9.0), am_with_cost("a", 1.0, 1.0)];
-        order_attempts_by_metric(RoutingStrategy::Failover, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::Failover,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["b", "a"]);
     }
@@ -2667,7 +2885,13 @@ mod tests {
         t.record_latency("fast", 50);
         t.record_latency("mid", 300);
         let mut attempts = vec![am("slow"), am("fast"), am("mid")];
-        order_attempts_by_metric(RoutingStrategy::LeastLatency, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::LeastLatency,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["fast", "mid", "slow"]);
     }
@@ -2679,7 +2903,13 @@ mod tests {
         // "unseen-a"/"unseen-b" have no samples → rank first (−∞), keeping
         // their declaration order via the stable sort.
         let mut attempts = vec![am("measured"), am("unseen-a"), am("unseen-b")];
-        order_attempts_by_metric(RoutingStrategy::LeastLatency, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::LeastLatency,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["unseen-a", "unseen-b", "measured"]);
     }
@@ -2704,7 +2934,13 @@ mod tests {
         let _m1 = t.begin_in_flight("mid"); // 1 in-flight
                                             // "idle" has 0 in-flight.
         let mut attempts = vec![am("busy"), am("idle"), am("mid")];
-        order_attempts_by_metric(RoutingStrategy::LeastBusy, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::LeastBusy,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["idle", "mid", "busy"]);
     }
@@ -2714,7 +2950,13 @@ mod tests {
         let t = crate::ModelRuntimeStatusTracker::new();
         // All idle (0 in-flight) → stable sort preserves declaration order.
         let mut attempts = vec![am("a"), am("b"), am("c")];
-        order_attempts_by_metric(RoutingStrategy::LeastBusy, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::LeastBusy,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b", "c"]);
     }

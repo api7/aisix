@@ -32,6 +32,7 @@ pub mod observability_exporter;
 pub mod oidc_provider;
 pub mod passthrough_route;
 pub mod policy_conditions;
+pub mod pricing;
 pub mod provider_key;
 pub mod rate_limit;
 pub mod rate_limit_policy;
@@ -73,6 +74,7 @@ pub use policy_conditions::{
     ConditionNode, ConditionOperator, ConditionValue, GroupByDimension, PolicyAction,
     PolicyCondition, PolicyDimension,
 };
+pub use pricing::{LivePricingIndex, Pricing, PricingIndex};
 pub use provider_key::{
     ApiEndpoint, ApiSurface, ParamConstraints, ProviderApis, ProviderKey, RequestOverrides,
     ResponseOverrides, StreamDoneMarker, TelemetryKind, TelemetryTags,
@@ -93,8 +95,9 @@ pub use schema::{
     validate_mcp_server_lenient, validate_model, validate_model_lenient,
     validate_observability_exporter, validate_observability_exporter_lenient,
     validate_oidc_provider, validate_oidc_provider_lenient, validate_passthrough_route,
-    validate_passthrough_route_lenient, validate_provider_key, validate_provider_key_lenient,
-    validate_rate_limit_policy, validate_rate_limit_policy_lenient, SchemaError,
+    validate_passthrough_route_lenient, validate_pricing, validate_pricing_lenient,
+    validate_provider_key, validate_provider_key_lenient, validate_rate_limit_policy,
+    validate_rate_limit_policy_lenient, SchemaError,
 };
 pub use semantic::{
     Aggregation, DistanceMetric, EmbeddingFailureMode, OnEmbeddingFailure, Semantic, SemanticMatch,
