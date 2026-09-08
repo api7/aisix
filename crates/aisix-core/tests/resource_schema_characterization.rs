@@ -1019,6 +1019,58 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// Every field the resources file refuses as an id-form model reference
+/// is a field this build's schema actually declares.
+///
+/// The refusal list (`filesource::model_ref_id_fields`) is written by
+/// hand, and `aisix export` rewrites the same list back to name form. A
+/// typo in either half is silent in both directions: the file would
+/// accept an id that resolves to nothing, and the export would leave one
+/// in a file that then refuses to load. Neither shows up as a test
+/// failure anywhere else, because a name nothing declares simply never
+/// matches.
+#[test]
+fn every_refused_model_reference_id_is_a_declared_field() {
+    fn declares(node: &Value, field: &str) -> bool {
+        match node {
+            Value::Object(map) => {
+                map.get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|p| p.contains_key(field))
+                    || map.values().any(|v| declares(v, field))
+            }
+            Value::Array(items) => items.iter().any(|v| declares(v, field)),
+            _ => false,
+        }
+    }
+
+    // (resources-file collection, the resource whose schema declares it)
+    for (kind, resource) in [
+        ("api_keys", "api_key"),
+        ("models", "model"),
+        ("cache_policies", "cache_policy"),
+        ("guardrails", "guardrail"),
+    ] {
+        let schema = resource_root_schema(resource, true);
+        let fields = aisix_core::filesource::model_ref_id_fields(kind);
+        assert!(
+            !fields.is_empty(),
+            "{kind} has model references but refuses none"
+        );
+        for (id_field, name_field) in fields {
+            assert!(
+                declares(&schema, id_field),
+                "{kind} refuses `{id_field}`, which the {resource} schema does not declare"
+            );
+            assert!(
+                declares(&schema, name_field),
+                "{kind} rewrites `{id_field}` to `{name_field}`, which the {resource} schema \
+                 does not declare"
+            );
+        }
+    }
+}
+
 /// The published files are exactly the ones `dump-schema` emits today.
 ///
 /// `dump-schema` only ever writes, so a file it STOPPED emitting would sit in
