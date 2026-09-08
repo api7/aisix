@@ -3236,11 +3236,44 @@ mod tests {
         );
     }
 
+    /// A subschema that states a cross-field REQUIREMENT and nothing
+    /// else: `required`, optionally with a bare type pin on each field it
+    /// names. The "name or id" alternative every model reference carries
+    /// is written this way — the type pin is there because `required` in
+    /// JSON Schema is satisfied by a key whose value is `null`, and the
+    /// id fields accept `null`.
+    ///
+    /// ReDoc renders no tab for such a branch and it defines no property
+    /// of its own, so the title and description guards below skip it —
+    /// exactly as they already skip `if`/`then`/`else`.
+    fn is_requiredness_constraint(node: &serde_json::Value) -> bool {
+        let Some(map) = node.as_object() else {
+            return false;
+        };
+        if !map.contains_key("required")
+            || !map
+                .keys()
+                .all(|k| matches!(k.as_str(), "required" | "properties"))
+        {
+            return false;
+        }
+        let Some(serde_json::Value::Object(properties)) = map.get("properties") else {
+            return true;
+        };
+        properties.values().all(|p| {
+            p.as_object()
+                .is_some_and(|o| o.len() == 1 && o.contains_key("type"))
+        })
+    }
+
     fn collect_missing_property_descriptions(
         value: &serde_json::Value,
         path: String,
         missing: &mut Vec<String>,
     ) {
+        if is_requiredness_constraint(value) {
+            return;
+        }
         match value {
             serde_json::Value::Object(map) => {
                 if map.get("type").is_some_and(|kind| kind == "object")
@@ -3368,6 +3401,14 @@ mod tests {
                 for key in ["oneOf", "anyOf"] {
                     if let Some(serde_json::Value::Array(variants)) = map.get(key) {
                         for (index, variant) in variants.iter().enumerate() {
+                            // A cross-field requirement is not a shape a
+                            // reader picks between, so ReDoc gives it no
+                            // tab and a title on it would name something
+                            // nobody sees. Same exemption the `not`
+                            // subschemas get below.
+                            if is_requiredness_constraint(variant) {
+                                continue;
+                            }
                             if variant["title"].as_str().is_none_or(str::is_empty) {
                                 missing.push(format!("{path}/{key}/{index}"));
                             }

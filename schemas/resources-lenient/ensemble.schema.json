@@ -2,12 +2,46 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
     "Judge": {
-      "description": "The judge model that synthesizes the panel responses into one answer. `model` references a direct model alias.",
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "model": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model"
+              ]
+            },
+            {
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model_id"
+              ]
+            }
+          ]
+        }
+      ],
+      "description": "The judge model that synthesizes the panel responses into one answer. The judge model is named either by `model` (its display name) or by `model_id` (its resource id); the judge must carry at least one of the two.",
       "properties": {
         "model": {
-          "description": "Model alias for the direct model that synthesizes panel responses.",
+          "description": "Model alias for the direct model that synthesizes panel responses. Read only when `model_id` is absent.",
           "minLength": 1,
           "type": "string"
+        },
+        "model_id": {
+          "description": "Resource id of the direct model that synthesizes panel responses. Present, it is authoritative and `model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps the judge pointing at it with no edit to this document. An id resolving to no model is a judge that does not exist, exactly as a `model` naming no model is.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "synthesis_prompt": {
           "description": "Override for the built-in synthesis prompt template.",
@@ -18,18 +52,49 @@
           ]
         }
       },
-      "required": [
-        "model"
-      ],
       "type": "object"
     },
     "PanelMember": {
-      "description": "One member of an ensemble panel. `model` references a direct model alias.",
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "model": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model"
+              ]
+            },
+            {
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model_id"
+              ]
+            }
+          ]
+        }
+      ],
+      "description": "One member of an ensemble panel. The member model is named either by `model` (its display name) or by `model_id` (its resource id); a member must carry at least one of the two.",
       "properties": {
         "model": {
-          "description": "Model alias for a direct model that receives one panel request.",
+          "description": "Model alias for a direct model that receives one panel request. Read only when `model_id` is absent.",
           "minLength": 1,
           "type": "string"
+        },
+        "model_id": {
+          "description": "Resource id of the direct model that receives one panel request. Present, it is authoritative and `model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this member pointing at it with no edit to this document. An id resolving to no model is a panel member that does not exist, exactly as a `model` naming no model is.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "seed": {
           "description": "Sampling seed for this panel member.",
@@ -59,9 +124,6 @@
           ]
         }
       },
-      "required": [
-        "model"
-      ],
       "type": "object"
     }
   },

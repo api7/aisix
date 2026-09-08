@@ -162,6 +162,140 @@ const KINDS: [(&str, IdentityField); 14] = [
     ),
 ];
 
+/// One id-form model reference a document can carry: the field, the
+/// name-form field that replaces it, and how an operator should spell that
+/// name form.
+///
+/// `hint` is not decoration. It is the same as `name_field` for every
+/// reference whose name form takes a bare model name, and differs for the
+/// one that does not: a cache policy's model scope is written into the
+/// free-form `applies_to`, where a bare name parses as no discriminator at
+/// all and the policy silently WIDENS to every request instead of failing.
+/// An error message that told an operator to "use `applies_to`" would be
+/// walking them into that.
+pub struct ModelRefIdField {
+    pub field: &'static str,
+    pub name_field: &'static str,
+    pub hint: &'static str,
+}
+
+const fn pair(field: &'static str, name_field: &'static str) -> ModelRefIdField {
+    ModelRefIdField {
+        field,
+        name_field,
+        hint: name_field,
+    }
+}
+
+/// The id-form model references a document of `kind` can carry.
+///
+/// A projected document may point at a Model by resource id instead of by
+/// display name, which is what makes a reference survive a rename of the
+/// model. The list is public because two consumers must agree on it: the
+/// resources file refuses the id form (see [`load_from_str`]) and `aisix
+/// export` rewrites it back to the name form, and a field one of them
+/// knows about and the other does not is a silent round-trip loss.
+pub fn model_ref_id_fields(kind: &str) -> &'static [ModelRefIdField] {
+    const API_KEYS: [ModelRefIdField; 1] = [pair("allowed_model_ids", "allowed_models")];
+    const MODELS: [ModelRefIdField; 4] = [
+        pair("model_id", "model"),
+        pair("target_id", "target"),
+        pair("embedding_model_id", "embedding_model"),
+        pair("default_id", "default"),
+    ];
+    const CACHE_POLICIES: [ModelRefIdField; 2] = [
+        ModelRefIdField {
+            field: "applies_to_model_id",
+            name_field: "applies_to",
+            hint: "applies_to: \"model:<name>\"",
+        },
+        pair("embedding_model_id", "embedding_model"),
+    ];
+    const GUARDRAILS: [ModelRefIdField; 1] = [pair("embedding_model_id", "embedding_model")];
+    match kind {
+        "api_keys" => &API_KEYS,
+        "models" => &MODELS,
+        "cache_policies" => &CACHE_POLICIES,
+        "guardrails" => &GUARDRAILS,
+        _ => &[],
+    }
+}
+
+/// Call `f` on every object in `doc` that may carry one of
+/// [`model_ref_id_fields`]'s fields, for a document of `kind`.
+///
+/// Addressed by path rather than by walking the whole document for the
+/// field names: `secrets` and `headers` on a guardrail are operator-keyed
+/// maps, so a blind walk would treat a secret named `model_id` as a model
+/// reference and rewrite it. Extend this when a new nesting site gains a
+/// model reference.
+pub fn for_each_model_ref_node(
+    kind: &str,
+    doc: &mut Value,
+    f: &mut dyn FnMut(&mut serde_json::Map<String, Value>),
+) {
+    let Some(root) = doc.as_object_mut() else {
+        return;
+    };
+    let objects_in =
+        |node: &mut Value, key: &str, f: &mut dyn FnMut(&mut serde_json::Map<String, Value>)| {
+            if let Some(Value::Array(items)) = node.get_mut(key) {
+                for item in items {
+                    if let Some(obj) = item.as_object_mut() {
+                        f(obj);
+                    }
+                }
+            }
+        };
+    match kind {
+        // The key's grant list is a root field; a guardrail's kind config
+        // is `#[serde(flatten)]`ed onto the root, so its embedder is too.
+        "api_keys" | "guardrails" => f(root),
+        "cache_policies" => {
+            f(root);
+            if let Some(Value::Object(semantic)) = root.get_mut("semantic") {
+                f(semantic);
+            }
+        }
+        "models" => {
+            if let Some(routing) = root.get_mut("routing") {
+                objects_in(routing, "targets", f);
+            }
+            if let Some(ensemble) = root.get_mut("ensemble") {
+                objects_in(ensemble, "panel", f);
+                if let Some(Value::Object(judge)) = ensemble.get_mut("judge") {
+                    f(judge);
+                }
+            }
+            if let Some(semantic) = root.get_mut("semantic") {
+                objects_in(semantic, "routes", f);
+                if let Some(Value::Object(on_failure)) = semantic.get_mut("on_embedding_failure") {
+                    f(on_failure);
+                }
+                if let Some(semantic) = semantic.as_object_mut() {
+                    f(semantic);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The first id-form model reference `doc` carries.
+fn model_ref_id_field(kind: &str, doc: &mut Value) -> Option<&'static ModelRefIdField> {
+    let fields = model_ref_id_fields(kind);
+    if fields.is_empty() {
+        return None;
+    }
+    let mut found = None;
+    for_each_model_ref_node(kind, doc, &mut |node| {
+        if found.is_none() {
+            found = fields.iter().find(|f| node.contains_key(f.field));
+        }
+    });
+    found
+}
+
 /// Load `path` into a fresh [`AisixSnapshot`], resolving `${VAR}`
 /// interpolation against the current process environment. `revision` is
 /// stamped on every entry (the file source's generation counter: 1 at
@@ -405,20 +539,11 @@ pub fn load_from_str(
             continue;
         }
 
-        // `allowed_model_ids` is a control-plane projection: it names
-        // models by the id the control plane assigned them, while a file's
-        // ids are derived from the entry names, so no id a file can carry
-        // ever resolves. Accepting it would make the key grant nothing at
-        // all — silently, and with `allowed_models` ignored on top — so the
-        // file rejects the field instead. (The etcd path is the opposite:
-        // there an id that resolves to no model simply grants nothing and
-        // must never fail the row, because a rejected api_key stops
-        // authenticating entirely.)
         // `pricing_key` is the same class of control-plane projection as
-        // `allowed_model_ids` below: it names a pricing document a file
-        // has no way to declare, so a file that carried it would leave the
-        // model with no price at all — silently, and with `cost` the only
-        // thing that could have supplied one.
+        // the model-reference id spellings below: it names a pricing
+        // document a file has no way to declare, so a file that carried
+        // it would leave the model with no price at all — silently, and
+        // with `cost` the only thing that could have supplied one.
         if entry.kind == "models" && entry.doc.get("pricing_key").is_some() {
             errors.push(LoadError {
                 scope,
@@ -430,13 +555,24 @@ pub fn load_from_str(
             continue;
         }
 
-        if entry.kind == "api_keys" && entry.doc.get("allowed_model_ids").is_some() {
+        // Every model reference has an id spelling that names the model by
+        // the id the control plane assigned it. A file's ids are derived
+        // from its entry names, so no id a file can carry ever resolves:
+        // accepting one would make the reference point at nothing —
+        // silently, and with the name spelling ignored on top. The file
+        // rejects the id spelling instead, wherever it appears. (The etcd
+        // path is the opposite: there an id that resolves to no model
+        // degrades that one reference and must never fail the row, because
+        // a rejected api_key stops authenticating entirely.)
+        if let Some(reference) = model_ref_id_field(entry.kind, &mut entry.doc) {
+            let (field, hint) = (reference.field, reference.hint);
             errors.push(LoadError {
                 scope,
-                message: "the resources file does not accept `allowed_model_ids` — it \
-                          names models by control-plane id, which a file cannot resolve; \
-                          grant models by name with `allowed_models`"
-                    .into(),
+                message: format!(
+                    "the resources file does not accept `{field}` — it names a model by \
+                     control-plane id, which a file cannot resolve; name the model with \
+                     `{hint}` instead"
+                ),
             });
             continue;
         }
@@ -613,7 +749,7 @@ pub fn load_from_str(
                     &route.target,
                 );
             }
-            if let crate::models::OnEmbeddingFailure::Target { target } =
+            if let crate::models::OnEmbeddingFailure::Target { target, .. } =
                 &semantic.on_embedding_failure
             {
                 check_model_ref(scope, "semantic on_embedding_failure target", target);

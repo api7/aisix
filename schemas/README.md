@@ -113,7 +113,7 @@ so a consumer that models the lenient set as "the strict set with
 | resource | additionally relaxed on read |
 | --- | --- |
 | `api_key` | `McpAccess.allow` is not required |
-| `guardrail` | the `semantic` kind requires neither `embedding_model` nor a threshold beside each example list |
+| `guardrail` | the `semantic` kind requires neither an embedding model (under either spelling) nor a threshold beside each example list |
 | `mcp_policy` | `allow` is not required |
 | `model` | the per-kind `not`/`anyOf` lists that forbid a knob a kind never resolves are shorter — a stored row keeps loading and `Model::strip_kind_inapplicable` drops the dead knob |
 

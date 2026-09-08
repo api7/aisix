@@ -1,5 +1,55 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "allOf": [
+    {
+      "anyOf": [
+        {
+          "properties": {
+            "embedding_model": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "embedding_model"
+          ]
+        },
+        {
+          "properties": {
+            "embedding_model_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "embedding_model_id"
+          ]
+        }
+      ]
+    },
+    {
+      "anyOf": [
+        {
+          "properties": {
+            "default": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "default"
+          ]
+        },
+        {
+          "properties": {
+            "default_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "default_id"
+          ]
+        }
+      ]
+    }
+  ],
   "definitions": {
     "Aggregation": {
       "description": "How a request's per-example similarity scores collapse into one score for the route. v1 uses `max` (the single best-matching example), chosen for explainability — the UI surfaces \"the top matching example\" — over semantic-router's default sum/mean-over-top_k.",
@@ -55,17 +105,22 @@
           "description": "`\"default\"` or `\"fail\"`."
         },
         {
-          "description": "`{ \"target\": \"<direct alias>\" }` — route to a specific safe model.",
+          "description": "`{ \"target\": \"<direct alias>\" }` (or `{ \"target_id\": \"<id>\" }`) — route to a specific safe model.",
           "properties": {
             "target": {
-              "description": "Direct-model alias to route to when embedding fails.",
+              "description": "Direct-model alias to route to when embedding fails. Read only when `target_id` is absent.",
               "minLength": 1,
               "type": "string"
+            },
+            "target_id": {
+              "description": "Resource id of the direct model to route to when embedding fails. Present, it is authoritative and `target` is ignored, so renaming that model keeps this fallback pointing at it with no edit to this document.",
+              "minLength": 1,
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
-          "required": [
-            "target"
-          ],
           "type": "object"
         }
       ],
@@ -106,6 +161,32 @@
       "type": "object"
     },
     "SemanticRoute": {
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "target": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target"
+              ]
+            },
+            {
+              "properties": {
+                "target_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target_id"
+              ]
+            }
+          ]
+        }
+      ],
       "description": "One semantic route: a labeled set of example utterances whose embeddings define the route. A request that scores high enough against them dispatches to `target`.",
       "properties": {
         "description": {
@@ -131,9 +212,17 @@
           "type": "string"
         },
         "target": {
-          "description": "Direct model alias that receives traffic matching this route.",
+          "description": "Direct model alias that receives traffic matching this route. Read only when `target_id` is absent.",
           "minLength": 1,
           "type": "string"
+        },
+        "target_id": {
+          "description": "Resource id of the direct model that receives traffic matching this route. Present, it is authoritative and `target` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this route pointing at it with no edit to this document. An id resolving to no model is a route target that does not exist, exactly as a `target` naming no model is.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "threshold": {
           "description": "Per-route similarity threshold. A request matches this route only when its aggregated score is `>=` this value. When omitted, the router-level threshold applies.",
@@ -148,8 +237,7 @@
       },
       "required": [
         "examples",
-        "name",
-        "target"
+        "name"
       ],
       "type": "object"
     }
@@ -157,14 +245,30 @@
   "description": "Semantic-routing config: pick a target by request meaning.",
   "properties": {
     "default": {
-      "description": "Direct model alias used when no route clears its threshold.",
+      "description": "Direct model alias used when no route clears its threshold. Read only when `default_id` is absent.",
       "minLength": 1,
       "type": "string"
     },
+    "default_id": {
+      "description": "Resource id of the direct model used when no route clears its threshold. Present, it is authoritative and `default` is ignored, so renaming that model keeps this router pointing at it with no edit to this document.",
+      "minLength": 1,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "embedding_model": {
-      "description": "Alias of an `embedding`-modality Model used to embed the request and (at apply time) the route examples.",
+      "description": "Alias of an `embedding`-modality Model used to embed the request and (at apply time) the route examples. Read only when `embedding_model_id` is absent.",
       "minLength": 1,
       "type": "string"
+    },
+    "embedding_model_id": {
+      "description": "Resource id of the `embedding`-modality Model used to embed the request and the route examples. Present, it is authoritative and `embedding_model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this router pointing at it with no edit to this document. An id resolving to no model is an embedding model that does not exist, exactly as an `embedding_model` naming no model is — the router applies `on_embedding_failure`.",
+      "minLength": 1,
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "embedding_timeout_ms": {
       "description": "Per-call deadline for the embedding request in milliseconds. `0` or absent disables the embedding-specific deadline.",
@@ -201,8 +305,6 @@
     }
   },
   "required": [
-    "default",
-    "embedding_model",
     "match",
     "routes"
   ],

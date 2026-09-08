@@ -539,6 +539,254 @@ api_keys:
     load(&ok, &env).expect("the same file without the field loads");
 }
 
+/// Every other id-form model reference is refused the same way, at every
+/// nesting site it can appear. Each fixture is asserted twice: once with
+/// the id field (one error naming it and the name-form field that
+/// replaces it) and once without (the file loads), so the rejection is
+/// pinned to the field rather than to anything else in the fixture.
+#[test]
+fn model_reference_ids_are_rejected_by_the_file_source() {
+    const PRELUDE: &str = r#"
+_format_version: "1"
+provider_keys:
+  - display_name: pk
+    api_key: sk-x
+models:
+  - display_name: m
+    provider: openai
+    model_name: x
+    provider_key: pk
+  - display_name: e
+    provider: openai
+    model_name: x
+    provider_key: pk
+    embedding:
+      dimensions: 4
+"#;
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "routing target",
+            "model_id",
+            r#"
+  - display_name: group
+    routing:
+      targets:
+        - model: m
+          model_id: 11111111-1111-1111-1111-111111111111
+"#,
+        ),
+        (
+            "ensemble panel member",
+            "model_id",
+            r#"
+  - display_name: panel
+    ensemble:
+      panel:
+        - model: m
+          model_id: 11111111-1111-1111-1111-111111111111
+      judge:
+        model: m
+"#,
+        ),
+        (
+            "ensemble judge",
+            "model_id",
+            r#"
+  - display_name: judged
+    ensemble:
+      panel:
+        - model: m
+      judge:
+        model: m
+        model_id: 11111111-1111-1111-1111-111111111111
+"#,
+        ),
+        (
+            "semantic embedding model",
+            "embedding_model_id",
+            r#"
+  - display_name: router
+    semantic:
+      embedding_model: e
+      embedding_model_id: 11111111-1111-1111-1111-111111111111
+      routes:
+        - name: r
+          target: m
+          examples: ["hi"]
+      default: m
+      match:
+        threshold: 0.5
+"#,
+        ),
+        (
+            "semantic default",
+            "default_id",
+            r#"
+  - display_name: router
+    semantic:
+      embedding_model: e
+      routes:
+        - name: r
+          target: m
+          examples: ["hi"]
+      default: m
+      default_id: 11111111-1111-1111-1111-111111111111
+      match:
+        threshold: 0.5
+"#,
+        ),
+        (
+            "semantic route target",
+            "target_id",
+            r#"
+  - display_name: router
+    semantic:
+      embedding_model: e
+      routes:
+        - name: r
+          target: m
+          target_id: 11111111-1111-1111-1111-111111111111
+          examples: ["hi"]
+      default: m
+      match:
+        threshold: 0.5
+"#,
+        ),
+        (
+            "semantic on_embedding_failure target",
+            "target_id",
+            r#"
+  - display_name: router
+    semantic:
+      embedding_model: e
+      routes:
+        - name: r
+          target: m
+          examples: ["hi"]
+      default: m
+      match:
+        threshold: 0.5
+      on_embedding_failure:
+        target: m
+        target_id: 11111111-1111-1111-1111-111111111111
+"#,
+        ),
+    ];
+
+    for (label, field, fragment) in cases {
+        let contents = format!("{PRELUDE}{fragment}");
+        let errs = errors_of(load(&contents, &env_of(&[])));
+        assert_eq!(errs.len(), 1, "{label}: {errs:?}");
+        assert!(
+            errs[0].contains(&format!("does not accept `{field}`")),
+            "{label}: {errs:?}"
+        );
+        let without = contents.replace(
+            &format!("          {field}: 11111111-1111-1111-1111-111111111111\n"),
+            "",
+        );
+        let without = without.replace(
+            &format!("      {field}: 11111111-1111-1111-1111-111111111111\n"),
+            "",
+        );
+        let without = without.replace(
+            &format!("        {field}: 11111111-1111-1111-1111-111111111111\n"),
+            "",
+        );
+        assert_ne!(without, contents, "{label}: fixture edit did not apply");
+        load(&without, &env_of(&[]))
+            .unwrap_or_else(|e| panic!("{label}: the same file without the field loads: {e:?}"));
+    }
+}
+
+#[test]
+fn cache_policy_and_guardrail_model_reference_ids_are_rejected() {
+    let with_scope = r#"
+_format_version: "1"
+cache_policies:
+  - name: p
+    applies_to: all
+    applies_to_model_id: 11111111-1111-1111-1111-111111111111
+"#;
+    let errs = errors_of(load(with_scope, &env_of(&[])));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("does not accept `applies_to_model_id`") && errs[0].contains("applies_to"),
+        "{errs:?}"
+    );
+
+    let with_cache_embedder = r#"
+_format_version: "1"
+provider_keys:
+  - display_name: pk
+    api_key: sk-x
+models:
+  - display_name: e
+    provider: openai
+    model_name: x
+    provider_key: pk
+    embedding:
+      dimensions: 4
+cache_policies:
+  - name: p
+    semantic:
+      embedding_model: e
+      embedding_model_id: 11111111-1111-1111-1111-111111111111
+      threshold: 0.9
+"#;
+    let errs = errors_of(load(with_cache_embedder, &env_of(&[])));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("does not accept `embedding_model_id`"),
+        "{errs:?}"
+    );
+    let without = with_cache_embedder.replace(
+        "      embedding_model_id: 11111111-1111-1111-1111-111111111111\n",
+        "",
+    );
+    load(&without, &env_of(&[])).expect("the same file without the field loads");
+
+    let with_guardrail_embedder = r#"
+_format_version: "1"
+guardrails:
+  - name: g
+    kind: semantic
+    embedding_model: e
+    embedding_model_id: 11111111-1111-1111-1111-111111111111
+    deny_examples: ["x"]
+    deny_threshold: 0.8
+"#;
+    let errs = errors_of(load(with_guardrail_embedder, &env_of(&[])));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("does not accept `embedding_model_id`"),
+        "{errs:?}"
+    );
+    let without = with_guardrail_embedder.replace(
+        "    embedding_model_id: 11111111-1111-1111-1111-111111111111\n",
+        "",
+    );
+    load(&without, &env_of(&[])).expect("the same file without the field loads");
+}
+
+/// A guardrail's operator-keyed maps are NOT model references: a
+/// `kind: custom` row may name a script secret anything, including a
+/// string the refusal list happens to contain, and refusing it would make
+/// a valid file unloadable.
+#[test]
+fn an_operator_keyed_secret_named_like_a_model_reference_still_loads() {
+    let contents = r#"
+_format_version: "1"
+guardrails:
+  - name: g
+    kind: custom
+    script: "export function input(ctx) { return { action: 'allow' }; }"
+    secrets:
+      embedding_model_id: shhh
+"#;
+    load(contents, &env_of(&[])).expect("an operator-named secret is not a model reference");
+}
+
 #[test]
 fn canonical_validation_failures_carry_entry_scope() {
     // Empty display_name violates the model schema (minLength 1)…

@@ -46,13 +46,21 @@
 //!   the native response timeout does not cover time spent waiting on the
 //!   connection manager's own in-progress reconnect — which is where the
 //!   remaining unbounded wait lived.
-//! - **A cool-off breaker.** Paying the timeout on *every* request during
+//! - **A cool-off breaker, shared per subsystem.** Paying the timeout on *every* request during
 //!   an outage is still a several-second latency floor for as long as the
-//!   outage lasts. After a connectivity failure the connection is held
-//!   open for [`BREAKER_WINDOW`]; commands issued inside that window
+//!   outage lasts. After a connectivity failure the subsystem is held
+//!   open for [`BREAKER_WINDOW`] — 30s, long enough to span an upstream
+//!   call so a request's cache write is still covered by the cool-off its
+//!   cache read opened; commands issued inside that window
 //!   return an error immediately, with no round trip, so each consumer's
 //!   existing fail-open branch runs at once. The first command after the
 //!   window probes Redis normally and closes the breaker on success.
+//!
+//! The breaker belongs to a **subsystem**, not to a connection — see
+//! [`FailurePolicy`]. A subsystem may hold several connections (the cache
+//! holds two: exact-KV and vector search) and one request touches all of
+//! them, so a per-connection breaker let a single request pay the budget
+//! once per connection.
 //!
 //! Breaker short-circuits are ordinary `Err`s, so they are counted by the
 //! consumers' existing `aisix_redis_failures_total{operation=...}` calls
@@ -75,7 +83,14 @@ use tokio::sync::Mutex;
 /// not configurable: it trades at most this much staleness (a Redis that
 /// recovered mid-window is not noticed until the window ends) for a hard
 /// ceiling on how often a request pays the full timeout during an outage.
-pub const BREAKER_WINDOW: Duration = Duration::from_secs(5);
+///
+/// Sized to outlast an upstream call, not to be a small multiple of the
+/// command budget. A request's cache read and its cache write straddle
+/// the upstream leg, so a window shorter than that leg leaves the write
+/// to find the cool-off expired and pay the budget a second time — which
+/// is what a 5s window did, since the non-streaming completions this
+/// cache stores routinely take longer than that.
+pub const BREAKER_WINDOW: Duration = Duration::from_secs(30);
 
 /// A long-lived Redis client handle. Cheap to [`Clone`] (every variant is
 /// `Arc`-backed). Build one with [`connect`].
@@ -129,11 +144,57 @@ enum HandleKind {
     Sentinel(MultiplexedConnection),
 }
 
-/// The per-connection failure policy: one command budget and one breaker,
-/// shared by every handle [`RedisConn::acquire`] hands out.
+/// One command budget and one breaker. Reached through [`FailurePolicy`],
+/// which is what decides how widely it is shared.
 struct Guard {
     timeout: Duration,
     breaker: Breaker,
+}
+
+/// The failure policy of one Redis **subsystem**: a command budget and a
+/// cool-off window shared by every connection that subsystem opens.
+///
+/// A subsystem is the unit that fails open together, and it is not the
+/// same thing as a connection. The cache is one subsystem holding two
+/// connections — exact-KV and vector search — and a single chat request
+/// touches both twice: exact lookup, semantic lookup, exact write,
+/// semantic write. With a breaker per connection each of those four
+/// operations found a breaker that no earlier operation had opened, so
+/// one request against a black-holed Redis paid the budget four times
+/// (measured: 20s at the default 5s budget). Sharing the policy makes the
+/// first failure short-circuit the operations that follow it inside the
+/// cool-off window.
+///
+/// The two lookups run back to back, but the two writes run after the
+/// upstream call, so this holds for a whole request only while
+/// [`BREAKER_WINDOW`] outlasts that upstream leg — which is why the
+/// window is 30s rather than a small multiple of the budget. A request
+/// whose upstream call runs longer than the window still finds it
+/// expired and pays a second budget on the write that follows.
+///
+/// Sharing the policy does NOT share the connection: the two cache
+/// connections stay separate so they do not serialize on one pipeline.
+///
+/// One policy per `redis:` config block. The rate limiter reads a
+/// different block and is a different subsystem, so it holds its own —
+/// a Redis outage that is really one outage still costs a request one
+/// budget for the cache and one for the limiter, which is the price of
+/// letting the two degrade independently.
+#[derive(Clone)]
+pub struct FailurePolicy(Arc<Guard>);
+
+impl FailurePolicy {
+    /// Build the policy for one `redis:` config block. Pass the same
+    /// value to every [`connect_with`] call for that block.
+    pub fn new(cfg: &RedisConnConfig) -> Self {
+        Self(Arc::new(Guard {
+            // `validate` rejects 0, but this type is constructible from a
+            // hand-built config in tests; clamping keeps "no budget at
+            // all" unreachable rather than merely unconfigurable.
+            timeout: Duration::from_secs(cfg.timeout_secs.max(1)),
+            breaker: Breaker::new(BREAKER_WINDOW),
+        }))
+    }
 }
 
 impl Guard {
@@ -142,8 +203,8 @@ impl Guard {
     /// A success closes the breaker; a *connectivity* failure or a
     /// timeout opens it. A failure the server itself reported (a script
     /// error, `WRONGTYPE`, an ACL refusal) is returned untouched — Redis
-    /// answered, so short-circuiting the next five seconds of traffic
-    /// would be wrong.
+    /// answered, so short-circuiting the subsystem's next half minute of
+    /// traffic would be wrong.
     async fn run<T>(
         &self,
         fut: impl std::future::Future<Output = RedisResult<T>>,
@@ -407,12 +468,18 @@ impl ConnectionLike for RedisConnHandle {
 /// rather than per request. Assumes [`RedisConnConfig::validate`] already
 /// passed (the boot path validates before calling this).
 pub async fn connect(cfg: &RedisConnConfig) -> RedisResult<RedisConn> {
+    connect_with(cfg, &FailurePolicy::new(cfg)).await
+}
+
+/// [`connect`] against an existing [`FailurePolicy`].
+///
+/// Every connection a subsystem opens from the same `redis:` block must
+/// be built this way from ONE policy, or the subsystem's operations each
+/// pay the command budget separately — see [`FailurePolicy`].
+pub async fn connect_with(cfg: &RedisConnConfig, policy: &FailurePolicy) -> RedisResult<RedisConn> {
     let tls = load_tls(cfg)?;
-    let timeout = Duration::from_secs(cfg.timeout_secs.max(1));
-    let guard = Arc::new(Guard {
-        timeout,
-        breaker: Breaker::new(BREAKER_WINDOW),
-    });
+    let guard = Arc::clone(&policy.0);
+    let timeout = guard.timeout;
     let inner = match cfg.mode {
         RedisMode::Single => {
             let url = insecure_url(cfg.url.as_deref().unwrap_or_default(), cfg);
@@ -804,6 +871,60 @@ mod guard_tests {
         assert!(!g.breaker.is_open(), "a success closes the breaker");
     }
 
+    /// The window has to date from when the failing command RETURNED.
+    /// Dating it from when the command started would leave it already
+    /// expired by the time that command gave up whenever the window is
+    /// not longer than the budget — and the next operation of the same
+    /// request would then probe and pay the budget all over again, which
+    /// is how one request came to pay four.
+    #[tokio::test]
+    async fn the_window_dates_from_when_the_command_returned() {
+        // Window shorter than the budget, so "from start" and "from
+        // return" give opposite answers. Both are generous: the margin
+        // between them is the whole tolerance for scheduling delay on a
+        // loaded CI runner.
+        let g = guard(400, 300);
+        g.run(pending::<RedisResult<()>>())
+            .await
+            .expect_err("the command spends its budget and gives up");
+
+        let started = Instant::now();
+        let err = g
+            .run(pending::<RedisResult<()>>())
+            .await
+            .expect_err("the operation behind it short-circuits");
+        assert!(
+            started.elapsed() < Duration::from_millis(40),
+            "the cool-off must still be open when the failure returns, took {:?}",
+            started.elapsed()
+        );
+        assert!(err.to_string().contains("cool-off"), "{err}");
+    }
+
+    /// Two connections of one subsystem share the policy, so the budget a
+    /// request spends on the first is not spent again on the second.
+    #[tokio::test]
+    async fn connections_sharing_a_policy_share_the_cool_off() {
+        let policy = FailurePolicy(Arc::new(guard(2_000, 5_000)));
+        let a = Arc::clone(&policy.0);
+        let b = Arc::clone(&policy.0);
+
+        a.run(async { Err::<(), _>(dropped_connection()) })
+            .await
+            .expect_err("the first connection fails");
+
+        let started = Instant::now();
+        b.run(pending::<RedisResult<()>>())
+            .await
+            .expect_err("the second connection short-circuits on the shared cool-off");
+        assert!(
+            started.elapsed() < Duration::from_millis(40),
+            "a second connection of the same subsystem must not pay the budget \
+             again, took {:?}",
+            started.elapsed()
+        );
+    }
+
     /// A cool-off that only gates the window itself still lets every
     /// command that arrives while the probe is in flight pay the full
     /// budget — during a sustained outage that is most of them, and no
@@ -899,7 +1020,8 @@ mod guard_tests {
 
     /// A reply from a live Redis — a script error, `WRONGTYPE`, an ACL
     /// refusal — is not an outage. Tripping on it would short-circuit
-    /// five seconds of healthy traffic every time one command is wrong.
+    /// the whole cool-off of healthy traffic every time one command is
+    /// wrong.
     #[tokio::test]
     async fn an_error_redis_itself_reported_does_not_open_the_breaker() {
         let g = guard(80, 5_000);

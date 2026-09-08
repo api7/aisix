@@ -73,11 +73,27 @@ impl std::fmt::Debug for RedisSemanticCache {
 }
 
 impl RedisSemanticCache {
-    /// Connect using the operator's `cache.redis` config — the same
-    /// config the exact redis cache uses; this opens its own
-    /// connection so the two caches don't serialize on one pipeline.
+    /// Connect on a policy of this store's own.
+    ///
+    /// Only for a standalone vector store. In the gateway this is the
+    /// second connection of the cache subsystem and must share the exact
+    /// cache's policy — use [`RedisSemanticCache::connect_with`].
     pub async fn connect(cfg: &RedisConnConfig) -> Result<Self, CacheError> {
-        let conn = aisix_redis::connect(cfg)
+        Self::connect_with(cfg, &aisix_redis::FailurePolicy::new(cfg)).await
+    }
+
+    /// Connect sharing `policy` with the exact cache.
+    ///
+    /// Same `cache.redis` config the exact cache uses, and still its OWN
+    /// connection so the two do not serialize on one pipeline — only the
+    /// failure policy is shared, so a request that already paid the
+    /// command budget on the exact half short-circuits here instead of
+    /// paying it again.
+    pub async fn connect_with(
+        cfg: &RedisConnConfig,
+        policy: &aisix_redis::FailurePolicy,
+    ) -> Result<Self, CacheError> {
+        let conn = aisix_redis::connect_with(cfg, policy)
             .await
             .map_err(|e| CacheError::Backend(format!("redis connect: {e}")))?;
         Ok(Self {
@@ -143,7 +159,9 @@ impl RedisSemanticCache {
                 // the life of the pod.
                 if e.is_io_error() {
                     CacheError::Backend(format!(
-                        "vector-search probe did not complete (cache.redis unreachable or                          too slow; this does not mean the server lacks vector search): {e}"
+                        "vector-search probe did not complete (cache.redis unreachable \
+                         or too slow; this does not mean the server lacks vector \
+                         search): {e}"
                     ))
                 } else {
                     CacheError::Backend(format!(

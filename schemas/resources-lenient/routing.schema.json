@@ -106,12 +106,46 @@
       ]
     },
     "RoutingTarget": {
-      "description": "One destination in a routing configuration. `model` references a direct model alias.",
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "model": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model"
+              ]
+            },
+            {
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model_id"
+              ]
+            }
+          ]
+        }
+      ],
+      "description": "One destination in a routing configuration. The target model is named either by `model` (its display name) or by `model_id` (its resource id); a target must carry at least one of the two.",
       "properties": {
         "model": {
-          "description": "Model alias for a direct model that can receive routed traffic.",
+          "description": "Model alias for a direct model that can receive routed traffic. Read only when `model_id` is absent.\n\nDefaulted at the type level and required by the schemas instead — as one half of a \"`model` or `model_id`\" alternative, so a target naming its model by id alone validates while one naming it neither way is still rejected.",
           "minLength": 1,
           "type": "string"
+        },
+        "model_id": {
+          "description": "Resource id of the direct model that can receive routed traffic. Present, it is authoritative and `model` is ignored: the id is resolved against the models in the current configuration and the name it resolves to is the target, so renaming that model keeps this target pointing at it with no edit to this document. An id resolving to no model is a target that does not exist, exactly as a `model` naming no model is.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "priority": {
           "description": "Priority tier, default `0`; a higher value is preferred (the APISIX node-priority convention — give backup targets `-1`). The strategy orders targets within each tier; a lower tier is only tried when every higher-tier target failed or is unavailable.",
@@ -142,9 +176,6 @@
           ]
         }
       },
-      "required": [
-        "model"
-      ],
       "type": "object"
     },
     "WhenAllUnavailablePolicy": {

@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use aisix_cache::{Cache, RedisCache};
+use aisix_cache::{Cache, RedisCache, SemanticCacheStore};
 use aisix_core::{RedisConnConfig, RedisMode};
 use aisix_gateway::{ChatMessage, ChatResponse, FinishReason, UsageStats};
 
@@ -297,4 +297,152 @@ fn uuid_like() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     format!("{nanos:x}-{:?}", std::thread::current().id()).replace(['(', ')', ' '], "")
+}
+
+/// A TCP relay in front of Redis that a test can black-hole: the socket
+/// stays open and nothing is ever forwarded or answered, which is what a
+/// paused container, a downed host or a partitioned network looks like
+/// from the client end. An error reply would be the *cheap* failure —
+/// the client learns immediately and no budget is spent.
+struct RedisBlackhole {
+    port: u16,
+    hole: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RedisBlackhole {
+    async fn start(upstream: &str) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let upstream = upstream
+            .trim_start_matches("redis://")
+            .trim_end_matches('/')
+            .to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hole = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = hole.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut client, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(mut server) = tokio::net::TcpStream::connect(&upstream).await else {
+                    continue;
+                };
+                let flag = flag.clone();
+                tokio::spawn(async move {
+                    let mut from_client = [0u8; 8192];
+                    let mut from_server = [0u8; 8192];
+                    loop {
+                        let held = || flag.load(std::sync::atomic::Ordering::Relaxed);
+                        tokio::select! {
+                            n = client.read(&mut from_client) => {
+                                let Ok(n) = n else { return };
+                                if n == 0 {
+                                    return;
+                                }
+                                if held() {
+                                    continue;
+                                }
+                                if server.write_all(&from_client[..n]).await.is_err() {
+                                    return;
+                                }
+                            }
+                            n = server.read(&mut from_server) => {
+                                let Ok(n) = n else { return };
+                                if n == 0 {
+                                    return;
+                                }
+                                if held() {
+                                    continue;
+                                }
+                                if client.write_all(&from_server[..n]).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        Self { port, hole }
+    }
+
+    fn url(&self) -> String {
+        format!("redis://127.0.0.1:{}", self.port)
+    }
+
+    fn blackhole(&self) {
+        self.hole.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// One request against a black-holed Redis must cost the cache ONE
+/// command budget, not one per connection.
+///
+/// The cache subsystem holds two connections to the same `cache.redis` —
+/// exact-KV and vector search — and a single chat request touches both
+/// twice: exact lookup, semantic lookup, exact write, semantic write. A
+/// breaker per connection meant each of those four found a breaker no
+/// earlier operation had opened, so the request paid the budget four
+/// times over (release QA measured 20.0s at the default 5s budget, 4.0s
+/// at 2s, against 5.0s for an exact-only policy). The two connections
+/// stay separate — they must not serialize on one pipeline — so what is
+/// shared is the failure policy.
+#[tokio::test]
+async fn the_whole_cache_subsystem_pays_one_budget_per_request() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: CACHE_TEST_REDIS_URL not set");
+        return;
+    };
+    // Below the 5s default so the bound below cannot pass on a build
+    // that ignored the configured budget.
+    const BUDGET_SECS: u64 = 2;
+    let relay = RedisBlackhole::start(&url).await;
+    let cfg = RedisConnConfig {
+        timeout_secs: BUDGET_SECS,
+        ..single(&relay.url())
+    };
+
+    // Exactly how the bootstrap wires them: one policy, two connections.
+    let policy = aisix_cache::FailurePolicy::new(&cfg);
+    let exact = aisix_cache::RedisCache::connect_with(&cfg, &policy)
+        .await
+        .expect("exact cache connects through the relay");
+    let vector = aisix_cache::RedisSemanticCache::connect_with(&cfg, &policy)
+        .await
+        .expect("vector store connects through the relay");
+
+    relay.blackhole();
+
+    let started = std::time::Instant::now();
+    // The four operations one chat request performs, in order.
+    let _ = exact.get("subsystem-budget").await;
+    let _ = vector
+        .lookup("policy-1", 1, "scope", &[1.0, 0.0], 0.5)
+        .await;
+    let _ = exact.put("subsystem-budget", sample("hi")).await;
+    let _ = vector
+        .store(
+            "policy-1",
+            1,
+            "scope",
+            "subsystem-budget",
+            vec![1.0, 0.0],
+            sample("hi"),
+            Duration::from_secs(60),
+            100,
+        )
+        .await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_secs(BUDGET_SECS),
+        "one operation must actually reach the blackhole and spend its \
+         budget; {elapsed:?} means the relay was never in the path",
+    );
+    assert!(
+        elapsed < Duration::from_millis(BUDGET_SECS * 1000 + 1_500),
+        "the request must pay ONE budget for the subsystem, not one per \
+         connection; took {elapsed:?}",
+    );
 }
