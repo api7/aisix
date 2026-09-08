@@ -34,7 +34,10 @@
 # The limiter fails open to per-replica counting when Redis errors, but an
 # unreachable Redis produces no error at all until something times out, so
 # without the bound a rate-limited request waits on TCP retransmission for
-# minutes. Lower it for a Redis on the same node; it must be >= 1.
+# minutes. Lower it for a Redis on the same node; it must be >= 1. After a
+# failure the limiter short-circuits for 30 seconds and then lets one
+# request probe, so an outage costs this budget once per 30 seconds rather
+# than once per request.
 #
 # Subsequent boots re-use the mTLS bundle written under
 # `managed.mtls_dir`.

@@ -44,7 +44,7 @@ const CALLER_KEY_HASH = createHash("sha256")
 
 // Below the 5s default on purpose: a bound derived from it cannot pass on
 // a gateway that ignored the configured budget.
-const TIMEOUT_SECS = 2;
+const TIMEOUT_SECS = 3;
 // One budget plus room for the mock upstream, the embedding call and
 // process scheduling. It has to stay under TWO budgets, which is what the
 // defect costs at this setting (measured 4.0s).
@@ -174,6 +174,11 @@ async function startEmbeddingMock(): Promise<{
 
 const SEMANTIC_MODEL = "cache-outage-semantic";
 const EXACT_MODEL = "cache-outage-exact";
+// Longer than the OLD 5s cool-off and shorter than the 30s one, so the
+// window length alone decides whether the cache write pays a second
+// budget. Non-streaming completions — the only responses this cache
+// stores — routinely run this long.
+const UPSTREAM_DELAY_MS = 7_000;
 
 /** Two chat models, each with its own redis cache policy — one carrying a
  *  `semantic` block, one exact-only — plus the embedding model the
@@ -244,82 +249,158 @@ async function timeChat(
   return { status: res.status, ms: Date.now() - started };
 }
 
+interface Fixture {
+  app: SpawnedApp;
+  upstream: OpenAiUpstream;
+  embed: Awaited<ReturnType<typeof startEmbeddingMock>>;
+  relay: Awaited<ReturnType<typeof startRedisBlackhole>>;
+  prefix: string;
+}
+
+/** One gateway with its own relay, so each case starts on a cool-off that
+ *  nothing has opened. Waiting one out instead would mean sleeping 30s. */
+async function bringUp(tag: string, responseDelayMs?: number): Promise<Fixture> {
+  const prefix = `/aisix-e2e-cache-outage-${tag}-${randomUUID()}`;
+  const upstream = await startOpenAiUpstream(
+    responseDelayMs ? { responseDelayMs } : {},
+  );
+  const embed = await startEmbeddingMock();
+  const relay = await startRedisBlackhole(REDIS_URL);
+  const app = await spawnApp({
+    extra: {
+      etcd: { endpoints: [ETCD_ENDPOINT], prefix },
+      cache: {
+        backend: "redis",
+        redis: { url: relay.url, timeout_secs: TIMEOUT_SECS },
+      },
+    },
+  });
+  await seed(prefix, embed.baseUrl, upstream.baseUrl);
+  const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+  await waitConfigPropagation(
+    async () => (await probe.listModels()).status === 200,
+  );
+  return { app, upstream, embed, relay, prefix };
+}
+
+async function tearDown(f: Fixture | undefined) {
+  if (!f) return;
+  await f.app.exit();
+  await f.upstream.close();
+  await f.embed.close();
+  await f.relay.close();
+  await new EtcdClient().deletePrefix(f.prefix);
+}
+
+async function vectorRedisReady(): Promise<boolean> {
+  return (await new EtcdClient().ping()) && (await redisVectorSupport(REDIS_URL)) === true;
+}
+
 describe("a Redis outage costs one request one budget for the whole cache", () => {
-  let app: SpawnedApp | undefined;
-  let upstream: OpenAiUpstream | undefined;
-  let embed: Awaited<ReturnType<typeof startEmbeddingMock>> | undefined;
-  let relay: Awaited<ReturnType<typeof startRedisBlackhole>> | undefined;
+  let f: Fixture | undefined;
   let ready = false;
-  const prefix = `/aisix-e2e-cache-outage-${randomUUID()}`;
 
   beforeAll(async () => {
-    const vector = await redisVectorSupport(REDIS_URL);
-    ready = (await new EtcdClient().ping()) && vector === true;
-    if (!ready) return;
-
-    upstream = await startOpenAiUpstream();
-    embed = await startEmbeddingMock();
-    relay = await startRedisBlackhole(REDIS_URL);
-    app = await spawnApp({
-      extra: {
-        etcd: { endpoints: [ETCD_ENDPOINT], prefix },
-        cache: {
-          backend: "redis",
-          redis: { url: relay.url, timeout_secs: TIMEOUT_SECS },
-        },
-      },
-    });
-    await seed(prefix, embed.baseUrl, upstream.baseUrl);
-    const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
-    await waitConfigPropagation(
-      async () => (await probe.listModels()).status === 200,
-    );
+    ready = await vectorRedisReady();
+    if (ready) f = await bringUp("fast");
   });
-
   afterAll(async () => {
-    await app?.exit();
-    await upstream?.close();
-    await embed?.close();
-    await relay?.close();
-    if (ready) await new EtcdClient().deletePrefix(prefix);
+    await tearDown(f);
   });
 
   test("a semantic policy pays one budget, not one per cache connection", async (ctx) => {
-    if (!ready || !app || !relay) {
+    if (!ready || !f) {
       ctx.skip();
       return;
     }
 
     // Healthy first, so both cache connections are established and the
     // semantic index exists before anything is broken.
-    const warm = await timeChat(app.proxyUrl, SEMANTIC_MODEL, "alpha warm");
+    const warm = await timeChat(f.app.proxyUrl, SEMANTIC_MODEL, "alpha warm");
     expect(warm.status).toBe(200);
 
-    relay.blackhole();
+    f.relay.blackhole();
 
-    const degraded = await timeChat(app.proxyUrl, SEMANTIC_MODEL, "alpha cold");
+    const degraded = await timeChat(f.app.proxyUrl, SEMANTIC_MODEL, "alpha cold");
     expect(degraded.status).toBe(200);
     expect(degraded.ms).toBeGreaterThanOrEqual(TIMEOUT_SECS * 1000);
     expect(degraded.ms).toBeLessThan(ONE_BUDGET_MS);
 
     // Behind it the cool-off is open, so the next request costs nothing.
-    const behind = await timeChat(app.proxyUrl, SEMANTIC_MODEL, "alpha behind");
+    const behind = await timeChat(f.app.proxyUrl, SEMANTIC_MODEL, "alpha behind");
     expect(behind.status).toBe(200);
     expect(behind.ms).toBeLessThan(1_000);
   }, 60_000);
+});
 
-  test("an exact-only policy still pays one budget", async (ctx) => {
-    if (!ready || !app || !relay) {
+// The cache read and the cache write of one request straddle the upstream
+// call, so "one budget per request" holds only while the cool-off outlasts
+// that call. At the 5s window this case paid a second budget on the write
+// — the reason the window is 30s. The case above cannot see it: its
+// upstream answers instantly, so its write lands inside any window.
+describe("an upstream slower than the old cool-off still costs one budget", () => {
+  let f: Fixture | undefined;
+  let ready = false;
+
+  beforeAll(async () => {
+    ready = await vectorRedisReady();
+    if (ready) f = await bringUp("slow", UPSTREAM_DELAY_MS);
+  }, 60_000);
+  afterAll(async () => {
+    await tearDown(f);
+  });
+
+  test("the cache write is still covered by the cool-off its read opened", async (ctx) => {
+    if (!ready || !f) {
       ctx.skip();
       return;
     }
 
-    // The previous test left the cool-off open; wait it out so this
-    // request is admitted as a probe and genuinely reaches the black
-    // hole, rather than passing by short-circuiting.
-    await new Promise((r) => setTimeout(r, 6_000));
+    const warm = await timeChat(f.app.proxyUrl, SEMANTIC_MODEL, "alpha warm");
+    expect(warm.status).toBe(200);
 
-    const degraded = await timeChat(app.proxyUrl, EXACT_MODEL, "exact cold");
+    f.relay.blackhole();
+
+    const degraded = await timeChat(f.app.proxyUrl, SEMANTIC_MODEL, "alpha cold");
+    expect(degraded.status).toBe(200);
+    // The exact lookup spends one budget, then the upstream runs; the
+    // writes that follow must short-circuit.
+    expect(degraded.ms).toBeGreaterThanOrEqual(
+      UPSTREAM_DELAY_MS + TIMEOUT_SECS * 1000,
+    );
+    // The bound sits between "one budget" (delay + budget) and "two"
+    // (delay + 2 x budget), with at least a second of room on each side
+    // so neither verdict rides on scheduling noise.
+    expect(degraded.ms).toBeLessThan(
+      UPSTREAM_DELAY_MS + TIMEOUT_SECS * 1000 + 2_000,
+    );
+  }, 60_000);
+});
+
+describe("an exact-only policy still pays one budget", () => {
+  let f: Fixture | undefined;
+  let ready = false;
+
+  beforeAll(async () => {
+    ready = await vectorRedisReady();
+    if (ready) f = await bringUp("exact");
+  });
+  afterAll(async () => {
+    await tearDown(f);
+  });
+
+  test("one connection, one budget", async (ctx) => {
+    if (!ready || !f) {
+      ctx.skip();
+      return;
+    }
+
+    const warm = await timeChat(f.app.proxyUrl, EXACT_MODEL, "exact warm");
+    expect(warm.status).toBe(200);
+
+    f.relay.blackhole();
+
+    const degraded = await timeChat(f.app.proxyUrl, EXACT_MODEL, "exact cold");
     expect(degraded.status).toBe(200);
     expect(degraded.ms).toBeGreaterThanOrEqual(TIMEOUT_SECS * 1000);
     expect(degraded.ms).toBeLessThan(ONE_BUDGET_MS);

@@ -48,8 +48,10 @@
 //!   remaining unbounded wait lived.
 //! - **A cool-off breaker, shared per subsystem.** Paying the timeout on *every* request during
 //!   an outage is still a several-second latency floor for as long as the
-//!   outage lasts. After a connectivity failure the connection is held
-//!   open for [`BREAKER_WINDOW`]; commands issued inside that window
+//!   outage lasts. After a connectivity failure the subsystem is held
+//!   open for [`BREAKER_WINDOW`] — 30s, long enough to span an upstream
+//!   call so a request's cache write is still covered by the cool-off its
+//!   cache read opened; commands issued inside that window
 //!   return an error immediately, with no round trip, so each consumer's
 //!   existing fail-open branch runs at once. The first command after the
 //!   window probes Redis normally and closes the breaker on success.
@@ -81,7 +83,14 @@ use tokio::sync::Mutex;
 /// not configurable: it trades at most this much staleness (a Redis that
 /// recovered mid-window is not noticed until the window ends) for a hard
 /// ceiling on how often a request pays the full timeout during an outage.
-pub const BREAKER_WINDOW: Duration = Duration::from_secs(5);
+///
+/// Sized to outlast an upstream call, not to be a small multiple of the
+/// command budget. A request's cache read and its cache write straddle
+/// the upstream leg, so a window shorter than that leg leaves the write
+/// to find the cool-off expired and pay the budget a second time — which
+/// is what a 5s window did, since the non-streaming completions this
+/// cache stores routinely take longer than that.
+pub const BREAKER_WINDOW: Duration = Duration::from_secs(30);
 
 /// A long-lived Redis client handle. Cheap to [`Clone`] (every variant is
 /// `Arc`-backed). Build one with [`connect`].
@@ -156,13 +165,12 @@ struct Guard {
 /// first failure short-circuit the operations that follow it inside the
 /// cool-off window.
 ///
-/// That is not the same as "once per request", and the difference is
-/// worth knowing: the two lookups run back to back, but the two writes
-/// run after the upstream call, so a request whose upstream leg outlives
-/// [`BREAKER_WINDOW`] finds the window expired and its write is admitted
-/// as the next probe. Such a request pays two budgets rather than four.
-/// Closing that last gap needs either a window longer than an upstream
-/// call or per-request degradation state; neither is decided here.
+/// The two lookups run back to back, but the two writes run after the
+/// upstream call, so this holds for a whole request only while
+/// [`BREAKER_WINDOW`] outlasts that upstream leg — which is why the
+/// window is 30s rather than a small multiple of the budget. A request
+/// whose upstream call runs longer than the window still finds it
+/// expired and pays a second budget on the write that follows.
 ///
 /// Sharing the policy does NOT share the connection: the two cache
 /// connections stay separate so they do not serialize on one pipeline.
@@ -195,8 +203,8 @@ impl Guard {
     /// A success closes the breaker; a *connectivity* failure or a
     /// timeout opens it. A failure the server itself reported (a script
     /// error, `WRONGTYPE`, an ACL refusal) is returned untouched — Redis
-    /// answered, so short-circuiting the next five seconds of traffic
-    /// would be wrong.
+    /// answered, so short-circuiting the subsystem's next half minute of
+    /// traffic would be wrong.
     async fn run<T>(
         &self,
         fut: impl std::future::Future<Output = RedisResult<T>>,
@@ -1012,7 +1020,8 @@ mod guard_tests {
 
     /// A reply from a live Redis — a script error, `WRONGTYPE`, an ACL
     /// refusal — is not an outage. Tripping on it would short-circuit
-    /// five seconds of healthy traffic every time one command is wrong.
+    /// the whole cool-off of healthy traffic every time one command is
+    /// wrong.
     #[tokio::test]
     async fn an_error_redis_itself_reported_does_not_open_the_breaker() {
         let g = guard(80, 5_000);

@@ -258,19 +258,19 @@ cache:
   #   # A Redis that stops answering without closing the socket (host down,
   #   # network partition, stopped container) would otherwise block the
   #   # request for minutes instead of degrading it. After a failure,
-  #   # commands short-circuit for about five seconds and then ONE request
-  #   # probes, so an outage costs this budget roughly once per five
-  #   # seconds rather than once per request. Must be >= 1.
+  #   # commands short-circuit for 30 seconds and then ONE request probes,
+  #   # so an outage costs this budget roughly once per 30 seconds rather
+  #   # than once per request. Must be >= 1.
   #   #
   #   # The cool-off is per SUBSYSTEM, not per connection. This cache
   #   # opens two connections to this Redis — the exact-KV one and, for
   #   # policies with a `semantic` block, the vector-search one — and they
-  #   # share one cool-off, so CONSECUTIVE cache operations pay this budget
-  #   # once between them rather than once each. A request whose upstream
-  #   # call outlives the cool-off can still pay it a second time on the
-  #   # cache write that follows, because the window will have expired by
-  #   # then: expect one budget when the upstream answers quickly and two
-  #   # when it does not.
+  #   # share one cool-off, so a request pays this budget once for the
+  #   # cache rather than once per cache operation. The 30-second cool-off
+  #   # is sized to outlast an upstream call, because a request's cache
+  #   # read and its cache write straddle that call; a request whose
+  #   # upstream leg runs longer than 30 seconds finds the cool-off expired
+  #   # and pays a second budget on the write.
   #   #
   #   # In sentinel mode, discovering the master is not one round trip —
   #   # the client walks the sentinels one at a time — so that step gets
@@ -305,7 +305,7 @@ ratelimit:
   #   # The limiter is a separate subsystem from the cache and cools off
   #   # independently, so a request that uses both can pay one budget for
   #   # each while a shared Redis is down — but only one within each,
-  #   # however many connections that subsystem holds.
+  #   # however many Redis operations that subsystem performs.
   #   # timeout_secs: 5
   # Seconds before an unreleased concurrency slot (crashed replica /
   # hung upstream) is reclaimed. Redis backend only.
