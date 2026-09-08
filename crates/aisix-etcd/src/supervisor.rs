@@ -724,8 +724,9 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// Stops after the first watch error — the outer [`Self::run`] loop
     /// decides whether to backoff and retry.
     pub async fn load_once(&self) -> Result<BuildStats, ProviderError> {
-        let (entries, revision) = self.load_all_prefixes().await?;
-        let stats = self.apply_resync(&entries);
+        let load = self.load_all_prefixes().await?;
+        let revision = load.max_revision();
+        let stats = self.apply_resync(&load.entries);
         // apply_resync uses max(entry revisions); bump to the etcd
         // load_all revision so the cache file records the true "as
         // of" point, not just the max entry write.
@@ -745,7 +746,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// Kine revisions are cluster-global, so the maximum is the point the
     /// whole read is consistent as of, and it is what the heartbeat
     /// reports as `applied_revision`.
-    async fn load_all_prefixes(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
+    async fn load_all_prefixes(&self) -> Result<PrefixLoad, ProviderError> {
         // Deduplicated by key, because the prefixes can nest: when the
         // gateway has no `env_id` the environment prefix is the bare base
         // and `<base>/global/` sits inside it, so both range reads return
@@ -754,7 +755,13 @@ impl<P: ConfigProvider> Supervisor<P> {
         // not — `accepted` and the per-field partially-compatible row
         // counts are sums, and those numbers are reported.
         let mut all: BTreeMap<String, RawEntry> = BTreeMap::new();
-        let mut revision = 0i64;
+        // Per source, and not just the maximum: each prefix's watch has
+        // to start from the revision ITS OWN range read was consistent
+        // as of. The reads run in sequence, so a later prefix reports a
+        // higher revision, and starting an earlier prefix's watch there
+        // would skip every write to it in between — absent from that
+        // read and never delivered to that watch.
+        let mut revisions: Vec<Option<i64>> = Vec::with_capacity(self.sources.len());
         for source in &self.sources {
             match source.provider.load_all().await {
                 Ok((entries, rev)) => {
@@ -773,17 +780,21 @@ impl<P: ConfigProvider> Supervisor<P> {
                             }
                         }
                     }
-                    revision = revision.max(rev);
+                    revisions.push(Some(rev));
                 }
                 Err(err) if source.tolerates(&err) => {
                     // Read as empty: the prefix contributes no rows and no
                     // revision, and readiness is not held back.
                     source.log_refusal(&err);
+                    revisions.push(None);
                 }
                 Err(err) => return Err(err),
             }
         }
-        Ok((all.into_values().collect(), revision))
+        Ok(PrefixLoad {
+            entries: all.into_values().collect(),
+            revisions,
+        })
     }
 
     /// Bump the recorded revision floor. Used by the cycle path to
@@ -1398,21 +1409,26 @@ impl<P: ConfigProvider> Supervisor<P> {
         &self,
         cancel: &tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), SupervisorError> {
-        let (entries, revision) = self
+        let load = self
             .load_all_prefixes()
             .await
             .map_err(SupervisorError::Provider)?;
+        let revision = load.max_revision();
 
         // ONE resync over the union: the snapshot is published only after
         // every prefix has been read, so readiness means every prefix's
         // initial load completed and no request can observe the
         // environment loaded and the catalog not.
-        self.apply_resync(&entries);
+        self.apply_resync(&load.entries);
         self.set_revision_floor(revision);
 
         let mut streams = Vec::with_capacity(self.sources.len());
-        for source in &self.sources {
-            match source.provider.watch(revision + 1).await {
+        for (source, from) in self.sources.iter().zip(&load.revisions) {
+            // Each prefix resumes from its own read, never from the
+            // maximum across prefixes. A prefix whose read was refused
+            // has no revision to resume from and no stream this cycle.
+            let Some(from) = *from else { continue };
+            match source.provider.watch(from + 1).await {
                 Ok(stream) => streams.push(stream),
                 Err(err) if source.tolerates(&err) => {
                     // No stream for this prefix this cycle. It is retried
@@ -1558,6 +1574,24 @@ impl<P: ConfigProvider> Supervisor<P> {
                 }
             }
         }
+    }
+}
+
+/// One pass of [`Supervisor::load_all_prefixes`]: the union of every
+/// watched prefix's rows, plus the revision each prefix's own read was
+/// consistent as of (`None` for a refusal that was tolerated).
+struct PrefixLoad {
+    entries: Vec<RawEntry>,
+    revisions: Vec<Option<i64>>,
+}
+
+impl PrefixLoad {
+    /// The revision the snapshot as a whole reflects. kine revisions are
+    /// cluster-global, so the highest any prefix reported is the point
+    /// the combined read is consistent as of, and it is what the
+    /// heartbeat reports as `applied_revision`.
+    fn max_revision(&self) -> i64 {
+        self.revisions.iter().flatten().copied().max().unwrap_or(0)
     }
 }
 
@@ -2103,6 +2137,8 @@ mod tests {
         entries: Vec<RawEntry>,
         revision: i64,
         refuse: bool,
+        /// The `start_revision` this provider's watch was opened with.
+        watched_from: Mutex<Option<i64>>,
     }
 
     impl ScopedProvider {
@@ -2111,6 +2147,7 @@ mod tests {
                 entries,
                 revision,
                 refuse: false,
+                watched_from: Mutex::new(None),
             })
         }
 
@@ -2119,6 +2156,7 @@ mod tests {
                 entries: Vec::new(),
                 revision: 0,
                 refuse: true,
+                watched_from: Mutex::new(None),
             })
         }
     }
@@ -2136,11 +2174,12 @@ mod tests {
 
         async fn watch(
             &self,
-            _start_revision: i64,
+            start_revision: i64,
         ) -> Result<
             Box<dyn futures::Stream<Item = Result<WatchEvent, ProviderError>> + Send + Unpin>,
             ProviderError,
         > {
+            *self.watched_from.lock().unwrap() = Some(start_revision);
             if self.refuse {
                 return Err(ProviderError::Rejected(
                     "etcdserver: permission denied: outside env env-1 prefix".into(),
@@ -2283,6 +2322,34 @@ mod tests {
         assert!(sup.recent_rejections().is_empty());
         // The revision floor comes from the prefix that did answer.
         assert_eq!(sup.watch_status().snapshot().revision, 12);
+    }
+
+    #[tokio::test]
+    async fn each_prefix_resumes_from_its_own_read() {
+        // The range reads run in sequence, so the later prefix reports a
+        // higher revision. Resuming BOTH watches from the maximum would
+        // skip every write to the earlier prefix made in between: absent
+        // from its read, and before the point its watch begins. The
+        // window is one range read wide and the loss is silent until the
+        // next resync.
+        let env =
+            ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 1)], 7);
+        let global =
+            ScopedProvider::serving(vec![entry("/aisix/global/pricing/g", VALID_PRICE, 1)], 42);
+        let sup = scoped_supervisor(Arc::clone(&env), Arc::clone(&global));
+
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        sup.cycle(&rx).await.expect("cycle completes");
+
+        assert_eq!(
+            *env.watched_from.lock().unwrap(),
+            Some(8),
+            "the environment watch must resume from its OWN read (7), not from the maximum (42)",
+        );
+        assert_eq!(*global.watched_from.lock().unwrap(), Some(43));
+        // The reported applied revision is still the maximum: it is what
+        // the whole combined read is consistent as of.
+        assert_eq!(sup.watch_status().snapshot().revision, 42);
     }
 
     #[tokio::test]
