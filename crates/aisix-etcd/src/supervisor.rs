@@ -746,13 +746,33 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// whole read is consistent as of, and it is what the heartbeat
     /// reports as `applied_revision`.
     async fn load_all_prefixes(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
-        let mut all = Vec::new();
+        // Deduplicated by key, because the prefixes can nest: when the
+        // gateway has no `env_id` the environment prefix is the bare base
+        // and `<base>/global/` sits inside it, so both range reads return
+        // the catalog's rows. The snapshot and the observed-state map are
+        // both keyed and would absorb the repeat, but the BuildStats are
+        // not — `accepted` and the per-field partially-compatible row
+        // counts are sums, and those numbers are reported.
+        let mut all: BTreeMap<String, RawEntry> = BTreeMap::new();
         let mut revision = 0i64;
         for source in &self.sources {
             match source.provider.load_all().await {
                 Ok((entries, rev)) => {
                     source.clear_refusal();
-                    all.extend(entries);
+                    for entry in entries {
+                        match all.entry(entry.key.clone()) {
+                            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                                // Two reads of one key are two points in
+                                // time; keep the later write.
+                                if entry.revision > slot.get().revision {
+                                    slot.insert(entry);
+                                }
+                            }
+                            std::collections::btree_map::Entry::Vacant(slot) => {
+                                slot.insert(entry);
+                            }
+                        }
+                    }
                     revision = revision.max(rev);
                 }
                 Err(err) if source.tolerates(&err) => {
@@ -763,7 +783,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                 Err(err) => return Err(err),
             }
         }
-        Ok((all, revision))
+        Ok((all.into_values().collect(), revision))
     }
 
     /// Bump the recorded revision floor. Used by the cycle path to
@@ -2163,6 +2183,44 @@ mod tests {
         assert_eq!(snap.models.len(), 1);
         assert_eq!(snap.pricing.len(), 1);
         assert_eq!(snap.global_pricing.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_row_both_prefixes_return_is_counted_once() {
+        // The nesting case: with no `env_id` the environment prefix is
+        // the bare base, so `<base>/global/` is inside it and the
+        // catalog's rows come back from BOTH range reads. The snapshot
+        // absorbs the repeat because it is keyed; `accepted` is a sum and
+        // would report two rows where etcd holds one.
+        let shared = entry("/aisix/global/pricing/p-1", VALID_PRICE, 4);
+        let sup = Arc::new(Supervisor::with_sources(
+            vec![
+                (
+                    WatchedPrefix::environment("/aisix"),
+                    ScopedProvider::serving(
+                        vec![entry("/aisix/models/m-1", VALID_MODEL, 3), shared.clone()],
+                        4,
+                    ),
+                ),
+                (
+                    WatchedPrefix::global("/aisix/global/"),
+                    ScopedProvider::serving(vec![shared], 4),
+                ),
+            ],
+            SnapshotCache::disabled(),
+        ));
+
+        let stats = sup.load_once().await.unwrap();
+        assert_eq!(
+            stats.accepted, 2,
+            "one model and one price, counted once each"
+        );
+        let snap = sup.handle().load();
+        assert_eq!(snap.models.len(), 1);
+        // Resolved to the catalog table by the longer prefix, not to the
+        // environment's, even though the outer prefix also returned it.
+        assert_eq!(snap.global_pricing.len(), 1);
+        assert_eq!(snap.pricing.len(), 0);
     }
 
     #[tokio::test]
