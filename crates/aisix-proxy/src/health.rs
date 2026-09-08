@@ -1644,6 +1644,20 @@ mod tests {
     }
 
     #[test]
+    fn exclusion_log_gate_does_not_extend_the_window_when_suppressed() {
+        let t = ModelRuntimeStatusTracker::new();
+        let key = ("g-1".to_string(), "m-1".to_string(), "cooling");
+        let logged_at = Instant::now() - EXCLUSION_LOG_INTERVAL / 2;
+        t.exclusion_log.insert(key.clone(), logged_at);
+
+        for _ in 0..8 {
+            assert!(!t.should_log_exclusion("g-1", "m-1", "cooling"));
+            // Busy traffic must not postpone the next log indefinitely.
+            assert_eq!(*t.exclusion_log.get(&key).unwrap(), logged_at);
+        }
+    }
+
+    #[test]
     fn exclusion_log_gate_reopens_after_the_interval_without_blocking() {
         let t = Arc::new(ModelRuntimeStatusTracker::new());
         t.exclusion_log.insert(
