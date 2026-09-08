@@ -732,14 +732,22 @@ fn model_pricing_key_is_dropped_from_the_export() {
     for m in models {
         assert!(m.get("pricing_key").is_none(), "{m:?}");
     }
-    // Losing it costs the first model its price entirely, which is worth
-    // saying; the second still carries `cost`, so nothing is lost there.
-    assert_eq!(doc.warnings.len(), 1, "{:?}", doc.warnings);
-    assert!(
-        doc.warnings[0].contains("priced-by-catalog") && doc.warnings[0].contains("least_cost"),
-        "{:?}",
-        doc.warnings
-    );
+    // BOTH are reported. The first loses its price outright. The second
+    // keeps a number, but a DIFFERENT one — the document outranks the
+    // inline `cost` at runtime, so exporting silently reprices it.
+    assert_eq!(doc.warnings.len(), 2, "{:?}", doc.warnings);
+    let by_catalog = doc
+        .warnings
+        .iter()
+        .find(|w| w.contains("priced-by-catalog"))
+        .expect("the model with no inline cost is reported");
+    assert!(by_catalog.contains("least_cost"), "{by_catalog:?}");
+    let inline_too = doc
+        .warnings
+        .iter()
+        .find(|w| w.contains("priced-inline-too"))
+        .expect("the model that falls back to a different price is reported");
+    assert!(inline_too.contains("`cost`"), "{inline_too:?}");
     assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
 }
 

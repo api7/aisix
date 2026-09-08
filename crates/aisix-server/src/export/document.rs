@@ -672,9 +672,13 @@ fn resugar_provider_key(
 /// A pricing document lives in a collection the resources file does not
 /// have, and the shared catalog lives outside the exported prefix
 /// entirely, so the reference cannot be resugared into anything a file
-/// can resolve. Dropping it costs the model its price unless it also
-/// carries an inline `cost`, which is worth saying: the exported model
-/// then ranks last under `least_cost` rather than at its real price.
+/// can resolve.
+///
+/// Dropping it always changes what the model costs, so it is always
+/// reported. A model carrying an inline `cost` too is NOT safe to pass
+/// over: the document wins at runtime, so the exported file prices that
+/// model at its `cost` instead — silently, and by a different number
+/// whenever the two disagree.
 fn drop_pricing_key(doc: &mut Value, model: &str, diag: &mut Diagnostics) {
     let Some(map) = doc.as_object_mut() else {
         return;
@@ -683,6 +687,11 @@ fn drop_pricing_key(doc: &mut Value, model: &str, diag: &mut Diagnostics) {
         return;
     };
     if map.contains_key("cost") {
+        diag.warnings.push(format!(
+            "model {model:?} is priced by the pricing document {key:?}, which a resources file \
+             cannot express — the exported model falls back to its inline `cost`, which is a \
+             different price whenever the two disagree"
+        ));
         return;
     }
     diag.warnings.push(format!(

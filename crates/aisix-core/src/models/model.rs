@@ -307,6 +307,7 @@ pub struct Model {
 
     /// Name of a shared `pricing` document to take the per-token cost from, instead of setting `cost` on this model. The environment's own pricing documents are searched first and the shared catalog second; when the key matches neither, `cost` applies. Editing the pricing document repricies every model naming it, with no change to the models themselves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 255))]
     pub pricing_key: Option<String>,
 
     /// Direct-model-only background health-check configuration.

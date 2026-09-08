@@ -109,6 +109,25 @@ describe("global pricing e2e: pricing documents drive least_cost", () => {
     });
   }
 
+  /**
+   * Wait until the two pricing tables together hold `total` rows.
+   *
+   * `waitForModels` cannot stand in for this: the catalog is a separate
+   * prefix on its own watch, so a model can be listed while the price
+   * that ranks it has not landed. Counting rows is the only signal the
+   * gateway exposes for the catalog, and it is upstream-neutral.
+   */
+  async function waitForPricingRows(total: number): Promise<void> {
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.metricsUrl}/status/config`);
+      if (!res.ok) return false;
+      const counts =
+        ((await res.json()) as { applied?: { resource_counts?: Record<string, number> } }).applied
+          ?.resource_counts ?? {};
+      return (counts.pricing ?? 0) + (counts.global_pricing ?? 0) >= total;
+    });
+  }
+
   /** Which upstream served, by the content the mock answers with. */
   async function ask(model: string, prompt: string): Promise<string | null | undefined> {
     const completion = await client().chat.completions.create({
@@ -128,9 +147,11 @@ describe("global pricing e2e: pricing documents drive least_cost", () => {
     const pricey = await startOpenAiUpstream({ nonStreamBody: okBody("g-pricey-served") });
     upstreams.push(cheap, pricey);
 
-    // Neither target carries `cost`. Everything ranking them comes from
-    // the catalog, so a test that passes with the documents removed is
-    // not testing anything.
+    // The catalog says cheap < pricey. The inline `cost` on each model
+    // says the OPPOSITE, so a resolver that consulted `cost` first would
+    // serve the other upstream and fail this case — without the
+    // conflicting values, omitting `cost` entirely would let such a
+    // resolver pass.
     await global.createPricing({ key: "vendor/g-cheap", input_per_1k: 0.1, output_per_1k: 0.1 });
     await global.createPricing({ key: "vendor/g-pricey", input_per_1k: 10, output_per_1k: 10 });
 
@@ -142,9 +163,16 @@ describe("global pricing e2e: pricing documents drive least_cost", () => {
         targets: [{ model: "g-pricey" }, { model: "g-cheap" }],
       },
     });
-    await createOpenAiModel("g-cheap", cheap, { pricing_key: "vendor/g-cheap" });
-    await createOpenAiModel("g-pricey", pricey, { pricing_key: "vendor/g-pricey" });
+    await createOpenAiModel("g-cheap", cheap, {
+      pricing_key: "vendor/g-cheap",
+      cost: { input_per_1k: 50, output_per_1k: 50 },
+    });
+    await createOpenAiModel("g-pricey", pricey, {
+      pricing_key: "vendor/g-pricey",
+      cost: { input_per_1k: 0.01, output_per_1k: 0.01 },
+    });
     await waitForModels("g-cheap", "g-pricey");
+    await waitForPricingRows(2);
 
     const cheapBaseline = cheap.receivedRequests.length;
     const priceyBaseline = pricey.receivedRequests.length;
@@ -181,6 +209,8 @@ describe("global pricing e2e: pricing documents drive least_cost", () => {
     await createOpenAiModel("env-a", a, { pricing_key: "vendor/env-a" });
     await createOpenAiModel("env-b", b, { pricing_key: "vendor/env-b" });
     await waitForModels("env-a", "env-b");
+    // Three more rows than the previous case left behind.
+    await waitForPricingRows(5);
 
     const aBaseline = a.receivedRequests.length;
     const bBaseline = b.receivedRequests.length;
@@ -254,6 +284,7 @@ describe("global pricing e2e: pricing documents drive least_cost", () => {
     const modelA = await createOpenAiModel("flip-a", a, { pricing_key: "vendor/flip-a" });
     await createOpenAiModel("flip-b", b, { pricing_key: "vendor/flip-b" });
     await waitForModels("flip-a", "flip-b");
+    await waitForPricingRows(7);
 
     const before = await seed.raw("models", modelA.id);
     expect(await ask("flip-virtual", "a is cheaper")).toBe("flip-a-served");

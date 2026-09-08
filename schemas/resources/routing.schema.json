@@ -85,7 +85,7 @@
           "type": "string"
         },
         {
-          "description": "Rank targets cheapest-first by the target model's `cost` (combined input+output per-1K price), then fall forward. Targets without a configured `cost` rank last.",
+          "description": "Rank targets cheapest-first by the target model's resolved price (combined input+output per-1K), then fall forward. A target is priced by the `pricing` document its `pricing_key` names, or by its inline `cost` when it names none; a target with no price at all ranks last.",
           "enum": [
             "least_cost"
           ],
