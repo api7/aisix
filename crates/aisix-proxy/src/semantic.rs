@@ -152,14 +152,15 @@ pub(crate) async fn resolve(
         .expect("resolve called on a non-semantic model");
     let router = &router_entry.value;
 
+    // Every alias this function dispatches to is read through the model
+    // reference helpers: a router that names its targets by id keeps
+    // working across a rename of any of them, and an id that resolves to
+    // nothing behaves as the dangling alias it stands in for.
+    let default_target = semantic.default_ref(snapshot);
+
     // No user text to classify (e.g. a system-only or tool-only request):
     // route to `default` without an embedding call rather than embedding an
     // empty string, which could spuriously match a route.
-    // Every alias below is resolved through the model reference helpers:
-    // a router that names its targets by id keeps working across a rename
-    // of any of them, and an id that resolves to nothing behaves as the
-    // dangling alias it stands in for.
-    let default_target = semantic.default_ref(snapshot);
     if prompt.trim().is_empty() {
         let (attempt, _) =
             select_eligible(state, snapshot, router, source_ip, &default_target, None)?;
