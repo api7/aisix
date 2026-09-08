@@ -110,14 +110,10 @@ struct SemanticParams {
     /// what telemetry reports.
     embedding_model: String,
     embedding_model_id: Option<String>,
-    /// What a [`GuardrailScore`] names as the model that produced it: the
-    /// id when the row names its embedder by one, the alias otherwise.
-    /// Cosine scores are not comparable across embedding models, so a
-    /// score is unreadable without knowing which model produced it — and
-    /// under an id-form reference the alias is not that model (it is
-    /// ignored, and may be empty). Neither spelling changes across
-    /// requests, so the identity in a stored event stays stable even
-    /// though the model's display name may not.
+    /// What the failure log names when nothing resolved: the id when the
+    /// row names its embedder by one, the alias otherwise. A SCORE never
+    /// uses this — it carries the display name the embedder resolved,
+    /// which is the model that actually produced the number.
     embedding_model_identity: String,
     deny_examples: Vec<String>,
     allow_examples: Vec<String>,
@@ -222,7 +218,7 @@ impl SemanticGuardrail {
             )
             .await
         {
-            Ok(v) if v.len() == prototypes.len() => v,
+            Ok(v) if v.vectors.len() == prototypes.len() => v.vectors,
             Ok(_) => return self.on_failure(EmbedFailure::Upstream, fail_open),
             Err(failure) => return self.on_failure(failure, fail_open),
         };
@@ -239,10 +235,15 @@ impl SemanticGuardrail {
             )
             .await
         {
-            Ok(v) if v.len() == texts.len() => v,
+            Ok(v) if v.vectors.len() == texts.len() => v,
             Ok(_) => return self.on_failure(EmbedFailure::Upstream, fail_open),
             Err(failure) => return self.on_failure(failure, fail_open),
         };
+        // The model that actually produced these numbers, by its current
+        // display name — what a score has to carry, and what neither
+        // spelling in the row reliably is.
+        let scored_by = candidate_vecs.model;
+        let candidate_vecs = candidate_vecs.vectors;
 
         let (deny_vecs, allow_vecs) = prototype_vecs.split_at(self.cfg.deny_examples.len());
 
@@ -273,8 +274,14 @@ impl SemanticGuardrail {
             }
         }
 
-        self.report(hook, "deny", self.cfg.deny_threshold, deny_peak);
-        self.report(hook, "allow", self.cfg.allow_threshold, allow_trough);
+        self.report(hook, "deny", self.cfg.deny_threshold, deny_peak, &scored_by);
+        self.report(
+            hook,
+            "allow",
+            self.cfg.allow_threshold,
+            allow_trough,
+            &scored_by,
+        );
         verdict
     }
 
@@ -288,6 +295,7 @@ impl SemanticGuardrail {
         direction: &'static str,
         threshold: f32,
         extreme: Option<(usize, f32)>,
+        scored_by: &str,
     ) {
         let (Some(log), Some((index, score))) = (self.scores.as_ref(), extreme) else {
             return;
@@ -300,7 +308,7 @@ impl SemanticGuardrail {
             threshold,
             matched: score >= threshold,
             top_example_index: index as u32,
-            embedding_model: self.cfg.embedding_model_identity.clone(),
+            embedding_model: scored_by.to_owned(),
         });
     }
 
@@ -557,7 +565,7 @@ mod tests {
             texts: &[String],
             _cacheable: bool,
             _timeout: Duration,
-        ) -> Result<Vec<Vec<f32>>, EmbedFailure> {
+        ) -> Result<crate::Embedded, EmbedFailure> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             self.calls.lock().unwrap().push(texts.to_vec());
             if let Some(failure) = self.fail {
@@ -567,7 +575,13 @@ mod tests {
             if self.wrong_length {
                 out.pop();
             }
-            Ok(out)
+            Ok(crate::Embedded {
+                // The name the embedder RESOLVED, deliberately unlike the
+                // alias the row is configured with (`embed-1`), so a score
+                // reporting the configured spelling is visible as wrong.
+                model: "resolved-embedder".to_owned(),
+                vectors: out,
+            })
         }
     }
 
@@ -989,7 +1003,11 @@ mod tests {
         let deny = score_of(&scores, "deny");
         assert_eq!(deny.guardrail_name, ROW);
         assert_eq!(deny.hook, "input");
-        assert_eq!(deny.embedding_model, "embed-1");
+        // The model the EMBEDDER resolved, not the alias the row was
+        // configured with — a row referencing its embedder by id has no
+        // reliable alias, and one referencing it by a name that has since
+        // been renamed has a stale one.
+        assert_eq!(deny.embedding_model, "resolved-embedder");
         assert_eq!(deny.threshold, 0.75);
         assert_eq!(deny.score, 0.0, "orthogonal topics score exactly 0");
         assert!(!deny.matched);

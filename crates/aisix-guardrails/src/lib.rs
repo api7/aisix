@@ -279,7 +279,23 @@ pub trait GuardrailEmbedder: Send + Sync + 'static {
         texts: &[String],
         cacheable: bool,
         timeout: std::time::Duration,
-    ) -> Result<Vec<Vec<f32>>, EmbedFailure>;
+    ) -> Result<Embedded, EmbedFailure>;
+}
+
+/// One embedding call's result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Embedded {
+    /// Current display name of the `embedding`-kind Model that produced
+    /// these vectors.
+    ///
+    /// Returned rather than taken from the row's config because a score is
+    /// unreadable without the model that produced it, and the row's own
+    /// `embedding_model` is not reliably that model: under an id-form
+    /// reference it is ignored, may be stale after a rename, and may be
+    /// absent entirely.
+    pub model: String,
+    /// One vector per input, in input order.
+    pub vectors: Vec<Vec<f32>>,
 }
 
 /// The process-wide guardrail embedder, passed to the chain builders.

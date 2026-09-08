@@ -1414,11 +1414,24 @@
         {
           "anyOf": [
             {
+              "properties": {
+                "embedding_model": {
+                  "type": "string"
+                }
+              },
               "required": [
                 "embedding_model"
               ]
             },
             {
+              "properties": {
+                "embedding_model_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
               "required": [
                 "embedding_model_id"
               ]
@@ -1479,7 +1492,10 @@
         "embedding_model_id": {
           "description": "Resource id of the `embedding`-kind Model used to embed both the examples and the screened text. Present, it is authoritative and `embedding_model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this row screening with it and needs no edit here. An id resolving to no model is an embedder that cannot be resolved, exactly as an `embedding_model` naming no model is — the row degrades per `fail_open`, fail-closed by default.\n\nDefaulted at the type level for the same reason `embedding_model` is: the strict write schema requires one of the two, the read path requires neither, and a screening row that fails to load is fail-OPEN.",
           "minLength": 1,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "enabled": {
           "default": true,

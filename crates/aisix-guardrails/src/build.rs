@@ -3487,8 +3487,11 @@ mod tests {
             texts: &[String],
             _cacheable: bool,
             _timeout: std::time::Duration,
-        ) -> Result<Vec<Vec<f32>>, crate::EmbedFailure> {
-            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        ) -> Result<crate::Embedded, crate::EmbedFailure> {
+            Ok(crate::Embedded {
+                model: "stub-embedder".to_owned(),
+                vectors: texts.iter().map(|_| vec![1.0, 0.0]).collect(),
+            })
         }
     }
 
@@ -3554,7 +3557,9 @@ mod tests {
         assert_eq!(scores[0].guardrail_name, "semantic-row");
         assert_eq!(scores[0].hook, "input");
         assert_eq!(scores[0].direction, "deny");
-        assert_eq!(scores[0].embedding_model, "embed-1");
+        // The model the embedder RESOLVED for this call, not the alias
+        // the row configures — the row may name its embedder by id.
+        assert_eq!(scores[0].embedding_model, "stub-embedder");
         assert!(scores[0].matched);
     }
 

@@ -981,9 +981,9 @@ async fn host_embed(
     // The script names the model by alias — `aisix.embed(name, texts)` is
     // the whole surface — so there is no id spelling to pass here.
     match embedder.embed(&model, None, &texts, false, budget).await {
-        Ok(vectors) => serde_json::to_string(&EmbedResult {
+        Ok(embedded) => serde_json::to_string(&EmbedResult {
             error: None,
-            vectors,
+            vectors: embedded.vectors,
         })
         .unwrap_or_else(|e| embed_error(e.to_string())),
         Err(failure) => {
@@ -1818,9 +1818,9 @@ mod tests {
                 texts: &[String],
                 _cacheable: bool,
                 _timeout: Duration,
-            ) -> Result<Vec<Vec<f32>>, crate::EmbedFailure> {
+            ) -> Result<crate::Embedded, crate::EmbedFailure> {
                 // "jailbreak" points one way, everything else the other.
-                Ok(texts
+                let vectors = texts
                     .iter()
                     .map(|t| {
                         if t.contains("jailbreak") {
@@ -1829,7 +1829,11 @@ mod tests {
                             vec![0.0, 1.0]
                         }
                     })
-                    .collect())
+                    .collect();
+                Ok(crate::Embedded {
+                    model: "stub-embedder".to_owned(),
+                    vectors,
+                })
             }
         }
         let cfg = config(

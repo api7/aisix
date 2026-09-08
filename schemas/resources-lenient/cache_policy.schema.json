@@ -33,11 +33,21 @@
         {
           "anyOf": [
             {
+              "properties": {
+                "embedding_model": {
+                  "type": "string"
+                }
+              },
               "required": [
                 "embedding_model"
               ]
             },
             {
+              "properties": {
+                "embedding_model_id": {
+                  "type": "string"
+                }
+              },
               "required": [
                 "embedding_model_id"
               ]
@@ -55,7 +65,10 @@
         "embedding_model_id": {
           "description": "Resource id of the `embedding` model used to embed requests. Present, it is authoritative and `embedding_model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this policy pointing at it with no edit to this document. An id resolving to no model leaves similarity matching off for the policy, exactly as an `embedding_model` naming no model does.",
           "minLength": 1,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "embedding_timeout_ms": {
           "description": "Per-call deadline for the embedding request in milliseconds. `0` or absent disables the embedding-specific deadline. On timeout the request proceeds to the upstream uncached.",
@@ -97,7 +110,10 @@
     "applies_to_model_id": {
       "description": "Scopes the policy to one model, named by resource id. Present, it is authoritative and `applies_to` is ignored entirely — the policy applies to the model this id resolves to and to nothing else. The id is resolved against the models in the current configuration, so renaming that model keeps the policy scoped to it with no edit to this document. An id resolving to no model makes the policy match nothing, exactly as `\"model:<name>\"` naming no model does.",
       "minLength": 1,
-      "type": "string"
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "backend": {
       "allOf": [

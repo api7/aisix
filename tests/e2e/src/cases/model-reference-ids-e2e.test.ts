@@ -736,7 +736,13 @@ describe("model references by resource id", () => {
       200,
     );
 
-    // …and the guardrail document is never rewritten across it.
+    // …and only the EMBEDDING MODEL's row is rewritten across it —
+    // neither the guardrail nor its attachment is touched. That is the
+    // point of the case, not incidental setup: the guardrail chain is
+    // cached and rebuilt only when the guardrail or attachment tables
+    // change, so a build-time resolution would survive this rename and
+    // the case would pass for the wrong reason. Do not "fix" a future
+    // failure here by also rewriting the guardrail row.
     await seed.update("models", ids["mr-embed-guard-renamed"], {
       display_name: "mr-embed-guard-renamed-v2",
       provider: "openai",

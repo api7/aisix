@@ -1,123 +1,175 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "EnsembleConfig",
-  "type": "object",
-  "required": [
-    "judge",
-    "panel"
-  ],
+  "additionalProperties": false,
+  "definitions": {
+    "Judge": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "model": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model"
+              ]
+            },
+            {
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model_id"
+              ]
+            }
+          ]
+        }
+      ],
+      "description": "The judge model that synthesizes the panel responses into one answer. The judge model is named either by `model` (its display name) or by `model_id` (its resource id); the judge must carry at least one of the two.",
+      "properties": {
+        "model": {
+          "description": "Model alias for the direct model that synthesizes panel responses. Read only when `model_id` is absent.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "model_id": {
+          "description": "Resource id of the direct model that synthesizes panel responses. Present, it is authoritative and `model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps the judge pointing at it with no edit to this document. An id resolving to no model is a judge that does not exist, exactly as a `model` naming no model is.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "synthesis_prompt": {
+          "description": "Override for the built-in synthesis prompt template.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "PanelMember": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "model": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model"
+              ]
+            },
+            {
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model_id"
+              ]
+            }
+          ]
+        }
+      ],
+      "description": "One member of an ensemble panel. The member model is named either by `model` (its display name) or by `model_id` (its resource id); a member must carry at least one of the two.",
+      "properties": {
+        "model": {
+          "description": "Model alias for a direct model that receives one panel request. Read only when `model_id` is absent.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "model_id": {
+          "description": "Resource id of the direct model that receives one panel request. Present, it is authoritative and `model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this member pointing at it with no edit to this document. An id resolving to no model is a panel member that does not exist, exactly as a `model` naming no model is.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "seed": {
+          "description": "Sampling seed for this panel member.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "temperature": {
+          "description": "Sampling temperature for this panel member. Omit it to keep the request's temperature.",
+          "format": "float",
+          "minimum": 0.0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "weight": {
+          "description": "Reserved for a future voting/quorum strategy. AISIX currently ignores this field.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
   "properties": {
     "judge": {
-      "description": "Direct model that combines successful panel responses.",
       "allOf": [
         {
           "$ref": "#/definitions/Judge"
         }
-      ]
+      ],
+      "description": "Direct model that combines successful panel responses."
     },
     "min_responses": {
       "description": "Minimum successful panel responses required before judge synthesis. When omitted, the gateway requires the smaller of 2 and the panel size.",
+      "format": "uint32",
+      "minimum": 1.0,
       "type": [
         "integer",
         "null"
-      ],
-      "format": "uint32",
-      "minimum": 1.0
+      ]
     },
     "panel": {
       "description": "Direct models called concurrently for each ensemble request.",
-      "type": "array",
       "items": {
         "$ref": "#/definitions/PanelMember"
       },
-      "minItems": 1
+      "minItems": 1,
+      "type": "array"
     },
     "timeout_ms": {
       "description": "Per-call upstream deadline applied to each panel member and the judge. Set `0` or omit it to disable the ensemble-level deadline.",
+      "format": "uint64",
+      "minimum": 0.0,
       "type": [
         "integer",
         "null"
-      ],
-      "format": "uint64",
-      "minimum": 0.0
+      ]
     }
   },
-  "additionalProperties": false,
-  "definitions": {
-    "Judge": {
-      "description": "The judge model that synthesizes the panel responses into one answer. The judge model is named either by `model` (its display name) or by `model_id` (its resource id); the judge must carry at least one of the two.",
-      "type": "object",
-      "properties": {
-        "model": {
-          "description": "Model alias for the direct model that synthesizes panel responses. Read only when `model_id` is absent.",
-          "type": "string",
-          "minLength": 1
-        },
-        "model_id": {
-          "description": "Resource id of the direct model that synthesizes panel responses. Present, it is authoritative and `model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps the judge pointing at it with no edit to this document. An id resolving to no model is a judge that does not exist, exactly as a `model` naming no model is.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "minLength": 1
-        },
-        "synthesis_prompt": {
-          "description": "Override for the built-in synthesis prompt template.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "minLength": 1
-        }
-      },
-      "additionalProperties": false
-    },
-    "PanelMember": {
-      "description": "One member of an ensemble panel. The member model is named either by `model` (its display name) or by `model_id` (its resource id); a member must carry at least one of the two.",
-      "type": "object",
-      "properties": {
-        "model": {
-          "description": "Model alias for a direct model that receives one panel request. Read only when `model_id` is absent.",
-          "type": "string",
-          "minLength": 1
-        },
-        "model_id": {
-          "description": "Resource id of the direct model that receives one panel request. Present, it is authoritative and `model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this member pointing at it with no edit to this document. An id resolving to no model is a panel member that does not exist, exactly as a `model` naming no model is.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "minLength": 1
-        },
-        "seed": {
-          "description": "Sampling seed for this panel member.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0.0
-        },
-        "temperature": {
-          "description": "Sampling temperature for this panel member. Omit it to keep the request's temperature.",
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "float",
-          "minimum": 0.0
-        },
-        "weight": {
-          "description": "Reserved for a future voting/quorum strategy. AISIX currently ignores this field.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0.0
-        }
-      },
-      "additionalProperties": false
-    }
-  }
+  "required": [
+    "judge",
+    "panel"
+  ],
+  "title": "EnsembleConfig",
+  "type": "object"
 }

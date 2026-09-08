@@ -162,29 +162,61 @@ const KINDS: [(&str, IdentityField); 14] = [
     ),
 ];
 
-/// The id-form model references a document of `kind` can carry, paired
-/// with the name-form field each replaces.
+/// One id-form model reference a document can carry: the field, the
+/// name-form field that replaces it, and how an operator should spell that
+/// name form.
+///
+/// `hint` is not decoration. It is the same as `name_field` for every
+/// reference whose name form takes a bare model name, and differs for the
+/// one that does not: a cache policy's model scope is written into the
+/// free-form `applies_to`, where a bare name parses as no discriminator at
+/// all and the policy silently WIDENS to every request instead of failing.
+/// An error message that told an operator to "use `applies_to`" would be
+/// walking them into that.
+pub struct ModelRefIdField {
+    pub field: &'static str,
+    pub name_field: &'static str,
+    pub hint: &'static str,
+}
+
+const fn pair(field: &'static str, name_field: &'static str) -> ModelRefIdField {
+    ModelRefIdField {
+        field,
+        name_field,
+        hint: name_field,
+    }
+}
+
+/// The id-form model references a document of `kind` can carry.
 ///
 /// A projected document may point at a Model by resource id instead of by
 /// display name, which is what makes a reference survive a rename of the
-/// model. The pairing is public because two consumers must agree on it:
-/// the resources file refuses the id form (see [`load_from_str`]) and
-/// `aisix export` rewrites it back to the name form, and a field one of
-/// them knows about and the other does not is a silent round-trip loss.
-pub fn model_ref_id_fields(kind: &str) -> &'static [(&'static str, &'static str)] {
+/// model. The list is public because two consumers must agree on it: the
+/// resources file refuses the id form (see [`load_from_str`]) and `aisix
+/// export` rewrites it back to the name form, and a field one of them
+/// knows about and the other does not is a silent round-trip loss.
+pub fn model_ref_id_fields(kind: &str) -> &'static [ModelRefIdField] {
+    const API_KEYS: [ModelRefIdField; 1] = [pair("allowed_model_ids", "allowed_models")];
+    const MODELS: [ModelRefIdField; 4] = [
+        pair("model_id", "model"),
+        pair("target_id", "target"),
+        pair("embedding_model_id", "embedding_model"),
+        pair("default_id", "default"),
+    ];
+    const CACHE_POLICIES: [ModelRefIdField; 2] = [
+        ModelRefIdField {
+            field: "applies_to_model_id",
+            name_field: "applies_to",
+            hint: "applies_to: \"model:<name>\"",
+        },
+        pair("embedding_model_id", "embedding_model"),
+    ];
+    const GUARDRAILS: [ModelRefIdField; 1] = [pair("embedding_model_id", "embedding_model")];
     match kind {
-        "api_keys" => &[("allowed_model_ids", "allowed_models")],
-        "models" => &[
-            ("model_id", "model"),
-            ("target_id", "target"),
-            ("embedding_model_id", "embedding_model"),
-            ("default_id", "default"),
-        ],
-        "cache_policies" => &[
-            ("applies_to_model_id", "applies_to"),
-            ("embedding_model_id", "embedding_model"),
-        ],
-        "guardrails" => &[("embedding_model_id", "embedding_model")],
+        "api_keys" => &API_KEYS,
+        "models" => &MODELS,
+        "cache_policies" => &CACHE_POLICIES,
+        "guardrails" => &GUARDRAILS,
         _ => &[],
     }
 }
@@ -249,9 +281,8 @@ pub fn for_each_model_ref_node(
     }
 }
 
-/// The first id-form model reference `doc` carries, as `(field, name-form
-/// replacement)`.
-fn model_ref_id_field(kind: &str, doc: &mut Value) -> Option<(&'static str, &'static str)> {
+/// The first id-form model reference `doc` carries.
+fn model_ref_id_field(kind: &str, doc: &mut Value) -> Option<&'static ModelRefIdField> {
     let fields = model_ref_id_fields(kind);
     if fields.is_empty() {
         return None;
@@ -259,10 +290,7 @@ fn model_ref_id_field(kind: &str, doc: &mut Value) -> Option<(&'static str, &'st
     let mut found = None;
     for_each_model_ref_node(kind, doc, &mut |node| {
         if found.is_none() {
-            found = fields
-                .iter()
-                .find(|(field, _)| node.contains_key(*field))
-                .copied();
+            found = fields.iter().find(|f| node.contains_key(f.field));
         }
     });
     found
@@ -503,13 +531,14 @@ pub fn load_from_str(
         // path is the opposite: there an id that resolves to no model
         // degrades that one reference and must never fail the row, because
         // a rejected api_key stops authenticating entirely.)
-        if let Some((field, name_field)) = model_ref_id_field(entry.kind, &mut entry.doc) {
+        if let Some(reference) = model_ref_id_field(entry.kind, &mut entry.doc) {
+            let (field, hint) = (reference.field, reference.hint);
             errors.push(LoadError {
                 scope,
                 message: format!(
                     "the resources file does not accept `{field}` — it names a model by \
                      control-plane id, which a file cannot resolve; name the model with \
-                     `{name_field}` instead"
+                     `{hint}` instead"
                 ),
             });
             continue;

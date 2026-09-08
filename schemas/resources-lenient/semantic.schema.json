@@ -1,5 +1,55 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "allOf": [
+    {
+      "anyOf": [
+        {
+          "properties": {
+            "embedding_model": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "embedding_model"
+          ]
+        },
+        {
+          "properties": {
+            "embedding_model_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "embedding_model_id"
+          ]
+        }
+      ]
+    },
+    {
+      "anyOf": [
+        {
+          "properties": {
+            "default": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "default"
+          ]
+        },
+        {
+          "properties": {
+            "default_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "default_id"
+          ]
+        }
+      ]
+    }
+  ],
   "definitions": {
     "Aggregation": {
       "description": "How a request's per-example similarity scores collapse into one score for the route. v1 uses `max` (the single best-matching example), chosen for explainability — the UI surfaces \"the top matching example\" — over semantic-router's default sum/mean-over-top_k.",
@@ -111,6 +161,32 @@
       "type": "object"
     },
     "SemanticRoute": {
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "target": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target"
+              ]
+            },
+            {
+              "properties": {
+                "target_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target_id"
+              ]
+            }
+          ]
+        }
+      ],
       "description": "One semantic route: a labeled set of example utterances whose embeddings define the route. A request that scores high enough against them dispatches to `target`.",
       "properties": {
         "description": {

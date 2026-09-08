@@ -298,11 +298,21 @@
         {
           "anyOf": [
             {
+              "properties": {
+                "model": {
+                  "type": "string"
+                }
+              },
               "required": [
                 "model"
               ]
             },
             {
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                }
+              },
               "required": [
                 "model_id"
               ]
@@ -320,7 +330,10 @@
         "model_id": {
           "description": "Resource id of the direct model that synthesizes panel responses. Present, it is authoritative and `model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps the judge pointing at it with no edit to this document. An id resolving to no model is a judge that does not exist, exactly as a `model` naming no model is.",
           "minLength": 1,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "synthesis_prompt": {
           "description": "Override for the built-in synthesis prompt template.",
@@ -369,11 +382,24 @@
             {
               "anyOf": [
                 {
+                  "properties": {
+                    "target": {
+                      "type": "string"
+                    }
+                  },
                   "required": [
                     "target"
                   ]
                 },
                 {
+                  "properties": {
+                    "target_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
                   "required": [
                     "target_id"
                   ]
@@ -391,7 +417,10 @@
             "target_id": {
               "description": "Resource id of the direct model to route to when embedding fails. Present, it is authoritative and `target` is ignored, so renaming that model keeps this fallback pointing at it with no edit to this document.",
               "minLength": 1,
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "type": "object"
@@ -405,11 +434,21 @@
         {
           "anyOf": [
             {
+              "properties": {
+                "model": {
+                  "type": "string"
+                }
+              },
               "required": [
                 "model"
               ]
             },
             {
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                }
+              },
               "required": [
                 "model_id"
               ]
@@ -427,7 +466,10 @@
         "model_id": {
           "description": "Resource id of the direct model that receives one panel request. Present, it is authoritative and `model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this member pointing at it with no edit to this document. An id resolving to no model is a panel member that does not exist, exactly as a `model` naming no model is.",
           "minLength": 1,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "seed": {
           "description": "Sampling seed for this panel member.",
@@ -618,11 +660,21 @@
         {
           "anyOf": [
             {
+              "properties": {
+                "model": {
+                  "type": "string"
+                }
+              },
               "required": [
                 "model"
               ]
             },
             {
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                }
+              },
               "required": [
                 "model_id"
               ]
@@ -640,7 +692,10 @@
         "model_id": {
           "description": "Resource id of the direct model that can receive routed traffic. Present, it is authoritative and `model` is ignored: the id is resolved against the models in the current configuration and the name it resolves to is the target, so renaming that model keeps this target pointing at it with no edit to this document. An id resolving to no model is a target that does not exist, exactly as a `model` naming no model is.",
           "minLength": 1,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "priority": {
           "description": "Priority tier, default `0`; a higher value is preferred (the APISIX node-priority convention — give backup targets `-1`). The strategy orders targets within each tier; a lower tier is only tried when every higher-tier target failed or is unavailable.",
@@ -670,11 +725,21 @@
         {
           "anyOf": [
             {
+              "properties": {
+                "embedding_model": {
+                  "type": "string"
+                }
+              },
               "required": [
                 "embedding_model"
               ]
             },
             {
+              "properties": {
+                "embedding_model_id": {
+                  "type": "string"
+                }
+              },
               "required": [
                 "embedding_model_id"
               ]
@@ -684,11 +749,21 @@
         {
           "anyOf": [
             {
+              "properties": {
+                "default": {
+                  "type": "string"
+                }
+              },
               "required": [
                 "default"
               ]
             },
             {
+              "properties": {
+                "default_id": {
+                  "type": "string"
+                }
+              },
               "required": [
                 "default_id"
               ]
@@ -706,7 +781,10 @@
         "default_id": {
           "description": "Resource id of the direct model used when no route clears its threshold. Present, it is authoritative and `default` is ignored, so renaming that model keeps this router pointing at it with no edit to this document.",
           "minLength": 1,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "embedding_model": {
           "description": "Alias of an `embedding`-modality Model used to embed the request and (at apply time) the route examples. Read only when `embedding_model_id` is absent.",
@@ -716,7 +794,10 @@
         "embedding_model_id": {
           "description": "Resource id of the `embedding`-modality Model used to embed the request and the route examples. Present, it is authoritative and `embedding_model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this router pointing at it with no edit to this document. An id resolving to no model is an embedding model that does not exist, exactly as an `embedding_model` naming no model is — the router applies `on_embedding_failure`.",
           "minLength": 1,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "embedding_timeout_ms": {
           "description": "Per-call deadline for the embedding request in milliseconds. `0` or absent disables the embedding-specific deadline.",
@@ -796,11 +877,21 @@
         {
           "anyOf": [
             {
+              "properties": {
+                "target": {
+                  "type": "string"
+                }
+              },
               "required": [
                 "target"
               ]
             },
             {
+              "properties": {
+                "target_id": {
+                  "type": "string"
+                }
+              },
               "required": [
                 "target_id"
               ]
@@ -837,7 +928,10 @@
         "target_id": {
           "description": "Resource id of the direct model that receives traffic matching this route. Present, it is authoritative and `target` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this route pointing at it with no edit to this document. An id resolving to no model is a route target that does not exist, exactly as a `target` naming no model is.",
           "minLength": 1,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "threshold": {
           "description": "Per-route similarity threshold. A request matches this route only when its aggregated score is `>=` this value. When omitted, the router-level threshold applies.",

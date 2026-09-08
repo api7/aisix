@@ -733,16 +733,17 @@ fn resugar_model_refs(
     let mut blocking: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     aisix_core::filesource::for_each_model_ref_node(kind, doc, &mut |node| {
-        for (id_field, name_field) in fields {
+        for reference in fields {
+            let (id_field, name_field) = (reference.field, reference.name_field);
             // Only a STRING id is rewritten here. `api_keys` carries an
             // array of them and has its own resugar
             // (`resugar_allowed_models`), so leaving a non-string in
             // place is what keeps the two from colliding if this ever
             // gains that kind.
-            let Some(Value::String(id)) = node.get(*id_field).cloned() else {
+            let Some(Value::String(id)) = node.get(id_field).cloned() else {
                 continue;
             };
-            node.remove(*id_field);
+            node.remove(id_field);
             let resolved = model_names.get(&id).cloned();
             if resolved.is_none() {
                 let message = format!(
@@ -761,12 +762,12 @@ fn resugar_model_refs(
             // `applies_to` string rather than a field of its own, and
             // overrides whatever that string held — the same precedence
             // the gateway applies.
-            let value = if *id_field == "applies_to_model_id" {
+            let value = if id_field == "applies_to_model_id" {
                 format!("model:{name}")
             } else {
                 name
             };
-            node.insert((*name_field).to_string(), Value::String(value));
+            node.insert(name_field.to_string(), Value::String(value));
         }
     });
     diag.blocking.extend(blocking);

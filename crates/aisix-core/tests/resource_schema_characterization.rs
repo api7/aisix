@@ -1057,7 +1057,8 @@ fn every_refused_model_reference_id_is_a_declared_field() {
             !fields.is_empty(),
             "{kind} has model references but refuses none"
         );
-        for (id_field, name_field) in fields {
+        for reference in fields {
+            let (id_field, name_field) = (reference.field, reference.name_field);
             assert!(
                 declares(&schema, id_field),
                 "{kind} refuses `{id_field}`, which the {resource} schema does not declare"
@@ -1066,6 +1067,88 @@ fn every_refused_model_reference_id_is_a_declared_field() {
                 declares(&schema, name_field),
                 "{kind} rewrites `{id_field}` to `{name_field}`, which the {resource} schema \
                  does not declare"
+            );
+            // The hint is what an operator is told to write instead, so it
+            // has to START with the name field — a hint naming a different
+            // field would send them somewhere the reference does not live.
+            assert!(
+                reference.hint.starts_with(name_field),
+                "{kind}'s hint for `{id_field}` ({:?}) does not name `{name_field}`",
+                reference.hint
+            );
+        }
+    }
+}
+
+/// Every `<name>` / `<name>_id` pair a resource declares is registered as
+/// a model reference.
+///
+/// The other direction of the check above, and the one that actually
+/// rots: a future site gains an id spelling, nobody adds it to
+/// `filesource::model_ref_id_fields`, and from then on the resources file
+/// SILENTLY accepts an id it can never resolve (with the name spelling
+/// ignored on top) while `aisix export` silently drops it. Nothing else
+/// notices, because a field no table mentions simply never matches.
+///
+/// Detected structurally rather than by name or by prose: a property
+/// ending `_id` (or `_ids`) whose name-form sibling is declared on the
+/// SAME object is the shape every model reference has. Sibling-less ids
+/// — `provider_key_id`, `team_id`, `user_id` — are not pairs and are not
+/// reported. A reference whose name form is spelled differently
+/// (`applies_to_model_id` → `applies_to`) cannot be found this way, which
+/// is why it is registered by hand; this check only ever demands MORE
+/// registration, never less.
+#[test]
+fn every_declared_name_and_id_pair_is_registered_as_a_model_reference() {
+    /// The name-form sibling `field` would pair with, if any.
+    fn name_form(field: &str) -> Option<String> {
+        if let Some(stem) = field.strip_suffix("_ids") {
+            return Some(format!("{stem}s"));
+        }
+        field.strip_suffix("_id").map(str::to_owned)
+    }
+
+    fn collect_pairs(node: &Value, out: &mut Vec<String>) {
+        match node {
+            Value::Object(map) => {
+                if let Some(Value::Object(properties)) = map.get("properties") {
+                    for field in properties.keys() {
+                        if name_form(field).is_some_and(|n| properties.contains_key(&n)) {
+                            out.push(field.clone());
+                        }
+                    }
+                }
+                for child in map.values() {
+                    collect_pairs(child, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    collect_pairs(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (kind, resource) in [
+        ("api_keys", "api_key"),
+        ("models", "model"),
+        ("cache_policies", "cache_policy"),
+        ("guardrails", "guardrail"),
+    ] {
+        let mut found = Vec::new();
+        collect_pairs(&resource_root_schema(resource, true), &mut found);
+        found.sort();
+        found.dedup();
+        let registered = aisix_core::filesource::model_ref_id_fields(kind);
+        for field in found {
+            assert!(
+                registered.iter().any(|r| r.field == field),
+                "the {resource} schema declares `{field}` beside its name form, but \
+                 `filesource::model_ref_id_fields(\"{kind}\")` does not list it — the \
+                 resources file would accept an id it can never resolve, and `aisix export` \
+                 would drop it"
             );
         }
     }

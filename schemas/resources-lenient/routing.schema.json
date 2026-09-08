@@ -106,6 +106,32 @@
       ]
     },
     "RoutingTarget": {
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "model": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model"
+              ]
+            },
+            {
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model_id"
+              ]
+            }
+          ]
+        }
+      ],
       "description": "One destination in a routing configuration. The target model is named either by `model` (its display name) or by `model_id` (its resource id); a target must carry at least one of the two.",
       "properties": {
         "model": {

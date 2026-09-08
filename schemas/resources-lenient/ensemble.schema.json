@@ -2,6 +2,32 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
     "Judge": {
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "model": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model"
+              ]
+            },
+            {
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model_id"
+              ]
+            }
+          ]
+        }
+      ],
       "description": "The judge model that synthesizes the panel responses into one answer. The judge model is named either by `model` (its display name) or by `model_id` (its resource id); the judge must carry at least one of the two.",
       "properties": {
         "model": {
@@ -29,6 +55,32 @@
       "type": "object"
     },
     "PanelMember": {
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "model": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model"
+              ]
+            },
+            {
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model_id"
+              ]
+            }
+          ]
+        }
+      ],
       "description": "One member of an ensemble panel. The member model is named either by `model` (its display name) or by `model_id` (its resource id); a member must carry at least one of the two.",
       "properties": {
         "model": {

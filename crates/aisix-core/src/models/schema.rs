@@ -857,17 +857,113 @@ pub fn model_root_schema(strict: bool) -> Value {
     // reference as a name or as a resource id. Applied to both contracts:
     // these fields were required on the read path too, so relaxing only the
     // write path would leave a stored id-only reference dropping its row.
-    for (definition, name, id) in [
-        ("RoutingTarget", "model", "model_id"),
-        ("PanelMember", "model", "model_id"),
-        ("Judge", "model", "model_id"),
-        ("SemanticRoute", "target", "target_id"),
-        ("Semantic", "embedding_model", "embedding_model_id"),
-        ("Semantic", "default", "default_id"),
-    ] {
-        require_name_or_id_in(&mut schema, definition, name, id);
-    }
+    apply_model_ref_alternatives(&mut schema);
     schema
+}
+
+/// Every `(type, name field, id field)` a model reference is written as.
+///
+/// One table, applied by [`apply_model_ref_alternatives`] to whatever
+/// schema carries the type — the resource root schemas here, and the
+/// standalone nested-type files `dump-schema` publishes beside them.
+/// Without it those files would say a routing target requires no fields
+/// at all, which is not the contract the enforced copy states.
+///
+/// The `kind: semantic` guardrail's embedder is not here: it lives in a
+/// `oneOf` branch rather than a named type, and it is required on the
+/// write path only (see [`guardrail_root_schema`]).
+pub const MODEL_REF_TYPES: &[(&str, &str, &str)] = &[
+    ("RoutingTarget", "model", "model_id"),
+    ("PanelMember", "model", "model_id"),
+    ("Judge", "model", "model_id"),
+    ("SemanticRoute", "target", "target_id"),
+    ("Semantic", "embedding_model", "embedding_model_id"),
+    ("Semantic", "default", "default_id"),
+    (
+        "SemanticCacheConfig",
+        "embedding_model",
+        "embedding_model_id",
+    ),
+];
+
+/// Every id-form model-reference FIELD, wherever it appears.
+///
+/// Distinct from [`MODEL_REF_TYPES`], which is keyed by the type carrying
+/// the pair: two of these sit somewhere no named type covers — a cache
+/// policy's `applies_to_model_id` on the resource root, and the
+/// `kind: semantic` guardrail's `embedding_model_id` inside a `oneOf`
+/// branch.
+const MODEL_REF_ID_FIELDS: &[&str] = &[
+    "model_id",
+    "target_id",
+    "embedding_model_id",
+    "default_id",
+    "applies_to_model_id",
+];
+
+/// Let every [`MODEL_REF_ID_FIELDS`] property accept an explicit `null`,
+/// at any depth.
+///
+/// A producer that spells "no id here" as `null` rather than by omitting
+/// the key must mean the same thing — the reference falls back to its
+/// name — and it does at the type level, where serde reads `null` into
+/// `None`. The schema is what decides whether serde ever sees the
+/// document: these resources render `Option` WITHOUT the null type
+/// (`struct_root_schema(false)`), so an explicit `null` would fail
+/// validation and the loader would skip the whole row. `api_key`, which
+/// renders with it, already accepts `null` on `allowed_model_ids` — this
+/// keeps the id form answering to `null` the same way on every resource
+/// rather than only on the one that happens to render nullably.
+fn allow_null_on_model_ref_ids(schema: &mut Value) {
+    match schema {
+        Value::Object(map) => {
+            if let Some(Value::Object(properties)) = map.get_mut("properties") {
+                for field in MODEL_REF_ID_FIELDS {
+                    let Some(Value::Object(property)) = properties.get_mut(*field) else {
+                        continue;
+                    };
+                    if property.get("type") == Some(&json!("string")) {
+                        property.insert("type".to_string(), json!(["string", "null"]));
+                    }
+                }
+            }
+            for child in map.values_mut() {
+                allow_null_on_model_ref_ids(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                allow_null_on_model_ref_ids(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Turn every [`MODEL_REF_TYPES`] entry `schema` carries into a "name or
+/// id" alternative — whether the type is the schema's ROOT (a standalone
+/// nested-type file) or one of its `definitions`. Types the schema does
+/// not carry are skipped. Also widens every id field to accept `null`
+/// (see [`allow_null_on_model_ref_ids`]).
+pub fn apply_model_ref_alternatives(schema: &mut Value) {
+    allow_null_on_model_ref_ids(schema);
+    let root_title = schema
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    for (type_name, name, id) in MODEL_REF_TYPES {
+        if root_title.as_deref() == Some(*type_name) {
+            if let Some(root) = schema.as_object_mut() {
+                require_name_or_id(root, name, id);
+            }
+        }
+        if let Some(node) = schema
+            .pointer_mut(&format!("/definitions/{type_name}"))
+            .and_then(Value::as_object_mut)
+        {
+            require_name_or_id(node, name, id);
+        }
+    }
 }
 
 /// Canonical JSON Schema for the `api_key` resource, derived from the
@@ -944,22 +1040,23 @@ fn require_name_or_id(node: &mut serde_json::Map<String, Value>, name: &str, id:
             node.remove("required");
         }
     }
-    let clause = json!({"anyOf": [{"required": [name]}, {"required": [id]}]});
+    // Each branch pins its field to a STRING, not merely to being
+    // present: `required` in JSON Schema is satisfied by a key whose
+    // value is `null`, and the id fields accept `null` (see
+    // `allow_null_on_model_ref_ids`). Without the type, `{"model_id":
+    // null}` — which names no model at all — would validate.
+    let clause = json!({
+        "anyOf": [
+            {"required": [name], "properties": {name: {"type": "string"}}},
+            {"required": [id], "properties": {id: {"type": "string"}}},
+        ]
+    });
     match node.get_mut("allOf").and_then(Value::as_array_mut) {
         Some(list) => list.push(clause),
         None => {
             node.insert("allOf".to_string(), json!([clause]));
         }
     }
-}
-
-/// [`require_name_or_id`] addressed at one `definitions` entry.
-fn require_name_or_id_in(schema: &mut Value, definition: &str, name: &str, id: &str) {
-    let node = schema
-        .pointer_mut(&format!("/definitions/{definition}"))
-        .and_then(Value::as_object_mut)
-        .unwrap_or_else(|| panic!("schema defines {definition}"));
-    require_name_or_id(node, name, id);
 }
 
 /// Canonical JSON Schema for the `provider_key` resource, derived from the
@@ -1649,6 +1746,10 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
         }
     }
     close_definitions(&mut schema);
+    // On BOTH contracts, unlike the requirement injected above: an
+    // explicit `null` must mean the same as omitting the key on the read
+    // path too, or a row that spells it that way is skipped whole.
+    allow_null_on_model_ref_ids(&mut schema);
     schema
 }
 
@@ -1807,12 +1908,7 @@ pub fn cache_policy_root_schema() -> Value {
     // The similarity layer's embedding model is named either way, like
     // every other model reference. `applies_to` needs no alternative: it
     // has a default, and `applies_to_model_id` simply overrides it.
-    require_name_or_id_in(
-        &mut schema,
-        "SemanticCacheConfig",
-        "embedding_model",
-        "embedding_model_id",
-    );
+    apply_model_ref_alternatives(&mut schema);
     schema
 }
 
@@ -2182,6 +2278,75 @@ mod tests {
             unknown_field_paths("model", &bogus),
             vec!["routing.targets.0.bogus_id"]
         );
+    }
+
+    /// An explicit `null` id means the same as omitting the key — the
+    /// reference falls back to its name — on BOTH contracts, and at every
+    /// site.
+    ///
+    /// The write path is the smaller half. On the read path a `null` the
+    /// schema rejects does not "ignore the field", it skips the whole
+    /// stored row: the model disappears, or the guardrail stops screening.
+    /// `api_key.allowed_model_ids` has accepted `null` since #1148 because
+    /// that resource happens to render `Option` nullably; a producer that
+    /// spells "unset" as `null` there and copies the idiom here must not
+    /// fall off a cliff.
+    #[test]
+    fn a_null_model_reference_id_means_the_same_as_an_absent_one() {
+        let model = json!({
+            "display_name": "g",
+            "routing": {"targets": [{"model": "a", "model_id": null}]},
+        });
+        validate_model(&model).unwrap();
+        validate_model_lenient(&model).unwrap();
+        assert_eq!(
+            serde_json::from_value::<crate::models::Model>(model.clone())
+                .unwrap()
+                .routing
+                .unwrap()
+                .targets[0]
+                .model_id,
+            None,
+            "serde reads a null id as absent; the schema must let it through to serde"
+        );
+
+        let semantic = json!({
+            "display_name": "s",
+            "semantic": {
+                "embedding_model": "e", "embedding_model_id": null,
+                "routes": [{"name": "r", "target": "t", "target_id": null, "examples": ["x"]}],
+                "default": "d", "default_id": null,
+                "match": {"threshold": 0.5},
+                "on_embedding_failure": {"target": "safe", "target_id": null}
+            }
+        });
+        validate_model(&semantic).unwrap();
+        validate_model_lenient(&semantic).unwrap();
+
+        let policy = json!({
+            "name": "p",
+            "applies_to": "all",
+            "applies_to_model_id": null,
+            "semantic": {"embedding_model": "e", "embedding_model_id": null, "threshold": 0.9}
+        });
+        validate_cache_policy(&policy).unwrap();
+        validate_cache_policy_lenient(&policy).unwrap();
+
+        let guardrail = json!({
+            "name": "g", "kind": "semantic",
+            "embedding_model": "e", "embedding_model_id": null,
+            "deny_examples": ["x"], "deny_threshold": 0.8
+        });
+        validate_guardrail(&guardrail).unwrap();
+        validate_guardrail_lenient(&guardrail).unwrap();
+
+        // A null id is not a way to name the model, though: it satisfies
+        // neither half of the alternative.
+        assert!(validate_model(&json!({
+            "display_name": "g",
+            "routing": {"targets": [{"model_id": null}]},
+        }))
+        .is_err());
     }
 
     /// Relaxing the name field must not make "names the model no way at

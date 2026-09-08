@@ -1195,15 +1195,33 @@ pub(crate) fn resolve_attempt_models(
     // rename of the model it points at; one whose id resolves to nothing
     // keeps the id as its name and is reported below as the missing target
     // it is — the same outcome a dangling `model` gets.
+    //
+    // Collapsing to one entry per resolved model is part of the same step,
+    // and not an optimisation: the loop below finds a picked name's target
+    // with `find`, so two entries resolving to the same model would give
+    // the second attempt the FIRST one's weight and priority and spend two
+    // `max_fallbacks` slots on one upstream. The write path rejects
+    // duplicate targets, but it can only compare the spelling each entry
+    // used — `{"model": "beta"}` beside `{"model_id": "<beta>"}` is one
+    // model written two ways and reaches this side intact.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let eligible: Vec<RoutingTarget> = eligible
         .into_iter()
-        .map(|t| {
+        .filter_map(|t| {
             let model = t.model_ref(snapshot).into_owned();
-            RoutingTarget {
+            if !seen.insert(model.clone()) {
+                tracing::debug!(
+                    virtual_model = %virtual_name,
+                    target_model = %model,
+                    "routing targets resolve to the same model; keeping the first",
+                );
+                return None;
+            }
+            Some(RoutingTarget {
                 model,
                 model_id: None,
                 ..t
-            }
+            })
         })
         .collect();
     // Client-IP pre-filter (AISIX-Cloud#1087 follow-up): a target whose own
@@ -1243,8 +1261,8 @@ pub(crate) fn resolve_attempt_models(
                 "routing target {name:?} does not resolve to a Model"
             ))
         })?;
-        // Duplicate target models are rejected at the write path, so the
-        // first match is the only match.
+        // One entry per resolved model (see the normalization above), so
+        // the first match is the only match.
         let target = routing
             .targets
             .iter()

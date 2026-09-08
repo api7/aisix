@@ -27,7 +27,7 @@ use std::time::Duration;
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, Model};
 use aisix_gateway::{BridgeError, Hub};
-use aisix_guardrails::{EmbedFailure, GuardrailEmbedder};
+use aisix_guardrails::{EmbedFailure, Embedded, GuardrailEmbedder};
 use async_trait::async_trait;
 
 use crate::error::ProxyError;
@@ -68,9 +68,18 @@ impl GuardrailEmbedder for ProxyGuardrailEmbedder {
         texts: &[String],
         cacheable: bool,
         timeout: Duration,
-    ) -> Result<Vec<Vec<f32>>, EmbedFailure> {
+    ) -> Result<Embedded, EmbedFailure> {
         if texts.is_empty() {
-            return Ok(Vec::new());
+            // No call, so nothing resolved and nothing to name. Safe
+            // because a caller with no texts also produces no score: the
+            // semantic guardrail's report is driven by the candidates it
+            // judged, and an empty batch judges none. A score carrying an
+            // empty `embedding_model` would be dropped whole downstream
+            // rather than shown without one.
+            return Ok(Embedded {
+                model: String::new(),
+                vectors: Vec::new(),
+            });
         }
         let snapshot = self.snapshot.load();
         // Resolved per call against the live table, so a rename of the
@@ -105,7 +114,10 @@ impl GuardrailEmbedder for ProxyGuardrailEmbedder {
             cached.push(hit);
         }
         if misses.is_empty() {
-            return Ok(cached.into_iter().map(Option::unwrap).collect());
+            return Ok(Embedded {
+                model: entry.value.display_name.clone(),
+                vectors: cached.into_iter().map(Option::unwrap).collect(),
+            });
         }
 
         let fetched = crate::semantic::embed_texts(
@@ -132,13 +144,16 @@ impl GuardrailEmbedder for ProxyGuardrailEmbedder {
         // Re-interleave: `fetched` is in `misses` order, which is the
         // order the `None` holes appear in.
         let mut fetched = fetched.into_iter();
-        Ok(cached
-            .into_iter()
-            .map(|slot| match slot {
-                Some(v) => v,
-                None => fetched.next().expect("miss count checked above"),
-            })
-            .collect())
+        Ok(Embedded {
+            model: entry.value.display_name.clone(),
+            vectors: cached
+                .into_iter()
+                .map(|slot| match slot {
+                    Some(v) => v,
+                    None => fetched.next().expect("miss count checked above"),
+                })
+                .collect(),
+        })
     }
 }
 
