@@ -529,18 +529,21 @@ async fn env_namespace_isolates_model_alias_bucket() {
         .expect_err("same env shares the counter");
 }
 
-/// A TCP relay in front of Redis that a test can cut. Until then every
-/// byte is forwarded both ways; afterwards the relay answers each client
-/// request with a Redis error instead of forwarding it.
+/// A TCP relay in front of Redis that a test can break, in either of the
+/// two shapes a real outage takes.
 ///
-/// An error reply rather than a dropped socket on purpose: the client's
-/// connection manager answers a dropped socket by reconnecting with its
-/// own multi-minute backoff, so a test that closes the connection spends
-/// that backoff before the operation it is measuring ever returns. Both
-/// shapes reach `RedisStore` as the same `Err`.
+/// - [`cut`](RedisCutoff::cut) — the relay answers each request with a
+///   Redis error instead of forwarding it. Redis is *reachable* and
+///   refusing, which is the cheap failure: the client learns immediately.
+/// - [`blackhole`](RedisCutoff::blackhole) — the socket stays open and
+///   nothing is ever forwarded or answered, which is what a stopped
+///   container, a downed host or a partitioned network looks like from
+///   the client end. Nothing arrives, nothing is refused, and without a
+///   command budget the caller waits on TCP retransmission for minutes.
 struct RedisCutoff {
     port: u16,
     cut: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    hole: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RedisCutoff {
@@ -553,7 +556,9 @@ impl RedisCutoff {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let cut = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hole = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = cut.clone();
+        let hole_flag = hole.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut client, _)) = listener.accept().await else {
@@ -563,6 +568,7 @@ impl RedisCutoff {
                     continue;
                 };
                 let flag = flag.clone();
+                let hole_flag = hole_flag.clone();
                 tokio::spawn(async move {
                     let mut from_client = [0u8; 8192];
                     let mut from_server = [0u8; 8192];
@@ -573,7 +579,10 @@ impl RedisCutoff {
                                 if n == 0 {
                                     return;
                                 }
-                                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                if hole_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                    // Swallowed: no forward, no reply, no
+                                    // close. The peer has simply gone quiet.
+                                } else if flag.load(std::sync::atomic::Ordering::Relaxed) {
                                     if client
                                         .write_all(b"-ERR simulated redis outage\r\n")
                                         .await
@@ -587,6 +596,9 @@ impl RedisCutoff {
                             }
                             n = server.read(&mut from_server) => {
                                 let Ok(n) = n else { return };
+                                if hole_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                    continue;
+                                }
                                 if n == 0 || client.write_all(&from_server[..n]).await.is_err() {
                                     return;
                                 }
@@ -596,7 +608,7 @@ impl RedisCutoff {
                 });
             }
         });
-        Self { port, cut }
+        Self { port, cut, hole }
     }
 
     fn url(&self) -> String {
@@ -605,6 +617,10 @@ impl RedisCutoff {
 
     fn cut(&self) {
         self.cut.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn blackhole(&self) {
+        self.hole.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -669,5 +685,70 @@ async fn a_redis_outage_counts_every_failed_operation() {
     assert!(
         counter_value(&metrics.render(), "ratelimit_acquire") > first,
         "each failed operation counts, not only the one that logged",
+    );
+}
+
+/// A Redis that stops answering without closing the socket must degrade
+/// the request, not hold it.
+///
+/// The store has always failed open on `Err`, but with no command budget
+/// the `Err` never arrived: the command sat on TCP retransmission and the
+/// caller — a live proxy request — hung with it. Reported against 1.2.0-rc.1
+/// and reproduced identically on v1.1.0, where a `docker stop` of Redis
+/// left every rate-limited request unanswered past three minutes.
+///
+/// Two properties, because each fails without the other: the first
+/// command must return inside the budget, and the ones behind it must not
+/// each pay that budget again for as long as the outage lasts.
+#[tokio::test]
+async fn a_silent_redis_fails_open_within_the_command_budget() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let relay = RedisCutoff::start(&url).await;
+    let cfg = RedisConnConfig {
+        timeout_secs: 2,
+        ..single(&relay.url())
+    };
+    let store = RedisStore::connect(&cfg)
+        .await
+        .expect("redis connect through the relay");
+    let key = unique_key("blackhole");
+    let limits = RateLimit {
+        rpm: Some(10),
+        ..rl()
+    };
+
+    store
+        .acquire(&key, &limits, "m-1")
+        .await
+        .expect("allowed while Redis answers");
+
+    relay.blackhole();
+
+    let started = std::time::Instant::now();
+    store
+        .acquire(&key, &limits, "m-2")
+        .await
+        .expect("fail-open still admits");
+    let first = started.elapsed();
+    assert!(
+        first < Duration::from_secs(6),
+        "the first silent command must give up on its budget, took {first:?}",
+    );
+
+    // Behind it the breaker is open, so this one costs nothing at all —
+    // otherwise every request for the length of the outage carries the
+    // full budget as added latency.
+    let started = std::time::Instant::now();
+    store
+        .acquire(&key, &limits, "m-3")
+        .await
+        .expect("fail-open still admits");
+    let second = started.elapsed();
+    assert!(
+        second < Duration::from_millis(500),
+        "the command behind a failure must short-circuit, took {second:?}",
     );
 }

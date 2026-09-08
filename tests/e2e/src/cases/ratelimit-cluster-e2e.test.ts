@@ -222,18 +222,23 @@ describe("rate limit is NOT shared with backend=memory (per-replica, the #798 bu
 
 
 /**
- * A TCP relay in front of Redis that the test can cut.
+ * A TCP relay in front of Redis that the test can break, in either of the
+ * two shapes a real outage takes.
  *
- * Until cut, every byte is forwarded both ways. Afterwards each client
- * request is answered with a Redis error instead of being forwarded — an
- * error reply rather than a dropped socket, because a dropped socket sends
- * the gateway's connection manager into its own multi-minute reconnect
- * backoff and the request under measurement would not return inside the
- * test. Both shapes reach the store as the same failed operation.
+ * `cut()` answers each client request with a Redis error instead of
+ * forwarding it: Redis is reachable and refusing, so the gateway learns
+ * of the failure immediately.
+ *
+ * `blackhole()` keeps the socket open and never forwards or answers
+ * anything, which is what a stopped container, a downed host or a
+ * partitioned network looks like from the client end. Nothing arrives and
+ * nothing is refused, so without a command budget the gateway waits on TCP
+ * retransmission — for minutes.
  */
 async function startRedisCutoff(upstreamUrl: string): Promise<{
   url: string;
   cut(): void;
+  blackhole(): void;
   close(): Promise<void>;
 }> {
   const m = /^redis:\/\/(?:[^@/]*@)?([^:/]+)(?::(\d+))?/.exec(upstreamUrl);
@@ -241,16 +246,22 @@ async function startRedisCutoff(upstreamUrl: string): Promise<{
   const host = m[1];
   const port = m[2] ? Number(m[2]) : 6379;
   let cut = false;
+  let hole = false;
   const live = new Set<Socket>();
   const server: Server = createServer((client) => {
     live.add(client);
     const server = connect({ host, port });
     live.add(server);
     client.on("data", (buf) => {
+      // Swallowed under blackhole: no forward, no reply, no close.
+      if (hole) return;
       if (cut) client.write("-ERR simulated redis outage\r\n");
       else server.write(buf);
     });
-    server.on("data", (buf) => client.write(buf));
+    server.on("data", (buf) => {
+      if (hole) return;
+      client.write(buf);
+    });
     const bin = () => {
       client.destroy();
       server.destroy();
@@ -269,6 +280,9 @@ async function startRedisCutoff(upstreamUrl: string): Promise<{
     url: `redis://127.0.0.1:${addr.port}`,
     cut: () => {
       cut = true;
+    },
+    blackhole: () => {
+      hole = true;
     },
     close: () =>
       new Promise<void>((r) => {
@@ -346,5 +360,118 @@ describe("a Redis outage on the shared rate-limit backend is scrapeable (#1060)"
         labels.operation.startsWith("ratelimit_"),
       ),
     ).toBeGreaterThan(0);
+  });
+});
+
+
+/** Seed one model + an ApiKey whose limit is high enough that every
+ *  request in the outage suite is admitted — what is under test is how
+ *  long the limiter takes to answer, not whether it refuses. */
+async function seedGenerousLimit(
+  etcdRoot: string,
+  upstreamBase: string,
+  model: string,
+) {
+  const seed = new SeedClient(new EtcdClient(), etcdRoot);
+  const pk = await seed.createProviderKey({
+    display_name: `${model}-pk`,
+    secret: "sk-mock",
+    api_base: `${upstreamBase}/v1`,
+  });
+  await seed.createModel({
+    display_name: model,
+    provider: "openai",
+    model_name: "gpt-4o-mini",
+    provider_key_id: pk.id,
+  });
+  await seed.createApiKey({
+    key_hash: CALLER_KEY_HASH,
+    allowed_models: [model],
+    rate_limit: { rpm: 1000 },
+  });
+}
+
+// A Redis that stops answering without closing the socket must degrade the
+// request, not hold it.
+//
+// The limiter has always failed open on a Redis *error* — the describe
+// above pins that — but with no bound on a command the error never
+// arrived: `docker stop` of the Redis container left every rate-limited
+// request unanswered past three minutes (curl exit 28), while requests
+// matching no policy answered in milliseconds. Redis unreachable is the
+// case the fail-open path exists for, and it was the one case it did not
+// cover.
+//
+// Two properties, because each is worthless without the other: the request
+// that meets the silence must come back inside the command budget, and the
+// requests behind it must not each pay that budget again for as long as
+// the outage lasts.
+describe("an unreachable Redis degrades the limiter instead of hanging the request", () => {
+  let app: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let relay: Awaited<ReturnType<typeof startRedisCutoff>> | undefined;
+  let infraReady = false;
+  const prefix = `/aisix-e2e-rl-redisblackhole-${randomUUID()}`;
+  const model = "rl-redis-blackhole";
+  // Short enough that the assertions below fit a normal test timeout, and
+  // still long enough that no healthy round trip on this host trips it.
+  const TIMEOUT_SECS = 2;
+
+  beforeAll(async () => {
+    infraReady = (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
+    if (!infraReady) return;
+
+    upstream = await startOpenAiUpstream();
+    relay = await startRedisCutoff(REDIS_URL);
+    app = await spawnApp({
+      extra: {
+        etcd: sharedEtcd(prefix),
+        ratelimit: {
+          backend: "redis",
+          redis: { url: relay.url, timeout_secs: TIMEOUT_SECS },
+        },
+      },
+    });
+    await seedGenerousLimit(prefix, upstream.baseUrl, model);
+    await waitModelLive(app.proxyUrl, model);
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+    await relay?.close();
+    if (infraReady) await new EtcdClient().deletePrefix(prefix);
+  });
+
+  test("the request completes on the local fallback, and the next one costs nothing", async (ctx) => {
+    if (!infraReady || !app || !relay) {
+      ctx.skip();
+      return;
+    }
+
+    const healthy = await chatRequest(app.proxyUrl, model);
+    expect(healthy.status).toBe(200);
+    await healthy.body?.cancel();
+
+    relay.blackhole();
+
+    const firstStarted = Date.now();
+    const first = await chatRequest(app.proxyUrl, model);
+    const firstMs = Date.now() - firstStarted;
+    expect(first.status).toBe(200);
+    await first.body?.cancel();
+    // Before the budget existed this never returned at all; the bound is
+    // the budget plus room for the mock upstream and process scheduling.
+    expect(firstMs).toBeLessThan((TIMEOUT_SECS + 8) * 1000);
+
+    // And the one behind it short-circuits: without the cool-off every
+    // request for the length of the outage carries the budget as added
+    // latency.
+    const secondStarted = Date.now();
+    const second = await chatRequest(app.proxyUrl, model);
+    const secondMs = Date.now() - secondStarted;
+    expect(second.status).toBe(200);
+    await second.body?.cancel();
+    expect(secondMs).toBeLessThan(TIMEOUT_SECS * 1000);
   });
 });
