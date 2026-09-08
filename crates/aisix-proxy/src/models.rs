@@ -9,7 +9,7 @@
 //! `model` field*, so every dispatch shape qualifies: direct models and
 //! the virtual aliases (routing / semantic / ensemble) alike. A Model
 //! Group is the stable public entry point its operator intends callers
-//! to use, and the same `allowed_models` ACL that authorizes the request
+//! to use, and the same key→model ACL that authorizes the request
 //! decides whether it appears here.
 //!
 //! Each Model surfaces as:
@@ -76,7 +76,7 @@ pub async fn list_models(
 
     let api_key = auth.key();
     let permitted: Vec<&str> =
-        api_key.accessible_models(all_names.iter().map(|s: &String| s.as_str()));
+        api_key.accessible_models(&snapshot, all_names.iter().map(|s: &String| s.as_str()));
 
     let mut data: Vec<ModelObject> = permitted
         .into_iter()

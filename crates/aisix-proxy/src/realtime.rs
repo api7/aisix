@@ -336,7 +336,7 @@ async fn prepare(
 
     let model_entry = crate::model_resolve::resolve_model(snapshot, &requested_model)
         .ok_or_else(|| ProxyError::ModelNotFound(format!("model {requested_model:?} not found")))?;
-    if !auth.key().can_access(&requested_model) {
+    if !auth.key().can_access(snapshot, &requested_model) {
         return Err(ProxyError::ModelForbidden(format!(
             "api key is not authorized for model {requested_model:?}"
         )));

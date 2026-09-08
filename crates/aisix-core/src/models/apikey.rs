@@ -31,8 +31,24 @@ pub struct ApiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
 
-    /// Model identifiers this key may use. An empty array denies access to every model.
+    /// Model names this key may use, matched as single-`*` globs. Read only
+    /// when `allowed_model_ids` is absent; ignored entirely when it is
+    /// present. When both are omitted the key may use no model — model
+    /// access is granted explicitly.
+    #[serde(default)]
     pub allowed_models: Vec<String>,
+
+    /// Models this key may use, named by resource id rather than by name, so
+    /// renaming a model does not change what this key may reach. Present —
+    /// including as an empty array — it is authoritative and `allowed_models`
+    /// is ignored; each id is resolved against the current models in the
+    /// snapshot and the resolved name is matched with the same single-`*`
+    /// glob rule, so an id naming a wildcard model still grants every name
+    /// that model's pattern covers. An id matching no model grants nothing.
+    /// Set to `null` it means the same as omitted: the key falls back to
+    /// `allowed_models`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_model_ids: Option<Vec<String>>,
 
     /// Request, token, and concurrency limits for this key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,16 +167,42 @@ impl ApiKey {
         self.expires_at.is_some_and(|deadline| deadline < now)
     }
 
-    /// True if this key is allowed to call the given Model.
+    /// True if this key is allowed to call the model the caller addressed.
     ///
-    /// Entries are matched as single-`*` globs, so `"*"` grants every model and
-    /// `"openai/*"` grants every `openai/*` name (pairing with wildcard Models);
-    /// entries without a `*` match exactly. An empty `allowed_models` list denies
-    /// everything (spec §3 authz rule).
-    pub fn can_access(&self, model_name: &str) -> bool {
-        self.allowed_models
-            .iter()
-            .any(|n| crate::wildcard::wildcard_matches(n, model_name))
+    /// **The single chokepoint for the key→model ACL.** Every request path
+    /// that gates on model access calls this and nothing else, so the two
+    /// grant shapes below can never diverge across the endpoint family. It
+    /// keys on the caller-addressed entry — the name the request names, or
+    /// the stored name of the entry it references — and never on whatever
+    /// target dispatch later picks, for every model kind.
+    ///
+    /// The key grants models one of two ways:
+    ///
+    /// - `allowed_model_ids` present (an empty array included): each id is
+    ///   resolved to the current name of the model carrying it and that name
+    ///   is matched as a single-`*` glob, so an id naming a wildcard model
+    ///   still grants every name its pattern covers. An id resolving to no
+    ///   model grants nothing. `allowed_models` is not read at all.
+    /// - `allowed_model_ids` absent: `allowed_models` names are matched as
+    ///   single-`*` globs — `"*"` grants every model, `"openai/*"` every
+    ///   `openai/*` name, an entry without a `*` matches exactly.
+    ///
+    /// With neither present the key may use no model. Resolution is done per
+    /// request against the live table rather than cached, so a model rename
+    /// takes effect on the next request with no rewrite of any key document.
+    pub fn can_access(&self, snapshot: &super::AisixSnapshot, model_name: &str) -> bool {
+        match &self.allowed_model_ids {
+            Some(ids) => ids.iter().any(|id| {
+                snapshot
+                    .models
+                    .get_by_id(id)
+                    .is_some_and(|m| crate::wildcard::wildcard_matches(m.value.name(), model_name))
+            }),
+            None => self
+                .allowed_models
+                .iter()
+                .any(|n| crate::wildcard::wildcard_matches(n, model_name)),
+        }
     }
 
     /// The limits this key carries for one MCP server, named as it is
@@ -204,13 +246,16 @@ impl ApiKey {
 
     /// Iterate over the names of models this key may access, filtering them
     /// against a known universe of model names. Delegates to [`Self::can_access`]
-    /// so glob entries stay consistent with per-request authz: `*` expands to
-    /// the full universe and `openai/*` to every matching name.
+    /// so the listing can never advertise a name the request path would
+    /// reject, whichever grant shape the key carries.
     pub fn accessible_models<'a>(
         &'a self,
+        snapshot: &super::AisixSnapshot,
         all_models: impl Iterator<Item = &'a str> + 'a,
     ) -> Vec<&'a str> {
-        all_models.filter(|name| self.can_access(name)).collect()
+        all_models
+            .filter(|name| self.can_access(snapshot, name))
+            .collect()
     }
 }
 
@@ -243,6 +288,30 @@ mod tests {
     /// SHA-256 hex of `"sk-my-api-key-123"`.
     const SAMPLE_PLAINTEXT: &str = "sk-my-api-key-123";
     const SAMPLE_HASH: &str = "91ed2dbc407561556f3e7be98ba0bd2a57986d6a868c482d867d19c6d40d201c";
+
+    /// A snapshot holding one model per `(id, display_name)` pair, so an
+    /// `allowed_model_ids` entry has something to resolve against.
+    fn snapshot_with_models(models: &[(&str, &str)]) -> super::super::AisixSnapshot {
+        let snap = super::super::AisixSnapshot::default();
+        for (id, display_name) in models {
+            let model: crate::models::Model = serde_json::from_str(&format!(
+                r#"{{
+                  "display_name": "{display_name}",
+                  "provider": "openai",
+                  "model_name": "gpt-4o",
+                  "provider_key_id": "11111111-1111-1111-1111-111111111111"
+                }}"#
+            ))
+            .unwrap();
+            snap.models
+                .insert(crate::resource::ResourceEntry::new(*id, model, 1));
+        }
+        snap
+    }
+
+    fn empty_snapshot() -> super::super::AisixSnapshot {
+        super::super::AisixSnapshot::default()
+    }
 
     fn sample() -> ApiKey {
         serde_json::from_str(&format!(
@@ -280,6 +349,7 @@ mod tests {
             key_hash: "abc".into(),
             display_name: None,
             allowed_models: vec![],
+            allowed_model_ids: None,
             rate_limit: None,
             team_id: None,
             user_id: None,
@@ -294,8 +364,9 @@ mod tests {
             disabled: false,
             runtime_id: String::new(),
         };
-        assert!(!k.can_access("my-gpt4"));
-        assert!(!k.can_access("anything"));
+        let snap = empty_snapshot();
+        assert!(!k.can_access(&snap, "my-gpt4"));
+        assert!(!k.can_access(&snap, "anything"));
     }
 
     #[test]
@@ -363,27 +434,30 @@ mod tests {
     #[test]
     fn can_access_checks_whitelist() {
         let k = sample();
-        assert!(k.can_access("my-gpt4"));
-        assert!(k.can_access("my-claude"));
-        assert!(!k.can_access("other"));
+        let snap = empty_snapshot();
+        assert!(k.can_access(&snap, "my-gpt4"));
+        assert!(k.can_access(&snap, "my-claude"));
+        assert!(!k.can_access(&snap, "other"));
     }
 
     #[test]
     fn wildcard_grants_access_to_any_model() {
         let k: ApiKey =
             serde_json::from_str(r#"{"key_hash":"abc","allowed_models":["*"]}"#).unwrap();
-        assert!(k.can_access("my-gpt4"));
-        assert!(k.can_access("literally-anything"));
+        let snap = empty_snapshot();
+        assert!(k.can_access(&snap, "my-gpt4"));
+        assert!(k.can_access(&snap, "literally-anything"));
     }
 
     #[test]
     fn glob_entry_grants_matching_names() {
         let k: ApiKey =
             serde_json::from_str(r#"{"key_hash":"abc","allowed_models":["openai/*"]}"#).unwrap();
-        assert!(k.can_access("openai/gpt-4o"));
-        assert!(k.can_access("openai/gpt-4o-mini"));
-        assert!(!k.can_access("anthropic/claude"));
-        assert!(!k.can_access("openai")); // prefix must be followed by the glob
+        let snap = empty_snapshot();
+        assert!(k.can_access(&snap, "openai/gpt-4o"));
+        assert!(k.can_access(&snap, "openai/gpt-4o-mini"));
+        assert!(!k.can_access(&snap, "anthropic/claude"));
+        assert!(!k.can_access(&snap, "openai")); // prefix must be followed by the glob
     }
 
     #[test]
@@ -391,7 +465,7 @@ mod tests {
         let k: ApiKey =
             serde_json::from_str(r#"{"key_hash":"abc","allowed_models":["openai/*"]}"#).unwrap();
         let universe = ["openai/gpt-4o", "openai/o1", "anthropic/claude"];
-        let mut accessible = k.accessible_models(universe.iter().copied());
+        let mut accessible = k.accessible_models(&empty_snapshot(), universe.iter().copied());
         accessible.sort_unstable();
         assert_eq!(accessible, vec!["openai/gpt-4o", "openai/o1"]);
     }
@@ -401,7 +475,7 @@ mod tests {
         let k: ApiKey =
             serde_json::from_str(r#"{"key_hash":"abc","allowed_models":["*"]}"#).unwrap();
         let universe = ["a", "b", "c"];
-        let accessible = k.accessible_models(universe.iter().copied());
+        let accessible = k.accessible_models(&empty_snapshot(), universe.iter().copied());
         assert_eq!(accessible, vec!["a", "b", "c"]);
     }
 
@@ -409,7 +483,7 @@ mod tests {
     fn accessible_models_filters_explicit_list() {
         let k = sample(); // allowed: ["my-gpt4", "my-claude"]
         let universe = ["my-gpt4", "my-claude", "other"];
-        let mut accessible = k.accessible_models(universe.iter().copied());
+        let mut accessible = k.accessible_models(&empty_snapshot(), universe.iter().copied());
         accessible.sort_unstable();
         assert_eq!(accessible, vec!["my-claude", "my-gpt4"]);
     }
@@ -418,7 +492,9 @@ mod tests {
     fn accessible_models_empty_list_returns_nothing() {
         let k: ApiKey = serde_json::from_str(r#"{"key_hash":"abc","allowed_models":[]}"#).unwrap();
         let universe = ["a", "b"];
-        assert!(k.accessible_models(universe.iter().copied()).is_empty());
+        assert!(k
+            .accessible_models(&empty_snapshot(), universe.iter().copied())
+            .is_empty());
     }
 
     #[test]
@@ -546,5 +622,99 @@ mod tests {
         let v = serde_json::to_value(sample()).unwrap();
         assert!(v.get("disabled").is_none());
         assert!(v.get("expires_at").is_none());
+    }
+
+    #[test]
+    fn allowed_model_ids_grant_by_resource_id() {
+        let snap = snapshot_with_models(&[("m-1", "my-gpt4"), ("m-2", "my-claude")]);
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_model_ids":["m-1"]}"#).unwrap();
+        assert!(k.can_access(&snap, "my-gpt4"));
+        assert!(!k.can_access(&snap, "my-claude"));
+    }
+
+    #[test]
+    fn allowed_model_ids_follow_a_rename() {
+        let snap = snapshot_with_models(&[("m-1", "my-gpt4")]);
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_model_ids":["m-1"]}"#).unwrap();
+        assert!(k.can_access(&snap, "my-gpt4"));
+
+        // Same id, new name: the key document is untouched.
+        let renamed = snapshot_with_models(&[("m-1", "my-gpt4-v2")]);
+        assert!(renamed.models.get_by_name("my-gpt4").is_none());
+        assert!(k.can_access(&renamed, "my-gpt4-v2"));
+        assert!(!k.can_access(&renamed, "my-gpt4"));
+    }
+
+    #[test]
+    fn allowed_model_ids_naming_a_wildcard_model_keep_its_pattern() {
+        let snap = snapshot_with_models(&[("m-1", "gpt-*")]);
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_model_ids":["m-1"]}"#).unwrap();
+        assert!(k.can_access(&snap, "gpt-4o"));
+        assert!(!k.can_access(&snap, "claude-sonnet"));
+    }
+
+    #[test]
+    fn allowed_model_ids_win_over_allowed_models() {
+        let snap = snapshot_with_models(&[("m-1", "my-gpt4"), ("m-2", "my-claude")]);
+        let k: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"h","allowed_models":["my-claude"],"allowed_model_ids":["m-1"]}"#,
+        )
+        .unwrap();
+        assert!(k.can_access(&snap, "my-gpt4"));
+        assert!(!k.can_access(&snap, "my-claude"));
+
+        // Even `allowed_models: ["*"]` is ignored once ids are present.
+        let widened: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"h","allowed_models":["*"],"allowed_model_ids":[]}"#,
+        )
+        .unwrap();
+        assert!(!widened.can_access(&snap, "my-gpt4"));
+    }
+
+    #[test]
+    fn unresolvable_id_grants_nothing_but_leaves_the_rest() {
+        let snap = snapshot_with_models(&[("m-1", "my-gpt4")]);
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_model_ids":["m-1","m-gone"]}"#)
+                .unwrap();
+        assert!(k.can_access(&snap, "my-gpt4"));
+        assert!(!k.can_access(&snap, "m-gone"));
+        assert!(!k.can_access(&snap, "anything-else"));
+    }
+
+    #[test]
+    fn neither_grant_field_loads_and_denies_everything() {
+        let snap = snapshot_with_models(&[("m-1", "my-gpt4")]);
+        let k: ApiKey = serde_json::from_str(r#"{"key_hash":"h"}"#).unwrap();
+        assert!(k.allowed_models.is_empty());
+        assert!(k.allowed_model_ids.is_none());
+        assert!(!k.can_access(&snap, "my-gpt4"));
+        assert!(!k.can_access(&snap, "*"));
+    }
+
+    #[test]
+    fn allowed_model_ids_stays_off_the_wire_when_absent() {
+        let v = serde_json::to_value(sample()).unwrap();
+        assert!(v.get("allowed_model_ids").is_none());
+
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_model_ids":["m-1"]}"#).unwrap();
+        let v = serde_json::to_value(&k).unwrap();
+        assert_eq!(v["allowed_model_ids"], serde_json::json!(["m-1"]));
+    }
+
+    #[test]
+    fn accessible_models_follows_the_id_grant() {
+        let snap = snapshot_with_models(&[("m-1", "my-gpt4"), ("m-2", "my-claude")]);
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_model_ids":["m-2"]}"#).unwrap();
+        let names = ["my-gpt4", "my-claude"];
+        assert_eq!(
+            k.accessible_models(&snap, names.iter().copied()),
+            vec!["my-claude"]
+        );
     }
 }

@@ -2444,11 +2444,29 @@ mod tests {
     }
 
     #[test]
-    fn apikey_missing_allowed_models_fails() {
+    fn apikey_grant_fields_are_both_optional() {
+        // A key may grant models by name, by id, or (having neither)
+        // not at all — so neither field is required on either path.
         let v =
             json!({"key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20"});
-        let err = validate_apikey(&v).unwrap_err();
-        assert!(err.message.to_lowercase().contains("allowed_models"));
+        validate_apikey(&v).unwrap();
+        validate_apikey_lenient(&v).unwrap();
+    }
+
+    #[test]
+    fn apikey_allowed_model_ids_is_accepted() {
+        let hash = "9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20";
+        for ids in [json!(["m-1", "m-2"]), json!([]), json!(null)] {
+            let v = json!({"key_hash": hash, "allowed_model_ids": ids});
+            validate_apikey(&v).unwrap();
+            validate_apikey_lenient(&v).unwrap();
+        }
+        // Both grant shapes may be written together; the runtime lets the
+        // ids decide.
+        let v = json!({"key_hash": hash, "allowed_models": ["a"], "allowed_model_ids": ["m-1"]});
+        validate_apikey(&v).unwrap();
+        // Ids are resource ids, not numbers or objects.
+        assert!(validate_apikey(&json!({"key_hash": hash, "allowed_model_ids": [1]})).is_err());
     }
 
     #[test]
