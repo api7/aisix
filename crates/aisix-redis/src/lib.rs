@@ -818,17 +818,22 @@ mod guard_tests {
         assert!(!g.breaker.is_open(), "the window has expired");
 
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let (admitted_tx, admitted_rx) = tokio::sync::oneshot::channel::<()>();
         let probe = tokio::spawn({
             let g = Arc::clone(&g);
             async move {
                 g.run(async move {
+                    // Sent from inside the guarded future, so receiving it
+                    // proves `admit` already ran. Yielding would only
+                    // *probably* get the task that far.
+                    let _ = admitted_tx.send(());
                     let _ = rx.await;
                     Ok::<_, redis::RedisError>(1)
                 })
                 .await
             }
         });
-        tokio::task::yield_now().await;
+        admitted_rx.await.expect("the probe was admitted");
 
         let started = Instant::now();
         let err = g
@@ -859,18 +864,22 @@ mod guard_tests {
         let g = Arc::new(guard(2_000, 5_000));
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
+        let (admitted_tx, admitted_rx) = tokio::sync::oneshot::channel::<()>();
         let inflight = tokio::spawn({
             let g = Arc::clone(&g);
             async move {
                 g.run(async move {
+                    let _ = admitted_tx.send(());
                     let _ = rx.await;
                     Ok::<_, redis::RedisError>(1)
                 })
                 .await
             }
         });
-        // Let it enter `run` and read the generation before anything fails.
-        tokio::task::yield_now().await;
+        // Sent from inside the guarded future, so receiving it proves the
+        // generation was read before anything below fails. Yielding would
+        // only *probably* get the task that far.
+        admitted_rx.await.expect("the in-flight command started");
 
         g.run(async { Err::<(), _>(dropped_connection()) })
             .await
