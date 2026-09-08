@@ -371,7 +371,7 @@ async fn the_card_fetch_deadline_covers_the_whole_candidate_walk() {
 }
 
 /// An upstream that answers `message/stream` with a real SSE body, written in
-/// awkward chunks: two events in one write, an event split across two writes,
+/// awkward chunks: two events in one write, an event split across several writes,
 /// and comment / `event:` framing in between. Proves the reader reassembles
 /// across chunk boundaries rather than assuming one chunk is one event.
 async fn spawn_streaming_agent() -> SocketAddr {
@@ -388,8 +388,9 @@ async fn spawn_streaming_agent() -> SocketAddr {
                 ": open\ndata: {{\"jsonrpc\":\"2.0\",\"id\":\"s\",\"result\":{{\"seq\":1,\"version\":{seen_version},\"accept\":\"{accept}\",\"headers\":{seen_headers}}}}}\n\n\
                  event: status-update\ndata: {{\"jsonrpc\":\"2.0\",\"id\":\"s\",\"result\":{{\"seq\":2}}}}\n\n"
             )),
-            Ok("data: {\"jsonrpc\":\"2.0\",\"id\":\"s\",\"resu".to_string()),
-            Ok("lt\":{\"seq\":3,\"final\":true}}\n\n".to_string()),
+            Ok("data: {\"jsonrpc\":\"2.0\",\r\ndata: \"id\":\"s\",\r".to_string()),
+            Ok("\n: keep-alive\r\nevent: status-update\r\ndata: \"resu".to_string()),
+            Ok("lt\":{\"seq\":3,\"final\":true}}\r\n\r\n".to_string()),
         ];
         (
             [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
@@ -426,7 +427,7 @@ async fn streams_events_as_they_arrive_across_chunk_boundaries() {
     assert_eq!(events.len(), 3, "got {events:#?}");
     assert_eq!(events[0]["result"]["seq"], 1);
     assert_eq!(events[1]["result"]["seq"], 2);
-    // Reassembled from two writes that split mid-JSON.
+    // One envelope spans multiple data fields and writes, including a split CRLF.
     assert_eq!(events[2]["result"]["seq"], 3);
     assert_eq!(events[2]["result"]["final"], true);
     // A streaming call is still an A2A call: it announces its version and asks
@@ -560,6 +561,45 @@ async fn a_malformed_final_line_fails_the_stream() {
     assert!(
         events[1].is_err(),
         "a truncated trailing event must fail the stream, not end it quietly"
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_multiline_event_fails_the_stream() {
+    use futures::StreamExt;
+
+    async fn oversized() -> impl IntoResponse {
+        // Each line fits below the cap, but without a blank line they belong
+        // to one event. Discarding lines as they arrive would evade the cap.
+        let line = format!(": {}\n", "x".repeat(1024));
+        let chunks = (0..16 * 1024).map(move |_| Ok::<_, std::convert::Infallible>(line.clone()));
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            axum::body::Body::from_stream(futures::stream::iter(chunks)),
+        )
+    }
+    let app = Router::new().route("/a2a", post(oversized));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let bridge = HttpBridge::new(upstream(format!("http://{addr}/a2a"), A2aAuth::None));
+    let events: Vec<_> = bridge
+        .send_stream(&json!({"jsonrpc":"2.0","id":"s","method":"message/stream"}))
+        .await
+        .expect("stream opens")
+        .collect()
+        .await;
+    server.abort();
+
+    assert_eq!(events.len(), 1, "got {events:#?}");
+    assert!(
+        matches!(&events[0], Err(A2aError::Request(message)) if message.contains("size cap")),
+        "got {events:#?}"
     );
 }
 
