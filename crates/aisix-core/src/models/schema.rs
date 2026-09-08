@@ -922,6 +922,15 @@ fn allow_null_on_model_ref_ids(schema: &mut Value) {
                     let Some(Value::Object(property)) = properties.get_mut(*field) else {
                         continue;
                     };
+                    // A property whose whole schema is a `type` is not a
+                    // DECLARATION, it is the pin inside a requiredness
+                    // clause ([`require_name_or_id`]), which exists to
+                    // reject exactly the `null` this would let through.
+                    // A real declaration always carries its description
+                    // and length bound beside the type.
+                    if property.len() == 1 {
+                        continue;
+                    }
                     if property.get("type") == Some(&json!("string")) {
                         property.insert("type".to_string(), json!(["string", "null"]));
                     }
@@ -2341,10 +2350,50 @@ mod tests {
         validate_guardrail_lenient(&guardrail).unwrap();
 
         // A null id is not a way to name the model, though: it satisfies
-        // neither half of the alternative.
-        assert!(validate_model(&json!({
-            "display_name": "g",
-            "routing": {"targets": [{"model_id": null}]},
+        // neither half of the alternative. Asserted at every site,
+        // because the requiredness clause and the nullability widening
+        // are two passes over the same schema and one can undo the other.
+        let rejected = [
+            json!({"display_name": "g", "routing": {"targets": [{"model_id": null}]}}),
+            json!({"display_name": "e", "ensemble": {
+                "panel": [{"model_id": null}], "judge": {"model": "j"}}}),
+            json!({"display_name": "e", "ensemble": {
+                "panel": [{"model": "a"}], "judge": {"model_id": null}}}),
+            json!({"display_name": "s", "semantic": {
+                "embedding_model_id": null,
+                "routes": [{"name": "r", "target": "t", "examples": ["x"]}],
+                "default": "d", "match": {"threshold": 0.5}}}),
+            json!({"display_name": "s", "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "r", "target": "t", "examples": ["x"]}],
+                "default_id": null, "match": {"threshold": 0.5}}}),
+            json!({"display_name": "s", "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "r", "target_id": null, "examples": ["x"]}],
+                "default": "d", "match": {"threshold": 0.5}}}),
+            json!({"display_name": "s", "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "r", "target": "t", "examples": ["x"]}],
+                "default": "d", "match": {"threshold": 0.5},
+                "on_embedding_failure": {"target_id": null}}}),
+        ];
+        for case in rejected {
+            assert!(
+                validate_model(&case).is_err(),
+                "strict accepted a null id as naming a model: {case}"
+            );
+            assert!(
+                validate_model_lenient(&case).is_err(),
+                "lenient accepted a null id as naming a model: {case}"
+            );
+        }
+        assert!(validate_cache_policy(&json!({
+            "name": "p", "semantic": {"embedding_model_id": null, "threshold": 0.9}
+        }))
+        .is_err());
+        assert!(validate_guardrail(&json!({
+            "name": "g", "kind": "semantic", "embedding_model_id": null,
+            "deny_examples": ["x"], "deny_threshold": 0.8
         }))
         .is_err());
     }

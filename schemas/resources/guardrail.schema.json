@@ -1426,10 +1426,7 @@
             {
               "properties": {
                 "embedding_model_id": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
+                  "type": "string"
                 }
               },
               "required": [

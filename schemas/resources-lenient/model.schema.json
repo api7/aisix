@@ -384,10 +384,7 @@
                 {
                   "properties": {
                     "target_id": {
-                      "type": [
-                        "string",
-                        "null"
-                      ]
+                      "type": "string"
                     }
                   },
                   "required": [
