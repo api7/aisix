@@ -928,10 +928,27 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     if cfg.cache.backend == CacheBackend::Redis && cfg.cache.redis.is_none() {
         anyhow::bail!("cache.backend = redis but cache.redis missing");
     }
-    let redis_cache: Option<Arc<dyn Cache>> = match cfg.cache.redis.as_ref() {
-        Some(redis_cfg) => {
+    // ONE failure policy for the whole cache subsystem. The exact-KV and
+    // vector-search stores below open separate connections to the same
+    // `cache.redis` — deliberately, so they do not serialize on one
+    // pipeline — but a single chat request touches both twice (lookup,
+    // lookup, write, write). A breaker per connection therefore let one
+    // request pay the command budget four times over while Redis was
+    // black-holed; sharing the policy makes the first failure
+    // short-circuit the rest of the request. The rate-limit store reads
+    // a different config block and keeps its own.
+    let cache_failure_policy = cfg
+        .cache
+        .redis
+        .as_ref()
+        .map(aisix_cache::FailurePolicy::new);
+    let redis_cache: Option<Arc<dyn Cache>> = match (
+        cfg.cache.redis.as_ref(),
+        &cache_failure_policy,
+    ) {
+        (Some(redis_cfg), Some(policy)) => {
             tracing::info!(target: "aisix::cache", backend = "redis", "connecting cache backend");
-            let redis = RedisCache::connect(redis_cfg)
+            let redis = RedisCache::connect_with(redis_cfg, policy)
                 .await
                 .map_err(|e| {
                     // Deliberately no URL in the message: redis URLs carry
@@ -943,7 +960,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 .with_metrics((*metrics).clone());
             Some(Arc::new(redis) as Arc<dyn Cache>)
         }
-        None => None,
+        _ => None,
     };
     // Shared semantic (L2) store for `backend: redis` policies. Wired
     // only when the server passes the vector-search probe — a plain
@@ -964,7 +981,13 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 // Degrade (never abort) on any failure here: the exact
                 // redis cache above is the load-bearing connection; the
                 // semantic store is an optimization layer.
-                match aisix_cache::RedisSemanticCache::connect(redis_cfg).await {
+                //
+                // `connect_with`, on the policy the exact cache is already
+                // running under: separate connection, one shared cool-off.
+                let policy = cache_failure_policy
+                    .clone()
+                    .unwrap_or_else(|| aisix_cache::FailurePolicy::new(redis_cfg));
+                match aisix_cache::RedisSemanticCache::connect_with(redis_cfg, &policy).await {
                     Err(e) => {
                         tracing::warn!(
                             target: "aisix::cache",

@@ -262,6 +262,12 @@ cache:
   #   # probes, so an outage costs this budget roughly once per five
   #   # seconds rather than once per request. Must be >= 1.
   #   #
+  #   # The cool-off is per SUBSYSTEM, not per connection. This cache
+  #   # opens two connections to this Redis — the exact-KV one and, for
+  #   # policies with a `semantic` block, the vector-search one — and they
+  #   # share one cool-off, so a request that uses both pays this budget at
+  #   # most once rather than once per operation.
+  #   #
   #   # In sentinel mode, discovering the master is not one round trip —
   #   # the client walks the sentinels one at a time — so that step gets
   #   # this budget once per configured sentinel, plus one for the master.
@@ -292,8 +298,10 @@ ratelimit:
   #   # it an unreachable Redis blocks every rate-limited request for
   #   # minutes instead of degrading it. Must be >= 1.
   #   #
-  #   # The cache and the limiter cool off independently, so a request that
-  #   # uses both can pay one budget for each while a shared Redis is down.
+  #   # The limiter is a separate subsystem from the cache and cools off
+  #   # independently, so a request that uses both can pay one budget for
+  #   # each while a shared Redis is down — but only one within each,
+  #   # however many connections that subsystem holds.
   #   # timeout_secs: 5
   # Seconds before an unreleased concurrency slot (crashed replica /
   # hung upstream) is reclaimed. Redis backend only.

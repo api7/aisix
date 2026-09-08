@@ -51,11 +51,24 @@ impl std::fmt::Debug for RedisCache {
 }
 
 impl RedisCache {
-    /// Connect using the operator's `cache.redis` config. The topology
-    /// (`single` / `cluster` / `sentinel`) is selected by `mode`; see
-    /// [`aisix_redis::connect`].
+    /// Connect on a policy of this cache's own.
+    ///
+    /// Only for a standalone exact cache. The gateway's cache subsystem
+    /// also holds a vector-search connection to the same `cache.redis`,
+    /// and the two must cool off together or one request pays the command
+    /// budget on each — use [`RedisCache::connect_with`] there.
     pub async fn connect(cfg: &RedisConnConfig) -> Result<Self, CacheError> {
-        let conn = aisix_redis::connect(cfg)
+        Self::connect_with(cfg, &aisix_redis::FailurePolicy::new(cfg)).await
+    }
+
+    /// Connect sharing `policy` with the rest of the cache subsystem. The
+    /// topology (`single` / `cluster` / `sentinel`) is selected by `mode`;
+    /// see [`aisix_redis::connect_with`].
+    pub async fn connect_with(
+        cfg: &RedisConnConfig,
+        policy: &aisix_redis::FailurePolicy,
+    ) -> Result<Self, CacheError> {
+        let conn = aisix_redis::connect_with(cfg, policy)
             .await
             .map_err(|e| CacheError::Backend(format!("redis connect: {e}")))?;
         Ok(Self {
