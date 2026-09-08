@@ -477,6 +477,24 @@ mod tests {
         assert!(sem.embedding_model.is_empty());
     }
 
+    /// The shape a producer that spells "not model-scoped" as `null`
+    /// writes: the policy keeps whatever `applies_to` says.
+    #[test]
+    fn a_null_applies_to_model_id_falls_back_to_applies_to() {
+        let snap = snapshot_with_models(&[("m-1", "gpt-4o")]);
+        let p: CachePolicy = serde_json::from_value(json!({
+            "name": "x",
+            "applies_to": "model:gpt-4o",
+            "applies_to_model_id": null
+        }))
+        .unwrap();
+        assert!(p.applies_to_model_id.is_none());
+        assert_eq!(
+            p.parsed_applies_to(&snap),
+            AppliesTo::Model("gpt-4o".into())
+        );
+    }
+
     #[test]
     fn absent_id_fields_stay_off_the_wire() {
         let p: CachePolicy =
