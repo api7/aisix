@@ -118,9 +118,15 @@ pub struct ToolAcl {
     /// layer.
     deny: Vec<DenyRule>,
     /// The registered servers this ACL resolves ids against, as of the
-    /// snapshot it was built from. Empty for the ACLs built without one
-    /// ([`ToolAcl::allow_all`], [`ToolAcl::from_allowed`]), which carry no
-    /// id-form entry to resolve.
+    /// snapshot it was built from. Only [`ToolAcl::resolve`] populates it;
+    /// [`ToolAcl::allow_all`] and [`ToolAcl::from_allowed`] leave it empty.
+    ///
+    /// An id-form layer on an ACL without it resolves nothing and so
+    /// admits nothing — fail-closed, but indistinguishable from a grant
+    /// that is simply empty. That used to be unreachable, because only
+    /// `resolve` could produce an id-form layer;
+    /// [`ToolAcl::narrowed_to_allowlist`] can now append one to any ACL,
+    /// so the pairing is asserted there instead.
     servers: Arc<McpServerIndex>,
 }
 
@@ -244,14 +250,22 @@ impl ToolAcl {
                     .map(|s| format!("{s}{TOOL_NAMESPACE_SEPARATOR}*"))
                     .collect(),
             ),
-            McpServerAllowlist::Ids(ids) => AllowLayer::Refs(
-                ids.iter()
-                    .map(|id| McpToolRef {
-                        server_id: id.clone(),
-                        tool: "*".to_string(),
-                    })
-                    .collect(),
-            ),
+            McpServerAllowlist::Ids(ids) => {
+                debug_assert!(
+                    ids.is_empty() || !self.servers.is_empty(),
+                    "an id-spelled ceiling resolves through the index only \
+                     `ToolAcl::resolve` builds; laid over an ACL without one it \
+                     admits nothing at all"
+                );
+                AllowLayer::Refs(
+                    ids.iter()
+                        .map(|id| McpToolRef {
+                            server_id: id.clone(),
+                            tool: "*".to_string(),
+                        })
+                        .collect(),
+                )
+            }
         });
         self
     }

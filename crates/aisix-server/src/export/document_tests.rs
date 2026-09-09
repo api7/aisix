@@ -1207,7 +1207,14 @@ fn a_server_name_containing_a_star_gets_no_name_form_grant() {
         "{:?}",
         doc.warnings
     );
-    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
+    // The `gh*` ROW is blocking in its own right (the write pattern no
+    // longer accepts such a name), but nothing about the grant is: this
+    // case is a drop, not a refusal.
+    assert!(
+        !doc.blocking.iter().any(|b| b.contains("mcp_access")),
+        "{:?}",
+        doc.blocking
+    );
 }
 
 #[test]
@@ -1324,9 +1331,11 @@ fn an_anonymous_ceiling_admitting_no_server_blocks_the_export() {
 
 #[test]
 fn a_star_named_server_in_the_anonymous_ceiling_blocks_the_export() {
-    // The ceiling is applied as `<server>__*` glob patterns, so a name
-    // built from `gh*` would admit `ghost`'s tools too — a ceiling the
-    // file would state WIDER than the gateway enforces.
+    // The ceiling is applied as `<server>__*`, so a name built from `gh*`
+    // yields a two-`*` pattern, which `wildcard_matches` refuses outright
+    // — the file would state a ceiling admitting NONE of that server's
+    // tools where the stored one admits all of them. (The allow/deny
+    // sides fail the opposite way for the same character.)
     let snap = AisixSnapshot::new();
     register_mcp_servers(&snap, &[("s-star", "gh*"), ("s-ghost", "ghost")]);
     snap.mcp_auth_settings.insert(anonymous_settings(json!({
@@ -1359,4 +1368,57 @@ fn an_anonymous_ceiling_without_server_ids_is_left_alone() {
     assert_eq!(settings[0]["anonymous"]["servers"], json!(["docs"]));
     assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
     assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
+}
+
+#[test]
+fn a_star_named_mcp_server_row_blocks_the_export() {
+    // The row loads from etcd unchanged — the read pattern deliberately
+    // still accepts it — but the WRITE pattern does not, so the file this
+    // export produces would fail `aisix validate`. The blocking list is
+    // the answer to "will this file load as-is", so it has to say so.
+    let snap = AisixSnapshot::new();
+    register_mcp_servers(&snap, &[("s-star", "gh*"), ("s-ok", "docs")]);
+
+    let doc = build_export_document(&snap, false);
+    assert!(
+        doc.blocking.iter().any(|b| b.contains("gh*")),
+        "{:?}",
+        doc.blocking
+    );
+    // The row is still emitted verbatim: renaming it here would silently
+    // detach every grant, limit and ceiling that names it.
+    let servers = find(&doc, "mcp_servers");
+    assert!(servers.iter().any(|s| s["name"] == json!("gh*")));
+    assert!(servers.iter().any(|s| s["name"] == json!("docs")));
+}
+
+#[test]
+fn a_ceiling_of_only_star_named_servers_blocks_once_with_the_right_advice() {
+    // Every entry dropped for a `*` name leaves the resolved list empty,
+    // but "admits no server — disable anonymous access instead" is the
+    // wrong fix here; the star diagnostic already names the real one.
+    let snap = AisixSnapshot::new();
+    register_mcp_servers(&snap, &[("s-star", "gh*")]);
+    snap.mcp_auth_settings.insert(anonymous_settings(json!({
+        "api_key_id": "k-uuid-1",
+        "source_cidrs": ["10.0.0.0/8"],
+        "servers": ["gh*"],
+        "server_ids": ["s-star"]
+    })));
+
+    let doc = build_export_document(&snap, false);
+    assert!(
+        !doc.blocking.iter().any(|b| b.contains("admits no server")),
+        "{:?}",
+        doc.blocking
+    );
+    assert_eq!(
+        doc.blocking
+            .iter()
+            .filter(|b| b.contains("anonymous MCP ceiling"))
+            .count(),
+        1,
+        "{:?}",
+        doc.blocking
+    );
 }

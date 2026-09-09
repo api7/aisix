@@ -217,7 +217,7 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             |s| s.name.clone(),
             "mcp_servers",
             &mut diag,
-            |_, _, _| {},
+            |_, identity, diag| flag_star_in_mcp_server_name(identity, diag),
             |doc, identity| {
                 let mut ctx = RedactionCtx {
                     kind_token: "MCP_SERVER",
@@ -916,6 +916,32 @@ fn resugar_mcp_refs(
     }
 }
 
+/// A registered MCP server whose name contains a `*` is emitted verbatim
+/// and reported as blocking.
+///
+/// Such a row loads from etcd — the read schema deliberately keeps the
+/// looser name pattern so an already-registered server is never dropped —
+/// but the WRITE pattern refuses it, so `aisix validate` fails on the file
+/// this export just produced. The blocking diagnostics answer "will this
+/// file load as-is", and without this one they would answer yes.
+///
+/// Reported even when nothing references the server: every name-form
+/// pattern built from such a name is wrong in one direction or the other
+/// (see `NAME_PATTERN_STRICT`), so the name is what has to change.
+///
+/// Not fixed up here: renaming the server would silently detach every
+/// name-form grant, limit and anonymous ceiling that points at it, which
+/// is a decision for the operator and not for an export.
+fn flag_star_in_mcp_server_name(identity: &str, diag: &mut Diagnostics) {
+    if identity.contains('*') {
+        diag.blocking.push(format!(
+            "MCP server {identity:?} has a `*` in its name, which the resources file no longer \
+             accepts — the exported file will not load until the server is renamed (its stored \
+             row keeps loading from etcd unchanged)"
+        ));
+    }
+}
+
 /// The anonymous ceiling's `anonymous.server_ids` (etcd server ids) → the
 /// name form `anonymous.servers`.
 ///
@@ -926,13 +952,15 @@ fn resugar_mcp_refs(
 /// An id naming no exported server is dropped with a warning — the ceiling
 /// then admits less, which is the direction the gateway already takes for an
 /// unresolvable id. Two cases the name form genuinely cannot express are
-/// blocking instead, because dropping them would export a ceiling WIDER than
-/// the stored one:
+/// blocking instead:
 ///
-/// - a server whose name contains a `*`: the ceiling is applied as
-///   `<server>__*` glob patterns, so a name built from `gh*` would also cover
-///   `ghost`'s tools (the same reason `mcp_access.allow_ids` refuses to build
-///   a pattern from such a name);
+/// - a server whose name contains a `*`. The ceiling is applied as
+///   `<server>__*`, so the emitted pattern would carry TWO `*` and
+///   `wildcard_matches` refuses any pattern with more than one — the file
+///   would state a ceiling admitting none of that server's tools, where the
+///   stored one admits all of them. (The allow/deny sides fail the opposite
+///   way for the same character, which is why the write path now rejects such
+///   a name outright.)
 /// - a ceiling that resolves to no server at all, including the empty array
 ///   that denies every anonymous caller: `servers` must name at least one
 ///   server, so the file has no spelling for it.
@@ -948,13 +976,21 @@ fn resugar_anonymous_servers(
         return;
     };
     let mut names = Vec::with_capacity(ids.len());
+    // A ceiling whose only entries were dropped for a `*` name is already
+    // blocking and already explained; adding "admits no server — disable
+    // anonymous access instead" on top would advise the wrong fix.
+    let mut unexpressible = false;
     for id in ids.iter().filter_map(Value::as_str) {
         match mcp_server_names.get(id) {
-            Some(name) if name.contains('*') => diag.blocking.push(format!(
-                "the anonymous MCP ceiling admits server {name:?}, whose name contains `*`; a \
-                 `<server>__<tool>` pattern built from it would admit a different server, so \
-                 the exported file cannot express this ceiling"
-            )),
+            Some(name) if name.contains('*') => {
+                unexpressible = true;
+                diag.blocking.push(format!(
+                    "the anonymous MCP ceiling admits server {name:?}, whose name contains `*`; \
+                     the ceiling is written as `<server>__*`, and a pattern carrying two `*` \
+                     matches nothing — the exported file would state a ceiling admitting none \
+                     of that server's tools"
+                ));
+            }
             Some(name) => names.push(Value::String(name.clone())),
             None => diag.warnings.push(format!(
                 "the anonymous MCP ceiling admits MCP server id {id:?}, which is not among the \
@@ -963,7 +999,7 @@ fn resugar_anonymous_servers(
             )),
         }
     }
-    if names.is_empty() {
+    if names.is_empty() && !unexpressible {
         diag.blocking.push(
             "the anonymous MCP ceiling admits no server, which `anonymous.servers` cannot \
              express — it must name at least one; disable anonymous access instead"

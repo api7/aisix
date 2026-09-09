@@ -1246,14 +1246,16 @@ fn accept_renamed_field(schema: &mut Value, canonical: &str, former: &str, note:
 /// is accepted under both its canonical name `name` and its former name
 /// `display_name` (see [`accept_renamed_field`]).
 ///
-/// `strict` additionally forbids a `*` in the label. The name is pasted
-/// into the `<server>__<tool>` glob patterns every name-form MCP grant,
-/// deny and anonymous ceiling is written as, so a `*` in it makes those
-/// patterns reach servers the operator never named — `gh*__read` built
-/// from a server called `gh*` also covers `ghost__read`. The read schema
-/// is deliberately left alone: a stored row that already carries a `*`
-/// must keep loading on every gateway, since a read-path tightening drops
-/// the row instead of the character.
+/// `strict` additionally forbids a `*` in the label
+/// ([`NAME_PATTERN_STRICT`](super::mcp_server::NAME_PATTERN_STRICT), whose
+/// doc has the mechanism): the name is pasted into the
+/// `<server>__<tool>` glob patterns every name-form MCP grant, deny and
+/// anonymous ceiling is written as, and a `*` in it makes them either
+/// wider than written (`gh*__read` also covers `ghost__read`) or empty
+/// (`gh*__*` carries two `*`, which matches nothing). The read schema is
+/// deliberately left alone: a stored row that already carries a `*` must
+/// keep loading on every gateway, since a read-path tightening drops the
+/// row instead of the character.
 pub fn mcp_server_root_schema(strict: bool) -> Value {
     let mut schema = struct_root_schema::<crate::models::McpServer>(true);
     schema
@@ -1500,11 +1502,16 @@ pub fn passthrough_route_root_schema() -> Value {
 /// all is one it does not apply.
 pub fn mcp_auth_settings_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::McpAuthSettings>(false);
-    if let Some(Value::Object(property)) =
-        schema.pointer_mut("/definitions/McpAnonymousAccess/properties/server_ids")
-    {
-        property.insert("type".to_string(), json!(["array", "null"]));
-    }
+    // `expect`, not a silent `if let`: a pointer that quietly stops
+    // matching would drop `null` out of the READ schema, and the loader
+    // skips a row it cannot validate — taking the OAuth discovery
+    // surface down with anonymous access, which is the outcome this
+    // patch exists to prevent.
+    schema
+        .pointer_mut("/definitions/McpAnonymousAccess/properties/server_ids")
+        .and_then(Value::as_object_mut)
+        .expect("mcp_auth_settings schema declares `anonymous.server_ids`")
+        .insert("type".to_string(), json!(["array", "null"]));
     schema
 }
 

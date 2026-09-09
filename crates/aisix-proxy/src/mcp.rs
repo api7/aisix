@@ -1997,7 +1997,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_empty_or_unresolvable_id_list_closes_every_anonymous_entry() {
+    async fn an_empty_or_unresolvable_id_list_closes_every_scoped_anonymous_entry() {
         // An empty array is the authoritative "no server", even beside a
         // name list that still names one — and an id matching no
         // registered server offers nothing rather than everything.
@@ -2022,14 +2022,43 @@ mod tests {
                     "{ids}: /mcp/{server} must stay closed"
                 );
             }
-            // The aggregated entry keeps its own opt-in, but the ceiling
-            // it serves under is empty, so it exposes no tool.
-            let response = router
-                .oneshot(from_ip(initialize_request(None), "10.1.2.3"))
-                .await
-                .expect("router responds");
-            assert_ne!(response.status(), StatusCode::UNAUTHORIZED, "{ids}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_allowlist_that_names_nothing_closes_the_aggregated_entry_too() {
+        // `aggregate_entry` cannot stand in for the allowlist: an open
+        // door onto an empty room reads as enabled, serves no tool, and
+        // suppresses the `WWW-Authenticate` hint a standard MCP client
+        // follows to sign in. `servers` is required non-empty on both
+        // schemas for that reason, so only `server_ids: []` can reach the
+        // state — and it closes with it.
+        let router = router_with(snapshot_with_anonymous(serde_json::json!({
+            "servers": ["docs", "kb"],
+            "server_ids": [],
+            "aggregate_entry": true,
+        })));
+        let response = router
+            .oneshot(from_ip(initialize_request(None), "10.1.2.3"))
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // An allowlist that names a server the gateway cannot resolve is
+        // NOT the same state: it is a transient the operator did not ask
+        // for, and the aggregated entry keeps its pre-existing behavior
+        // there (open, under a ceiling that admits nothing) for the name
+        // spelling as much as the id one.
+        let router = router_with(snapshot_with_anonymous(serde_json::json!({
+            "servers": ["docs"],
+            "server_ids": ["mcp-gone"],
+            "aggregate_entry": true,
+        })));
+        let response = router
+            .oneshot(from_ip(initialize_request(None), "10.1.2.3"))
+            .await
+            .expect("router responds");
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

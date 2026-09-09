@@ -307,13 +307,27 @@ describe("mcp anonymous access: the allowlist may name servers by id", () => {
     for (const server of ["docs", "kb", "roam-v2"]) {
       expect(await initialize(`/mcp/${server}`, undefined), server).toBe(401);
     }
-    // The aggregated endpoint keeps its own opt-in, so it still answers —
-    // under a ceiling that admits nothing.
-    expect((await listToolNames("/mcp", undefined)).names).toEqual([]);
-    expect(await served("/mcp", undefined, "docs__echo")).toBe(false);
+    // The aggregated entry closes with them, `aggregate_entry: true` and
+    // all: an open door onto an empty room would admit an uncredentialed
+    // caller as the principal with no tool to reach, and suppress the
+    // `WWW-Authenticate` hint a standard client follows to sign in.
+    expect(await initialize("/mcp", undefined)).toBe(401);
 
     // The authenticated path is untouched by all of it.
     expect((await listToolNames("/mcp", SENTINEL)).names?.length).toBe(6);
+  }, 60_000);
+
+  test("an unresolvable id is not the same as an empty allowlist", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return ctx.skip();
+
+    // A server the gateway cannot resolve is a transient the operator did
+    // not ask for, not a deliberate "no server": the aggregated entry keeps
+    // its pre-existing behavior there (open, under a ceiling admitting
+    // nothing) rather than closing the way an empty allowlist does.
+    await applyAnonymous({ servers: ["docs"], server_ids: [randomUUID()] });
+    expect(await initialize("/mcp", undefined)).toBe(200);
+    expect((await listToolNames("/mcp", undefined)).names).toEqual([]);
+    expect(await initialize("/mcp/docs", undefined)).toBe(401);
   }, 60_000);
 
   test("an id naming no registered server admits nothing", async (ctx) => {

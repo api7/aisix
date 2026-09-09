@@ -116,6 +116,7 @@ so a consumer that models the lenient set as "the strict set with
 | `guardrail` | the `semantic` kind requires neither an embedding model (under either spelling) nor a threshold beside each example list |
 | `mcp_policy` | `allow` is not required; the `McpToolRef` relaxations above apply here too, as does the absent `deny`-beside-`deny_ids` guard (its team-scope guard is on both sets) |
 | `mcp_server` | the label pattern (`name`, and its former spelling `display_name`) still forbids `__` and a trailing `_`, but not a `*` |
+
 | `model` | the per-kind `not`/`anyOf` lists that forbid a knob a kind never resolves are shorter — a stored row keeps loading and `Model::strip_kind_inapplicable` drops the dead knob |
 
 Three of those are worth spelling out. A half-written `McpToolRef` entry
@@ -140,6 +141,15 @@ either way, so rejecting it is what makes it visible in
 
 These come from the five producers that take a `strict` flag in
 `crates/aisix-core/src/models/schema.rs` and are deliberate.
+
+One consequence is registered rather than fixed: the gateway's own Admin
+API embeds the **strict** files as its response schemas, so a resource
+whose stored row is legal on the read path but not on the write path —
+today an `mcp_server` whose name carries a `*`, and an `api_key` whose
+`mcp_access` omits `allow` — validates as non-conforming against the
+schema its own `GET` response is published under. Generate strict
+validators from `resources/` for what you SEND; read responses against
+`resources-lenient/`.
 
 Separately, the lenient files keep five `default` annotations the
 strict producer strips on purpose — `default: 0.75` on the `semantic`

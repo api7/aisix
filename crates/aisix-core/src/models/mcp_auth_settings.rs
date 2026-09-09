@@ -124,11 +124,29 @@ pub struct McpAnonymousAccess {
     /// server does not drop it out of the anonymous ceiling.
     ///
     /// Present — including as an empty array — it is authoritative and
-    /// `servers` is ignored; an empty array therefore admits no server
-    /// at all, on the scoped and the aggregated entry alike. An id
-    /// naming no registered server admits nothing, and the other
-    /// entries are unaffected. Absent or `null`, the allowlist falls
-    /// back to `servers`.
+    /// `servers` is ignored. An empty array therefore admits no server
+    /// at all: every `/mcp/{server}` entry closes, and so does the
+    /// aggregated `/mcp` entry even with `aggregate_entry` set, since
+    /// an open door onto an empty room reads as enabled, serves
+    /// nothing, and suppresses the `WWW-Authenticate` discovery hint a
+    /// standard client would otherwise follow. An id naming no
+    /// registered server admits nothing, and the other entries are
+    /// unaffected. Absent or `null`, the allowlist falls back to
+    /// `servers`.
+    ///
+    /// A gateway one release behind the control plane does not read
+    /// this field and applies `servers` instead, so the two spellings
+    /// must be written to mean the same thing. For a non-empty array
+    /// that is simply the current names of the servers it lists. The
+    /// empty array has no name-form spelling at all — `servers` is
+    /// required and non-empty on every release — so a control plane that
+    /// offers it MUST keep an older gateway from reading a permissive
+    /// `servers` beside it; emptying the ceiling would otherwise close
+    /// it on new gateways and leave it open on older ones, which is the
+    /// wrong direction for an access control. Even then the older
+    /// gateway keeps serving the aggregated entry when `aggregate_entry`
+    /// is set: that entry closing on an empty ceiling is a rule only
+    /// this release knows, and no `servers` value can carry it back.
     ///
     /// It cannot express "every server": each entry names one server
     /// exactly and an id is never a glob, so an enumeration of the
@@ -140,7 +158,9 @@ pub struct McpAnonymousAccess {
 
     /// Whether the aggregated `/mcp` endpoint ALSO serves anonymous
     /// callers. It exposes the same allowlisted servers, under their
-    /// `<server>__<tool>` namespaced names.
+    /// `<server>__<tool>` namespaced names. It cannot stand in for the
+    /// allowlist: with no server allowlisted the aggregated entry stays
+    /// closed whatever this says, the same way every scoped entry does.
     ///
     /// Off by default: it is the entry a standard MCP client uses for
     /// OAuth discovery, and the namespaced names are not what a client
@@ -189,6 +209,22 @@ impl McpAnonymousAccess {
 }
 
 impl McpServerAllowlist {
+    /// Whether the allowlist names nothing at all — no server is offered
+    /// anonymously, on either entry.
+    ///
+    /// Only the id spelling can reach this: `servers` is required and
+    /// non-empty on both schemas, precisely because an empty ceiling
+    /// "could never serve a useful request, including through
+    /// `aggregate_entry`". `server_ids: []` says exactly that, and says
+    /// it deliberately, so the aggregated entry closes with it rather
+    /// than becoming an open door onto an empty room.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Names(names) => names.is_empty(),
+            Self::Ids(ids) => ids.is_empty(),
+        }
+    }
+
     /// Whether the allowlist offers the registered server `name`
     /// anonymously — the `/mcp/{server}` entry gate.
     ///
@@ -402,6 +438,29 @@ mod tests {
         assert_eq!(emptied.server_allowlist(), McpServerAllowlist::Ids(vec![]));
         assert!(!emptied.server_allowlist().admits_server(&index, "docs"));
         assert!(!emptied.server_allowlist().admits_server(&index, "kb"));
+    }
+
+    #[test]
+    fn an_allowlist_that_names_nothing_is_empty_in_either_spelling() {
+        // The one consumer that reads this is the aggregated `/mcp` entry
+        // gate: `aggregate_entry` cannot stand in for the allowlist, so an
+        // allowlist naming nothing closes that entry the way it closes
+        // every scoped one. Only the id spelling can reach the state —
+        // `servers` is required non-empty on both schemas.
+        assert!(anonymous(serde_json::json!({ "server_ids": [] }))
+            .server_allowlist()
+            .is_empty());
+        assert!(!anonymous(serde_json::json!({ "server_ids": ["s-docs"] }))
+            .server_allowlist()
+            .is_empty());
+        assert!(!anonymous(serde_json::json!({}))
+            .server_allowlist()
+            .is_empty());
+        // An id that resolves to nothing is not the same as naming
+        // nothing: the operator asked for a server, it is simply absent.
+        assert!(!anonymous(serde_json::json!({ "server_ids": ["s-gone"] }))
+            .server_allowlist()
+            .is_empty());
     }
 
     #[test]

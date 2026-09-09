@@ -1136,16 +1136,39 @@ fn every_refused_model_reference_id_is_a_declared_field() {
 /// that then refuses to load.
 #[test]
 fn every_refused_mcp_reference_id_is_a_declared_field() {
-    fn declares(node: &Value, field: &str) -> bool {
-        match node {
-            Value::Object(map) => {
-                map.get("properties")
-                    .and_then(Value::as_object)
-                    .is_some_and(|p| p.contains_key(field))
-                    || map.values().any(|v| declares(v, field))
-            }
-            Value::Array(items) => items.iter().any(|v| declares(v, field)),
-            _ => false,
+    /// The object `path` names, walked from the schema root through
+    /// `properties`, following a `$ref` into `definitions` at each step.
+    ///
+    /// Walked rather than searched, because `path` is exactly as
+    /// typo-prone as the field names beside it and a whole-document
+    /// search cannot see it: `mcp_ref_id_field` navigates the DOCUMENT by
+    /// that path, so a path naming no object makes the refusal silently
+    /// never fire — the file then loads a ceiling built from
+    /// control-plane ids, which resolves to nothing, with the name form
+    /// beside it unread.
+    fn object_at<'a>(schema: &'a Value, path: &[&str]) -> Option<&'a Value> {
+        let mut node = schema;
+        for segment in path {
+            let property = node.get("properties")?.get(segment)?;
+            node = resolve_ref(schema, property)?;
+        }
+        Some(node)
+    }
+
+    /// Follow one indirection into `definitions`: a bare `$ref`, or the
+    /// single `$ref` branch of the `allOf` / `anyOf` wrapper `schemars`
+    /// emits for a described or nullable field.
+    fn resolve_ref<'a>(schema: &'a Value, node: &'a Value) -> Option<&'a Value> {
+        let referenced = node.get("$ref").or_else(|| {
+            ["allOf", "anyOf", "oneOf"]
+                .iter()
+                .filter_map(|k| node.get(k))
+                .filter_map(Value::as_array)
+                .find_map(|branches| branches.iter().find_map(|b| b.get("$ref")))
+        });
+        match referenced.and_then(Value::as_str) {
+            Some(pointer) => schema.pointer(pointer.trim_start_matches('#')),
+            None => Some(node),
         }
     }
 
@@ -1161,15 +1184,29 @@ fn every_refused_mcp_reference_id_is_a_declared_field() {
             "{kind} carries MCP server references but refuses none"
         );
         for reference in fields {
-            let (id_field, name_field) = (reference.field, reference.name_field);
+            let (path, id_field, name_field) =
+                (reference.path, reference.field, reference.name_field);
+            let holder = object_at(&schema, path).unwrap_or_else(|| {
+                panic!(
+                    "{kind} refuses `{id_field}` under path {path:?}, which the {resource} \
+                     schema declares no object at"
+                )
+            });
+            let declares = |field: &str| {
+                holder
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|p| p.contains_key(field))
+            };
             assert!(
-                declares(&schema, id_field),
-                "{kind} refuses `{id_field}`, which the {resource} schema does not declare"
+                declares(id_field),
+                "{kind} refuses `{id_field}`, which the {resource} schema does not declare at \
+                 {path:?}"
             );
             assert!(
-                declares(&schema, name_field),
+                declares(name_field),
                 "{kind} rewrites `{id_field}` to `{name_field}`, which the {resource} schema \
-                 does not declare"
+                 does not declare at {path:?}"
             );
         }
     }

@@ -159,11 +159,21 @@ pub(crate) fn anonymous_entry(
     // The allowlist is read through the one chokepoint that decides
     // between its two spellings, so the gate and the ceiling below can
     // never disagree about which one governs.
+    //
+    // An allowlist that names nothing closes the aggregated entry too,
+    // whatever `aggregate_entry` says: serving it would admit an
+    // uncredentialed caller as the principal with no tool to reach, and
+    // suppress the `WWW-Authenticate` discovery hint on the way. Only
+    // the id spelling can reach that state — `servers` is required and
+    // non-empty on both schemas for exactly this reason.
     let allowlist = anon.server_allowlist();
-    let entry_allowed = match scope {
-        Some(server) => allowlist.admits_server(&state.mcp_servers.for_snapshot(snapshot), server),
-        None => anon.aggregate_entry,
-    };
+    let entry_allowed = !allowlist.is_empty()
+        && match scope {
+            Some(server) => {
+                allowlist.admits_server(&state.mcp_servers.for_snapshot(snapshot), server)
+            }
+            None => anon.aggregate_entry,
+        };
     if !entry_allowed {
         return None;
     }
