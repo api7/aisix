@@ -106,7 +106,7 @@ That is the tolerance the split exists for: an optional field a newer
 control plane adds inside a nested config object is ignored and reported,
 instead of taking the whole row down.
 
-For **four** resources the read contract relaxes a requirement as well,
+For **five** resources the read contract relaxes a requirement as well,
 so a consumer that models the lenient set as "the strict set with
 `additionalProperties` stripped" is wrong about them:
 
@@ -115,9 +115,11 @@ so a consumer that models the lenient set as "the strict set with
 | `api_key` | `McpAccess.allow` is not required; an `McpToolRef` entry needs neither half, and neither has to be non-empty; the write-path guards requiring `deny` beside `deny_ids` and `mcp_rate_limits` beside `mcp_rate_limits_by_id` are absent |
 | `guardrail` | the `semantic` kind requires neither an embedding model (under either spelling) nor a threshold beside each example list |
 | `mcp_policy` | `allow` is not required; the `McpToolRef` relaxations above apply here too, as does the absent `deny`-beside-`deny_ids` guard (its team-scope guard is on both sets) |
+| `mcp_server` | the label pattern (`name`, and its former spelling `display_name`) still forbids `__` and a trailing `_`, but not a `*` |
+
 | `model` | the per-kind `not`/`anyOf` lists that forbid a knob a kind never resolves are shorter — a stored row keeps loading and `Model::strip_kind_inapplicable` drops the dead knob |
 
-Two of those are worth spelling out. A half-written `McpToolRef` entry
+Three of those are worth spelling out. A half-written `McpToolRef` entry
 has to keep DESERIALIZING, not merely validating: the loader skips a row
 it cannot deserialize whole, and for an `api_key` that stops the key
 authenticating every kind of traffic rather than costing it MCP access.
@@ -125,15 +127,29 @@ The malformed entry matches no server and no tool instead. And the
 name-form guards are a write contract only — a stored row that carries
 just the id spelling still loads, it is only new writes that must carry
 both, so that a gateway one release behind the control plane can still
-read the restriction.
+read the restriction. `mcp_server`'s label pattern is the same kind of
+write-only tightening: a `*` in a server name makes the `<server>__*`
+glob patterns every name-form grant, deny and anonymous ceiling is
+written as reach servers nobody named, so new names may not carry one —
+but a row that already does must keep loading, and closing the read
+pattern would drop the row rather than the character.
 
 Note what is NOT in that table: the `custom` guardrail's `script` is
 required on **both** sets. A scriptless `custom` row screens nothing
 either way, so rejecting it is what makes it visible in
 `GET /status/config`'s `rejected[]`.
 
-These come from the four producers that take a `strict` flag in
+These come from the five producers that take a `strict` flag in
 `crates/aisix-core/src/models/schema.rs` and are deliberate.
+
+One consequence is registered rather than fixed: the gateway's own Admin
+API embeds the **strict** files as its response schemas, so a resource
+whose stored row is legal on the read path but not on the write path —
+today an `mcp_server` whose name carries a `*`, and an `api_key` whose
+`mcp_access` omits `allow` — validates as non-conforming against the
+schema its own `GET` response is published under. Generate strict
+validators from `resources/` for what you SEND; read responses against
+`resources-lenient/`.
 
 Separately, the lenient files keep five `default` annotations the
 strict producer strips on purpose — `default: 0.75` on the `semantic`

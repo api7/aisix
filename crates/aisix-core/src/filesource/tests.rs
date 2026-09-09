@@ -588,6 +588,41 @@ api_keys:
     }
 }
 
+/// The anonymous ceiling's id spelling is refused too, for the same
+/// reason: a file registers its MCP servers by name and derives their ids
+/// from those names, so a control-plane id written here resolves to
+/// nothing — the ceiling would admit no server while the name spelling
+/// beside it went unread.
+#[test]
+fn the_anonymous_ceiling_server_ids_are_rejected_by_the_file_source() {
+    const PRELUDE: &str = r#"
+_format_version: "1"
+mcp_servers:
+  - name: github
+    url: https://example.test/mcp
+api_keys:
+  - display_name: k
+    key_env: CALLER_KEY
+    allowed_models: []
+mcp_auth_settings:
+  - anonymous:
+      api_key_id: k
+      source_cidrs: ["10.0.0.0/8"]
+      servers: ["github"]
+"#;
+    let env = env_of(&[("CALLER_KEY", "sk-caller")]);
+    let contents =
+        format!("{PRELUDE}      server_ids: [\"11111111-1111-1111-1111-111111111111\"]\n");
+    let errs = errors_of(load(&contents, &env));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("does not accept `anonymous.server_ids`") && errs[0].contains("servers"),
+        "{errs:?}"
+    );
+
+    load(PRELUDE, &env).expect("the same file without the field loads");
+}
+
 /// Every other id-form model reference is refused the same way, at every
 /// nesting site it can appear. Each fixture is asserted twice: once with
 /// the id field (one error naming it and the name-form field that

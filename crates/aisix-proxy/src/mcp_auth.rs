@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Once;
 
-use aisix_core::models::McpAuthSettings;
+use aisix_core::models::{McpAuthSettings, McpServerAllowlist};
 use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
 use axum::extract::{Request, State};
@@ -155,10 +155,25 @@ pub(crate) fn anonymous_entry(
     // listed. An unlisted (or unknown) server answers exactly like a
     // configured-but-unreachable one: 401 before the 404, so the
     // registered set stays invisible to an anonymous prober.
-    let entry_allowed = match scope {
-        Some(server) => anon.servers.iter().any(|s| s == server),
-        None => anon.aggregate_entry,
-    };
+    //
+    // The allowlist is read through the one chokepoint that decides
+    // between its two spellings, so the gate and the ceiling below can
+    // never disagree about which one governs.
+    //
+    // An allowlist that names nothing closes the aggregated entry too,
+    // whatever `aggregate_entry` says: serving it would admit an
+    // uncredentialed caller as the principal with no tool to reach, and
+    // suppress the `WWW-Authenticate` discovery hint on the way. Only
+    // the id spelling can reach that state — `servers` is required and
+    // non-empty on both schemas for exactly this reason.
+    let allowlist = anon.server_allowlist();
+    let entry_allowed = !allowlist.is_empty()
+        && match scope {
+            Some(server) => {
+                allowlist.admits_server(&state.mcp_servers.for_snapshot(snapshot), server)
+            }
+            None => anon.aggregate_entry,
+        };
     if !entry_allowed {
         return None;
     }
@@ -200,7 +215,7 @@ pub(crate) fn anonymous_entry(
             jwt: None,
             anonymous: true,
         },
-        servers: anon.servers.clone(),
+        allowlist,
     })
 }
 
@@ -210,13 +225,14 @@ pub(crate) struct AnonymousEntry {
     /// authenticated one downstream, which is the point: ACL, quota,
     /// guardrails, budget and usage all key on it unchanged.
     pub auth: crate::auth::AuthenticatedKey,
-    /// The configured server allowlist. It is not only the entry gate
-    /// but the principal's CEILING: the caller may reach these servers'
-    /// tools and no others, on the aggregated endpoint as much as the
-    /// scoped one. Without that, a principal whose own grant is wider
-    /// than the list could name `<unlisted>__<tool>` on the aggregated
-    /// endpoint and reach a server whose scoped entry is closed.
-    pub servers: Vec<String>,
+    /// The configured server allowlist, in the spelling the settings row
+    /// used. It is not only the entry gate but the principal's CEILING:
+    /// the caller may reach these servers' tools and no others, on the
+    /// aggregated endpoint as much as the scoped one. Without that, a
+    /// principal whose own grant is wider than the list could name
+    /// `<unlisted>__<tool>` on the aggregated endpoint and reach a server
+    /// whose scoped entry is closed.
+    pub allowlist: McpServerAllowlist,
 }
 
 /// Parse and validate the configured resource URL: absolute `http`/

@@ -15,6 +15,30 @@ use serde_json::{json, Value};
 
 use crate::resource::Resource;
 
+/// The WRITE-path pattern for [`McpServer::name`]: the read pattern
+/// (`^(?:[^_]|_[^_])*$`, on the field itself) with `*` additionally
+/// excluded from both alternatives.
+///
+/// A name is pasted into the `<server>__<tool>` glob patterns that every
+/// name-form MCP grant, deny and anonymous ceiling is written as, and a
+/// `*` in it breaks those patterns in BOTH directions — which is why the
+/// name, rather than any one call site, is what gets fixed:
+///
+/// - **wider than written**, wherever the tool half is a literal. A deny
+///   of `gh*__read` on a server called `gh*` also matches `ghost__read`:
+///   `crate::wildcard` anchors the one `*` between the prefix `gh` and
+///   the suffix `__read`, and `ghost__read` satisfies both.
+/// - **empty**, wherever the tool half is itself `*` — the shape the
+///   anonymous ceiling always builds. `gh*__*` carries TWO `*`, and
+///   `wildcard_matches` refuses any pattern with more than one, so such a
+///   ceiling admits nothing at all, not even that server's own tools.
+///
+/// New names may not carry one; stored rows that already do keep loading,
+/// because the lenient read schema is left on the looser pattern
+/// (`aisix-etcd`'s loader skips a row it cannot validate, and skipping the
+/// row is a strictly worse outcome than a name that globs).
+pub const NAME_PATTERN_STRICT: &str = r"^(?:[^_*]|_[^_*])*$";
+
 // `Eq` is deliberately absent: `spec` holds a `serde_json::Value`, which is
 // only `PartialEq` (JSON numbers are floats).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
@@ -32,7 +56,10 @@ pub struct McpServer {
     // (see `aisix_mcp::gateway`). So the name must contain no `__` AND must not
     // end in `_`: `gh_` + `x` and `gh` + `_x` both serialize to `gh___x`, and the
     // split resolves the former to the non-existent server `gh`. The pattern
-    // below rejects both shapes on every configuration path.
+    // below rejects both shapes on every configuration path; the WRITE path
+    // additionally rejects a `*` (`NAME_PATTERN_STRICT`, whose doc has the two
+    // ways such a name breaks the patterns built from it), which stays out of
+    // the read pattern so a row that already carries one keeps loading.
     #[schemars(regex(pattern = "^(?:[^_]|_[^_])*$"), length(min = 1))]
     pub name: String,
 

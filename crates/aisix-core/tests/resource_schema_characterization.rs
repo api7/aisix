@@ -978,7 +978,7 @@ fn published_strict_schemas_are_what_the_write_path_compiles() {
 /// `additionalProperties: false` stripped) and the lenient file disagree.
 ///
 /// A consumer that models the lenient set as "the strict set with the
-/// closures removed" is wrong for these four, and the difference is not
+/// closures removed" is wrong for these five, and the difference is not
 /// cosmetic: the loader accepts an `mcp_policy` with no `allow` and reads the
 /// field's default. Registering the paths rather than a prose reason is what
 /// makes the table checkable — a claim that some OTHER field relaxed, or that
@@ -987,9 +987,13 @@ fn published_strict_schemas_are_what_the_write_path_compiles() {
 /// Three shapes appear here, and `schemas/README.md` must keep telling them
 /// apart:
 ///
-/// - a `required` / `minLength` / `not` change, which really does let the
-///   loader accept a document the write path rejects (`api_key`,
-///   `mcp_policy`, `model`, and the `semantic` guardrail branch). The
+/// - a `required` / `minLength` / `pattern` / `not` change, which really does
+///   let the loader accept a document the write path rejects (`api_key`,
+///   `mcp_policy`, `mcp_server`, `model`, and the `semantic` guardrail
+///   branch). `mcp_server`'s is the label pattern, which forbids a `*` only
+///   on the write path — a stored row that already carries one must keep
+///   loading, and a read-path tightening would drop the row rather than the
+///   character. The
 ///   `McpToolRef` `required` / `minLength` paths are this shape: a
 ///   half-written entry has to keep deserializing, because the loader
 ///   skips a row it cannot deserialize whole and for an `api_key` that
@@ -1039,6 +1043,13 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
             "/definitions/McpToolRef/properties/tool/minLength",
             "/definitions/McpToolRef/required",
             "/required",
+        ],
+    ),
+    (
+        "mcp_server",
+        &[
+            "/properties/display_name/pattern",
+            "/properties/name/pattern",
         ],
     ),
     (
@@ -1108,6 +1119,94 @@ fn every_refused_model_reference_id_is_a_declared_field() {
                 reference.hint.starts_with(name_field),
                 "{kind}'s hint for `{id_field}` ({:?}) does not name `{name_field}`",
                 reference.hint
+            );
+        }
+    }
+}
+
+/// The same check for the OTHER reference with an id spelling: every
+/// field the resources file refuses as an id-form MCP server reference,
+/// and every name field it points the operator at, is one this build's
+/// schema actually declares.
+///
+/// `filesource::mcp_ref_id_fields` is hand-written per collection and
+/// `aisix export` rewrites the same list back to the name form, so a typo
+/// in either half is silent in both directions — the file would accept an
+/// id that resolves to nothing, and the export would emit one into a file
+/// that then refuses to load.
+#[test]
+fn every_refused_mcp_reference_id_is_a_declared_field() {
+    /// The object `path` names, walked from the schema root through
+    /// `properties`, following a `$ref` into `definitions` at each step.
+    ///
+    /// Walked rather than searched, because `path` is exactly as
+    /// typo-prone as the field names beside it and a whole-document
+    /// search cannot see it: `mcp_ref_id_field` navigates the DOCUMENT by
+    /// that path, so a path naming no object makes the refusal silently
+    /// never fire — the file then loads a ceiling built from
+    /// control-plane ids, which resolves to nothing, with the name form
+    /// beside it unread.
+    fn object_at<'a>(schema: &'a Value, path: &[&str]) -> Option<&'a Value> {
+        let mut node = schema;
+        for segment in path {
+            let property = node.get("properties")?.get(segment)?;
+            node = resolve_ref(schema, property)?;
+        }
+        Some(node)
+    }
+
+    /// Follow one indirection into `definitions`: a bare `$ref`, or the
+    /// single `$ref` branch of the `allOf` / `anyOf` wrapper `schemars`
+    /// emits for a described or nullable field.
+    fn resolve_ref<'a>(schema: &'a Value, node: &'a Value) -> Option<&'a Value> {
+        let referenced = node.get("$ref").or_else(|| {
+            ["allOf", "anyOf", "oneOf"]
+                .iter()
+                .filter_map(|k| node.get(k))
+                .filter_map(Value::as_array)
+                .find_map(|branches| branches.iter().find_map(|b| b.get("$ref")))
+        });
+        match referenced.and_then(Value::as_str) {
+            Some(pointer) => schema.pointer(pointer.trim_start_matches('#')),
+            None => Some(node),
+        }
+    }
+
+    // (resources-file collection, the resource whose schema declares it)
+    for (kind, resource) in [
+        ("api_keys", "api_key"),
+        ("mcp_auth_settings", "mcp_auth_settings"),
+    ] {
+        let schema = resource_root_schema(resource, true);
+        let fields = aisix_core::filesource::mcp_ref_id_fields(kind);
+        assert!(
+            !fields.is_empty(),
+            "{kind} carries MCP server references but refuses none"
+        );
+        for reference in fields {
+            let (path, id_field, name_field) =
+                (reference.path, reference.field, reference.name_field);
+            let holder = object_at(&schema, path).unwrap_or_else(|| {
+                panic!(
+                    "{kind} refuses `{id_field}` under path {path:?}, which the {resource} \
+                     schema declares no object at"
+                )
+            });
+            let declares = |field: &str| {
+                holder
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|p| p.contains_key(field))
+            };
+            assert!(
+                declares(id_field),
+                "{kind} refuses `{id_field}`, which the {resource} schema does not declare at \
+                 {path:?}"
+            );
+            assert!(
+                declares(name_field),
+                "{kind} rewrites `{id_field}` to `{name_field}`, which the {resource} schema \
+                 does not declare at {path:?}"
             );
         }
     }
