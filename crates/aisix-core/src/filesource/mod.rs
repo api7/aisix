@@ -225,9 +225,10 @@ pub fn model_ref_id_fields(kind: &str) -> &'static [ModelRefIdField] {
 /// the field, and the name-form field that replaces it.
 ///
 /// The name form spells the server as the `<server>` half of a namespaced
-/// `<server>__<tool>` pattern (an ACL side) or as a map key (the per-server
-/// rate limits); either way the file names the server, and the id form is
-/// what a file cannot express.
+/// `<server>__<tool>` pattern (an ACL side), as a map key (the per-server
+/// rate limits), or as a bare entry in a list (the anonymous ceiling);
+/// either way the file names the server, and the id form is what a file
+/// cannot express.
 pub struct McpRefIdField {
     /// Object path from the document root to the object carrying `field`.
     pub path: &'static [&'static str],
@@ -258,6 +259,11 @@ impl McpRefIdField {
 /// `mcp_policies` is deliberately absent — the file source carries no such
 /// collection, so there is no document of that kind for a file to reject.
 pub fn mcp_ref_id_fields(kind: &str) -> &'static [McpRefIdField] {
+    const MCP_AUTH_SETTINGS: [McpRefIdField; 1] = [McpRefIdField {
+        path: &["anonymous"],
+        field: "server_ids",
+        name_field: "servers",
+    }];
     const API_KEYS: [McpRefIdField; 3] = [
         McpRefIdField {
             path: &[],
@@ -277,6 +283,7 @@ pub fn mcp_ref_id_fields(kind: &str) -> &'static [McpRefIdField] {
     ];
     match kind {
         "api_keys" => &API_KEYS,
+        "mcp_auth_settings" => &MCP_AUTH_SETTINGS,
         _ => &[],
     }
 }

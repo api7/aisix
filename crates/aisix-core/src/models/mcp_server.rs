@@ -15,6 +15,19 @@ use serde_json::{json, Value};
 
 use crate::resource::Resource;
 
+/// The WRITE-path pattern for [`McpServer::name`]: the read pattern
+/// (`^(?:[^_]|_[^_])*$`, on the field itself) with `*` additionally
+/// excluded from both alternatives.
+///
+/// A name is pasted into the `<server>__<tool>` glob patterns that every
+/// name-form MCP grant, deny and anonymous ceiling is written as, so a `*`
+/// in one makes those patterns reach servers nobody named. New names may
+/// not carry one; stored rows that already do keep loading, because the
+/// lenient read schema is left on the looser pattern (`aisix-etcd`'s
+/// loader skips a row it cannot validate, and skipping is a strictly worse
+/// outcome than a name that globs).
+pub const NAME_PATTERN_STRICT: &str = r"^(?:[^_*]|_[^_*])*$";
+
 // `Eq` is deliberately absent: `spec` holds a `serde_json::Value`, which is
 // only `PartialEq` (JSON numbers are floats).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
@@ -32,7 +45,9 @@ pub struct McpServer {
     // (see `aisix_mcp::gateway`). So the name must contain no `__` AND must not
     // end in `_`: `gh_` + `x` and `gh` + `_x` both serialize to `gh___x`, and the
     // split resolves the former to the non-existent server `gh`. The pattern
-    // below rejects both shapes on every configuration path.
+    // below rejects both shapes on every configuration path; the WRITE path
+    // additionally rejects a `*` (`NAME_PATTERN_STRICT`), which stays out of the
+    // read pattern so a row that already carries one keeps loading.
     #[schemars(regex(pattern = "^(?:[^_]|_[^_])*$"), length(min = 1))]
     pub name: String,
 

@@ -298,7 +298,7 @@
     "display_name": {
       "description": "Accepted as an alternative spelling of `name`. Provide the label under exactly one of the two names.",
       "minLength": 1,
-      "pattern": "^(?:[^_]|_[^_])*$",
+      "pattern": "^(?:[^_*]|_[^_*])*$",
       "type": "string"
     },
     "enabled": {
@@ -316,7 +316,7 @@
     "name": {
       "description": "Operator-facing label, unique within the gateway. It is used as the namespace prefix for this server's tools, which are exposed to clients as `<name>__<tool>`, so it must not contain the reserved separator `__`.",
       "minLength": 1,
-      "pattern": "^(?:[^_]|_[^_])*$",
+      "pattern": "^(?:[^_*]|_[^_*])*$",
       "type": "string"
     },
     "protocol_version": {

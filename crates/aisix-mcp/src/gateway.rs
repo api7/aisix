@@ -41,8 +41,8 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use rmcp::{RoleServer, ServerHandler};
 
 use aisix_core::models::{
-    ApiKey, LiveMcpServerIndex, McpPolicy, McpPolicyScope, McpServerIndex, McpServerType,
-    McpToolRef,
+    ApiKey, LiveMcpServerIndex, McpPolicy, McpPolicyScope, McpServerAllowlist, McpServerIndex,
+    McpServerType, McpToolRef,
 };
 use aisix_core::{AisixSnapshot, ResourceEntry};
 
@@ -216,9 +216,9 @@ impl ToolAcl {
         }
     }
 
-    /// Narrow this ACL to the tools of `servers`, as an additional
-    /// conjunctive allow layer: the result permits a tool only if the
-    /// ACL already did AND the tool belongs to one of the named servers.
+    /// Narrow this ACL to the tools of the allowlisted servers, as an
+    /// additional conjunctive allow layer: the result permits a tool only
+    /// if the ACL already did AND the tool belongs to one of them.
     ///
     /// Used for anonymous callers (AISIX-Cloud#1313), whose configured
     /// server allowlist is a ceiling on the bound principal rather than
@@ -228,18 +228,31 @@ impl ToolAcl {
     /// point both listing and calling go through, and it evaluates the
     /// namespaced form on either endpoint.
     ///
-    /// An empty list admits nothing, which is exactly right: an
+    /// Either spelling of the allowlist becomes the layer it already has:
+    /// names become `<server>__*` patterns, ids become `{server_id, tool:
+    /// "*"}` entries resolved against this ACL's server index. An empty
+    /// allowlist admits nothing under both, which is exactly right: an
     /// anonymous principal with no listed server has no tools.
-    pub fn narrowed_to_servers(mut self, servers: &[String]) -> Self {
-        // Built directly rather than via `from_patterns`: every entry
-        // here is `<server>__*`, never a bare `*`, so the all-admitting
-        // fold that helper performs must not apply.
-        self.allow.push(AllowLayer::Patterns(
-            servers
-                .iter()
-                .map(|s| format!("{s}{TOOL_NAMESPACE_SEPARATOR}*"))
-                .collect(),
-        ));
+    pub fn narrowed_to_allowlist(mut self, allowlist: &McpServerAllowlist) -> Self {
+        self.allow.push(match allowlist {
+            // Built directly rather than via `from_patterns`: every entry
+            // here is `<server>__*`, never a bare `*`, so the
+            // all-admitting fold that helper performs must not apply.
+            McpServerAllowlist::Names(names) => AllowLayer::Patterns(
+                names
+                    .iter()
+                    .map(|s| format!("{s}{TOOL_NAMESPACE_SEPARATOR}*"))
+                    .collect(),
+            ),
+            McpServerAllowlist::Ids(ids) => AllowLayer::Refs(
+                ids.iter()
+                    .map(|id| McpToolRef {
+                        server_id: id.clone(),
+                        tool: "*".to_string(),
+                    })
+                    .collect(),
+            ),
+        });
         self
     }
 
@@ -879,6 +892,38 @@ mod tests {
         assert!(!SUPPORTED_PROTOCOL_VERSIONS.contains(&ProtocolVersion::V_2024_11_05));
     }
 
+    /// An index over `(id, name)` pairs, so the id-spelled ceilings below
+    /// have registered servers to resolve against.
+    fn server_index(servers: &[(&str, &str)]) -> Arc<McpServerIndex> {
+        let snap = AisixSnapshot::default();
+        for (id, name) in servers {
+            let server: aisix_core::models::McpServer = serde_json::from_str(&format!(
+                r#"{{"name":"{name}","url":"https://example.test/mcp"}}"#
+            ))
+            .unwrap();
+            snap.mcp_servers.insert(ResourceEntry::new(*id, server, 1));
+        }
+        Arc::new(McpServerIndex::build(&snap.mcp_servers))
+    }
+
+    /// A wide-open ACL that resolves ids against `servers` — what
+    /// `ToolAcl::resolve` produces for a principal granted `*`.
+    fn wide_acl_over(servers: Arc<McpServerIndex>) -> ToolAcl {
+        ToolAcl {
+            allow: vec![AllowLayer::All],
+            deny: Vec::new(),
+            servers,
+        }
+    }
+
+    fn names(servers: &[&str]) -> McpServerAllowlist {
+        McpServerAllowlist::Names(servers.iter().map(|s| s.to_string()).collect())
+    }
+
+    fn ids(servers: &[&str]) -> McpServerAllowlist {
+        McpServerAllowlist::Ids(servers.iter().map(|s| s.to_string()).collect())
+    }
+
     /// The anonymous ceiling intersects — it can only ever remove tools.
     /// A principal whose own grant is `*` must still be confined to the
     /// listed servers, which is what stops an anonymous caller from
@@ -890,7 +935,7 @@ mod tests {
         assert!(wide.permits("kb__search"));
 
         let capped = ToolAcl::from_allowed(Some(&["*".to_string()]))
-            .narrowed_to_servers(&["docs".to_string()]);
+            .narrowed_to_allowlist(&names(&["docs"]));
         assert!(capped.permits("docs__search"));
         assert!(!capped.permits("kb__search"));
         // A bare tool name belongs to no server and is never admitted.
@@ -900,24 +945,88 @@ mod tests {
         assert!(!capped.permits("docsecret__search"));
     }
 
+    /// The id spelling of the same ceiling, resolved through the server
+    /// index: same admissions, addressed by the id the server is stored
+    /// under rather than by the name a caller types.
+    #[test]
+    fn an_id_spelled_ceiling_narrows_a_wide_grant() {
+        let index = server_index(&[("s-docs", "docs"), ("s-kb", "kb")]);
+        let capped = wide_acl_over(Arc::clone(&index)).narrowed_to_allowlist(&ids(&["s-docs"]));
+        assert!(capped.permits("docs__search"));
+        assert!(!capped.permits("kb__search"));
+        assert!(!capped.permits("search"));
+        assert!(!capped.permits("docsecret__search"));
+    }
+
+    /// The whole point of the id spelling: the ceiling follows the server
+    /// through a rename, with the settings document untouched.
+    #[test]
+    fn an_id_spelled_ceiling_follows_a_rename() {
+        let allowlist = ids(&["s-docs"]);
+        let before = wide_acl_over(server_index(&[("s-docs", "docs"), ("s-kb", "kb")]))
+            .narrowed_to_allowlist(&allowlist);
+        assert!(before.permits("docs__search"));
+
+        // Same id, new name — the allowlist above is reused verbatim.
+        let after = wide_acl_over(server_index(&[("s-docs", "handbook"), ("s-kb", "kb")]))
+            .narrowed_to_allowlist(&allowlist);
+        assert!(after.permits("handbook__search"));
+        assert!(!after.permits("docs__search"));
+        assert!(!after.permits("kb__search"));
+    }
+
+    /// An id naming no registered server admits nothing, and leaves the
+    /// entries beside it alone.
+    #[test]
+    fn an_unresolvable_id_in_the_ceiling_admits_nothing() {
+        let index = server_index(&[("s-docs", "docs"), ("s-kb", "kb")]);
+        let acl =
+            wide_acl_over(Arc::clone(&index)).narrowed_to_allowlist(&ids(&["s-gone", "s-docs"]));
+        assert!(acl.permits("docs__search"));
+        assert!(!acl.permits("kb__search"));
+
+        let only_gone = wide_acl_over(index).narrowed_to_allowlist(&ids(&["s-gone"]));
+        assert!(!only_gone.permits("docs__search"));
+        assert!(!only_gone.permits("kb__search"));
+    }
+
     /// The ceiling never widens: a narrow grant stays narrow even when
     /// the allowlist names more servers than the key can reach.
     #[test]
     fn server_ceiling_cannot_widen_a_grant() {
         let acl = ToolAcl::from_allowed(Some(&["docs__search".to_string()]))
-            .narrowed_to_servers(&["docs".to_string(), "kb".to_string()]);
+            .narrowed_to_allowlist(&names(&["docs", "kb"]));
         assert!(acl.permits("docs__search"));
         assert!(!acl.permits("docs__write"));
         assert!(!acl.permits("kb__search"));
+
+        let index = server_index(&[("s-docs", "docs"), ("s-kb", "kb")]);
+        let by_id = ToolAcl {
+            allow: vec![AllowLayer::from_patterns(&["docs__search".to_string()])],
+            deny: Vec::new(),
+            servers: index,
+        }
+        .narrowed_to_allowlist(&ids(&["s-docs", "s-kb"]));
+        assert!(by_id.permits("docs__search"));
+        assert!(!by_id.permits("docs__write"));
+        assert!(!by_id.permits("kb__search"));
     }
 
     /// An empty allowlist admits nothing — an anonymous principal with
-    /// no listed server has no tools, rather than all of them.
+    /// no listed server has no tools, rather than all of them. True of
+    /// both spellings, and of the id one even though it is the spelling
+    /// an operator uses to deny every anonymous caller.
     #[test]
     fn server_ceiling_with_no_servers_admits_nothing() {
-        let acl = ToolAcl::from_allowed(Some(&["*".to_string()])).narrowed_to_servers(&[]);
+        let acl =
+            ToolAcl::from_allowed(Some(&["*".to_string()])).narrowed_to_allowlist(&names(&[]));
         assert!(!acl.permits("docs__search"));
         assert!(!acl.permits("anything"));
+
+        let by_id =
+            wide_acl_over(server_index(&[("s-docs", "docs")])).narrowed_to_allowlist(&ids(&[]));
+        assert!(!by_id.permits("docs__search"));
+        assert!(!by_id.permits("anything"));
     }
 
     /// The exact served set, as literals: growing or shrinking it is a

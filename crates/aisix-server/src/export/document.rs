@@ -358,7 +358,7 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             |_| "mcp_auth_settings".to_string(),
             "mcp_auth_settings",
             &mut diag,
-            |_, _, _| {},
+            |doc, _, diag| resugar_anonymous_servers(doc, &mcp_server_names, diag),
             |_, _| {},
         ),
     );
@@ -914,6 +914,63 @@ fn resugar_mcp_refs(
         }
         access.insert(name_field.into(), Value::Array(patterns));
     }
+}
+
+/// The anonymous ceiling's `anonymous.server_ids` (etcd server ids) → the
+/// name form `anonymous.servers`.
+///
+/// The id form is authoritative at runtime, so the name form it shadows is
+/// REPLACED rather than merged: keeping both would export a settings row
+/// whose stored ceiling and exported ceiling differ.
+///
+/// An id naming no exported server is dropped with a warning — the ceiling
+/// then admits less, which is the direction the gateway already takes for an
+/// unresolvable id. Two cases the name form genuinely cannot express are
+/// blocking instead, because dropping them would export a ceiling WIDER than
+/// the stored one:
+///
+/// - a server whose name contains a `*`: the ceiling is applied as
+///   `<server>__*` glob patterns, so a name built from `gh*` would also cover
+///   `ghost`'s tools (the same reason `mcp_access.allow_ids` refuses to build
+///   a pattern from such a name);
+/// - a ceiling that resolves to no server at all, including the empty array
+///   that denies every anonymous caller: `servers` must name at least one
+///   server, so the file has no spelling for it.
+fn resugar_anonymous_servers(
+    doc: &mut Value,
+    mcp_server_names: &BTreeMap<String, String>,
+    diag: &mut Diagnostics,
+) {
+    let Some(Value::Object(anon)) = doc.get_mut("anonymous") else {
+        return;
+    };
+    let Some(Value::Array(ids)) = anon.remove("server_ids") else {
+        return;
+    };
+    let mut names = Vec::with_capacity(ids.len());
+    for id in ids.iter().filter_map(Value::as_str) {
+        match mcp_server_names.get(id) {
+            Some(name) if name.contains('*') => diag.blocking.push(format!(
+                "the anonymous MCP ceiling admits server {name:?}, whose name contains `*`; a \
+                 `<server>__<tool>` pattern built from it would admit a different server, so \
+                 the exported file cannot express this ceiling"
+            )),
+            Some(name) => names.push(Value::String(name.clone())),
+            None => diag.warnings.push(format!(
+                "the anonymous MCP ceiling admits MCP server id {id:?}, which is not among the \
+                 exported MCP servers — the entry is dropped (the gateway already treats it as \
+                 admitting nothing)"
+            )),
+        }
+    }
+    if names.is_empty() {
+        diag.blocking.push(
+            "the anonymous MCP ceiling admits no server, which `anonymous.servers` cannot \
+             express — it must name at least one; disable anonymous access instead"
+                .to_string(),
+        );
+    }
+    anon.insert("servers".into(), Value::Array(names));
 }
 
 /// `claim_mapping.resolve.api_key_id` (etcd id) → `resolve.api_key`

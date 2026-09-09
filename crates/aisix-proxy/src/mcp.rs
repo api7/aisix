@@ -17,6 +17,7 @@
 
 use std::time::{Duration, Instant};
 
+use aisix_core::models::McpServerAllowlist;
 use aisix_obs::{AccessLog, UsageEvent};
 use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
@@ -86,7 +87,7 @@ struct McpCaller {
     /// The anonymous entry's server allowlist, which caps what this
     /// caller may see and call. `None` when the caller authenticated —
     /// an authenticated principal is bounded by its own grant alone.
-    anonymous_servers: Option<Vec<String>>,
+    anonymous_allowlist: Option<McpServerAllowlist>,
 }
 
 /// Authenticate the caller of a `/mcp` entry.
@@ -122,7 +123,7 @@ async fn resolve_caller(
             parts.extensions.insert(anon.auth.entry.clone());
             return Ok(McpCaller {
                 auth: anon.auth,
-                anonymous_servers: Some(anon.servers),
+                anonymous_allowlist: Some(anon.allowlist),
             });
         }
     }
@@ -133,7 +134,7 @@ async fn resolve_caller(
         .await?;
     Ok(McpCaller {
         auth,
-        anonymous_servers: None,
+        anonymous_allowlist: None,
     })
 }
 
@@ -152,7 +153,7 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
     };
     let McpCaller {
         auth,
-        anonymous_servers,
+        anonymous_allowlist,
     } = caller;
     let request = Request::from_parts(parts, body);
     // #698: /mcp emits the same access log + request metrics as every other
@@ -178,7 +179,7 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
 
     let response = dispatch(
         auth,
-        anonymous_servers.as_deref(),
+        anonymous_allowlist.as_ref(),
         scope.as_deref(),
         &state,
         request,
@@ -236,7 +237,7 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
 
 async fn dispatch(
     auth: AuthenticatedKey,
-    anonymous_servers: Option<&[String]>,
+    anonymous_allowlist: Option<&McpServerAllowlist>,
     scope: Option<&str>,
     state: &ProxyState,
     request: Request,
@@ -594,8 +595,8 @@ async fn dispatch(
         // `tools/call` alike, so an anonymous caller cannot reach an
         // unlisted server by naming `<server>__<tool>` on the
         // aggregated endpoint while its scoped entry stays closed.
-        match anonymous_servers {
-            Some(servers) => resolved.narrowed_to_servers(servers),
+        match anonymous_allowlist {
+            Some(allowlist) => resolved.narrowed_to_allowlist(allowlist),
             None => resolved,
         }
     };
@@ -1945,6 +1946,89 @@ mod tests {
                 StatusCode::UNAUTHORIZED,
                 "{server} must be indistinguishable from an unknown server"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_anonymous_entry_gate_reads_the_id_form_when_it_is_present() {
+        // `servers` names `kb`, `server_ids` names `docs`'s id. The id
+        // side decides both ways: `docs` opens and `kb` stays closed.
+        let router = router_with(snapshot_with_anonymous(serde_json::json!({
+            "servers": ["kb"],
+            "server_ids": ["mcp-docs"],
+        })));
+        for (server, expected) in [("docs", StatusCode::OK), ("kb", StatusCode::UNAUTHORIZED)] {
+            let response = router
+                .clone()
+                .oneshot(from_ip(
+                    scoped_request(server, None, "initialize", serde_json::json!({})),
+                    "10.1.2.3",
+                ))
+                .await
+                .expect("router responds");
+            assert_eq!(response.status(), expected, "/mcp/{server}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_id_spelled_anonymous_entry_gate_follows_a_rename() {
+        // Same id, new name, settings document untouched: anonymous
+        // access moves to the server's new namespace.
+        let snapshot = snapshot_with_anonymous(serde_json::json!({
+            "servers": ["docs"],
+            "server_ids": ["mcp-docs"],
+        }));
+        insert_mcp_server(&snapshot, "mcp-docs", "docs-v2", true);
+        let router = router_with(snapshot);
+        for (server, expected) in [
+            ("docs-v2", StatusCode::OK),
+            ("docs", StatusCode::UNAUTHORIZED),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(from_ip(
+                    scoped_request(server, None, "initialize", serde_json::json!({})),
+                    "10.1.2.3",
+                ))
+                .await
+                .expect("router responds");
+            assert_eq!(response.status(), expected, "/mcp/{server}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_unresolvable_id_list_closes_every_anonymous_entry() {
+        // An empty array is the authoritative "no server", even beside a
+        // name list that still names one — and an id matching no
+        // registered server offers nothing rather than everything.
+        for ids in [serde_json::json!([]), serde_json::json!(["mcp-gone"])] {
+            let router = router_with(snapshot_with_anonymous(serde_json::json!({
+                "servers": ["docs", "kb"],
+                "server_ids": ids,
+                "aggregate_entry": true,
+            })));
+            for server in ["docs", "kb"] {
+                let response = router
+                    .clone()
+                    .oneshot(from_ip(
+                        scoped_request(server, None, "initialize", serde_json::json!({})),
+                        "10.1.2.3",
+                    ))
+                    .await
+                    .expect("router responds");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "{ids}: /mcp/{server} must stay closed"
+                );
+            }
+            // The aggregated entry keeps its own opt-in, but the ceiling
+            // it serves under is empty, so it exposes no tool.
+            let response = router
+                .oneshot(from_ip(initialize_request(None), "10.1.2.3"))
+                .await
+                .expect("router responds");
+            assert_ne!(response.status(), StatusCode::UNAUTHORIZED, "{ids}");
         }
     }
 

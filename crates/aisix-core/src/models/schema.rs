@@ -132,7 +132,7 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "cache_policy" => cache_policy_root_schema(),
         "observability_exporter" => observability_exporter_root_schema(),
         "rate_limit_policy" => rate_limit_policy_root_schema(),
-        "mcp_server" => mcp_server_root_schema(),
+        "mcp_server" => mcp_server_root_schema(strict),
         "mcp_policy" => mcp_policy_root_schema(strict),
         "a2a_agent" => a2a_agent_root_schema(),
         "oidc_provider" => oidc_provider_root_schema(),
@@ -1245,7 +1245,16 @@ fn accept_renamed_field(schema: &mut Value, canonical: &str, former: &str, note:
 /// path enforces them. The label
 /// is accepted under both its canonical name `name` and its former name
 /// `display_name` (see [`accept_renamed_field`]).
-pub fn mcp_server_root_schema() -> Value {
+///
+/// `strict` additionally forbids a `*` in the label. The name is pasted
+/// into the `<server>__<tool>` glob patterns every name-form MCP grant,
+/// deny and anonymous ceiling is written as, so a `*` in it makes those
+/// patterns reach servers the operator never named — `gh*__read` built
+/// from a server called `gh*` also covers `ghost__read`. The read schema
+/// is deliberately left alone: a stored row that already carries a `*`
+/// must keep loading on every gateway, since a read-path tightening drops
+/// the row instead of the character.
+pub fn mcp_server_root_schema(strict: bool) -> Value {
     let mut schema = struct_root_schema::<crate::models::McpServer>(true);
     schema
         .as_object_mut()
@@ -1254,6 +1263,19 @@ pub fn mcp_server_root_schema() -> Value {
             "allOf".to_string(),
             super::mcp_server::mcp_server_credential_coupling(),
         );
+    if strict {
+        // Applied BEFORE the rename acceptance below, which copies this
+        // property to `display_name` — the two spellings of one label
+        // cannot enforce different patterns.
+        let name = schema
+            .pointer_mut("/properties/name")
+            .and_then(Value::as_object_mut)
+            .expect("mcp server schema declares `name`");
+        name.insert(
+            "pattern".to_string(),
+            json!(super::mcp_server::NAME_PATTERN_STRICT),
+        );
+    }
     accept_renamed_field(
         &mut schema,
         "name",
@@ -1464,8 +1486,26 @@ pub fn passthrough_route_root_schema() -> Value {
 /// (cp-api keys the row by the environment id; the resources file
 /// rejects duplicates at load) and, at read time, by the resolvers
 /// failing closed — not by the document schema.
+///
+/// The resource renders its `Option` fields non-nullable, but
+/// `anonymous.server_ids` accepts an explicit `null` on BOTH paths: the
+/// control plane clears the id spelling by writing one, and the read
+/// schema refusing it would drop the whole row — taking the OAuth
+/// discovery surface down along with anonymous access.
+///
+/// `servers` stays required beside it on both paths, which is stricter
+/// than the "write the name form beside the id form" guard the other MCP
+/// id spellings carry: a gateway one release behind the control plane
+/// reads the name form only, and an anonymous ceiling it cannot read at
+/// all is one it does not apply.
 pub fn mcp_auth_settings_root_schema() -> Value {
-    struct_root_schema::<crate::models::McpAuthSettings>(false)
+    let mut schema = struct_root_schema::<crate::models::McpAuthSettings>(false);
+    if let Some(Value::Object(property)) =
+        schema.pointer_mut("/definitions/McpAnonymousAccess/properties/server_ids")
+    {
+        property.insert("type".to_string(), json!(["array", "null"]));
+    }
+    schema
 }
 
 /// Canonical JSON Schema for the `mcp_policy` resource, derived from the
@@ -4947,6 +4987,54 @@ mod tests {
         validate_mcp_server(&json!({"name": "github", "url": "https://x/mcp"})).unwrap();
         validate_mcp_server(&json!({"display_name": "github", "url": "https://x/mcp"})).unwrap();
         assert!(validate_mcp_server(&json!({"url": "https://x/mcp"})).is_err());
+    }
+
+    #[test]
+    fn an_mcp_server_name_may_not_carry_a_star_on_the_write_path() {
+        // A name is pasted into the `<server>__*` glob patterns every
+        // name-form MCP grant, deny and anonymous ceiling is written as,
+        // so `gh*` would reach `ghost`'s tools as well as its own.
+        for label in ["name", "display_name"] {
+            for bad in ["gh*", "*", "a*b", "*gh"] {
+                assert!(
+                    validate_mcp_server(&json!({label: bad, "url": "https://x/mcp"})).is_err(),
+                    "{label}: {bad} must be refused on the write path"
+                );
+            }
+            // The shapes the pattern already refused, and one it never
+            // did — the tightening must not have moved either.
+            for bad in ["gh__ub", "gh_"] {
+                assert!(
+                    validate_mcp_server(&json!({label: bad, "url": "https://x/mcp"})).is_err(),
+                    "{label}: {bad} must stay refused"
+                );
+            }
+            validate_mcp_server(&json!({label: "gh_ub", "url": "https://x/mcp"})).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_stored_mcp_server_name_with_a_star_still_loads() {
+        // Pins the split, and the split is the whole point: the loader
+        // SKIPS a row it cannot validate, so closing the read pattern
+        // would delete an already-registered server rather than fix its
+        // name — and with it every grant, limit and anonymous entry that
+        // names it. Rejected by the write path, accepted by the loader,
+        // and it really deserializes.
+        let doc = json!({"name": "gh*", "url": "https://x/mcp"});
+        assert!(validate_mcp_server(&doc).is_err());
+        validate_mcp_server_lenient(&doc).unwrap();
+        let parsed: crate::models::McpServer = serde_json::from_value(doc).unwrap();
+        assert_eq!(parsed.name, "gh*");
+
+        // The `__` and trailing-`_` shapes are refused on BOTH paths, as
+        // before: those names cannot be split back into server + tool at
+        // all, so serving the row is worse than skipping it.
+        for bad in ["gh__ub", "gh_"] {
+            let doc = json!({"name": bad, "url": "https://x/mcp"});
+            assert!(validate_mcp_server(&doc).is_err(), "{bad}");
+            assert!(validate_mcp_server_lenient(&doc).is_err(), "{bad}");
+        }
     }
 
     #[test]
