@@ -16,22 +16,30 @@ import {
 const CALLER_KEY = "sk-user-agent-e2e";
 const routes = [
   {
+    provider: "openai",
     path: "/v1/chat/completions",
     body: { messages: [{ role: "user", content: "hi" }] },
   },
   {
+    provider: "openai",
     path: "/v1/messages",
     body: { max_tokens: 16, messages: [{ role: "user", content: "hi" }] },
   },
   {
+    provider: "openai",
     path: "/v1/responses",
     body: { input: "hi" },
+  },
+  {
+    provider: "anthropic",
+    path: "/v1/chat/completions",
+    body: { messages: [{ role: "user", content: "hi" }] },
   },
 ];
 
 describe.each([false, true])("upstream User-Agent (threadPerCore=%s)", (threadPerCore) => {
   let app: SpawnedApp | undefined;
-  let upstream: OpenAiUpstream | undefined;
+  const upstreams: Record<string, OpenAiUpstream> = {};
   let version: string;
 
   beforeAll(async () => {
@@ -44,23 +52,39 @@ describe.each([false, true])("upstream User-Agent (threadPerCore=%s)", (threadPe
     expect(stdout.trim()).toMatch(/^aisix \S+$/);
     version = stdout.trim().slice("aisix ".length);
 
-    upstream = await startOpenAiUpstream();
+    upstreams.openai = await startOpenAiUpstream();
+    upstreams.anthropic = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "msg-user-agent",
+        type: "message",
+        role: "assistant",
+        model: "mock-model",
+        content: [{ type: "text", text: "hi" }],
+        stop_reason: "end_turn",
+        stop_sequence: null,
+        usage: { input_tokens: 5, output_tokens: 1 },
+      },
+    });
     app = await spawnApp({ threadPerCore });
     const seed = new SeedClient(etcd, app.etcdPrefix);
-    for (const pool of ["default", "provider-key"]) {
-      const pk = await seed.createProviderKey({
-        display_name: `ua-${pool}`,
-        secret: "sk-mock",
-        api_base: `${upstream.baseUrl}/v1`,
-        // Select the per-key client even on loopback HTTP.
-        ...(pool === "provider-key" ? { tls: { verify: false } } : {}),
-      });
-      await seed.createModel({
-        display_name: `ua-${pool}`,
-        provider: "openai",
-        model_name: "mock-model",
-        provider_key_id: pk.id,
-      });
+    for (const [provider, upstream] of Object.entries(upstreams)) {
+      for (const pool of ["default", "provider-key"]) {
+        const pk = await seed.createProviderKey({
+          display_name: `ua-${provider}-${pool}`,
+          provider,
+          adapter: provider,
+          secret: "sk-mock",
+          api_base: upstream.baseUrl + (provider === "openai" ? "/v1" : ""),
+          // Select the per-key client even on loopback HTTP.
+          ...(pool === "provider-key" ? { tls: { verify: false } } : {}),
+        });
+        await seed.createModel({
+          display_name: `ua-${provider}-${pool}`,
+          provider,
+          model_name: "mock-model",
+          provider_key_id: pk.id,
+        });
+      }
     }
     await seed.createApiKey({
       key_hash: createHash("sha256").update(CALLER_KEY).digest("hex"),
@@ -77,11 +101,12 @@ describe.each([false, true])("upstream User-Agent (threadPerCore=%s)", (threadPe
 
   afterAll(async () => {
     await app?.exit();
-    await upstream?.close();
+    await Promise.all(Object.values(upstreams).map((upstream) => upstream.close()));
   });
 
   describe.each(["default", "provider-key"])("%s pool", (pool) => {
-    test.for(routes)("$path reports the binary's version upstream", async (route, ctx) => {
+    test.for(routes)("$provider $path reports the binary's version upstream", async (route, ctx) => {
+      const upstream = upstreams[route.provider];
       if (!app || !upstream) {
         ctx.skip();
         return;
@@ -95,7 +120,7 @@ describe.each([false, true])("upstream User-Agent (threadPerCore=%s)", (threadPe
           "anthropic-version": "2023-06-01",
           "user-agent": "test-client/1.0",
         },
-        body: JSON.stringify({ model: `ua-${pool}`, ...route.body }),
+        body: JSON.stringify({ model: `ua-${route.provider}-${pool}`, ...route.body }),
       });
       await res.arrayBuffer();
       expect(res.status).toBe(200);

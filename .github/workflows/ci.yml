@@ -298,6 +298,11 @@ jobs:
           name: coverage-unit
           path: lcov-unit.info
           retention-days: 7
+      - name: exporter User-Agent uses the release version
+        env:
+          # Differ from Cargo's version so the old source cannot pass.
+          AISIX_BUILD_VERSION: 0.0.0-ci
+        run: cargo test -p aisix-obs --lib otlp_http_sink::tests::otlp_sink_posts_one_request_with_all_spans -- --exact
 
   build-bin:
     name: build aisix (instrumented)
@@ -305,6 +310,7 @@ jobs:
     env:
       RUSTFLAGS: "-C instrument-coverage"
       LLVM_PROFILE_FILE: "coverage/aisix-%p-%m.profraw"
+      AISIX_BUILD_VERSION: 0.0.0-ci
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
