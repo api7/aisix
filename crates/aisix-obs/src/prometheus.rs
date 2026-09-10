@@ -1,6 +1,6 @@
 //! Per-series storage keeps scrape work off the recording path. Labels are
-//! escaped once on the first scrape; histogram samples use the existing lock-free
-//! bucket and the exporter's existing distribution/quantile implementation.
+//! escaped once on the first scrape; histogram samples use a concurrent queue
+//! and the exporter's existing distribution/quantile implementation.
 
 use std::{
     collections::HashMap,
@@ -8,6 +8,7 @@ use std::{
     sync::{atomic::Ordering, Arc, Mutex, OnceLock},
 };
 
+use crossbeam_queue::SegQueue;
 use metrics::{
     atomics::AtomicU64, Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName,
     Metadata, Recorder as MetricsRecorder, SharedString, Unit,
@@ -16,7 +17,7 @@ use metrics_exporter_prometheus::{
     formatting::{sanitize_label_key, sanitize_metric_name, write_help_line, write_type_line},
     Distribution, DistributionBuilder,
 };
-use metrics_util::{registry::Registry, storage::AtomicBucket};
+use metrics_util::registry::Registry;
 use quanta::Instant;
 
 struct Labels {
@@ -124,7 +125,7 @@ impl GaugeFn for Scalar {
 struct DistributionSeries {
     labels: Labels,
     kind: &'static str,
-    pending: AtomicBucket<(f64, Instant)>,
+    pending: SegQueue<(f64, Instant)>,
     distribution: Mutex<Distribution>,
 }
 
@@ -135,19 +136,37 @@ impl HistogramFn for DistributionSeries {
 }
 
 impl DistributionSeries {
+    fn drain(&self, distribution: &mut Distribution) {
+        // Bound this drain to the current backlog so ongoing writers cannot
+        // keep a scrape busy indefinitely. New samples stay queued for next time.
+        let count = self.pending.len();
+        let mut samples = Vec::with_capacity(count.min(64));
+        for _ in 0..count {
+            let Some(sample) = self.pending.pop() else {
+                break;
+            };
+            samples.push(sample);
+            if samples.len() == 64 {
+                distribution.record_samples(&samples);
+                samples.clear();
+            }
+        }
+        if !samples.is_empty() {
+            distribution.record_samples(&samples);
+        }
+    }
+
     fn upkeep(&self) {
         if self.pending.is_empty() {
             return;
         }
         let mut distribution = self.distribution.lock().expect("metric distribution");
-        self.pending
-            .clear_with(|samples| distribution.record_samples(samples));
+        self.drain(&mut distribution);
     }
 
     fn render(&self, output: &mut String) {
         let mut distribution = self.distribution.lock().expect("metric distribution");
-        self.pending
-            .clear_with(|samples| distribution.record_samples(samples));
+        self.drain(&mut distribution);
         let (sum, count) = match &*distribution {
             Distribution::Summary(summary, quantiles, sum) => {
                 let snapshot = summary.snapshot(Instant::now());
@@ -208,7 +227,7 @@ impl metrics_util::registry::Storage<Key> for Storage {
         Arc::new(DistributionSeries {
             labels: Labels::new(key),
             kind,
-            pending: AtomicBucket::new(),
+            pending: SegQueue::new(),
             distribution: Mutex::new(distribution),
         })
     }
@@ -494,6 +513,7 @@ mod tests {
         let recorder = Arc::new(Recorder::new(distributions()));
         let metadata = Metadata::new("test", metrics::Level::INFO, None);
         let histogram = recorder.register_histogram(&Key::from_name("latency"), &metadata);
+        let summary = recorder.register_histogram(&Key::from_name("duration"), &metadata);
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let maintenance = {
             let recorder = Arc::clone(&recorder);
@@ -508,9 +528,11 @@ mod tests {
         let writers = (0..4)
             .map(|_| {
                 let histogram = histogram.clone();
+                let summary = summary.clone();
                 std::thread::spawn(move || {
                     for _ in 0..10_000 {
                         histogram.record(0.5);
+                        summary.record(0.5);
                     }
                 })
             })
@@ -529,6 +551,8 @@ mod tests {
             assert_eq!(sample(&output, "latency_bucket{le=\"+Inf\"} "), count);
             assert_eq!(sample(&output, "latency_bucket{le=\"0.5\"} "), count);
             assert_eq!(sample(&output, "latency_sum "), count * 0.5);
+            let count = sample(&output, "duration_count ");
+            assert_eq!(sample(&output, "duration_sum "), count * 0.5);
         }
         for writer in writers {
             writer.join().unwrap();
@@ -538,5 +562,7 @@ mod tests {
         let output = recorder.render();
         assert_eq!(sample(&output, "latency_count "), 40_000.0);
         assert_eq!(sample(&output, "latency_sum "), 20_000.0);
+        assert_eq!(sample(&output, "duration_count "), 40_000.0);
+        assert_eq!(sample(&output, "duration_sum "), 20_000.0);
     }
 }

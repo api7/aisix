@@ -140,6 +140,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt",
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 metrics-util = { version = "0.19", default-features = false, features = ["registry"] }
+crossbeam-queue = "0.3"
 quanta = "0.12"
 
 # Errors / utilities

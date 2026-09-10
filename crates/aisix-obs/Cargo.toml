@@ -19,6 +19,7 @@ tracing-subscriber.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 metrics-util.workspace = true
+crossbeam-queue.workspace = true
 quanta.workspace = true
 bytes.workspace = true
 regex.workspace = true
