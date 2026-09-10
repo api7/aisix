@@ -17,6 +17,8 @@ pub mod access_log;
 pub mod metric_labels;
 pub mod metrics;
 pub mod otlp_http_sink;
+mod prometheus;
+mod scrape;
 pub mod sink;
 pub mod trace;
 pub mod usage;

@@ -489,9 +489,10 @@ fn select_managed_boot_path(bundle_on_disk: bool, bundle_provided: bool) -> Mana
 
 /// Run `job` every `period` until cancelled. Two callers: the metrics
 /// upkeep sweep and the inert-guardrail sweep.
-async fn run_periodic<F>(mut cancel: watch::Receiver<bool>, period: Duration, job: F)
+async fn run_periodic<F, Fut>(mut cancel: watch::Receiver<bool>, period: Duration, job: F)
 where
-    F: Fn(),
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = ()>,
 {
     let mut interval = tokio::time::interval(period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -500,7 +501,7 @@ where
             break;
         }
         tokio::select! {
-            _ = interval.tick() => job(),
+            _ = interval.tick() => job().await,
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
                     break;
@@ -929,14 +930,24 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             cancel_rx.clone(),
             Duration::from_secs(5),
             move || {
-                metrics.run_upkeep();
-                // Retire the gauge series whose key is gone. These families
-                // are written only from the request (or health-check) path,
-                // and the recorder registers no idle timeout, so a deleted
-                // or rebound api key leaves a sample frozen at its last
-                // value while still claiming to describe the present.
-                let snap = snapshot.load();
-                metrics.retire_stale_gauges(|series| gauge_series_is_live(&snap, series));
+                let metrics = metrics.clone();
+                let snapshot = snapshot.clone();
+                async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        metrics.run_upkeep();
+                        // Retire the gauge series whose key is gone. These families
+                        // are written only from the request (or health-check) path,
+                        // and the recorder registers no idle timeout, so a deleted
+                        // or rebound api key leaves a sample frozen at its last
+                        // value while still claiming to describe the present.
+                        let snap = snapshot.load();
+                        metrics.retire_stale_gauges(|series| gauge_series_is_live(&snap, series));
+                    })
+                    .await;
+                    if let Err(error) = result {
+                        tracing::error!(%error, "metrics upkeep task failed");
+                    }
+                }
             },
         ))
     };
@@ -1184,6 +1195,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                     &snap.guardrails,
                     &snap.guardrail_attachments,
                 );
+                std::future::ready(())
             },
         ));
     }
@@ -2893,6 +2905,7 @@ mod tests {
         let observed = calls.clone();
         let task = tokio::spawn(run_periodic(cancel_rx, Duration::from_secs(5), move || {
             observed.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(())
         }));
 
         tokio::task::yield_now().await;

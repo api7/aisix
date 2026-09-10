@@ -1,0 +1,18 @@
+[package]
+name = "metrics-scale-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+metrics = "=0.24.3"
+metrics-exporter-prometheus = "=0.16.2"
+serde_json = "1"
+libc = "0.2"
+metrics-util = "=0.19.1"
+quanta = "0.12"
+
+[features]
+optimized = []
+
+[profile.release]
+debug = 1
