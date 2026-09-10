@@ -548,6 +548,38 @@ describe("guardrail input_messages: latest_turn (AISIX-Cloud#1558)", () => {
     60_000,
   );
 
+  test(
+    "/v1/responses: a model turn carrying no readable text still opens the window",
+    async (ctx) => {
+      if (!etcdReachable || !app) {
+        ctx.skip();
+        return;
+      }
+      await waitForLane(kwLatest.model);
+      await waitForLane(scriptLatest.model);
+
+      // What an agent client replays when reasoning summaries are off:
+      // the item's only payload is provider ciphertext, so it carries no
+      // text to scan — but it is still the model's turn, and both halves
+      // of the window rule have to agree that the marker before it is
+      // history.
+      const input = [
+        { role: "user", content: `earlier ${MARKER}` },
+        { type: "reasoning", encrypted_content: "opaque-provider-blob" },
+        { role: "user", content: "a clean new question" },
+      ];
+      expect(
+        await blocked(responses(kwLatest.model, input)),
+        "check pass: the marker sits before the model's turn",
+      ).toBe(false);
+      expect(
+        await blocked(responses(scriptLatest.model, input)),
+        "segment pass must agree with the check pass",
+      ).toBe(false);
+    },
+    60_000,
+  );
+
   // ── masking follows the same window ───────────────────────────────────
 
   test(

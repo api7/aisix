@@ -993,10 +993,21 @@ fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
                     continue;
                 }
                 let text = responses_item_text(item);
-                if text.is_empty() {
+                let role = responses_item_role(item);
+                // A text-empty item carries nothing to scan and is dropped
+                // — EXCEPT an assistant-side one, which is where the
+                // latest-turn window opens. The mask walkers read that
+                // boundary off the wire and cannot tell that the item held
+                // no text, so dropping it here would make the two halves
+                // of the rule disagree: the check pass would see no model
+                // turn at all and widen back to the whole conversation.
+                // The shape is real — a `reasoning` item whose only
+                // payload is `encrypted_content` has no readable text and
+                // is replayed on every turn by agent clients.
+                if text.is_empty() && role != Role::Assistant {
                     continue;
                 }
-                messages.push(match responses_item_role(item) {
+                messages.push(match role {
                     Role::Assistant => ChatMessage::assistant(text),
                     Role::System => ChatMessage::system(text),
                     Role::Tool => ChatMessage::tool(text),
@@ -3828,6 +3839,51 @@ mod tests {
         // The call's name and arguments are the scannable text.
         assert!(seen[5].1.contains("lookup"), "{:?}", seen[5]);
         assert!(seen[5].1.contains("SECRET"), "{:?}", seen[5]);
+    }
+
+    /// The check pass and the mask walkers each answer "where does the
+    /// latest turn start" for their own representation, so a model turn
+    /// that carries no readable text still has to reach the parsed view —
+    /// otherwise a `latest_turn` row would refuse on history that the
+    /// mask walkers correctly treat as out of window.
+    #[test]
+    fn responses_input_keeps_a_text_empty_assistant_item_as_a_boundary() {
+        let body = serde_json::json!({
+            "model": "m",
+            "input": [
+                {"role": "user", "content": "earlier"},
+                {"type": "reasoning", "encrypted_content": "opaque"},
+                {"role": "user", "content": "fresh"},
+            ],
+        });
+        let chat = super::responses_input_to_chat("m", &body);
+        let roles: Vec<_> = chat.messages.iter().map(|m| m.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                aisix_gateway::Role::User,
+                aisix_gateway::Role::Assistant,
+                aisix_gateway::Role::User,
+            ],
+        );
+        let window = aisix_guardrails::latest_turn_view(&chat);
+        assert_eq!(window.messages.len(), 1);
+        assert_eq!(window.messages[0].content_str(), "fresh");
+    }
+
+    /// A text-empty item that is NOT a model turn is still dropped — the
+    /// exception above must be the boundary, not a blanket change.
+    #[test]
+    fn responses_input_still_drops_a_text_empty_non_assistant_item() {
+        let body = serde_json::json!({
+            "model": "m",
+            "input": [
+                {"role": "user", "content": "earlier"},
+                {"type": "function_call_output", "call_id": "c1", "output": ""},
+            ],
+        });
+        let chat = super::responses_input_to_chat("m", &body);
+        assert_eq!(chat.messages.len(), 1);
     }
 
     /// A tool RESULT is the caller answering, so it lands on `Role::Tool`
