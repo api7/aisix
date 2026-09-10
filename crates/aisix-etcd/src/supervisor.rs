@@ -26,7 +26,7 @@ use futures::StreamExt;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
@@ -34,7 +34,7 @@ use crate::backoff::ExpBackoff;
 use crate::key::{PrefixScope, PrefixSet, WatchedPrefix};
 use crate::loader::{self, BuildStats, PartialCompatEntry, PartialCompatRow, RejectedEntry};
 use crate::provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
-use crate::snapshot_cache::SnapshotCache;
+use crate::snapshot_cache::{encode_entry, encode_stale, SnapshotCache};
 use std::sync::atomic::AtomicBool;
 
 /// Cheap clonable handle for the watch supervisor's freshness state —
@@ -176,11 +176,34 @@ const CACHE_WRITE_DRAIN: Duration = Duration::from_secs(5);
 /// not truncate a report. The map is bounded by the number of rows that
 /// ever loaded successfully — a subset of the served snapshot, which is
 /// itself uncapped.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct StaleServing {
     pub entry: RawEntry,
     pub since_unix_secs: u64,
+    cache_record: OnceLock<Arc<[u8]>>,
 }
+
+impl StaleServing {
+    pub(crate) fn new(entry: RawEntry, since_unix_secs: u64) -> Self {
+        Self {
+            entry,
+            since_unix_secs,
+            cache_record: OnceLock::new(),
+        }
+    }
+
+    fn cache_record(&self) -> Arc<[u8]> {
+        self.cache_record.get_or_init(|| encode_stale(self)).clone()
+    }
+}
+
+impl PartialEq for StaleServing {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry == other.entry && self.since_unix_secs == other.since_unix_secs
+    }
+}
+
+impl Eq for StaleServing {}
 
 /// One observed etcd entry plus the bytes it contributes to the config
 /// digests, computed once when the entry is stored.
@@ -191,12 +214,23 @@ struct StateEntry {
     /// function of `(key, value)`, so it is valid for exactly as long as
     /// this map holds these bytes.
     record: Arc<[u8]>,
+    cache_record: OnceLock<Arc<[u8]>>,
 }
 
 impl StateEntry {
     fn new(entry: RawEntry) -> Self {
         let record: Arc<[u8]> = hash_record(&entry.key, &entry.value).into();
-        Self { entry, record }
+        Self {
+            entry,
+            record,
+            cache_record: OnceLock::new(),
+        }
+    }
+
+    fn cache_record(&self) -> Arc<[u8]> {
+        self.cache_record
+            .get_or_init(|| encode_entry(&self.entry))
+            .clone()
     }
 }
 
@@ -940,10 +974,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             .lock()
             .unwrap()
             .entry(key_str.to_string())
-            .or_insert_with(|| StaleServing {
-                entry: good,
-                since_unix_secs: now_unix_secs(),
-            });
+            .or_insert_with(|| StaleServing::new(good, now_unix_secs()));
     }
 
     /// Apply a single Put event on top of the current snapshot.
@@ -1302,10 +1333,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                 if let Some(good) = prev_state.get(&r.key) {
                     stale.insert(
                         r.key.clone(),
-                        StaleServing {
-                            entry: good.clone(),
-                            since_unix_secs: now_unix_secs(),
-                        },
+                        StaleServing::new(good.clone(), now_unix_secs()),
                     );
                 }
             }
@@ -1394,26 +1422,29 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// don't drive the cache), the write is silently dropped which is
     /// the desired no-op.
     fn flush_cache(&self) {
-        let entries: Vec<RawEntry> = {
+        if !self.cache.is_enabled() {
+            return;
+        }
+        let entries: Vec<Arc<[u8]>> = {
             let state = self.state.lock().unwrap();
-            state.values().map(|e| e.entry.clone()).collect()
+            state.values().map(StateEntry::cache_record).collect()
         };
-        let stale: Vec<StaleServing> = {
+        let stale: Vec<Arc<[u8]>> = {
             let guard = self.stale_serving.lock().unwrap();
-            guard.values().cloned().collect()
+            guard.values().map(StaleServing::cache_record).collect()
         };
         let revision = *self.revision.lock().unwrap();
         let cache = self.cache.clone();
         // Spawn the actual write so the apply path stays sync. If we
-        // aren't inside a runtime (cache::disabled() tests), just skip.
+        // aren't inside a runtime, just skip.
         // Track the JoinHandle so [`Self::run`] can drain it at shutdown,
         // and so tests can deterministically await the write via
         // [`Self::await_pending_cache_writes`] instead of leaning on
         // `tokio::time::sleep`, which under CI load raced the spawn
         // (~50ms wasn't enough on heavily loaded GitHub Actions runners).
         if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
-            let join =
-                rt_handle.spawn(async move { cache.store(&entries, revision, &stale).await });
+            let join = rt_handle
+                .spawn(async move { cache.store_encoded(&entries, revision, &stale).await });
             let mut pending = self.pending_writes.lock().unwrap();
             // Only writes still in flight are worth draining, and only
             // those may be retained: the list is appended to on every
@@ -2205,7 +2236,7 @@ mod tests {
     use crate::provider::{RawEntry, WatchEvent};
     use async_trait::async_trait;
     use futures::stream;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
 
     struct FakeProvider {
         entries: Mutex<Vec<RawEntry>>,
@@ -3013,6 +3044,75 @@ mod tests {
         assert_eq!(snap.guardrails.len(), 1);
     }
 
+    #[tokio::test]
+    async fn disabled_cache_skips_encoding_and_background_writes() {
+        let provider = Arc::new(FakeProvider::new(
+            vec![entry("/aisix/models/m-1", VALID_MODEL, 1)],
+            1,
+        ));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+        assert!(sup.pending_writes.lock().unwrap().is_empty());
+        assert!(sup
+            .state
+            .lock()
+            .unwrap()
+            .values()
+            .all(|row| row.cache_record.get().is_none()));
+
+        sup.apply_put(&entry("/aisix/models/m-1", b"not json", 2));
+        assert_eq!(sup.handle().load().models.len(), 1);
+        assert_eq!(sup.stale_serving.lock().unwrap().len(), 1);
+        assert!(sup
+            .stale_serving
+            .lock()
+            .unwrap()
+            .values()
+            .all(|row| row.cache_record.get().is_none()));
+        sup.apply_delete("/aisix/models/m-1");
+        assert_eq!(sup.handle().load().models.len(), 0);
+        assert!(sup.pending_writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cache_records_are_shared_until_their_entry_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = SnapshotCache::new(dir.path().join("snap.json"));
+        let provider = Arc::new(FakeProvider::new(
+            vec![
+                entry("/aisix/models/m-1", VALID_MODEL, 1),
+                entry("/aisix/api_keys/k-1", VALID_APIKEY, 1),
+            ],
+            1,
+        ));
+        let sup = Supervisor::with_cache(provider, "/aisix", cache.clone());
+        sup.load_once().await.unwrap();
+        let records = || {
+            let state = sup.state.lock().unwrap();
+            (
+                state["/aisix/models/m-1"].cache_record(),
+                state["/aisix/api_keys/k-1"].cache_record(),
+            )
+        };
+        let before = records();
+        sup.apply_put(&entry("/aisix/models/m-1", b"not json", 2));
+        let after = records();
+        assert!(!Arc::ptr_eq(&before.0, &after.0));
+        assert!(Arc::ptr_eq(&before.1, &after.1));
+        let pinned = sup.stale_serving.lock().unwrap()["/aisix/models/m-1"].cache_record();
+        sup.apply_put(&entry("/aisix/api_keys/k-1", VALID_APIKEY, 3));
+        assert!(Arc::ptr_eq(
+            &pinned,
+            &sup.stale_serving.lock().unwrap()["/aisix/models/m-1"].cache_record()
+        ));
+        sup.await_pending_cache_writes().await;
+        let cached = cache.load().unwrap();
+        assert_eq!(cached.revision, 3);
+        assert_eq!(cached.entries.len(), 2);
+        assert_eq!(cached.stale.len(), 1);
+        assert_eq!(cached.stale[0].entry.value, VALID_MODEL);
+    }
+
     /// A delete for a key the gateway never held changes what
     /// `/status/config` reports (the revision floor moved) and nothing
     /// about the observed entry set — so it must not rewrite the on-disk
@@ -3020,7 +3120,12 @@ mod tests {
     #[tokio::test]
     async fn a_delete_of_an_unknown_key_publishes_status_without_writing_the_cache() {
         let provider = Arc::new(FakeProvider::new(vec![], 0));
-        let sup = Supervisor::new(provider, "/aisix");
+        let dir = tempfile::tempdir().unwrap();
+        let sup = Supervisor::with_cache(
+            provider,
+            "/aisix",
+            SnapshotCache::new(dir.path().join("snap.json")),
+        );
         sup.load_once().await.unwrap();
         sup.await_pending_cache_writes().await;
 

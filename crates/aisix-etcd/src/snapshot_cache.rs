@@ -22,15 +22,14 @@
 //! Atomicity: `store` writes to `<path>.tmp` first, fsyncs, then
 //! renames over the destination. A torn write never corrupts the
 //! committed file. Disabled when [`SnapshotCache::disabled`] is used
-//! (passed when `managed.snapshot_cache_path` is empty so operators
-//! can opt out).
+//! (the default unless `managed.snapshot_cache_enabled` is true).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
 
 use crate::provider::RawEntry;
@@ -58,12 +57,9 @@ struct Inner {
     /// so they also commit in order. Reads are unguarded — they go
     /// through OS caches and the rename is atomic.
     ///
-    /// The ordering half matters because [`Self::store`] serialises its
-    /// snapshot BEFORE taking this lock: the supervisor spawns one write
-    /// per apply and never waits for it, so two writes racing that work
-    /// can reach the lock in the opposite order to the applies that
-    /// produced them, and the older snapshot lands last. `i64::MIN`
-    /// until the first write, so a revision of `0` still commits.
+    /// Applies spawn independent tasks, so a newer revision may acquire
+    /// the lock first. Never let a late older task replace it. `i64::MIN`
+    /// until the first write so revision zero also commits.
     write_lock: Mutex<i64>,
 }
 
@@ -135,6 +131,10 @@ impl SnapshotCache {
         }
     }
 
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.inner.path.is_some()
+    }
+
     /// Read the cached snapshot, or `None` if no usable file exists.
     /// "Usable" means: the file is present, parses as JSON, declares a
     /// recognised [`FORMAT_VERSION`], and every entry's value decodes.
@@ -180,13 +180,15 @@ impl SnapshotCache {
             .stale
             .into_iter()
             .map(|s| {
-                B64.decode(&s.value_b64).map(|value| StaleServing {
-                    entry: RawEntry {
-                        key: s.key,
-                        value,
-                        revision: s.revision,
-                    },
-                    since_unix_secs: s.since_unix_secs,
+                B64.decode(&s.value_b64).map(|value| {
+                    StaleServing::new(
+                        RawEntry {
+                            key: s.key,
+                            value,
+                            revision: s.revision,
+                        },
+                        s.since_unix_secs,
+                    )
                 })
             })
             .collect();
@@ -208,36 +210,22 @@ impl SnapshotCache {
     /// cache is not worth blowing up an otherwise-healthy DP — at worst
     /// the next restart rebuilds from etcd.
     pub async fn store(&self, entries: &[RawEntry], revision: i64, stale: &[StaleServing]) {
-        let Some(path) = self.inner.path.clone() else {
+        if !self.is_enabled() {
             return;
-        };
-        let cached = CachedFile {
-            version: FORMAT_VERSION,
-            revision,
-            entries: entries
-                .iter()
-                .map(|e| CachedEntry {
-                    key: e.key.clone(),
-                    value_b64: B64.encode(&e.value),
-                    revision: e.revision,
-                })
-                .collect(),
-            stale: stale
-                .iter()
-                .map(|s| CachedStaleEntry {
-                    key: s.entry.key.clone(),
-                    value_b64: B64.encode(&s.entry.value),
-                    revision: s.entry.revision,
-                    since_unix_secs: s.since_unix_secs,
-                })
-                .collect(),
-        };
-        let bytes = match serde_json::to_vec(&cached) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(error = %e, "snapshot cache serialise failed");
-                return;
-            }
+        }
+        let entries: Vec<_> = entries.iter().map(encode_entry).collect();
+        let stale: Vec<_> = stale.iter().map(encode_stale).collect();
+        self.store_encoded(&entries, revision, &stale).await;
+    }
+
+    pub(crate) async fn store_encoded(
+        &self,
+        entries: &[Arc<[u8]>],
+        revision: i64,
+        stale: &[Arc<[u8]>],
+    ) {
+        let Some(path) = self.inner.path.as_ref() else {
+            return;
         };
         let mut committed = self.inner.write_lock.lock().await;
         // A write that lost the serialisation race to a NEWER apply has
@@ -249,7 +237,7 @@ impl SnapshotCache {
         if revision < *committed {
             return;
         }
-        if let Err(e) = atomic_write(&path, &bytes).await {
+        if let Err(e) = atomic_write(path, entries, revision, stale).await {
             tracing::warn!(error = %e, path = %path.display(), "snapshot cache write failed");
             return;
         }
@@ -257,9 +245,35 @@ impl SnapshotCache {
     }
 }
 
-/// Write `bytes` to `path` atomically: write to a sibling tmp file,
-/// fsync, rename. Survives crashes between any two of those steps.
-async fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn encode_entry(entry: &RawEntry) -> Arc<[u8]> {
+    serde_json::to_vec(&CachedEntry {
+        key: entry.key.clone(),
+        value_b64: B64.encode(&entry.value),
+        revision: entry.revision,
+    })
+    .expect("snapshot entries contain only strings and integers")
+    .into()
+}
+
+pub(crate) fn encode_stale(stale: &StaleServing) -> Arc<[u8]> {
+    serde_json::to_vec(&CachedStaleEntry {
+        key: stale.entry.key.clone(),
+        value_b64: B64.encode(&stale.entry.value),
+        revision: stale.entry.revision,
+        since_unix_secs: stale.since_unix_secs,
+    })
+    .expect("stale entries contain only strings and integers")
+    .into()
+}
+
+/// Preserve the v1 JSON envelope while writing shared records through a
+/// bounded buffer. No full-snapshot byte buffer is assembled per apply.
+async fn atomic_write(
+    path: &Path,
+    entries: &[Arc<[u8]>],
+    revision: i64,
+    stale: &[Arc<[u8]>],
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             tokio::fs::create_dir_all(parent).await?;
@@ -267,11 +281,34 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     let tmp = path.with_extension("tmp");
     {
-        let mut f = tokio::fs::File::create(&tmp).await?;
-        f.write_all(bytes).await?;
-        f.sync_all().await?;
+        let mut writer = BufWriter::with_capacity(64 * 1024, tokio::fs::File::create(&tmp).await?);
+        writer
+            .write_all(
+                format!(r#"{{"version":{FORMAT_VERSION},"revision":{revision},"entries":["#)
+                    .as_bytes(),
+            )
+            .await?;
+        write_records(&mut writer, entries).await?;
+        writer.write_all(b"],\"stale\":[").await?;
+        write_records(&mut writer, stale).await?;
+        writer.write_all(b"]}").await?;
+        writer.flush().await?;
+        writer.get_ref().sync_all().await?;
     }
     tokio::fs::rename(&tmp, path).await
+}
+
+async fn write_records(
+    writer: &mut BufWriter<tokio::fs::File>,
+    records: &[Arc<[u8]>],
+) -> std::io::Result<()> {
+    for (index, record) in records.iter().enumerate() {
+        if index > 0 {
+            writer.write_all(b",").await?;
+        }
+        writer.write_all(record).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -355,10 +392,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let cache = SnapshotCache::new(dir.path().join("snap.json"));
         let entries = vec![entry("/aisix/models/m-1", br#"{"bad":true}"#, 9)];
-        let stale = vec![StaleServing {
-            entry: entry("/aisix/models/m-1", br#"{"name":"last-good"}"#, 7),
-            since_unix_secs: 1_770_000_000,
-        }];
+        let stale = vec![StaleServing::new(
+            entry("/aisix/models/m-1", br#"{"name":"last-good"}"#, 7),
+            1_770_000_000,
+        )];
         cache.store(&entries, 9, &stale).await;
 
         let cached = cache.load().expect("cache file exists");

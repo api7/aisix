@@ -797,11 +797,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                     cfg.etcd.request_timeout(),
                 ))
             };
-            // Snapshot cache: persist to disk so the DP can serve traffic
-            // from the last-known config across CP outages and restarts.
-            // Managed mode defaults to /var/lib/aisix/config_cache.json;
-            // self-hosted etcd mode enables it only when the operator sets
-            // a path explicitly; "" disables it in either mode.
+            // Disk recovery is opt-in in both managed and self-hosted modes.
             let snapshot_cache = match cfg.managed.effective_snapshot_cache_path() {
                 Some(path) => SnapshotCache::new(path),
                 None => SnapshotCache::disabled(),

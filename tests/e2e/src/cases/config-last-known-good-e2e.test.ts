@@ -59,7 +59,7 @@ async function scrape(app: SpawnedApp): Promise<string> {
 
 describe("config last-known-good: rejected updates keep serving across resync and restart", () => {
   let app: SpawnedApp | undefined;
-  let stoppedApp: SpawnedApp | undefined;
+  const stoppedApps: SpawnedApp[] = [];
   let upstream: OpenAiUpstream | undefined;
   let etcd: EtcdClient | undefined;
   let etcdReachable = false;
@@ -106,7 +106,7 @@ describe("config last-known-good: rejected updates keep serving across resync an
     await app?.exit();
     // The pre-restart app was stop()ped without cleanup; exit() is
     // idempotent on the dead process and reclaims its tmp dir.
-    await stoppedApp?.exit();
+    for (const stopped of stoppedApps) await stopped.exit();
     await upstream?.close();
     if (cacheDir) await rm(cacheDir, { recursive: true, force: true });
   });
@@ -177,7 +177,7 @@ describe("config last-known-good: rejected updates keep serving across resync an
     }
 
     // Full process restart on the same etcd prefix + snapshot cache.
-    stoppedApp = app;
+    stoppedApps.push(app);
     await app.stop();
     app = await spawnApp({
       etcdPrefix,
@@ -221,6 +221,33 @@ describe("config last-known-good: rejected updates keep serving across resync an
 
     const text = await scrape(app);
     expect(text).toMatch(/aisix_config_stale_served_resources\{kind="models"\} 1/);
+  });
+
+  test("disabling persistence does not restore the last good configuration on restart", async (ctx) => {
+    if (!etcdReachable || !app || !etcd) {
+      ctx.skip();
+      return;
+    }
+
+    const uncached = await spawnApp({ etcdPrefix, snapshotCachePath: "" });
+    stoppedApps.push(uncached);
+    try {
+      await waitConfigPropagation(async () => {
+        const cfg = await getStatusConfig(uncached);
+        return cfg.rejected.some((row) => row.resource_id === modelId);
+      });
+      const cfg = await getStatusConfig(uncached);
+      expect(cfg.applied?.resource_counts.models ?? 0).toBe(0);
+      expect(cfg.rejected.find((row) => row.resource_id === modelId)?.serving_stale_since).toBeUndefined();
+      const proxy = new ProxyClient(uncached.proxyUrl, CALLER_PLAINTEXT);
+      const response = await proxy.chat({
+        model: "lkg-model",
+        messages: [{ role: "user", content: "no disk recovery" }],
+      });
+      expect(response.status, JSON.stringify(response.body)).toBe(404);
+    } finally {
+      await uncached.stop();
+    }
   });
 
   test("deleting the etcd key kills the pinned value — no zombie config", async (ctx) => {
