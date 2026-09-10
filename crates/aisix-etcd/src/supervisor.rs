@@ -2236,7 +2236,7 @@ mod tests {
     use crate::provider::{RawEntry, WatchEvent};
     use async_trait::async_trait;
     use futures::stream;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
     struct FakeProvider {
         entries: Mutex<Vec<RawEntry>>,
