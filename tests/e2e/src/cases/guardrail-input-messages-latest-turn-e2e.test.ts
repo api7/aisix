@@ -608,20 +608,25 @@ describe("guardrail input_messages: latest_turn (AISIX-Cloud#1558)", () => {
 
       await waitConfigPropagation(async () => {
         const before = upstream!.receivedRequests.length;
-        await chat(piiLatest.model, [
+        const probe = await chat(piiLatest.model, [
           { role: "user", content: `probe ${CURRENT_MAIL}` },
         ]);
+        if (!probe.ok) return false;
         return upstream!.receivedRequests
           .slice(before)
           .some((r) => !r.body.includes(CURRENT_MAIL));
       });
 
       const before = upstream.receivedRequests.length;
-      await chat(piiLatest.model, [
+      const res = await chat(piiLatest.model, [
         { role: "user", content: `earlier ${HISTORY_MAIL}` },
         { role: "assistant", content: "understood" },
         { role: "user", content: `now ${CURRENT_MAIL}` },
       ]);
+      // A mask row never refuses, so anything but a success here means the
+      // request took a path this case is not describing — and the upstream
+      // body below would then be evidence about the wrong request.
+      expect(res.status, "a masking row must not refuse the request").toBe(200);
       const sent = upstream.receivedRequests.slice(before);
       expect(sent.length).toBeGreaterThan(0);
       const body = sent[sent.length - 1].body;
@@ -644,22 +649,23 @@ describe("guardrail input_messages: latest_turn (AISIX-Cloud#1558)", () => {
       // upstream rather than on a refusal.
       await waitConfigPropagation(async () => {
         const before = upstream!.receivedRequests.length;
-        await chat(maskLatest.model, [
+        const probe = await chat(maskLatest.model, [
           { role: "user", content: `probe ${SECRET}` },
         ]);
-        const forwarded = upstream!.receivedRequests
+        if (!probe.ok) return false;
+        return upstream!.receivedRequests
           .slice(before)
           .some((r) => r.body.includes(MASKED));
-        return forwarded;
       });
 
       const before = upstream.receivedRequests.length;
-      await chat(maskLatest.model, [
+      const res = await chat(maskLatest.model, [
         { role: "system", content: `system holds ${SECRET}` },
         { role: "user", content: `earlier turn holds ${SECRET}` },
         { role: "assistant", content: "understood" },
         { role: "user", content: `this turn holds ${SECRET}` },
       ]);
+      expect(res.status, "a masking row must not refuse the request").toBe(200);
       const sent = upstream.receivedRequests.slice(before);
       expect(sent.length, "the request must reach the upstream").toBeGreaterThan(0);
       const body = JSON.parse(sent[sent.length - 1].body) as {
