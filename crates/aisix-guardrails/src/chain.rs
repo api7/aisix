@@ -15,7 +15,8 @@ use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 
 use aisix_core::models::{
-    GuardrailEnforcedHit, GuardrailExecution, GuardrailMetricsSink, GuardrailMonitorHit,
+    GuardrailEnforcedHit, GuardrailExecution, GuardrailInputMessages, GuardrailMetricsSink,
+    GuardrailMonitorHit,
 };
 
 use crate::audit::GuardrailAuditLog;
@@ -31,6 +32,10 @@ struct ChainMember {
     name: String,
     kind: String,
     guardrail: Arc<dyn Guardrail>,
+    /// The row's `input_messages`. Lives on the member rather than the
+    /// guardrail because it is common to all twelve kinds and none of them
+    /// needs to know its own window — the chain narrows what it hands over.
+    input_messages: GuardrailInputMessages,
 }
 
 #[derive(Clone)]
@@ -57,6 +62,31 @@ pub struct GuardrailChain {
     audit: Option<Arc<GuardrailAuditLog>>,
 }
 
+/// The message window each member reads, resolved once per fold.
+///
+/// `None` when no member narrows — the common case, and the one that must
+/// stay allocation-free: `latest_turn_view` clones the request's messages.
+fn latest_turn_view_if_needed(members: &[ChainMember], req: &ChatFormat) -> Option<ChatFormat> {
+    members
+        .iter()
+        .any(|m| m.input_messages == GuardrailInputMessages::LatestTurn)
+        .then(|| crate::latest_turn_view(req))
+}
+
+/// What `m` is allowed to read of `req`.
+fn member_input<'a>(
+    m: &ChainMember,
+    req: &'a ChatFormat,
+    narrowed: &'a Option<ChatFormat>,
+) -> &'a ChatFormat {
+    match m.input_messages {
+        GuardrailInputMessages::All => req,
+        // `narrowed` is `Some` whenever any member asks for it, so the
+        // fallback is unreachable rather than a silent widening.
+        GuardrailInputMessages::LatestTurn => narrowed.as_ref().unwrap_or(req),
+    }
+}
+
 impl std::fmt::Debug for GuardrailChain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GuardrailChain")
@@ -74,6 +104,7 @@ impl GuardrailChain {
                     name: g.name().to_owned(),
                     kind: g.name().to_owned(),
                     guardrail: g,
+                    input_messages: GuardrailInputMessages::All,
                 })
                 .collect(),
             applied: Vec::new(),
@@ -90,26 +121,44 @@ impl GuardrailChain {
     /// chain's runtime behaviour does not depend on that — `applied` is
     /// telemetry-only.
     pub fn new_with_applied(
-        members: Vec<(String, Arc<dyn Guardrail>)>,
+        members: Vec<(String, Arc<dyn Guardrail>, GuardrailInputMessages)>,
         applied: Vec<AppliedGuardrail>,
     ) -> Self {
         Self {
             members: members
                 .into_iter()
                 .enumerate()
-                .map(|(i, (name, guardrail))| ChainMember {
+                .map(|(i, (name, guardrail, input_messages))| ChainMember {
                     kind: applied
                         .get(i)
                         .map(|a| a.kind.clone())
                         .unwrap_or_else(|| guardrail.name().to_owned()),
                     name,
                     guardrail,
+                    input_messages,
                 })
                 .collect(),
             applied,
             sink: None,
             audit: None,
         }
+    }
+
+    /// Test shorthand for a chain whose every member is left on
+    /// `input_messages: all` — the default, and what the folds behave like
+    /// when nothing narrows.
+    #[cfg(test)]
+    pub fn new_with_applied_all(
+        members: Vec<(String, Arc<dyn Guardrail>)>,
+        applied: Vec<AppliedGuardrail>,
+    ) -> Self {
+        Self::new_with_applied(
+            members
+                .into_iter()
+                .map(|(name, g)| (name, g, GuardrailInputMessages::All))
+                .collect(),
+            applied,
+        )
     }
 
     /// Attach a per-execution telemetry sink (AISIX-Cloud#1076). Called by
@@ -555,9 +604,13 @@ impl Guardrail for GuardrailChain {
 
     async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
         let mut bypass: Option<String> = None;
+        let narrowed = latest_turn_view_if_needed(&self.members, req);
         for m in &self.members {
             let started = Instant::now();
-            let verdict = m.guardrail.check_input(req).await;
+            let verdict = m
+                .guardrail
+                .check_input(member_input(m, req, &narrowed))
+                .await;
             record_execution(
                 self.recorders(),
                 m,
@@ -635,9 +688,13 @@ impl Guardrail for GuardrailChain {
     ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
         let mut bypass: Option<String> = None;
         let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
+        let narrowed = latest_turn_view_if_needed(&self.members, req);
         for m in &self.members {
             let started = Instant::now();
-            let (verdict, member_hits) = m.guardrail.check_input_observed(req).await;
+            let (verdict, member_hits) = m
+                .guardrail
+                .check_input_observed(member_input(m, req, &narrowed))
+                .await;
             record_execution(
                 self.recorders(),
                 m,
@@ -727,9 +784,13 @@ impl Guardrail for GuardrailChain {
     ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
         let mut bypass: Option<String> = None;
         let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
+        let narrowed = latest_turn_view_if_needed(&self.members, req);
         for m in &self.members {
             let started = Instant::now();
-            let (verdict, member_hits) = m.guardrail.check_input_non_segment_observed(req).await;
+            let (verdict, member_hits) = m
+                .guardrail
+                .check_input_non_segment_observed(member_input(m, req, &narrowed))
+                .await;
             // A segment-moderating member answers via the segment pass —
             // this call is an instant Allow, not an execution; recording
             // it would pollute the member's series with zero-length
@@ -832,11 +893,26 @@ impl Guardrail for GuardrailChain {
     /// member moderates the previous member's masked output, mirroring
     /// `fold_redactions`; the first Bypass reason sticks. Counts merge.
     async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
-        fold_segments(&self.members, self.recorders(), texts, true).await
+        fold_segments(&self.members, self.recorders(), texts, true, None).await
+    }
+
+    async fn moderate_input_segments_in_turn(
+        &self,
+        texts: &[String],
+        in_latest_turn: &[bool],
+    ) -> SegmentsOutcome {
+        fold_segments(
+            &self.members,
+            self.recorders(),
+            texts,
+            true,
+            Some(in_latest_turn),
+        )
+        .await
     }
 
     async fn moderate_output_segments(&self, texts: &[String]) -> SegmentsOutcome {
-        fold_segments(&self.members, self.recorders(), texts, false).await
+        fold_segments(&self.members, self.recorders(), texts, false, None).await
     }
 
     /// The check fold minus segment-moderating members — the pass those
@@ -846,9 +922,13 @@ impl Guardrail for GuardrailChain {
     /// rather than being skipped wholesale.
     async fn check_input_non_segment(&self, req: &ChatFormat) -> GuardrailVerdict {
         let mut bypass: Option<String> = None;
+        let narrowed = latest_turn_view_if_needed(&self.members, req);
         for m in &self.members {
             let started = Instant::now();
-            let verdict = m.guardrail.check_input_non_segment(req).await;
+            let verdict = m
+                .guardrail
+                .check_input_non_segment(member_input(m, req, &narrowed))
+                .await;
             if !m.guardrail.moderates_segments() {
                 record_execution(
                     self.recorders(),
@@ -930,9 +1010,16 @@ impl Guardrail for GuardrailChain {
     /// output, so stacked redacting guardrails compose. Counts merge across
     /// members.
     fn redact_input_text(&self, text: &str) -> Option<Redaction> {
+        self.redact_input_text_in_turn(text, true)
+    }
+
+    fn redact_input_text_in_turn(&self, text: &str, in_latest_turn: bool) -> Option<Redaction> {
         fold_redactions(
             text,
-            self.members.iter().filter(|m| m.guardrail.redacts_input()),
+            self.members.iter().filter(|m| {
+                m.guardrail.redacts_input()
+                    && (in_latest_turn || m.input_messages == GuardrailInputMessages::All)
+            }),
             true,
             self.audit.as_deref(),
         )
@@ -952,11 +1039,19 @@ impl Guardrail for GuardrailChain {
 /// check folds (first Block short-circuits with attribution, first Bypass
 /// reason sticks) plus mask composition: each member moderates the
 /// previous member's masked output. Counts merge across members.
+///
+/// `in_latest_turn` (input side only) flags which of `texts` sit inside the
+/// latest-turn window; a member configured `input_messages: latest_turn` is
+/// offered only those slots and its masked reply is spliced back onto the
+/// positions it was given, so the slots it never saw keep the caller's text
+/// verbatim. `None` — the output side, and any input chain with no such
+/// member — offers every slot to everyone, allocation-free.
 async fn fold_segments(
     members: &[ChainMember],
     to: Recorders<'_>,
     texts: &[String],
     input: bool,
+    in_latest_turn: Option<&[bool]>,
 ) -> SegmentsOutcome {
     let phase = if input { "input" } else { "output" };
     let mut masked: Option<Vec<String>> = None;
@@ -967,7 +1062,25 @@ async fn fold_segments(
         if !m.guardrail.moderates_segments() {
             continue;
         }
-        let src: &[String] = masked.as_deref().unwrap_or(texts);
+        let full: &[String] = masked.as_deref().unwrap_or(texts);
+        // Slots this member may read, as indices into `full`. `None` = all
+        // of them. A flag missing for a slot counts as in-window: the
+        // walker and the collector enumerate the same body, so a short
+        // flag vector is a bug, and erring toward scanning MORE keeps a
+        // block rule firing rather than silently going quiet.
+        let window: Option<Vec<usize>> = match (m.input_messages, in_latest_turn) {
+            (GuardrailInputMessages::LatestTurn, Some(flags)) => {
+                let idx: Vec<usize> = (0..full.len())
+                    .filter(|i| flags.get(*i).copied().unwrap_or(true))
+                    .collect();
+                (idx.len() != full.len()).then_some(idx)
+            }
+            _ => None,
+        };
+        let narrowed: Option<Vec<String>> = window
+            .as_ref()
+            .map(|idx| idx.iter().map(|&i| full[i].clone()).collect());
+        let src: &[String] = narrowed.as_deref().unwrap_or(full);
         let started = Instant::now();
         let mut outcome = if input {
             m.guardrail.moderate_input_segments(src).await
@@ -1020,7 +1133,19 @@ async fn fold_segments(
             // APPLIED anonymization (`redacted_entity_counts`), so a
             // refused mask must not inflate them.
             if new_masked.len() == src.len() {
-                masked = Some(new_masked);
+                masked = Some(match window {
+                    // Splice the member's window back into the full slot
+                    // list; everything outside it keeps the text the
+                    // previous member left.
+                    Some(idx) => {
+                        let mut spliced = full.to_vec();
+                        for (k, &i) in idx.iter().enumerate() {
+                            spliced[i] = new_masked[k].clone();
+                        }
+                        spliced
+                    }
+                    None => new_masked,
+                });
                 Redaction::merge_counts(&mut counts, &outcome.counts);
             } else {
                 tracing::warn!(
@@ -1095,7 +1220,7 @@ fn fold_redactions<'a>(
 mod tests {
     use super::*;
     use crate::{KeywordBlocklist, KeywordRule};
-    use aisix_gateway::{ChatMessage, FinishReason, UsageStats};
+    use aisix_gateway::{ChatMessage, FinishReason, Role, UsageStats};
 
     /// AISIX-Cloud#1330: the audit log and the metrics sink are gated
     /// independently. `record_execution` used to bail the moment the sink
@@ -1105,7 +1230,7 @@ mod tests {
     #[tokio::test]
     async fn a_block_is_audited_even_with_no_metrics_sink_attached() {
         let audit = Arc::new(GuardrailAuditLog::new());
-        let chain = GuardrailChain::new_with_applied(
+        let chain = GuardrailChain::new_with_applied_all(
             vec![(
                 "deny-secrets".to_owned(),
                 Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("nope")]))
@@ -1198,7 +1323,7 @@ mod tests {
         }
 
         let audit = Arc::new(GuardrailAuditLog::new());
-        let chain = GuardrailChain::new_with_applied(
+        let chain = GuardrailChain::new_with_applied_all(
             vec![
                 (
                     "open-row".to_owned(),
@@ -1317,7 +1442,7 @@ mod tests {
         }
 
         let audit = Arc::new(GuardrailAuditLog::new());
-        let chain = GuardrailChain::new_with_applied(
+        let chain = GuardrailChain::new_with_applied_all(
             vec![(
                 "lakera-prod".to_owned(),
                 Arc::new(Unavailable) as Arc<dyn Guardrail>,
@@ -1471,7 +1596,7 @@ mod tests {
     /// reason.
     #[tokio::test]
     async fn block_is_attributed_to_the_firing_member_by_name() {
-        let chain = GuardrailChain::new_with_applied(
+        let chain = GuardrailChain::new_with_applied_all(
             vec![
                 (
                     "pass-through".to_owned(),
@@ -1515,7 +1640,7 @@ mod tests {
     /// pass it through (innermost name wins, no double prefix).
     #[tokio::test]
     async fn nested_chain_block_keeps_innermost_attribution() {
-        let inner = GuardrailChain::new_with_applied(
+        let inner = GuardrailChain::new_with_applied_all(
             vec![(
                 "inner-rule".to_owned(),
                 Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("AKIA")]))
@@ -1523,7 +1648,7 @@ mod tests {
             )],
             Vec::new(),
         );
-        let outer = GuardrailChain::new_with_applied(
+        let outer = GuardrailChain::new_with_applied_all(
             vec![(
                 "outer-chain".to_owned(),
                 Arc::new(inner) as Arc<dyn Guardrail>,
@@ -1790,6 +1915,353 @@ mod tests {
         }
     }
 
+    // ── input_messages: latest_turn (AISIX-Cloud#1558) ───────────────────
+
+    fn conversation() -> ChatFormat {
+        ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::system("system AKIA"),
+                ChatMessage::user("old AKIA"),
+                ChatMessage::assistant("sure"),
+                ChatMessage::user("fresh"),
+                ChatMessage::tool("tool result"),
+            ],
+        )
+    }
+
+    fn member(
+        name: &str,
+        g: Arc<dyn Guardrail>,
+        scope: GuardrailInputMessages,
+    ) -> (String, Arc<dyn Guardrail>, GuardrailInputMessages) {
+        (name.to_owned(), g, scope)
+    }
+
+    fn applied(n: usize) -> Vec<AppliedGuardrail> {
+        (0..n)
+            .map(|_| AppliedGuardrail {
+                kind: "keyword".to_owned(),
+                hook: "both".to_owned(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn latest_turn_view_starts_after_the_last_assistant_and_drops_system() {
+        let view = crate::latest_turn_view(&conversation());
+        let seen: Vec<_> = view
+            .messages
+            .iter()
+            .map(|m| (m.role, m.content_str().to_owned()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (Role::User, "fresh".to_owned()),
+                (Role::Tool, "tool result".to_owned()),
+            ],
+        );
+    }
+
+    /// A trailing assistant message is a prefill, not an answered turn.
+    /// If it closed the window the window would be EMPTY, and appending
+    /// one would be a one-line bypass of every `latest_turn` rule.
+    #[test]
+    fn a_trailing_assistant_prefill_does_not_close_the_window() {
+        let req = ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::system("sys"),
+                ChatMessage::user("old AKIA"),
+                ChatMessage::assistant("answered"),
+                ChatMessage::user("fresh"),
+                ChatMessage::assistant("Sure, here is"),
+            ],
+        );
+        let seen: Vec<_> = crate::latest_turn_view(&req)
+            .messages
+            .iter()
+            .map(|m| (m.role, m.content_str().to_owned()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (Role::User, "fresh".to_owned()),
+                (Role::Assistant, "Sure, here is".to_owned()),
+            ],
+        );
+    }
+
+    /// The prefill rule is measured against the last NON-SYSTEM message.
+    /// Otherwise appending a system message after the prefill makes the
+    /// prefill look answered, and the window is left holding system
+    /// messages alone — which, since system messages are excluded, is an
+    /// empty window and the same bypass one step further out.
+    #[tokio::test]
+    async fn a_system_message_after_a_prefill_does_not_reopen_the_bypass() {
+        let chain = GuardrailChain::new_with_applied(
+            vec![member(
+                "narrow",
+                Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("AKIA")]))
+                    as Arc<dyn Guardrail>,
+                GuardrailInputMessages::LatestTurn,
+            )],
+            applied(1),
+        );
+        let req = ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::user("please handle AKIA"),
+                ChatMessage::assistant("Sure, here is"),
+                ChatMessage::system("trailing policy"),
+            ],
+        );
+        assert!(
+            chain.check_input(&req).await.is_block(),
+            "the window must still hold the user message",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trailing_assistant_message_cannot_silence_a_narrowed_row() {
+        let chain = GuardrailChain::new_with_applied(
+            vec![member(
+                "narrow",
+                Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("AKIA")]))
+                    as Arc<dyn Guardrail>,
+                GuardrailInputMessages::LatestTurn,
+            )],
+            applied(1),
+        );
+        let req = ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::user("please handle AKIA"),
+                ChatMessage::assistant("Sure, here is"),
+            ],
+        );
+        assert!(
+            chain.check_input(&req).await.is_block(),
+            "appending an assistant message must not empty the window",
+        );
+    }
+
+    #[test]
+    fn latest_turn_view_with_no_assistant_keeps_every_non_system_message() {
+        let req = ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::system("sys"),
+                ChatMessage::user("a"),
+                ChatMessage::tool("b"),
+            ],
+        );
+        let roles: Vec<_> = crate::latest_turn_view(&req)
+            .messages
+            .iter()
+            .map(|m| m.role)
+            .collect();
+        assert_eq!(roles, vec![Role::User, Role::Tool]);
+    }
+
+    /// The customer report: the pattern sits in replayed history and the
+    /// new prompt is clean. A `latest_turn` row must let it through while
+    /// an `all` row on the same wording still refuses it.
+    #[tokio::test]
+    async fn latest_turn_member_does_not_see_history_but_an_all_member_does() {
+        let kw = || {
+            Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("AKIA")]))
+                as Arc<dyn Guardrail>
+        };
+        let narrowed = GuardrailChain::new_with_applied(
+            vec![member("narrow", kw(), GuardrailInputMessages::LatestTurn)],
+            applied(1),
+        );
+        assert_eq!(
+            narrowed.check_input(&conversation()).await,
+            GuardrailVerdict::Allow,
+        );
+
+        let whole = GuardrailChain::new_with_applied(
+            vec![member("whole", kw(), GuardrailInputMessages::All)],
+            applied(1),
+        );
+        assert!(
+            whole.check_input(&conversation()).await.is_block(),
+            "an `all` row still reads the replayed history",
+        );
+    }
+
+    /// The window is per member, so one narrowed row must not narrow its
+    /// peers — the same fold hands each member a different view.
+    #[tokio::test]
+    async fn a_narrowed_member_does_not_narrow_its_peers() {
+        let chain = GuardrailChain::new_with_applied(
+            vec![
+                // Matches history only. It is FIRST in the chain, so if
+                // the fold handed it the whole request it would block and
+                // take the attribution below.
+                member(
+                    "narrow",
+                    Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("AKIA")]))
+                        as Arc<dyn Guardrail>,
+                    GuardrailInputMessages::LatestTurn,
+                ),
+                // Matches the current turn.
+                member(
+                    "whole",
+                    Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("fresh")]))
+                        as Arc<dyn Guardrail>,
+                    GuardrailInputMessages::All,
+                ),
+            ],
+            applied(2),
+        );
+        let verdict = chain.check_input(&conversation()).await;
+        match verdict {
+            GuardrailVerdict::Block { guardrail_name, .. } => {
+                assert_eq!(guardrail_name.as_deref(), Some("whole"));
+            }
+            other => panic!("expected the `all` member to block, got {other:?}"),
+        }
+    }
+
+    /// A masking row on `latest_turn` rewrites only the slots inside the
+    /// window; the history keeps the caller's bytes.
+    #[tokio::test]
+    async fn a_narrowed_segment_member_masks_only_in_window_slots() {
+        let chain = GuardrailChain::new_with_applied(
+            vec![member(
+                "seg",
+                Arc::new(StubSegments {
+                    verdict: GuardrailVerdict::Allow,
+                    mask: true,
+                }) as Arc<dyn Guardrail>,
+                GuardrailInputMessages::LatestTurn,
+            )],
+            applied(1),
+        );
+        let texts = vec!["history".to_owned(), "current".to_owned()];
+        let out = chain
+            .moderate_input_segments_in_turn(&texts, &[false, true])
+            .await;
+        assert_eq!(
+            out.masked.expect("mask applied"),
+            vec!["history".to_owned(), "CURRENT".to_owned()],
+        );
+    }
+
+    /// Two members with DIFFERENT windows compose on one slot list: the
+    /// `all` member rewrites everything, then the `latest_turn` member
+    /// rewrites its window ON TOP of that. A history slot must carry the
+    /// first member's mark and only that; a window slot must carry both.
+    /// Nothing else covers this — the check fold has
+    /// `a_narrowed_member_does_not_narrow_its_peers`, the segment fold had
+    /// no equivalent, and each e2e lane carries a single row.
+    #[tokio::test]
+    async fn members_with_different_windows_compose_on_the_same_slots() {
+        struct Suffix(&'static str);
+        #[async_trait]
+        impl Guardrail for Suffix {
+            fn name(&self) -> &'static str {
+                "suffix"
+            }
+            fn moderates_segments(&self) -> bool {
+                true
+            }
+            async fn moderate_input_segments(&self, texts: &[String]) -> crate::SegmentsOutcome {
+                crate::SegmentsOutcome {
+                    verdict: GuardrailVerdict::Allow,
+                    masked: Some(texts.iter().map(|t| format!("{t}{}", self.0)).collect()),
+                    counts: std::collections::BTreeMap::new(),
+                    monitor_hits: Vec::new(),
+                }
+            }
+        }
+
+        let chain = GuardrailChain::new_with_applied(
+            vec![
+                member(
+                    "whole",
+                    Arc::new(Suffix("+A")) as Arc<dyn Guardrail>,
+                    GuardrailInputMessages::All,
+                ),
+                member(
+                    "narrow",
+                    Arc::new(Suffix("+L")) as Arc<dyn Guardrail>,
+                    GuardrailInputMessages::LatestTurn,
+                ),
+            ],
+            applied(2),
+        );
+        let texts = vec!["history".to_owned(), "current".to_owned()];
+        let out = chain
+            .moderate_input_segments_in_turn(&texts, &[false, true])
+            .await;
+        assert_eq!(
+            out.masked.expect("mask applied"),
+            vec!["history+A".to_owned(), "current+A+L".to_owned()],
+        );
+    }
+
+    /// The same member on `all` still rewrites everything — the assertion
+    /// above must be pinning the window, not the stub.
+    #[tokio::test]
+    async fn an_unnarrowed_segment_member_masks_every_slot() {
+        let chain = GuardrailChain::new_with_applied(
+            vec![member(
+                "seg",
+                Arc::new(StubSegments {
+                    verdict: GuardrailVerdict::Allow,
+                    mask: true,
+                }) as Arc<dyn Guardrail>,
+                GuardrailInputMessages::All,
+            )],
+            applied(1),
+        );
+        let texts = vec!["history".to_owned(), "current".to_owned()];
+        let out = chain
+            .moderate_input_segments_in_turn(&texts, &[false, true])
+            .await;
+        assert_eq!(
+            out.masked.expect("mask applied"),
+            vec!["HISTORY".to_owned(), "CURRENT".to_owned()],
+        );
+    }
+
+    /// The sync mask channel (`pii`) takes the window through the same
+    /// per-member filter.
+    #[test]
+    fn the_sync_mask_channel_skips_a_narrowed_member_outside_the_window() {
+        let chain = GuardrailChain::new_with_applied(
+            vec![member(
+                "pii",
+                Arc::new(crate::PiiGuardrail::new(
+                    vec![crate::builtin_rule("email", crate::PiiAction::Mask)
+                        .expect("builtin email rule")],
+                    aisix_core::models::GuardrailHookPoint::Both,
+                    0,
+                    false,
+                )) as Arc<dyn Guardrail>,
+                GuardrailInputMessages::LatestTurn,
+            )],
+            applied(1),
+        );
+        assert!(
+            chain
+                .redact_input_text_in_turn("mail alice@example.com", false)
+                .is_none(),
+            "history is forwarded byte-identical",
+        );
+        assert!(
+            chain
+                .redact_input_text_in_turn("mail alice@example.com", true)
+                .is_some(),
+            "the current turn is still masked",
+        );
+    }
+
     /// The non-segment check fold skips segment members (they're consulted
     /// via the segment pass) while normal members still run — the panic in
     /// the stub's `check_input` proves the skip.
@@ -1826,7 +2298,7 @@ mod tests {
     async fn segment_fold_composes_masks_and_attributes_blocks() {
         // Two maskers: uppercase then uppercase again (idempotent — the
         // composition is observable via counts merging to 2 members).
-        let chain = GuardrailChain::new_with_applied(
+        let chain = GuardrailChain::new_with_applied_all(
             vec![
                 (
                     "mask-a".to_owned(),
@@ -1855,7 +2327,7 @@ mod tests {
         assert_eq!(out.counts.get("STUB"), Some(&4), "2 members × 2 slots");
 
         // Block short-circuits and is attributed to the firing member.
-        let blocking = GuardrailChain::new_with_applied(
+        let blocking = GuardrailChain::new_with_applied_all(
             vec![(
                 "seg-blocker".to_owned(),
                 Arc::new(StubSegments {
@@ -1925,7 +2397,7 @@ mod tests {
                 hook: "both".to_owned(),
             },
         ];
-        let chain = GuardrailChain::new_with_applied(vec![], applied.clone());
+        let chain = GuardrailChain::new_with_applied_all(vec![], applied.clone());
         assert_eq!(chain.applied(), applied.as_slice());
     }
 
@@ -1979,7 +2451,7 @@ mod tests {
         applied: Vec<AppliedGuardrail>,
     ) -> (GuardrailChain, Arc<RecordingSink>) {
         let sink = Arc::new(RecordingSink::default());
-        let chain = GuardrailChain::new_with_applied(members, applied)
+        let chain = GuardrailChain::new_with_applied_all(members, applied)
             .with_metrics_sink(Some(sink.clone()));
         (chain, sink)
     }

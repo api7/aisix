@@ -47,7 +47,7 @@ mod text_moderation;
 mod too_large;
 
 use aisix_core::models::GuardrailMonitorHit;
-use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse};
+use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse, Role};
 use async_trait::async_trait;
 
 /// Max bytes of an upstream guardrail-provider error body to echo into a log
@@ -162,6 +162,56 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
         }
     }
     parts.join("\n")
+}
+
+/// The messages a `input_messages: latest_turn` guardrail may read: every
+/// message after the last assistant one, with system messages dropped.
+///
+/// IDE and agent clients replay the whole conversation on every call, so a
+/// rule that matched one message keeps matching for the rest of the
+/// session. The window is the part the model has not answered yet — this
+/// turn's user message together with the tool results answering it
+/// (`Role::Tool` on the OpenAI wire, an Anthropic `tool_result` block, a
+/// Responses `function_call_output` item). A request with no assistant
+/// message narrows to every non-system message.
+///
+/// A TRAILING assistant message does not close the window. It is a
+/// prefill — text the caller wrote for the model to continue, not a turn
+/// the model has answered — so it belongs to the current turn and is
+/// scanned with it. Treating it as a boundary would empty the window and
+/// hand every caller a one-line bypass: append a dummy assistant message
+/// and a `latest_turn` rule goes quiet. Anthropic's documented
+/// assistant-prefill feature reaches the same shape by accident.
+///
+/// "Trailing" is measured against the last NON-SYSTEM message, not the
+/// last message. System messages are outside the window wherever they
+/// sit, so an assistant message followed only by system ones has still
+/// answered nothing — and reading it as a boundary would leave a window
+/// holding system messages alone, which is to say an empty one. Appending
+/// a system message after the prefill would otherwise reopen the same
+/// bypass.
+///
+/// This is the CHECK pass's half of the rule. The masking walkers in
+/// `aisix-proxy::redact` apply the same rule to each wire shape directly,
+/// because their slots are raw JSON with no `ChatFormat` to index against;
+/// the e2e cases pin both halves per protocol.
+pub fn latest_turn_view(req: &ChatFormat) -> ChatFormat {
+    let answered = req
+        .messages
+        .iter()
+        .rposition(|m| m.role != Role::System)
+        .unwrap_or(0);
+    let start = req.messages[..answered]
+        .iter()
+        .rposition(|m| m.role == Role::Assistant)
+        .map_or(0, |i| i + 1);
+    let mut view = req.clone();
+    view.messages = req.messages[start..]
+        .iter()
+        .filter(|m| m.role != Role::System)
+        .cloned()
+        .collect();
+    view
 }
 
 /// The guardrail `kind` discriminators compiled into this binary whose
@@ -810,6 +860,23 @@ pub trait Guardrail: Send + Sync + 'static {
         None
     }
 
+    /// [`Self::redact_input_text`], told whether the text sits inside the
+    /// latest-turn window — `false` for a system message and for anything
+    /// the model has already replied to.
+    ///
+    /// Only [`GuardrailChain`] overrides this: it drops the members
+    /// configured `input_messages: latest_turn` for out-of-window text, so
+    /// a mask rule on that setting rewrites the current turn and leaves the
+    /// replayed history byte-identical. A leaf guardrail has no window of
+    /// its own — the setting belongs to the chain member, not the kind —
+    /// so the default ignores the flag and every caller that has no window
+    /// to report (the whole response side, and the single-input endpoints)
+    /// keeps using [`Self::redact_input_text`] directly.
+    fn redact_input_text_in_turn(&self, text: &str, in_latest_turn: bool) -> Option<Redaction> {
+        let _ = in_latest_turn;
+        self.redact_input_text(text)
+    }
+
     // --- remote segment moderation (#932 bedrock follow-up) ---------------
     //
     // A remote-API guardrail that can MASK (Bedrock PII anonymize) can't
@@ -838,6 +905,23 @@ pub trait Guardrail: Send + Sync + 'static {
     /// Moderate the response's text segments in one remote call.
     async fn moderate_output_segments(&self, _texts: &[String]) -> SegmentsOutcome {
         SegmentsOutcome::allow()
+    }
+
+    /// [`Self::moderate_input_segments`] with one window flag per text, in
+    /// the same order (see [`Self::redact_input_text_in_turn`]).
+    ///
+    /// Only [`GuardrailChain`] overrides it: a `latest_turn` member is
+    /// offered the in-window subset and its masked replies are mapped back
+    /// onto the original positions, so the slots it never saw keep the
+    /// caller's text. The per-kind segment hooks are untouched by the
+    /// setting — a kind never learns its own window.
+    async fn moderate_input_segments_in_turn(
+        &self,
+        texts: &[String],
+        in_latest_turn: &[bool],
+    ) -> SegmentsOutcome {
+        let _ = in_latest_turn;
+        self.moderate_input_segments(texts).await
     }
 
     /// `check_input` minus segment-moderating members — used by call

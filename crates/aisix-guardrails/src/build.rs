@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex};
 
 use aisix_core::models::{
     AisixSnapshot, AppliedGuardrail, Guardrail as DomainGuardrail, GuardrailAttachment,
-    GuardrailHookPoint, GuardrailKind, GuardrailMonitorHit, GuardrailScopeType, KeywordPattern,
+    GuardrailHookPoint, GuardrailInputMessages, GuardrailKind, GuardrailMonitorHit,
+    GuardrailScopeType, KeywordPattern,
 };
 use aisix_core::snapshot::ResourceTable;
 use aisix_core::{ConfigStatus, IncomingRejection, SnapshotHandle};
@@ -96,7 +97,7 @@ fn build_chain_from_snapshot_reported(
     embedder: &GuardrailEmbedderSlot,
     instances: &mut GuardrailInstances,
 ) -> (GuardrailChain, Vec<GuardrailBuildRejection>) {
-    let mut chain: Vec<(String, Arc<dyn Guardrail>)> = Vec::new();
+    let mut chain: Vec<(String, Arc<dyn Guardrail>, GuardrailInputMessages)> = Vec::new();
     // `applied` mirrors `chain` 1:1 — the `{kind, hook}` of each member that
     // actually materialised, for applied-guardrail telemetry (#379). Pushed
     // only on the `Ok(Some)` path so inert/invalid rows (which never join the
@@ -117,7 +118,7 @@ fn build_chain_from_snapshot_reported(
             &mut BuildReuse::default(),
         ) {
             Ok(Some(g)) => {
-                chain.push((row.name.clone(), g));
+                chain.push((row.name.clone(), g, row.input_messages));
                 applied.push(applied_for(row));
             }
             Ok(None) => {
@@ -1162,6 +1163,17 @@ impl Guardrail for LiveGuardrailChain {
         self.current().redact_input_text(text)
     }
 
+    /// Forwarded for the same reason the hold-back methods above are: the
+    /// trait default would delegate to `redact_input_text`, dropping the
+    /// window and quietly letting an `input_messages: latest_turn` row
+    /// rewrite history. (This wrapper does not forward the segment hooks
+    /// either, which predates this change — it is exported but unused by
+    /// the proxy, which resolves chains through `LiveGuardrailIndex`.)
+    fn redact_input_text_in_turn(&self, text: &str, in_latest_turn: bool) -> Option<Redaction> {
+        self.current()
+            .redact_input_text_in_turn(text, in_latest_turn)
+    }
+
     fn redact_output_text(&self, text: &str) -> Option<Redaction> {
         self.current().redact_output_text(text)
     }
@@ -1297,6 +1309,7 @@ fn build_index_from_snapshot_reported(
             attachment.scope_id.clone(),
             attachment.priority,
             runtime_guardrail,
+            row.input_messages,
             applied_for(row),
         ));
     }

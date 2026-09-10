@@ -29,6 +29,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use aisix_core::models::GuardrailInputMessages;
 use aisix_core::AppliedGuardrail;
 
 use crate::{Guardrail, GuardrailChain};
@@ -59,6 +60,10 @@ pub(crate) struct IndexEntry {
     /// Higher = higher precedence. Entries are pre-sorted descending.
     priority: i32,
     guardrail: Arc<dyn Guardrail>,
+    /// The row's `input_messages`, carried onto the resolved chain so a
+    /// `latest_turn` rule is handed only the part of the conversation the
+    /// model has not answered yet.
+    input_messages: GuardrailInputMessages,
     /// The `{kind, hook}` of this entry's guardrail, captured at index-build
     /// time (the only place the domain row's `kind` + `hook_point` are in
     /// scope). `resolve` collects these from the entries it keeps so the
@@ -185,7 +190,7 @@ impl GuardrailIndex {
     /// Complexity: O(n) in the number of attachment entries.
     pub fn resolve(&self, ctx: &RequestContext<'_>) -> GuardrailChain {
         let mut seen: HashSet<&str> = HashSet::new();
-        let mut chain: Vec<(String, Arc<dyn Guardrail>)> = Vec::new();
+        let mut chain: Vec<(String, Arc<dyn Guardrail>, GuardrailInputMessages)> = Vec::new();
         // `applied` mirrors `chain` 1:1 — the `{kind, hook}` of each member
         // we keep, for applied-guardrail telemetry (#379). Pushed on the same
         // (matched + not-deduplicated) path so it never drifts from `chain`.
@@ -199,7 +204,11 @@ impl GuardrailIndex {
                 continue;
             }
             seen.insert(entry.guardrail_id.as_str());
-            chain.push((entry.guardrail_name.clone(), Arc::clone(&entry.guardrail)));
+            chain.push((
+                entry.guardrail_name.clone(),
+                Arc::clone(&entry.guardrail),
+                entry.input_messages,
+            ));
             applied.push(entry.applied.clone());
         }
 
@@ -212,6 +221,7 @@ impl GuardrailIndex {
 // ---------------------------------------------------------------------------
 
 impl GuardrailIndex {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn push_entry(
         guardrail_id: impl Into<String>,
         guardrail_name: impl Into<String>,
@@ -219,6 +229,7 @@ impl GuardrailIndex {
         scope_id: Option<String>,
         priority: i32,
         guardrail: Arc<dyn Guardrail>,
+        input_messages: GuardrailInputMessages,
         applied: AppliedGuardrail,
     ) -> IndexEntry {
         IndexEntry {
@@ -228,6 +239,7 @@ impl GuardrailIndex {
             scope_id,
             priority,
             guardrail,
+            input_messages,
             applied,
         }
     }
@@ -307,6 +319,7 @@ mod tests {
             sid.map(str::to_owned),
             priority,
             g,
+            GuardrailInputMessages::All,
             AppliedGuardrail {
                 kind: "keyword".to_owned(),
                 hook: "both".to_owned(),

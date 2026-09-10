@@ -69,6 +69,29 @@ pub enum GuardrailHookPoint {
     Both,
 }
 
+/// How much of a request's message history an input guardrail reads.
+///
+/// IDE and agent clients replay the whole conversation on every call, so a
+/// rule that matched once keeps matching for the rest of the session even
+/// after the offending message is long past. `LatestTurn` narrows every
+/// input hook — the block check and the masking pass alike — to the part
+/// of the conversation the model has not answered yet.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardrailInputMessages {
+    /// Read every message in the request, including replayed history and
+    /// system prompts.
+    #[default]
+    All,
+    /// Read only the messages after the last assistant message, excluding
+    /// system messages: the current user message together with any tool
+    /// results answering it. Messages the model has already replied to are
+    /// neither screened nor rewritten.
+    LatestTurn,
+}
+
 /// Literal or regular-expression pattern used by a keyword guardrail.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", content = "value", rename_all = "lowercase")]
@@ -1342,6 +1365,26 @@ pub struct Guardrail {
     /// Where in the lifecycle this rule runs.
     #[serde(default)]
     pub hook_point: GuardrailHookPoint,
+
+    /// How much of the request this rule reads at the input hook.
+    ///
+    /// `all` (the default) scans every message the caller sent, including
+    /// replayed history and system prompts. `latest_turn` scans only the
+    /// messages after the last assistant message, with system messages
+    /// excluded — the current user message plus any tool results answering
+    /// it. It exists for clients that resend the whole conversation on
+    /// every call, where a rule that matched one earlier message would
+    /// otherwise keep refusing the rest of the session.
+    ///
+    /// The narrowing governs everything the rule does on the request:
+    /// under `latest_turn` a masking rule rewrites only the current turn,
+    /// and messages outside it reach the upstream exactly as the caller
+    /// sent them. A rule whose job is to mask the whole conversation
+    /// belongs on `all`.
+    ///
+    /// Ignored at the output hook, which always reads the whole response.
+    #[serde(default)]
+    pub input_messages: GuardrailInputMessages,
 
     /// Behavior when this guardrail cannot complete its check. Two
     /// causes: a remote provider that is unreachable, timing out,
