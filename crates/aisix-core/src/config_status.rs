@@ -48,8 +48,8 @@
 //!   rejected reload the applied hash stays at the last-good file's hash.
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use ring::digest::{Context, SHA256};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
@@ -516,13 +516,13 @@ impl ConfigStatus {
         let identity_hash = if all_rejected.is_empty() {
             None
         } else {
-            let mut hasher = Sha256::new();
+            let mut hasher = Context::new(&SHA256);
             hasher.update(b"aisix-runtime-rejections-v1\0");
             for identity in all_rejected.keys() {
                 hasher.update(identity.as_bytes());
-                hasher.update([b'\n']);
+                hasher.update(b"\n");
             }
-            Some(hex(hasher.finalize().as_slice()))
+            Some(hex(hasher.finish().as_ref()))
         };
 
         let mut merged = BTreeMap::new();
@@ -671,12 +671,12 @@ impl ConfigStatusInner {
         let Some(identity_hash) = self.build_rejected_identity_hash.as_ref() else {
             return Some(base.clone());
         };
-        let mut hasher = Sha256::new();
+        let mut hasher = Context::new(&SHA256);
         hasher.update(b"aisix-runtime-filtered-v1\0");
         hasher.update(base.as_bytes());
-        hasher.update([0u8]);
+        hasher.update(&[0u8]);
         hasher.update(identity_hash.as_bytes());
-        Some(hex(hasher.finalize().as_slice()))
+        Some(hex(hasher.finish().as_ref()))
     }
 
     fn effective_resource_counts(&self) -> BTreeMap<String, usize> {
@@ -946,18 +946,18 @@ where
     I: IntoIterator<Item = R>,
     R: AsRef<[u8]>,
 {
-    let mut hasher = Sha256::new();
+    let mut hasher = Context::new(&SHA256);
     for record in records {
         hasher.update(record.as_ref());
     }
-    hex(hasher.finalize().as_slice())
+    hex(hasher.finish().as_ref())
 }
 
 /// Hash raw file bytes: `sha256` hex.
 pub fn hash_bytes(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
+    let mut hasher = Context::new(&SHA256);
     hasher.update(bytes);
-    hex(hasher.finalize().as_slice())
+    hex(hasher.finish().as_ref())
 }
 
 /// Serialize a JSON value with object keys sorted recursively and no
@@ -1782,6 +1782,19 @@ mod tests {
     /// so the two digests differ.
     const HASH_FIXTURE_ACCEPTED: &str =
         "f0b4b0cdc9ae4da988e11b3e64b47e802212859e6ed2d08b64434967a9d41308";
+
+    #[test]
+    fn hash_backend_matches_sha256_across_chunk_boundaries() {
+        use sha2::{Digest, Sha256};
+        for len in [0, 1, 55, 56, 63, 64, 65, 127, 128, 129, 4096, 65537] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let expected = hex(Sha256::digest(&bytes).as_slice());
+            assert_eq!(hash_bytes(&bytes), expected);
+            for chunk in [1, 7, 64, 1024] {
+                assert_eq!(hash_records(bytes.chunks(chunk)), expected);
+            }
+        }
+    }
 
     #[test]
     fn hash_entries_output_is_pinned() {

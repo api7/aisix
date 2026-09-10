@@ -370,8 +370,13 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     // specs rely on. Drain immediately here; the drain spec sets its own
     // window through `extra`.
     shutdown: { min_drain_secs: 0 },
-    ...(overrides.snapshotCachePath
-      ? { managed: { snapshot_cache_path: overrides.snapshotCachePath } }
+    ...(overrides.snapshotCachePath !== undefined
+      ? {
+          managed: {
+            snapshot_cache_enabled: overrides.snapshotCachePath !== "",
+            snapshot_cache_path: overrides.snapshotCachePath,
+          },
+        }
       : {}),
     ...(overrides.extra ?? {}),
   };

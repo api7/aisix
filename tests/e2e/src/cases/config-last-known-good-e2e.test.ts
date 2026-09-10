@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
@@ -8,6 +8,7 @@ import {
   ProxyClient,
   SeedClient,
   spawnApp,
+  startEtcdRelay,
   startOpenAiUpstream,
   waitConfigPropagation,
   type OpenAiUpstream,
@@ -35,6 +36,7 @@ const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("he
 
 interface StatusConfig {
   state: string;
+  source: { connected: boolean };
   applied?: { resource_counts: Record<string, number> };
   rejected: Array<{
     resource_kind: string;
@@ -59,7 +61,7 @@ async function scrape(app: SpawnedApp): Promise<string> {
 
 describe("config last-known-good: rejected updates keep serving across resync and restart", () => {
   let app: SpawnedApp | undefined;
-  let stoppedApp: SpawnedApp | undefined;
+  const stoppedApps: SpawnedApp[] = [];
   let upstream: OpenAiUpstream | undefined;
   let etcd: EtcdClient | undefined;
   let etcdReachable = false;
@@ -106,147 +108,195 @@ describe("config last-known-good: rejected updates keep serving across resync an
     await app?.exit();
     // The pre-restart app was stop()ped without cleanup; exit() is
     // idempotent on the dead process and reclaims its tmp dir.
-    await stoppedApp?.exit();
+    for (const stopped of stoppedApps) await stopped.exit();
     await upstream?.close();
     if (cacheDir) await rm(cacheDir, { recursive: true, force: true });
   });
 
-  test("a rejected update leaves the old value serving real traffic, with staleness reported", async (ctx) => {
+  test("last-good lifecycle: reject, restore, disable persistence, and delete", async (ctx) => {
     if (!etcdReachable || !app || !etcd) {
       ctx.skip();
       return;
     }
 
-    await waitConfigPropagation(async () => {
-      const cfg = await getStatusConfig(app!);
-      return (cfg.applied?.resource_counts.models ?? 0) >= 1;
-    });
+    {
+      await waitConfigPropagation(async () => {
+        const cfg = await getStatusConfig(app!);
+        return (cfg.applied?.resource_counts.models ?? 0) >= 1;
+      });
 
-    // Baseline: the model serves.
-    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
-    const before = await proxy.chat({
-      model: "lkg-model",
-      messages: [{ role: "user", content: "baseline" }],
-    });
-    expect(before.status, JSON.stringify(before.body)).toBe(200);
+      // Baseline: the model serves.
+      const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+      const before = await proxy.chat({
+        model: "lkg-model",
+        messages: [{ role: "user", content: "baseline" }],
+      });
+      expect(before.status, JSON.stringify(before.body)).toBe(200);
 
-    // A newer control plane (or a bug) replaces the document with bytes
-    // this DP rejects: empty display_name violates the schema (RED).
-    await etcd.put(
-      modelKey,
-      JSON.stringify({
-        display_name: "",
-        provider: "openai",
-        model_name: "gpt-4o-mini",
-      }),
-    );
+      // A newer control plane (or a bug) replaces the document with bytes
+      // this DP rejects: empty display_name violates the schema (RED).
+      await etcd.put(
+        modelKey,
+        JSON.stringify({
+          display_name: "",
+          provider: "openai",
+          model_name: "gpt-4o-mini",
+        }),
+      );
 
-    let cfg: StatusConfig | undefined;
-    await waitConfigPropagation(async () => {
-      cfg = await getStatusConfig(app!);
-      return cfg.rejected.some((r) => r.resource_id === modelId);
-    });
+      let cfg: StatusConfig | undefined;
+      await waitConfigPropagation(async () => {
+        cfg = await getStatusConfig(app!);
+        return cfg.rejected.some((r) => r.resource_id === modelId);
+      });
 
-    // The old value keeps serving REAL traffic — the user journey the
-    // cliff used to break.
-    const during = await proxy.chat({
-      model: "lkg-model",
-      messages: [{ role: "user", content: "still serving?" }],
-    });
-    expect(during.status, JSON.stringify(during.body)).toBe(200);
+      // The old value keeps serving REAL traffic — the user journey the
+      // cliff used to break.
+      const during = await proxy.chat({
+        model: "lkg-model",
+        messages: [{ role: "user", content: "still serving?" }],
+      });
+      expect(during.status, JSON.stringify(during.body)).toBe(200);
 
-    // The rejection is reported with the staleness attached.
-    expect(cfg!.state).toBe("degraded");
-    const rejection = cfg!.rejected.find((r) => r.resource_id === modelId)!;
-    expect(rejection.resource_kind).toBe("models");
-    expect(rejection.serving_stale_since).toBeTypeOf("string");
-    expect(rejection.serving_stale_age_seconds).toBeTypeOf("number");
-    staleSinceBeforeRestart = rejection.serving_stale_since;
-    // The served row keeps counting.
-    expect(cfg!.applied?.resource_counts.models).toBe(1);
+      // The rejection is reported with the staleness attached.
+      expect(cfg!.state).toBe("degraded");
+      const rejection = cfg!.rejected.find((r) => r.resource_id === modelId)!;
+      expect(rejection.resource_kind).toBe("models");
+      expect(rejection.serving_stale_since).toBeTypeOf("string");
+      expect(rejection.serving_stale_age_seconds).toBeTypeOf("number");
+      staleSinceBeforeRestart = rejection.serving_stale_since;
+      // The served row keeps counting.
+      expect(cfg!.applied?.resource_counts.models).toBe(1);
 
-    // And the per-kind gauge on the metrics listener.
-    const text = await scrape(app);
-    expect(text).toMatch(/aisix_config_stale_served_resources\{kind="models"\} 1/);
-  });
-
-  test("the last known good survives a restart (cache replay + live resync against rejected bytes)", async (ctx) => {
-    if (!etcdReachable || !app || !etcd) {
-      ctx.skip();
-      return;
+      // And the per-kind gauge on the metrics listener.
+      const text = await scrape(app);
+      expect(text).toMatch(/aisix_config_stale_served_resources\{kind="models"\} 1/);
     }
 
-    // Full process restart on the same etcd prefix + snapshot cache.
-    stoppedApp = app;
-    await app.stop();
-    app = await spawnApp({
-      etcdPrefix,
-      snapshotCachePath: join(cacheDir!, "config_cache.json"),
-    });
+    {
+      // Full process restart on the same etcd prefix + snapshot cache.
+      stoppedApps.push(app);
+      await app.stop();
+      app = await spawnApp({
+        etcdPrefix,
+        snapshotCachePath: join(cacheDir!, "config_cache.json"),
+      });
 
-    // Prove the LIVE etcd read completed (not just the cache replay):
-    // a sentinel written after the restart can only appear via the new
-    // process's load_all/watch. By then the boot resync has re-read the
-    // rejected bytes for the model key — the exact path that used to
-    // drop the row.
-    await etcd.put(
-      `${etcdPrefix}/api_keys/${randomUUID()}`,
-      JSON.stringify({
-        key_hash: createHash("sha256").update(`sentinel-${randomUUID()}`).digest("hex"),
-        allowed_models: [],
-      }),
-    );
-    await waitConfigPropagation(async () => {
-      const cfg = await getStatusConfig(app!);
-      return (cfg.applied?.resource_counts.api_keys ?? 0) >= 2;
-    });
+      // Prove the LIVE etcd read completed (not just the cache replay):
+      // a sentinel written after the restart can only appear via the new
+      // process's load_all/watch. By then the boot resync has re-read the
+      // rejected bytes for the model key — the exact path that used to
+      // drop the row.
+      await etcd.put(
+        `${etcdPrefix}/api_keys/${randomUUID()}`,
+        JSON.stringify({
+          key_hash: createHash("sha256").update(`sentinel-${randomUUID()}`).digest("hex"),
+          allowed_models: [],
+        }),
+      );
+      await waitConfigPropagation(async () => {
+        const cfg = await getStatusConfig(app!);
+        return (cfg.applied?.resource_counts.api_keys ?? 0) >= 2;
+      });
 
-    // The model still serves real traffic from its pinned value.
-    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
-    const after = await proxy.chat({
-      model: "lkg-model",
-      messages: [{ role: "user", content: "post-restart" }],
-    });
-    expect(after.status, JSON.stringify(after.body)).toBe(200);
+      // The model still serves real traffic from its pinned value.
+      const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+      const after = await proxy.chat({
+        model: "lkg-model",
+        messages: [{ role: "user", content: "post-restart" }],
+      });
+      expect(after.status, JSON.stringify(after.body)).toBe(200);
 
-    // The rejection + staleness survive, and the stale-since instant is
-    // CONTINUOUS across the restart (persisted in the snapshot cache),
-    // so the age keeps growing instead of resetting.
-    const cfg = await getStatusConfig(app);
-    const rejection = cfg.rejected.find((r) => r.resource_id === modelId)!;
-    expect(rejection).toBeDefined();
-    expect(rejection.serving_stale_since).toBe(staleSinceBeforeRestart);
-    expect(rejection.serving_stale_age_seconds).toBeTypeOf("number");
-    expect(cfg.applied?.resource_counts.models).toBe(1);
+      // The rejection + staleness survive, and the stale-since instant is
+      // CONTINUOUS across the restart (persisted in the snapshot cache),
+      // so the age keeps growing instead of resetting.
+      const cfg = await getStatusConfig(app);
+      const rejection = cfg.rejected.find((r) => r.resource_id === modelId)!;
+      expect(rejection).toBeDefined();
+      expect(rejection.serving_stale_since).toBe(staleSinceBeforeRestart);
+      expect(rejection.serving_stale_age_seconds).toBeTypeOf("number");
+      expect(cfg.applied?.resource_counts.models).toBe(1);
 
-    const text = await scrape(app);
-    expect(text).toMatch(/aisix_config_stale_served_resources\{kind="models"\} 1/);
-  });
-
-  test("deleting the etcd key kills the pinned value — no zombie config", async (ctx) => {
-    if (!etcdReachable || !app || !etcd) {
-      ctx.skip();
-      return;
+      const text = await scrape(app);
+      expect(text).toMatch(/aisix_config_stale_served_resources\{kind="models"\} 1/);
     }
 
-    await etcd.delete(modelKey);
-    await waitConfigPropagation(async () => {
-      const cfg = await getStatusConfig(app!);
-      return (cfg.applied?.resource_counts.models ?? 0) === 0;
-    });
+    const persisted = await readFile(join(cacheDir!, "config_cache.json"));
+    const offlinePath = join(cacheDir!, "offline-cache.json");
+    await writeFile(offlinePath, persisted);
+    const relay = await startEtcdRelay();
+    let offline: SpawnedApp | undefined;
+    try {
+      await relay.refuse();
+      offline = await spawnApp({
+        etcdPrefix,
+        snapshotCachePath: offlinePath,
+        extra: { etcd: { endpoints: [relay.endpoint], prefix: etcdPrefix } },
+      });
+      stoppedApps.push(offline);
+      await waitConfigPropagation(async () => (await getStatusConfig(offline!)).source.connected === false);
+      const proxy = new ProxyClient(offline.proxyUrl, CALLER_PLAINTEXT);
+      const response = await proxy.chat({
+        model: "lkg-model",
+        messages: [{ role: "user", content: "offline restart" }],
+      });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      const cfg = await getStatusConfig(offline);
+      expect(cfg.rejected.find((row) => row.resource_id === modelId)?.serving_stale_since)
+        .toBe(staleSinceBeforeRestart);
+    } finally {
+      await offline?.stop();
+      await relay.stop();
+    }
 
-    // The resource is gone for real traffic...
-    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
-    const gone = await proxy.chat({
-      model: "lkg-model",
-      messages: [{ role: "user", content: "should be gone" }],
-    });
-    expect(gone.status, JSON.stringify(gone.body)).toBe(404);
+    const disabledPath = join(cacheDir!, "disabled-cache.json");
+    await writeFile(disabledPath, persisted);
+    for (const toggle of [{}, { snapshot_cache_enabled: false }]) {
+      const uncached = await spawnApp({
+        etcdPrefix,
+        extra: { managed: { snapshot_cache_path: disabledPath, ...toggle } },
+      });
+      stoppedApps.push(uncached);
+      try {
+        await waitConfigPropagation(async () => {
+          const cfg = await getStatusConfig(uncached);
+          return cfg.rejected.some((row) => row.resource_id === modelId);
+        });
+        const cfg = await getStatusConfig(uncached);
+        expect(cfg.applied?.resource_counts.models ?? 0).toBe(0);
+        expect(cfg.rejected.find((row) => row.resource_id === modelId)?.serving_stale_since).toBeUndefined();
+        const proxy = new ProxyClient(uncached.proxyUrl, CALLER_PLAINTEXT);
+        const response = await proxy.chat({
+          model: "lkg-model",
+          messages: [{ role: "user", content: "no disk recovery" }],
+        });
+        expect(response.status, JSON.stringify(response.body)).toBe(404);
+      } finally {
+        await uncached.stop();
+      }
+      expect(await readFile(disabledPath)).toEqual(persisted);
+    }
 
-    // ...and every stale/rejected signal clears with it.
-    const cfg = await getStatusConfig(app);
-    expect(cfg.rejected).toHaveLength(0);
-    const text = await scrape(app);
-    expect(text).toMatch(/aisix_config_stale_served_resources\{kind="models"\} 0/);
+    {
+      await etcd.delete(modelKey);
+      await waitConfigPropagation(async () => {
+        const cfg = await getStatusConfig(app!);
+        return (cfg.applied?.resource_counts.models ?? 0) === 0;
+      });
+
+      // The resource is gone for real traffic...
+      const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+      const gone = await proxy.chat({
+        model: "lkg-model",
+        messages: [{ role: "user", content: "should be gone" }],
+      });
+      expect(gone.status, JSON.stringify(gone.body)).toBe(404);
+
+      // ...and every stale/rejected signal clears with it.
+      const cfg = await getStatusConfig(app);
+      expect(cfg.rejected).toHaveLength(0);
+      const text = await scrape(app);
+      expect(text).toMatch(/aisix_config_stale_served_resources\{kind="models"\} 0/);
+    }
   });
 });

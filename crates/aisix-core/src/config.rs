@@ -286,21 +286,16 @@ pub struct ManagedConfig {
     #[serde(default = "ManagedConfig::default_dp_id_file")]
     pub dp_id_file: String,
 
-    /// Optional path to the on-disk snapshot cache the DP keeps as a
-    /// fallback when etcd is unreachable (prd-09 §9.7.2). When set, the
-    /// supervisor flushes every applied resync / put / delete to this
-    /// file and re-loads it at boot before opening the etcd connection,
-    /// so the proxy can serve traffic from cached config across CP
-    /// outages and full container restarts.
-    ///
-    /// When the field is omitted, managed mode uses
-    /// `/var/lib/aisix/config_cache.json` and self-hosted etcd mode
-    /// leaves persistence off (unchanged defaults). Setting a path
-    /// enables the cache in either mode — self-hosted etcd deployments
-    /// gain the same offline resilience by opting in. Empty string
-    /// disables persistence everywhere — useful for ephemeral test runs
-    /// where you don't want a stale cache to mask a real failure. A
-    /// bare `snapshot_cache_path:` (YAML null) is treated as omitted.
+    /// Enable on-disk configuration snapshots for recovery across restarts
+    /// when etcd is unavailable. Disabled by default in both managed and
+    /// self-hosted etcd modes; in-memory last-known-good serving is unaffected.
+    /// Snapshots include unencrypted credentials; restrict cache directory access.
+    #[serde(default)]
+    pub snapshot_cache_enabled: bool,
+
+    /// Cache location when `snapshot_cache_enabled` is true. Omitted or
+    /// null uses `/var/lib/aisix/config_cache.json`; an empty string also
+    /// disables persistence. A path alone does not enable the cache.
     #[serde(default)]
     pub snapshot_cache_path: Option<String>,
 
@@ -337,20 +332,18 @@ impl ManagedConfig {
         has_pem || has_file
     }
 
-    /// Resolve the snapshot-cache path per the field docs: an explicit
-    /// path wins in any mode, an explicit empty string disables, and an
-    /// omitted field means "the default path in managed mode, disabled
-    /// in self-hosted etcd mode".
+    /// Resolve the optional cache only after the operator enables it.
     pub fn effective_snapshot_cache_path(&self) -> Option<&str> {
+        if !self.snapshot_cache_enabled {
+            return None;
+        }
         match self.snapshot_cache_path.as_deref() {
             Some("") => None,
             Some(path) => Some(path),
-            None if self.is_managed() => Some(Self::DEFAULT_SNAPSHOT_CACHE_PATH),
-            None => None,
+            None => Some(Self::DEFAULT_SNAPSHOT_CACHE_PATH),
         }
     }
 
-    /// Default on-disk snapshot cache location for managed mode.
     pub const DEFAULT_SNAPSHOT_CACHE_PATH: &'static str = "/var/lib/aisix/config_cache.json";
 
     fn default_mtls_dir() -> String {
@@ -3407,50 +3400,53 @@ managed:
         assert!(cfg.managed.is_managed());
         assert_eq!(cfg.managed.mtls_dir, "/var/lib/aisix/mtls");
         assert_eq!(cfg.managed.dp_id_file, "/var/lib/aisix/dp_id");
-        // Default snapshot cache path keeps offline-resilience on by
-        // default in managed mode; operators opt out by setting the
-        // field to "".
-        assert_eq!(
-            cfg.managed.effective_snapshot_cache_path(),
-            Some("/var/lib/aisix/config_cache.json"),
-        );
+        assert_eq!(cfg.managed.effective_snapshot_cache_path(), None);
         // CP URL comes from env at runtime — empty here is fine.
         assert!(cfg.managed.cp_base_url.is_none());
     }
 
-    /// #871: the snapshot cache resolves per mode — managed defaults on,
-    /// self-hosted etcd defaults off, an explicit path enables either,
-    /// an explicit "" disables either.
     #[test]
     fn snapshot_cache_path_resolution_per_mode() {
-        let mut managed = ManagedConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            managed.effective_snapshot_cache_path(),
-            Some(ManagedConfig::DEFAULT_SNAPSHOT_CACHE_PATH),
-        );
-        managed.snapshot_cache_path = Some(String::new());
-        assert_eq!(managed.effective_snapshot_cache_path(), None);
-        managed.snapshot_cache_path = Some("/tmp/cache.json".into());
-        assert_eq!(
-            managed.effective_snapshot_cache_path(),
-            Some("/tmp/cache.json"),
-        );
-
-        let mut self_hosted = ManagedConfig {
-            enabled: false,
-            ..Default::default()
-        };
-        assert_eq!(self_hosted.effective_snapshot_cache_path(), None);
-        self_hosted.snapshot_cache_path = Some("/tmp/cache.json".into());
-        assert_eq!(
-            self_hosted.effective_snapshot_cache_path(),
-            Some("/tmp/cache.json"),
-        );
-        self_hosted.snapshot_cache_path = Some(String::new());
-        assert_eq!(self_hosted.effective_snapshot_cache_path(), None);
+        for enabled in [false, true] {
+            for toggle in [
+                "",
+                "snapshot_cache_enabled: false",
+                "snapshot_cache_enabled: true",
+            ] {
+                for (setting, when_enabled) in [
+                    ("", Some(ManagedConfig::DEFAULT_SNAPSHOT_CACHE_PATH)),
+                    (
+                        "snapshot_cache_path: null",
+                        Some(ManagedConfig::DEFAULT_SNAPSHOT_CACHE_PATH),
+                    ),
+                    ("snapshot_cache_path: \"\"", None),
+                    (
+                        "snapshot_cache_path: /tmp/cache.json",
+                        Some("/tmp/cache.json"),
+                    ),
+                ] {
+                    let managed: ManagedConfig = config::Config::builder()
+                        .add_source(config::File::from_str(
+                            &format!("enabled: {enabled}\n{toggle}\n{setting}\n"),
+                            config::FileFormat::Yaml,
+                        ))
+                        .build()
+                        .unwrap()
+                        .try_deserialize()
+                        .unwrap();
+                    let expected = if toggle.ends_with("true") {
+                        when_enabled
+                    } else {
+                        None
+                    };
+                    assert_eq!(
+                        managed.effective_snapshot_cache_path(),
+                        expected,
+                        "{enabled}: {toggle}: {setting}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
