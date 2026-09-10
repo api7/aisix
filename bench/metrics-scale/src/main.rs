@@ -38,8 +38,28 @@ fn main() {
 
 fn run() {
     let args = std::env::args().collect::<Vec<_>>();
-    let n: usize = args.get(1).map_or("53260", String::as_str).parse().unwrap();
-    let reduced = args.get(2).is_some_and(|v| v == "reduced");
+    let n = match args
+        .get(1)
+        .map_or(Ok(53_260), |value| value.parse::<usize>())
+    {
+        Ok(n) if n > 0 => n,
+        _ => {
+            eprintln!("identity count must be a positive integer");
+            std::process::exit(2);
+        }
+    };
+    let reduced = match args.get(2).map_or("full", String::as_str) {
+        "full" => false,
+        "reduced" => true,
+        _ => {
+            eprintln!("label mode must be full or reduced");
+            std::process::exit(2);
+        }
+    };
+    if args.len() > 3 {
+        eprintln!("usage: metrics-scale-bench [positive identity count] [full|reduced]");
+        std::process::exit(2);
+    }
     #[cfg(not(feature = "optimized"))]
     let recorder = PrometheusBuilder::new().build_recorder();
     #[cfg(not(feature = "optimized"))]
