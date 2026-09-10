@@ -8,6 +8,7 @@ import {
   ProxyClient,
   SeedClient,
   spawnApp,
+  startEtcdRelay,
   startOpenAiUpstream,
   waitConfigPropagation,
   type OpenAiUpstream,
@@ -35,6 +36,7 @@ const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("he
 
 interface StatusConfig {
   state: string;
+  source: { connected: boolean };
   applied?: { resource_counts: Record<string, number> };
   rejected: Array<{
     resource_kind: string;
@@ -220,6 +222,33 @@ describe("config last-known-good: rejected updates keep serving across resync an
     }
 
     const persisted = await readFile(join(cacheDir!, "config_cache.json"));
+    const offlinePath = join(cacheDir!, "offline-cache.json");
+    await writeFile(offlinePath, persisted);
+    const relay = await startEtcdRelay();
+    let offline: SpawnedApp | undefined;
+    try {
+      await relay.refuse();
+      offline = await spawnApp({
+        etcdPrefix,
+        snapshotCachePath: offlinePath,
+        extra: { etcd: { endpoints: [relay.endpoint], prefix: etcdPrefix } },
+      });
+      stoppedApps.push(offline);
+      await waitConfigPropagation(async () => (await getStatusConfig(offline!)).source.connected === false);
+      const proxy = new ProxyClient(offline.proxyUrl, CALLER_PLAINTEXT);
+      const response = await proxy.chat({
+        model: "lkg-model",
+        messages: [{ role: "user", content: "offline restart" }],
+      });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      const cfg = await getStatusConfig(offline);
+      expect(cfg.rejected.find((row) => row.resource_id === modelId)?.serving_stale_since)
+        .toBe(staleSinceBeforeRestart);
+    } finally {
+      await offline?.stop();
+      await relay.stop();
+    }
+
     const disabledPath = join(cacheDir!, "disabled-cache.json");
     await writeFile(disabledPath, persisted);
     for (const toggle of [{}, { snapshot_cache_enabled: false }]) {
