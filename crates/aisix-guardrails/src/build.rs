@@ -1163,6 +1163,17 @@ impl Guardrail for LiveGuardrailChain {
         self.current().redact_input_text(text)
     }
 
+    /// Forwarded for the same reason the hold-back methods above are: the
+    /// trait default would delegate to `redact_input_text`, dropping the
+    /// window and quietly letting an `input_messages: latest_turn` row
+    /// rewrite history. (This wrapper does not forward the segment hooks
+    /// either, which predates this change — it is exported but unused by
+    /// the proxy, which resolves chains through `LiveGuardrailIndex`.)
+    fn redact_input_text_in_turn(&self, text: &str, in_latest_turn: bool) -> Option<Redaction> {
+        self.current()
+            .redact_input_text_in_turn(text, in_latest_turn)
+    }
+
     fn redact_output_text(&self, text: &str) -> Option<Redaction> {
         self.current().redact_output_text(text)
     }
