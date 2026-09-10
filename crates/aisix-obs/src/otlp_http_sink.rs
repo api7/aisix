@@ -65,10 +65,6 @@ use crate::usage::UsageEvent;
 /// tasks for a wedged user receiver.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `User-Agent` header so vendor receivers can attribute traces back
-/// to AISIX in their own analytics. Not a contract; informational.
-const USER_AGENT: &str = concat!("aisix-dp/", env!("CARGO_PKG_VERSION"));
-
 /// Fans usage events out to every configured observability exporter — any
 /// [`ExporterKind`], dispatched per kind to the matching
 /// [`crate::sink::ObservabilitySink`] — each via its own
@@ -120,7 +116,7 @@ impl OtlpHttpFanOut {
     fn build(metrics: Option<Metrics>) -> Self {
         let client = aisix_gateway::client_builder()
             .timeout(REQUEST_TIMEOUT)
-            .user_agent(USER_AGENT)
+            .user_agent(format!("aisix-dp/{}", aisix_core::BUILD_VERSION))
             .build()
             // The client builder only fails on illegal TLS roots; the
             // default config is always valid.
@@ -2172,7 +2168,7 @@ mod tests {
             "test-exp",
             format!("{}/v1/traces", server.uri()),
             BTreeMap::new(),
-            otlp_test_client(),
+            OtlpHttpFanOut::new().inner.client.clone(),
         );
 
         let ack = sink
@@ -2183,6 +2179,10 @@ mod tests {
 
         let reqs = server.received_requests().await.unwrap();
         assert_eq!(reqs.len(), 1, "one batched request, not three spawns");
+        assert_eq!(
+            reqs[0].headers["user-agent"],
+            format!("aisix-dp/{}", aisix_core::BUILD_VERSION)
+        );
         let body: Value = serde_json::from_slice(&reqs[0].body).unwrap();
         let spans = body["resourceSpans"][0]["scopeSpans"][0]["spans"]
             .as_array()
