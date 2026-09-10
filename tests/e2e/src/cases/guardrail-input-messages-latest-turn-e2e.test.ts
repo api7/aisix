@@ -86,6 +86,7 @@ describe("guardrail input_messages: latest_turn (AISIX-Cloud#1558)", () => {
   const scriptLatest: Lane = { model: "lt-script-latest" };
   const scriptAll: Lane = { model: "lt-script-all" };
   const maskLatest: Lane = { model: "lt-mask-latest" };
+  const piiLatest: Lane = { model: "lt-pii-latest" };
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -163,6 +164,18 @@ describe("guardrail input_messages: latest_turn (AISIX-Cloud#1558)", () => {
       timeout_ms: 5000,
     });
 
+    // The sync mask channel (`redact_input_text`) is a different code path
+    // from the segment one above — per-member filtering rather than slot
+    // splicing — and it is the one a real PII mask rule uses.
+    await lane(piiLatest, {
+      name: "lt-pii-latest-row",
+      enabled: true,
+      hook_point: "input",
+      input_messages: "latest_turn",
+      kind: "pii",
+      detectors: [{ type: "email", action: "mask" }],
+    });
+
     // Seeded last: this key authenticating implies every resource above it
     // is already in the gateway's snapshot.
     await seed.createApiKey({
@@ -173,6 +186,7 @@ describe("guardrail input_messages: latest_turn (AISIX-Cloud#1558)", () => {
         scriptLatest.model,
         scriptAll.model,
         maskLatest.model,
+        piiLatest.model,
       ],
     });
   });
@@ -581,6 +595,43 @@ describe("guardrail input_messages: latest_turn (AISIX-Cloud#1558)", () => {
   );
 
   // ── masking follows the same window ───────────────────────────────────
+
+  test(
+    "a `pii` mask row on `latest_turn` leaves history's PII untouched",
+    async (ctx) => {
+      if (!etcdReachable || !app || !upstream) {
+        ctx.skip();
+        return;
+      }
+      const HISTORY_MAIL = "history.person@example.com";
+      const CURRENT_MAIL = "current.person@example.com";
+
+      await waitConfigPropagation(async () => {
+        const before = upstream!.receivedRequests.length;
+        await chat(piiLatest.model, [
+          { role: "user", content: `probe ${CURRENT_MAIL}` },
+        ]);
+        return upstream!.receivedRequests
+          .slice(before)
+          .some((r) => !r.body.includes(CURRENT_MAIL));
+      });
+
+      const before = upstream.receivedRequests.length;
+      await chat(piiLatest.model, [
+        { role: "user", content: `earlier ${HISTORY_MAIL}` },
+        { role: "assistant", content: "understood" },
+        { role: "user", content: `now ${CURRENT_MAIL}` },
+      ]);
+      const sent = upstream.receivedRequests.slice(before);
+      expect(sent.length).toBeGreaterThan(0);
+      const body = sent[sent.length - 1].body;
+      expect(body, "history PII is forwarded as the caller sent it").toContain(
+        HISTORY_MAIL,
+      );
+      expect(body, "the current turn is masked").not.toContain(CURRENT_MAIL);
+    },
+    60_000,
+  );
 
   test(
     "a masking row on `latest_turn` rewrites the current turn and forwards history byte-identical",
