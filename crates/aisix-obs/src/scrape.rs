@@ -58,7 +58,9 @@ mod tests {
         let (release, wait) = std::sync::mpsc::channel();
         let calls = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&calls);
+        let runtime_thread = std::thread::current().id();
         let mut first = Box::pin(scrape.render(move || {
+            assert_ne!(std::thread::current().id(), runtime_thread);
             count.fetch_add(1, Ordering::SeqCst);
             started.send(()).unwrap();
             wait.recv().unwrap();

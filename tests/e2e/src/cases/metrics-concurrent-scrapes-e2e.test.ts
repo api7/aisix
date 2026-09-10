@@ -9,6 +9,7 @@ import {
 import { metricDelta, scrapeMetrics } from "../harness/metrics.js";
 
 const MODEL = "concurrent-metrics";
+const ESCAPED_MODELS = [String.raw`model\x`, String.raw`model\\x`];
 const KEYS = Array.from({ length: 64 }, (_, i) => `sk-concurrent-metrics-${i}`);
 
 function resources(base: string): string {
@@ -20,14 +21,14 @@ provider_keys:
     api_key: sk-mock
     api_base: ${base}/v1
 models:
-  - display_name: ${MODEL}
+${[MODEL, ...ESCAPED_MODELS].map((model) => `  - display_name: ${JSON.stringify(model)}
     provider: openai
     model_name: mock-model
-    provider_key: metrics-upstream
+    provider_key: metrics-upstream`).join("\n")}
 api_keys:
 ${KEYS.map((key, i) => `  - display_name: metrics-caller-${i}
     key_hash: ${createHash("sha256").update(key).digest("hex")}
-    allowed_models: [${MODEL}]`).join("\n")}
+    allowed_models: ${JSON.stringify([MODEL, ...ESCAPED_MODELS])}`).join("\n")}
 `;
 }
 
@@ -106,5 +107,28 @@ describe("concurrent and cancelled metric scrapes preserve request observations"
     const durations = after.filter((s) => s.name === "aisix_proxy_request_duration_seconds" && s.labels.model === MODEL);
     expect(new Set(durations.map((s) => s.labels.api_key_id)).size).toBe(KEYS.length);
     expect([...new Set(durations.map((s) => s.labels.quantile))].sort()).toEqual(["0", "0.5", "0.9", "0.95", "0.99", "0.999", "1"]);
+  });
+
+  test("distinct model names containing backslashes never produce conflicting samples", async () => {
+    const before = await scrapeMetrics(app.metricsUrl);
+    for (const [index, model] of ESCAPED_MODELS.entries()) {
+      for (let repeat = 0; repeat <= index; repeat++) {
+        const response = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${KEYS[0]}`, "content-type": "application/json" },
+          body: JSON.stringify({ model, messages: [{ role: "user", content: "metrics" }] }),
+        });
+        expect(response.status, await response.text()).toBe(200);
+      }
+    }
+    const after = await scrapeMetrics(app.metricsUrl);
+    for (const [index, model] of ESCAPED_MODELS.entries()) {
+      const labels = { model: JSON.stringify(model).slice(1, -1) };
+      for (const name of ["aisix_proxy_requests_total", "aisix_proxy_request_duration_seconds_count", "aisix_llm_request_duration_seconds_count"]) {
+        const samples = after.filter((s) => s.name === name && s.labels.model === labels.model);
+        expect(samples, `${name}: ${model}`).toHaveLength(1);
+        expect(metricDelta(before, after, name, labels)).toBe(index + 1);
+      }
+    }
   });
 });

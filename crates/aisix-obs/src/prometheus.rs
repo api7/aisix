@@ -13,7 +13,7 @@ use metrics::{
     Metadata, Recorder as MetricsRecorder, SharedString, Unit,
 };
 use metrics_exporter_prometheus::{
-    formatting::{key_to_parts, sanitize_metric_name, write_help_line, write_type_line},
+    formatting::{sanitize_label_key, sanitize_metric_name, write_help_line, write_type_line},
     Distribution, DistributionBuilder,
 };
 use metrics_util::{registry::Registry, storage::AtomicBucket};
@@ -46,9 +46,28 @@ impl Labels {
             output.push('_');
             output.push_str(suffix);
         }
-        let labels = self
-            .text
-            .get_or_init(|| key_to_parts(&self.key, None).1.join(","));
+        let labels = self.text.get_or_init(|| {
+            let mut text = String::new();
+            for (index, label) in self.key.labels().enumerate() {
+                if index != 0 {
+                    text.push(',');
+                }
+                write!(text, "{}=\"", sanitize_label_key(label.key()))
+                    .expect("writing to a String");
+                // Values are raw, never pre-escaped. Treating a pair of
+                // backslashes as an existing escape aliases distinct series.
+                for ch in label.value().chars() {
+                    match ch {
+                        '\\' => text.push_str("\\\\"),
+                        '"' => text.push_str("\\\""),
+                        '\n' => text.push_str("\\n"),
+                        ch => text.push(ch),
+                    }
+                }
+                text.push('"');
+            }
+            text
+        });
         if !labels.is_empty() || extra.is_some() {
             output.push('{');
             output.push_str(labels);
@@ -422,6 +441,52 @@ mod tests {
                 .render()
                 .contains("duration_count{model=\"a\\\\b\\\"c\\nd\",member=\"成员\"} 20"));
         });
+    }
+
+    #[test]
+    fn distinct_raw_label_values_remain_distinct_in_every_metric_type() {
+        let recorder = Recorder::new(distributions());
+        let metadata = Metadata::new("test", metrics::Level::INFO, None);
+        let values = [
+            (r"model\x", r"model\\x"),
+            (r"model\\x", r"model\\\\x"),
+            ("line\nnext", r"line\nnext"),
+            (r"line\nnext", r"line\\nnext"),
+            ("quote\\\"x", r#"quote\\\"x"#),
+            ("末尾\\", r"末尾\\"),
+        ];
+        for (index, (raw, _)) in values.iter().enumerate() {
+            let key = |name| Key::from_parts(name, vec![metrics::Label::new("model", *raw)]);
+            let count = (index + 1) as u64;
+            recorder
+                .register_counter(&key("requests_total"), &metadata)
+                .increment(count);
+            recorder
+                .register_gauge(&key("remaining"), &metadata)
+                .set(count as f64);
+            for name in ["duration", "latency"] {
+                let histogram = recorder.register_histogram(&key(name), &metadata);
+                for _ in 0..count {
+                    histogram.record(0.1);
+                }
+            }
+        }
+        let output = recorder.render();
+        for family in [
+            "requests_total",
+            "remaining",
+            "duration_count",
+            "latency_count",
+        ] {
+            for (index, (_, escaped)) in values.iter().enumerate() {
+                let prefix = format!("{family}{{model=\"{escaped}\"}} ");
+                let samples = output
+                    .lines()
+                    .filter_map(|line| line.strip_prefix(&prefix))
+                    .collect::<Vec<_>>();
+                assert_eq!(samples, vec![(index + 1).to_string()], "{prefix}");
+            }
+        }
     }
 
     #[test]
