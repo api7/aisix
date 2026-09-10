@@ -986,28 +986,28 @@ fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
             for item in items {
                 // A bare-string array element is treated as user text; an
                 // object element is a message whose role we preserve.
+                //
+                // EVERY item becomes a message, including one that carries
+                // no readable text. That is what keeps this view aligned
+                // one-to-one with `input[]`, and the alignment is what
+                // makes the latest-turn window agree with the mask
+                // walkers in `crate::redact`, which compute the same
+                // boundary off the raw wire and cannot tell that an item
+                // held no text. Drop one here and the two halves disagree
+                // on where the current turn starts — a replayed
+                // `{"type": "reasoning", "encrypted_content": "…"}` (what
+                // an agent client sends on every turn with reasoning
+                // summaries off) or a `refusal`-only assistant message
+                // would make the check pass see no model turn at all and
+                // widen back to the whole conversation. An empty message
+                // contributes nothing to any kind's scan, so keeping it
+                // costs nothing.
                 if let Some(text) = item.as_str() {
-                    if !text.is_empty() {
-                        messages.push(ChatMessage::user(text.to_string()));
-                    }
+                    messages.push(ChatMessage::user(text.to_string()));
                     continue;
                 }
                 let text = responses_item_text(item);
-                let role = responses_item_role(item);
-                // A text-empty item carries nothing to scan and is dropped
-                // — EXCEPT an assistant-side one, which is where the
-                // latest-turn window opens. The mask walkers read that
-                // boundary off the wire and cannot tell that the item held
-                // no text, so dropping it here would make the two halves
-                // of the rule disagree: the check pass would see no model
-                // turn at all and widen back to the whole conversation.
-                // The shape is real — a `reasoning` item whose only
-                // payload is `encrypted_content` has no readable text and
-                // is replayed on every turn by agent clients.
-                if text.is_empty() && role != Role::Assistant {
-                    continue;
-                }
-                messages.push(match role {
+                messages.push(match responses_item_role(item) {
                     Role::Assistant => ChatMessage::assistant(text),
                     Role::System => ChatMessage::system(text),
                     Role::Tool => ChatMessage::tool(text),
@@ -1032,7 +1032,7 @@ fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
 /// Responses spelling of what `/v1/chat/completions` sends as an assistant
 /// message with `tool_calls` followed by `role: "tool"` messages.
 /// <https://platform.openai.com/docs/api-reference/responses/create>
-fn responses_item_role(item: &Value) -> Role {
+pub(crate) fn responses_item_role(item: &Value) -> Role {
     match item.get("role").and_then(|v| v.as_str()) {
         Some("assistant") => return Role::Assistant,
         Some("system") | Some("developer") => return Role::System,
@@ -1062,9 +1062,16 @@ fn responses_item_role(item: &Value) -> Role {
 ///   collapsed to empty text and was dropped from the scan: a block rule
 ///   that fires on `/v1/chat/completions` (where the same replayed call
 ///   rides `extra["tool_calls"]` and IS scanned) was bypassable by moving
-///   the payload into a tool call on this surface. The mask walker already
-///   rewrote both keys, so the two passes now read the same slots — the
-///   same pair the output scanner reads for a generated call.
+///   the payload into a tool call on this surface. The same pair the
+///   output scanner reads for a generated call.
+///
+/// `arguments` / `input` are rewritten by the mask walker
+/// (`redact::redact_responses_item`); `name` is NOT, exactly as a
+/// `tool_calls` function name is scanned but never rewritten on the chat
+/// wire — a tool name is structural, and masking it would break the call
+/// it identifies. So a Mask rule can report a hit on a tool NAME and
+/// forward it; a Block rule still refuses. That asymmetry is deliberate
+/// and shared with `/v1/chat/completions`.
 ///
 /// A `reasoning` item's `content[]` parts are covered by the `content`
 /// key above. Reasoning replayed on the REQUEST is caller-supplied text
@@ -3866,24 +3873,76 @@ mod tests {
                 aisix_gateway::Role::User,
             ],
         );
+        assert_eq!(chat.messages[1].content_str(), "", "no readable text");
         let window = aisix_guardrails::latest_turn_view(&chat);
         assert_eq!(window.messages.len(), 1);
         assert_eq!(window.messages[0].content_str(), "fresh");
     }
 
-    /// A text-empty item that is NOT a model turn is still dropped — the
-    /// exception above must be the boundary, not a blanket change.
+    /// The parsed view is one message per `input[]` item, whatever the
+    /// item carries. That alignment is what lets the check pass and the
+    /// mask walkers land on the same boundary; dropping the text-empty
+    /// item here would move the last model turn to the end of the list
+    /// and widen a `latest_turn` row back to the whole conversation.
     #[test]
-    fn responses_input_still_drops_a_text_empty_non_assistant_item() {
+    fn responses_input_keeps_one_message_per_item_even_when_text_is_empty() {
         let body = serde_json::json!({
             "model": "m",
             "input": [
-                {"role": "user", "content": "earlier"},
+                {"role": "user", "content": "earlier SECRET"},
+                {"role": "assistant", "type": "message",
+                 "content": [{"type": "output_text", "text": "answered"}]},
                 {"type": "function_call_output", "call_id": "c1", "output": ""},
             ],
         });
         let chat = super::responses_input_to_chat("m", &body);
-        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages.len(), 3);
+        let window = aisix_guardrails::latest_turn_view(&chat);
+        assert_eq!(
+            window.messages.len(),
+            1,
+            "only the empty tool result is in the window: {:?}",
+            window
+                .messages
+                .iter()
+                .map(|m| (m.role, m.content_str().to_owned()))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Naming a consequence of the role mapping so it is not rediscovered
+    /// as a bug: two kinds screen only user-role messages under their
+    /// DEFAULT `text_source` — `semantic` (`user_messages`) and
+    /// `azure_content_safety_text_moderation` (`concatenate_user_content`)
+    /// — so a replayed tool result on `/v1/responses` is now outside what
+    /// they read, exactly as a `role: "tool"` message already is on
+    /// `/v1/chat/completions`. Before the mapping it was mislabelled as
+    /// user text and they happened to scan it. Operators who want it
+    /// screened set `text_source` to the all-messages value, on either
+    /// surface.
+    #[test]
+    fn a_replayed_tool_result_is_not_user_role_on_either_surface() {
+        let responses = super::responses_input_to_chat(
+            "m",
+            &serde_json::json!({
+                "model": "m",
+                "input": [
+                    {"type": "function_call_output", "call_id": "c1", "output": "RESULT"},
+                ],
+            }),
+        );
+        let chat: aisix_gateway::ChatFormat = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "tool", "tool_call_id": "c1", "content": "RESULT"},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(responses.messages[0].role, aisix_gateway::Role::Tool);
+        assert_eq!(
+            responses.messages[0].role, chat.messages[0].role,
+            "the two surfaces must agree on what a tool result is",
+        );
     }
 
     /// A tool RESULT is the caller answering, so it lands on `Role::Tool`

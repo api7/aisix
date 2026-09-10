@@ -2231,6 +2231,10 @@ fn add_variant_titles(doc: &mut Value) {
             &["Input", "Output", "Both"],
         ),
         (
+            "/components/schemas/GuardrailInputMessages/oneOf",
+            &["All messages", "Latest turn only"],
+        ),
+        (
             "/components/schemas/KeywordPattern/oneOf",
             &["Literal", "Regex"],
         ),

@@ -1964,6 +1964,59 @@ mod tests {
         );
     }
 
+    /// A trailing assistant message is a prefill, not an answered turn.
+    /// If it closed the window the window would be EMPTY, and appending
+    /// one would be a one-line bypass of every `latest_turn` rule.
+    #[test]
+    fn a_trailing_assistant_prefill_does_not_close_the_window() {
+        let req = ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::system("sys"),
+                ChatMessage::user("old AKIA"),
+                ChatMessage::assistant("answered"),
+                ChatMessage::user("fresh"),
+                ChatMessage::assistant("Sure, here is"),
+            ],
+        );
+        let seen: Vec<_> = crate::latest_turn_view(&req)
+            .messages
+            .iter()
+            .map(|m| (m.role, m.content_str().to_owned()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (Role::User, "fresh".to_owned()),
+                (Role::Assistant, "Sure, here is".to_owned()),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trailing_assistant_message_cannot_silence_a_narrowed_row() {
+        let chain = GuardrailChain::new_with_applied(
+            vec![member(
+                "narrow",
+                Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("AKIA")]))
+                    as Arc<dyn Guardrail>,
+                GuardrailInputMessages::LatestTurn,
+            )],
+            applied(1),
+        );
+        let req = ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::user("please handle AKIA"),
+                ChatMessage::assistant("Sure, here is"),
+            ],
+        );
+        assert!(
+            chain.check_input(&req).await.is_block(),
+            "appending an assistant message must not empty the window",
+        );
+    }
+
     #[test]
     fn latest_turn_view_with_no_assistant_keeps_every_non_system_message() {
         let req = ChatFormat::new(
@@ -2066,6 +2119,59 @@ mod tests {
         assert_eq!(
             out.masked.expect("mask applied"),
             vec!["history".to_owned(), "CURRENT".to_owned()],
+        );
+    }
+
+    /// Two members with DIFFERENT windows compose on one slot list: the
+    /// `all` member rewrites everything, then the `latest_turn` member
+    /// rewrites its window ON TOP of that. A history slot must carry the
+    /// first member's mark and only that; a window slot must carry both.
+    /// Nothing else covers this — the check fold has
+    /// `a_narrowed_member_does_not_narrow_its_peers`, the segment fold had
+    /// no equivalent, and each e2e lane carries a single row.
+    #[tokio::test]
+    async fn members_with_different_windows_compose_on_the_same_slots() {
+        struct Suffix(&'static str);
+        #[async_trait]
+        impl Guardrail for Suffix {
+            fn name(&self) -> &'static str {
+                "suffix"
+            }
+            fn moderates_segments(&self) -> bool {
+                true
+            }
+            async fn moderate_input_segments(&self, texts: &[String]) -> crate::SegmentsOutcome {
+                crate::SegmentsOutcome {
+                    verdict: GuardrailVerdict::Allow,
+                    masked: Some(texts.iter().map(|t| format!("{t}{}", self.0)).collect()),
+                    counts: std::collections::BTreeMap::new(),
+                    monitor_hits: Vec::new(),
+                }
+            }
+        }
+
+        let chain = GuardrailChain::new_with_applied(
+            vec![
+                member(
+                    "whole",
+                    Arc::new(Suffix("+A")) as Arc<dyn Guardrail>,
+                    GuardrailInputMessages::All,
+                ),
+                member(
+                    "narrow",
+                    Arc::new(Suffix("+L")) as Arc<dyn Guardrail>,
+                    GuardrailInputMessages::LatestTurn,
+                ),
+            ],
+            applied(2),
+        );
+        let texts = vec!["history".to_owned(), "current".to_owned()];
+        let out = chain
+            .moderate_input_segments_in_turn(&texts, &[false, true])
+            .await;
+        assert_eq!(
+            out.masked.expect("mask applied"),
+            vec!["history+A".to_owned(), "current+A+L".to_owned()],
         );
     }
 

@@ -502,7 +502,8 @@ pub fn redact_chat_format(chain: &dyn Guardrail, req: &mut ChatFormat) -> Redact
 /// has to exist separately because the mask walkers rewrite raw slots and
 /// have no parsed view to index against.
 fn chat_latest_turn_start(messages: &[aisix_gateway::ChatMessage]) -> usize {
-    messages
+    let answered = messages.len().saturating_sub(1);
+    messages[..answered]
         .iter()
         .rposition(|m| m.role == Role::Assistant)
         .map_or(0, |i| i + 1)
@@ -565,9 +566,11 @@ pub fn redact_anthropic_request(chain: &dyn Guardrail, body: &mut Value) -> Reda
 /// A tool-loop turn is an assistant message carrying `tool_use` blocks,
 /// so the boundary lands where the parsed view puts it — the `tool_result`
 /// blocks answering it ride the FINAL user message, which is in the window
-/// whole.
+/// whole. A TRAILING assistant message is a prefill and never closes the
+/// window; see `aisix_guardrails::latest_turn_view`.
 fn anthropic_latest_turn_start(messages: &[Value]) -> usize {
-    messages
+    let answered = messages.len().saturating_sub(1);
+    messages[..answered]
         .iter()
         .rposition(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
         .map_or(0, |i| i + 1)
@@ -710,7 +713,8 @@ pub fn redact_responses_request(chain: &dyn Guardrail, body: &mut Value) -> Reda
 /// API spells a model turn as a typed item with no role at all — see
 /// [`responses_item_is_assistant`].
 fn responses_latest_turn_start(items: &[Value]) -> usize {
-    items
+    let answered = items.len().saturating_sub(1);
+    items[..answered]
         .iter()
         .rposition(responses_item_is_assistant)
         .map_or(0, |i| i + 1)
@@ -719,28 +723,25 @@ fn responses_latest_turn_start(items: &[Value]) -> usize {
 /// Whether one `input[]` item is something the MODEL produced, and so a
 /// boundary for the latest-turn window.
 ///
-/// Three shapes, all of which `responses::responses_input_to_chat` maps to
-/// `Role::Assistant`: a `role: "assistant"` message, a tool call the model
-/// asked for (`function_call`, and the custom-tool spelling), and a
-/// `reasoning` item. A tool RESULT is the caller answering that call and
-/// is not a boundary.
+/// This API does not spell a model turn as a role: a tool call the model
+/// asked for is a bare `function_call` item, and so is a `reasoning`
+/// item. A tool RESULT is the caller answering that call and is not a
+/// boundary.
+///
+/// Asks `responses::responses_item_role` rather than re-deriving the
+/// answer, so this protocol has ONE role mapping and not two. Two of them
+/// disagreed on `{"role": "user", "type": "reasoning"}` — nothing sends
+/// that, but the whole point of the design is that the check pass and
+/// these walkers cannot drift, and a second copy is where drift comes
+/// from.
 fn responses_item_is_assistant(item: &Value) -> bool {
-    if item.get("role").and_then(Value::as_str) == Some("assistant") {
-        return true;
-    }
-    matches!(
-        item.get("type").and_then(Value::as_str),
-        Some("function_call" | "custom_tool_call" | "reasoning")
-    )
+    crate::responses::responses_item_role(item) == Role::Assistant
 }
 
 /// Whether one `input[]` item is a system-side message. `developer` is
 /// this API's spelling of the same thing.
 fn responses_item_is_system(item: &Value) -> bool {
-    matches!(
-        item.get("role").and_then(Value::as_str),
-        Some("system" | "developer")
-    )
+    crate::responses::responses_item_role(item) == Role::System
 }
 
 /// One `/v1/responses` input/output item. `message` items carry
@@ -778,7 +779,18 @@ fn redact_responses_item(
                 *args = owned;
             }
         }
-        Some("function_call_output") => {
+        // The custom-tool spelling of the same pair. Its argument slot is
+        // `input` and it is free-form text rather than JSON-encoded, so it
+        // is rewritten directly. Both are read by the scan
+        // (`responses::responses_item_text`), and a slot the scan reads
+        // and this walk does not is a Mask rule that reports a hit and
+        // then forwards the match unmasked.
+        Some("custom_tool_call") => {
+            if let Some(input) = item.get_mut("input") {
+                apply_to_value_string(chain, dir, input, counts);
+            }
+        }
+        Some("function_call_output" | "custom_tool_call_output") => {
             if let Some(output) = item.get_mut("output") {
                 apply_to_value_string(chain, dir, output, counts);
             }
@@ -1966,6 +1978,58 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(chat_latest_turn_start(&req.messages), 3);
+    }
+
+    /// The wire-level twin of
+    /// `chain::tests::a_trailing_assistant_prefill_does_not_close_the_window`.
+    #[test]
+    fn a_trailing_assistant_message_does_not_close_the_window_on_any_wire() {
+        let chat: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "answered"},
+                {"role": "user", "content": "fresh"},
+                {"role": "assistant", "content": "Sure, here is"},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(chat_latest_turn_start(&chat.messages), 2);
+
+        let anthropic = json!([
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "answered"},
+            {"role": "user", "content": "fresh"},
+            {"role": "assistant", "content": "Sure, here is"},
+        ]);
+        assert_eq!(
+            anthropic_latest_turn_start(anthropic.as_array().unwrap()),
+            2,
+        );
+
+        let responses = json!([
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "type": "message",
+             "content": [{"type": "output_text", "text": "answered"}]},
+            {"role": "user", "content": "fresh"},
+            {"type": "reasoning", "encrypted_content": "opaque"},
+        ]);
+        assert_eq!(
+            responses_latest_turn_start(responses.as_array().unwrap()),
+            2,
+        );
+    }
+
+    /// A request that is nothing but one assistant prefill still has a
+    /// window — the whole request.
+    #[test]
+    fn a_request_of_one_assistant_message_is_entirely_in_the_window() {
+        let chat: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "content": "Sure, here is"}],
+        }))
+        .unwrap();
+        assert_eq!(chat_latest_turn_start(&chat.messages), 0);
     }
 
     #[test]
