@@ -502,7 +502,10 @@ pub fn redact_chat_format(chain: &dyn Guardrail, req: &mut ChatFormat) -> Redact
 /// has to exist separately because the mask walkers rewrite raw slots and
 /// have no parsed view to index against.
 fn chat_latest_turn_start(messages: &[aisix_gateway::ChatMessage]) -> usize {
-    let answered = messages.len().saturating_sub(1);
+    let answered = messages
+        .iter()
+        .rposition(|m| m.role != Role::System)
+        .unwrap_or(0);
     messages[..answered]
         .iter()
         .rposition(|m| m.role == Role::Assistant)
@@ -569,7 +572,10 @@ pub fn redact_anthropic_request(chain: &dyn Guardrail, body: &mut Value) -> Reda
 /// whole. A TRAILING assistant message is a prefill and never closes the
 /// window; see `aisix_guardrails::latest_turn_view`.
 fn anthropic_latest_turn_start(messages: &[Value]) -> usize {
-    let answered = messages.len().saturating_sub(1);
+    let answered = messages
+        .iter()
+        .rposition(|m| m.get("role").and_then(Value::as_str) != Some("system"))
+        .unwrap_or(0);
     messages[..answered]
         .iter()
         .rposition(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
@@ -713,7 +719,10 @@ pub fn redact_responses_request(chain: &dyn Guardrail, body: &mut Value) -> Reda
 /// API spells a model turn as a typed item with no role at all — see
 /// [`responses_item_is_assistant`].
 fn responses_latest_turn_start(items: &[Value]) -> usize {
-    let answered = items.len().saturating_sub(1);
+    let answered = items
+        .iter()
+        .rposition(|i| !responses_item_is_system(i))
+        .unwrap_or(0);
     items[..answered]
         .iter()
         .rposition(responses_item_is_assistant)
@@ -2017,6 +2026,46 @@ mod tests {
         assert_eq!(
             responses_latest_turn_start(responses.as_array().unwrap()),
             2,
+        );
+    }
+
+    /// The wire-level twin of
+    /// `chain::tests::a_system_message_after_a_prefill_does_not_reopen_the_bypass`:
+    /// a system message trailing the prefill must not make the prefill
+    /// look answered on any of the three shapes.
+    #[test]
+    fn a_system_message_after_a_prefill_does_not_close_the_window() {
+        let chat: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "secret"},
+                {"role": "assistant", "content": "Sure, here is"},
+                {"role": "system", "content": "trailing policy"},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(chat_latest_turn_start(&chat.messages), 0);
+
+        // The non-spec `role: "system"` entry Claude Code sends (#597).
+        let anthropic = json!([
+            {"role": "user", "content": "secret"},
+            {"role": "assistant", "content": "Sure, here is"},
+            {"role": "system", "content": "trailing policy"},
+        ]);
+        assert_eq!(
+            anthropic_latest_turn_start(anthropic.as_array().unwrap()),
+            0,
+        );
+
+        let responses = json!([
+            {"role": "user", "content": "secret"},
+            {"role": "assistant", "type": "message",
+             "content": [{"type": "output_text", "text": "Sure, here is"}]},
+            {"role": "developer", "content": "trailing policy"},
+        ]);
+        assert_eq!(
+            responses_latest_turn_start(responses.as_array().unwrap()),
+            0,
         );
     }
 

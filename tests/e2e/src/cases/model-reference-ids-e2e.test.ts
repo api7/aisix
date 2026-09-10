@@ -667,9 +667,23 @@ describe("model references by resource id", () => {
     await scoped("mr-beta", { embedding_model: DANGLING });
     // Fail-closed is the default, so a benign prompt is refused too —
     // that is what makes the two spellings comparable on one request.
+    //
+    // Wait for BOTH rows. The two guardrails and their two attachments are
+    // four separate etcd keys, so the snapshot can carry `mr-alpha`'s pair
+    // while `mr-beta`'s attachment is not yet applied — and a guardrail
+    // with no attachment in force governs nothing, so `mr-beta` answers
+    // 200 and the comparison below fails on a request that was never
+    // screened. Gating on one of the two made that a scheduler-dependent
+    // race (it reproduced on the work-stealing leg while the
+    // thread-per-core leg passed on identical code). The gate is still a
+    // real check: if either spelling stopped failing closed it would never
+    // be satisfied and the test times out.
     await waitConfigPropagation(async () => {
-      const r = await chat("mr-alpha", "what is the weather");
-      return r.status === 422;
+      const [a, b] = await Promise.all([
+        chat("mr-alpha", "what is the weather"),
+        chat("mr-beta", "what is the weather"),
+      ]);
+      return a.status === 422 && b.status === 422;
     });
     const byId = await chat("mr-alpha", "what is the weather");
     const byName = await chat("mr-beta", "what is the weather");

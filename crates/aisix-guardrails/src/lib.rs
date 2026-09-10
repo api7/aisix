@@ -183,12 +183,24 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
 /// and a `latest_turn` rule goes quiet. Anthropic's documented
 /// assistant-prefill feature reaches the same shape by accident.
 ///
+/// "Trailing" is measured against the last NON-SYSTEM message, not the
+/// last message. System messages are outside the window wherever they
+/// sit, so an assistant message followed only by system ones has still
+/// answered nothing — and reading it as a boundary would leave a window
+/// holding system messages alone, which is to say an empty one. Appending
+/// a system message after the prefill would otherwise reopen the same
+/// bypass.
+///
 /// This is the CHECK pass's half of the rule. The masking walkers in
 /// `aisix-proxy::redact` apply the same rule to each wire shape directly,
 /// because their slots are raw JSON with no `ChatFormat` to index against;
 /// the e2e cases pin both halves per protocol.
 pub fn latest_turn_view(req: &ChatFormat) -> ChatFormat {
-    let answered = req.messages.len().saturating_sub(1);
+    let answered = req
+        .messages
+        .iter()
+        .rposition(|m| m.role != Role::System)
+        .unwrap_or(0);
     let start = req.messages[..answered]
         .iter()
         .rposition(|m| m.role == Role::Assistant)
