@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
@@ -219,8 +219,14 @@ describe("config last-known-good: rejected updates keep serving across resync an
       expect(text).toMatch(/aisix_config_stale_served_resources\{kind="models"\} 1/);
     }
 
-    {
-      const uncached = await spawnApp({ etcdPrefix, snapshotCachePath: "" });
+    const persisted = await readFile(join(cacheDir!, "config_cache.json"));
+    const disabledPath = join(cacheDir!, "disabled-cache.json");
+    await writeFile(disabledPath, persisted);
+    for (const toggle of [{}, { snapshot_cache_enabled: false }]) {
+      const uncached = await spawnApp({
+        etcdPrefix,
+        extra: { managed: { snapshot_cache_path: disabledPath, ...toggle } },
+      });
       stoppedApps.push(uncached);
       try {
         await waitConfigPropagation(async () => {
@@ -239,6 +245,7 @@ describe("config last-known-good: rejected updates keep serving across resync an
       } finally {
         await uncached.stop();
       }
+      expect(await readFile(disabledPath)).toEqual(persisted);
     }
 
     {

@@ -289,6 +289,7 @@ pub struct ManagedConfig {
     /// Enable on-disk configuration snapshots for recovery across restarts
     /// when etcd is unavailable. Disabled by default in both managed and
     /// self-hosted etcd modes; in-memory last-known-good serving is unaffected.
+    /// Snapshots include unencrypted credentials; restrict cache directory access.
     #[serde(default)]
     pub snapshot_cache_enabled: bool,
 

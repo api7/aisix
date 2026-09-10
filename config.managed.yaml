@@ -151,6 +151,7 @@ managed:
   dp_id_file: "/var/lib/aisix/dp_id"
   # Optional recovery across restarts while the configuration store is
   # unavailable. Each instance needs its own writable cache location.
+  # The cache contains unencrypted credentials; restrict directory access.
   snapshot_cache_enabled: false
   snapshot_cache_path: "/var/lib/aisix/config_cache.json"
 
