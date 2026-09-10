@@ -29,7 +29,9 @@
 //! installed, so tests can spin up isolated instances per case.
 
 use crate::metric_labels::{LabelRecorder, LabelSelection};
-use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use crate::prometheus::Recorder as PrometheusRecorder;
+use crate::scrape::Scrape;
+use metrics_exporter_prometheus::{DistributionBuilder, Matcher};
 use std::collections::HashMap;
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -577,7 +579,8 @@ pub struct Metrics {
 
 struct MetricsInner {
     recorder: LabelRecorder,
-    handle: PrometheusHandle,
+    handle: Arc<PrometheusRecorder>,
+    scrape: Scrape,
     /// Per-(endpoint, protocol) in-flight counts. A linear scan over a
     /// bounded slot list (route templates × protocols): the steady-state
     /// hit is two pointer-length string compares with no allocation and
@@ -944,35 +947,39 @@ impl Metrics {
         // histogram: with `metrics-exporter-prometheus`, a distribution
         // without configured buckets renders as a summary — which is what
         // every legacy `histogram!` series here intentionally stays as.
-        let recorder = PrometheusBuilder::new()
-            .set_buckets_for_metric(
-                Matcher::Full(M_REQUEST_E2E_LATENCY_SECONDS.to_string()),
-                &buckets.request_e2e_latency,
-            )
-            .expect("bucket lists are validated non-empty")
-            .set_buckets_for_metric(
-                Matcher::Full(M_REQUEST_TTFT_SECONDS.to_string()),
-                &buckets.request_ttft,
-            )
-            .expect("bucket lists are validated non-empty")
-            .set_buckets_for_metric(
-                Matcher::Full(M_GUARDRAIL_LATENCY_SECONDS.to_string()),
-                &buckets.guardrail_latency,
-            )
-            .expect("bucket lists are validated non-empty")
-            .set_buckets_for_metric(
-                Matcher::Full(M_A2A_TTFB_SECONDS.to_string()),
-                &buckets.a2a_ttfb,
-            )
-            .expect("bucket lists are validated non-empty")
-            .build_recorder();
-        let handle = recorder.handle();
+        let distributions = DistributionBuilder::new(
+            metrics_util::parse_quantiles(&[0.0, 0.5, 0.9, 0.95, 0.99, 0.999, 1.0]),
+            None,
+            None,
+            None,
+            Some(HashMap::from([
+                (
+                    Matcher::Full(M_REQUEST_E2E_LATENCY_SECONDS.to_string()),
+                    buckets.request_e2e_latency.clone(),
+                ),
+                (
+                    Matcher::Full(M_REQUEST_TTFT_SECONDS.to_string()),
+                    buckets.request_ttft.clone(),
+                ),
+                (
+                    Matcher::Full(M_GUARDRAIL_LATENCY_SECONDS.to_string()),
+                    buckets.guardrail_latency.clone(),
+                ),
+                (
+                    Matcher::Full(M_A2A_TTFB_SECONDS.to_string()),
+                    buckets.a2a_ttfb.clone(),
+                ),
+            ])),
+        );
+        let recorder = Arc::new(PrometheusRecorder::new(distributions));
+        let handle = recorder.clone();
         let recorder = LabelRecorder::new(recorder, selection, env_id);
         static NEXT_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         Ok(Self {
             inner: Arc::new(MetricsInner {
                 recorder,
                 handle,
+                scrape: Scrape::default(),
                 proxy_in_flight: Mutex::new(Vec::new()),
                 worker_key_prefix: format!(
                     "{:x}",
@@ -1164,11 +1171,17 @@ impl Metrics {
         self.inner.handle.render()
     }
 
+    /// Render outside the async runtime, sharing work and bytes between
+    /// overlapping scrapes. A later scrape always starts a fresh snapshot.
+    pub async fn render_async(&self) -> Result<bytes::Bytes, String> {
+        let metrics = self.clone();
+        self.inner.scrape.render(move || metrics.render()).await
+    }
+
     /// Drain pending histogram samples into their distributions.
     ///
-    /// `PrometheusBuilder::build_recorder` does not start the exporter's
-    /// background upkeep task, so the server must call this periodically
-    /// even when no Prometheus server is scraping the metrics endpoint.
+    /// The server calls this periodically even without scrapes so pending
+    /// raw samples cannot accumulate indefinitely.
     pub fn run_upkeep(&self) {
         self.inner.handle.run_upkeep();
     }

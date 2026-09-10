@@ -257,10 +257,17 @@ async fn metrics_handler(
     state
         .metrics
         .sync_config_status(&state.config_status.metrics());
+    let rendered = match state.metrics.render_async().await {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            tracing::error!(%error, "metrics scrape failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "metrics scrape failed").into_response();
+        }
+    };
     (
         StatusCode::OK,
         [(CONTENT_TYPE, "text/plain; version=0.0.4")],
-        state.metrics.render(),
+        rendered,
     )
         .into_response()
 }

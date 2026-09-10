@@ -12,10 +12,10 @@ use metrics::{
     Counter, CounterFn, Gauge, Histogram, Key, KeyName, Label, Metadata, Recorder, SharedString,
     Unit,
 };
-use metrics_exporter_prometheus::PrometheusRecorder;
 use serde::Serialize;
 
 use crate::metrics::*;
+use crate::prometheus::Recorder as PrometheusRecorder;
 
 #[derive(Debug, Serialize)]
 pub struct MetricVariable {
@@ -408,7 +408,7 @@ impl LabelSelection {
 }
 
 pub(crate) struct LabelRecorder {
-    inner: PrometheusRecorder,
+    inner: Arc<PrometheusRecorder>,
     selection: LabelSelection,
     env_id: String,
     counters: Mutex<HashMap<Key, Counter>>,
@@ -419,7 +419,7 @@ impl LabelRecorder {
         self.selection.labels.get(metric).map_or(&[], Vec::as_slice)
     }
 
-    pub fn new(inner: PrometheusRecorder, selection: LabelSelection, env_id: &str) -> Self {
+    pub fn new(inner: Arc<PrometheusRecorder>, selection: LabelSelection, env_id: &str) -> Self {
         Self {
             inner,
             selection,
@@ -609,8 +609,16 @@ mod tests {
 
     #[test]
     fn removing_all_labels_merges_absolute_counters_without_losing_sources() {
-        let inner = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        let handle = inner.handle();
+        let inner = Arc::new(PrometheusRecorder::new(
+            metrics_exporter_prometheus::DistributionBuilder::new(
+                metrics_util::parse_quantiles(&[0.0, 0.5, 0.9, 0.95, 0.99, 0.999, 1.0]),
+                None,
+                None,
+                None,
+                None,
+            ),
+        ));
+        let handle = inner.clone();
         let recorder = LabelRecorder::new(
             inner,
             LabelSelection::compile(&selection(M_CONFIG_RELOAD_FAILURES_TOTAL, &[])).unwrap(),

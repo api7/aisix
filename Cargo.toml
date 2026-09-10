@@ -22,7 +22,7 @@ members = [
 ]
 # Build-time tool for the PGO release pipeline (#967): own manifest + lockfile,
 # never part of the product build graph.
-exclude = ["bench/pgo-training/trainer"]
+exclude = ["bench/pgo-training/trainer", "bench/metrics-scale"]
 
 [workspace.package]
 version = "0.3.0"
@@ -139,6 +139,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt", "registry"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
+metrics-util = { version = "0.19", default-features = false, features = ["registry"] }
+quanta = "0.12"
 
 # Errors / utilities
 anyhow = "1"
