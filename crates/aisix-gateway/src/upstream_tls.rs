@@ -212,13 +212,6 @@ static PK_CLIENTS: OnceLock<dashmap::DashMap<ProviderKeyTls, reqwest::Client>> =
 
 // ─── per-worker pools ────────────────────────────────────────────────
 
-/// The user agent every dispatch-path client is built with.
-///
-/// A worker's pool stands in for those clients, so it has to present the
-/// same identity upstream. `every_dispatch_client_presents_the_same_user_agent`
-/// holds them in step.
-pub(crate) const DISPATCH_USER_AGENT: &str = "aisix/0.1";
-
 thread_local! {
     /// Whether this thread serves proxy traffic on its own runtime.
     static IS_WORKER_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -256,20 +249,15 @@ fn worker_client() -> Option<reqwest::Client> {
         return None;
     }
     WORKER_CLIENT.with(|cell| {
-        cell.get_or_init(|| {
-            match crate::upstream_http::client_builder()
-                .user_agent(DISPATCH_USER_AGENT)
-                .build()
-            {
-                Ok(client) => Some(client),
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        "per-worker upstream pool could not be built; this worker \
-                         dispatches on the shared pool"
-                    );
-                    None
-                }
+        cell.get_or_init(|| match crate::upstream_http::client_builder().build() {
+            Ok(client) => Some(client),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "per-worker upstream pool could not be built; this worker \
+                     dispatches on the shared pool"
+                );
+                None
             }
         })
         .clone()
@@ -321,7 +309,7 @@ fn build_provider_key_client(tls: &ProviderKeyTls) -> Result<reqwest::Client, St
     // than replacing them: a deployment CA and a per-key CA are both
     // trust roots, and a client presenting the deployment's mTLS
     // identity must keep presenting it.
-    let mut builder = crate::upstream_http::client_builder().user_agent(PROVIDER_KEY_USER_AGENT);
+    let mut builder = crate::upstream_http::client_builder();
     if let Some(pem) = tls.ca_cert.as_ref().filter(|p| !p.trim().is_empty()) {
         let roots = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
             .map_err(|e| format!("provider_key.tls.ca_cert: {e}"))?;
@@ -337,10 +325,6 @@ fn build_provider_key_client(tls: &ProviderKeyTls) -> Result<reqwest::Client, St
     }
     builder.build().map_err(|e| e.to_string())
 }
-
-/// Matches the agent every bridge sets on its shared client, so a
-/// per-key client is indistinguishable upstream from the shared one.
-const PROVIDER_KEY_USER_AGENT: &str = "aisix/0.1";
 
 // ─── raw rustls (Realtime WebSocket) ─────────────────────────────────
 
@@ -560,15 +544,6 @@ mod tests {
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         params.self_signed(&kp).unwrap().pem().into_bytes()
-    }
-
-    /// The literal scan in `upstream_http` cannot see named constants, so
-    /// the per-key client's agent is pinned to the dispatch agent here —
-    /// a per-key client must stay indistinguishable upstream from the
-    /// shared (or per-worker) one.
-    #[test]
-    fn provider_key_clients_present_the_dispatch_user_agent() {
-        assert_eq!(PROVIDER_KEY_USER_AGENT, DISPATCH_USER_AGENT);
     }
 
     #[test]

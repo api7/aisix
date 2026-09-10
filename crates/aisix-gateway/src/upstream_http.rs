@@ -131,12 +131,12 @@ pub fn config() -> &'static UpstreamHttpConfig {
     CONFIG.get_or_init(UpstreamHttpConfig::default)
 }
 
-/// A `reqwest::ClientBuilder` with the connection settings **and the
-/// deployment's outbound TLS trust** applied. Callers add their own
-/// `user_agent` and `build()`.
+/// A `reqwest::ClientBuilder` with the connection settings, deployment's
+/// outbound TLS trust, and versioned `aisix` user agent applied.
 pub fn client_builder() -> reqwest::ClientBuilder {
     let cfg = config();
     let mut b = reqwest::Client::builder()
+        .user_agent(format!("aisix/{}", aisix_core::BUILD_VERSION))
         .pool_idle_timeout(cfg.pool_idle_timeout)
         .tcp_keepalive(cfg.tcp_keepalive);
     if let Some(d) = cfg.connect_timeout {
@@ -447,9 +447,8 @@ mod tests {
     }
 
     /// On a thread-per-core worker every dispatch runs on that worker's
-    /// own pool, and that one pool stands in for all of the clients
-    /// below — so it is built with a single user agent
-    /// (`upstream_tls::DISPATCH_USER_AGENT`).
+    /// own pool, and that one pool stands in for all dispatch clients.
+    /// They must inherit the same user agent from `client_builder`.
     ///
     /// That substitution is only invisible while the clients it replaces
     /// agree on the user agent. Give one bridge its own and the header
@@ -460,30 +459,32 @@ mod tests {
     #[test]
     fn every_dispatch_client_presents_the_same_user_agent() {
         let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
-        // Only literals: the telemetry, heartbeat, and OTLP clients build
-        // theirs from a version string or a named constant, and none of
-        // them talks to a model provider or reaches the per-worker pool.
-        const NEEDLE: &str = ".user_agent(\"";
         let mut offenders = Vec::new();
         for file in rust_sources(crates_dir) {
+            // These clients never reach the dispatch pools; their
+            // existing control-plane/exporter identities are separate.
+            if [
+                "aisix-gateway/src/upstream_http.rs",
+                "aisix-server/src/telemetry.rs",
+                "aisix-server/src/heartbeat.rs",
+                "aisix-obs/src/otlp_http_sink.rs",
+            ]
+            .iter()
+            .any(|path| file.ends_with(path))
+            {
+                continue;
+            }
             let src = std::fs::read_to_string(&file).expect("read source");
             for (n, line) in production_half(&src).lines().enumerate() {
-                let Some(rest) = line.split_once(NEEDLE).map(|(_, r)| r) else {
-                    continue;
-                };
-                let Some((agent, _)) = rest.split_once('"') else {
-                    continue;
-                };
-                if agent != crate::upstream_tls::DISPATCH_USER_AGENT {
-                    offenders.push(format!("{}:{}: {agent}", file.display(), n + 1));
+                if line.contains(".user_agent(") {
+                    offenders.push(format!("{}:{}", file.display(), n + 1));
                 }
             }
         }
         assert!(
             offenders.is_empty(),
-            "these dispatch clients present a user agent the per-worker \
-             pool would replace with `{}`:\n{}",
-            crate::upstream_tls::DISPATCH_USER_AGENT,
+            "these clients override the user agent inherited from \
+             `client_builder`, which the per-worker pool also uses:\n{}",
             offenders.join("\n"),
         );
     }
