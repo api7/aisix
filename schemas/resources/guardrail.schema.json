@@ -105,6 +105,25 @@
         }
       ]
     },
+    "GuardrailInputMessages": {
+      "description": "How much of a request's message history an input guardrail reads.\n\nIDE and agent clients replay the whole conversation on every call, so a rule that matched once keeps matching for the rest of the session even after the offending message is long past. `LatestTurn` narrows every input hook — the block check and the masking pass alike — to the part of the conversation the model has not answered yet.",
+      "oneOf": [
+        {
+          "description": "Read every message in the request, including replayed history and system prompts.",
+          "enum": [
+            "all"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Read only the messages after the last assistant message, excluding system messages: the current user message together with any tool results answering it. Messages the model has already replied to are neither screened nor rewritten.",
+          "enum": [
+            "latest_turn"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "KeywordPattern": {
       "description": "Literal or regular-expression pattern used by a keyword guardrail.",
       "oneOf": [
@@ -289,6 +308,15 @@
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
         },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
+        },
         "kind": {
           "description": "Guardrail provider type for literal and regular expression matching.",
           "enum": [
@@ -372,6 +400,15 @@
           ],
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
+        },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
         },
         "kind": {
           "description": "Guardrail provider type for Amazon Bedrock Guardrails.",
@@ -461,6 +498,15 @@
           ],
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
+        },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
         },
         "kind": {
           "description": "Guardrail provider type for Azure Prompt Shield.",
@@ -576,6 +622,15 @@
           ],
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
+        },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
         },
         "kind": {
           "description": "Guardrail provider type for Azure text moderation.",
@@ -737,6 +792,15 @@
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
         },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
+        },
         "kind": {
           "description": "Guardrail provider type for Aliyun text moderation.",
           "enum": [
@@ -875,6 +939,15 @@
           ],
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
+        },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
         },
         "kind": {
           "description": "Guardrail provider type for Aliyun AI Guardrails policy-driven moderation.",
@@ -1015,6 +1088,15 @@
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
         },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
+        },
         "kind": {
           "description": "Guardrail provider type for in-process sensitive-data detection and redaction.",
           "enum": [
@@ -1093,6 +1175,15 @@
           ],
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
+        },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
         },
         "kind": {
           "description": "Guardrail provider type for Lakera Guard screening.",
@@ -1202,6 +1293,15 @@
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
         },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
+        },
         "kind": {
           "description": "Guardrail provider type for the OpenAI Moderation API.",
           "enum": [
@@ -1304,6 +1404,15 @@
           ],
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
+        },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
         },
         "kind": {
           "description": "Guardrail provider type for PII detection and anonymization by a customer-run Presidio.",
@@ -1518,6 +1627,15 @@
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
         },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
+        },
         "kind": {
           "description": "Guardrail provider type for embedding-similarity screening against example texts, using an embedding-kind Model.",
           "enum": [
@@ -1618,6 +1736,15 @@
           ],
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
+        },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
         },
         "kind": {
           "description": "Guardrail provider type for screening by an operator-supplied script the gateway runs in a sandboxed engine.",
@@ -1747,6 +1874,15 @@
       ],
       "default": "both",
       "description": "Where in the lifecycle this rule runs."
+    },
+    "input_messages": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/GuardrailInputMessages"
+        }
+      ],
+      "default": "all",
+      "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
     },
     "name": {
       "description": "Operator-facing name that surfaces in metric labels and error reasons.",

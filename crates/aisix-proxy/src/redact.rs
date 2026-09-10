@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-use aisix_gateway::{ChatChunk, ChatFormat, ChatResponse};
+use aisix_gateway::{ChatChunk, ChatFormat, ChatResponse, Role};
 use aisix_guardrails::Guardrail;
 use serde_json::Value;
 
@@ -36,13 +36,45 @@ pub fn merge_counts(into: &mut RedactionCounts, from: RedactionCounts) {
     }
 }
 
-/// Which side's redactor to run. The two sides can be configured
-/// independently (`hook_point`), so every JSON-walking helper takes the
-/// direction rather than hardcoding one.
+/// Which side's redactor to run, and — on the request side — which part of
+/// the conversation the text belongs to. The two sides can be configured
+/// independently (`hook_point`), so every JSON-walking helper takes this
+/// rather than hardcoding one.
+///
+/// The request side splits because a guardrail row may carry
+/// `input_messages: latest_turn`, which narrows it to the part of the
+/// conversation the model has not answered yet. Carrying the split in this
+/// type rather than in a parallel argument is what makes it total: every
+/// slot a walker offers has to name which half it is in, and the compiler
+/// asks the question at each new one.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
+    /// Request text inside the latest-turn window: this turn's user
+    /// message and the tool results answering it. Every input guardrail
+    /// reads it. Also the direction a caller names for a whole-request
+    /// pass, and the only one the single-input surfaces ever use.
     Input,
+    /// Request text the model has already replied to, plus every system
+    /// message. Only rows left on `input_messages: all` read it.
+    InputHistory,
     Output,
+}
+
+impl Direction {
+    /// Request side, either window.
+    pub fn is_input(self) -> bool {
+        matches!(self, Direction::Input | Direction::InputHistory)
+    }
+
+    /// The request-side direction for a slot, given whether it sits inside
+    /// the latest-turn window.
+    fn input_window(in_latest_turn: bool) -> Self {
+        if in_latest_turn {
+            Direction::Input
+        } else {
+            Direction::InputHistory
+        }
+    }
 }
 
 fn redact_str(
@@ -51,7 +83,8 @@ fn redact_str(
     text: &str,
 ) -> Option<aisix_guardrails::Redaction> {
     match dir {
-        Direction::Input => chain.redact_input_text(text),
+        Direction::Input => chain.redact_input_text_in_turn(text, true),
+        Direction::InputHistory => chain.redact_input_text_in_turn(text, false),
         Direction::Output => chain.redact_output_text(text),
     }
 }
@@ -86,23 +119,26 @@ fn redact_str(
 /// counts and reports the provider's entity counts instead.
 const SEGMENT_APPLY_MARKER: &str = "__segment_apply__";
 
-/// Pass-1 probe: records every text slot the walker offers. Never
-/// rewrites, so the body is bit-identical after the collect walk.
+/// Pass-1 probe: records every text slot the walker offers, with the
+/// latest-turn window each one belongs to. Never rewrites, so the body is
+/// bit-identical after the collect walk.
 #[derive(Default)]
 struct SegmentCollector {
-    texts: std::sync::Mutex<Vec<String>>,
+    texts: std::sync::Mutex<Vec<(String, bool)>>,
 }
 
 impl SegmentCollector {
-    fn take(&self) -> Vec<String> {
-        std::mem::take(&mut self.texts.lock().expect("collector poisoned"))
+    /// The collected slots and their window flags, positionally aligned.
+    fn take(&self) -> (Vec<String>, Vec<bool>) {
+        let mut slots = self.texts.lock().expect("collector poisoned");
+        std::mem::take(&mut *slots).into_iter().unzip()
     }
 
-    fn record(&self, text: &str) -> Option<aisix_guardrails::Redaction> {
+    fn record(&self, text: &str, in_latest_turn: bool) -> Option<aisix_guardrails::Redaction> {
         self.texts
             .lock()
             .expect("collector poisoned")
-            .push(text.to_owned());
+            .push((text.to_owned(), in_latest_turn));
         None
     }
 }
@@ -118,10 +154,20 @@ impl Guardrail for SegmentCollector {
         true
     }
     fn redact_input_text(&self, text: &str) -> Option<aisix_guardrails::Redaction> {
-        self.record(text)
+        self.record(text, true)
+    }
+    // The window arrives here and nowhere else: `redact_str` routes every
+    // request-side slot through this method, so overriding the plain one
+    // alone would collect the text and lose which half it came from.
+    fn redact_input_text_in_turn(
+        &self,
+        text: &str,
+        in_latest_turn: bool,
+    ) -> Option<aisix_guardrails::Redaction> {
+        self.record(text, in_latest_turn)
     }
     fn redact_output_text(&self, text: &str) -> Option<aisix_guardrails::Redaction> {
-        self.record(text)
+        self.record(text, true)
     }
 }
 
@@ -249,11 +295,14 @@ pub async fn moderate_body_scanning(
     }
     let collector = SegmentCollector::default();
     walk(&collector);
-    let mut texts = collector.take();
+    let (mut texts, mut in_latest_turn) = collector.take();
     // Everything past here is judged but unwritable; the apply walk only
     // ever offers the first `writable` slots back.
     let writable = texts.len();
     texts.extend(scan_only);
+    // The scan-only tail is Anthropic signed reasoning — assistant content,
+    // and so outside every latest-turn window by construction.
+    in_latest_turn.resize(texts.len(), false);
     // The pass runs even with zero collected slots. "Nothing to scan" is
     // not "nothing to decide": a segment-moderating member may hold a
     // verdict that does not depend on the text (a `kind: custom` policy
@@ -263,7 +312,11 @@ pub async fn moderate_body_scanning(
     // itself (bedrock/lakera/presidio/aliyun all refuse empty content), so
     // consulting the chain here costs no provider round-trip.
     let mut outcome = match dir {
-        Direction::Input => chain.moderate_input_segments(&texts).await,
+        Direction::Input | Direction::InputHistory => {
+            chain
+                .moderate_input_segments_in_turn(&texts, &in_latest_turn)
+                .await
+        }
         Direction::Output => chain.moderate_output_segments(&texts).await,
     };
     monitor_hits_out.append(&mut outcome.monitor_hits);
@@ -409,15 +462,17 @@ pub fn redact_chat_format(chain: &dyn Guardrail, req: &mut ChatFormat) -> Redact
     if !chain.redacts_input() {
         return counts;
     }
-    for msg in &mut req.messages {
+    let window_from = chat_latest_turn_start(&req.messages);
+    for (i, msg) in req.messages.iter_mut().enumerate() {
+        let dir = Direction::input_window(i >= window_from && msg.role != Role::System);
         if let Some(content) = msg.content.as_mut() {
-            apply_to_string(chain, Direction::Input, content, &mut counts);
+            apply_to_string(chain, dir, content, &mut counts);
         }
         if let Some(blocks) = msg.content_blocks.as_mut() {
             for block in blocks {
                 if block.get("type").and_then(Value::as_str) == Some("text") {
                     if let Some(text) = block.get_mut("text") {
-                        apply_to_value_string(chain, Direction::Input, text, &mut counts);
+                        apply_to_value_string(chain, dir, text, &mut counts);
                     }
                 }
             }
@@ -425,17 +480,32 @@ pub fn redact_chat_format(chain: &dyn Guardrail, req: &mut ChatFormat) -> Redact
         // History-replay tool calls: arguments travel to the upstream
         // verbatim through `extra`, so mask them like fresh content.
         if let Some(tool_calls) = msg.extra.get_mut("tool_calls") {
-            redact_tool_call_arguments(chain, Direction::Input, tool_calls, &mut counts);
+            redact_tool_call_arguments(chain, dir, tool_calls, &mut counts);
         }
         // Same reason for replayed reasoning: `reasoning_content` is the
         // canonical slot the provider overrides normalise every vendor
         // spelling onto, and it rides `extra` to the upstream untouched.
         // Nothing signs it on this wire, so masking it is safe.
         if let Some(reasoning @ Value::String(_)) = msg.extra.get_mut("reasoning_content") {
-            apply_to_value_string(chain, Direction::Input, reasoning, &mut counts);
+            apply_to_value_string(chain, dir, reasoning, &mut counts);
         }
     }
     counts
+}
+
+/// Index of the first message inside the latest-turn window: one past the
+/// last assistant message, or 0 when the request carries none.
+///
+/// The wire-level half of `aisix_guardrails::latest_turn_view`, which
+/// answers the same question for the CHECK pass over the parsed
+/// `ChatFormat`. Both are pinned per protocol by the e2e cases — this one
+/// has to exist separately because the mask walkers rewrite raw slots and
+/// have no parsed view to index against.
+fn chat_latest_turn_start(messages: &[aisix_gateway::ChatMessage]) -> usize {
+    messages
+        .iter()
+        .rposition(|m| m.role == Role::Assistant)
+        .map_or(0, |i| i + 1)
 }
 
 /// Mask `function.arguments` (JSON-encoded string) on each element of an
@@ -469,17 +539,38 @@ pub fn redact_anthropic_request(chain: &dyn Guardrail, body: &mut Value) -> Reda
     if !chain.redacts_input() {
         return counts;
     }
+    // The top-level `system` prompt is never in the window.
     if let Some(system) = body.get_mut("system") {
-        redact_anthropic_content(chain, Direction::Input, system, &mut counts);
+        redact_anthropic_content(chain, Direction::InputHistory, system, &mut counts);
     }
     if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
-        for msg in messages {
+        let window_from = anthropic_latest_turn_start(messages);
+        for (i, msg) in messages.iter_mut().enumerate() {
+            // A `role: "system"` entry is not in the Anthropic spec but
+            // Claude Code sends it (#597); it is a system message wherever
+            // it sits, so it stays out of the window like the field above.
+            let is_system = msg.get("role").and_then(Value::as_str) == Some("system");
+            let dir = Direction::input_window(i >= window_from && !is_system);
             if let Some(content) = msg.get_mut("content") {
-                redact_anthropic_content(chain, Direction::Input, content, &mut counts);
+                redact_anthropic_content(chain, dir, content, &mut counts);
             }
         }
     }
     counts
+}
+
+/// Index of the first `messages[]` entry inside the latest-turn window on
+/// the Anthropic wire: one past the last `role: "assistant"` entry.
+///
+/// A tool-loop turn is an assistant message carrying `tool_use` blocks,
+/// so the boundary lands where the parsed view puts it — the `tool_result`
+/// blocks answering it ride the FINAL user message, which is in the window
+/// whole.
+fn anthropic_latest_turn_start(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .rposition(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+        .map_or(0, |i| i + 1)
 }
 
 /// Anthropic `content` is either a bare string or an array of typed
@@ -590,21 +681,66 @@ pub fn redact_responses_request(chain: &dyn Guardrail, body: &mut Value) -> Reda
     if !chain.redacts_input() {
         return counts;
     }
+    // `instructions` is this API's system prompt — never in the window.
     if let Some(instructions) = body.get_mut("instructions") {
-        apply_to_value_string(chain, Direction::Input, instructions, &mut counts);
+        apply_to_value_string(chain, Direction::InputHistory, instructions, &mut counts);
     }
     match body.get_mut("input") {
+        // A bare-string `input` is the whole current turn.
         Some(v @ Value::String(_)) => {
             apply_to_value_string(chain, Direction::Input, v, &mut counts)
         }
         Some(Value::Array(items)) => {
-            for item in items {
-                redact_responses_item(chain, Direction::Input, item, &mut counts);
+            let window_from = responses_latest_turn_start(items);
+            for (i, item) in items.iter_mut().enumerate() {
+                let dir =
+                    Direction::input_window(i >= window_from && !responses_item_is_system(item));
+                redact_responses_item(chain, dir, item, &mut counts);
             }
         }
         _ => {}
     }
     counts
+}
+
+/// Index of the first `input[]` item inside the latest-turn window on the
+/// Responses wire: one past the last assistant-side item.
+///
+/// Assistant-side is broader than `role: "assistant"` here, because this
+/// API spells a model turn as a typed item with no role at all — see
+/// [`responses_item_is_assistant`].
+fn responses_latest_turn_start(items: &[Value]) -> usize {
+    items
+        .iter()
+        .rposition(responses_item_is_assistant)
+        .map_or(0, |i| i + 1)
+}
+
+/// Whether one `input[]` item is something the MODEL produced, and so a
+/// boundary for the latest-turn window.
+///
+/// Three shapes, all of which `responses::responses_input_to_chat` maps to
+/// `Role::Assistant`: a `role: "assistant"` message, a tool call the model
+/// asked for (`function_call`, and the custom-tool spelling), and a
+/// `reasoning` item. A tool RESULT is the caller answering that call and
+/// is not a boundary.
+fn responses_item_is_assistant(item: &Value) -> bool {
+    if item.get("role").and_then(Value::as_str) == Some("assistant") {
+        return true;
+    }
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call" | "custom_tool_call" | "reasoning")
+    )
+}
+
+/// Whether one `input[]` item is a system-side message. `developer` is
+/// this API's spelling of the same thing.
+fn responses_item_is_system(item: &Value) -> bool {
+    matches!(
+        item.get("role").and_then(Value::as_str),
+        Some("system" | "developer")
+    )
 }
 
 /// One `/v1/responses` input/output item. `message` items carry
@@ -668,7 +804,7 @@ fn redact_responses_item(
         // Input only. Reasoning the model GENERATES is out of
         // output-guardrail scope, so this arm must not fire on
         // `redact_responses_response`.
-        Some("reasoning") if dir == Direction::Input => {
+        Some("reasoning") if dir.is_input() => {
             for key in ["content", "summary"] {
                 if let Some(Value::Array(parts)) = item.get_mut(key) {
                     for part in parts {
@@ -1807,6 +1943,107 @@ mod tests {
 
     fn both() -> Arc<dyn Guardrail> {
         mask_chain(aisix_core::models::GuardrailHookPoint::Both)
+    }
+
+    // ── latest-turn window, wire level (AISIX-Cloud#1558) ────────────────
+    //
+    // The mask walkers rewrite raw slots and have no parsed `ChatFormat` to
+    // index against, so each wire shape answers the boundary question for
+    // itself. These pin the three answers against the one
+    // `aisix_guardrails::latest_turn_view` gives the check pass.
+
+    #[test]
+    fn chat_window_starts_after_the_last_assistant_message() {
+        let req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "reply"},
+                {"role": "user", "content": "fresh"},
+                {"role": "tool", "content": "result", "tool_call_id": "c1"},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(chat_latest_turn_start(&req.messages), 3);
+    }
+
+    #[test]
+    fn chat_window_with_no_assistant_message_is_the_whole_request() {
+        let req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "only"},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(chat_latest_turn_start(&req.messages), 0);
+    }
+
+    /// An Anthropic tool loop: the assistant turn carrying `tool_use` is
+    /// the boundary, and the `tool_result` answering it rides the final
+    /// user message, which is inside the window whole.
+    #[test]
+    fn anthropic_window_starts_after_the_tool_use_turn() {
+        let messages = json!([
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": [{"type": "text", "text": "reply"}]},
+            {"role": "user", "content": "call it"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "result"}
+            ]},
+        ]);
+        assert_eq!(anthropic_latest_turn_start(messages.as_array().unwrap()), 4,);
+    }
+
+    /// The Responses API spells a model turn as a typed item with no role
+    /// at all, so `role: "assistant"` alone would put a whole agent tool
+    /// loop inside the window.
+    #[test]
+    fn responses_window_treats_typed_model_items_as_the_boundary() {
+        let items = json!([
+            {"role": "user", "content": "old"},
+            {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "result"},
+        ]);
+        // The tool RESULT is the caller answering, not a boundary — the
+        // window opens right after the call.
+        assert_eq!(responses_latest_turn_start(items.as_array().unwrap()), 2);
+    }
+
+    #[test]
+    fn responses_window_opens_after_a_replayed_assistant_message() {
+        let items = json!([
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "type": "message",
+             "content": [{"type": "output_text", "text": "reply"}]},
+            {"role": "user", "content": "fresh"},
+        ]);
+        assert_eq!(responses_latest_turn_start(items.as_array().unwrap()), 2);
+    }
+
+    /// The window is what a `latest_turn` row reads; a row left on `all`
+    /// must keep rewriting the history, so the walkers cannot simply skip
+    /// out-of-window slots.
+    #[test]
+    fn an_all_row_still_masks_history_after_the_window_split() {
+        let chain = both();
+        let mut req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "old alice@example.com"},
+                {"role": "assistant", "content": "reply"},
+                {"role": "user", "content": "fresh bob@example.com"},
+            ],
+        }))
+        .unwrap();
+        let counts = redact_chat_format(chain.as_ref(), &mut req);
+        assert_eq!(counts.get("email"), Some(&2), "{counts:?}");
+        assert!(!req.messages[0].content_str().contains("alice@example.com"));
     }
 
     /// `message_scan_text` reads `extra["reasoning_content"]`, so this

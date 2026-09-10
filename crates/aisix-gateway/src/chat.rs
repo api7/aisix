@@ -213,6 +213,22 @@ impl ChatMessage {
         }
     }
 
+    /// A tool RESULT the caller replays. `tool_call_id` is left unset:
+    /// the constructor exists for the scan-side views (`ChatFormat`s built
+    /// only to be handed to the guardrail chain), which read role and text
+    /// and never dispatch. A message built for dispatch must set the id
+    /// itself — OpenAI rejects a `role: "tool"` message without one.
+    pub fn tool(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: Some(content.into()),
+            content_blocks: None,
+            name: None,
+            tool_call_id: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
     /// The text content as a `&str`, treating absent (`null`) content as
     /// `""`. Use this for bridges/guardrails that need a plain string and
     /// for which the string-vs-null distinction is irrelevant.

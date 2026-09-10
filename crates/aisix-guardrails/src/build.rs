@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex};
 
 use aisix_core::models::{
     AisixSnapshot, AppliedGuardrail, Guardrail as DomainGuardrail, GuardrailAttachment,
-    GuardrailHookPoint, GuardrailKind, GuardrailMonitorHit, GuardrailScopeType, KeywordPattern,
+    GuardrailHookPoint, GuardrailInputMessages, GuardrailKind, GuardrailMonitorHit,
+    GuardrailScopeType, KeywordPattern,
 };
 use aisix_core::snapshot::ResourceTable;
 use aisix_core::{ConfigStatus, IncomingRejection, SnapshotHandle};
@@ -96,7 +97,7 @@ fn build_chain_from_snapshot_reported(
     embedder: &GuardrailEmbedderSlot,
     instances: &mut GuardrailInstances,
 ) -> (GuardrailChain, Vec<GuardrailBuildRejection>) {
-    let mut chain: Vec<(String, Arc<dyn Guardrail>)> = Vec::new();
+    let mut chain: Vec<(String, Arc<dyn Guardrail>, GuardrailInputMessages)> = Vec::new();
     // `applied` mirrors `chain` 1:1 — the `{kind, hook}` of each member that
     // actually materialised, for applied-guardrail telemetry (#379). Pushed
     // only on the `Ok(Some)` path so inert/invalid rows (which never join the
@@ -117,7 +118,7 @@ fn build_chain_from_snapshot_reported(
             &mut BuildReuse::default(),
         ) {
             Ok(Some(g)) => {
-                chain.push((row.name.clone(), g));
+                chain.push((row.name.clone(), g, row.input_messages));
                 applied.push(applied_for(row));
             }
             Ok(None) => {
@@ -1297,6 +1298,7 @@ fn build_index_from_snapshot_reported(
             attachment.scope_id.clone(),
             attachment.priority,
             runtime_guardrail,
+            row.input_messages,
             applied_for(row),
         ));
     }
