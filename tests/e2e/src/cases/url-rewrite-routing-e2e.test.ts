@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { request as httpRequest } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { harnessRequest } from "../harness/http.js";
 import {
@@ -13,6 +14,24 @@ import {
 
 const KEY = "sk-url-rewrite-routing";
 const BODY = { model: "chat-alias", messages: [{ role: "user", content: "hello" }] };
+
+function absoluteRequest(proxyUrl: string, authority: string, host: string) {
+  return new Promise<{ status: number | undefined; body: string }>((resolve, reject) => {
+    const req = httpRequest(proxyUrl, {
+      method: "POST", path: `http://${authority}/chat`, agent: false,
+      signal: AbortSignal.timeout(5000),
+      headers: { host, authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+    }, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => { body += chunk; });
+      res.on("end", () => resolve({ status: res.statusCode, body }));
+      res.on("error", reject);
+    });
+    req.on("error", reject);
+    req.end(JSON.stringify(BODY));
+  });
+}
 
 describe("URL rewrite precedes every route and respects host scope", () => {
   let app: SpawnedApp | undefined;
@@ -137,6 +156,30 @@ describe("URL rewrite precedes every route and respects host scope", () => {
     });
 
   }
+
+  test("absolute-form authority overrides a conflicting Host for Chat rewriting", async (ctx) => {
+    if (!etcdReachable || !app || !agent || !llm) return ctx.skip();
+    const beforeAgent = agent.receivedRequests.length;
+    const beforeLlm = llm.receivedRequests.length;
+    const res = await absoluteRequest(app.proxyUrl, "GW.example.com:8443", "other.example.com");
+    expect(res.status, res.body).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ choices: [{ message: { content: "mock reply" } }] });
+    expect(agent.receivedRequests).toHaveLength(beforeAgent);
+    expect(llm.receivedRequests).toHaveLength(beforeLlm + 1);
+    expect(llm.receivedRequests.at(-1)?.path).toBe("/v1/chat/completions");
+  });
+
+  test("absolute-form authority controls both rewriting and host passthrough dispatch", async (ctx) => {
+    if (!etcdReachable || !app || !agent || !llm) return ctx.skip();
+    const beforeAgent = agent.receivedRequests.length;
+    const beforeLlm = llm.receivedRequests.length;
+    const res = await absoluteRequest(app.proxyUrl, "A.tenant.example.com:8080", "gw.example.com");
+    expect(res.status, res.body).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ servedBy: "agent" });
+    expect(llm.receivedRequests).toHaveLength(beforeLlm);
+    expect(agent.receivedRequests).toHaveLength(beforeAgent + 1);
+    expect(agent.receivedRequests.at(-1)?.path).toBe("/host/rewritten/chat");
+  });
 
   test("rewritten Chat and host passthrough requests still require authentication", async (ctx) => {
     if (!etcdReachable || !app || !agent || !llm) return ctx.skip();

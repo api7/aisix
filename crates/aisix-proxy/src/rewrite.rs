@@ -266,6 +266,12 @@ mod tests {
                 "http://gw.example.com/legacy/health",
                 Some("other.example.com"),
                 None,
+                200,
+            ),
+            (
+                "http://other.example.com/legacy/health",
+                Some("gw.example.com"),
+                None,
                 404,
             ),
             ("/legacy/other", Some("gw.example.com"), None, 404),
