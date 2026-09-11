@@ -131,6 +131,20 @@ test("configuration digests match the written rows through updates, rejection, d
     await put(modelKey(257), model(257));
     await check();
 
+    // Spaced updates and key deletion must publish the same final bytes
+    // regardless of how many watch events the gateway groups together.
+    for (let i = 0; i < 24; i++) {
+      await put(modelKey(i), JSON.stringify({ ...JSON.parse(model(i)), model_name: "gpt-4o" }));
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    const callerConfig = rows.get(caller)!;
+    await remove(caller);
+    await check();
+    expect((await proxy().listModels()).status).toBe(401);
+    await put(caller, callerConfig);
+    await check();
+    expect((await proxy().listModels()).status).toBe(200);
+
     await app.stop();
     await remove(modelKey(0));
     await put(modelKey(128), JSON.stringify({ ...JSON.parse(model(128)), model_name: "gpt-4o" }));

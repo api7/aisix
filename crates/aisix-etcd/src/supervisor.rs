@@ -1663,6 +1663,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         // stream). Held here so the next loop iteration handles it
         // exactly as if it had just arrived.
         let mut pushed_back: Option<Option<Watched>> = None;
+        let mut apply_timing = ApplyTiming::default();
 
         loop {
             if *cancel.borrow() {
@@ -1708,8 +1709,8 @@ impl<P: ConfigProvider> Supervisor<P> {
                     // Coalesce: hold the batch open for a short bounded
                     // window and apply the whole run as one
                     // copy-on-write cycle. The window closes on the first
-                    // of three conditions — COALESCE_QUIET_PERIOD with no
-                    // new event, COALESCE_MAX_WAIT since the first event,
+                    // of three conditions — the quiet period with no new
+                    // event, COALESCE_MAX_WAIT since the first event,
                     // or MAX_APPLY_BATCH events — so a bulk edit costs a
                     // bounded number of whole-configuration passes no
                     // matter how the source spaces its deliveries
@@ -1718,6 +1719,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                     // endpoint happened to batch its watch deliveries and
                     // on how long the previous apply took.
                     let mut batch = vec![first];
+                    let quiet_period = apply_timing.quiet_period();
                     let deadline = tokio::time::Instant::now() + COALESCE_MAX_WAIT;
                     while batch.len() < MAX_APPLY_BATCH {
                         // Checked here as well as in the select: with a
@@ -1750,7 +1752,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                             _ = wait_for_cancel(cancel.clone()) => break,
                             item = stream.next() => item,
                             _ = tokio::time::sleep_until(deadline) => break,
-                            _ = tokio::time::sleep(COALESCE_QUIET_PERIOD) => break,
+                            _ = tokio::time::sleep(quiet_period) => break,
                         };
                         match item {
                             Some(Watched::Event(Ok(
@@ -1791,7 +1793,9 @@ impl<P: ConfigProvider> Supervisor<P> {
                             }
                         })
                         .collect();
+                    let started = std::time::Instant::now();
                     self.apply_events(&staged);
+                    apply_timing.record(started.elapsed());
                 }
             }
         }
@@ -1871,15 +1875,7 @@ async fn wait_for_cancel(mut rx: tokio::sync::watch::Receiver<bool>) {
 /// snapshot arbitrarily stale.
 const MAX_APPLY_BATCH: usize = 512;
 
-/// How long a coalescing window stays open after the last event before
-/// the batch is applied.
-///
-/// This is the delay a lone write pays in full — measured, it moves the
-/// etcd-write-to-`applied_revision` median from 21 ms to 42 ms — so it
-/// buys nothing by being larger than it has to be. It only has to clear
-/// the gap between consecutive deliveries of one control-plane burst,
-/// which measured 1–3 ms against a local etcd and stays in single-digit
-/// milliseconds for an outbox relay writing a row per transaction.
+/// Quiet period for cheap applies and the first write after an idle interval.
 const COALESCE_QUIET_PERIOD: Duration = Duration::from_millis(20);
 
 /// Hard cap on how long the first event of a batch waits for company.
@@ -1893,6 +1889,29 @@ const COALESCE_QUIET_PERIOD: Duration = Duration::from_millis(20);
 /// less: a 1500-row burst costs 12 applies here and would cost 9 at the
 /// 200 ms this was picked under.
 const COALESCE_MAX_WAIT: Duration = Duration::from_millis(150);
+
+#[derive(Default)]
+struct ApplyTiming {
+    previous: Option<(tokio::time::Instant, Duration)>,
+}
+
+impl ApplyTiming {
+    fn quiet_period(&self) -> Duration {
+        match self.previous {
+            // Expensive applies need to amortize their configuration-wide
+            // work across spaced writes too. Forget that cost after an idle
+            // interval so a later isolated write keeps its short wait.
+            Some((finished, cost)) if finished.elapsed() < COALESCE_MAX_WAIT => {
+                cost.clamp(COALESCE_QUIET_PERIOD, COALESCE_MAX_WAIT)
+            }
+            _ => COALESCE_QUIET_PERIOD,
+        }
+    }
+
+    fn record(&mut self, cost: Duration) {
+        self.previous = Some((tokio::time::Instant::now(), cost));
+    }
+}
 
 /// One watch event staged for a coalesced apply.
 enum PendingEvent<'a> {
@@ -3438,6 +3457,25 @@ mod tests {
                 self.rx.lock().unwrap().take().expect("watched twice"),
             ))
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalescing_cost_expires_and_never_extends_the_maximum_wait() {
+        let mut timing = ApplyTiming::default();
+        assert_eq!(timing.quiet_period(), Duration::from_millis(20));
+
+        timing.record(Duration::from_millis(90));
+        tokio::time::advance(Duration::from_millis(70)).await;
+        assert_eq!(timing.quiet_period(), Duration::from_millis(90));
+
+        timing.record(Duration::from_secs(1));
+        assert_eq!(timing.quiet_period(), Duration::from_millis(150));
+        tokio::time::advance(Duration::from_millis(150)).await;
+        assert_eq!(timing.quiet_period(), Duration::from_millis(20));
+
+        timing.record(Duration::from_millis(90));
+        timing.record(Duration::from_millis(1));
+        assert_eq!(timing.quiet_period(), Duration::from_millis(20));
     }
 
     /// A burst that arrives one event at a time — how the control plane's
