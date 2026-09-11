@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startA2aUpstream,
@@ -361,13 +362,7 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
       enabled: true,
     });
 
-    const callerKey = await seed.createApiKey({
-      key_hash: CALLER_HASH,
-      allowed_models: ["*"],
-      allowed_routes: ["*"],
-      allowed_agents: ["*"],
-      mcp_access: { allow: ["*"] },
-    });
+    const callerKeyId = randomUUID();
 
     // A route that names its OWN gateway-credential slot, and one that
     // names none. `x-*` is the same pattern on both: what differs is
@@ -404,18 +399,21 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
       path_prefix: `${ROUTE_PREFIX}-anon`,
       target_url: upstream.baseUrl,
       auth_mode: "anonymous",
-      anonymous_key_id: callerKey.id,
+      anonymous_key_id: callerKeyId,
       source_cidrs: ["127.0.0.0/8", "::1/128"],
       credential_mode: "inject",
       provider_key_id: slotPk.id,
       forward_client_headers: ["x-*"],
     });
-
-    await waitConfigPropagation(async () => {
-      const res = await chat(FORWARD_MODEL);
-      await res.text();
-      return res.status === 200;
+    await seed.update("api_keys", callerKeyId, {
+      key_hash: CALLER_HASH,
+      allowed_models: ["*"],
+      allowed_routes: ["*"],
+      allowed_agents: ["*"],
+      mcp_access: { allow: ["*"] },
     });
+    const proxy = new ProxyClient(app.proxyUrl, CALLER_KEY);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
   }, 120_000);
 
   afterAll(async () => {
