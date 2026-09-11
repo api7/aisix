@@ -1661,7 +1661,8 @@ impl Config {
         // otherwise surface at runtime as silently mis-routed or 404ing
         // legacy traffic, which is much harder to trace back to a typo in
         // one line of config.
-        let host_pattern = regex::Regex::new(crate::host::HOST_PATTERN).expect("host pattern is valid");
+        let host_pattern =
+            regex::Regex::new(crate::host::HOST_PATTERN).expect("host pattern is valid");
         for (i, rule) in self.proxy.url_rewrites.iter().enumerate() {
             let ctx = || {
                 rule.name
