@@ -507,9 +507,10 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub workers: Option<usize>,
     /// Entry-level URL rewrite rules, applied to every proxy-listener
-    /// request **before** routing (the admin and metrics listeners are
-    /// unaffected). The first rule whose `match` regex matches the request
-    /// path rewrites it — once, no cascading — and the request then flows
+    /// request **before** all routing, including host-based passthrough
+    /// (the admin and metrics listeners are unaffected). The first rule
+    /// whose optional `hosts` and path `match` both match rewrites it —
+    /// once, no cascading — and the request then flows
     /// through the normal endpoint (auth, ACL, quota, …) as if the client
     /// had sent the rewritten path. Lets operators map legacy URL shapes
     /// onto AISIX endpoints, e.g. per-server MCP paths onto
@@ -553,6 +554,11 @@ pub struct UrlRewriteRule {
     /// Optional name, used in logs when the rule fires.
     #[serde(default)]
     pub name: Option<String>,
+    /// Optional inbound hosts. Omitted means all hosts; an explicit list
+    /// must be non-empty. Host and path must both match. Matching ignores
+    /// case and the request's port; `*.` matches one additional label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosts: Option<Vec<String>>,
     /// Regex matched against the **raw, percent-encoded** request path
     /// (never the query string) — no decoding, no normalization. Anchor
     /// with `^`/`$` to match the whole path; an unanchored pattern matches
@@ -1661,6 +1667,17 @@ impl Config {
                     .clone()
                     .unwrap_or_else(|| format!("proxy.url_rewrites[{i}]"))
             };
+            if let Some(hosts) = &rule.hosts {
+                let pattern =
+                    regex::Regex::new(crate::host::HOST_PATTERN).expect("host pattern is valid");
+                if hosts.is_empty() || hosts.iter().any(|host| !pattern.is_match(host)) {
+                    return Err(BootstrapError::Config(format!(
+                        "{}: hosts must be a non-empty list of hostnames or single-label \
+                         wildcards such as *.example.com (no scheme, port, or path)",
+                        ctx()
+                    )));
+                }
+            }
             let regex = match regex::Regex::new(&rule.pattern) {
                 Ok(regex) => regex,
                 Err(e) => {
@@ -2164,6 +2181,47 @@ admin:
     }
 
     #[test]
+    fn url_rewrites_validate_optional_hosts() {
+        let load = |hosts: serde_json::Value| {
+            let f = write_yaml(
+                &serde_json::json!({
+                    "etcd": {"endpoints": ["http://127.0.0.1:2379"]},
+                    "admin": {"addr": "127.0.0.1:3001", "admin_keys": ["test"]},
+                    "proxy": {"addr": "127.0.0.1:3000", "url_rewrites": [{
+                        "name": "host-scoped-chat", "hosts": hosts,
+                        "match": "^/chat$", "rewrite": "/v1/chat/completions"
+                    }]}
+                })
+                .to_string(),
+            );
+            Config::load_from_path(Some(f.path()))
+        };
+        for hosts in [
+            serde_json::json!(["GW.Example.com", "*.example.com"]),
+            serde_json::json!(["localhost", "127.0.0.1"]),
+        ] {
+            let cfg = load(hosts.clone()).unwrap();
+            assert_eq!(serde_json::json!(cfg.proxy.url_rewrites[0].hosts), hosts);
+        }
+        for hosts in [
+            serde_json::json!([]),
+            serde_json::json!([""]),
+            serde_json::json!(["*"]),
+            serde_json::json!(["*.com"]),
+            serde_json::json!(["https://gw.example.com"]),
+            serde_json::json!(["gw.example.com:8080"]),
+            serde_json::json!(["gw.example.com/chat"]),
+            serde_json::json!(["gw.example.com", "bad host"]),
+        ] {
+            let err = load(hosts.clone()).unwrap_err().to_string();
+            assert!(
+                err.contains("host-scoped-chat") && err.contains("hosts"),
+                "{hosts}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn loads_url_rewrites_and_rejects_an_invalid_regex() {
         let f = write_yaml(
             r#"
@@ -2184,6 +2242,7 @@ admin:
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
         assert_eq!(cfg.proxy.url_rewrites.len(), 1);
         assert_eq!(cfg.proxy.url_rewrites[0].replacement, "/mcp/$1");
+        assert!(cfg.proxy.url_rewrites[0].hosts.is_none());
 
         let f = write_yaml(
             r#"
@@ -2377,7 +2436,7 @@ admin:
             ),
             (
                 "AISIX_PROXY__URL_REWRITES",
-                r#"[{"name":"c","match":"^/a$","rewrite":"/b"}]"#,
+                r#"[{"name":"c","hosts":["gw.example.com"],"match":"^/a$","rewrite":"/b"}]"#,
             ),
             (
                 "AISIX_OBSERVABILITY__METRICS__CLIENT_TYPE_RULES",
@@ -2415,6 +2474,10 @@ admin:
         }
 
         let cfg = Config::load_from_path(None).unwrap();
+        assert_eq!(
+            cfg.proxy.url_rewrites[0].hosts.as_deref(),
+            Some(["gw.example.com".to_string()].as_slice())
+        );
         assert_eq!(
             cfg.proxy.real_ip.trusted_proxies,
             vec!["10.0.0.0/8".to_string(), "127.0.0.1/32".to_string()],

@@ -14,7 +14,7 @@ import {
 // gateway + etcd + a real MCP upstream.
 //
 // Pinned contract:
-//   - the first rule whose `match` regex matches the path rewrites it; the
+//   - the first rule whose host and path conditions match rewrites it; the
 //     request then flows through the normal endpoint (auth, ACL, quota) as
 //     if the client had sent the rewritten path;
 //   - the flagship scenario: a client keeping its legacy per-server MCP URL
@@ -136,6 +136,7 @@ describe("url rewrite e2e: proxy.url_rewrites", () => {
       urlRewrites: [
         {
           name: "per-server-mcp-compat",
+          hosts: ["127.0.0.1"],
           match: "^/mcp-servers/([^/]+)/mcp$",
           rewrite: "/mcp/$1",
         },
@@ -158,11 +159,11 @@ describe("url rewrite e2e: proxy.url_rewrites", () => {
     });
 
     await waitConfigPropagation(async () => {
-      const listed = await listToolNames("/mcp-servers/alpha/mcp");
-      return (
-        listed.status === 200 &&
-        JSON.stringify(listed.names) === JSON.stringify(["echo", "reverse"])
-      );
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${KEY}` },
+      });
+      await res.text();
+      return res.status === 200;
     });
   }, 60_000);
 

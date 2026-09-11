@@ -54,7 +54,7 @@ export interface AppOverrides {
    * rewriting: first matching rule wins, `rewrite` replaces the matched
    * portion of the path.
    */
-  urlRewrites?: Array<{ name?: string; match: string; rewrite: string }>;
+  urlRewrites?: Array<{ name?: string; hosts?: string[]; match: string; rewrite: string }>;
   /**
    * `proxy.request_body_limit_bytes`. A dedicated override (like
    * `realIp`) because `extra` replaces whole top-level blocks and the

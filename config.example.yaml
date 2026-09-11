@@ -114,8 +114,12 @@ proxy:
   # AISIX_PROXY__URL_REWRITES='[{"match":"...","rewrite":"..."}]'
   # Example: serve per-server MCP URLs like /mcp-servers/github/mcp on
   # the /mcp/{server} endpoint.
+  # Runs before ALL routing, including host-matched passthrough routes.
+  # Optional hosts restrict a rule to those inbound hosts; omit for all hosts.
+  # Host matching ignores case/port; *.example.com matches one extra label.
   # url_rewrites:
   #   - name: per-server-mcp-compat
+  #     hosts: ["gateway.example.com"]
   #     match: "^/mcp-servers/([^/]+)/mcp$"
   #     rewrite: "/mcp/$1"
 

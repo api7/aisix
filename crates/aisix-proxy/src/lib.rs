@@ -50,6 +50,7 @@ mod guardrail_coverage;
 mod guardrail_embedder;
 mod guardrail_stream;
 pub mod health;
+mod host;
 mod http_client;
 mod images;
 mod images_edits;
@@ -242,6 +243,24 @@ pub fn build_router(state: ProxyState) -> Router {
     )
     .with_state(state.clone());
 
+    // Host-based passthrough-route dispatch. A request whose `Host`
+    // matches an enabled route's `hosts` was never addressed to this
+    // gateway's own API (forward-proxy traffic delivered with the
+    // original host), so it must not fall into a typed route that
+    // happens to share the path. URL rewriting runs before this dispatch,
+    // so both host and path routes see the rewritten URI.
+    // Wrapped unconditionally: routes arrive dynamically via the
+    // snapshot, and the per-request probe is one arc-swap load plus a
+    // scan of the (typically tiny) route table. Matched requests go to
+    // `host_entry_stack`, which carries the same shared layers as the
+    // main stack (see above).
+    let router = Router::new()
+        .fallback_service(router)
+        .layer(middleware::from_fn_with_state(
+            (state.clone(), host_entry_stack),
+            passthrough_route::host_dispatch,
+        ));
+
     // Pre-routing URL rewriting (`proxy.url_rewrites`). `Router::layer`
     // middleware runs AFTER route matching, so a URI rewritten there could
     // never change which route matches. Wrapping the whole router as the
@@ -260,24 +279,6 @@ pub fn build_router(state: ProxyState) -> Router {
                 rewrite::rewrite_request_uri,
             ))
     };
-
-    // Host-based passthrough-route dispatch. A request whose `Host`
-    // matches an enabled route's `hosts` was never addressed to this
-    // gateway's own API (forward-proxy traffic delivered with the
-    // original host), so it must not fall into a typed route that
-    // happens to share the path — this seat is pre-routing AND outside
-    // the rewrite layer, so `url_rewrites` never touches foreign-host
-    // paths. Wrapped unconditionally: routes arrive dynamically via the
-    // snapshot, and the per-request probe is one arc-swap load plus a
-    // scan of the (typically tiny) route table. Matched requests go to
-    // `host_entry_stack`, which carries the same shared layers as the
-    // main stack (see above).
-    let router = Router::new()
-        .fallback_service(router)
-        .layer(middleware::from_fn_with_state(
-            (state.clone(), host_entry_stack),
-            passthrough_route::host_dispatch,
-        ));
 
     // Outermost: mint the request id into the request extensions
     // before any handler/extractor runs — including the rewrite layer,
