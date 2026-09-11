@@ -22,6 +22,7 @@ pub mod error;
 pub mod filesource;
 pub mod forwarded_headers;
 pub mod header_template;
+pub mod host;
 pub mod models;
 pub mod resource;
 pub mod similarity;

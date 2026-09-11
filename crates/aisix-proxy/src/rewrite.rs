@@ -2,7 +2,7 @@
 //!
 //! Applied to every proxy-listener request **before** route matching (the
 //! admin and metrics listeners never see this layer): the first rule whose
-//! `match` regex matches the request path rewrites it — once, no cascading —
+//! host condition and `match` regex match rewrites it — once, no cascading —
 //! and the request then flows through the normal endpoint (auth, ACL, quota,
 //! metrics labelling) as if the client had sent the rewritten path. A miss
 //! leaves the request untouched.
@@ -31,6 +31,7 @@ use crate::state::ProxyState;
 /// One boot-compiled rewrite rule.
 pub struct CompiledRewrite {
     name: Option<String>,
+    hosts: Option<Vec<String>>,
     pattern: Regex,
     replacement: String,
 }
@@ -60,6 +61,7 @@ pub fn compile(rules: &[UrlRewriteRule]) -> Arc<[CompiledRewrite]> {
         .iter()
         .map(|rule| CompiledRewrite {
             name: rule.name.clone(),
+            hosts: rule.hosts.clone(),
             pattern: Regex::new(&rule.pattern)
                 .expect("proxy.url_rewrites pattern is validated at config load"),
             replacement: rule.replacement.clone(),
@@ -73,7 +75,16 @@ pub async fn rewrite_request_uri(
     mut request: Request,
     next: Next,
 ) -> Response {
+    let host = crate::host::inbound_host(&request);
     let fired = state.url_rewrites.iter().find_map(|rule| {
+        if let Some(hosts) = &rule.hosts {
+            if !host
+                .as_deref()
+                .is_some_and(|host| aisix_core::host::matches(hosts, host))
+            {
+                return None;
+            }
+        }
         let path = request.uri().path();
         rule.apply(path).map(|to| (rule, path.to_owned(), to))
     });
@@ -119,6 +130,7 @@ mod tests {
     fn rule(pattern: &str, replacement: &str) -> UrlRewriteRule {
         UrlRewriteRule {
             name: None,
+            hosts: None,
             pattern: pattern.to_string(),
             replacement: replacement.to_string(),
         }
@@ -219,6 +231,65 @@ mod tests {
         assert_eq!(get(router.clone(), "/legacy/other").await, 404);
         // The canonical path keeps working alongside the legacy one.
         assert_eq!(get(router, "/livez").await, 200);
+    }
+
+    #[tokio::test]
+    async fn host_scoping_uses_inbound_authority_and_first_complete_match_once() {
+        use tower::ServiceExt;
+
+        let mut scoped = rule("^/legacy/health$", "/livez");
+        scoped.hosts = Some(vec!["GW.Example.com".into(), "*.tenant.example.com".into()]);
+        let router = router_with_rules(vec![
+            scoped,
+            rule("^/legacy/health$", "/nonexistent"),
+            rule("^/livez$", "/must-not-cascade"),
+        ]);
+        for (uri, host, forwarded, expected) in [
+            ("/legacy/health", Some("gW.example.COM:8443"), None, 200),
+            ("/legacy/health", Some("one.tenant.example.com"), None, 200),
+            ("/legacy/health", Some("tenant.example.com"), None, 404),
+            (
+                "/legacy/health",
+                Some("two.one.tenant.example.com"),
+                None,
+                404,
+            ),
+            (
+                "/legacy/health",
+                Some("other.example.com"),
+                Some("gw.example.com"),
+                404,
+            ),
+            ("/legacy/health", None, Some("gw.example.com"), 404),
+            ("http://gw.example.com:8080/legacy/health", None, None, 200),
+            (
+                "http://gw.example.com/legacy/health",
+                Some("other.example.com"),
+                None,
+                200,
+            ),
+            (
+                "http://other.example.com/legacy/health",
+                Some("gw.example.com"),
+                None,
+                404,
+            ),
+            ("/legacy/other", Some("gw.example.com"), None, 404),
+        ] {
+            let mut req = http::Request::get(uri);
+            if let Some(host) = host {
+                req = req.header(http::header::HOST, host);
+            }
+            if let Some(forwarded) = forwarded {
+                req = req.header("x-forwarded-host", forwarded);
+            }
+            let response = router
+                .clone()
+                .oneshot(req.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "uri={uri} host={host:?}");
+        }
     }
 
     #[tokio::test]

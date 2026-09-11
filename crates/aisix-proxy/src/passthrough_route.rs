@@ -33,7 +33,7 @@
 //!   route can never shadow `/v1/*`, `/mcp`, or `/a2a`. A no-match request
 //!   keeps the pre-existing plain 404, `/passthrough/*` included — that
 //!   namespace is claimed by explicit routes like any other.
-//! - [`host_dispatch`] — a **pre-routing** middleware (outermost wrap in
+//! - [`host_dispatch`] — a **pre-routing** middleware (after URL rewriting in
 //!   `build_router`). A request whose `Host` matches an enabled route's
 //!   `hosts` was never addressed to this gateway's own API, so it must not
 //!   fall into a typed route that happens to share the path (forward-proxy
@@ -74,6 +74,7 @@ use aisix_core::{PassthroughAuthMode, PassthroughCredentialMode, PassthroughRout
 
 use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
+use crate::host::inbound_host;
 use crate::state::ProxyState;
 
 /// Bounded `model` metric label for passthrough-route requests. Route
@@ -135,27 +136,6 @@ fn has_host_match(snapshot: &aisix_core::AisixSnapshot, host: Option<&str>) -> b
         .entries()
         .iter()
         .any(|e| e.value.enabled && e.value.matches_host(host))
-}
-
-/// The request's inbound host: the `Host` header (origin-form requests),
-/// falling back to the URI authority (absolute-form requests from a
-/// chained proxy). Lowercased, `:port` stripped.
-fn inbound_host(req: &Request) -> Option<String> {
-    let raw = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| req.uri().authority().map(|a| a.as_str()))?;
-    let no_port = raw.rsplit_once(':').map_or(raw, |(head, port)| {
-        // Only treat the suffix as a port when it is all digits — an
-        // IPv6 literal's last group would otherwise be truncated.
-        if port.chars().all(|c| c.is_ascii_digit()) {
-            head
-        } else {
-            raw
-        }
-    });
-    Some(no_port.trim_end_matches('.').to_ascii_lowercase())
 }
 
 /// Pre-routing middleware: dispatch foreign-host traffic to the entry

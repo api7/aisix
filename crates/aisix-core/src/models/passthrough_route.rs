@@ -248,22 +248,7 @@ impl PassthroughRoute {
         let Some(hosts) = &self.hosts else {
             return false;
         };
-        hosts.iter().any(|pattern| {
-            let p = pattern.to_ascii_lowercase();
-            if let Some(suffix) = p.strip_prefix("*.") {
-                match host.strip_suffix(suffix) {
-                    // `label.` + suffix, with exactly one label consumed.
-                    Some(head) => {
-                        head.ends_with('.')
-                            && !head[..head.len() - 1].is_empty()
-                            && !head[..head.len() - 1].contains('.')
-                    }
-                    None => false,
-                }
-            } else {
-                p == host
-            }
-        })
+        crate::host::matches(hosts, host)
     }
 }
 
@@ -313,7 +298,7 @@ pub fn passthrough_route_coupling() -> Value {
                 "type": "array", "minItems": 1,
                 "items": {
                     "type": "string", "minLength": 1,
-                    "pattern": "^(\\*\\.)?([A-Za-z0-9-]+\\.)+[A-Za-z0-9-]+$|^[A-Za-z0-9-]+$"
+                    "pattern": crate::host::HOST_PATTERN
                 }
             } } }
         },
