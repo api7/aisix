@@ -120,13 +120,10 @@ describe("config last-known-good: rejected updates keep serving across resync an
     }
 
     {
-      await waitConfigPropagation(async () => {
-        const cfg = await getStatusConfig(app!);
-        return (cfg.applied?.resource_counts.models ?? 0) >= 1;
-      });
+      const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+      await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
 
       // Baseline: the model serves.
-      const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
       const before = await proxy.chat({
         model: "lkg-model",
         messages: [{ role: "user", content: "baseline" }],

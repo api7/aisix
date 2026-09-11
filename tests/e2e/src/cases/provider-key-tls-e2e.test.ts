@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -124,10 +125,6 @@ describe("provider_key.tls (#860)", () => {
     // Provider Keys themselves.
     app = await spawnApp();
     const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
-    await seed.createApiKey({
-      key_hash: CALLER_KEY_HASH,
-      allowed_models: [MODEL_TRUSTED, MODEL_WRONG_CA, MODEL_NO_VERIFY],
-    });
 
     const cases: Array<[string, Record<string, unknown>]> = [
       [MODEL_TRUSTED, { ca_cert: caA.certPem }],
@@ -148,6 +145,12 @@ describe("provider_key.tls (#860)", () => {
         provider_key_id: pk.id,
       });
     }
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: [MODEL_TRUSTED, MODEL_WRONG_CA, MODEL_NO_VERIFY],
+    });
+    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
   });
 
   afterAll(async () => {
@@ -172,15 +175,6 @@ describe("provider_key.tls (#860)", () => {
       ctx.skip();
       return;
     }
-    await waitConfigPropagation(async () => {
-      try {
-        const { status } = await chat(MODEL_TRUSTED);
-        return status === 200 || status === 502;
-      } catch {
-        return false;
-      }
-    });
-
     const { status, body } = await chat(MODEL_TRUSTED);
     expect(status).toBe(200);
     expect(JSON.parse(body).choices[0].message.content).toBe("trusted");
