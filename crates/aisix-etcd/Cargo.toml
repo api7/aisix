@@ -21,6 +21,8 @@ thiserror.workspace = true
 tracing.workspace = true
 base64.workspace = true
 chrono.workspace = true
+ring.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

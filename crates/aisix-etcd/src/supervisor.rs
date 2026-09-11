@@ -23,7 +23,9 @@ use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::AisixSnapshot;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
+use ring::digest::{Context, SHA256};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
@@ -234,6 +236,75 @@ impl StateEntry {
     }
 }
 
+// Checkpoints contain the digest state AFTER each group of records. Any
+// insertion, replacement or deletion invalidates the checkpoint at its key
+// and all later checkpoints. Keep the map and its cache under the same lock.
+const HASH_CHECKPOINT_RECORDS: usize = 64;
+
+#[derive(Default)]
+struct ObservedState {
+    entries: BTreeMap<String, StateEntry>,
+    checkpoints: Vec<(String, Context)>,
+    digest: Option<String>,
+    #[cfg(test)]
+    last_hashed_records: usize,
+}
+
+impl ObservedState {
+    fn invalidate(&mut self, key: &str) {
+        let keep = self.checkpoints.partition_point(|(k, _)| k.as_str() < key);
+        self.checkpoints.truncate(keep);
+        self.digest = None;
+    }
+
+    fn insert(&mut self, entry: RawEntry) {
+        let row = StateEntry::new(entry);
+        if self
+            .entries
+            .get(&row.entry.key)
+            .is_none_or(|old| old.record != row.record)
+        {
+            self.invalidate(&row.entry.key);
+        }
+        self.entries.insert(row.entry.key.clone(), row);
+    }
+
+    fn remove(&mut self, key: &str) -> Option<StateEntry> {
+        let removed = self.entries.remove(key);
+        if removed.is_some() {
+            self.invalidate(key);
+        }
+        removed
+    }
+
+    fn source_hash(&mut self) -> String {
+        #[cfg(test)]
+        {
+            self.last_hashed_records = 0;
+        }
+        if let Some(digest) = &self.digest {
+            return digest.clone();
+        }
+        let (start, mut hash) = match self.checkpoints.last() {
+            Some((key, hash)) => (Excluded(key.clone()), hash.clone()),
+            None => (Unbounded, Context::new(&SHA256)),
+        };
+        for (index, (key, row)) in self.entries.range((start, Unbounded)).enumerate() {
+            hash.update(&row.record);
+            #[cfg(test)]
+            {
+                self.last_hashed_records += 1;
+            }
+            if (index + 1) % HASH_CHECKPOINT_RECORDS == 0 {
+                self.checkpoints.push((key.clone(), hash.clone()));
+            }
+        }
+        let digest = hex::encode(hash.finish());
+        self.digest = Some(digest.clone());
+        digest
+    }
+}
+
 /// One supervisor instance. Consumers call [`Supervisor::run`] once and
 /// drop the returned handle on shutdown.
 pub struct Supervisor<P: ConfigProvider> {
@@ -247,17 +318,10 @@ pub struct Supervisor<P: ConfigProvider> {
     prefixes: PrefixSet,
     handle: SnapshotHandle<AisixSnapshot>,
 
-    // Last-known etcd state, kept in `key → RawEntry` form so deltas
-    // (Put/Delete) can update it incrementally and the whole map can
-    // be flushed to disk via `cache.store`. Each entry carries its
-    // pre-computed [`hash_record`] so the two full-config digests
-    // `sync_config_status` publishes cost a SHA-256 pass over cached
-    // bytes rather than a JSON parse and canonical re-serialisation of
-    // every row in the configuration on every watch event
-    // (AISIX-Cloud#1542). `BTreeMap`, not `HashMap`, so the records are
-    // already in the ascending-key order the digest is defined over and
-    // no sort runs per call.
-    state: Mutex<BTreeMap<String, StateEntry>>,
+    // Cached records and SHA-256 prefixes share the authoritative entry
+    // map's lock, so status publication cannot reuse a prefix invalidated
+    // by a concurrent Put/Delete/resync. Disk snapshot encoding is lazy.
+    state: Mutex<ObservedState>,
     revision: Mutex<i64>,
     cache: SnapshotCache,
 
@@ -418,7 +482,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             sources,
             prefixes,
             handle: SnapshotHandle::new(AisixSnapshot::new()),
-            state: Mutex::new(BTreeMap::new()),
+            state: Mutex::new(ObservedState::default()),
             revision: Mutex::new(0),
             cache,
             status: WatchStatus::new(),
@@ -459,17 +523,11 @@ impl<P: ConfigProvider> Supervisor<P> {
         let config_hash;
         let rejected: Vec<IncomingRejection>;
         {
-            let state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap();
             let rejections = self.rejections.lock().unwrap();
-            // `state` is the raw entry map the DP holds — every observed
-            // etcd write lands here, including rejected ones (a resync
-            // inserts them wholesale; a rejected live Put mirrors its
-            // bytes in too, #871), so source_hash always covers the
-            // observed etcd state. It is a `BTreeMap`, so iterating it
-            // already yields the ascending-key order the digest is
-            // defined over, and each value carries its record from the
-            // one time its bytes were stored.
-            source_hash = hash_records(state.values().map(|e| &e.record));
+            // Every observed write, including a rejected one, contributes
+            // to the source hash. Unchanged prefixes keep their SHA state.
+            source_hash = state.source_hash();
             let rejected_keys: HashSet<&str> = rejections.iter().map(|r| r.key.as_str()).collect();
             // config_hash covers the bytes each key ACTUALLY serves: the
             // observed etcd bytes for accepted keys, the pinned last-known-
@@ -486,7 +544,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             config_hash = if rejected_keys.is_empty() && stale.is_empty() {
                 source_hash.clone()
             } else {
-                hash_records(served_records(&state, &rejected_keys, &stale))
+                hash_records(served_records(&state.entries, &rejected_keys, &stale))
             };
             rejected = rejections
                 .iter()
@@ -901,6 +959,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     fn entries_last_read_from(&self, prefix: &WatchedPrefix) -> Vec<RawEntry> {
         let state = self.state.lock().unwrap();
         state
+            .entries
             .iter()
             .filter(|(key, _)| key.starts_with(&prefix.prefix))
             .map(|(_, held)| held.entry.clone())
@@ -963,6 +1022,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             .state
             .lock()
             .unwrap()
+            .entries
             .get(key_str)
             .map(|e| e.entry.clone())
         else {
@@ -1227,7 +1287,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     fn store_observed(&self, entry: &RawEntry) {
         {
             let mut state = self.state.lock().unwrap();
-            state.insert(entry.key.clone(), StateEntry::new(entry.clone()));
+            state.insert(entry.clone());
         }
         let mut rev = self.revision.lock().unwrap();
         if entry.revision > *rev {
@@ -1306,7 +1366,12 @@ impl<P: ConfigProvider> Supervisor<P> {
             stats
                 .rejections
                 .iter()
-                .filter_map(|r| state.get(&r.key).map(|e| (r.key.clone(), e.entry.clone())))
+                .filter_map(|r| {
+                    state
+                        .entries
+                        .get(&r.key)
+                        .map(|e| (r.key.clone(), e.entry.clone()))
+                })
                 .collect()
         };
         let prev_snap = self.handle.load();
@@ -1375,9 +1440,9 @@ impl<P: ConfigProvider> Supervisor<P> {
         // Replace the cache-tracking map wholesale and flush.
         {
             let mut state = self.state.lock().unwrap();
-            state.clear();
+            *state = ObservedState::default();
             for e in entries {
-                state.insert(e.key.clone(), StateEntry::new(e.clone()));
+                state.insert(e.clone());
             }
         }
         match read_revision {
@@ -1427,7 +1492,11 @@ impl<P: ConfigProvider> Supervisor<P> {
         }
         let entries: Vec<Arc<[u8]>> = {
             let state = self.state.lock().unwrap();
-            state.values().map(StateEntry::cache_record).collect()
+            state
+                .entries
+                .values()
+                .map(StateEntry::cache_record)
+                .collect()
         };
         let stale: Vec<Arc<[u8]>> = {
             let guard = self.stale_serving.lock().unwrap();
@@ -2284,6 +2353,125 @@ mod tests {
         "provider_key_id": "11111111-1111-1111-1111-111111111111"
     }"#;
 
+    fn assert_observed_hash(state: &mut ObservedState) {
+        let expected = aisix_core::config_status::hash_entries(
+            state
+                .entries
+                .iter()
+                .map(|(key, row)| (key.as_str(), row.entry.value.as_slice())),
+        );
+        assert_eq!(state.source_hash(), expected);
+        assert!(state.checkpoints.len() <= state.entries.len() / HASH_CHECKPOINT_RECORDS);
+    }
+
+    #[test]
+    fn observed_hash_reuses_unchanged_prefix_and_identical_records() {
+        let mut state = ObservedState::default();
+        for i in 0..256 {
+            state.insert(entry(
+                &format!("/aisix/models/{i:04}"),
+                br#"{"a":1,"b":2}"#,
+                1,
+            ));
+        }
+        assert_observed_hash(&mut state);
+        assert_eq!(state.last_hashed_records, 256);
+        state.insert(entry("/aisix/models/0240", br#"{"a":2,"b":2}"#, 2));
+        assert_observed_hash(&mut state);
+        assert!(
+            state.last_hashed_records < 128,
+            "a late change must skip the unchanged prefix"
+        );
+        let digest = state.source_hash();
+        state.insert(entry("/aisix/models/0240", br#"{ "b": 2, "a": 2 }"#, 3));
+        assert_eq!(state.source_hash(), digest);
+        assert_eq!(
+            state.last_hashed_records, 0,
+            "canonical-equivalent updates do not hash again"
+        );
+        assert_eq!(state.entries["/aisix/models/0240"].entry.revision, 3);
+        assert!(state.remove("/aisix/models/missing").is_none());
+        assert_observed_hash(&mut state);
+        assert_eq!(state.last_hashed_records, 0);
+    }
+
+    #[test]
+    fn observed_hash_matches_full_digest_across_mutation_boundaries() {
+        let mut state = ObservedState::default();
+        assert_observed_hash(&mut state);
+        for i in 0..259 {
+            state.insert(entry(
+                &format!("/aisix/models/{i:04}"),
+                br#"{"nested":{"z":1,"a":[]}}"#,
+                1,
+            ));
+        }
+        assert_observed_hash(&mut state);
+        // Delete checkpoint keys, either edge, and an interior row; insert
+        // both before an existing checkpoint and after the previous tail.
+        for key in ["0063", "0127", "0000", "0258", "0190"] {
+            state.remove(&format!("/aisix/models/{key}"));
+            assert_observed_hash(&mut state);
+        }
+        for key in ["0000", "0062a", "0127", "0259"] {
+            state.insert(entry(
+                &format!("/aisix/models/{key}"),
+                b"invalid JSON\0\xff",
+                2,
+            ));
+            assert_observed_hash(&mut state);
+        }
+        // Multiple changes between publications, with varying raw lengths
+        // and update order, exercise the first-dirty-key boundary.
+        let mut seed = 6443u64;
+        for batch in 0..80 {
+            for op in 0..1 + batch % 8 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let key = format!("/aisix/models/{:04}", (seed >> 32) % 320);
+                if op % 3 == 0 {
+                    state.remove(&key);
+                } else {
+                    state.insert(entry(
+                        &key,
+                        &vec![b'x'; (seed as usize % 257) + 1],
+                        batch + 3,
+                    ));
+                }
+            }
+            assert_observed_hash(&mut state);
+        }
+        for key in state.entries.keys().cloned().collect::<Vec<_>>() {
+            state.remove(&key);
+            assert_observed_hash(&mut state);
+        }
+        assert!(state.checkpoints.is_empty());
+    }
+
+    #[test]
+    fn observed_hash_is_rebuilt_on_full_resync() {
+        let sup = Supervisor::new(Arc::new(FakeProvider::new(vec![], 0)), "/aisix");
+        let mut rows: Vec<_> = (0..256)
+            .map(|i| entry(&format!("/aisix/models/{i:04}"), VALID_MODEL, 1))
+            .collect();
+        sup.apply_resync_at(&rows, Some(1));
+        assert!(!sup.state.lock().unwrap().checkpoints.is_empty());
+        rows.remove(240);
+        rows[200].value = b"invalid JSON".to_vec();
+        rows.push(entry("/aisix/models/0256", VALID_MODEL, 2));
+        sup.apply_resync_at(&rows, Some(2));
+        let expected = aisix_core::config_status::hash_entries(
+            rows.iter()
+                .map(|row| (row.key.as_str(), row.value.as_slice())),
+        );
+        let status = sup.config_status().view();
+        assert_eq!(status.source.source_hash, Some(expected));
+        assert_eq!(status.source.observed_revision, Some(2));
+        assert_observed_hash(&mut sup.state.lock().unwrap());
+        sup.apply_resync_at(&[], Some(3));
+        assert_observed_hash(&mut sup.state.lock().unwrap());
+        assert!(sup.state.lock().unwrap().checkpoints.is_empty());
+    }
+
     fn entry(key: &str, v: &[u8], rev: i64) -> RawEntry {
         RawEntry {
             key: key.into(),
@@ -2837,6 +3025,7 @@ mod tests {
             .state
             .lock()
             .unwrap()
+            .entries
             .values()
             .map(|e| (e.entry.key.clone(), e.entry.value.clone()))
             .collect();
@@ -3057,6 +3246,7 @@ mod tests {
             .state
             .lock()
             .unwrap()
+            .entries
             .values()
             .all(|row| row.cache_record.get().is_none()));
 
@@ -3090,8 +3280,8 @@ mod tests {
         let records = || {
             let state = sup.state.lock().unwrap();
             (
-                state["/aisix/models/m-1"].cache_record(),
-                state["/aisix/api_keys/k-1"].cache_record(),
+                state.entries["/aisix/models/m-1"].cache_record(),
+                state.entries["/aisix/api_keys/k-1"].cache_record(),
             )
         };
         let before = records();
