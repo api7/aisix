@@ -1661,6 +1661,7 @@ impl Config {
         // otherwise surface at runtime as silently mis-routed or 404ing
         // legacy traffic, which is much harder to trace back to a typo in
         // one line of config.
+        let host_pattern = regex::Regex::new(crate::host::HOST_PATTERN).expect("host pattern is valid");
         for (i, rule) in self.proxy.url_rewrites.iter().enumerate() {
             let ctx = || {
                 rule.name
@@ -1668,9 +1669,7 @@ impl Config {
                     .unwrap_or_else(|| format!("proxy.url_rewrites[{i}]"))
             };
             if let Some(hosts) = &rule.hosts {
-                let pattern =
-                    regex::Regex::new(crate::host::HOST_PATTERN).expect("host pattern is valid");
-                if hosts.is_empty() || hosts.iter().any(|host| !pattern.is_match(host)) {
+                if hosts.is_empty() || hosts.iter().any(|host| !host_pattern.is_match(host)) {
                     return Err(BootstrapError::Config(format!(
                         "{}: hosts must be a non-empty list of hostnames or single-label \
                          wildcards such as *.example.com (no scheme, port, or path)",
