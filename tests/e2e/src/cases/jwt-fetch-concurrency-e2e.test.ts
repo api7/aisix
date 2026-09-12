@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { once } from "node:events";
 import { createServer } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
 import { expect, test } from "vitest";
@@ -7,9 +8,14 @@ import {
   startMockIdp, waitConfigPropagation,
 } from "../harness/index.js";
 
+// JWT key refreshes are limited to once per second.
+const REFRESH_INTERVAL_MS = 1000;
+
 async function fixture(ctx: { onTestFinished: (fn: () => Promise<void>) => void }) {
   const signer = await startMockIdp();
+  ctx.onTestFinished(() => signer.close());
   const app = await spawnApp({});
+  ctx.onTestFinished(() => app.exit());
   const etcd = new EtcdClient();
   const seed = new SeedClient(etcd, app.etcdPrefix);
   const port = await pickFreePort();
@@ -33,14 +39,16 @@ async function fixture(ctx: { onTestFinished: (fn: () => Promise<void>) => void 
     res.end(JSON.stringify(path === "/.well-known/openid-configuration"
       ? { issuer, jwks_uri: `${issuer}/jwks` } : keys));
   });
-  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
   ctx.onTestFinished(async () => {
     release();
-    await app.exit();
     server.closeAllConnections();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    await signer.close();
+    if (server.listening) {
+      await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+    }
   });
+  const listening = once(server, "listening");
+  server.listen(port, "127.0.0.1");
+  await listening;
   const provider = {
     name: randomUUID(), issuer, audiences: ["aisix-gateway"],
     identity_claim: "sub", jwks_uri: `${issuer}/jwks`,
@@ -92,7 +100,7 @@ for (const stage of ["jwks", "discovery", "uri-change", "rotation"] as const) {
     if (stage === "uri-change" || stage === "rotation") {
       expect((await f.request(f.token())).status).toBe(200);
       if (stage === "uri-change") await f.configure(false, "?new-keys=1");
-      else { await f.rotate(); await sleep(1100); }
+      else { await f.rotate(); await sleep(REFRESH_INTERVAL_MS + 100); }
     }
     const path = stage === "discovery" ? "/.well-known/openid-configuration" : "/jwks";
     const before = f.counts.get(path) ?? 0;
@@ -113,8 +121,8 @@ for (const stage of ["jwks", "discovery", "uri-change", "rotation"] as const) {
 for (const { discovery, delay } of [
   { discovery: false, delay: 100 },
   { discovery: true, delay: 100 },
-  { discovery: false, delay: 1200 },
-  { discovery: true, delay: 1200 },
+  { discovery: false, delay: REFRESH_INTERVAL_MS + 200 },
+  { discovery: true, delay: REFRESH_INTERVAL_MS + 200 },
 ]) {
   test(`failed ${discovery ? "discovery" : "JWKS"} fetch (${delay}ms) is shared and remains rate limited`, async (ctx) => {
     if (!(await new EtcdClient().ping())) { ctx.skip(); return; }
