@@ -131,4 +131,22 @@ describe("concurrent and cancelled metric scrapes preserve request observations"
       }
     }
   });
+
+  test("a warmed series catalog still exports observations from a new label combination", async () => {
+    const before = await scrapeMetrics(app.metricsUrl);
+    for (const stream of [false, true]) {
+      const response = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${KEYS[1]}`, "content-type": "application/json" },
+        body: JSON.stringify({ model: ESCAPED_MODELS[0], stream, messages: [{ role: "user", content: "new series" }] }),
+      });
+      expect(response.status, await response.text()).toBe(200);
+      const labels = { model: JSON.stringify(ESCAPED_MODELS[0]).slice(1, -1), stream: String(stream) };
+      await expect.poll(async () => {
+        const after = await scrapeMetrics(app.metricsUrl);
+        return ["aisix_proxy_requests_total", "aisix_proxy_request_duration_seconds_count", "aisix_llm_request_duration_seconds_count"]
+          .map((name) => metricDelta(before, after, name, labels));
+      }, { timeout: 10_000, interval: 100 }).toEqual([1, 1, 1]);
+    }
+  });
 });
