@@ -468,7 +468,7 @@ mod tests {
         assert!(output.contains("latency_sum 1.5\n"));
         assert!(Arc::ptr_eq(&catalog, &recorder.series()));
 
-        recorder.register_counter(&Key::from_name("requests"), &metadata);
+        let _ = recorder.register_counter(&Key::from_name("requests"), &metadata);
         assert!(Arc::ptr_eq(&catalog, &recorder.series()));
         recorder
             .register_counter(&Key::from_name("new_requests"), &metadata)
