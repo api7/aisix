@@ -410,6 +410,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     stdio: ["ignore", "pipe", "pipe"],
     env: childEnv,
   });
+  const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
 
   let stderrBuf = "";
   child.stderr?.on("data", (c: Buffer) => {
@@ -478,17 +479,13 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     }
   } catch (err) {
     const detail = exitErr ?? "still running";
-    // Keep the head too — a startup error (anyhow's `Error: …` line)
-    // prints before its backtrace, and a tail-only excerpt used to cut
-    // exactly the line that says what went wrong.
-    const stderr =
-      stderrBuf.length <= 3000
-        ? stderrBuf
-        : `${stderrBuf.slice(0, 1500)}\n  […]\n${stderrBuf.slice(-1500)}`;
     await terminate(child);
+    // `exit` can precede the final pipe data. Assertions need the full
+    // diagnostic, including an error between startup logs and a backtrace.
+    await closed;
     await cleanup(fileMode ? undefined : etcd, etcdPrefix, dir);
     throw new Error(
-      `${(err as Error).message}\n  binary state: ${detail}\n  stderr:\n${stderr}`,
+      `${(err as Error).message}\n  binary state: ${detail}\n  stderr:\n${stderrBuf}`,
     );
   }
 
