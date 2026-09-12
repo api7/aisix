@@ -120,16 +120,17 @@ async function seed(etcdRoot: string, upstreamBase: string) {
     model_name: "gpt-4o-mini",
     provider_key_id: pk.id,
   });
-  await seed.createApiKey({
-    key_hash: CALLER_KEY_HASH,
-    allowed_models: [MODEL],
-  });
   await seed.createCachePolicy({
     name: `${MODEL}-redis-policy`,
     enabled: true,
     backend: "redis",
     ttl_seconds: 300,
     applies_to: "all",
+  });
+  // Authenticating this final row also proves the cache policy has arrived.
+  await seed.createApiKey({
+    key_hash: CALLER_KEY_HASH,
+    allowed_models: [MODEL],
   });
 }
 
