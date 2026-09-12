@@ -386,9 +386,9 @@ async fn reserve_layers(
     Ok(MultiReservation::new(reservations))
 }
 
-/// Scan the policy table once for the given phase and reserve every
+/// Select policy candidates for the given phase and reserve every
 /// applicable layer. Shared by the request gate ([`reserve_layers`])
-/// and the per-target gate ([`reserve_model_only`]) so the two scans
+/// and the per-target gate ([`reserve_model_only`]) so the two paths
 /// cannot drift (the schedules gate had to be patched into both loops
 /// once already — AISIX-Cloud#1104).
 async fn reserve_policy_layers(
@@ -403,13 +403,14 @@ async fn reserve_policy_layers(
 ) -> Result<(), ProxyError> {
     // O(1) empty check before anything else: deployments with no
     // rate-limit policies (the default) skip the wall-clock read and
-    // the per-shard table scan below entirely. Covers both callers —
+    // candidate lookup below entirely. Covers both callers —
     // the request gate and the per-target gate.
     if snap.rate_limit_policies.is_empty() {
         return Ok(());
     }
     let now = chrono::Utc::now();
-    for entry in snap.rate_limit_policies.entries() {
+    let index = state.policy_index.for_table(&snap.rate_limit_policies);
+    for entry in index.candidates(input) {
         let policy = &entry.value;
         // Inside a scheduled suspension window the policy reserves
         // nothing; enforcement resumes automatically when the window
@@ -717,6 +718,93 @@ mod tests {
         )
         .expect("policy applies")
         .bucket_key
+    }
+
+    #[test]
+    fn policy_candidates_preserve_all_matching_layers() {
+        use aisix_core::{resource::ResourceEntry, snapshot::ResourceTable};
+        use serde_json::json;
+        let table = ResourceTable::new();
+        let mut id = 0;
+        let mut add = |policy| {
+            id += 1;
+            table.insert(ResourceEntry::new(format!("p{id}"), policy, 1));
+        };
+        for scope in ["api_key", "model", "team", "member", "team_member"] {
+            for value in ["selected", "parent", "other"] {
+                add(make_scoped_policy(scope, value));
+            }
+        }
+        for dim in [
+            "team",
+            "member",
+            "api_key",
+            "model",
+            "model_name",
+            "provider",
+        ] {
+            for (op, value) in [
+                ("==", json!("selected")),
+                ("~=", json!("selected")),
+                ("in", json!(["selected", "parent", "selected"])),
+                ("~~", json!("^selected$")),
+            ] {
+                for negate in [false, true] {
+                    let leaf = json!({"dimension":dim,"operator":op,"value":value,"negate":negate});
+                    let other = json!({"dimension":"member","operator":"==","value":"other"});
+                    for conditions in [
+                        json!([leaf]),
+                        json!([other, leaf]),
+                        json!([{"logic":"and","children":[leaf,other]}]),
+                        json!([{"logic":"or","children":[leaf,other]}]),
+                        json!([{"logic":"and","negate":true,"children":[leaf,other]}]),
+                        json!([{"logic":"or","negate":true,"children":[leaf,other]}]),
+                        json!([{"logic":"and","children":[{"logic":"or","children":[other]},leaf]}]),
+                    ] {
+                        add(make_conditional_policy(json!({
+                            "name":"conditional", "conditions":conditions,
+                            "group_by":["member","model"], "limits":{"rpm":10}
+                        })));
+                    }
+                }
+            }
+        }
+        add(make_conditional_policy(
+            json!({"name":"global","limits":{"rpm":10}}),
+        ));
+        let index = crate::policy_index::LivePolicyIndex::default().for_table(&table);
+        for value in [None, Some("selected"), Some("other")] {
+            for parent in [None, Some("parent"), Some("selected")] {
+                let input = ConditionInput {
+                    team: value,
+                    member: value,
+                    api_key: value,
+                    model: value,
+                    model_name: value,
+                    provider: value,
+                    routing_parent_model: parent,
+                    routing_parent_model_name: parent,
+                };
+                for phase in [REQUEST, REQUEST_DEFERRING, PolicyPhase::ModelTarget] {
+                    let layer = |entry: &ResourceEntry<RateLimitPolicy>| {
+                        match_policy_layer(&entry.value, &entry.id, &input, phase).map(|layer| {
+                            (
+                                layer.bucket_key,
+                                serde_json::to_value(layer.limits).unwrap(),
+                            )
+                        })
+                    };
+                    let expected: Vec<_> = table
+                        .entries()
+                        .into_iter()
+                        .filter_map(|e| layer(&e))
+                        .collect();
+                    let actual: Vec<_> =
+                        index.candidates(&input).filter_map(|e| layer(e)).collect();
+                    assert_eq!(actual, expected, "input={input:?}");
+                }
+            }
+        }
     }
 
     #[test]

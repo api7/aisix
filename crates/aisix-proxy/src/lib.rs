@@ -65,6 +65,7 @@ mod model_resolve;
 mod models;
 mod operation;
 mod passthrough_route;
+mod policy_index;
 mod quota;
 mod realtime;
 mod redact;

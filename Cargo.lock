@@ -380,6 +380,7 @@ dependencies = [
  "aisix-provider-anthropic",
  "aisix-provider-openai",
  "aisix-ratelimit",
+ "arc-swap",
  "async-stream",
  "async-trait",
  "axum 0.7.9",
