@@ -208,6 +208,7 @@ impl DistributionSeries {
 
 struct Storage {
     distributions: DistributionBuilder,
+    generation: Arc<AtomicUsize>,
 }
 
 impl metrics_util::registry::Storage<Key> for Storage {
@@ -216,9 +217,11 @@ impl metrics_util::registry::Storage<Key> for Storage {
     type Histogram = Arc<DistributionSeries>;
 
     fn counter(&self, key: &Key) -> Self::Counter {
+        self.generation.fetch_add(1, Ordering::Release);
         Arc::new(Scalar::new(key))
     }
     fn gauge(&self, key: &Key) -> Self::Gauge {
+        self.generation.fetch_add(1, Ordering::Release);
         Arc::new(Scalar::new(key))
     }
     fn histogram(&self, key: &Key) -> Self::Histogram {
@@ -227,6 +230,7 @@ impl metrics_util::registry::Storage<Key> for Storage {
             Distribution::Histogram(_) => "histogram",
             Distribution::Summary(..) => "summary",
         };
+        self.generation.fetch_add(1, Ordering::Release);
         Arc::new(DistributionSeries {
             labels: Labels::new(key),
             kind,
@@ -236,26 +240,70 @@ impl metrics_util::registry::Storage<Key> for Storage {
     }
 }
 
+#[derive(Default)]
+struct Series {
+    counters: Vec<Arc<Scalar>>,
+    gauges: Vec<Arc<Scalar>>,
+    distributions: Vec<Arc<DistributionSeries>>,
+}
+
 pub(crate) struct Recorder {
     registry: Registry<Key, Storage>,
     descriptions: Mutex<HashMap<String, SharedString>>,
     previous_render_bytes: AtomicUsize,
+    generation: Arc<AtomicUsize>,
+    series: Mutex<Option<(usize, Arc<Series>)>>,
 }
 
 impl Recorder {
     pub(crate) fn new(distributions: DistributionBuilder) -> Self {
+        let generation = Arc::new(AtomicUsize::new(0));
         Self {
-            registry: Registry::new(Storage { distributions }),
+            registry: Registry::new(Storage {
+                distributions,
+                generation: generation.clone(),
+            }),
             descriptions: Mutex::new(HashMap::new()),
             previous_render_bytes: AtomicUsize::new(0),
+            generation,
+            series: Mutex::new(None),
         }
     }
 
-    pub(crate) fn run_upkeep(&self) {
-        let mut series = Vec::new();
+    fn series(&self) -> Arc<Series> {
+        let mut cached = self.series.lock().expect("metric series");
+        // Read before visiting: a concurrent insertion can be absent from
+        // this snapshot, but must invalidate it for the next visit. Storage
+        // increments under the registry's insertion lock, which visits read.
+        let generation = self.generation.load(Ordering::Acquire);
+        if let Some((previous, series)) = &*cached {
+            if *previous == generation {
+                return series.clone();
+            }
+        }
+        let mut series = Series::default();
         self.registry
-            .visit_histograms(|_, value| series.push(Arc::clone(value)));
-        for value in series {
+            .visit_counters(|_, value| series.counters.push(value.clone()));
+        self.registry
+            .visit_gauges(|_, value| series.gauges.push(value.clone()));
+        self.registry
+            .visit_histograms(|_, value| series.distributions.push(value.clone()));
+        series
+            .counters
+            .sort_unstable_by(|a, b| a.labels.name.cmp(&b.labels.name));
+        series
+            .gauges
+            .sort_unstable_by(|a, b| a.labels.name.cmp(&b.labels.name));
+        series
+            .distributions
+            .sort_unstable_by(|a, b| a.labels.name.cmp(&b.labels.name));
+        let series = Arc::new(series);
+        *cached = Some((generation, series.clone()));
+        series
+    }
+
+    pub(crate) fn run_upkeep(&self) {
+        for value in &self.series().distributions {
             value.upkeep();
         }
     }
@@ -270,12 +318,9 @@ impl Recorder {
         // room for growing counters without copying that buffer on every scrape.
         let previous_bytes = self.previous_render_bytes.load(Ordering::Relaxed);
         let mut output = String::with_capacity(previous_bytes.saturating_add(previous_bytes / 8));
-        let mut scalars = Vec::new();
-        self.registry
-            .visit_counters(|_, value| scalars.push(Arc::clone(value)));
-        scalars.sort_unstable_by(|a, b| a.labels.name.cmp(&b.labels.name));
+        let series = self.series();
         let mut previous = "";
-        for value in &scalars {
+        for value in &series.counters {
             write_header(
                 &mut output,
                 &descriptions,
@@ -287,12 +332,8 @@ impl Recorder {
                 .labels
                 .write(&mut output, None, None, value.value.load(Ordering::Acquire));
         }
-        scalars.clear();
-        self.registry
-            .visit_gauges(|_, value| scalars.push(Arc::clone(value)));
-        scalars.sort_unstable_by(|a, b| a.labels.name.cmp(&b.labels.name));
         previous = "";
-        for value in &scalars {
+        for value in &series.gauges {
             write_header(
                 &mut output,
                 &descriptions,
@@ -307,12 +348,8 @@ impl Recorder {
                 f64::from_bits(value.value.load(Ordering::Acquire)),
             );
         }
-        let mut distributions = Vec::new();
-        self.registry
-            .visit_histograms(|_, value| distributions.push(Arc::clone(value)));
-        distributions.sort_unstable_by(|a, b| a.labels.name.cmp(&b.labels.name));
         previous = "";
-        for value in &distributions {
+        for value in &series.distributions {
             write_header(
                 &mut output,
                 &descriptions,
@@ -402,6 +439,90 @@ mod tests {
             .collect::<Vec<_>>();
         lines.sort_unstable();
         lines
+    }
+
+    #[test]
+    fn series_catalog_is_reused_while_values_and_membership_stay_live() {
+        let recorder = Recorder::new(distributions());
+        let metadata = Metadata::new("test", metrics::Level::INFO, None);
+        assert!(recorder.render().is_empty());
+        let counter = recorder.register_counter(&Key::from_name("requests"), &metadata);
+        counter.increment(1);
+        assert!(recorder.render().contains("requests 1\n"));
+        let gauge = recorder.register_gauge(&Key::from_name("active"), &metadata);
+        gauge.set(2.0);
+        assert!(recorder.render().contains("active 2\n"));
+        let histogram = recorder.register_histogram(&Key::from_name("latency"), &metadata);
+        histogram.record(0.5);
+        assert!(recorder.render().contains("latency_count 1\n"));
+
+        let catalog = recorder.series();
+        counter.increment(3);
+        gauge.set(4.0);
+        histogram.record(1.0);
+        recorder.run_upkeep();
+        let output = recorder.render();
+        assert!(output.contains("requests 4\n"));
+        assert!(output.contains("active 4\n"));
+        assert!(output.contains("latency_count 2\n"));
+        assert!(output.contains("latency_sum 1.5\n"));
+        assert!(Arc::ptr_eq(&catalog, &recorder.series()));
+
+        recorder.register_counter(&Key::from_name("requests"), &metadata);
+        assert!(Arc::ptr_eq(&catalog, &recorder.series()));
+        recorder
+            .register_counter(&Key::from_name("new_requests"), &metadata)
+            .increment(7);
+        assert!(recorder.render().contains("new_requests 7\n"));
+        assert!(!Arc::ptr_eq(&catalog, &recorder.series()));
+    }
+
+    #[test]
+    fn concurrent_registration_and_scrapes_do_not_lose_new_series() {
+        let recorder = Arc::new(Recorder::new(distributions()));
+        recorder.render();
+        let writers: Vec<_> = (0..4)
+            .map(|worker| {
+                let recorder = recorder.clone();
+                std::thread::spawn(move || {
+                    let metadata = Metadata::new("test", metrics::Level::INFO, None);
+                    for i in 0..100 {
+                        let key = |name| {
+                            Key::from_parts(
+                                name,
+                                vec![metrics::Label::new("id", format!("{worker}-{i}"))],
+                            )
+                        };
+                        recorder
+                            .register_counter(&key("dynamic_counter"), &metadata)
+                            .increment(1);
+                        recorder
+                            .register_gauge(&key("dynamic_gauge"), &metadata)
+                            .set(2.0);
+                        recorder
+                            .register_histogram(&key("dynamic_histogram"), &metadata)
+                            .record(0.5);
+                    }
+                })
+            })
+            .collect();
+        while writers.iter().any(|writer| !writer.is_finished()) {
+            recorder.run_upkeep();
+            recorder.render();
+        }
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let output = recorder.render();
+        for worker in 0..4 {
+            for i in 0..100 {
+                let label = format!("{{id=\"{worker}-{i}\"}}");
+                assert!(output.contains(&format!("dynamic_counter{label} 1\n")));
+                assert!(output.contains(&format!("dynamic_gauge{label} 2\n")));
+                assert!(output.contains(&format!("dynamic_histogram_count{label} 1\n")));
+                assert!(output.contains(&format!("dynamic_histogram_sum{label} 0.5\n")));
+            }
+        }
     }
 
     #[test]
