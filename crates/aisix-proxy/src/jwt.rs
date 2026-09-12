@@ -762,19 +762,23 @@ fn usable_for_verification(jwk: &jsonwebtoken::jwk::Jwk, alg: Algorithm) -> bool
 
 // ── JWKS fetch + cache ───────────────────────────────────────────────
 
+#[derive(Default)]
 struct JwksEntry {
     /// The last successfully fetched key set and when it landed.
     jwks: Option<(Arc<JwkSet>, Instant)>,
-    /// Last fetch attempt, success or failure — the rate-limit clock.
+    /// Completion of the last fetch, success or failure — the rate-limit clock.
     last_attempt: Option<Instant>,
+    fetch_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// One issuer's resolved discovery result plus its rate-limit clock.
+#[derive(Default)]
 struct DiscoveryEntry {
     /// The resolved `jwks_uri` and when discovery last succeeded.
     resolved: Option<(String, Instant)>,
-    /// Last discovery attempt, success or failure.
+    /// Completion of the last discovery attempt, success or failure.
     last_attempt: Option<Instant>,
+    fetch_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Read a poisoned-lock-tolerant guard. A panic while some other request
@@ -790,8 +794,8 @@ fn write_recover<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 }
 
 /// Process-global JWKS cache keyed by URL. Guards are held only for map
-/// lookups/inserts, never across an await; concurrent misses may fetch in
-/// parallel (each result is valid — last insert wins).
+/// lookups/inserts, never across an await. Each entry's async lock lets
+/// concurrent misses share the completed fetch, across serving runtimes.
 fn jwks_cache() -> &'static RwLock<HashMap<String, JwksEntry>> {
     static CACHE: OnceLock<RwLock<HashMap<String, JwksEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
@@ -833,6 +837,31 @@ async fn resolve_jwks_url(prov: &OidcProvider) -> Result<String, String> {
         }
         return Ok(u.clone());
     }
+    {
+        let map = read_recover(discovery_cache());
+        if let Some((url, at)) = map.get(&prov.issuer).and_then(|e| e.resolved.as_ref()) {
+            if at.elapsed() < JWKS_TTL {
+                return Ok(url.clone());
+            }
+        }
+    }
+    let fetch_lock = write_recover(discovery_cache())
+        .entry(prov.issuer.clone())
+        .or_default()
+        .fetch_lock
+        .clone();
+    let _fetch = match fetch_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            if let Some((url, _)) = read_recover(discovery_cache())
+                .get(&prov.issuer)
+                .and_then(|e| e.resolved.as_ref())
+            {
+                return Ok(url.clone());
+            }
+            fetch_lock.lock().await
+        }
+    };
     let now = Instant::now();
     let (stale, attempted_recently) = {
         let map = read_recover(discovery_cache());
@@ -860,20 +889,18 @@ async fn resolve_jwks_url(prov: &OidcProvider) -> Result<String, String> {
             .ok_or_else(|| "OIDC discovery suppressed by the refresh interval".to_string());
     }
 
-    // Stamp the attempt before awaiting so concurrent misses don't stampede.
-    write_recover(discovery_cache())
-        .entry(prov.issuer.clone())
-        .or_insert(DiscoveryEntry {
-            resolved: None,
-            last_attempt: None,
-        })
-        .last_attempt = Some(now);
-
     let discovery_url = format!(
         "{}/.well-known/openid-configuration",
         prov.issuer.trim_end_matches('/')
     );
-    match fetch_json(&discovery_url).await {
+    let result = fetch_json(&discovery_url).await;
+    // Only completed attempts consume the interval. Cancellation drops the
+    // fetch lock so a waiting request can take over instead of failing cold.
+    write_recover(discovery_cache())
+        .entry(prov.issuer.clone())
+        .or_default()
+        .last_attempt = Some(Instant::now());
+    match result {
         Ok(doc) => {
             // §4.3: the document must claim the issuer we asked about.
             if doc.get("issuer").and_then(|v| v.as_str()) != Some(prov.issuer.as_str()) {
@@ -897,11 +924,8 @@ async fn resolve_jwks_url(prov: &OidcProvider) -> Result<String, String> {
             }
             write_recover(discovery_cache())
                 .entry(prov.issuer.clone())
-                .or_insert(DiscoveryEntry {
-                    resolved: None,
-                    last_attempt: Some(now),
-                })
-                .resolved = Some((jwks_uri.clone(), now));
+                .or_default()
+                .resolved = Some((jwks_uri.clone(), Instant::now()));
             Ok(jwks_uri)
         }
         Err(e) => {
@@ -963,70 +987,81 @@ fn same_origin(base: &str, candidate: &str) -> bool {
 /// failed re-fetch keeps serving the stale set; with nothing cached the
 /// error propagates and the request fails closed as retryable.
 async fn get_jwks(url: &str) -> Result<Arc<JwkSet>, String> {
-    let now = Instant::now();
-    let (stale, attempted_recently) = {
+    {
         let map = read_recover(jwks_cache());
-        match map.get(url) {
-            Some(entry) => {
-                if let Some((jwks, fetched_at)) = &entry.jwks {
-                    if now.duration_since(*fetched_at) < JWKS_TTL {
-                        return Ok(jwks.clone());
-                    }
-                }
-                (
-                    entry.jwks.as_ref().map(|(j, _)| j.clone()),
-                    entry
-                        .last_attempt
-                        .is_some_and(|at| now.duration_since(at) < JWKS_REFRESH_MIN_INTERVAL),
-                )
+        if let Some((jwks, at)) = map.get(url).and_then(|e| e.jwks.as_ref()) {
+            if at.elapsed() < JWKS_TTL {
+                return Ok(jwks.clone());
             }
-            None => (None, false),
         }
-    };
-    if attempted_recently {
-        return stale.ok_or_else(|| "JWKS fetch suppressed by the refresh interval".to_string());
     }
-    refresh_jwks(url).await
+    refresh_jwks(url, false).await
 }
 
 /// One fetch for an unknown `kid`, suppressed inside
 /// [`JWKS_REFRESH_MIN_INTERVAL`] of the previous attempt.
 async fn refresh_jwks_rate_limited(url: &str) -> Option<Arc<JwkSet>> {
-    let now = Instant::now();
-    if let Some(entry) = read_recover(jwks_cache()).get(url) {
-        if let Some(at) = entry.last_attempt {
-            if now.duration_since(at) < JWKS_REFRESH_MIN_INTERVAL {
-                return None;
+    refresh_jwks(url, true).await.ok()
+}
+
+async fn refresh_jwks(url: &str, unknown_kid: bool) -> Result<Arc<JwkSet>, String> {
+    let fetch_lock = write_recover(jwks_cache())
+        .entry(url.to_string())
+        .or_default()
+        .fetch_lock
+        .clone();
+    let _fetch = match fetch_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            if !unknown_kid {
+                if let Some((stale, _)) = read_recover(jwks_cache())
+                    .get(url)
+                    .and_then(|e| e.jwks.as_ref())
+                {
+                    return Ok(stale.clone());
+                }
+            }
+            fetch_lock.lock().await
+        }
+    };
+    {
+        let map = read_recover(jwks_cache());
+        if let Some(entry) = map.get(url) {
+            if !unknown_kid {
+                if let Some((jwks, at)) = &entry.jwks {
+                    if at.elapsed() < JWKS_TTL {
+                        return Ok(jwks.clone());
+                    }
+                }
+            }
+            if entry
+                .last_attempt
+                .is_some_and(|at| at.elapsed() < JWKS_REFRESH_MIN_INTERVAL)
+            {
+                return entry
+                    .jwks
+                    .as_ref()
+                    .map(|(j, _)| j.clone())
+                    .ok_or_else(|| "JWKS fetch suppressed by the refresh interval".to_string());
             }
         }
     }
-    refresh_jwks(url).await.ok()
-}
-
-async fn refresh_jwks(url: &str) -> Result<Arc<JwkSet>, String> {
-    // Stamp the attempt before awaiting so a slow endpoint is not
-    // hammered by concurrent refreshes.
-    {
-        let mut map = write_recover(jwks_cache());
-        map.entry(url.to_string())
-            .or_insert(JwksEntry {
-                jwks: None,
-                last_attempt: None,
-            })
-            .last_attempt = Some(Instant::now());
-    }
-    match fetch_json(url).await.and_then(|v| {
+    let result = fetch_json(url).await.and_then(|v| {
         serde_json::from_value::<JwkSet>(v).map_err(|e| format!("not a JWKS document: {e}"))
-    }) {
+    });
+    // The lock covers in-flight requests; the interval covers completed
+    // attempts, including failures slower than the interval itself.
+    write_recover(jwks_cache())
+        .entry(url.to_string())
+        .or_default()
+        .last_attempt = Some(Instant::now());
+    match result {
         Ok(set) => {
             let arc = Arc::new(set);
             write_recover(jwks_cache())
                 .entry(url.to_string())
-                .and_modify(|e| e.jwks = Some((arc.clone(), Instant::now())))
-                .or_insert(JwksEntry {
-                    jwks: Some((arc.clone(), Instant::now())),
-                    last_attempt: Some(Instant::now()),
-                });
+                .or_default()
+                .jwks = Some((arc.clone(), Instant::now()));
             Ok(arc)
         }
         Err(e) => {
@@ -1082,6 +1117,160 @@ mod tests {
     use super::*;
     use aisix_core::resource::ResourceEntry;
     use jsonwebtoken::{encode, EncodingKey, Header};
+
+    struct FetchServer {
+        url: String,
+        hold: Arc<std::sync::atomic::AtomicBool>,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for FetchServer {
+        fn drop(&mut self) {
+            self.release.notify_waiters();
+            self.task.abort();
+        }
+    }
+
+    async fn fetch_server(discovery: bool) -> FetchServer {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let hold = Arc::new(AtomicBool::new(false));
+        let fail = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handler = {
+            let (hold, fail, calls, entered, release) = (
+                hold.clone(),
+                fail.clone(),
+                calls.clone(),
+                entered.clone(),
+                release.clone(),
+            );
+            let body = if discovery {
+                serde_json::json!({"issuer": url, "jwks_uri": format!("{url}/jwks")}).to_string()
+            } else {
+                TEST_JWKS.to_string()
+            };
+            move || {
+                let (hold, fail, calls, entered, release, body) = (
+                    hold.clone(),
+                    fail.clone(),
+                    calls.clone(),
+                    entered.clone(),
+                    release.clone(),
+                    body.clone(),
+                );
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if hold.load(Ordering::SeqCst) {
+                        let released = release.notified();
+                        tokio::pin!(released);
+                        released.as_mut().enable();
+                        entered.notify_one();
+                        released.await;
+                    }
+                    let status = if fail.load(Ordering::SeqCst) {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        axum::http::StatusCode::OK
+                    };
+                    (status, body)
+                }
+            }
+        };
+        let router = axum::Router::new().fallback(handler);
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        FetchServer {
+            url,
+            hold,
+            fail,
+            calls,
+            entered,
+            release,
+            task,
+        }
+    }
+
+    async fn cached_fetch(url: &str, discovery: bool) -> Result<(), String> {
+        if discovery {
+            let mut provider = base_provider();
+            provider.issuer = url.to_string();
+            resolve_jwks_url(&provider).await.map(|_| ())
+        } else {
+            get_jwks(url).await.map(|_| ())
+        }
+    }
+
+    async fn assert_cancelled_fetch_can_retry(discovery: bool) {
+        use std::sync::atomic::Ordering;
+        let server = fetch_server(discovery).await;
+        server.hold.store(true, Ordering::SeqCst);
+        let url = server.url.clone();
+        let first = tokio::spawn(async move { cached_fetch(&url, discovery).await });
+        server.entered.notified().await;
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        server.hold.store(false, Ordering::SeqCst);
+        server.release.notify_waiters();
+        assert_eq!(cached_fetch(&server.url, discovery).await, Ok(()));
+        assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_jwks_fetch_can_retry() {
+        assert_cancelled_fetch_can_retry(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_discovery_fetch_can_retry() {
+        assert_cancelled_fetch_can_retry(true).await;
+    }
+
+    #[tokio::test]
+    async fn expired_trust_material_stays_available_during_refresh_and_outage() {
+        use std::sync::atomic::Ordering;
+        for discovery in [false, true] {
+            let server = fetch_server(discovery).await;
+            assert_eq!(cached_fetch(&server.url, discovery).await, Ok(()));
+            let past = Instant::now() - JWKS_TTL - Duration::from_secs(1);
+            if discovery {
+                let mut cache = write_recover(discovery_cache());
+                let entry = cache.get_mut(&server.url).unwrap();
+                entry.resolved.as_mut().unwrap().1 = past;
+                entry.last_attempt = Some(past);
+            } else {
+                let mut cache = write_recover(jwks_cache());
+                let entry = cache.get_mut(&server.url).unwrap();
+                entry.jwks.as_mut().unwrap().1 = past;
+                entry.last_attempt = Some(past);
+            }
+            server.hold.store(true, Ordering::SeqCst);
+            server.fail.store(true, Ordering::SeqCst);
+            let url = server.url.clone();
+            let refresh = tokio::spawn(async move { cached_fetch(&url, discovery).await });
+            server.entered.notified().await;
+            // A known key / discovery URL must not wait behind an outage.
+            assert_eq!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    cached_fetch(&server.url, discovery)
+                )
+                .await
+                .unwrap(),
+                Ok(())
+            );
+            server.release.notify_waiters();
+            assert_eq!(refresh.await.unwrap(), Ok(()));
+            assert_eq!(cached_fetch(&server.url, discovery).await, Ok(()));
+            assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+        }
+    }
 
     /// Test-only RSA keypair. The private PEM signs fixture tokens; the
     /// JWK below is its public half (kid `test-kid-1`).
