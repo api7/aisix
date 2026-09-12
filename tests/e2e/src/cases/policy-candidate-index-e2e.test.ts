@@ -105,10 +105,7 @@ test("policy candidates follow creation, identity edits, fallback conditions and
     await synced();
     await request(1, 200);
   } finally {
-    if (app) {
-      await app.stop();
-      await etcd.deletePrefix(app.etcdPrefix);
-    }
+    await app?.exit();
     await upstream.close();
   }
 }, 30_000);
