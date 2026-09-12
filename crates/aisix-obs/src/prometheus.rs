@@ -5,7 +5,10 @@
 use std::{
     collections::HashMap,
     fmt::Write,
-    sync::{atomic::Ordering, Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+    },
 };
 
 use crossbeam_queue::SegQueue;
@@ -236,6 +239,7 @@ impl metrics_util::registry::Storage<Key> for Storage {
 pub(crate) struct Recorder {
     registry: Registry<Key, Storage>,
     descriptions: Mutex<HashMap<String, SharedString>>,
+    previous_render_bytes: AtomicUsize,
 }
 
 impl Recorder {
@@ -243,6 +247,7 @@ impl Recorder {
         Self {
             registry: Registry::new(Storage { distributions }),
             descriptions: Mutex::new(HashMap::new()),
+            previous_render_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -261,7 +266,10 @@ impl Recorder {
             .lock()
             .expect("metric descriptions")
             .clone();
-        let mut output = String::new();
+        // A warmed high-cardinality scrape can be hundreds of MiB. Leave
+        // room for growing counters without copying that buffer on every scrape.
+        let previous_bytes = self.previous_render_bytes.load(Ordering::Relaxed);
+        let mut output = String::with_capacity(previous_bytes.saturating_add(previous_bytes / 8));
         let mut scalars = Vec::new();
         self.registry
             .visit_counters(|_, value| scalars.push(Arc::clone(value)));
@@ -314,6 +322,8 @@ impl Recorder {
             );
             value.render(&mut output);
         }
+        self.previous_render_bytes
+            .store(output.len(), Ordering::Relaxed);
         output
     }
 
