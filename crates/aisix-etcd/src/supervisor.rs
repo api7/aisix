@@ -3763,7 +3763,10 @@ mod tests {
         tokio::spawn(async move { release_tx.send(()).unwrap() })
             .await
             .unwrap();
-        let _ = apply.await;
+        // Without another yield, synchronous work may finish before abort takes effect.
+        if let Err(error) = apply.await {
+            assert!(error.is_cancelled(), "config work task failed: {error}");
+        }
         assert!(completed.load(Ordering::SeqCst));
     }
 
