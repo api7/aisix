@@ -116,6 +116,21 @@ test("configuration digests match the written rows through updates, rejection, d
     await put(modelKey(1), JSON.stringify({ ...JSON.parse(model(1)), model_name: "gpt-4o" }));
     await check();
 
+    await put(modelKey(191), JSON.stringify({ ...JSON.parse(model(191)), display_name: "renamed-hash-model" }));
+    await check();
+    const chatByName = (name: string) => proxy().chat({
+      model: name,
+      messages: [{ role: "user", content: "resolve the current name" }],
+    });
+    expect((await chatByName("hash-model-191")).status).toBe(404);
+    expect((await chatByName("renamed-hash-model")).status).toBe(200);
+    await remove(modelKey(191));
+    await check();
+    expect((await chatByName("renamed-hash-model")).status).toBe(404);
+    await put(modelKey(191), model(191));
+    await check();
+    expect((await chatByName("hash-model-191")).status).toBe(200);
+
     const served = new Map(rows);
     await put(modelKey(190), "not JSON");
     await put(modelKey(257), "{}");

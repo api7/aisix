@@ -37,8 +37,9 @@ static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// duplicate storage — the name map just holds ids.
 #[derive(Debug)]
 pub struct ResourceTable<T: Resource> {
-    by_id: DashMap<String, Arc<ResourceEntry<T>>>,
-    by_name: DashMap<String, String>,
+    // Index strings are immutable and shared across copy-on-write snapshots.
+    by_id: DashMap<Arc<str>, Arc<ResourceEntry<T>>>,
+    by_name: DashMap<Arc<str>, Arc<str>>,
     /// Cached entry count, maintained by [`ResourceTable::insert`] /
     /// [`ResourceTable::remove`]. DashMap's own `len()` / `is_empty()`
     /// visit every shard (a CAS pair per shard), so per-request
@@ -136,14 +137,14 @@ impl<T: Resource> ResourceTable<T> {
     /// the copy-on-write path, where the new table shares the previous
     /// snapshot's rows instead of deep-copying every payload.
     pub fn insert_arc(&self, entry: Arc<ResourceEntry<T>>) {
-        let id = entry.id.clone();
-        let name = entry.value.name().to_string();
+        let id: Arc<str> = Arc::from(entry.id.as_str());
+        let name: Arc<str> = Arc::from(entry.value.name());
 
-        if let Some(old) = self.by_id.get(&id) {
-            let old_name = old.value.name().to_string();
-            if old_name != name {
+        if let Some(old) = self.by_id.get(id.as_ref()) {
+            let old_name = old.value.name();
+            if old_name != name.as_ref() {
                 // Only clear the old mapping if it still points at us.
-                self.by_name.remove_if(&old_name, |_, v| v == &id);
+                self.by_name.remove_if(old_name, |_, v| v == &id);
             }
         }
 
@@ -164,8 +165,8 @@ impl<T: Resource> ResourceTable<T> {
     pub fn remove(&self, id: &str) -> Option<Arc<ResourceEntry<T>>> {
         let (_, entry) = self.by_id.remove(id)?;
         self.count.fetch_sub(1, Ordering::Relaxed);
-        let name = entry.value.name().to_string();
-        self.by_name.remove_if(&name, |_, v| v == id);
+        let name = entry.value.name();
+        self.by_name.remove_if(name, |_, v| v.as_ref() == id);
         self.bump_generation();
         Some(entry)
     }
@@ -175,6 +176,8 @@ impl<T: Resource> ResourceTable<T> {
     }
 
     pub fn get_by_name(&self, name: &str) -> Option<Arc<ResourceEntry<T>>> {
+        // Release the name shard before taking the id shard, since updates
+        // acquire them in the opposite order.
         let id = self.by_name.get(name)?.clone();
         self.get_by_id(&id)
     }
@@ -185,7 +188,7 @@ impl<T: Resource> ResourceTable<T> {
     pub fn name_conflicts(&self, name: &str, self_id: Option<&str>) -> bool {
         match self.by_name.get(name) {
             Some(existing_id) => match self_id {
-                Some(me) => existing_id.as_str() != me,
+                Some(me) => existing_id.as_ref() != me,
                 None => true,
             },
             None => false,
