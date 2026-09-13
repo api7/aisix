@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startRestUpstream,
@@ -203,18 +204,9 @@ describe("mcp openapi e2e: REST API exposed as MCP tools", () => {
       mcp_access: { allow: ["erp__getitem"] },
     });
 
-    // Tolerant probe (no assertions): both the key and the server must have
-    // propagated before the pinned tests run.
-    await waitConfigPropagation(async () => {
-      if ((await initialize(KEY_FULL)) !== 200) return false;
-      const r = await post(KEY_FULL, {
-        jsonrpc: "2.0",
-        id: 2,
-        method: "tools/list",
-        params: {},
-      });
-      return (r.json?.result?.tools ?? []).length === 3;
-    });
+    // The last key authenticating implies the earlier key and server landed.
+    const gate = new ProxyClient(app.proxyUrl, KEY_SCOPED);
+    await waitConfigPropagation(async () => (await gate.listModels()).status === 200);
   }, 120_000);
 
   afterAll(async () => {
