@@ -15,6 +15,8 @@
 //! business types in `models::AisixSnapshot`. This crate provides the
 //! primitive only.
 
+mod reclaim;
+
 use crate::resource::{Resource, ResourceEntry};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -247,6 +249,9 @@ impl<T: Resource> ResourceTable<T> {
 /// `SnapshotHandle<S>` is the type actually stored in axum state — consumers
 /// call [`SnapshotHandle::load`] on every request to get the current `Arc<S>`
 /// without any locking.
+/// Replaced snapshots are retained until their readers finish, then destroyed
+/// on a shared reclamation thread. The bounded retirement queue can apply
+/// backpressure to writers; readers never use that queue.
 ///
 /// The manual `Clone` impl deliberately does *not* require `S: Clone` — the
 /// handle only clones its inner `Arc`, the `S` is never duplicated.
@@ -265,7 +270,7 @@ impl<S> Clone for SnapshotHandle<S> {
     }
 }
 
-impl<S> SnapshotHandle<S> {
+impl<S: Send + Sync + 'static> SnapshotHandle<S> {
     pub fn new(initial: S) -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(initial)),
@@ -296,8 +301,9 @@ impl<S> SnapshotHandle<S> {
     /// Atomic store. Called by the etcd watch supervisor after building a
     /// fresh snapshot.
     pub fn store(&self, new: S) {
-        self.inner.store(Arc::new(new));
+        let previous = self.inner.swap(Arc::new(new));
         self.version.fetch_add(1, Ordering::Release);
+        reclaim::retire(previous);
     }
 
     /// Read-copy-update. Runs `f(current)` to produce a new snapshot,
@@ -316,8 +322,9 @@ impl<S> SnapshotHandle<S> {
     where
         F: FnMut(&S) -> S,
     {
-        self.inner.rcu(|current| f(current.as_ref()));
+        let previous = self.inner.rcu(|current| f(current.as_ref()));
         self.version.fetch_add(1, Ordering::Release);
+        reclaim::retire(previous);
     }
 }
 
