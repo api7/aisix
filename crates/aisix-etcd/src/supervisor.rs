@@ -843,6 +843,13 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// snapshot. Returns the stats from the build for observability.
     /// Stops after the first watch error — the outer [`Self::run`] loop
     /// decides whether to backoff and retry.
+    ///
+    /// # Panics
+    ///
+    /// On a multithread Tokio runtime, configuration work uses in-place
+    /// blocking and cannot run directly in a [`tokio::task::LocalSet`].
+    /// Local callers must use [`tokio::spawn`] for this future instead of
+    /// `spawn_local`. Current-thread runtimes keep applying inline.
     pub async fn load_once(&self) -> Result<BuildStats, ProviderError> {
         let load = self.load_all_prefixes().await?;
         let revision = load.applied_revision();
@@ -1534,6 +1541,12 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// that owns every call to [`Self::flush_cache`] has just exited.
     /// Callers already await this task after the connection drain, so
     /// nothing about the graceful-drain sequence changes.
+    ///
+    /// # Panics
+    ///
+    /// Like [`Self::load_once`], this future must run outside a
+    /// [`tokio::task::LocalSet`] on a multithread runtime. Local callers
+    /// must use [`tokio::spawn`] rather than `spawn_local`.
     pub async fn run(self: Arc<Self>, cancel: tokio::sync::watch::Receiver<bool>) {
         self.watch_loop(cancel).await;
         self.drain_pending_cache_writes().await;
@@ -3768,6 +3781,46 @@ mod tests {
             assert!(error.is_cancelled(), "config work task failed: {error}");
         }
         assert!(completed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn local_callers_spawn_supervisor_work_on_the_runtime() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let provider = Arc::new(FakeProvider::new(
+                    vec![entry("/aisix/models/m-1", VALID_MODEL, 1)],
+                    5,
+                ));
+                let initial = Supervisor::new(provider, "/aisix");
+                let stats = tokio::spawn(async move { initial.load_once().await })
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(stats.accepted, 1);
+
+                let (provider, events) = LiveProvider::new(0);
+                let supervisor = Arc::new(Supervisor::new(provider, "/aisix"));
+                let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                let watch = tokio::spawn(supervisor.clone().run(cancel_rx));
+                events
+                    .unbounded_send(Ok(WatchEvent::Put(entry(
+                        "/aisix/models/m-2",
+                        VALID_MODEL,
+                        1,
+                    ))))
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while supervisor.handle().load().models.len() != 1 {
+                        assert!(!watch.is_finished(), "supervisor stopped before applying");
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                cancel_tx.send(true).unwrap();
+                watch.await.unwrap();
+            })
+            .await;
     }
 
     #[tokio::test]
