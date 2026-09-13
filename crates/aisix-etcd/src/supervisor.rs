@@ -846,11 +846,12 @@ impl<P: ConfigProvider> Supervisor<P> {
     pub async fn load_once(&self) -> Result<BuildStats, ProviderError> {
         let load = self.load_all_prefixes().await?;
         let revision = load.applied_revision();
-        let stats = self.apply_resync_at(&load.entries, Some(revision));
-        // apply_resync uses max(entry revisions); bump to the etcd
-        // load_all revision so the cache file records the true "as
-        // of" point, not just the max entry write.
-        self.record_read_revision(revision);
+        let stats = config_work(|| {
+            let stats = self.apply_resync_at(&load.entries, Some(revision));
+            // Preserve the range read's consistent-as-of revision.
+            self.record_read_revision(revision);
+            stats
+        });
         tracing::info!(
             accepted = stats.accepted,
             rejected = stats.schema_rejected + stats.parse_rejected,
@@ -1630,8 +1631,10 @@ impl<P: ConfigProvider> Supervisor<P> {
         // every prefix has been read, so readiness means every prefix's
         // initial load completed and no request can observe the
         // environment loaded and the catalog not.
-        self.apply_resync_at(&load.entries, Some(revision));
-        self.record_read_revision(revision);
+        config_work(|| {
+            self.apply_resync_at(&load.entries, Some(revision));
+            self.record_read_revision(revision);
+        });
 
         let mut streams = Vec::with_capacity(self.sources.len());
         for (source, from) in self.sources.iter().zip(&load.revisions) {
@@ -1694,11 +1697,11 @@ impl<P: ConfigProvider> Supervisor<P> {
                 }
                 Some(Watched::Event(Err(err))) => return Err(SupervisorError::Provider(err)),
                 Some(Watched::Event(Ok(WatchEvent::Resync { entries, revision }))) => {
-                    self.apply_resync_at(&entries, Some(revision));
-                    // The resync's header revision is the "consistent as
-                    // of" point even when the entry set is empty or only
-                    // contains older mod_revisions.
-                    self.record_read_revision(revision);
+                    config_work(|| {
+                        self.apply_resync_at(&entries, Some(revision));
+                        // The resync header remains the consistent-as-of point.
+                        self.record_read_revision(revision);
+                    });
                 }
                 // Explicit over the two batchable variants rather than a
                 // catch-all: a new `WatchEvent` must fail to compile here
@@ -1794,11 +1797,22 @@ impl<P: ConfigProvider> Supervisor<P> {
                         })
                         .collect();
                     let started = std::time::Instant::now();
-                    self.apply_events(&staged);
+                    config_work(|| self.apply_events(&staged));
                     apply_timing.record(started.elapsed());
                 }
             }
         }
+    }
+}
+
+// Keep synchronous parsing, snapshot cloning and hashing from occupying an
+// async worker. The apply still completes before the next watch item or cancel
+// is handled; a detached blocking task could publish after the loop exits.
+fn config_work<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+        // Current-thread embedders retain the synchronous behavior.
+        _ => work(),
     }
 }
 
@@ -3726,6 +3740,31 @@ mod tests {
             "shutdown drained the whole ready backlog ({applied} events) instead of leaving the \
              window at the first cancel check",
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn config_work_releases_the_worker_but_finishes_before_cancellation() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let completed = Arc::new(AtomicBool::new(false));
+        let done = completed.clone();
+        let apply = tokio::spawn(async move {
+            config_work(|| {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("another async task must run while config work is in progress");
+                done.store(true, Ordering::SeqCst);
+            });
+        });
+        entered_rx.await.unwrap();
+        apply.abort();
+        assert!(!apply.is_finished());
+        tokio::spawn(async move { release_tx.send(()).unwrap() })
+            .await
+            .unwrap();
+        let _ = apply.await;
+        assert!(completed.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

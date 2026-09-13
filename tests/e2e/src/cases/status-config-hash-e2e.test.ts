@@ -148,10 +148,28 @@ test("configuration digests match the written rows through updates, rejection, d
 
     // Spaced updates and key deletion must publish the same final bytes
     // regardless of how many watch events the gateway groups together.
-    for (let i = 0; i < 24; i++) {
-      await put(modelKey(i), JSON.stringify({ ...JSON.parse(model(i)), model_name: "gpt-4o" }));
-      await new Promise((resolve) => setTimeout(resolve, 40));
-    }
+    let writesFinished = false;
+    await Promise.all([
+      (async () => {
+        try {
+          for (let i = 0; i < 24; i++) {
+            await put(modelKey(i), JSON.stringify({ ...JSON.parse(model(i)), model_name: "gpt-4o" }));
+            await new Promise((resolve) => setTimeout(resolve, 40));
+          }
+        } finally {
+          writesFinished = true;
+        }
+      })(),
+      (async () => {
+        do {
+          const scrape = await fetch(`${app!.metricsUrl}/metrics`);
+          expect(scrape.status).toBe(200);
+          expect(await scrape.text()).toContain("aisix_proxy_requests_total");
+          const serving = await chatByName("hash-model-255");
+          expect(serving.status, JSON.stringify(serving.body)).toBe(200);
+        } while (!writesFinished);
+      })(),
+    ]);
     const callerConfig = rows.get(caller)!;
     await remove(caller);
     await check();
