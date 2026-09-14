@@ -10,10 +10,11 @@
 //!
 //! On the bridged `/v1/responses` and `/v1/messages` paths the estimate
 //! is ALSO what the client is told, so the caller cannot read a zero
-//! against a bill they cannot reconcile. Those paths adopt it only when
-//! the upstream sent no usage block at all; a block that arrived with a
-//! zero sub-count still reaches the client as that zero while the record
-//! fills it, which is the one place the two can still diverge.
+//! against a bill they cannot reconcile. Those paths fill per counter,
+//! exactly as the record does: a counter the upstream reported stands,
+//! and one it left at zero is filled even when the other arrived in the
+//! same usage block. A total reported beside such a zero no longer adds
+//! up once it is filled, so it is recomputed rather than echoed.
 //!
 //! Counting follows the OpenAI cookbook message scheme: 3 tokens per
 //! message, +1 per `name`, +3 reply priming, tool definitions rendered

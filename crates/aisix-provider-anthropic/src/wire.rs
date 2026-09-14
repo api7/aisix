@@ -23,6 +23,7 @@
 
 use std::borrow::Cow;
 
+use aisix_core::MappedEffort;
 use aisix_gateway::{
     BridgeError, ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, FinishReason, Role,
     UsageStats,
@@ -870,7 +871,14 @@ pub fn translate_anthropic_tool_choice_to_openai(
 /// `thinking` and `output_config` are resolved together after the loop:
 /// both encode the same OpenAI knob, so neither can be translated by
 /// looking at one key in isolation (AISIX-Cloud#1474).
-pub fn translate_extras_to_openai_shape(extra: &mut serde_json::Map<String, serde_json::Value>) {
+///
+/// `mapped_effort` reports what the target model's effort mapping did to
+/// the request before it got here, so a mapping that removed the effort
+/// is not undone by resolving `thinking` into one.
+pub fn translate_extras_to_openai_shape(
+    extra: &mut serde_json::Map<String, serde_json::Value>,
+    mapped_effort: MappedEffort,
+) {
     let anthropic = std::mem::take(extra);
     let mut thinking = None;
     let mut output_config = None;
@@ -932,7 +940,9 @@ pub fn translate_extras_to_openai_shape(extra: &mut serde_json::Map<String, serd
         extra.insert("parallel_tool_calls".to_string(), false.into());
     }
 
-    if let Some(effort) = reasoning_effort_for(thinking.as_ref(), output_config.as_ref()) {
+    if let Some(effort) =
+        reasoning_effort_for(thinking.as_ref(), output_config.as_ref(), mapped_effort)
+    {
         extra.insert("reasoning_effort".to_string(), effort);
     }
 
@@ -957,10 +967,15 @@ pub fn translate_extras_to_openai_shape(extra: &mut serde_json::Map<String, serd
 ///    this pair the same way).
 /// 2. `output_config.effort` → forwarded verbatim. This is Anthropic's
 ///    current effort control and the only one Opus 4.7 and later accept.
-/// 3. `thinking.type = "enabled"` → bucketed from `budget_tokens`.
+/// 3. An effort mapping that removed the request's effort
+///    ([`MappedEffort::Removed`]) → none. The operator asked
+///    for no effort field, and deriving one from `thinking` would put
+///    back exactly what was removed. Rule 1 still outranks this: an
+///    explicit client opt-out is not the operator's to overrule.
+/// 4. `thinking.type = "enabled"` → bucketed from `budget_tokens`.
 ///    Deprecated on Opus 4.6 and rejected outright from 4.7, kept for
 ///    clients still sending it.
-/// 4. `thinking.type = "adaptive"` with no effort → `high`, which is
+/// 5. `thinking.type = "adaptive"` with no effort → `high`, which is
 ///    what Anthropic itself applies when `output_config.effort` is
 ///    omitted.
 ///
@@ -971,6 +986,7 @@ pub fn translate_extras_to_openai_shape(extra: &mut serde_json::Map<String, serd
 fn reasoning_effort_for(
     thinking: Option<&serde_json::Value>,
     output_config: Option<&serde_json::Value>,
+    mapped_effort: MappedEffort,
 ) -> Option<serde_json::Value> {
     let thinking_type = thinking
         .and_then(|t| t.get("type"))
@@ -983,6 +999,9 @@ fn reasoning_effort_for(
         .and_then(|e| e.as_str());
     if let Some(effort) = declared {
         return Some(effort.into());
+    }
+    if mapped_effort == MappedEffort::Removed {
+        return None;
     }
     reasoning_effort_from_thinking(thinking?).map(Into::into)
 }
@@ -4079,7 +4098,7 @@ mod tests {
             "tool_choice".to_string(),
             serde_json::json!({"type": "none", "disable_parallel_tool_use": true}),
         );
-        translate_extras_to_openai_shape(&mut extra);
+        translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
         assert_eq!(extra.get("tool_choice"), Some(&serde_json::json!("none")));
         assert!(!extra.contains_key("parallel_tool_calls"));
     }
@@ -4113,7 +4132,7 @@ mod tests {
             "tool_choice".to_string(),
             serde_json::json!({"type": "any", "disable_parallel_tool_use": true}),
         );
-        translate_extras_to_openai_shape(&mut extra);
+        translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
         assert_eq!(
             extra.get("tool_choice"),
             Some(&serde_json::json!("required"))
@@ -4131,7 +4150,7 @@ mod tests {
             "tool_choice".to_string(),
             serde_json::json!({"type": "any", "disable_parallel_tool_use": true}),
         );
-        translate_extras_to_openai_shape(&mut extra);
+        translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
         assert!(!extra.contains_key("tool_choice"));
         assert!(!extra.contains_key("parallel_tool_calls"));
 
@@ -4145,7 +4164,7 @@ mod tests {
             "tool_choice".to_string(),
             serde_json::json!({"type": "auto"}),
         );
-        translate_extras_to_openai_shape(&mut extra);
+        translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
         assert!(!extra.contains_key("parallel_tool_calls"));
     }
 
@@ -4531,7 +4550,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        translate_extras_to_openai_shape(&mut extra);
+        translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
         assert!(extra.is_empty(), "expected all dropped, got: {extra:?}");
     }
 
@@ -4546,7 +4565,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        translate_extras_to_openai_shape(&mut extra);
+        translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
 
         assert_eq!(extra.get("stop"), Some(&serde_json::json!(["\n\nHuman:"])));
         assert!(!extra.contains_key("stop_sequences"));
@@ -4578,7 +4597,7 @@ mod tests {
         ];
         for case in cases {
             let mut extra = case.as_object().unwrap().clone();
-            translate_extras_to_openai_shape(&mut extra);
+            translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
             assert!(!extra.contains_key("tools"), "tools for {case}");
             assert!(!extra.contains_key("tool_choice"), "tool_choice for {case}");
         }
@@ -4590,7 +4609,7 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-        translate_extras_to_openai_shape(&mut extra);
+        translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
         assert!(extra.is_empty());
     }
 
@@ -4622,7 +4641,7 @@ mod tests {
         ] {
             let mut extra = serde_json::Map::new();
             extra.insert("thinking".to_string(), thinking.clone());
-            translate_extras_to_openai_shape(&mut extra);
+            translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
             assert_eq!(
                 extra.get("reasoning_effort").and_then(|v| v.as_str()),
                 expected,
@@ -4655,7 +4674,7 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-            translate_extras_to_openai_shape(&mut extra);
+            translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
             assert_eq!(
                 extra.get("reasoning_effort").and_then(|v| v.as_str()),
                 Some(expected),
@@ -4674,7 +4693,7 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-        translate_extras_to_openai_shape(&mut extra);
+        translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
         assert_eq!(
             extra.get("reasoning_effort"),
             Some(&serde_json::json!("xhigh"))
@@ -4691,7 +4710,7 @@ mod tests {
                 .as_object()
                 .unwrap()
                 .clone();
-            translate_extras_to_openai_shape(&mut extra);
+            translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
             assert_eq!(
                 extra.get("reasoning_effort").and_then(|v| v.as_str()),
                 Some(tier)
@@ -4709,7 +4728,46 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        translate_extras_to_openai_shape(&mut extra);
+        translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
+        assert_eq!(
+            extra.get("reasoning_effort"),
+            Some(&serde_json::json!("none"))
+        );
+    }
+
+    #[test]
+    fn extras_shape_removed_effort_is_not_rebuilt_from_thinking() {
+        // An effort-mapping entry took the effort off the request. The
+        // `thinking` block beside it is not a second statement of the
+        // same setting, so deriving an effort from it would hand the
+        // upstream exactly what the operator removed.
+        for thinking in [
+            serde_json::json!({"type": "adaptive"}),
+            serde_json::json!({"type": "enabled", "budget_tokens": 8192}),
+        ] {
+            let mut extra = serde_json::json!({"thinking": thinking})
+                .as_object()
+                .unwrap()
+                .clone();
+            translate_extras_to_openai_shape(&mut extra, MappedEffort::Removed);
+            assert!(
+                !extra.contains_key("reasoning_effort"),
+                "thinking = {thinking}, got: {extra:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extras_shape_disabled_thinking_outranks_a_removed_effort() {
+        // Turning reasoning off is the client's own instruction, and the
+        // operator's level mapping does not overrule it — the request
+        // still reaches the upstream asking for no reasoning rather than
+        // for the provider default.
+        let mut extra = serde_json::json!({"thinking": {"type": "disabled"}})
+            .as_object()
+            .unwrap()
+            .clone();
+        translate_extras_to_openai_shape(&mut extra, MappedEffort::Removed);
         assert_eq!(
             extra.get("reasoning_effort"),
             Some(&serde_json::json!("none"))
@@ -4725,7 +4783,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        translate_extras_to_openai_shape(&mut extra);
+        translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
         assert_eq!(
             extra.get("reasoning_effort"),
             Some(&serde_json::json!("high"))
@@ -4743,7 +4801,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        translate_extras_to_openai_shape(&mut extra);
+        translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
         assert!(extra.is_empty(), "expected all dropped, got: {extra:?}");
     }
 
@@ -4772,7 +4830,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        translate_extras_to_openai_shape(&mut extra);
+        translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
 
         let rf = extra.get("response_format").expect("response_format set");
         assert_eq!(rf["type"], serde_json::json!("json_schema"));
@@ -4804,7 +4862,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        translate_extras_to_openai_shape(&mut extra);
+        translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
         assert_eq!(
             extra["response_format"]["json_schema"]["schema"]["required"],
             serde_json::json!(["legacy"])
@@ -4822,7 +4880,7 @@ mod tests {
         ] {
             let mut extra = serde_json::Map::new();
             extra.insert("output_format".to_string(), output_format.clone());
-            translate_extras_to_openai_shape(&mut extra);
+            translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
             assert!(extra.is_empty(), "output_format = {output_format}");
         }
     }

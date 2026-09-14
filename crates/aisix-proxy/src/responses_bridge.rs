@@ -397,18 +397,47 @@ fn function_call_output_to_chat(output: &Value) -> ChatContent {
     // the value as an empty one erased the result. An array is ambiguous:
     // it is the Responses content-part shape when its elements are parts,
     // and a plain JSON array (a list of records, say) otherwise, which
-    // would parse as parts and come out empty. `null` and an absent
-    // output stay the empty string.
-    let is_json_value = match output {
-        Value::Object(_) | Value::Number(_) | Value::Bool(_) => true,
-        Value::Array(items) => !items.is_empty() && !items.iter().any(is_content_part),
-        _ => false,
-    };
-    if is_json_value {
-        return ChatContent {
-            text: serde_json::to_string(output).unwrap_or_default(),
-            blocks: None,
-        };
+    // would parse as parts and come out empty. An array that is both
+    // keeps its parts as text and serialises the rest in place, so no
+    // element the tool returned is silently dropped. `null` and an
+    // absent output stay the empty string.
+    match output {
+        Value::Object(_) | Value::Number(_) | Value::Bool(_) => {
+            return ChatContent {
+                text: serde_json::to_string(output).unwrap_or_default(),
+                blocks: None,
+            }
+        }
+        // An array holding no content part at all is one JSON value —
+        // a list of records, say — and is serialised whole.
+        Value::Array(items) if !items.is_empty() && !items.iter().any(is_content_part) => {
+            return ChatContent {
+                text: serde_json::to_string(output).unwrap_or_default(),
+                blocks: None,
+            }
+        }
+        // A mixed array is rendered element by element: every element
+        // the model would otherwise never see arrives as its own JSON,
+        // in the position the tool put it in.
+        Value::Array(items) => {
+            let mut text = String::new();
+            for item in items {
+                if is_content_part(item) {
+                    if let Some(s) = item.as_str() {
+                        text.push_str(s);
+                    } else if let Some(t) = item.get("text").and_then(Value::as_str) {
+                        text.push_str(t);
+                    }
+                    // A typed non-text part (an image, a file, audio) has
+                    // no text and no `tool`-role counterpart; it is the
+                    // one thing this role cannot carry.
+                } else {
+                    text.push_str(&serde_json::to_string(item).unwrap_or_default());
+                }
+            }
+            return ChatContent { text, blocks: None };
+        }
+        _ => {}
     }
     let mut content = responses_content_to_chat(output);
     content.blocks = None;
@@ -2617,6 +2646,28 @@ mod tests {
         assert_eq!(
             chat.messages.last().unwrap().content.as_deref(),
             Some("21C")
+        );
+
+        // A mixed array keeps its parts as text and serialises every
+        // element that is not one, in place — nothing the tool returned
+        // is dropped on the floor.
+        let body = json!({
+            "model": "m",
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": [
+                    {"type": "text", "text": "rows: "},
+                    42,
+                    {"total": 3},
+                    "plain",
+                ],
+            }],
+        });
+        let chat = responses_request_to_chat("m", &body);
+        assert_eq!(
+            chat.messages.last().unwrap().content.as_deref(),
+            Some(r#"rows: 42{"total":3}plain"#)
         );
 
         // An empty array is not a value worth serialising as "[]".

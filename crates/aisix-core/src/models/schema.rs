@@ -299,8 +299,10 @@ static REPORT_SCHEMAS: Lazy<Vec<(&'static str, Value)>> = Lazy::new(|| {
 /// `datadog` exporter carrying an `otlp_http` field) does not show up here —
 /// that is a malformed document, not a field from a newer build, and the
 /// write path rejects it. Map-valued fields (`headers`,
-/// `severity_threshold_by_category`) declare a value schema rather than
-/// properties, so their keys are never unknown.
+/// `severity_threshold_by_category`, `effort_mapping`) declare a value
+/// schema every key falls back to, so their keys are never unknown —
+/// including the one key `effort_mapping` additionally declares as a
+/// property.
 pub fn unknown_field_paths(resource: &str, value: &Value) -> Vec<String> {
     let Some((_, schema)) = REPORT_SCHEMAS.iter().find(|(name, _)| *name == resource) else {
         return Vec::new();
@@ -870,7 +872,44 @@ pub fn model_root_schema(strict: bool) -> Value {
     // these fields were required on the read path too, so relaxing only the
     // write path would leave a stored id-only reference dropping its row.
     apply_model_ref_alternatives(&mut schema);
+    apply_effort_mapping_tokens(&mut schema, strict);
     schema
+}
+
+/// State `effort_mapping`'s reserved forms on both contracts: a `null` value
+/// ("send this request with no effort field at all") and the empty-string
+/// key that stands for a request setting no effort in the first place.
+///
+/// `schemars` renders a map from its value type alone, so it cannot say
+/// that those two may not be combined — and `"": null` asks to remove a
+/// field the request never set, a rule that can never do anything. Pinning
+/// that one key to a string rejects the pair outright instead of storing a
+/// rule nothing reads.
+fn apply_effort_mapping_tokens(schema: &mut Value, strict: bool) {
+    let node = schema
+        .pointer_mut("/properties/effort_mapping")
+        .and_then(Value::as_object_mut)
+        .expect("model schema declares effort_mapping");
+    // An empty target value is refused on the write path only. It asks to
+    // send an effort the gateway itself reads back as "no effort set", so
+    // it is another rule that can never mean what it says — but `minLength`
+    // on the read schema would delete a stored row that carries one, and a
+    // row is worth more than the knob. `minLength` ignores a `null`, so the
+    // removal form is unaffected.
+    let value_schema = if strict {
+        json!({"type": ["string", "null"], "minLength": 1})
+    } else {
+        json!({"type": ["string", "null"]})
+    };
+    node.insert("additionalProperties".to_string(), value_schema);
+    let mut not_set_key = json!({
+        "description": "The entry for a request that sets no reasoning effort. Its value is sent upstream in place of the missing one, and may not be `null` — a request that sets no effort has no field to remove.",
+        "type": "string"
+    });
+    if strict {
+        not_set_key["minLength"] = json!(1);
+    }
+    node.insert("properties".to_string(), json!({"": not_set_key}));
 }
 
 /// Every `(type, name field, id field)` a model reference is written as.
@@ -3512,6 +3551,42 @@ mod tests {
         ] {
             assert!(validate_model(&virtual_model).is_err());
             validate_model_lenient(&virtual_model).unwrap();
+        }
+    }
+
+    /// The reserved forms of `effort_mapping`, and the one pair that is
+    /// refused on BOTH contracts: `""` means "the request set no effort"
+    /// and `null` means "send no effort field", so the two together are a
+    /// rule that can never do anything. Read-path rejection is deliberate —
+    /// nothing writes that pair, so a stored row carrying it is not a row
+    /// an older control plane left behind.
+    #[test]
+    fn effort_mapping_reserved_forms_are_accepted_except_the_empty_null_pair() {
+        let with = |mapping: Value| {
+            json!({
+                "display_name": "glm",
+                "provider": "openai",
+                "model_name": "glm-5.3",
+                "provider_key_id": "pk-1",
+                "effort_mapping": mapping
+            })
+        };
+
+        let ok = with(json!({"": "high", "*": "low", "medium": null}));
+        validate_model(&ok).unwrap();
+        validate_model_lenient(&ok).unwrap();
+
+        let bad = with(json!({"": null}));
+        assert!(validate_model(&bad).is_err());
+        assert!(validate_model_lenient(&bad).is_err());
+
+        // An empty target value is a write-path refusal only: it asks to
+        // send an effort the gateway reads back as "no effort set", but a
+        // stored row carrying one must still load rather than vanish.
+        for empty in [json!({"medium": ""}), json!({"": ""})] {
+            let doc = with(empty);
+            assert!(validate_model(&doc).is_err(), "{doc}");
+            validate_model_lenient(&doc).unwrap();
         }
     }
 

@@ -322,17 +322,49 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_prompt_caching: Option<AutoPromptCaching>,
 
-    /// Direct-model-only mapping from a client-requested reasoning effort to
-    /// the value sent upstream. The gateway applies one exact lookup after
-    /// resolving the final target; unlisted values pass through unchanged.
+    /// Direct-model-only mapping from a client-requested reasoning effort to the value sent upstream. After resolving the final target the gateway looks the requested effort up once — the exact entry first, then the `*` entry — and never looks the result up again. A requested value that matches neither is sent unchanged.
+    ///
+    /// Three entries are reserved. The empty-string key matches a request that sets no effort at all, meaning the effort field is absent, `null`, or empty, and its value is added to the outbound request. The `*` key matches any other present value that has no entry of its own, and never matches a request that sets no effort. A `null` value removes the effort field from the outbound request so the provider's own default applies; mapping `*` to `null` therefore strips the effort from every request whose value has no entry of its own. The empty-string key may not be mapped to `null`, because a request that sets no effort has nothing to remove, and no entry may be mapped to an empty value.
+    ///
+    /// On the Anthropic messages and token-counting endpoints only `output_config.effort` is read and rewritten. A `thinking` block is not an effort setting for this mapping, so a request that carries `thinking` but no `output_config.effort` sets no effort and the empty-string entry applies to it. When such a request is dispatched to a provider that does not accept the Anthropic protocol, the upstream reasoning effort is derived from the mapped `output_config.effort` when one is present and from `thinking` otherwise, except that an entry that removed the effort sends no effort at all. A request that sets `thinking.type: disabled` is never given an effort by this mapping: on the Anthropic protocol no entry writes a tier to it, though an entry that removes the effort still removes it, and on any other protocol it always sends the `none` effort.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort_mapping: Option<BTreeMap<String, String>>,
+    pub effort_mapping: Option<BTreeMap<String, Option<String>>>,
 
     /// Non-schema runtime id. Not part of the JSON payload — filled in by
     /// the snapshot loader from the etcd key path. Kept here so `Resource`
     /// can return a `&str` id.
     #[serde(skip)]
     pub(crate) runtime_id: String,
+}
+
+/// What a model's `effort_mapping` does to one request's reasoning effort,
+/// as resolved by [`Model::mapped_effort`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortAction<'a> {
+    /// No entry applies: the request's effort field goes upstream exactly
+    /// as it arrived, whether it was set or not.
+    Keep,
+    /// Send this effort upstream, adding the field when the request set
+    /// none.
+    Set(&'a str),
+    /// Drop the effort field from the outbound request so the provider's
+    /// own default applies.
+    Remove,
+}
+
+/// What a model's `effort_mapping` did to one request, carried alongside
+/// the rewritten request so a translation to another wire protocol can
+/// tell a request whose effort an entry deliberately removed from one
+/// that simply never stated an effort of its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MappedEffort {
+    /// The outbound request states whatever effort it carries, be that
+    /// the caller's own, one an entry wrote in, or none at all.
+    #[default]
+    AsWritten,
+    /// An entry removed the effort field: the outbound request states no
+    /// effort on purpose, and nothing may put one back.
+    Removed,
 }
 
 impl Model {
@@ -409,14 +441,30 @@ impl Model {
         stripped
     }
 
-    /// Return the configured upstream effort for one caller-supplied
-    /// value. This is deliberately a single exact lookup: a map such as
+    /// Resolve one request's reasoning effort against `effort_mapping`.
+    ///
+    /// `requested` is `None` when the request sets no effort — its carrier
+    /// field is absent, `null`, or an empty string — and `Some` for a
+    /// present, non-empty value. The two are distinct lookups: `""` is the
+    /// only key that matches the former, and `"*"` only ever matches the
+    /// latter.
+    ///
+    /// A present value resolves by exact key first and `"*"` second. The
+    /// result is never looked up again, so a map such as
     /// `low -> high, high -> max` rewrites `low` to `high`, never `max`.
-    pub fn mapped_effort<'a>(&'a self, effort: &str) -> Option<&'a str> {
-        self.effort_mapping
-            .as_ref()?
-            .get(effort)
-            .map(String::as_str)
+    pub fn mapped_effort(&self, requested: Option<&str>) -> EffortAction<'_> {
+        let Some(mapping) = self.effort_mapping.as_ref() else {
+            return EffortAction::Keep;
+        };
+        let rule = match requested {
+            None => mapping.get(""),
+            Some(effort) => mapping.get(effort).or_else(|| mapping.get("*")),
+        };
+        match rule {
+            None => EffortAction::Keep,
+            Some(None) => EffortAction::Remove,
+            Some(Some(mapped)) => EffortAction::Set(mapped),
+        }
     }
 
     /// This resource's own non-streaming deadline, as one level of the
@@ -840,9 +888,45 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(model.mapped_effort("medium"), Some("high"));
-        assert_eq!(model.mapped_effort("high"), Some("max"));
-        assert_eq!(model.mapped_effort("low"), None);
+        assert_eq!(
+            model.mapped_effort(Some("medium")),
+            EffortAction::Set("high")
+        );
+        assert_eq!(model.mapped_effort(Some("high")), EffortAction::Set("max"));
+        assert_eq!(model.mapped_effort(Some("low")), EffortAction::Keep);
+        assert_eq!(model.mapped_effort(None), EffortAction::Keep);
+    }
+
+    #[test]
+    fn effort_mapping_reserved_tokens_resolve_by_precedence() {
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "glm",
+            "provider": "openai",
+            "model_name": "glm-5.3",
+            "provider_key_id": "pk-1",
+            "effort_mapping": {
+                "": "high",
+                "*": "low",
+                "medium": serde_json::Value::Null
+            }
+        }))
+        .unwrap();
+
+        // A request that sets no effort takes the `""` entry, never `*`.
+        assert_eq!(model.mapped_effort(None), EffortAction::Set("high"));
+        // An exact entry wins over `*`, removal included.
+        assert_eq!(model.mapped_effort(Some("medium")), EffortAction::Remove);
+        assert_eq!(model.mapped_effort(Some("xl")), EffortAction::Set("low"));
+
+        let star_only: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "glm",
+            "provider": "openai",
+            "model_name": "glm-5.3",
+            "provider_key_id": "pk-1",
+            "effort_mapping": {"*": "low"}
+        }))
+        .unwrap();
+        assert_eq!(star_only.mapped_effort(None), EffortAction::Keep);
     }
 
     #[test]

@@ -612,7 +612,11 @@ async fn count_tokens_to_target(
     } else {
         aisix_provider_anthropic::strip_billing_header_attribution(body)
     };
-    let mut body = crate::effort_mapping::anthropic_request(body.as_ref(), model).into_owned();
+    // This route dispatches only to Anthropic-protocol upstreams, which
+    // read `output_config.effort` themselves, so the mapping outcome the
+    // cross-provider bridge needs has no consumer here.
+    let (mapped, _) = crate::effort_mapping::anthropic_request(body.as_ref(), model);
+    let mut body = mapped.into_owned();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
