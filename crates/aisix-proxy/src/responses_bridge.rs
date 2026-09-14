@@ -383,44 +383,52 @@ fn input_audio_block(part: &Value) -> Option<Value> {
 
 /// A `function_call_output.output` rendered as chat `tool` content.
 ///
-/// The chat `tool` role is text-first: it carries a string, or an array of
-/// parts. Only text and images translate — a file or audio part in a tool
-/// result has no `tool`-role counterpart and is dropped, and an image is
-/// forwarded as an `image_url` part, which the providers whose adapters
-/// accept multimodal tool results consume and a strict chat upstream does
-/// not. Text-only output stays a plain string.
+/// The chat `tool` role is text-only, so the output is always a plain
+/// string: OpenAI rejects a `tool` message carrying an `image_url` part
+/// outright ("Image URLs are only allowed for messages with role 'user'"),
+/// and the bridges that do not speak content blocks (Anthropic, Gemini,
+/// Bedrock) read the concatenated text anyway — so forwarding the image
+/// would turn a tool result that used to answer into a 400 without any
+/// upstream gaining the image. Non-text parts are dropped and their text
+/// siblings still reach the model.
 fn function_call_output_to_chat(output: &Value) -> ChatContent {
-    // A tool that returned JSON (an object, a number, a bool) reaches the
-    // upstream as that JSON serialised — a chat `tool` message carries a
-    // string, and rendering the value as an empty one erased the result.
-    // `null` stays the empty string.
-    match output {
-        Value::Object(_) | Value::Number(_) | Value::Bool(_) => {
-            return ChatContent {
-                text: serde_json::to_string(output).unwrap_or_default(),
-                blocks: None,
-            }
-        }
-        _ => {}
+    // A tool that returned JSON reaches the upstream as that JSON
+    // serialised — a chat `tool` message carries a string, and rendering
+    // the value as an empty one erased the result. An array is ambiguous:
+    // it is the Responses content-part shape when its elements are parts,
+    // and a plain JSON array (a list of records, say) otherwise, which
+    // would parse as parts and come out empty. `null` and an absent
+    // output stay the empty string.
+    let is_json_value = match output {
+        Value::Object(_) | Value::Number(_) | Value::Bool(_) => true,
+        Value::Array(items) => !items.is_empty() && !items.iter().any(is_content_part),
+        _ => false,
+    };
+    if is_json_value {
+        return ChatContent {
+            text: serde_json::to_string(output).unwrap_or_default(),
+            blocks: None,
+        };
     }
     let mut content = responses_content_to_chat(output);
-    let Some(blocks) = content.blocks.take() else {
-        return content;
-    };
-    let kept: Vec<Value> = blocks
-        .into_iter()
-        .filter(|b| {
-            matches!(
-                b.get("type").and_then(Value::as_str),
-                Some("text") | Some("image_url")
-            )
-        })
-        .collect();
-    content.blocks = kept
-        .iter()
-        .any(|b| b.get("type").and_then(Value::as_str) == Some("image_url"))
-        .then_some(kept);
+    content.blocks = None;
     content
+}
+
+/// Whether one array element is a Responses content part rather than a
+/// member of a plain JSON array: a bare string, a typed part this bridge
+/// maps, or anything carrying a `text` member.
+fn is_content_part(item: &Value) -> bool {
+    if item.is_string() {
+        return true;
+    }
+    if item.get("text").is_some_and(Value::is_string) {
+        return true;
+    }
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("input_text" | "output_text" | "text" | "input_image" | "input_file" | "input_audio")
+    )
 }
 
 /// Translate the Responses `text.format` object into the chat
@@ -922,18 +930,36 @@ impl ResponsesSseEncoder {
     }
 
     /// Adopt locally-estimated token counts as the client-visible usage,
-    /// for a bridged stream whose upstream never sent a usage frame. The
+    /// for a bridged stream whose upstream left them unreported. The
     /// internal usage record is filled from the same estimate, and a client
     /// reading `response.completed.usage` must not be told zero while the
-    /// record says otherwise (AISIX-Cloud#1074). A no-op once a real usage
-    /// frame landed, or once the terminal event has already gone out — the
-    /// client must never be handed numbers that contradict what it was sent.
+    /// record says otherwise (AISIX-Cloud#1074). Per counter, and only
+    /// into a zero: a number the upstream actually reported is never
+    /// overridden, and a frame that reported one counter and left the
+    /// other at zero still gets that zero filled — the record fills it
+    /// the same way, and the two must not disagree. A no-op once the
+    /// terminal event has gone out: the client must never be handed
+    /// numbers contradicting what it was already sent.
     pub fn set_estimated_usage(&mut self, prompt_tokens: u32, completion_tokens: u32) {
-        if self.usage_seen || self.finished {
+        if self.finished {
             return;
         }
-        self.prompt_tokens = self.prompt_tokens.max(prompt_tokens);
-        self.completion_tokens = self.completion_tokens.max(completion_tokens);
+        let mut filled = false;
+        if self.prompt_tokens == 0 && prompt_tokens > 0 {
+            self.prompt_tokens = prompt_tokens;
+            filled = true;
+        }
+        if self.completion_tokens == 0 && completion_tokens > 0 {
+            self.completion_tokens = completion_tokens;
+            filled = true;
+        }
+        if filled {
+            // A total the upstream reported beside a zero sub-counter no
+            // longer describes what the client is about to be told.
+            // Zeroing it makes the projection derive prompt + completion,
+            // the same arithmetic it uses when no total was reported.
+            self.total_tokens = 0;
+        }
     }
 
     fn usage_value(&self) -> Value {
@@ -2167,7 +2193,11 @@ mod tests {
     /// A tool result carrying an image forwards it as an `image_url` part;
     /// a text-only tool result stays a plain string.
     #[test]
-    fn tool_output_array_carries_text_and_image_parts() {
+    fn tool_output_array_keeps_its_text_and_drops_the_image() {
+        // OpenAI answers 400 "Image URLs are only allowed for messages
+        // with role 'user'" to a `tool` message carrying an image part,
+        // and no bridge reads blocks off a tool message, so the image is
+        // dropped and its text siblings still reach the model.
         let chat = responses_request_to_chat(
             "m",
             &json!({
@@ -2180,16 +2210,7 @@ mod tests {
         );
         assert!(matches!(chat.messages[0].role, Role::Tool));
         assert_eq!(chat.messages[0].content_str(), "screenshot:");
-        assert_eq!(
-            chat.messages[0].content_blocks.as_deref(),
-            Some(
-                [
-                    json!({"type": "text", "text": "screenshot:"}),
-                    json!({"type": "image_url", "image_url": {"url": "https://example.com/s.png"}}),
-                ]
-                .as_slice()
-            )
-        );
+        assert!(chat.messages[0].content_blocks.is_none());
     }
 
     #[test]
@@ -2561,6 +2582,50 @@ mod tests {
             chat.messages.last().unwrap().content.as_deref(),
             Some("21C")
         );
+    }
+
+    #[test]
+    fn a_json_array_tool_output_is_serialised_not_parsed_as_content_parts() {
+        // A tool returning a list of records is a JSON array, not the
+        // Responses content-part array it would otherwise be parsed as —
+        // which recognised no part and emptied the whole tool message.
+        let body = json!({
+            "model": "m",
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": [{"id": 1, "name": "x"}, {"id": 2, "name": "y"}],
+            }],
+        });
+        let chat = responses_request_to_chat("m", &body);
+        assert_eq!(
+            chat.messages.last().unwrap().content.as_deref(),
+            Some(r#"[{"id":1,"name":"x"},{"id":2,"name":"y"}]"#)
+        );
+
+        // An array that IS content parts keeps the part handling: its
+        // text reaches the model unquoted.
+        let body = json!({
+            "model": "m",
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": [{"type": "input_text", "text": "21C"}],
+            }],
+        });
+        let chat = responses_request_to_chat("m", &body);
+        assert_eq!(
+            chat.messages.last().unwrap().content.as_deref(),
+            Some("21C")
+        );
+
+        // An empty array is not a value worth serialising as "[]".
+        let body = json!({
+            "model": "m",
+            "input": [{"type": "function_call_output", "call_id": "c1", "output": []}],
+        });
+        let chat = responses_request_to_chat("m", &body);
+        assert_eq!(chat.messages.last().unwrap().content.as_deref(), Some(""));
     }
 
     #[test]
@@ -3204,6 +3269,32 @@ mod tests {
     /// The relay hands the encoder an estimate whenever it computed one, so
     /// a usage frame that landed WITHOUT a finish chunk — the shape an
     /// OpenAI-compatible upstream sends — must still win at force_finish.
+    #[test]
+    fn a_usage_frame_reporting_only_one_counter_still_gets_the_other_filled() {
+        // A relay that streams `{prompt_tokens: 3, completion_tokens: 0}`
+        // used to block the whole estimate, so the client read
+        // `output_tokens: 0` while the usage record — which fills per
+        // counter — billed the estimate.
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let _ = enc.next_events(&content_chunk("hi"));
+        let mut partial = UsageStats::new(3, 0);
+        partial.total_tokens = 3;
+        let _ = enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta::default(),
+            finish_reason: None,
+            usage: Some(partial),
+        });
+        enc.set_estimated_usage(3, 7);
+        let events = enc.force_finish();
+        let usage = &events.last().unwrap().data["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 3, "the reported counter stands");
+        assert_eq!(usage["output_tokens"], 7, "the zero was filled");
+        // The total the frame carried described the pre-fill counters.
+        assert_eq!(usage["total_tokens"], 10);
+    }
+
     #[test]
     fn set_estimated_usage_is_ignored_once_a_usage_frame_landed() {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);

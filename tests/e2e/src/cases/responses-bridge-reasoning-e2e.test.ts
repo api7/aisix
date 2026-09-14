@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startMockSls,
@@ -277,23 +278,34 @@ describe("/v1/responses bridged onto a chat upstream: reasoning + client-visible
     });
   }
 
+  /**
+   * One gate for the whole file: the caller key is seeded last, so it
+   * authenticating implies every resource before it is in the snapshot.
+   * It spends no token budget and exercises none of the behavior under
+   * test, so a failure here reads as "config never propagated" rather
+   * than as a silent timeout in place of an assertion — and it leaves no
+   * probe request on the mock upstreams the tests then inspect.
+   */
+  async function ready(): Promise<void> {
+    const probe = new ProxyClient(app!.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(async () => {
+      const res = await probe.listModels();
+      if (res.status !== 200) return false;
+      const data = (res.body as { data?: Array<{ id?: string }> }).data ?? [];
+      return [
+        "bridge-reason-stream",
+        "bridge-reason-nonstream",
+        "bridge-no-usage-stream",
+      ].every((m) => data.some((entry) => entry.id === m));
+    });
+  }
+
   test("streaming: reasoning_content deltas become a reasoning item ahead of the message item", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
       return;
     }
-    await waitConfigPropagation(async () => {
-      try {
-        const probe = await post({
-          model: "bridge-reason-stream",
-          input: "ready",
-          stream: true,
-        });
-        return probe.status === 200 && (await probe.text()).includes("response.completed");
-      } catch {
-        return false;
-      }
-    });
+    await ready();
 
     const res = await post({
       model: "bridge-reason-stream",
@@ -366,14 +378,7 @@ describe("/v1/responses bridged onto a chat upstream: reasoning + client-visible
       ctx.skip();
       return;
     }
-    await waitConfigPropagation(async () => {
-      try {
-        const probe = await post({ model: "bridge-reason-nonstream", input: "ready" });
-        return probe.status === 200 && (await probe.json()).object === "response";
-      } catch {
-        return false;
-      }
-    });
+    await ready();
 
     const res = await post({
       model: "bridge-reason-nonstream",
@@ -396,18 +401,7 @@ describe("/v1/responses bridged onto a chat upstream: reasoning + client-visible
       ctx.skip();
       return;
     }
-    await waitConfigPropagation(async () => {
-      try {
-        const probe = await post({
-          model: "bridge-no-usage-stream",
-          input: "ready",
-          stream: true,
-        });
-        return probe.status === 200 && (await probe.text()).includes("response.completed");
-      } catch {
-        return false;
-      }
-    });
+    await ready();
 
     const res = await post({
       model: "bridge-no-usage-stream",

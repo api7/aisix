@@ -2561,6 +2561,11 @@ async fn responses_cross_provider_to_target(
                 u.usage_estimated = true;
                 resp.usage.prompt_tokens = filled.prompt_tokens;
                 resp.usage.completion_tokens = filled.completion_tokens;
+                // A total the upstream reported beside a zero sub-counter
+                // no longer adds up once that zero is filled; zeroing it
+                // makes the projection derive prompt + completion, the
+                // same arithmetic it uses when no total was reported.
+                resp.usage.total_tokens = 0;
             }
         }
         u

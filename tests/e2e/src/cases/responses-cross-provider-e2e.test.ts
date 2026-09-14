@@ -348,6 +348,10 @@ describe("/v1/responses cross-provider → Anthropic (#825)", () => {
           },
         },
       ],
+      parallel_tool_calls: false,
+      // Translated to chat `response_format`, which has no Anthropic
+      // counterpart — it must be dropped, not flattened onto the body.
+      text: { format: { type: "json_object" } },
     });
     expect(res.status).toBe(200);
 
@@ -383,7 +387,16 @@ describe("/v1/responses cross-provider → Anthropic (#825)", () => {
     expect(anthropicReq.tools[0].input_schema.type).toBe("object");
 
     // No OpenAI-only Responses knobs leaked onto the Anthropic wire.
+    // Anthropic rejects unknown top-level parameters, so each of these
+    // would be a 400 rather than a degradation.
     expect(anthropicReq.reasoning).toBeUndefined();
     expect(anthropicReq.store).toBeUndefined();
+    expect(anthropicReq.response_format).toBeUndefined();
+    expect(anthropicReq.parallel_tool_calls).toBeUndefined();
+    // …and the one that does have a counterpart arrives as that.
+    expect(anthropicReq.tool_choice).toEqual({
+      type: "auto",
+      disable_parallel_tool_use: true,
+    });
   });
 });

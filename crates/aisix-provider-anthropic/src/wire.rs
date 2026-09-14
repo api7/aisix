@@ -466,10 +466,14 @@ pub fn build_request<'a>(
         .and(requested_tool_choice)
         .and_then(translate_openai_tool_choice_to_anthropic);
     if serial_tool_calls && tools.is_some() {
-        // With no choice of the caller's to carry it, the flag needs
-        // Anthropic's own default to ride on. `none` is left alone: it
-        // forbids tool calls outright, so there is no parallelism to
-        // disable and Anthropic rejects the pair.
+        // The flag is a member of `tool_choice`, so with no translated
+        // choice to carry it — the caller sent none, or sent one this
+        // bridge discards — it rides Anthropic's own default. That keeps
+        // the caller's "one call at a time" even when their choice went
+        // nowhere, and `auto` is what Anthropic would have applied
+        // anyway. `none` is left alone: it forbids tool calls outright,
+        // so there is no parallelism to disable and Anthropic rejects
+        // the pair.
         let carrier = tool_choice.get_or_insert_with(|| serde_json::json!({"type": "auto"}));
         if carrier.get("type").and_then(|t| t.as_str()) != Some("none") {
             if let Some(obj) = carrier.as_object_mut() {
@@ -478,6 +482,15 @@ pub fn build_request<'a>(
         }
     }
     translate_reasoning_effort_to_anthropic(&mut extras);
+    // `response_format` is the OpenAI spelling of structured outputs and
+    // has no top-level Anthropic counterpart, so it would ride `extra`
+    // onto the body and be rejected as an unknown parameter. It reaches
+    // this bridge from a chat caller and from the `/v1/responses`
+    // translation of `text.format`; both are dropped here, as every
+    // OpenAI-only knob with no provider-neutral equivalent is.
+    if extras.remove("response_format").is_some() {
+        tracing::debug!("dropping response_format: no Anthropic counterpart on this path");
+    }
     AnthropicRequest {
         model: upstream_model,
         messages,
@@ -910,8 +923,12 @@ pub fn translate_extras_to_openai_shape(extra: &mut serde_json::Map<String, serd
 
     // Anthropic carries "one tool call at a time" inside `tool_choice`;
     // chat carries it as its own boolean. It travels under the same
-    // condition as `tool_choice` itself.
-    if serial_tool_calls && extra.contains_key("tools") {
+    // condition as `tool_choice` itself, and skips a `none` choice for
+    // the same reason the forward direction does.
+    if serial_tool_calls
+        && extra.contains_key("tools")
+        && extra.get("tool_choice").and_then(|c| c.as_str()) != Some("none")
+    {
         extra.insert("parallel_tool_calls".to_string(), false.into());
     }
 
@@ -1911,21 +1928,12 @@ fn tool_message_from_tool_result(block: &serde_json::Value) -> ChatMessage {
     let (content, content_blocks) = match block.get("content") {
         Some(Value::String(s)) => (Some(s.clone()), None),
         Some(Value::Array(items)) => {
-            let mut parts = Vec::new();
             let mut text = String::new();
-            let mut non_text = false;
             for item in items {
                 match item.get("type").and_then(Value::as_str) {
                     Some("text") => {
                         if let Some(t) = item.get("text").and_then(Value::as_str) {
                             text.push_str(t);
-                            parts.push(serde_json::json!({"type": "text", "text": t}));
-                        }
-                    }
-                    Some("image") => {
-                        if let Some(p) = openai_media_part_from_anthropic(item) {
-                            parts.push(p);
-                            non_text = true;
                         }
                     }
                     other => {
@@ -1936,12 +1944,14 @@ fn tool_message_from_tool_result(block: &serde_json::Value) -> ChatMessage {
                     }
                 }
             }
-            if non_text {
-                (Some(text), Some(parts))
-            } else {
-                // All-text (or empty) collapses to a plain string.
-                (Some(text), None)
-            }
+            // Text only, always. OpenAI rejects a `tool` message carrying
+            // an image part outright ("Image URLs are only allowed for
+            // messages with role 'user'"), and no bridge reads blocks off
+            // a tool message — an Anthropic target filters a tool result
+            // back down to its text blocks — so forwarding the image
+            // turned a tool result that used to answer into a 400 without
+            // any upstream gaining the image.
+            (Some(text), None)
         }
         _ => (Some(String::new()), None),
     };
@@ -2478,28 +2488,36 @@ impl AnthropicSseEncoder {
         events
     }
 
+    /// Adopt locally-estimated token counts as the client-visible usage,
+    /// for a bridged stream whose upstream never sent a usage frame. The
+    /// internal usage record is filled from the same estimate, and a client
+    /// reading the closing `message_delta` must not be told
+    /// `output_tokens: 0` for a response it can read the text of
+    /// (AISIX-Cloud#1074). Per counter, and only into a zero: a number
+    /// the upstream actually reported is never overridden, and a frame
+    /// that reported one counter and left the other at zero still gets
+    /// that zero filled — the record fills it the same way, and the two
+    /// must not disagree. A no-op once the closing pair has gone out:
+    /// the client must never be handed numbers contradicting what it was
+    /// already sent.
+    pub fn set_estimated_usage(&mut self, prompt_tokens: u32, completion_tokens: u32) {
+        if self.finished {
+            return;
+        }
+        if self.seen_input_tokens == 0 {
+            self.seen_input_tokens = prompt_tokens;
+        }
+        if self.seen_output_tokens == 0 {
+            self.seen_output_tokens = completion_tokens;
+        }
+    }
+
     /// The closing `message_delta` + `message_stop` pair, carrying the
     /// best-known cumulative usage. `input_tokens` is included when
     /// known — on a translated stream `message_start` fires before any
     /// usage frame exists and always reports 0, so this is the only
     /// place the client can learn the prompt token count. The same goes
     /// for the cache counters (AISIX-Cloud#1405).
-    /// Adopt locally-estimated token counts as the client-visible usage,
-    /// for a bridged stream whose upstream never sent a usage frame. The
-    /// internal usage record is filled from the same estimate, and a client
-    /// reading the closing `message_delta` must not be told
-    /// `output_tokens: 0` for a response it can read the text of
-    /// (AISIX-Cloud#1074). A no-op once a real usage frame landed, or once
-    /// the closing pair has already gone out — the client must never be
-    /// handed numbers that contradict what it was sent.
-    pub fn set_estimated_usage(&mut self, prompt_tokens: u32, completion_tokens: u32) {
-        if self.usage_seen || self.finished {
-            return;
-        }
-        self.seen_input_tokens = self.seen_input_tokens.max(prompt_tokens);
-        self.seen_output_tokens = self.seen_output_tokens.max(completion_tokens);
-    }
-
     fn closing_pair(&mut self, stop_reason: &'static str) -> Vec<AnthropicSseEvent> {
         let input = AnthropicInputUsage::from_usage(&UsageStats {
             prompt_tokens: self.seen_input_tokens,
@@ -4023,6 +4041,50 @@ mod tests {
     }
 
     #[test]
+    fn build_request_drops_response_format_instead_of_flattening_it() {
+        // Anthropic rejects unknown top-level parameters, and
+        // `response_format` has no counterpart there. It reaches this
+        // bridge both from a chat caller and from the `/v1/responses`
+        // translation of `text.format`.
+        let req = ChatFormat {
+            extra: {
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "response_format".to_string(),
+                    serde_json::json!({"type": "json_schema", "json_schema": {"name": "a"}}),
+                );
+                m.insert("custom_field".to_string(), serde_json::json!("kept"));
+                m
+            },
+            ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+        };
+        let (_system, messages) = split_system(&req).unwrap();
+        let built = build_request(&req, "c-name", None, messages, false);
+        assert!(!built.extra.contains_key("response_format"));
+        assert_eq!(
+            built.extra.get("custom_field"),
+            Some(&serde_json::json!("kept"))
+        );
+    }
+
+    #[test]
+    fn anthropic_none_choice_yields_no_chat_parallel_tool_calls() {
+        // The mirror of the forward direction's `none` guard.
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "tools".to_string(),
+            serde_json::json!([{"name": "get_time", "input_schema": {"type": "object"}}]),
+        );
+        extra.insert(
+            "tool_choice".to_string(),
+            serde_json::json!({"type": "none", "disable_parallel_tool_use": true}),
+        );
+        translate_extras_to_openai_shape(&mut extra);
+        assert_eq!(extra.get("tool_choice"), Some(&serde_json::json!("none")));
+        assert!(!extra.contains_key("parallel_tool_calls"));
+    }
+
+    #[test]
     fn build_request_drops_parallel_tool_calls_when_no_tool_survives_translation() {
         let req = ChatFormat {
             extra: {
@@ -5313,6 +5375,27 @@ mod tests {
     /// including a usage frame that landed while the stream was still open,
     /// before the closing pair was built.
     #[test]
+    fn sse_encoder_partial_usage_frame_still_gets_the_zero_counter_filled() {
+        // The sibling of the `/v1/responses` case: a frame carrying an
+        // input count and a zero output count used to block the whole
+        // estimate, leaving the client `output_tokens: 0` against a bill
+        // computed from it.
+        let mut enc = AnthropicSseEncoder::new("msg_01", "alias", 0);
+        let mut with_usage = delta_chunk("hi");
+        with_usage.usage = Some(UsageStats::new(5, 0));
+        let _ = enc.next_events(&with_usage);
+
+        enc.set_estimated_usage(5, 9);
+        let events = enc.force_finish();
+        let delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("closing pair emitted");
+        assert_eq!(delta.data["usage"]["input_tokens"], 5);
+        assert_eq!(delta.data["usage"]["output_tokens"], 9);
+    }
+
+    #[test]
     fn sse_encoder_set_estimated_usage_is_ignored_once_a_usage_frame_landed() {
         let mut enc = AnthropicSseEncoder::new("msg_01", "alias", 0);
         let mut with_usage = delta_chunk("hi");
@@ -5773,7 +5856,7 @@ mod tests {
     }
 
     #[test]
-    fn inbound_tool_result_with_image_keeps_combined_parts() {
+    fn inbound_tool_result_with_image_keeps_its_text_and_drops_the_image() {
         let body = serde_json::json!({
             "model": "claude",
             "messages": [{"role": "user", "content": [
@@ -5788,10 +5871,13 @@ mod tests {
         let chat = parse_inbound_request(&body).unwrap();
         let tool_msg = &chat.messages[0];
         assert_eq!(tool_msg.role, Role::Tool);
-        let parts = tool_msg.content_blocks.as_ref().unwrap();
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0]["type"], "text");
-        assert_eq!(parts[1]["type"], "image_url");
+        // OpenAI answers 400 "Image URLs are only allowed for messages
+        // with role 'user'" to a `tool` message carrying an image part,
+        // and an Anthropic target filters a tool result back down to its
+        // text blocks — so the image goes nowhere either way and must
+        // not cost the request.
+        assert_eq!(tool_msg.content_str(), "screenshot:");
+        assert!(tool_msg.content_blocks.is_none());
     }
 
     #[test]
