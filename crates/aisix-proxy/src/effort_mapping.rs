@@ -11,8 +11,9 @@ enum Carrier<'a> {
     NotSet,
     /// A present, non-empty effort.
     Value(&'a str),
-    /// Present but not a string. Not an effort this mapping can read, and
-    /// not ours to rewrite — the upstream answers for it.
+    /// An effort this mapping does not act on: a carrier value that is not
+    /// a string, a carrier whose enclosing object is not one, or an effort
+    /// the request stated some other way. Left exactly as it arrived.
     Foreign,
 }
 
@@ -63,13 +64,60 @@ pub(crate) fn chat_request<'a>(request: &'a ChatFormat, model: &Model) -> Cow<'a
 }
 
 /// Apply the final direct target's mapping to an Anthropic Messages request.
+///
+/// `output_config.effort` is not the only way one of these requests states
+/// an effort. `reasoning_effort_for` — the resolver that decides what a
+/// cross-provider dispatch actually sends upstream — also reads a
+/// `thinking` block: `disabled` resolves to `none`, `enabled` to a tier
+/// bucketed from its budget, `adaptive` to the provider's own default. A
+/// request carrying one has therefore set an effort, and the `""` entry
+/// exists for requests that set none, so it must not fire there. Injecting
+/// would override the caller's own budget, because a declared
+/// `output_config.effort` outranks `thinking` in that resolver, and it
+/// would build the `disabled`-plus-tier pair
+/// `translate_reasoning_effort_to_anthropic` deliberately never builds.
+///
+/// The tier a `thinking` block expresses takes no part in MATCHING: exact
+/// entries and `"*"` still read and rewrite `output_config.effort` alone,
+/// which is the mapping's existing scope.
 pub(crate) fn anthropic_request<'a>(body: &'a Value, model: &Model) -> Cow<'a, Value> {
-    json_request(body, model, "output_config", "effort")
+    let mut carrier = json_carrier(body, "output_config", "effort");
+    if matches!(carrier, Carrier::NotSet) && states_effort_via_thinking(body) {
+        carrier = Carrier::Foreign;
+    }
+    json_request(body, model, "output_config", "effort", carrier)
+}
+
+/// Whether a `thinking` block states an effort of its own — the three
+/// shapes `reasoning_effort_for` (in `aisix-provider-anthropic`) resolves
+/// to a tier.
+fn states_effort_via_thinking(body: &Value) -> bool {
+    matches!(
+        body.get("thinking")
+            .and_then(|thinking| thinking.get("type"))
+            .and_then(Value::as_str),
+        Some("disabled" | "enabled" | "adaptive")
+    )
 }
 
 /// Apply the final direct target's mapping to an OpenAI Responses request.
 pub(crate) fn responses_request<'a>(body: &'a Value, model: &Model) -> Cow<'a, Value> {
-    json_request(body, model, "reasoning", "effort")
+    let carrier = json_carrier(body, "reasoning", "effort");
+    json_request(body, model, "reasoning", "effort", carrier)
+}
+
+/// Read the effort one nested carrier states. A body or an enclosing value
+/// that is not an object is [`Carrier::Foreign`], which keeps the request
+/// borrowed rather than rewritten.
+fn json_carrier<'a>(body: &'a Value, parent: &str, leaf: &str) -> Carrier<'a> {
+    let Some(fields) = body.as_object() else {
+        return Carrier::Foreign;
+    };
+    match fields.get(parent) {
+        None | Some(Value::Null) => Carrier::NotSet,
+        Some(Value::Object(nested)) => read_carrier(nested.get(leaf)),
+        Some(_) => Carrier::Foreign,
+    }
 }
 
 /// The shared body rewrite for the two carriers that nest their effort one
@@ -77,15 +125,13 @@ pub(crate) fn responses_request<'a>(body: &'a Value, model: &Model) -> Cow<'a, V
 /// the request did not set, and dropped again when removing the effort
 /// empties it — a bare `{"reasoning": {}}` is not what the caller sent.
 /// Sibling keys (`reasoning.summary`) are never touched.
-fn json_request<'a>(body: &'a Value, model: &Model, parent: &str, leaf: &str) -> Cow<'a, Value> {
-    let Some(fields) = body.as_object() else {
-        return Cow::Borrowed(body);
-    };
-    let carrier = match fields.get(parent) {
-        None | Some(Value::Null) => Carrier::NotSet,
-        Some(Value::Object(nested)) => read_carrier(nested.get(leaf)),
-        Some(_) => Carrier::Foreign,
-    };
+fn json_request<'a>(
+    body: &'a Value,
+    model: &Model,
+    parent: &str,
+    leaf: &str,
+    carrier: Carrier<'_>,
+) -> Cow<'a, Value> {
     match resolve(carrier, model) {
         EffortAction::Keep => Cow::Borrowed(body),
         EffortAction::Set(mapped) if already_sends(carrier, mapped) => Cow::Borrowed(body),
@@ -93,7 +139,7 @@ fn json_request<'a>(body: &'a Value, model: &Model, parent: &str, leaf: &str) ->
             let mut outbound = body.clone();
             let root = outbound
                 .as_object_mut()
-                .expect("body is an object, checked before cloning");
+                .expect("a non-object body reads as Foreign, which never reaches here");
             match root.get_mut(parent) {
                 Some(Value::Object(nested)) => {
                     nested.insert(leaf.to_string(), Value::String(mapped.to_string()));
@@ -108,7 +154,7 @@ fn json_request<'a>(body: &'a Value, model: &Model, parent: &str, leaf: &str) ->
             let mut outbound = body.clone();
             let root = outbound
                 .as_object_mut()
-                .expect("body is an object, checked before cloning");
+                .expect("a non-object body reads as Foreign, which never reaches here");
             if let Some(Value::Object(nested)) = root.get_mut(parent) {
                 nested.remove(leaf);
                 if nested.is_empty() {
@@ -310,6 +356,96 @@ mod tests {
             chat_request(&chat, &star_only).extra["reasoning_effort"],
             ""
         );
+    }
+
+    /// A `thinking` block is an effort statement of its own, so the `""`
+    /// entry does not treat the request as setting none — whichever of the
+    /// three tier-resolving shapes it uses.
+    #[test]
+    fn the_not_set_entry_skips_a_request_that_states_effort_via_thinking() {
+        let model = token_model();
+
+        for thinking in [
+            json!({"type": "enabled", "budget_tokens": 8192}),
+            json!({"type": "disabled"}),
+            json!({"type": "adaptive"}),
+        ] {
+            for leaf in [None, Some(json!(null)), Some(json!(""))] {
+                let mut body = json!({"thinking": thinking.clone()});
+                if let Some(leaf) = leaf {
+                    body["output_config"] = json!({"effort": leaf});
+                }
+                assert!(
+                    matches!(anthropic_request(&body, &model), Cow::Borrowed(_)),
+                    "{body}"
+                );
+            }
+        }
+
+        // A `thinking` shape that resolves to no tier is not a statement,
+        // and neither is one on the Responses carrier.
+        let body = json!({"thinking": {"type": "something_else"}});
+        assert_eq!(
+            anthropic_request(&body, &model)["output_config"]["effort"],
+            "high"
+        );
+        let body = json!({"thinking": {"type": "enabled", "budget_tokens": 8192}});
+        assert_eq!(
+            responses_request(&body, &model)["reasoning"]["effort"],
+            "high"
+        );
+    }
+
+    /// The effort a `thinking` block states takes no part in matching: an
+    /// `output_config.effort` beside it is mapped exactly as it would be
+    /// alone.
+    #[test]
+    fn thinking_does_not_change_how_a_declared_effort_maps() {
+        let model = token_model();
+
+        let body = json!({
+            "thinking": {"type": "enabled", "budget_tokens": 8192},
+            "output_config": {"effort": "xl"}
+        });
+        assert_eq!(
+            anthropic_request(&body, &model)["output_config"]["effort"],
+            "low"
+        );
+
+        let body = json!({
+            "thinking": {"type": "enabled", "budget_tokens": 8192},
+            "output_config": {"effort": "medium"}
+        });
+        let mapped = anthropic_request(&body, &model);
+        assert!(mapped.get("output_config").is_none());
+        assert!(mapped.get("thinking").is_some());
+    }
+
+    /// `*` mapped to `null` strips the effort from every request whose
+    /// value has no entry of its own, and still leaves a not-set one alone.
+    #[test]
+    fn wildcard_mapped_to_null_removes_every_unlisted_value() {
+        let model: Model = serde_json::from_value(json!({
+            "display_name": "glm",
+            "provider": "openai",
+            "model_name": "glm-5.3",
+            "provider_key_id": "pk-1",
+            "effort_mapping": {"*": null, "medium": "high"}
+        }))
+        .unwrap();
+
+        let body = json!({"reasoning": {"effort": "xl", "summary": "auto"}});
+        assert_eq!(
+            responses_request(&body, &model)["reasoning"],
+            json!({"summary": "auto"})
+        );
+        let body = json!({"reasoning": {"effort": "medium"}});
+        assert_eq!(
+            responses_request(&body, &model)["reasoning"]["effort"],
+            "high"
+        );
+        let body = json!({});
+        assert!(matches!(responses_request(&body, &model), Cow::Borrowed(_)));
     }
 
     /// Without a `""` entry, a request that sets no effort is untouched —

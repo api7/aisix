@@ -872,7 +872,7 @@ pub fn model_root_schema(strict: bool) -> Value {
     // these fields were required on the read path too, so relaxing only the
     // write path would leave a stored id-only reference dropping its row.
     apply_model_ref_alternatives(&mut schema);
-    apply_effort_mapping_tokens(&mut schema);
+    apply_effort_mapping_tokens(&mut schema, strict);
     schema
 }
 
@@ -885,24 +885,31 @@ pub fn model_root_schema(strict: bool) -> Value {
 /// field the request never set, a rule that can never do anything. Pinning
 /// that one key to a string rejects the pair outright instead of storing a
 /// rule nothing reads.
-fn apply_effort_mapping_tokens(schema: &mut Value) {
+fn apply_effort_mapping_tokens(schema: &mut Value, strict: bool) {
     let node = schema
         .pointer_mut("/properties/effort_mapping")
         .and_then(Value::as_object_mut)
         .expect("model schema declares effort_mapping");
-    node.insert(
-        "additionalProperties".to_string(),
-        json!({"type": ["string", "null"]}),
-    );
-    node.insert(
-        "properties".to_string(),
-        json!({
-            "": {
-                "description": "The entry for a request that sets no reasoning effort. Its value is sent upstream in place of the missing one, and may not be `null` — a request that sets no effort has no field to remove.",
-                "type": "string"
-            }
-        }),
-    );
+    // An empty target value is refused on the write path only. It asks to
+    // send an effort the gateway itself reads back as "no effort set", so
+    // it is another rule that can never mean what it says — but `minLength`
+    // on the read schema would delete a stored row that carries one, and a
+    // row is worth more than the knob. `minLength` ignores a `null`, so the
+    // removal form is unaffected.
+    let value_schema = if strict {
+        json!({"type": ["string", "null"], "minLength": 1})
+    } else {
+        json!({"type": ["string", "null"]})
+    };
+    node.insert("additionalProperties".to_string(), value_schema);
+    let mut not_set_key = json!({
+        "description": "The entry for a request that sets no reasoning effort. Its value is sent upstream in place of the missing one, and may not be `null` — a request that sets no effort has no field to remove.",
+        "type": "string"
+    });
+    if strict {
+        not_set_key["minLength"] = json!(1);
+    }
+    node.insert("properties".to_string(), json!({"": not_set_key}));
 }
 
 /// Every `(type, name field, id field)` a model reference is written as.
@@ -3572,6 +3579,15 @@ mod tests {
         let bad = with(json!({"": null}));
         assert!(validate_model(&bad).is_err());
         assert!(validate_model_lenient(&bad).is_err());
+
+        // An empty target value is a write-path refusal only: it asks to
+        // send an effort the gateway reads back as "no effort set", but a
+        // stored row carrying one must still load rather than vanish.
+        for empty in [json!({"medium": ""}), json!({"": ""})] {
+            let doc = with(empty);
+            assert!(validate_model(&doc).is_err(), "{doc}");
+            validate_model_lenient(&doc).unwrap();
+        }
     }
 
     #[test]

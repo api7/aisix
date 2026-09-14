@@ -315,6 +315,13 @@ describe("direct-model effort mapping", () => {
     // copies the caller's effort only when there is one, so a caller that
     // sets none leaves the judge request for the `""` entry to fill.
     await seed.createModel({
+      display_name: "effort-tokens-strip",
+      provider: "openai",
+      model_name: "glm-tokens-strip-wire",
+      provider_key_id: tokensOpenaiKey.id,
+      effort_mapping: { "*": null, medium: "high" },
+    });
+    await seed.createModel({
       display_name: "effort-tokens-panel",
       provider: "openai",
       model_name: "glm-tokens-panel-wire",
@@ -360,6 +367,7 @@ describe("direct-model effort mapping", () => {
         "effort-tokens-anthropic",
         "effort-tokens-count",
         "effort-tokens-ensemble",
+        "effort-tokens-strip",
       ],
     });
     const proxy = new ProxyClient(app.proxyUrl, API_KEY);
@@ -867,6 +875,110 @@ describe("direct-model effort mapping", () => {
     ).toBe("high");
   });
 
+  test("leaves a thinking-stated effort for the upstream to resolve", async (ctx) => {
+    if (!etcdReachable || !app || !tokensAnthropic || !tokensCount) {
+      ctx.skip();
+      return;
+    }
+
+    // `thinking` states an effort of its own, so the `""` entry must not
+    // treat these as requests that set none — whichever shape they use.
+    for (const thinking of [
+      { type: "enabled", budget_tokens: 8192 },
+      { type: "disabled" },
+      { type: "adaptive" },
+    ]) {
+      let baseline = tokensAnthropic.receivedRequests.length;
+      await post(
+        "/v1/messages",
+        {
+          model: "effort-tokens-anthropic",
+          max_tokens: 64,
+          messages: [{ role: "user", content: "hello" }],
+          thinking,
+        },
+        "anthropic",
+      );
+      const sent = receivedSince(tokensAnthropic, baseline, "/v1/messages");
+      expect(sent, JSON.stringify(thinking)).not.toHaveProperty(
+        "output_config",
+      );
+      expect(sent.thinking, JSON.stringify(thinking)).toEqual(thinking);
+
+      baseline = tokensCount.receivedRequests.length;
+      await post(
+        "/v1/messages/count_tokens",
+        {
+          model: "effort-tokens-count",
+          messages: [{ role: "user", content: "hello" }],
+          thinking,
+        },
+        "anthropic",
+      );
+      expect(
+        receivedSince(tokensCount, baseline, "/v1/messages/count_tokens"),
+        JSON.stringify(thinking),
+      ).not.toHaveProperty("output_config");
+    }
+
+    // The effort a `thinking` block states takes no part in matching: an
+    // `output_config.effort` beside it maps exactly as it would alone.
+    const baseline = tokensAnthropic.receivedRequests.length;
+    await post(
+      "/v1/messages",
+      {
+        model: "effort-tokens-anthropic",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hello" }],
+        thinking: { type: "enabled", budget_tokens: 8192 },
+        output_config: { effort: "xl" },
+      },
+      "anthropic",
+    );
+    expect(
+      receivedSince(tokensAnthropic, baseline, "/v1/messages").output_config,
+    ).toEqual({ effort: "low" });
+  });
+
+  test("strips the effort from every unlisted value when the wildcard maps to null", async (ctx) => {
+    if (!etcdReachable || !app || !tokensOpenai) {
+      ctx.skip();
+      return;
+    }
+
+    let baseline = tokensOpenai.receivedRequests.length;
+    await post("/v1/chat/completions", {
+      model: "effort-tokens-strip",
+      messages: [{ role: "user", content: "hello" }],
+      reasoning_effort: "xl",
+    });
+    expect(
+      receivedSince(tokensOpenai, baseline, "/v1/chat/completions"),
+    ).not.toHaveProperty("reasoning_effort");
+
+    // An exact entry still outranks the wildcard, and a request that sets
+    // no effort is still not the wildcard's business.
+    baseline = tokensOpenai.receivedRequests.length;
+    await post("/v1/chat/completions", {
+      model: "effort-tokens-strip",
+      messages: [{ role: "user", content: "hello" }],
+      reasoning_effort: "medium",
+    });
+    expect(
+      receivedSince(tokensOpenai, baseline, "/v1/chat/completions")
+        .reasoning_effort,
+    ).toBe("high");
+
+    baseline = tokensOpenai.receivedRequests.length;
+    await post("/v1/chat/completions", {
+      model: "effort-tokens-strip",
+      messages: [{ role: "user", content: "hello" }],
+    });
+    expect(
+      receivedSince(tokensOpenai, baseline, "/v1/chat/completions"),
+    ).not.toHaveProperty("reasoning_effort");
+  });
+
   test("passes an unset effort through when no entry matches it", async (ctx) => {
     if (!etcdReachable || !app || !openai) {
       ctx.skip();
@@ -1022,6 +1134,27 @@ describe("resources file: the not-set key may not map to null", () => {
       );
       const ok = await execFileP(BIN_PATH, ["validate", "--resources", good]);
       expect(ok.stdout).toContain("OK:");
+
+      // An empty target value asks to send an effort the gateway itself
+      // reads back as "no effort set".
+      for (const [label, mapping] of [
+        ["listed", '      medium: ""'],
+        ["not-set", '      "": ""'],
+      ]) {
+        const emptyValue = join(dir, `empty-${label}.yaml`);
+        await writeFile(emptyValue, file(mapping), "utf8");
+        let rejected: (Error & { code?: number; stderr?: string }) | undefined;
+        try {
+          await execFileP(BIN_PATH, ["validate", "--resources", emptyValue]);
+        } catch (e) {
+          rejected = e as Error & { code?: number; stderr?: string };
+        }
+        if (!rejected) {
+          throw new Error(`${label}: expected \`aisix validate\` to fail`);
+        }
+        expect(rejected.code, label).toBe(1);
+        expect(String(rejected.stderr), label).toContain("effort_mapping");
+      }
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
