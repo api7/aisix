@@ -265,6 +265,7 @@ impl ChatContent {
 ///     `image_url` passed through as given (an https URL or a `data:` URL)
 ///   * `input_file` → `{type:"file", file:{file_data?, filename?, file_id?}}`
 ///   * `input_audio` → `{type:"input_audio", input_audio:{data, format}}`
+///
 /// Parts that carry none of the above are skipped.
 fn responses_content_to_chat(v: &Value) -> ChatContent {
     match v {
