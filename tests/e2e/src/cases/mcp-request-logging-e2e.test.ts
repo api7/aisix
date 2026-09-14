@@ -260,7 +260,12 @@ describe("mcp request logging e2e: JSON-RPC method, tool counts, ACL warning", (
         l.includes("status=400"),
       "the access-log line for the rejected protocol version",
     );
+    // Every MCP field the request could not have produced, not just the
+    // first: the gate returns before a gateway exists, so there is no list
+    // to count and no tool was addressed.
     expect(line).not.toContain("tools_total");
+    expect(line).not.toContain("tools_returned");
+    expect(line).not.toContain("mcp_tool");
   });
 
   test("tools/call names the tool; the handshake names itself", async (ctx) => {
