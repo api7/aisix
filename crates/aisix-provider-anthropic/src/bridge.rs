@@ -24,9 +24,11 @@ use futures::StreamExt;
 use reqwest::{header, Client, StatusCode};
 use std::time::{Duration, Instant};
 
+use aisix_gateway::structured_output::{response_into_fake_stream_chunks, unwrap_json_tool_call};
+
 use crate::wire::{
     build_request, inject_cache_breakpoints, response_into_chat_response, split_system,
-    AnthropicResponse, AnthropicStreamEvent, StreamState,
+    structured_output_for, AnthropicResponse, AnthropicStreamEvent, StreamState, StructuredOutput,
 };
 
 /// Matches the API header that Anthropic bakes backwards-compat into.
@@ -360,6 +362,10 @@ impl Bridge for AnthropicBridge {
         let (system, messages) =
             split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
         let mut body = build_request(req, upstream, system, messages, false);
+        let synthetic_json_tool = matches!(
+            structured_output_for(req, upstream),
+            StructuredOutput::Tool(_)
+        );
         maybe_inject_cache_breakpoints(&mut body, ctx);
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
@@ -396,7 +402,11 @@ impl Bridge for AnthropicBridge {
                 .json()
                 .await
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-            Ok(response_into_chat_response(parsed))
+            let mut chat = response_into_chat_response(parsed);
+            if synthetic_json_tool {
+                unwrap_json_tool_call(&mut chat);
+            }
+            Ok(chat)
         })
         .await
     }
@@ -408,6 +418,23 @@ impl Bridge for AnthropicBridge {
     ) -> Result<ChatChunkStream, BridgeError> {
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
+
+        // The tool path's JSON only exists once the synthetic tool call
+        // has been assembled, so it cannot be streamed as it arrives.
+        // Run the request non-streaming and fake-stream the translated
+        // result: the client sees an ordinary chunk sequence, and usage
+        // rides its own terminal chunk exactly as on a real stream.
+        if matches!(
+            structured_output_for(req, upstream),
+            StructuredOutput::Tool(_)
+        ) {
+            // The leg is not streaming, so it runs under the budget a
+            // non-streaming call would have got — the streaming budget
+            // this context carries bounds a chunk gap, not a completion.
+            let chunks =
+                response_into_fake_stream_chunks(self.chat(req, &ctx.non_streaming_ctx()).await?);
+            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+        }
 
         let (system, messages) =
             split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
@@ -551,6 +578,77 @@ mod tests {
             })))
             .mount(server)
             .await;
+    }
+
+    #[tokio::test]
+    async fn a_small_stream_budget_does_not_cut_the_fake_stream_leg() {
+        // On a streaming dispatch the deadline is the streaming budget,
+        // which bounds a chunk gap rather than a whole completion. The
+        // tool route's upstream leg is not streaming, so it runs under
+        // the end-to-end budget carried beside it.
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(250))
+                    .set_body_json(serde_json::json!({
+                        "id": "msg_json",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-3-5-haiku-20241022",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "toolu_json",
+                            "name": "json_tool_call",
+                            "input": {"name": "Ada"},
+                        }],
+                        "stop_reason": "tool_use",
+                        "usage": {"input_tokens": 9, "output_tokens": 4},
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "my-claude",
+            "provider": "anthropic",
+            // Older family: takes the tool route, which cannot stream.
+            "model_name": "claude-3-5-haiku-20241022",
+            "provider_key_id": "11111111-1111-1111-1111-111111111111",
+        }))
+        .unwrap();
+        let ctx = BridgeContext::new("req-1", Arc::new(model), sample_provider_key(&server.uri()))
+            .with_deadline(std::time::Duration::from_millis(50))
+            .with_non_streaming_deadline(Some(std::time::Duration::from_secs(30)));
+
+        let mut req = ChatFormat::new("my-claude", vec![ChatMessage::user("who is Ada")]);
+        req.stream = Some(true);
+        req.extra.insert(
+            "response_format".into(),
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "person",
+                    "schema": {"type": "object", "properties": {"name": {"type": "string"}}},
+                    "strict": true,
+                },
+            }),
+        );
+
+        let stream = AnthropicBridge::new()
+            .chat_stream(&req, &ctx)
+            .await
+            .expect("the fake-stream leg must not be cut by the chunk-gap budget");
+        let chunks: Vec<ChatChunk> = futures::StreamExt::collect::<Vec<_>>(stream)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            chunks[1].delta.content.as_deref(),
+            Some(r#"{"name":"Ada"}"#)
+        );
     }
 
     #[tokio::test]

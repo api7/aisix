@@ -1742,6 +1742,11 @@ async fn dispatch(
             if let Some(d) = stream_budget {
                 ctx = ctx.with_deadline(d);
             }
+            // A bridge that has to answer this streaming request with a
+            // non-streaming upstream leg (the structured-output tool
+            // route) measures that leg against the end-to-end budget,
+            // not against the per-chunk one set above.
+            ctx = ctx.with_non_streaming_deadline(timeouts.request);
 
             // How many times to re-hit the SAME target (with backoff) on a
             // retryable failure before failing over to the next one.

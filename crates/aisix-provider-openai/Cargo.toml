@@ -23,5 +23,10 @@ bytes.workspace = true
 http.workspace = true
 
 [dev-dependencies]
+# Only for the strict-structured-output test: the `/v1/messages` inbound
+# translation lives in the Anthropic crate, and what this edge must emit
+# for it is exactly what that translation feeds in. No cycle — the
+# Anthropic crate depends on aisix-gateway and aisix-core only.
+aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 wiremock.workspace = true

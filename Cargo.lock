@@ -287,6 +287,7 @@ version = "0.3.0"
 dependencies = [
  "aisix-core",
  "aisix-gateway",
+ "aisix-provider-anthropic",
  "aisix-provider-openai",
  "async-stream",
  "async-trait",
@@ -332,6 +333,7 @@ version = "0.3.0"
 dependencies = [
  "aisix-core",
  "aisix-gateway",
+ "aisix-provider-anthropic",
  "async-stream",
  "async-trait",
  "bytes",

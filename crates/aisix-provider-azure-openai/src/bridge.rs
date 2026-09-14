@@ -29,6 +29,7 @@ use reqwest::{header, Client, StatusCode};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
+use aisix_provider_openai::close_strict_response_format_schema;
 use aisix_provider_openai::overrides::{
     apply_content_list_to_string, apply_default_body_fields, apply_param_constraints,
     apply_param_renames, apply_stream_done_marker_policy, extract_reasoning_field,
@@ -594,6 +595,10 @@ fn prepare_outbound_body<T: serde::Serialize>(
 ) -> Result<Value, BridgeError> {
     let mut body = serde_json::to_value(typed)
         .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?;
+    // Azure serves the OpenAI wire, so it owes the same strict-mode
+    // schema closing the OpenAI edge applies — one function, not a
+    // second copy, because these two bodies have to stay identical.
+    close_strict_response_format_schema(&mut body);
     if let Some(r) = request {
         apply_param_renames(&mut body, &r.param_renames);
         if let Some(constraints) = &r.param_constraints {
@@ -938,6 +943,76 @@ fn parse_stream_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Azure serves the OpenAI wire, so an Anthropic-shaped
+    /// `/v1/messages` request translated onto an Azure deployment must
+    /// arrive with exactly the schema the OpenAI edge would send. Azure
+    /// keeps its own copy of the outbound-body pipeline, which is
+    /// precisely how it came to be missing the strict-mode closing.
+    #[test]
+    fn a_translated_messages_request_reaches_azure_byte_for_byte_as_before() {
+        use aisix_gateway::{ChatFormat, ChatMessage};
+        use aisix_provider_anthropic::wire::translate_extras_to_openai_shape;
+
+        let mut extra = serde_json::json!({
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {"high": {"type": "number"}},
+                                },
+                            },
+                        },
+                    },
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        translate_extras_to_openai_shape(&mut extra, aisix_core::MappedEffort::AsWritten);
+
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("weather?")]);
+        req.extra = extra;
+        let messages = messages_from(&req);
+        let typed = build_request(&req, "ci-chat", &messages, false);
+        let body = prepare_outbound_body(&typed, None, None).unwrap();
+
+        assert_eq!(
+            body["response_format"],
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "structured_output",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["city", "days"],
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["high"],
+                                    "properties": {"high": {"type": "number"}},
+                                },
+                            },
+                        },
+                    },
+                },
+            })
+        );
+    }
 
     /// AISIX-Cloud#1222 scenario 3: an in-band `data: {"error":{...}}`
     /// frame inside the committed 200 stream surfaces as the typed
