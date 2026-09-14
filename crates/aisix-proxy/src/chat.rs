@@ -1062,6 +1062,50 @@ pub(crate) fn estimation_output_text(resp: &aisix_gateway::ChatResponse) -> Stri
     out
 }
 
+/// Token-estimation fallback for a non-streaming `/v1/chat/completions`
+/// response (AISIX-Cloud#1074). Fills token counters the upstream never
+/// reported — per counter, so a number it did report always stands — and
+/// writes them onto `resp` itself, which is what `render_response`
+/// serialises. The client-visible usage and the usage record are one
+/// number: a caller told `completion_tokens: 0` for a reply it can read
+/// has no way to reconcile that with what the dashboard bills. Returns
+/// whether anything was estimated.
+///
+/// The sibling `/v1/messages` and `/v1/responses` paths fill the same way
+/// (`messages::fill_missing_anthropic_metrics`,
+/// `responses_bridge::ResponsesSseEncoder::set_estimated_usage`).
+fn fill_missing_chat_usage(
+    resp: &mut aisix_gateway::ChatResponse,
+    upstream_model: &str,
+    req: &ChatFormat,
+) -> bool {
+    if resp.usage.prompt_tokens != 0 && resp.usage.completion_tokens != 0 {
+        return false;
+    }
+    let est = crate::token_estimate::Estimator::new(
+        upstream_model,
+        crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
+    );
+    let filled = crate::token_estimate::fill_missing(
+        &est,
+        resp.usage.prompt_tokens,
+        resp.usage.completion_tokens,
+        Some(&estimation_output_text(resp)),
+    );
+    if !filled.estimated {
+        return false;
+    }
+    resp.usage.prompt_tokens = filled.prompt_tokens;
+    resp.usage.completion_tokens = filled.completion_tokens;
+    // A total the upstream reported beside a zero sub-counter was built
+    // from numbers the client is no longer being told. Zeroing it makes
+    // both the client-facing projection and the quota total derive
+    // prompt + completion — the arithmetic they already use when no total
+    // was reported at all.
+    resp.usage.total_tokens = 0;
+    true
+}
+
 /// #1074 ensemble sub-call token fallback. A sub-call backend (a panel
 /// member, or the judge) that reports no usage would otherwise record
 /// silent zeros; estimate the prompt from that sub-call's own request
@@ -3082,34 +3126,15 @@ async fn dispatch(
     // Token-estimation fallback (AISIX-Cloud#1074): when the upstream
     // response carries no usage block, fill the missing counters locally
     // BEFORE the quota commit and telemetry below so neither records
-    // silent zeros. Local variables only — `render_response` serialises
-    // the upstream body untouched, so the client never sees synthesised
-    // usage presented as the provider's.
-    let (prompt_tokens_u32, completion_tokens_u32, usage_estimated) = {
-        let (p, c) = (
-            upstream.usage.prompt_tokens,
-            upstream.usage.completion_tokens,
-        );
-        if p == 0 || c == 0 {
-            let est = crate::token_estimate::Estimator::new(
-                &upstream_model,
-                crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
-            );
-            let filled = crate::token_estimate::fill_missing(
-                &est,
-                p,
-                c,
-                Some(&estimation_output_text(&upstream)),
-            );
-            (
-                filled.prompt_tokens,
-                filled.completion_tokens,
-                filled.estimated,
-            )
-        } else {
-            (p, c, false)
-        }
-    };
+    // silent zeros — and carry the SAME numbers into the response
+    // `render_response` builds. The client-visible usage and the usage
+    // record are one number: a caller told `completion_tokens: 0` for a
+    // reply it can read has no way to reconcile that with what the
+    // dashboard bills. The estimate is reported in the ordinary usage
+    // shape — there is no client-facing marker saying it was estimated.
+    let usage_estimated = fill_missing_chat_usage(&mut upstream, &upstream_model, req);
+    let prompt_tokens_u32 = upstream.usage.prompt_tokens;
+    let completion_tokens_u32 = upstream.usage.completion_tokens;
     let prompt = prompt_tokens_u32 as u64;
     let completion = completion_tokens_u32 as u64;
     let total = cache_inclusive_total(
@@ -6288,9 +6313,10 @@ mod complete_on_drop_tests {
     //! chunks delivered to the consumer", drop, observe the
     //! callback args.
     use super::{
-        cache_inclusive_total, effective_subcall_usage, estimate_subcall_tokens, AtomicU32,
-        CompleteOnDrop, StreamCompletion,
+        cache_inclusive_total, effective_subcall_usage, estimate_subcall_tokens,
+        fill_missing_chat_usage, AtomicU32, CompleteOnDrop, StreamCompletion,
     };
+    use aisix_gateway::chat::UsageStats;
     use std::sync::{Arc, Mutex};
 
     /// Build the guard with `delivered_count` pre-set on the
@@ -6412,6 +6438,72 @@ mod complete_on_drop_tests {
         assert_eq!(out.completion_tokens, 23);
         assert_eq!(out.total_tokens, 40);
         assert!(!out.usage_estimated);
+    }
+
+    /// AISIX-Cloud#1074: the client-visible usage carries the same filled
+    /// counters the usage record gets, per counter — a number the upstream
+    /// reported stands, a zero is filled, and a total built beside that
+    /// zero is recomputed from what the client is actually told.
+    ///
+    /// `Usage::from_stats` is asserted alongside the stats because the
+    /// client reads the projection, not the struct: a filled
+    /// `completion_tokens` beside an echoed stale `total_tokens` would
+    /// hand the caller a total that does not add up.
+    #[test]
+    fn non_streaming_usage_fill_reaches_the_client_projection() {
+        let req = subcall_req("Hello");
+        let mut resp = chat_response_for_estimation("Hello world", UsageStats::new(17, 0));
+        // The upstream reported a total beside the zero completion count.
+        resp.usage.total_tokens = 17;
+
+        assert!(fill_missing_chat_usage(&mut resp, "relay-model", &req));
+        assert_eq!(resp.usage.prompt_tokens, 17, "a reported counter stands");
+        assert_eq!(resp.usage.completion_tokens, 2, "the zero is filled");
+
+        let rendered = crate::render::render_response(0, resp, "m");
+        assert_eq!(rendered.usage.prompt_tokens, 17);
+        assert_eq!(rendered.usage.completion_tokens, 2);
+        assert_eq!(
+            rendered.usage.total_tokens, 19,
+            "the total the client reads is prompt + completion"
+        );
+    }
+
+    /// The mirror half: a response whose upstream reported both counters is
+    /// untouched, so no estimate can displace real numbers.
+    #[test]
+    fn non_streaming_usage_fill_leaves_reported_usage_alone() {
+        let req = subcall_req("Hello");
+        let mut resp = chat_response_for_estimation("Hello world", UsageStats::new(17, 23));
+        resp.usage.total_tokens = 99;
+
+        assert!(!fill_missing_chat_usage(&mut resp, "relay-model", &req));
+        assert_eq!(resp.usage.prompt_tokens, 17);
+        assert_eq!(resp.usage.completion_tokens, 23);
+        assert_eq!(
+            resp.usage.total_tokens, 99,
+            "a total the upstream reported is not second-guessed"
+        );
+    }
+
+    fn chat_response_for_estimation(
+        text: &str,
+        usage: UsageStats,
+    ) -> aisix_gateway::chat::ChatResponse {
+        aisix_gateway::chat::ChatResponse {
+            id: "id".into(),
+            model: "relay-model".into(),
+            message: aisix_gateway::chat::ChatMessage {
+                role: aisix_gateway::chat::Role::Assistant,
+                content: Some(text.into()),
+                content_blocks: None,
+                name: None,
+                tool_call_id: None,
+                extra: serde_json::Map::new(),
+            },
+            finish_reason: aisix_gateway::chat::FinishReason::Stop,
+            usage,
+        }
     }
 
     fn subcall_req(user: &str) -> aisix_gateway::chat::ChatFormat {

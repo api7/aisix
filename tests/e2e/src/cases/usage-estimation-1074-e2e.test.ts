@@ -21,8 +21,11 @@ import { decodedTextFor, startMockSls, type MockSls } from "../harness/sls-mock.
 // upstream DOES report usage, its values win untouched (pinned by the Rust
 // unit suite; this file covers the estimation-positive paths end-to-end).
 // Estimation feeds telemetry (usage events → exporters, prometheus token
-// counters, TPM accounting) ONLY: the client-visible body/stream is never
-// rewritten with synthesised usage.
+// counters, TPM accounting) AND, on a buffered reply, the client-visible
+// `usage` block — the two are one number, because a caller told zero for a
+// reply it can read has no way to reconcile that with what it is billed.
+// A client-facing stream is still never given a usage frame it did not ask
+// for: the estimate is only known once the stream has ended.
 //
 // Expected token values are ground truth from the de-facto OpenAI counting
 // scheme (https://github.com/openai/openai-cookbook — "How to count tokens"):
@@ -320,7 +323,7 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     await waitSlsFlagged("est-chat-stream");
   }, 60_000);
 
-  test("chat non-streaming 200 without usage: telemetry estimated, client body not rewritten", async (ctx) => {
+  test("chat non-streaming 200 without usage: the client usage block carries the same estimate the record does", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
       return;
@@ -344,11 +347,14 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
       messages: [{ role: "user", content: "hi" }],
     });
     expect(resp.choices[0]?.message?.content).toBe("Hello world");
-    // The upstream sent no usage; the gateway must not inject estimated
-    // numbers into the client-visible body (zeros = normalized absence,
-    // the pre-existing wire shape).
-    expect(resp.usage?.prompt_tokens ?? 0).toBe(0);
-    expect(resp.usage?.completion_tokens ?? 0).toBe(0);
+    // The upstream sent no usage, so the client reads the local estimate —
+    // the same numbers the usage record and the token counters below get.
+    // Pre-fix both of these were 0 while the dashboard billed the estimate.
+    expect(resp.usage?.prompt_tokens).toBe(EXPECTED_PROMPT_TOKENS);
+    expect(resp.usage?.completion_tokens).toBe(EXPECTED_COMPLETION_TOKENS);
+    expect(resp.usage?.total_tokens).toBe(
+      EXPECTED_PROMPT_TOKENS + EXPECTED_COMPLETION_TOKENS,
+    );
 
     const deadline = Date.now() + 10_000;
     let input = 0;
