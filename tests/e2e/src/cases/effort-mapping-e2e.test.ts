@@ -354,6 +354,16 @@ describe("direct-model effort mapping", () => {
       provider_key_id: tokensOpenaiKey.id,
       effort_mapping: { "*": null },
     });
+    // Every kind of write one map can perform, so the `disabled` cells
+    // can show each of them being skipped: the not-set entry, an exact
+    // rewrite, a wildcard rewrite — and a removal, which still applies.
+    await seed.createModel({
+      display_name: "effort-thinking-disabled",
+      provider: "anthropic",
+      model_name: "glm-thinking-disabled-wire",
+      provider_key_id: tokensAnthropicKey.id,
+      effort_mapping: { "": "low", medium: "max", "*": "xhigh", low: null },
+    });
     await seed.createModel({
       display_name: "effort-thinking-passthrough",
       provider: "anthropic",
@@ -413,6 +423,7 @@ describe("direct-model effort mapping", () => {
         "effort-thinking-drop-exact",
         "effort-thinking-drop-star",
         "effort-thinking-passthrough",
+        "effort-thinking-disabled",
       ],
     });
     const proxy = new ProxyClient(app.proxyUrl, API_KEY);
@@ -931,7 +942,6 @@ describe("direct-model effort mapping", () => {
     // uses — and the block itself is forwarded untouched.
     for (const thinking of [
       { type: "enabled", budget_tokens: 8192 },
-      { type: "disabled" },
       { type: "adaptive" },
     ]) {
       let baseline = tokensAnthropic.receivedRequests.length;
@@ -1008,6 +1018,94 @@ describe("direct-model effort mapping", () => {
     expect(
       receivedSince(tokensAnthropic, baseline, "/v1/messages").output_config,
     ).toEqual({ effort: "low" });
+  });
+
+  test("never writes a tier beside disabled thinking", async (ctx) => {
+    if (!etcdReachable || !app || !tokensAnthropic || !tokensCount) {
+      ctx.skip();
+      return;
+    }
+
+    const disabled = { type: "disabled" };
+
+    // Control: without the opt-out this model does write. Every "no
+    // tier" assertion below would otherwise pass on a map that never
+    // fires at all.
+    let baseline = tokensAnthropic.receivedRequests.length;
+    await post(
+      "/v1/messages",
+      {
+        model: "effort-thinking-disabled",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hello" }],
+        thinking: { type: "adaptive" },
+      },
+      "anthropic",
+    );
+    expect(
+      receivedSince(tokensAnthropic, baseline, "/v1/messages").output_config,
+    ).toEqual({ effort: "low" });
+
+    // Each kind of write, skipped. The not-set entry has nothing to
+    // inject into, so no `output_config` reaches the upstream at all;
+    // the two rewrites leave the caller's own tier exactly as sent.
+    for (const [label, sent, expected] of [
+      ["not-set entry", {}, undefined],
+      ["exact entry", { output_config: { effort: "medium" } }, { effort: "medium" }],
+      ["wildcard entry", { output_config: { effort: "xl" } }, { effort: "xl" }],
+    ] as const) {
+      baseline = tokensAnthropic.receivedRequests.length;
+      await post(
+        "/v1/messages",
+        {
+          model: "effort-thinking-disabled",
+          max_tokens: 64,
+          messages: [{ role: "user", content: "hello" }],
+          thinking: disabled,
+          ...sent,
+        },
+        "anthropic",
+      );
+      const got = receivedSince(tokensAnthropic, baseline, "/v1/messages");
+      expect(got.output_config, label).toEqual(expected);
+      expect(got.thinking, label).toEqual(disabled);
+    }
+
+    // A removal is not a tier, so it still applies.
+    baseline = tokensAnthropic.receivedRequests.length;
+    await post(
+      "/v1/messages",
+      {
+        model: "effort-thinking-disabled",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hello" }],
+        thinking: disabled,
+        output_config: { effort: "low" },
+      },
+      "anthropic",
+    );
+    const removed = receivedSince(tokensAnthropic, baseline, "/v1/messages");
+    expect(removed).not.toHaveProperty("output_config");
+    expect(removed.thinking).toEqual(disabled);
+
+    // The token-counting sibling shares the mapping, so it shares this.
+    baseline = tokensCount.receivedRequests.length;
+    await post(
+      "/v1/messages/count_tokens",
+      {
+        model: "effort-tokens-count",
+        messages: [{ role: "user", content: "hello" }],
+        thinking: disabled,
+      },
+      "anthropic",
+    );
+    const counted = receivedSince(
+      tokensCount,
+      baseline,
+      "/v1/messages/count_tokens",
+    );
+    expect(counted).not.toHaveProperty("output_config");
+    expect(counted.thinking).toEqual(disabled);
   });
 
   test("resolves the upstream effort of a thinking-only request on the bridge", async (ctx) => {

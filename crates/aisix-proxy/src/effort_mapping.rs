@@ -73,17 +73,40 @@ pub(crate) fn chat_request<'a>(request: &'a ChatFormat, model: &Model) -> Cow<'a
 /// picked one — so a request carrying `thinking` and no
 /// `output_config.effort` sets no effort and takes the `""` entry.
 ///
+/// The single exception, and the only time this mapping looks at
+/// `thinking` at all: a request that turned reasoning off outright is
+/// never given a tier. Pairing one with `thinking.type: "disabled"`
+/// builds a request the upstream rejects above the `high` tier, so no
+/// entry writes one — neither the `""` entry injecting into a request
+/// that set no effort, nor an exact or `"*"` entry rewriting one that
+/// did. Matching is unaffected; only the write is skipped. A removal
+/// still applies, because dropping the effort cannot contradict the
+/// opt-out. `translate_reasoning_effort_to_anthropic` refuses to build
+/// the same pair from the other direction.
+///
 /// A cross-provider dispatch resolves `thinking` into an upstream
 /// reasoning effort of its own (`reasoning_effort_for`, in
 /// `aisix-provider-anthropic`), after this mapping and out of its reach.
 /// [`MappedEffort::Removed`] is what stops that resolution from putting
-/// back an effort an entry just removed.
+/// back an effort an entry just removed; `disabled` resolves to the
+/// `none` effort there whatever this decided.
 pub(crate) fn anthropic_request<'a>(
     body: &'a Value,
     model: &Model,
 ) -> (Cow<'a, Value>, MappedEffort) {
     let carrier = json_carrier(body, "output_config", "effort");
+    if thinking_is_disabled(body) && matches!(resolve(carrier, model), EffortAction::Set(_)) {
+        return (Cow::Borrowed(body), MappedEffort::AsWritten);
+    }
     json_request(body, model, "output_config", "effort", carrier)
+}
+
+/// Whether the request turned reasoning off outright.
+fn thinking_is_disabled(body: &Value) -> bool {
+    body.get("thinking")
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str)
+        == Some("disabled")
 }
 
 /// Apply the final direct target's mapping to an OpenAI Responses request.
@@ -351,15 +374,15 @@ mod tests {
 
     /// A `thinking` block is not an effort setting for this mapping, so a
     /// request carrying one and no `output_config.effort` sets no effort
-    /// and takes the `""` entry — whichever shape the block uses. The
-    /// block itself is left exactly as the caller wrote it.
+    /// and takes the `""` entry. The block itself is left exactly as the
+    /// caller wrote it. `disabled` is the one shape this does not cover —
+    /// see the test below.
     #[test]
     fn the_not_set_entry_fires_for_a_request_that_only_carries_thinking() {
         let model = token_model();
 
         for thinking in [
             json!({"type": "enabled", "budget_tokens": 8192}),
-            json!({"type": "disabled"}),
             json!({"type": "adaptive"}),
         ] {
             for leaf in [None, Some(json!(null)), Some(json!(""))] {
@@ -378,6 +401,54 @@ mod tests {
         assert_eq!(
             responses_request(&body, &model)["reasoning"]["effort"],
             "high"
+        );
+    }
+
+    /// A request that turned reasoning off is never given a tier: no
+    /// entry writes one, whether it would inject into a request that set
+    /// no effort or rewrite one that did. A removal still applies.
+    #[test]
+    fn no_entry_writes_a_tier_beside_disabled_thinking() {
+        let model = token_model();
+        let disabled = json!({"type": "disabled"});
+
+        // The `""` entry, on all three not-set carriers.
+        for leaf in [None, Some(json!(null)), Some(json!(""))] {
+            let mut body = json!({"thinking": disabled.clone()});
+            if let Some(leaf) = leaf {
+                body["output_config"] = json!({"effort": leaf});
+            }
+            let (mapped, outcome) = anthropic_request(&body, &model);
+            assert!(matches!(mapped, Cow::Borrowed(_)), "{body}");
+            assert_eq!(outcome, MappedEffort::AsWritten, "{body}");
+        }
+
+        // The `"*"` entry rewriting a present value, and an exact one.
+        for effort in ["xl", "high"] {
+            let body = json!({"thinking": disabled.clone(), "output_config": {"effort": effort}});
+            let (mapped, outcome) = anthropic_request(&body, &model);
+            assert_eq!(mapped["output_config"]["effort"], effort, "{body}");
+            assert_eq!(outcome, MappedEffort::AsWritten, "{body}");
+        }
+
+        // A removal is not a tier, so it still applies.
+        let body = json!({"thinking": disabled.clone(), "output_config": {"effort": "medium"}});
+        let (mapped, outcome) = anthropic_request(&body, &model);
+        assert!(mapped.get("output_config").is_none());
+        assert_eq!(mapped["thinking"], disabled);
+        assert_eq!(outcome, MappedEffort::Removed);
+
+        // Only `disabled` is read, and only on this carrier: the other
+        // thinking shapes and the Responses carrier are unaffected.
+        let body = json!({"thinking": {"type": "something_else"}});
+        assert_eq!(
+            anthropic_request(&body, &model).0["output_config"]["effort"],
+            "high"
+        );
+        let body = json!({"thinking": disabled, "reasoning": {"effort": "xl"}});
+        assert_eq!(
+            responses_request(&body, &model)["reasoning"]["effort"],
+            "low"
         );
     }
 
