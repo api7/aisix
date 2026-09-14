@@ -70,11 +70,28 @@ pub fn close_object_schemas(schema: &mut serde_json::Value) {
     walk_object_schemas(schema, true);
 }
 
+/// Whether a schema node describes an object and therefore has to be
+/// sealed. `type` is not always the bare string `"object"`: the
+/// canonical strict-mode spelling of an optional nested object is the
+/// union `["object", "null"]`, and a node carrying `properties` with no
+/// `type` at all is still an object schema. Missing either leaves that
+/// node — and everything under it, since the walk would not recurse —
+/// open, which the providers that require sealing reject outright.
+fn is_object_schema(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    match obj.get("type") {
+        Some(serde_json::Value::String(ty)) => ty == "object",
+        Some(serde_json::Value::Array(types)) => types.iter().any(|t| t.as_str() == Some("object")),
+        // No `type`, but `properties` can only describe an object.
+        None => obj.contains_key("properties"),
+        _ => false,
+    }
+}
+
 fn walk_object_schemas(schema: &mut serde_json::Value, require_every_property: bool) {
     let Some(obj) = schema.as_object_mut() else {
         return;
     };
-    if obj.get("type").and_then(|t| t.as_str()) == Some("object") {
+    if is_object_schema(obj) {
         if let Some(properties) = obj.get("properties").and_then(|p| p.as_object()) {
             let required: Vec<serde_json::Value> =
                 properties.keys().map(|k| k.as_str().into()).collect();
@@ -114,12 +131,22 @@ fn walk_object_schemas(schema: &mut serde_json::Value, require_every_property: b
 /// synthetic tool, so a caller's own tool of that name is never touched.
 ///
 /// The call's arguments are already the JSON-encoded tool input, which
-/// is exactly the document the schema describes. When it is the only
-/// call the response becomes an ordinary text completion — no
-/// `tool_calls`, and a tool-use finish reason demoted to `stop`, which
-/// is what a client that never offered a tool must see. When the model
-/// called real tools alongside it, those and their finish reason are
-/// left untouched and the JSON is appended to the content.
+/// is exactly the document the schema describes.
+///
+/// When it is the only call the JSON **replaces** the content: the
+/// caller asked for a document they can parse, and a model that
+/// narrated before calling the tool ("Sure, here you go:") would
+/// otherwise leave them with a string that is not JSON. Any prose is
+/// dropped, `tool_calls` with it, and a tool-use finish reason is
+/// demoted to `stop` — what a client that never offered a tool must
+/// see. Prose is likeliest exactly where the tool could not be forced
+/// (a caller's own `tool_choice`, extended thinking, a Converse family
+/// with no `toolChoice`), so this is not a rare shape.
+///
+/// When the model called real tools alongside it, the caller *did* ask
+/// for tool calls and is parsing the response themselves, so those
+/// calls and their finish reason are left untouched and the JSON is
+/// appended to whatever text came with them.
 pub fn unwrap_json_tool_call(resp: &mut ChatResponse) {
     let mut json_parts: Vec<String> = Vec::new();
     let mut real_calls_remain = false;
@@ -142,11 +169,13 @@ pub fn unwrap_json_tool_call(resp: &mut ChatResponse) {
     if json_parts.is_empty() {
         return;
     }
+    let json = json_parts.join("\n");
     if !real_calls_remain {
         resp.message.extra.remove("tool_calls");
         resp.finish_reason = FinishReason::Stop;
+        resp.message.content = Some(json);
+        return;
     }
-    let json = json_parts.join("\n");
     resp.message.content = Some(match resp.message.content.take() {
         Some(text) if !text.is_empty() => format!("{text}\n{json}"),
         _ => json,
@@ -176,11 +205,28 @@ pub fn response_into_fake_stream_chunks(resp: ChatResponse) -> Vec<ChatChunk> {
         finish_reason,
         usage,
     };
+    // The non-streaming `tool_calls` shape carries no `index`, but the
+    // streaming one must: OpenAI SDKs accumulate by it, and this repo's
+    // Anthropic SSE re-encoder reads it to key each `content_block`,
+    // folding every index-less call onto block 0. Number them densely
+    // in arrival order, leaving any index a decoder already assigned.
     let tool_calls = message
         .extra
         .get("tool_calls")
         .and_then(|c| c.as_array())
-        .cloned();
+        .map(|calls| {
+            calls
+                .iter()
+                .enumerate()
+                .map(|(i, call)| {
+                    let mut call = call.clone();
+                    if let Some(obj) = call.as_object_mut() {
+                        obj.entry("index").or_insert(i.into());
+                    }
+                    call
+                })
+                .collect()
+        });
     vec![
         chunk(
             ChatDelta {
@@ -258,6 +304,37 @@ mod tests {
         assert_eq!(schema["items"]["additionalProperties"], false);
         assert_eq!(schema["anyOf"][0]["additionalProperties"], false);
         assert_eq!(schema["$defs"]["d"]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn sealing_recognises_union_typed_and_untyped_object_nodes() {
+        // `["object","null"]` is how strict mode spells an optional
+        // nested object, and a node with `properties` and no `type` is
+        // still an object. Missing either leaves the whole subtree open
+        // and the provider rejects the request.
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "nullable": {
+                    "type": ["object", "null"],
+                    "properties": {"a": {"type": "string"}},
+                },
+                "untyped": {"properties": {"b": {"type": "string"}}},
+            },
+        });
+        seal_object_schemas(&mut schema);
+        assert_eq!(
+            schema["properties"]["nullable"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            schema["properties"]["nullable"]["properties"]["a"]["type"],
+            "string"
+        );
+        assert_eq!(
+            schema["properties"]["untyped"]["additionalProperties"],
+            false
+        );
     }
 
     #[test]

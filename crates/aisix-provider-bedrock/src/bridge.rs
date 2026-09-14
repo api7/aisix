@@ -49,7 +49,8 @@ use std::time::{Duration, Instant};
 
 use aisix_provider_anthropic::wire::{
     build_request, response_into_chat_response, split_system, structured_output_for,
-    translate_reasoning_effort_to_anthropic, AnthropicResponse, StructuredOutput,
+    tool_choice_states_a_preference, translate_reasoning_effort_to_anthropic, AnthropicResponse,
+    StructuredOutput,
 };
 
 // Per-`ProviderKey` request override pipeline (#302 §5 / #340). The JSON-body
@@ -1874,9 +1875,44 @@ fn build_converse_additional_model_request_fields(
 /// output on Converse covers the same Claude families Anthropic's own
 /// API does.
 fn bedrock_structured_output(req: &ChatFormat, upstream_id: &str) -> StructuredOutput {
-    structured_output_for(
+    let decided = structured_output_for(
         req,
         bedrock_claude_model_name(upstream_id).unwrap_or(upstream_id),
+    );
+    // The tool route only exists where the model can call a tool at
+    // all. Attaching a `toolConfig` to a publisher whose Converse
+    // implementation has none fails the whole request — and it would
+    // fail a request carrying no tools of its own, purely because the
+    // caller asked for JSON. Leaving the field unhonoured is the lesser
+    // outcome, and is what these models did before.
+    if matches!(decided, StructuredOutput::Tool(_))
+        && !converse_supports_tool_use(BedrockPublisher::from_model_id(upstream_id))
+    {
+        tracing::debug!(
+            model = %upstream_id,
+            "dropping response_format: this Bedrock publisher supports neither native structured output nor tool use"
+        );
+        return StructuredOutput::None;
+    }
+    decided
+}
+
+/// Whether this publisher's Converse implementation supports tool use at
+/// all, per AWS's supported-model table. Titan Text has none, and
+/// `Other` is the set this bridge has not classified — several of which
+/// (DeepSeek R1 among them) also reject `toolConfig`.
+///
+/// Only the *synthetic* tool is gated on this. A caller who sent their
+/// own `tools` still gets them forwarded: an explicit unsupported tool
+/// request is theirs to see rejected, which is what #560 shipped.
+fn converse_supports_tool_use(publisher: Option<BedrockPublisher>) -> bool {
+    matches!(
+        publisher,
+        Some(BedrockPublisher::Anthropic)
+            | Some(BedrockPublisher::AmazonNova)
+            | Some(BedrockPublisher::Meta)
+            | Some(BedrockPublisher::Mistral)
+            | Some(BedrockPublisher::Cohere)
     )
 }
 
@@ -1996,17 +2032,25 @@ fn build_tool_config(
     // caller's `response_format` is the more specific statement about
     // what the answer must be — and the contradiction still costs the
     // forcing, so the model is only offered the tool.
-    if req.extra.get("tool_choice").and_then(|v| v.as_str()) == Some("none")
-        && json_tool_schema.is_none()
-    {
+    let caller_forbade_tools =
+        req.extra.get("tool_choice").and_then(|v| v.as_str()) == Some("none");
+    if caller_forbade_tools && json_tool_schema.is_none() {
         return None;
     }
-    let tools_json = req
-        .extra
-        .get("tools")
-        .and_then(|v| v.as_array())
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+    // With `response_format` beside it the schema wins — the JSON has to
+    // come out of a tool call on this route — but only the synthetic
+    // tool goes on the table. Putting the caller's own tools back under
+    // no `toolChoice` would hand the model exactly what "none" told it
+    // not to use.
+    let tools_json = if caller_forbade_tools {
+        &[][..]
+    } else {
+        req.extra
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    };
     let mut tools: Vec<Tool> = Vec::new();
     for entry in tools_json {
         // OpenAI only defines `type:"function"` tools today; skip any
@@ -2056,7 +2100,7 @@ fn build_tool_config(
         return None;
     }
     let mut config = ToolConfiguration::builder().set_tools(Some(tools));
-    let client_set_tool_choice = req.extra.contains_key("tool_choice");
+    let client_set_tool_choice = tool_choice_states_a_preference(req.extra.get("tool_choice"));
     let thinking_enabled = req
         .extra
         .get("thinking")
@@ -3949,13 +3993,11 @@ mod tests {
             "anthropic.claude-sonnet-4-20250514-v1:0",
             "us.anthropic.claude-3-5-sonnet-20240620-v1:0",
             "anthropic.claude-3-haiku-20240307-v1:0",
-            // Other publishers, and a profile ARN whose last segment is
-            // an opaque id naming no model this gateway can identify.
+            // Other publishers whose Converse supports tool use.
             "amazon.nova-pro-v1:0",
             "meta.llama3-3-70b-instruct-v1:0",
             "mistral.mistral-large-2407-v1:0",
-            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abcd1234",
-            "arn:aws:bedrock:us-east-1:123456789012:provisioned-model/xyz",
+            "cohere.command-r-plus-v1:0",
         ] {
             assert!(
                 matches!(
@@ -3963,6 +4005,24 @@ mod tests {
                     StructuredOutput::Tool(_)
                 ),
                 "{id} should take the tool path"
+            );
+        }
+        for id in [
+            // No native structured output AND no Converse tool use, so
+            // there is no shape to translate into. Dropping the field
+            // keeps these models answering as they did before rather
+            // than failing the request on a `toolConfig` they reject.
+            "amazon.titan-text-express-v1",
+            "deepseek.r1-v1:0",
+            "ai21.jamba-1-5-large-v1:0",
+            // A profile ARN whose last segment is an opaque id naming no
+            // model this gateway can identify.
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abcd1234",
+            "arn:aws:bedrock:us-east-1:123456789012:provisioned-model/xyz",
+        ] {
+            assert!(
+                matches!(bedrock_structured_output(&req, id), StructuredOutput::None),
+                "{id} has no structured-output shape and must drop the field"
             );
         }
     }
@@ -4105,6 +4165,56 @@ mod tests {
             body["toolConfig"]["toolChoice"]["tool"]["name"],
             "get_weather"
         );
+    }
+
+    #[tokio::test]
+    async fn converse_tool_path_still_forces_when_the_caller_sent_tool_choice_auto() {
+        let mut req = structured_request(person_schema());
+        req.extra.insert("tool_choice".into(), "auto".into());
+        let body = capture_bedrock_body("amazon.nova-pro-v1:0", "converse", &req, false).await;
+        assert_eq!(
+            body["toolConfig"]["toolChoice"]["tool"]["name"],
+            JSON_TOOL_NAME
+        );
+    }
+
+    #[tokio::test]
+    async fn converse_tool_choice_none_offers_only_the_synthetic_tool() {
+        // "none" means the caller wants no tool call this turn. The
+        // schema still has to come out of one on this route, but their
+        // own tools must not go back on the table unforced.
+        let mut req = structured_request(person_schema());
+        req.extra.insert(
+            "tools".into(),
+            serde_json::json!([{
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {"type": "object"}},
+            }]),
+        );
+        req.extra.insert("tool_choice".into(), "none".into());
+        let body = capture_bedrock_body("amazon.nova-pro-v1:0", "converse", &req, false).await;
+        let tools = body["toolConfig"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["toolSpec"]["name"], JSON_TOOL_NAME);
+        assert!(
+            body["toolConfig"].get("toolChoice").is_none(),
+            "body={body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_publisher_without_tool_use_gets_no_tool_config_from_response_format() {
+        // Titan Text has no Converse tool support; a `toolConfig` it
+        // never asked for would fail the whole request.
+        let body = capture_bedrock_body(
+            "amazon.titan-text-express-v1",
+            "converse",
+            &structured_request(person_schema()),
+            false,
+        )
+        .await;
+        assert!(body.get("toolConfig").is_none(), "body={body}");
+        assert!(body.get("outputConfig").is_none(), "body={body}");
     }
 
     #[tokio::test]

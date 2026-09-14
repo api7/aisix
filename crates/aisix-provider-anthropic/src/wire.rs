@@ -466,7 +466,7 @@ pub fn build_request<'a>(
         .as_ref()
         .and_then(serde_json::Value::as_bool)
         == Some(false);
-    let client_set_tool_choice = requested_tool_choice.is_some();
+    let client_set_tool_choice = tool_choice_states_a_preference(requested_tool_choice.as_ref());
     let mut tool_choice = tools
         .as_ref()
         .and(requested_tool_choice)
@@ -552,6 +552,22 @@ pub fn build_request<'a>(
         tools,
         tool_choice,
         extra: extras,
+    }
+}
+
+/// Whether an OpenAI `tool_choice` says anything the structured-output
+/// tool route has to yield to.
+///
+/// `"auto"` does not: it is OpenAI's own default and plenty of clients
+/// send it on every request, so reading it as a deliberate choice would
+/// silently disable `response_format` for them. `"required"`, `"none"`
+/// and a named function are deliberate, and each outranks the forcing
+/// the gateway would otherwise add.
+pub fn tool_choice_states_a_preference(tool_choice: Option<&serde_json::Value>) -> bool {
+    match tool_choice {
+        None => false,
+        Some(serde_json::Value::String(s)) => s != "auto",
+        Some(_) => true,
     }
 }
 
@@ -6359,6 +6375,35 @@ mod tests {
     }
 
     #[test]
+    fn tool_choice_auto_is_not_a_preference_and_still_forces_the_json_tool() {
+        // `auto` is OpenAI's default and many clients send it on every
+        // request; reading it as a deliberate choice would silently
+        // disable `response_format` for them.
+        let mut req = request_with_response_format(json_schema_format(person_schema()));
+        req.extra.insert(
+            "tools".into(),
+            serde_json::json!([{
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {"type": "object"}},
+            }]),
+        );
+        req.extra.insert("tool_choice".into(), "auto".into());
+        let built = build(&req, "glm-4.5");
+        assert_eq!(
+            built.tool_choice,
+            Some(serde_json::json!({"type": "tool", "name": JSON_TOOL_NAME}))
+        );
+
+        // A deliberate choice still outranks it.
+        req.extra.insert("tool_choice".into(), "required".into());
+        let built = build(&req, "glm-4.5");
+        assert_ne!(
+            built.tool_choice,
+            Some(serde_json::json!({"type": "tool", "name": JSON_TOOL_NAME}))
+        );
+    }
+
+    #[test]
     fn extended_thinking_leaves_the_synthetic_tool_on_auto() {
         // Anthropic rejects a forced tool choice beside extended
         // thinking, so the tool is offered rather than forced.
@@ -6413,6 +6458,51 @@ mod tests {
         // A client that never offered a tool must not be told the model
         // stopped to call one.
         assert_eq!(resp.finish_reason, FinishReason::Stop);
+    }
+
+    #[test]
+    fn a_prose_preamble_never_survives_into_the_json_answer() {
+        // The tool is often offered rather than forced (a caller's own
+        // `tool_choice`, extended thinking, a family with no forced
+        // choice), and a model that narrates before calling it would
+        // otherwise hand the caller a string that is not JSON.
+        let body = serde_json::json!({
+            "id": "msg_preamble",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-3-5-haiku-20241022",
+            "content": [
+                {"type": "text", "text": "Sure, here you go:"},
+                {"type": "tool_use", "id": "toolu_json", "name": JSON_TOOL_NAME,
+                 "input": {"name": "Ada"}},
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 9, "output_tokens": 4},
+        });
+        let mut resp = response_into_chat_response(serde_json::from_value(body).unwrap());
+        unwrap_json_tool_call(&mut resp);
+        let content = resp.message.content.as_deref().unwrap();
+        assert_eq!(content, r#"{"name":"Ada"}"#);
+        serde_json::from_str::<serde_json::Value>(content).expect("content parses as JSON");
+    }
+
+    #[test]
+    fn fake_streamed_tool_calls_carry_a_dense_index() {
+        // The streaming shape needs `index`; the non-streaming decode
+        // this is built from does not emit one, and the SSE re-encoder
+        // folds every index-less call onto content block 0.
+        let mut resp = synthetic_tool_reply(serde_json::json!([
+            {"type": "tool_use", "id": "toolu_a", "name": "get_weather", "input": {"city": "SF"}},
+            {"type": "tool_use", "id": "toolu_b", "name": "get_time", "input": {"tz": "UTC"}},
+        ]));
+        unwrap_json_tool_call(&mut resp);
+        let chunks = response_into_fake_stream_chunks(resp);
+        let calls = chunks[1].delta.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["index"], 0);
+        assert_eq!(calls[1]["index"], 1);
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(calls[1]["function"]["name"], "get_time");
     }
 
     #[test]

@@ -2028,8 +2028,19 @@ fn rewrite_gemini_openapi_schema(schema: &mut serde_json::Value) {
     };
     obj.remove("additionalProperties");
     obj.remove("$schema");
-    if let Some(serde_json::Value::String(ty)) = obj.get_mut("type") {
-        *ty = ty.to_ascii_uppercase();
+    match obj.get_mut("type") {
+        Some(serde_json::Value::String(ty)) => *ty = ty.to_ascii_uppercase(),
+        // A union type (`["string","null"]`, how strict mode spells an
+        // optional field) would otherwise reach the wire with lower-case
+        // names Vertex does not recognise.
+        Some(serde_json::Value::Array(types)) => {
+            for ty in types.iter_mut() {
+                if let serde_json::Value::String(ty) = ty {
+                    *ty = ty.to_ascii_uppercase();
+                }
+            }
+        }
+        _ => {}
     }
     if let Some(properties) = obj.get("properties").and_then(|p| p.as_object()) {
         let ordering: Vec<serde_json::Value> =
@@ -2050,6 +2061,18 @@ fn rewrite_gemini_openapi_schema(schema: &mut serde_json::Value) {
         if let Some(branches) = obj.get_mut(key).and_then(|b| b.as_array_mut()) {
             for branch in branches {
                 rewrite_gemini_openapi_schema(branch);
+            }
+        }
+    }
+    // Reached by `$ref` rather than by nesting, so the walk above never
+    // visits them — and a `$def` that keeps its `additionalProperties`
+    // or a lower-case type name fails the whole request. Every
+    // schema generator that emits nested models (Pydantic among them)
+    // produces these.
+    for key in ["$defs", "definitions"] {
+        if let Some(defs) = obj.get_mut(key).and_then(|d| d.as_object_mut()) {
+            for def in defs.values_mut() {
+                rewrite_gemini_openapi_schema(def);
             }
         }
     }
@@ -3070,6 +3093,43 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(ordering, on_the_wire);
+    }
+
+    #[test]
+    fn gemini_openapi_dialect_reaches_definitions_and_union_types() {
+        // `$defs` is reached by `$ref`, not by nesting, so the ordinary
+        // walk never visits it — and a `$def` that keeps its
+        // `additionalProperties` or a lower-case type name fails the
+        // whole request.
+        let req = gemini_request_with_response_format(json_schema_format(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pet": {"$ref": "#/$defs/Pet"},
+                "nickname": {"type": ["string", "null"]},
+            },
+            "$defs": {
+                "Pet": {
+                    "type": "object",
+                    "properties": {"kind": {"type": "string"}},
+                    "additionalProperties": false,
+                },
+            },
+        })));
+        let schema = build_gemini_request(&req, "gemini-1.5-pro")
+            .generation_config
+            .unwrap()
+            .response_schema
+            .unwrap();
+        assert_eq!(schema["$defs"]["Pet"]["type"], "OBJECT");
+        assert_eq!(
+            schema["$defs"]["Pet"]["properties"]["kind"]["type"],
+            "STRING"
+        );
+        assert!(schema["$defs"]["Pet"].get("additionalProperties").is_none());
+        assert_eq!(
+            schema["properties"]["nickname"]["type"],
+            serde_json::json!(["STRING", "NULL"])
+        );
     }
 
     #[test]
