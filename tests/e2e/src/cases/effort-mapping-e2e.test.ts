@@ -1079,7 +1079,9 @@ describe("direct-model effort mapping", () => {
     }
 
     // Turning reasoning off is the client's own instruction and outranks
-    // the operator's level mapping, injected or removed alike.
+    // the operator's level mapping, injected or removed alike. The
+    // removal leg needs a present effort for `*` to match and drop —
+    // without one no entry fires and the cell is not a removal at all.
     for (const model of ["effort-thinking-low", "effort-thinking-drop-star"]) {
       baseline = tokensOpenai.receivedRequests.length;
       await post(
@@ -1089,6 +1091,9 @@ describe("direct-model effort mapping", () => {
           max_tokens: 64,
           messages: [{ role: "user", content: "hello" }],
           thinking: { type: "disabled" },
+          ...(model === "effort-thinking-drop-star"
+            ? { output_config: { effort: "high" } }
+            : {}),
         },
         "anthropic",
       );
