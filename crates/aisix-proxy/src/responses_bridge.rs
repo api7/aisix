@@ -158,8 +158,38 @@ fn append_input_item(messages: &mut Vec<ChatMessage>, item: &Value) {
                 }),
             );
         }
+        // A prior custom-tool call replayed for the agent loop. The request
+        // side gave the model a function tool taking one string
+        // (`custom_tool_parameters`), so the replayed call has to go back in
+        // that same shape or the history stops matching the tools the model
+        // was given.
+        Some("custom_tool_call") => {
+            let call_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let name = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let input = item.get("input").and_then(|v| v.as_str()).unwrap_or("");
+            push_tool_call(
+                messages,
+                json!({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": wrap_custom_tool_input(input),
+                    },
+                }),
+            );
+        }
         // The tool result fed back by the caller → a `tool` role message.
-        Some("function_call_output") => {
+        // A custom tool's result item is the same shape under a different
+        // type name, and its `output` takes the same string-or-parts union.
+        Some("function_call_output" | "custom_tool_call_output") => {
             let call_id = item
                 .get("call_id")
                 .and_then(|v| v.as_str())
@@ -542,19 +572,78 @@ fn responses_tools_to_chat(tools: &Value) -> Option<Value> {
     (!out.is_empty()).then_some(Value::Array(out))
 }
 
+/// The single string parameter a `custom` tool takes once it has been
+/// translated into a function tool. Both directions of the translation
+/// read this one constant — the request side wraps the freeform input in
+/// it, the reply side unwraps it back out — so the pair cannot drift.
+const CUSTOM_TOOL_INPUT_PARAM: &str = "content";
+
 /// The JSON-schema a `custom` tool takes once it is a function tool: one
 /// required string holding whatever the freeform tool would have received.
 fn custom_tool_parameters(name: &str) -> Value {
     json!({
         "type": "object",
         "properties": {
-            "content": {
+            CUSTOM_TOOL_INPUT_PARAM: {
                 "type": "string",
                 "description": format!("The {name} content following the specified format"),
             }
         },
-        "required": ["content"],
+        "required": [CUSTOM_TOOL_INPUT_PARAM],
     })
+}
+
+/// A custom tool's freeform input, wrapped as the function `arguments`
+/// string the single-parameter schema above describes.
+fn wrap_custom_tool_input(input: &str) -> String {
+    json!({ CUSTOM_TOOL_INPUT_PARAM: input }).to_string()
+}
+
+/// The freeform `input` of a custom tool call, unwrapped from the function
+/// `arguments` the model produced against that schema.
+///
+/// A model that did not follow the schema — `arguments` that are not JSON,
+/// or JSON without the parameter as a string — has its raw argument string
+/// forwarded instead. That is the text the caller's freeform tool was going
+/// to receive either way, and dropping it would lose the call's whole
+/// payload.
+fn unwrap_custom_tool_input(arguments: &str) -> String {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .as_ref()
+        .and_then(Value::as_object)
+        // Exactly the one member the wrapper has. A model that answered
+        // with its freeform payload verbatim may itself have produced a
+        // JSON object carrying a `content` field beside others — reading
+        // that as the wrapper would deliver the inner string and silently
+        // drop the rest, which is corruption rather than a fallback. An
+        // object that IS exactly `{"content": "…"}` stays ambiguous and is
+        // unwrapped; nothing on the wire can separate the two.
+        .filter(|o| o.len() == 1)
+        .and_then(|o| o.get(CUSTOM_TOOL_INPUT_PARAM))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| arguments.to_string())
+}
+
+/// The names of the `custom` tools a Responses request declared.
+///
+/// The request side turns each of them into an ordinary function tool
+/// ([`responses_tools_to_chat`]), so the reply arrives as a chat tool call
+/// carrying nothing that says which Responses tool kind it came from. The
+/// caller registered the tool as `custom` and is waiting for a
+/// `custom_tool_call` item back, so both response translators need the
+/// request's own tool list to tell the two kinds apart.
+pub fn custom_tool_names(body: &Value) -> std::collections::BTreeSet<String> {
+    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+        return std::collections::BTreeSet::new();
+    };
+    tools
+        .iter()
+        .filter(|t| t.get("type").and_then(Value::as_str) == Some("custom"))
+        .filter_map(|t| t.get("name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
 }
 
 /// A custom tool's grammar, rendered for the tail of its description. Empty
@@ -620,10 +709,14 @@ fn responses_tool_choice_to_chat(tc: &Value) -> Option<Value> {
 /// Build the non-streaming Responses-API response object from a bridge
 /// [`ChatResponse`]. `requested_model` is echoed back (not the upstream
 /// id). `created_at` is a unix timestamp stamped by the caller.
+/// `custom_tools` names the request's `custom` tools (see
+/// [`custom_tool_names`]) so a call to one of them is returned as the
+/// `custom_tool_call` item the caller registered it for.
 pub fn chat_response_to_responses_json(
     resp: &ChatResponse,
     requested_model: &str,
     created_at: i64,
+    custom_tools: &std::collections::BTreeSet<String>,
 ) -> Value {
     let (status, incomplete_reason) = responses_status(&resp.finish_reason);
     let output = build_output_items(
@@ -633,6 +726,7 @@ pub fn chat_response_to_responses_json(
             .extra
             .get("tool_calls")
             .and_then(|v| v.as_array()),
+        custom_tools,
     );
 
     let mut obj = json!({
@@ -691,11 +785,14 @@ fn message_reasoning_text(message: &ChatMessage) -> Option<&str> {
 
 /// Assemble the `output` array: a `reasoning` item carrying the upstream's
 /// chain-of-thought (when any), then a `message` item carrying the assistant
-/// text (when any), followed by one `function_call` item per tool call.
+/// text (when any), followed by one tool-call item per tool call —
+/// `custom_tool_call` for a call naming one of `custom_tools`,
+/// `function_call` for everything else.
 fn build_output_items(
     reasoning: Option<&str>,
     text: Option<&str>,
     tool_calls: Option<&Vec<Value>>,
+    custom_tools: &std::collections::BTreeSet<String>,
 ) -> Vec<Value> {
     let mut output: Vec<Value> = Vec::new();
     // Reasoning leads the output array, as it does on a native Responses
@@ -729,14 +826,25 @@ fn build_output_items(
                 .and_then(|f| f.get("arguments"))
                 .and_then(|a| a.as_str())
                 .unwrap_or("");
-            output.push(json!({
-                "type": "function_call",
-                "id": format!("fc_{}", Uuid::new_v4().simple()),
-                "call_id": call_id,
-                "name": name,
-                "arguments": arguments,
-                "status": "completed",
-            }));
+            if custom_tools.contains(name) {
+                output.push(json!({
+                    "type": "custom_tool_call",
+                    "id": format!("ctc_{}", Uuid::new_v4().simple()),
+                    "call_id": call_id,
+                    "name": name,
+                    "input": unwrap_custom_tool_input(arguments),
+                    "status": "completed",
+                }));
+            } else {
+                output.push(json!({
+                    "type": "function_call",
+                    "id": format!("fc_{}", Uuid::new_v4().simple()),
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments,
+                    "status": "completed",
+                }));
+            }
         }
     }
     output
@@ -839,12 +947,49 @@ struct ReasoningState {
 /// Per-tool-call streaming state.
 #[derive(Debug)]
 struct ToolCallState {
-    item_id: String,
+    /// Minted when the call opens, before its name is known — so the item
+    /// id is assembled from it once the kind is (see [`Self::item_id`]).
+    item_uuid: String,
     call_id: String,
     name: String,
+    /// The call names one of the request's `custom` tools, so it streams as
+    /// a `custom_tool_call` item rather than a `function_call` one.
+    custom: bool,
     output_index: u32,
     arguments: String,
     item_added: bool,
+}
+
+impl ToolCallState {
+    /// `fc_…` for a function call, `ctc_…` for a custom tool call — the two
+    /// item-id prefixes the Responses API uses for the two item types.
+    fn item_id(&self) -> String {
+        let prefix = if self.custom { "ctc" } else { "fc" };
+        format!("{prefix}_{}", self.item_uuid)
+    }
+
+    /// The completed output item for this call.
+    fn done_item(&self) -> Value {
+        if self.custom {
+            json!({
+                "type": "custom_tool_call",
+                "id": self.item_id(),
+                "call_id": self.call_id,
+                "name": self.name,
+                "input": unwrap_custom_tool_input(&self.arguments),
+                "status": "completed",
+            })
+        } else {
+            json!({
+                "type": "function_call",
+                "id": self.item_id(),
+                "call_id": self.call_id,
+                "name": self.name,
+                "arguments": self.arguments,
+                "status": "completed",
+            })
+        }
+    }
 }
 
 /// State machine re-encoding a `ChatChunk` stream as Responses-API SSE.
@@ -872,6 +1017,9 @@ pub struct ResponsesSseEncoder {
     reasoning_done: Vec<ReasoningState>,
     // Tool-call items keyed by the OpenAI delta index.
     tool_calls: std::collections::BTreeMap<u64, ToolCallState>,
+    /// The request's `custom` tool names (see [`custom_tool_names`]) — a
+    /// call naming one of them streams as a `custom_tool_call` item.
+    custom_tools: std::collections::BTreeSet<String>,
     /// Withheld terminal status + incomplete reason while waiting on a
     /// trailing usage frame.
     pending_status: Option<&'static str>,
@@ -889,12 +1037,17 @@ pub struct ResponsesSseEncoder {
 }
 
 impl ResponsesSseEncoder {
+    /// `custom_tools` names the request's `custom` tools (see
+    /// [`custom_tool_names`]); pass an empty set for a request that declared
+    /// none.
     pub fn new(
         response_id: impl Into<String>,
         model_display_name: impl Into<String>,
         created_at: i64,
+        custom_tools: std::collections::BTreeSet<String>,
     ) -> Self {
         Self {
+            custom_tools,
             response_id: response_id.into(),
             model_display_name: model_display_name.into(),
             created_at,
@@ -1069,17 +1222,7 @@ impl ResponsesSseEncoder {
             ));
         }
         for tc in self.tool_calls.values() {
-            items.push((
-                tc.output_index,
-                json!({
-                    "type": "function_call",
-                    "id": tc.item_id,
-                    "call_id": tc.call_id,
-                    "name": tc.name,
-                    "arguments": tc.arguments,
-                    "status": "completed",
-                }),
-            ));
+            items.push((tc.output_index, tc.done_item()));
         }
         items.sort_by_key(|(idx, _)| *idx);
         items.into_iter().map(|(_, v)| v).collect()
@@ -1251,46 +1394,68 @@ impl ResponsesSseEncoder {
                     self.tool_calls.insert(
                         oai_index,
                         ToolCallState {
-                            item_id: format!("fc_{}", Uuid::new_v4().simple()),
+                            item_uuid: Uuid::new_v4().simple().to_string(),
                             call_id: String::new(),
                             name: String::new(),
+                            custom: false,
                             output_index,
                             arguments: String::new(),
                             item_added: false,
                         },
                     );
                 }
+                let custom = self.custom_tools.contains(name);
                 let state = self.tool_calls.get_mut(&oai_index).expect("just inserted");
                 if !id.is_empty() {
                     state.call_id = id.to_string();
                 }
                 if !name.is_empty() {
                     state.name = name.to_string();
+                    // Only until the item has been announced: `.added`
+                    // carries both the item id and the item type, and both
+                    // are derived from this flag. An upstream that splits
+                    // `function.name` across chunks overwrites the name on
+                    // each one, and letting a later fragment flip the flag
+                    // would leave `.done` disagreeing with the `.added`
+                    // the client already read.
+                    if !state.item_added {
+                        state.custom = custom;
+                    }
                 }
 
                 // Emit output_item.added once the call id + name are known.
                 if !state.item_added && !state.call_id.is_empty() && !state.name.is_empty() {
                     state.item_added = true;
-                    let (item_id, call_id, name, output_index) = (
-                        state.item_id.clone(),
+                    let (item_id, call_id, name, output_index, custom) = (
+                        state.item_id(),
                         state.call_id.clone(),
                         state.name.clone(),
                         state.output_index,
+                        state.custom,
                     );
+                    let item = if custom {
+                        json!({"type": "custom_tool_call", "id": item_id, "call_id": call_id, "name": name, "input": "", "status": "in_progress"})
+                    } else {
+                        json!({"type": "function_call", "id": item_id, "call_id": call_id, "name": name, "arguments": "", "status": "in_progress"})
+                    };
                     events.push(self.event(
                         "response.output_item.added",
-                        json!({
-                            "output_index": output_index,
-                            "item": {"type": "function_call", "id": item_id, "call_id": call_id, "name": name, "arguments": "", "status": "in_progress"},
-                        }),
+                        json!({"output_index": output_index, "item": item}),
                     ));
                 }
 
                 if !arguments.is_empty() {
                     let state = self.tool_calls.get_mut(&oai_index).expect("present");
                     state.arguments.push_str(arguments);
-                    if state.item_added {
-                        let (item_id, output_index) = (state.item_id.clone(), state.output_index);
+                    // A custom tool's fragments are the function-call
+                    // wrapper's JSON, not the freeform input the caller
+                    // asked for; they are buffered and emitted as one
+                    // unwrapped `custom_tool_call_input.delta` at the close.
+                    // Streaming the wrapper through would hand the client
+                    // pieces of `{"content":"…"}` under an event type whose
+                    // payload is supposed to be the input itself.
+                    if state.item_added && !state.custom {
+                        let (item_id, output_index) = (state.item_id(), state.output_index);
                         events.push(self.event(
                             "response.function_call_arguments.delta",
                             json!({
@@ -1407,30 +1572,50 @@ impl ResponsesSseEncoder {
             .map(|(k, _)| *k)
             .collect();
         for k in pending {
-            let (item_id, call_id, name, arguments, output_index) = {
+            let (item_id, arguments, output_index, custom, done_item) = {
                 let s = self.tool_calls.get(&k).expect("present");
                 (
-                    s.item_id.clone(),
-                    s.call_id.clone(),
-                    s.name.clone(),
+                    s.item_id(),
                     s.arguments.clone(),
                     s.output_index,
+                    s.custom,
+                    s.done_item(),
                 )
             };
-            events.push(self.event(
-                "response.function_call_arguments.done",
-                json!({
-                    "item_id": item_id,
-                    "output_index": output_index,
-                    "arguments": arguments,
-                }),
-            ));
+            if custom {
+                // The buffered fragments become exactly one delta carrying
+                // the unwrapped input, then the done event — a custom tool
+                // never emits `response.function_call_arguments.*`.
+                let input = unwrap_custom_tool_input(&arguments);
+                events.push(self.event(
+                    "response.custom_tool_call_input.delta",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "delta": input,
+                    }),
+                ));
+                events.push(self.event(
+                    "response.custom_tool_call_input.done",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "input": input,
+                    }),
+                ));
+            } else {
+                events.push(self.event(
+                    "response.function_call_arguments.done",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "arguments": arguments,
+                    }),
+                ));
+            }
             events.push(self.event(
                 "response.output_item.done",
-                json!({
-                    "output_index": output_index,
-                    "item": {"type": "function_call", "id": item_id, "call_id": call_id, "name": name, "arguments": arguments, "status": "completed"},
-                }),
+                json!({"output_index": output_index, "item": done_item}),
             ));
         }
         events
@@ -2036,6 +2221,12 @@ fn finish_reason_label(reason: &FinishReason) -> String {
 mod tests {
     use super::*;
     use aisix_gateway::{ChatDelta, Role};
+    use std::collections::BTreeSet;
+
+    /// A request that declared no `custom` tools.
+    fn no_custom_tools() -> BTreeSet<String> {
+        BTreeSet::new()
+    }
 
     // ── Request translation ──────────────────────────────────────
 
@@ -2485,6 +2676,85 @@ mod tests {
         assert_eq!(tools[0]["function"]["description"], "d");
     }
 
+    /// A custom tool call the caller replays has to go back upstream in the
+    /// same single-string function shape the tool was offered in, or the
+    /// history stops matching the tools list and the model re-asks.
+    #[test]
+    fn a_replayed_custom_tool_call_rewraps_its_input_as_function_arguments() {
+        let body = json!({
+            "model": "m",
+            "tools": [{"type": "custom", "name": "apply_patch"}],
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "id": "ctc_1",
+                    "call_id": "call_1",
+                    "name": "apply_patch",
+                    "input": "*** Begin Patch",
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_1",
+                    "output": "applied",
+                },
+            ],
+        });
+        let chat = responses_request_to_chat("m", &body);
+        assert_eq!(chat.messages.len(), 2);
+
+        assert!(matches!(chat.messages[0].role, Role::Assistant));
+        let tool_calls = chat.messages[0].extra["tool_calls"].as_array().unwrap();
+        assert_eq!(
+            tool_calls[0],
+            json!({
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "apply_patch",
+                    "arguments": "{\"content\":\"*** Begin Patch\"}",
+                },
+            })
+        );
+
+        assert!(matches!(chat.messages[1].role, Role::Tool));
+        assert_eq!(chat.messages[1].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(chat.messages[1].content.as_deref(), Some("applied"));
+    }
+
+    /// A custom tool's result takes the same string-or-content-parts union
+    /// as `function_call_output`, so it reads through the same converter.
+    #[test]
+    fn a_custom_tool_result_carrying_content_parts_reads_like_a_function_one() {
+        let body = json!({
+            "model": "m",
+            "input": [{
+                "type": "custom_tool_call_output",
+                "call_id": "c1",
+                "output": [{"type": "output_text", "text": "done"}],
+            }],
+        });
+        let chat = responses_request_to_chat("m", &body);
+        assert!(matches!(chat.messages[0].role, Role::Tool));
+        assert_eq!(chat.messages[0].content.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn custom_tool_names_reads_only_the_custom_entries() {
+        let body = json!({
+            "tools": [
+                {"type": "function", "name": "get_weather"},
+                {"type": "custom", "name": "apply_patch"},
+                {"type": "custom"},
+                {"type": "web_search_preview"},
+            ],
+        });
+        assert_eq!(
+            custom_tool_names(&body),
+            BTreeSet::from(["apply_patch".to_string()])
+        );
+        assert!(custom_tool_names(&json!({"input": "hi"})).is_empty());
+    }
+
     #[test]
     fn tool_choice_forms_normalise_to_the_provider_neutral_chat_shape() {
         let with_choice = |tc: Value| {
@@ -2717,7 +2987,7 @@ mod tests {
     #[test]
     fn non_streaming_text_response_builds_message_output_and_usage() {
         let resp = chat_response_with(Some("hello"), None, FinishReason::Stop);
-        let out = chat_response_to_responses_json(&resp, "opus-4.7", 100);
+        let out = chat_response_to_responses_json(&resp, "opus-4.7", 100, &no_custom_tools());
         assert_eq!(out["object"], "response");
         assert_eq!(out["status"], "completed");
         assert_eq!(out["model"], "opus-4.7");
@@ -2734,7 +3004,7 @@ mod tests {
     fn non_streaming_tool_call_response_builds_function_call_item() {
         let tcs = json!([{"id": "call_9", "type": "function", "function": {"name": "shell", "arguments": "{\"cmd\":\"ls\"}"}}]);
         let resp = chat_response_with(None, Some(tcs), FinishReason::ToolCalls);
-        let out = chat_response_to_responses_json(&resp, "m", 1);
+        let out = chat_response_to_responses_json(&resp, "m", 1, &no_custom_tools());
         let item = &out["output"][0];
         assert_eq!(item["type"], "function_call");
         assert_eq!(item["call_id"], "call_9");
@@ -2742,10 +3012,86 @@ mod tests {
         assert_eq!(item["arguments"], "{\"cmd\":\"ls\"}");
     }
 
+    /// The caller registered `apply_patch` as a `custom` tool, so the call
+    /// it gets back is a `custom_tool_call` item carrying the freeform
+    /// `input` — not the single-string function wrapper the request side
+    /// used to reach a chat upstream.
+    #[test]
+    fn a_call_to_a_custom_tool_returns_a_custom_tool_call_item() {
+        let tcs = json!([{
+            "id": "call_9",
+            "type": "function",
+            "function": {"name": "apply_patch", "arguments": "{\"content\":\"*** Begin Patch\"}"},
+        }]);
+        let resp = chat_response_with(None, Some(tcs), FinishReason::ToolCalls);
+        let out = chat_response_to_responses_json(
+            &resp,
+            "m",
+            1,
+            &BTreeSet::from(["apply_patch".to_string()]),
+        );
+        let item = &out["output"][0];
+        assert_eq!(item["type"], "custom_tool_call");
+        assert_eq!(item["call_id"], "call_9");
+        assert_eq!(item["name"], "apply_patch");
+        assert_eq!(item["input"], "*** Begin Patch");
+        assert_eq!(item["status"], "completed");
+        assert!(item["id"].as_str().unwrap().starts_with("ctc_"));
+        // The function-call spelling is gone, not carried alongside.
+        assert!(item.get("arguments").is_none());
+    }
+
+    /// A model that ignored the single-string schema still has its payload
+    /// delivered: the raw argument string becomes the input, because that
+    /// is what the caller's freeform tool was going to receive either way.
+    #[test]
+    fn custom_tool_input_falls_back_to_the_raw_arguments() {
+        let custom = BTreeSet::from(["apply_patch".to_string()]);
+        for arguments in [
+            "not json at all",
+            "{\"other\":\"x\"}",
+            "{\"content\":42}",
+            // The model answered with its freeform payload verbatim and it
+            // happens to be JSON carrying a `content` field. Unwrapping
+            // that would deliver `"x"` and drop `keep`.
+            "{\"content\":\"x\",\"keep\":1}",
+        ] {
+            let tcs = json!([{
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "apply_patch", "arguments": arguments},
+            }]);
+            let resp = chat_response_with(None, Some(tcs), FinishReason::ToolCalls);
+            let out = chat_response_to_responses_json(&resp, "m", 1, &custom);
+            assert_eq!(out["output"][0]["input"], arguments, "for {arguments}");
+        }
+    }
+
+    /// One reply can mix both kinds, and each keeps its own item type —
+    /// the set is consulted per call, not once per response.
+    #[test]
+    fn a_mixed_reply_keeps_each_call_on_its_own_item_type() {
+        let tcs = json!([
+            {"id": "c1", "type": "function", "function": {"name": "shell", "arguments": "{\"cmd\":\"ls\"}"}},
+            {"id": "c2", "type": "function", "function": {"name": "apply_patch", "arguments": "{\"content\":\"p\"}"}},
+        ]);
+        let resp = chat_response_with(None, Some(tcs), FinishReason::ToolCalls);
+        let out = chat_response_to_responses_json(
+            &resp,
+            "m",
+            1,
+            &BTreeSet::from(["apply_patch".to_string()]),
+        );
+        assert_eq!(out["output"][0]["type"], "function_call");
+        assert_eq!(out["output"][0]["arguments"], "{\"cmd\":\"ls\"}");
+        assert_eq!(out["output"][1]["type"], "custom_tool_call");
+        assert_eq!(out["output"][1]["input"], "p");
+    }
+
     #[test]
     fn length_finish_maps_to_incomplete_status() {
         let resp = chat_response_with(Some("x"), None, FinishReason::Length);
-        let out = chat_response_to_responses_json(&resp, "m", 1);
+        let out = chat_response_to_responses_json(&resp, "m", 1, &no_custom_tools());
         assert_eq!(out["status"], "incomplete");
         assert_eq!(out["incomplete_details"]["reason"], "max_output_tokens");
     }
@@ -2771,7 +3117,7 @@ mod tests {
 
     #[test]
     fn streaming_text_emits_canonical_event_sequence() {
-        let mut enc = ResponsesSseEncoder::new("resp_1", "opus-4.7", 0);
+        let mut enc = ResponsesSseEncoder::new("resp_1", "opus-4.7", 0, no_custom_tools());
         let mut all: Vec<ResponsesSseEvent> = Vec::new();
         all.extend(enc.next_events(&content_chunk("Hel")));
         all.extend(enc.next_events(&content_chunk("lo")));
@@ -2815,7 +3161,7 @@ mod tests {
     #[test]
     fn streaming_completed_withheld_until_trailing_usage_frame() {
         // OpenAI-compat upstreams send usage AFTER the finish chunk.
-        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let _ = enc.next_events(&content_chunk("hi"));
         // Finish without usage → close items but NOT completed yet.
         let at_finish = enc.next_events(&ChatChunk {
@@ -2841,7 +3187,7 @@ mod tests {
 
     #[test]
     fn streaming_tool_call_emits_function_call_events() {
-        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let chunk = ChatChunk {
             id: "c".into(),
             model: "m".into(),
@@ -2887,9 +3233,236 @@ mod tests {
         assert_eq!(item["arguments"], "{\"cmd\":\"ls\"}");
     }
 
+    /// One custom-tool call, streamed: the item opens as a
+    /// `custom_tool_call` with an empty `input`, the wrapper fragments are
+    /// buffered rather than streamed, and the close emits exactly one
+    /// unwrapped input delta, its done event, and the full item.
+    #[test]
+    fn streaming_custom_tool_call_emits_one_unwrapped_input_delta() {
+        let mut enc = ResponsesSseEncoder::new(
+            "resp_1",
+            "m",
+            0,
+            BTreeSet::from(["apply_patch".to_string()]),
+        );
+        let mut all = enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![json!({
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "apply_patch", "arguments": "{\"content\":\"*** Be"},
+                })]),
+                ..Default::default()
+            },
+            finish_reason: None,
+            usage: None,
+        });
+        all.extend(enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![
+                    json!({"index": 0, "function": {"arguments": "gin Patch\"}"}}),
+                ]),
+                ..Default::default()
+            },
+            finish_reason: None,
+            usage: None,
+        }));
+        all.extend(enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta::default(),
+            finish_reason: Some(FinishReason::ToolCalls),
+            usage: Some(UsageStats::new(4, 6)),
+        }));
+
+        assert_eq!(
+            types_of(&all),
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.custom_tool_call_input.delta",
+                "response.custom_tool_call_input.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+
+        let added = &all[2].data;
+        assert_eq!(added["item"]["type"], "custom_tool_call");
+        assert_eq!(added["item"]["input"], "");
+        assert_eq!(added["item"]["status"], "in_progress");
+        let item_id = added["item"]["id"].as_str().unwrap().to_string();
+        assert!(item_id.starts_with("ctc_"));
+
+        assert_eq!(all[3].data["delta"], "*** Begin Patch");
+        assert_eq!(all[3].data["item_id"], item_id);
+        assert_eq!(all[4].data["input"], "*** Begin Patch");
+        assert_eq!(all[4].data["item_id"], item_id);
+
+        let done_item = &all[5].data["item"];
+        assert_eq!(done_item["type"], "custom_tool_call");
+        assert_eq!(done_item["id"], item_id);
+        assert_eq!(done_item["call_id"], "call_1");
+        assert_eq!(done_item["input"], "*** Begin Patch");
+        assert_eq!(done_item["status"], "completed");
+
+        let final_item = &all[6].data["response"]["output"][0];
+        assert_eq!(final_item["type"], "custom_tool_call");
+        assert_eq!(final_item["input"], "*** Begin Patch");
+
+        // `sequence_number` runs unbroken across the custom-tool events.
+        let seqs: Vec<u64> = all
+            .iter()
+            .map(|e| e.data["sequence_number"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, (0..all.len() as u64).collect::<Vec<_>>());
+    }
+
+    /// A custom tool never streams the function-call argument events —
+    /// they carry the single-string wrapper, which is gateway plumbing the
+    /// caller never asked to see.
+    /// An upstream that splits `function.name` across chunks overwrites
+    /// the name on each one. The item id and the item type are both
+    /// derived from whether the name is a custom tool, so a later fragment
+    /// completing the name must not change what an already-emitted
+    /// `output_item.added` said — `.done` would name an item the client
+    /// never saw opened.
+    #[test]
+    fn a_tool_name_completed_after_the_item_opened_keeps_its_announced_identity() {
+        let mut enc = ResponsesSseEncoder::new(
+            "resp_1",
+            "m",
+            0,
+            BTreeSet::from(["apply_patch".to_string()]),
+        );
+        // First fragment carries a PREFIX of the custom tool's name, so the
+        // item opens as a plain function call.
+        let mut all = enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![json!({
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "apply_"},
+                })]),
+                ..Default::default()
+            },
+            finish_reason: None,
+            usage: None,
+        });
+        all.extend(enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![
+                    json!({"index": 0, "function": {"name": "apply_patch", "arguments": "{}"}}),
+                ]),
+                ..Default::default()
+            },
+            finish_reason: None,
+            usage: None,
+        }));
+        all.extend(enc.force_finish());
+
+        let added = all
+            .iter()
+            .find(|e| e.event_type == "response.output_item.added")
+            .expect("item announced");
+        let done = all
+            .iter()
+            .find(|e| e.event_type == "response.output_item.done")
+            .expect("item closed");
+        assert_eq!(added.data["item"]["id"], done.data["item"]["id"]);
+        assert_eq!(added.data["item"]["type"], done.data["item"]["type"]);
+        let final_item = &all.last().unwrap().data["response"]["output"][0];
+        assert_eq!(final_item["id"], added.data["item"]["id"]);
+        assert_eq!(final_item["type"], added.data["item"]["type"]);
+    }
+
+    #[test]
+    fn streaming_custom_tool_call_emits_no_function_call_argument_events() {
+        let mut enc = ResponsesSseEncoder::new(
+            "resp_1",
+            "m",
+            0,
+            BTreeSet::from(["apply_patch".to_string()]),
+        );
+        let mut all = enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![json!({
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "apply_patch", "arguments": "{\"content\":\"p\"}"},
+                })]),
+                ..Default::default()
+            },
+            finish_reason: None,
+            usage: None,
+        });
+        all.extend(enc.force_finish());
+        let types = types_of(&all);
+        assert!(!types.contains(&"response.function_call_arguments.delta"));
+        assert!(!types.contains(&"response.function_call_arguments.done"));
+    }
+
+    /// Both kinds in one stream keep their own item types and event
+    /// families, at their own `output_index`.
+    #[test]
+    fn streaming_mixed_tool_calls_keep_their_own_event_families() {
+        let mut enc = ResponsesSseEncoder::new(
+            "resp_1",
+            "m",
+            0,
+            BTreeSet::from(["apply_patch".to_string()]),
+        );
+        let mut all = enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![
+                    json!({"index": 0, "id": "c1", "type": "function",
+                           "function": {"name": "shell", "arguments": "{\"cmd\":\"ls\"}"}}),
+                    json!({"index": 1, "id": "c2", "type": "function",
+                           "function": {"name": "apply_patch", "arguments": "{\"content\":\"p\"}"}}),
+                ]),
+                ..Default::default()
+            },
+            finish_reason: None,
+            usage: None,
+        });
+        all.extend(enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta::default(),
+            finish_reason: Some(FinishReason::ToolCalls),
+            usage: Some(UsageStats::new(4, 6)),
+        }));
+        let types = types_of(&all);
+        assert!(types.contains(&"response.function_call_arguments.delta"));
+        assert!(types.contains(&"response.function_call_arguments.done"));
+        assert!(types.contains(&"response.custom_tool_call_input.delta"));
+        assert!(types.contains(&"response.custom_tool_call_input.done"));
+
+        let output = all.last().unwrap().data["response"]["output"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(output[0]["type"], "function_call");
+        assert_eq!(output[0]["arguments"], "{\"cmd\":\"ls\"}");
+        assert!(output[0]["id"].as_str().unwrap().starts_with("fc_"));
+        assert_eq!(output[1]["type"], "custom_tool_call");
+        assert_eq!(output[1]["input"], "p");
+        assert!(output[1]["id"].as_str().unwrap().starts_with("ctc_"));
+    }
+
     #[test]
     fn force_finish_on_empty_stream_emits_well_formed_completed() {
-        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let events = enc.force_finish();
         let types = types_of(&events);
         assert_eq!(
@@ -2907,7 +3480,7 @@ mod tests {
     fn tool_call_finish_without_usage_then_force_finish_does_not_double_close() {
         // Finish chunk lacks usage → done events emitted, completed withheld.
         // force_finish must NOT re-emit the per-item done events.
-        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let _ = enc.next_events(&ChatChunk {
             id: "c".into(),
             model: "m".into(),
@@ -2955,7 +3528,7 @@ mod tests {
     #[test]
     fn streaming_total_tokens_is_echoed_unless_the_shape_converted() {
         fn closing_usage(usage: UsageStats) -> Value {
-            let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+            let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
             let _ = enc.next_events(&content_chunk("hi"));
             let done = enc.next_events(&ChatChunk {
                 id: "c".into(),
@@ -2994,7 +3567,7 @@ mod tests {
 
     #[test]
     fn streaming_length_finish_emits_incomplete_with_reason() {
-        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let _ = enc.next_events(&content_chunk("partial"));
         let done = enc.next_events(&ChatChunk {
             id: "c".into(),
@@ -3095,7 +3668,7 @@ mod tests {
     /// closed — rather than an empty response.
     #[test]
     fn streaming_reasoning_only_emits_a_closed_reasoning_item() {
-        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let mut all = enc.next_events(&reasoning_chunk("think"));
         all.extend(enc.next_events(&reasoning_chunk("ing")));
         all.extend(enc.next_events(&finish_chunk(Some(UsageStats::new(4, 6)))));
@@ -3144,7 +3717,7 @@ mod tests {
     /// item opens.
     #[test]
     fn streaming_reasoning_then_content_then_tool_call_advances_output_index() {
-        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let mut all = enc.next_events(&reasoning_chunk("why"));
         all.extend(enc.next_events(&content_chunk("because")));
         all.extend(enc.next_events(&ChatChunk {
@@ -3203,7 +3776,7 @@ mod tests {
     /// message item keeps its own index and its own accumulated text.
     #[test]
     fn streaming_reasoning_after_content_opens_a_further_reasoning_item() {
-        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let mut all = enc.next_events(&content_chunk("first"));
         all.extend(enc.next_events(&reasoning_chunk("second thoughts")));
         all.extend(enc.next_events(&finish_chunk(Some(UsageStats::new(1, 1)))));
@@ -3234,7 +3807,7 @@ mod tests {
         resp.message
             .extra
             .insert("reasoning_content".into(), json!("6 times 7"));
-        let out = chat_response_to_responses_json(&resp, "m", 1);
+        let out = chat_response_to_responses_json(&resp, "m", 1, &no_custom_tools());
         assert_eq!(out["output"][0]["type"], "reasoning");
         assert!(out["output"][0]["id"].as_str().unwrap().starts_with("rs_"));
         assert_eq!(out["output"][0]["summary"][0]["type"], "summary_text");
@@ -3248,7 +3821,7 @@ mod tests {
     #[test]
     fn non_streaming_without_reasoning_emits_no_reasoning_item() {
         let resp = chat_response_with(Some("42"), None, FinishReason::Stop);
-        let out = chat_response_to_responses_json(&resp, "m", 1);
+        let out = chat_response_to_responses_json(&resp, "m", 1, &no_custom_tools());
         assert_eq!(out["output"][0]["type"], "message");
         assert!(out["output"]
             .as_array()
@@ -3262,7 +3835,7 @@ mod tests {
     /// path, so it must not reach the assembled assistant message.
     #[test]
     fn assembled_assistant_message_excludes_reasoning() {
-        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let _ = enc.next_events(&reasoning_chunk("SECRET"));
         let _ = enc.next_events(&content_chunk("visible"));
         let (text, tool_calls) = enc.assembled_assistant_message();
@@ -3275,7 +3848,7 @@ mod tests {
     /// adopts the local estimate before the synthesized terminal event.
     #[test]
     fn force_finish_reports_the_estimate_the_usage_record_gets() {
-        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let _ = enc.next_events(&content_chunk("hello"));
         let _ = enc.next_events(&ChatChunk {
             id: "c".into(),
@@ -3326,7 +3899,7 @@ mod tests {
         // used to block the whole estimate, so the client read
         // `output_tokens: 0` while the usage record — which fills per
         // counter — billed the estimate.
-        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let _ = enc.next_events(&content_chunk("hi"));
         let mut partial = UsageStats::new(3, 0);
         partial.total_tokens = 3;
@@ -3348,7 +3921,7 @@ mod tests {
 
     #[test]
     fn set_estimated_usage_is_ignored_once_a_usage_frame_landed() {
-        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let _ = enc.next_events(&content_chunk("hi"));
         let _ = enc.next_events(&ChatChunk {
             id: "c".into(),
