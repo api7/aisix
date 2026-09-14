@@ -1106,8 +1106,8 @@ async fn dispatch_to_target(
     } else {
         aisix_provider_anthropic::strip_billing_header_attribution(body)
     };
-    let body = crate::effort_mapping::anthropic_request(body.as_ref(), model);
-    let body = body.as_ref();
+    let (mapped, mapped_effort) = crate::effort_mapping::anthropic_request(body.as_ref(), model);
+    let body = mapped.as_ref();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
 
     if !crate::dispatch::speaks_anthropic(snapshot, model) {
@@ -1115,6 +1115,7 @@ async fn dispatch_to_target(
             state,
             snapshot,
             body,
+            mapped_effort,
             model,
             &target.id,
             timeouts,
@@ -2009,6 +2010,10 @@ async fn cross_provider_dispatch(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     body: &Value,
+    // What the target's `effort_mapping` did to this request's
+    // `output_config.effort`, so a removal is not undone by deriving an
+    // upstream effort from the `thinking` block beside it.
+    mapped_effort: aisix_core::MappedEffort,
     model: &aisix_core::Model,
     model_id: &str,
     timeouts: crate::routing::TimeoutBudget,
@@ -2067,7 +2072,7 @@ async fn cross_provider_dispatch(
     // fields (context_management, top_k, mcp_servers, …) are dropped —
     // flattened onto an OpenAI-compatible upstream they 400 as unknown
     // parameters (AISIX-Cloud#953).
-    translate_extras_to_openai_shape(&mut chat.extra);
+    translate_extras_to_openai_shape(&mut chat.extra, mapped_effort);
 
     let is_stream = chat.is_streaming();
 

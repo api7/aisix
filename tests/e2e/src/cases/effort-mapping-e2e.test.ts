@@ -321,6 +321,56 @@ describe("direct-model effort mapping", () => {
       provider_key_id: tokensOpenaiKey.id,
       effort_mapping: { "*": null, medium: "high" },
     });
+    // Claude Code sends `thinking` on every request and states an effort
+    // only when its user picked one, so these models exercise a request
+    // whose only reasoning control is the block. Each maps the not-set
+    // entry to a tier the bridge would never derive from `thinking` on
+    // its own, so the assertion fails if the injection stops happening.
+    await seed.createModel({
+      display_name: "effort-thinking-low",
+      provider: "openai",
+      model_name: "glm-thinking-low-wire",
+      provider_key_id: tokensOpenaiKey.id,
+      effort_mapping: { "": "low" },
+    });
+    await seed.createModel({
+      display_name: "effort-thinking-minimal",
+      provider: "openai",
+      model_name: "glm-thinking-minimal-wire",
+      provider_key_id: tokensOpenaiKey.id,
+      effort_mapping: { "": "minimal" },
+    });
+    await seed.createModel({
+      display_name: "effort-thinking-drop-exact",
+      provider: "openai",
+      model_name: "glm-thinking-drop-exact-wire",
+      provider_key_id: tokensOpenaiKey.id,
+      effort_mapping: { high: null },
+    });
+    await seed.createModel({
+      display_name: "effort-thinking-drop-star",
+      provider: "openai",
+      model_name: "glm-thinking-drop-star-wire",
+      provider_key_id: tokensOpenaiKey.id,
+      effort_mapping: { "*": null },
+    });
+    // Every kind of write one map can perform, so the `disabled` cells
+    // can show each of them being skipped: the not-set entry, an exact
+    // rewrite, a wildcard rewrite — and a removal, which still applies.
+    await seed.createModel({
+      display_name: "effort-thinking-disabled",
+      provider: "anthropic",
+      model_name: "glm-thinking-disabled-wire",
+      provider_key_id: tokensAnthropicKey.id,
+      effort_mapping: { "": "low", medium: "max", "*": "xhigh", low: null },
+    });
+    await seed.createModel({
+      display_name: "effort-thinking-passthrough",
+      provider: "anthropic",
+      model_name: "glm-thinking-passthrough-wire",
+      provider_key_id: tokensAnthropicKey.id,
+      effort_mapping: { "": "low", high: null },
+    });
     await seed.createModel({
       display_name: "effort-tokens-panel",
       provider: "openai",
@@ -368,6 +418,12 @@ describe("direct-model effort mapping", () => {
         "effort-tokens-count",
         "effort-tokens-ensemble",
         "effort-tokens-strip",
+        "effort-thinking-low",
+        "effort-thinking-minimal",
+        "effort-thinking-drop-exact",
+        "effort-thinking-drop-star",
+        "effort-thinking-passthrough",
+        "effort-thinking-disabled",
       ],
     });
     const proxy = new ProxyClient(app.proxyUrl, API_KEY);
@@ -875,17 +931,17 @@ describe("direct-model effort mapping", () => {
     ).toBe("high");
   });
 
-  test("leaves a thinking-stated effort for the upstream to resolve", async (ctx) => {
+  test("treats a thinking block as no effort at all", async (ctx) => {
     if (!etcdReachable || !app || !tokensAnthropic || !tokensCount || !tokensOpenai) {
       ctx.skip();
       return;
     }
 
-    // `thinking` states an effort of its own, so the `""` entry must not
-    // treat these as requests that set none — whichever shape they use.
+    // A `thinking` block is not an effort setting: these requests set no
+    // effort, so the `""` entry fills one in — whichever shape the block
+    // uses — and the block itself is forwarded untouched.
     for (const thinking of [
       { type: "enabled", budget_tokens: 8192 },
-      { type: "disabled" },
       { type: "adaptive" },
     ]) {
       let baseline = tokensAnthropic.receivedRequests.length;
@@ -900,9 +956,9 @@ describe("direct-model effort mapping", () => {
         "anthropic",
       );
       const sent = receivedSince(tokensAnthropic, baseline, "/v1/messages");
-      expect(sent, JSON.stringify(thinking)).not.toHaveProperty(
-        "output_config",
-      );
+      expect(sent.output_config, JSON.stringify(thinking)).toEqual({
+        effort: "high",
+      });
       expect(sent.thinking, JSON.stringify(thinking)).toEqual(thinking);
 
       baseline = tokensCount.receivedRequests.length;
@@ -915,17 +971,21 @@ describe("direct-model effort mapping", () => {
         },
         "anthropic",
       );
-      expect(
-        receivedSince(tokensCount, baseline, "/v1/messages/count_tokens"),
-        JSON.stringify(thinking),
-      ).not.toHaveProperty("output_config");
+      const counted = receivedSince(
+        tokensCount,
+        baseline,
+        "/v1/messages/count_tokens",
+      );
+      expect(counted.output_config, JSON.stringify(thinking)).toEqual({
+        effort: "high",
+      });
+      expect(counted.thinking, JSON.stringify(thinking)).toEqual(thinking);
     }
 
-    // The leg the guard exists for. Dispatching to a provider that does
-    // not accept the Anthropic protocol, the gateway resolves the
-    // `thinking` block itself — a budget of 1024 reads as `low` — and an
-    // injected `output_config.effort` would have outranked it.
-    let crossBaseline = tokensOpenai!.receivedRequests.length;
+    // Dispatched to a provider that does not accept the Anthropic
+    // protocol, the injected effort is what the upstream gets: a budget
+    // of 1024 would otherwise have been resolved as `low`.
+    const crossBaseline = tokensOpenai.receivedRequests.length;
     await post(
       "/v1/messages",
       {
@@ -937,9 +997,9 @@ describe("direct-model effort mapping", () => {
       "anthropic",
     );
     expect(
-      receivedSince(tokensOpenai!, crossBaseline, "/v1/chat/completions")
+      receivedSince(tokensOpenai, crossBaseline, "/v1/chat/completions")
         .reasoning_effort,
-    ).toBe("low");
+    ).toBe("high");
 
     // The effort a `thinking` block states takes no part in matching: an
     // `output_config.effort` beside it maps exactly as it would alone.
@@ -958,6 +1018,231 @@ describe("direct-model effort mapping", () => {
     expect(
       receivedSince(tokensAnthropic, baseline, "/v1/messages").output_config,
     ).toEqual({ effort: "low" });
+  });
+
+  test("never writes a tier beside disabled thinking", async (ctx) => {
+    if (!etcdReachable || !app || !tokensAnthropic || !tokensCount) {
+      ctx.skip();
+      return;
+    }
+
+    const disabled = { type: "disabled" };
+
+    // Control: without the opt-out this model does write. Every "no
+    // tier" assertion below would otherwise pass on a map that never
+    // fires at all.
+    let baseline = tokensAnthropic.receivedRequests.length;
+    await post(
+      "/v1/messages",
+      {
+        model: "effort-thinking-disabled",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hello" }],
+        thinking: { type: "adaptive" },
+      },
+      "anthropic",
+    );
+    expect(
+      receivedSince(tokensAnthropic, baseline, "/v1/messages").output_config,
+    ).toEqual({ effort: "low" });
+
+    // Each kind of write, skipped. The not-set entry has nothing to
+    // inject into, so no `output_config` reaches the upstream at all;
+    // the two rewrites leave the caller's own tier exactly as sent.
+    for (const [label, sent, expected] of [
+      ["not-set entry", {}, undefined],
+      ["exact entry", { output_config: { effort: "medium" } }, { effort: "medium" }],
+      ["wildcard entry", { output_config: { effort: "xl" } }, { effort: "xl" }],
+    ] as const) {
+      baseline = tokensAnthropic.receivedRequests.length;
+      await post(
+        "/v1/messages",
+        {
+          model: "effort-thinking-disabled",
+          max_tokens: 64,
+          messages: [{ role: "user", content: "hello" }],
+          thinking: disabled,
+          ...sent,
+        },
+        "anthropic",
+      );
+      const got = receivedSince(tokensAnthropic, baseline, "/v1/messages");
+      expect(got.output_config, label).toEqual(expected);
+      expect(got.thinking, label).toEqual(disabled);
+    }
+
+    // A removal is not a tier, so it still applies.
+    baseline = tokensAnthropic.receivedRequests.length;
+    await post(
+      "/v1/messages",
+      {
+        model: "effort-thinking-disabled",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hello" }],
+        thinking: disabled,
+        output_config: { effort: "low" },
+      },
+      "anthropic",
+    );
+    const removed = receivedSince(tokensAnthropic, baseline, "/v1/messages");
+    expect(removed).not.toHaveProperty("output_config");
+    expect(removed.thinking).toEqual(disabled);
+
+    // The token-counting sibling shares the mapping, so it shares this.
+    baseline = tokensCount.receivedRequests.length;
+    await post(
+      "/v1/messages/count_tokens",
+      {
+        model: "effort-tokens-count",
+        messages: [{ role: "user", content: "hello" }],
+        thinking: disabled,
+      },
+      "anthropic",
+    );
+    const counted = receivedSince(
+      tokensCount,
+      baseline,
+      "/v1/messages/count_tokens",
+    );
+    expect(counted).not.toHaveProperty("output_config");
+    expect(counted.thinking).toEqual(disabled);
+  });
+
+  test("resolves the upstream effort of a thinking-only request on the bridge", async (ctx) => {
+    if (!etcdReachable || !app || !tokensOpenai) {
+      ctx.skip();
+      return;
+    }
+
+    // The shape Claude Code sends when its user picked no effort level.
+    const claudeCodeDefault = {
+      max_tokens: 64,
+      messages: [{ role: "user", content: "hello" }],
+      thinking: { type: "adaptive" },
+    };
+
+    // Injected, and the injected tier is what goes upstream — `adaptive`
+    // on its own resolves to `high`, so `low` can only be the entry.
+    let baseline = tokensOpenai.receivedRequests.length;
+    await post(
+      "/v1/messages",
+      { model: "effort-thinking-low", ...claudeCodeDefault },
+      "anthropic",
+    );
+    expect(
+      receivedSince(tokensOpenai, baseline, "/v1/chat/completions")
+        .reasoning_effort,
+    ).toBe("low");
+
+    // A budget of 8192 buckets to `high`; the entry's `minimal` wins.
+    baseline = tokensOpenai.receivedRequests.length;
+    await post(
+      "/v1/messages",
+      {
+        model: "effort-thinking-minimal",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hello" }],
+        thinking: { type: "enabled", budget_tokens: 8192 },
+      },
+      "anthropic",
+    );
+    expect(
+      receivedSince(tokensOpenai, baseline, "/v1/chat/completions")
+        .reasoning_effort,
+    ).toBe("minimal");
+
+    // An entry that removed the effort sends none: the `thinking` block
+    // beside it must not be resolved back into one. Both routes to a
+    // removal — the exact entry and the wildcard.
+    for (const model of [
+      "effort-thinking-drop-exact",
+      "effort-thinking-drop-star",
+    ]) {
+      baseline = tokensOpenai.receivedRequests.length;
+      await post(
+        "/v1/messages",
+        {
+          model,
+          max_tokens: 64,
+          messages: [{ role: "user", content: "hello" }],
+          thinking: { type: "adaptive" },
+          output_config: { effort: "high" },
+        },
+        "anthropic",
+      );
+      expect(
+        receivedSince(tokensOpenai, baseline, "/v1/chat/completions"),
+        model,
+      ).not.toHaveProperty("reasoning_effort");
+    }
+
+    // Turning reasoning off is the client's own instruction and outranks
+    // the operator's level mapping, injected or removed alike. The
+    // removal leg needs a present effort for `*` to match and drop —
+    // without one no entry fires and the cell is not a removal at all.
+    for (const model of ["effort-thinking-low", "effort-thinking-drop-star"]) {
+      baseline = tokensOpenai.receivedRequests.length;
+      await post(
+        "/v1/messages",
+        {
+          model,
+          max_tokens: 64,
+          messages: [{ role: "user", content: "hello" }],
+          thinking: { type: "disabled" },
+          ...(model === "effort-thinking-drop-star"
+            ? { output_config: { effort: "high" } }
+            : {}),
+        },
+        "anthropic",
+      );
+      expect(
+        receivedSince(tokensOpenai, baseline, "/v1/chat/completions")
+          .reasoning_effort,
+        model,
+      ).toBe("none");
+    }
+  });
+
+  test("leaves the thinking block alone on an Anthropic upstream", async (ctx) => {
+    if (!etcdReachable || !app || !tokensAnthropic) {
+      ctx.skip();
+      return;
+    }
+
+    // Passthrough: the mapped effort lands beside the block the caller
+    // sent, which is forwarded byte for byte.
+    const thinking = { type: "adaptive" };
+    let baseline = tokensAnthropic.receivedRequests.length;
+    await post(
+      "/v1/messages",
+      {
+        model: "effort-thinking-passthrough",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hello" }],
+        thinking,
+      },
+      "anthropic",
+    );
+    let sent = receivedSince(tokensAnthropic, baseline, "/v1/messages");
+    expect(sent.output_config).toEqual({ effort: "low" });
+    expect(sent.thinking).toEqual(thinking);
+
+    // And a removal drops only the effort.
+    baseline = tokensAnthropic.receivedRequests.length;
+    await post(
+      "/v1/messages",
+      {
+        model: "effort-thinking-passthrough",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hello" }],
+        thinking,
+        output_config: { effort: "high" },
+      },
+      "anthropic",
+    );
+    sent = receivedSince(tokensAnthropic, baseline, "/v1/messages");
+    expect(sent).not.toHaveProperty("output_config");
+    expect(sent.thinking).toEqual(thinking);
   });
 
   test("strips the effort from every unlisted value when the wildcard maps to null", async (ctx) => {

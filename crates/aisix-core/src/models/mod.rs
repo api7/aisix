@@ -62,7 +62,7 @@ pub use mcp_policy::{McpAccess, McpPolicy, McpPolicyScope};
 pub use mcp_ref::{LiveMcpServerIndex, McpServerIndex, McpToolRef};
 pub use mcp_server::{McpAuthType, McpProtocolVersion, McpServer, McpServerType, McpTransport};
 pub use model::{
-    Adapter, BackgroundModelCheck, CooldownConfig, EffortAction, Model,
+    Adapter, BackgroundModelCheck, CooldownConfig, EffortAction, MappedEffort, Model,
     DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use model_ref::resolve_model_ref;
