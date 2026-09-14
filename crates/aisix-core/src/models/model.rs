@@ -326,7 +326,7 @@ pub struct Model {
     ///
     /// Three entries are reserved. The empty-string key matches a request that sets no effort at all, meaning the effort field is absent, `null`, or empty, and its value is added to the outbound request. The `*` key matches any other present value that has no entry of its own, and never matches a request that sets no effort. A `null` value removes the effort field from the outbound request so the provider's own default applies; mapping `*` to `null` therefore strips the effort from every request whose value has no entry of its own. The empty-string key may not be mapped to `null`, because a request that sets no effort has nothing to remove, and no entry may be mapped to an empty value.
     ///
-    /// On the Anthropic messages and token-counting endpoints a request may state its effort with a `thinking` block instead of `output_config.effort`: `disabled` means no reasoning, `enabled` states a thinking budget, and `adaptive` takes the provider's own default. Such a request has set an effort, so the empty-string key does not match it. The effort a `thinking` block states takes no part in matching — only `output_config.effort` is read and rewritten. When such a request is dispatched to a provider that does not accept the Anthropic protocol, the gateway converts the block into an upstream reasoning effort of its own; that value does not pass through this mapping, so no entry, `*` included, rewrites or removes it.
+    /// On the Anthropic messages and token-counting endpoints only `output_config.effort` is read and rewritten. A `thinking` block is not an effort setting for this mapping, so a request that carries `thinking` but no `output_config.effort` sets no effort and the empty-string entry applies to it. When such a request is dispatched to a provider that does not accept the Anthropic protocol, the upstream reasoning effort is derived from the mapped `output_config.effort` when one is present and from `thinking` otherwise — except that an entry that removed the effort sends none, and `thinking.type: disabled` always sends no reasoning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_mapping: Option<BTreeMap<String, Option<String>>>,
 
@@ -350,6 +350,21 @@ pub enum EffortAction<'a> {
     /// Drop the effort field from the outbound request so the provider's
     /// own default applies.
     Remove,
+}
+
+/// What a model's `effort_mapping` did to one request, carried alongside
+/// the rewritten request so a translation to another wire protocol can
+/// tell a request whose effort an entry deliberately removed from one
+/// that simply never stated an effort of its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MappedEffort {
+    /// The outbound request states whatever effort it carries, be that
+    /// the caller's own, one an entry wrote in, or none at all.
+    #[default]
+    AsWritten,
+    /// An entry removed the effort field: the outbound request states no
+    /// effort on purpose, and nothing may put one back.
+    Removed,
 }
 
 impl Model {
