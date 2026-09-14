@@ -1170,9 +1170,17 @@
     },
     "effort_mapping": {
       "additionalProperties": {
-        "type": "string"
+        "type": [
+          "string",
+          "null"
+        ]
       },
-      "description": "Direct-model-only mapping from a client-requested reasoning effort to the value sent upstream. The gateway applies one exact lookup after resolving the final target; unlisted values pass through unchanged.",
+      "description": "Direct-model-only mapping from a client-requested reasoning effort to the value sent upstream. After resolving the final target the gateway looks the requested effort up once — the exact entry first, then the `*` entry — and never looks the result up again. A requested value that matches neither is sent unchanged.\n\nThree entries are reserved. The empty-string key matches a request that sets no effort at all, meaning the effort field is absent, `null`, or empty, and its value is added to the outbound request. The `*` key matches any other present value that has no entry of its own, and never matches a request that sets no effort. A `null` value removes the effort field from the outbound request so the provider's own default applies; the empty-string key may not be mapped to `null`, because a request that sets no effort has nothing to remove.",
+      "properties": {
+        "": {
+          "type": "string"
+        }
+      },
       "type": "object"
     },
     "embedding": {

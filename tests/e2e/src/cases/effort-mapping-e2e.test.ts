@@ -1,4 +1,9 @@
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -10,6 +15,16 @@ import {
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
+
+const execFileP = promisify(execFile);
+
+// The three ways a request sets no reasoning effort at all. Every one of
+// them takes the mapping's `""` entry.
+const NO_EFFORT_CARRIERS: Record<string, unknown>[] = [
+  {},
+  { reasoning_effort: null },
+  { reasoning_effort: "" },
+];
 
 const API_KEY = "sk-effort-mapping";
 const KEY_HASH = createHash("sha256").update(API_KEY).digest("hex");
@@ -99,6 +114,9 @@ describe("direct-model effort mapping", () => {
   let openaiStream: OpenAiUpstream | undefined;
   let anthropicStream: OpenAiUpstream | undefined;
   let ensembleStream: OpenAiUpstream | undefined;
+  let tokensOpenai: OpenAiUpstream | undefined;
+  let tokensAnthropic: OpenAiUpstream | undefined;
+  let tokensCount: OpenAiUpstream | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -126,6 +144,15 @@ describe("direct-model effort mapping", () => {
         { nonStreamBody: chatResponse },
         { streamEvents: openaiStreamEvents },
       ],
+    });
+    // The reserved-token models get upstreams of their own: the ones above
+    // answer from a fixed script, so an extra request would run off its end.
+    tokensOpenai = await startOpenAiUpstream({ nonStreamBody: chatResponse });
+    tokensAnthropic = await startOpenAiUpstream({
+      nonStreamBody: anthropicResponse,
+    });
+    tokensCount = await startOpenAiUpstream({
+      nonStreamBody: { input_tokens: 3 },
     });
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
@@ -158,6 +185,25 @@ describe("direct-model effort mapping", () => {
       display_name: "effort-map-ensemble-stream-key",
       secret: "sk-ensemble-stream-mock",
       api_base: `${ensembleStream.baseUrl}/v1`,
+    });
+    const tokensOpenaiKey = await seed.createProviderKey({
+      display_name: "effort-map-tokens-openai-key",
+      secret: "sk-tokens-openai-mock",
+      api_base: `${tokensOpenai.baseUrl}/v1`,
+    });
+    const tokensAnthropicKey = await seed.createProviderKey({
+      display_name: "effort-map-tokens-anthropic-key",
+      provider: "anthropic",
+      adapter: "anthropic",
+      secret: "sk-tokens-anthropic-mock",
+      api_base: tokensAnthropic.baseUrl,
+    });
+    const tokensCountKey = await seed.createProviderKey({
+      display_name: "effort-map-tokens-count-key",
+      provider: "anthropic",
+      adapter: "anthropic",
+      secret: "sk-tokens-count-mock",
+      api_base: tokensCount.baseUrl,
     });
 
     const mapping = { medium: "high", high: "max" };
@@ -233,6 +279,38 @@ describe("direct-model effort mapping", () => {
         min_responses: 1,
       },
     });
+    // One map carrying all three reserved entries: add `high` when the
+    // request sets no effort, drop the field for `medium`, and catch every
+    // other value with `*`.
+    const tokens = { "": "high", medium: null, "*": "low" };
+    await seed.createModel({
+      display_name: "effort-tokens-openai",
+      provider: "openai",
+      model_name: "glm-tokens-openai-wire",
+      provider_key_id: tokensOpenaiKey.id,
+      effort_mapping: tokens,
+    });
+    await seed.createModel({
+      display_name: "effort-tokens-star",
+      provider: "openai",
+      model_name: "glm-tokens-star-wire",
+      provider_key_id: tokensOpenaiKey.id,
+      effort_mapping: { "*": "low" },
+    });
+    await seed.createModel({
+      display_name: "effort-tokens-anthropic",
+      provider: "anthropic",
+      model_name: "glm-tokens-anthropic-wire",
+      provider_key_id: tokensAnthropicKey.id,
+      effort_mapping: tokens,
+    });
+    await seed.createModel({
+      display_name: "effort-tokens-count",
+      provider: "anthropic",
+      model_name: "glm-tokens-count-wire",
+      provider_key_id: tokensCountKey.id,
+      effort_mapping: tokens,
+    });
     await seed.createModel({
       display_name: "effort-map-group",
       routing: {
@@ -253,6 +331,10 @@ describe("direct-model effort mapping", () => {
         "effort-map-ensemble",
         "effort-map-ensemble-stream",
         "effort-map-group",
+        "effort-tokens-openai",
+        "effort-tokens-star",
+        "effort-tokens-anthropic",
+        "effort-tokens-count",
       ],
     });
     const proxy = new ProxyClient(app.proxyUrl, API_KEY);
@@ -268,6 +350,9 @@ describe("direct-model effort mapping", () => {
     await openaiStream?.close();
     await anthropicStream?.close();
     await ensembleStream?.close();
+    await tokensOpenai?.close();
+    await tokensAnthropic?.close();
+    await tokensCount?.close();
   });
 
   async function post(
@@ -459,6 +544,296 @@ describe("direct-model effort mapping", () => {
     ).toBe("max");
   });
 
+  test("adds the configured effort when the request sets none", async (ctx) => {
+    if (!etcdReachable || !app || !tokensOpenai || !tokensAnthropic || !tokensCount) {
+      ctx.skip();
+      return;
+    }
+
+    // A request sets no effort three ways, and all three take the same
+    // entry: the field is absent, it is null, or it is empty.
+    for (const carrier of NO_EFFORT_CARRIERS) {
+      const baseline = tokensOpenai.receivedRequests.length;
+      await post("/v1/chat/completions", {
+        model: "effort-tokens-openai",
+        messages: [{ role: "user", content: "hello" }],
+        ...carrier,
+      });
+      expect(
+        receivedSince(tokensOpenai, baseline, "/v1/chat/completions")
+          .reasoning_effort,
+        JSON.stringify(carrier),
+      ).toBe("high");
+    }
+
+    for (const carrier of [
+      {},
+      { reasoning: null },
+      { reasoning: { effort: null } },
+      { reasoning: { effort: "" } },
+    ]) {
+      const baseline = tokensOpenai.receivedRequests.length;
+      await post("/v1/responses", {
+        model: "effort-tokens-openai",
+        input: "hello",
+        ...carrier,
+      });
+      expect(
+        receivedSince(tokensOpenai, baseline, "/v1/responses").reasoning,
+        JSON.stringify(carrier),
+      ).toEqual({ effort: "high" });
+    }
+
+    // An existing parent object keeps the keys the caller put beside the
+    // effort.
+    let baseline = tokensOpenai.receivedRequests.length;
+    await post("/v1/responses", {
+      model: "effort-tokens-openai",
+      input: "hello",
+      reasoning: { summary: "auto" },
+    });
+    expect(
+      receivedSince(tokensOpenai, baseline, "/v1/responses").reasoning,
+    ).toEqual({ effort: "high", summary: "auto" });
+
+    baseline = tokensAnthropic.receivedRequests.length;
+    await post(
+      "/v1/messages",
+      {
+        model: "effort-tokens-anthropic",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hello" }],
+      },
+      "anthropic",
+    );
+    expect(
+      receivedSince(tokensAnthropic, baseline, "/v1/messages").output_config,
+    ).toEqual({ effort: "high" });
+
+    // Same model reached through the Responses → Chat bridge.
+    baseline = tokensAnthropic.receivedRequests.length;
+    await post("/v1/responses", {
+      model: "effort-tokens-anthropic",
+      input: "hello",
+    });
+    expect(
+      receivedSince(tokensAnthropic, baseline, "/v1/messages").output_config,
+    ).toEqual({ effort: "high" });
+
+    baseline = tokensCount.receivedRequests.length;
+    await post(
+      "/v1/messages/count_tokens",
+      {
+        model: "effort-tokens-count",
+        messages: [{ role: "user", content: "hello" }],
+      },
+      "anthropic",
+    );
+    expect(
+      receivedSince(tokensCount, baseline, "/v1/messages/count_tokens")
+        .output_config,
+    ).toEqual({ effort: "high" });
+  });
+
+  test("removes the effort field when the entry maps to null", async (ctx) => {
+    if (!etcdReachable || !app || !tokensOpenai || !tokensAnthropic || !tokensCount) {
+      ctx.skip();
+      return;
+    }
+
+    let baseline = tokensOpenai.receivedRequests.length;
+    await post("/v1/chat/completions", {
+      model: "effort-tokens-openai",
+      messages: [{ role: "user", content: "hello" }],
+      reasoning_effort: "medium",
+    });
+    expect(
+      receivedSince(tokensOpenai, baseline, "/v1/chat/completions"),
+    ).not.toHaveProperty("reasoning_effort");
+
+    // Removing the leaf empties `reasoning`, so the parent goes too.
+    baseline = tokensOpenai.receivedRequests.length;
+    await post("/v1/responses", {
+      model: "effort-tokens-openai",
+      input: "hello",
+      reasoning: { effort: "medium" },
+    });
+    expect(
+      receivedSince(tokensOpenai, baseline, "/v1/responses"),
+    ).not.toHaveProperty("reasoning");
+
+    // A sibling key keeps the parent alive and is left as the caller
+    // wrote it.
+    baseline = tokensOpenai.receivedRequests.length;
+    await post("/v1/responses", {
+      model: "effort-tokens-openai",
+      input: "hello",
+      reasoning: { effort: "medium", summary: "auto" },
+    });
+    expect(
+      receivedSince(tokensOpenai, baseline, "/v1/responses").reasoning,
+    ).toEqual({ summary: "auto" });
+
+    baseline = tokensAnthropic.receivedRequests.length;
+    await post(
+      "/v1/messages",
+      {
+        model: "effort-tokens-anthropic",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hello" }],
+        output_config: { effort: "medium" },
+      },
+      "anthropic",
+    );
+    expect(
+      receivedSince(tokensAnthropic, baseline, "/v1/messages"),
+    ).not.toHaveProperty("output_config");
+
+    baseline = tokensAnthropic.receivedRequests.length;
+    await post("/v1/responses", {
+      model: "effort-tokens-anthropic",
+      input: "hello",
+      reasoning: { effort: "medium" },
+    });
+    expect(
+      receivedSince(tokensAnthropic, baseline, "/v1/messages"),
+    ).not.toHaveProperty("output_config");
+
+    baseline = tokensCount.receivedRequests.length;
+    await post(
+      "/v1/messages/count_tokens",
+      {
+        model: "effort-tokens-count",
+        messages: [{ role: "user", content: "hello" }],
+        output_config: { effort: "medium" },
+      },
+      "anthropic",
+    );
+    expect(
+      receivedSince(tokensCount, baseline, "/v1/messages/count_tokens"),
+    ).not.toHaveProperty("output_config");
+  });
+
+  test("falls back to the wildcard only for a present unlisted value", async (ctx) => {
+    if (!etcdReachable || !app || !tokensOpenai || !tokensAnthropic || !tokensCount) {
+      ctx.skip();
+      return;
+    }
+
+    let baseline = tokensOpenai.receivedRequests.length;
+    await post("/v1/chat/completions", {
+      model: "effort-tokens-openai",
+      messages: [{ role: "user", content: "hello" }],
+      reasoning_effort: "xl",
+    });
+    expect(
+      receivedSince(tokensOpenai, baseline, "/v1/chat/completions")
+        .reasoning_effort,
+    ).toBe("low");
+
+    baseline = tokensOpenai.receivedRequests.length;
+    await post("/v1/responses", {
+      model: "effort-tokens-openai",
+      input: "hello",
+      reasoning: { effort: "xl" },
+    });
+    expect(
+      receivedSince(tokensOpenai, baseline, "/v1/responses").reasoning,
+    ).toEqual({ effort: "low" });
+
+    baseline = tokensAnthropic.receivedRequests.length;
+    await post(
+      "/v1/messages",
+      {
+        model: "effort-tokens-anthropic",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hello" }],
+        output_config: { effort: "xl" },
+      },
+      "anthropic",
+    );
+    expect(
+      receivedSince(tokensAnthropic, baseline, "/v1/messages").output_config,
+    ).toEqual({ effort: "low" });
+
+    baseline = tokensCount.receivedRequests.length;
+    await post(
+      "/v1/messages/count_tokens",
+      {
+        model: "effort-tokens-count",
+        messages: [{ role: "user", content: "hello" }],
+        output_config: { effort: "xl" },
+      },
+      "anthropic",
+    );
+    expect(
+      receivedSince(tokensCount, baseline, "/v1/messages/count_tokens")
+        .output_config,
+    ).toEqual({ effort: "low" });
+
+    // A model whose only entry is the wildcard leaves a request that sets
+    // no effort alone: the wildcard stands for a value, not for its
+    // absence.
+    for (const carrier of NO_EFFORT_CARRIERS) {
+      baseline = tokensOpenai.receivedRequests.length;
+      await post("/v1/chat/completions", {
+        model: "effort-tokens-star",
+        messages: [{ role: "user", content: "hello" }],
+        ...carrier,
+      });
+      const sent = receivedSince(
+        tokensOpenai,
+        baseline,
+        "/v1/chat/completions",
+      );
+      expect(sent.reasoning_effort, JSON.stringify(carrier)).toEqual(
+        carrier.reasoning_effort,
+      );
+    }
+  });
+
+  test("passes an unset effort through when no entry matches it", async (ctx) => {
+    if (!etcdReachable || !app || !openai) {
+      ctx.skip();
+      return;
+    }
+
+    // `effort-map-openai` maps only `medium` and `high`, so a request that
+    // sets no effort reaches the upstream exactly as the caller wrote it —
+    // an explicit null or empty string included.
+    for (const carrier of NO_EFFORT_CARRIERS) {
+      const baseline = openai.receivedRequests.length;
+      await post("/v1/chat/completions", {
+        model: "effort-map-openai",
+        messages: [{ role: "user", content: "hello" }],
+        ...carrier,
+      });
+      const sent = receivedSince(openai, baseline, "/v1/chat/completions");
+      expect(sent.reasoning_effort, JSON.stringify(carrier)).toEqual(
+        carrier.reasoning_effort,
+      );
+    }
+
+    let baseline = openai.receivedRequests.length;
+    await post("/v1/responses", {
+      model: "effort-map-openai",
+      input: "hello",
+      reasoning: { effort: null, summary: "auto" },
+    });
+    expect(
+      receivedSince(openai, baseline, "/v1/responses").reasoning,
+    ).toEqual({ effort: null, summary: "auto" });
+
+    baseline = openai.receivedRequests.length;
+    await post("/v1/responses", {
+      model: "effort-map-openai",
+      input: "hello",
+    });
+    expect(
+      receivedSince(openai, baseline, "/v1/responses"),
+    ).not.toHaveProperty("reasoning");
+  });
+
   test("maps native and translated streaming requests", async (ctx) => {
     if (
       !etcdReachable ||
@@ -520,4 +895,60 @@ describe("direct-model effort mapping", () => {
       )?.reasoning_effort,
     ).toBe("max");
   });
+});
+
+// The empty-string key stands for a request that sets no effort, and a
+// null value removes the effort field — so the pair asks to remove a field
+// the request never set. A rule that can never do anything is refused at
+// the write contract rather than stored and never read.
+describe("resources file: the not-set key may not map to null", () => {
+  const BIN_PATH =
+    process.env.AISIX_BIN ??
+    join(process.cwd(), "..", "..", "target", "debug", "aisix");
+
+  const file = (mapping: string) =>
+    [
+      '_format_version: "1"',
+      "provider_keys:",
+      "  - display_name: pk",
+      "    api_key: sk-x",
+      "models:",
+      "  - display_name: m",
+      "    provider: openai",
+      "    model_name: gpt-4o",
+      "    provider_key: pk",
+      "    effort_mapping:",
+      mapping,
+    ].join("\n");
+
+  test("`\"\": null` is refused, and the other two tokens validate", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "aisix-effort-tokens-"));
+    try {
+      const bad = join(dir, "bad.yaml");
+      await writeFile(bad, file('      "": null'), "utf8");
+      let failure: (Error & { code?: number; stderr?: string }) | undefined;
+      try {
+        await execFileP(BIN_PATH, ["validate", "--resources", bad]);
+      } catch (e) {
+        failure = e as Error & { code?: number; stderr?: string };
+      }
+      if (!failure) throw new Error("expected `aisix validate` to fail");
+      expect(failure.code).toBe(1);
+      expect(String(failure.stderr)).toContain("effort_mapping");
+
+      // The same file with a value on that key, plus the two tokens that
+      // do combine, validates — so the refusal is the pair and nothing
+      // else in the fixture.
+      const good = join(dir, "good.yaml");
+      await writeFile(
+        good,
+        file('      "": high\n      "*": low\n      medium: null'),
+        "utf8",
+      );
+      const ok = await execFileP(BIN_PATH, ["validate", "--resources", good]);
+      expect(ok.stdout).toContain("OK:");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
