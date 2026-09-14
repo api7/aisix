@@ -5132,26 +5132,25 @@ mod tests {
         assert_eq!(delta.data["usage"]["output_tokens"], 7);
     }
 
-    /// The estimate never overrides what an upstream actually reported.
+    /// The estimate never overrides what an upstream actually reported —
+    /// including a usage frame that landed while the stream was still open,
+    /// before the closing pair was built.
     #[test]
     fn sse_encoder_set_estimated_usage_is_ignored_once_a_usage_frame_landed() {
         let mut enc = AnthropicSseEncoder::new("msg_01", "alias", 0);
-        let _ = enc.next_events(&delta_chunk("hi"));
-        let events = enc.next_events(&ChatChunk {
-            id: "cmpl-1".into(),
-            model: "u".into(),
-            delta: ChatDelta::default(),
-            finish_reason: Some(FinishReason::Stop),
-            usage: Some(UsageStats::new(5, 2)),
-        });
+        let mut with_usage = delta_chunk("hi");
+        with_usage.usage = Some(UsageStats::new(5, 2));
+        let _ = enc.next_events(&with_usage);
+        assert!(!enc.is_finished(), "still mid-stream");
+
         enc.set_estimated_usage(900, 900);
+        let events = enc.force_finish();
         let delta = events
             .iter()
             .find(|e| e.event == "message_delta")
             .expect("closing pair emitted");
         assert_eq!(delta.data["usage"]["input_tokens"], 5);
         assert_eq!(delta.data["usage"]["output_tokens"], 2);
-        assert!(enc.force_finish().is_empty());
     }
 
     /// AISIX-Cloud#1405, streaming half: an OpenAI-compatible upstream
