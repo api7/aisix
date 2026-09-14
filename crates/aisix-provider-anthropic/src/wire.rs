@@ -452,10 +452,31 @@ pub fn build_request<'a>(
     if tools.is_none() && requested_tool_choice.is_some() {
         tracing::debug!("dropping tool_choice: no tool survived translation to Anthropic");
     }
-    let tool_choice = tools
+    // Anthropic spells "one tool call at a time" as a member of
+    // `tool_choice`, not as a top-level field: the OpenAI key is always
+    // consumed here, or it would ride `extra` onto the body and be
+    // rejected as an unknown parameter.
+    let serial_tool_calls = extras
+        .remove("parallel_tool_calls")
+        .as_ref()
+        .and_then(serde_json::Value::as_bool)
+        == Some(false);
+    let mut tool_choice = tools
         .as_ref()
         .and(requested_tool_choice)
         .and_then(translate_openai_tool_choice_to_anthropic);
+    if serial_tool_calls && tools.is_some() {
+        // With no choice of the caller's to carry it, the flag needs
+        // Anthropic's own default to ride on. `none` is left alone: it
+        // forbids tool calls outright, so there is no parallelism to
+        // disable and Anthropic rejects the pair.
+        let carrier = tool_choice.get_or_insert_with(|| serde_json::json!({"type": "auto"}));
+        if carrier.get("type").and_then(|t| t.as_str()) != Some("none") {
+            if let Some(obj) = carrier.as_object_mut() {
+                obj.insert("disable_parallel_tool_use".to_string(), true.into());
+            }
+        }
+    }
     translate_reasoning_effort_to_anthropic(&mut extras);
     AnthropicRequest {
         model: upstream_model,
@@ -827,6 +848,7 @@ pub fn translate_anthropic_tool_choice_to_openai(
 ///
 /// Translations (matching LiteLLM's Anthropic→OpenAI adapter):
 ///   tools / tool_choice                → OpenAI shapes (existing helpers)
+///   tool_choice.disable_parallel_tool_use → parallel_tool_calls
 ///   stop_sequences                     → stop
 ///   metadata.user_id                   → user
 ///   thinking / output_config.effort    → reasoning_effort
@@ -840,6 +862,7 @@ pub fn translate_extras_to_openai_shape(extra: &mut serde_json::Map<String, serd
     let mut thinking = None;
     let mut output_config = None;
     let mut output_format = None;
+    let mut serial_tool_calls = false;
     for (key, value) in anthropic {
         match key.as_str() {
             "tools" => {
@@ -848,6 +871,10 @@ pub fn translate_extras_to_openai_shape(extra: &mut serde_json::Map<String, serd
                 }
             }
             "tool_choice" => {
+                serial_tool_calls = value
+                    .get("disable_parallel_tool_use")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 if let Some(translated) = translate_anthropic_tool_choice_to_openai(value) {
                     extra.insert("tool_choice".to_string(), translated);
                 }
@@ -879,6 +906,13 @@ pub fn translate_extras_to_openai_shape(extra: &mut serde_json::Map<String, serd
     // entries this bridge cannot express (AISIX-Cloud#1614).
     if !extra.contains_key("tools") && extra.remove("tool_choice").is_some() {
         tracing::debug!("dropping tool_choice: no tool survived translation to OpenAI shape");
+    }
+
+    // Anthropic carries "one tool call at a time" inside `tool_choice`;
+    // chat carries it as its own boolean. It travels under the same
+    // condition as `tool_choice` itself.
+    if serial_tool_calls && extra.contains_key("tools") {
+        extra.insert("parallel_tool_calls".to_string(), false.into());
     }
 
     if let Some(effort) = reasoning_effort_for(thinking.as_ref(), output_config.as_ref()) {
@@ -3908,6 +3942,149 @@ mod tests {
         assert!(built.tools.is_some());
         assert!(built.tool_choice.is_none());
         assert!(!built.extra.contains_key("tool_choice"));
+    }
+
+    /// A chat request carrying one function tool plus whatever `extra`
+    /// entries the case needs.
+    fn chat_with_tool(extras: &[(&str, serde_json::Value)]) -> ChatFormat {
+        ChatFormat {
+            extra: {
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "tools".to_string(),
+                    serde_json::json!([{
+                        "type": "function",
+                        "function": {"name": "get_time", "parameters": {"type": "object"}},
+                    }]),
+                );
+                for (k, v) in extras {
+                    m.insert((*k).to_string(), v.clone());
+                }
+                m
+            },
+            ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+        }
+    }
+
+    #[test]
+    fn build_request_moves_parallel_tool_calls_false_onto_the_tool_choice() {
+        // Anthropic has no top-level `parallel_tool_calls` and rejects
+        // unknown parameters, so the key must be consumed here and
+        // re-expressed as `tool_choice.disable_parallel_tool_use`.
+        let req = chat_with_tool(&[("parallel_tool_calls", serde_json::json!(false))]);
+        let (_system, messages) = split_system(&req).unwrap();
+        let built = build_request(&req, "c-name", None, messages, false);
+        assert!(!built.extra.contains_key("parallel_tool_calls"));
+        assert_eq!(
+            built.tool_choice,
+            Some(serde_json::json!({"type": "auto", "disable_parallel_tool_use": true}))
+        );
+
+        // A caller-supplied choice carries the flag instead of the
+        // default one.
+        let req = chat_with_tool(&[
+            ("parallel_tool_calls", serde_json::json!(false)),
+            (
+                "tool_choice",
+                serde_json::json!({"type": "function", "function": {"name": "get_time"}}),
+            ),
+        ]);
+        let (_system, messages) = split_system(&req).unwrap();
+        let built = build_request(&req, "c-name", None, messages, false);
+        assert_eq!(
+            built.tool_choice,
+            Some(serde_json::json!({
+                "type": "tool",
+                "name": "get_time",
+                "disable_parallel_tool_use": true,
+            }))
+        );
+    }
+
+    #[test]
+    fn build_request_consumes_parallel_tool_calls_without_marking_the_choice() {
+        // `true` is Anthropic's own default: the key is still consumed,
+        // but nothing is attached.
+        let req = chat_with_tool(&[("parallel_tool_calls", serde_json::json!(true))]);
+        let (_system, messages) = split_system(&req).unwrap();
+        let built = build_request(&req, "c-name", None, messages, false);
+        assert!(!built.extra.contains_key("parallel_tool_calls"));
+        assert!(built.tool_choice.is_none());
+
+        // `none` forbids tool calls outright — there is no parallelism
+        // to disable and Anthropic rejects the pair.
+        let req = chat_with_tool(&[
+            ("parallel_tool_calls", serde_json::json!(false)),
+            ("tool_choice", serde_json::json!("none")),
+        ]);
+        let (_system, messages) = split_system(&req).unwrap();
+        let built = build_request(&req, "c-name", None, messages, false);
+        assert_eq!(built.tool_choice, Some(serde_json::json!({"type": "none"})));
+    }
+
+    #[test]
+    fn build_request_drops_parallel_tool_calls_when_no_tool_survives_translation() {
+        let req = ChatFormat {
+            extra: {
+                let mut m = serde_json::Map::new();
+                m.insert("tools".to_string(), serde_json::json!([]));
+                m.insert("parallel_tool_calls".to_string(), serde_json::json!(false));
+                m
+            },
+            ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+        };
+        let (_system, messages) = split_system(&req).unwrap();
+        let built = build_request(&req, "c-name", None, messages, false);
+        assert!(built.tools.is_none());
+        assert!(built.tool_choice.is_none());
+        assert!(!built.extra.contains_key("parallel_tool_calls"));
+    }
+
+    #[test]
+    fn anthropic_disable_parallel_tool_use_becomes_the_chat_boolean() {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "tools".to_string(),
+            serde_json::json!([{"name": "get_time", "input_schema": {"type": "object"}}]),
+        );
+        extra.insert(
+            "tool_choice".to_string(),
+            serde_json::json!({"type": "any", "disable_parallel_tool_use": true}),
+        );
+        translate_extras_to_openai_shape(&mut extra);
+        assert_eq!(
+            extra.get("tool_choice"),
+            Some(&serde_json::json!("required"))
+        );
+        assert_eq!(
+            extra.get("parallel_tool_calls"),
+            Some(&serde_json::json!(false))
+        );
+
+        // The flag travels under the same condition as `tool_choice`: no
+        // surviving tools, no field.
+        let mut extra = serde_json::Map::new();
+        extra.insert("tools".to_string(), serde_json::json!([]));
+        extra.insert(
+            "tool_choice".to_string(),
+            serde_json::json!({"type": "any", "disable_parallel_tool_use": true}),
+        );
+        translate_extras_to_openai_shape(&mut extra);
+        assert!(!extra.contains_key("tool_choice"));
+        assert!(!extra.contains_key("parallel_tool_calls"));
+
+        // Unset means unset — not `parallel_tool_calls: true`.
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "tools".to_string(),
+            serde_json::json!([{"name": "get_time", "input_schema": {"type": "object"}}]),
+        );
+        extra.insert(
+            "tool_choice".to_string(),
+            serde_json::json!({"type": "auto"}),
+        );
+        translate_extras_to_openai_shape(&mut extra);
+        assert!(!extra.contains_key("parallel_tool_calls"));
     }
 
     #[test]

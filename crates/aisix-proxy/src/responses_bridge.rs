@@ -93,12 +93,20 @@ pub fn responses_request_to_chat(model: &str, body: &Value) -> ChatFormat {
             {
                 chat.extra.insert("tool_choice".to_string(), tc);
             }
+            // `parallel_tool_calls` is the same boolean in both APIs, and
+            // travels under the same condition as `tool_choice`.
+            if let Some(p) = body.get("parallel_tool_calls").and_then(Value::as_bool) {
+                chat.extra
+                    .insert("parallel_tool_calls".to_string(), Value::Bool(p));
+            }
         }
         // A caller that asked for a tool call and lost it to this filter
         // gets prose back instead of an upstream 400; say so, or the
         // downgrade is invisible from the logs.
-        None if body.get("tool_choice").is_some() => {
-            tracing::debug!("dropping tool_choice on the chat bridge: no tool survived translation")
+        None if body.get("tool_choice").is_some() || body.get("parallel_tool_calls").is_some() => {
+            tracing::debug!(
+                "dropping tool_choice/parallel_tool_calls on the chat bridge: no tool survived translation"
+            )
         }
         None => {}
     }
@@ -382,6 +390,19 @@ fn input_audio_block(part: &Value) -> Option<Value> {
 /// accept multimodal tool results consume and a strict chat upstream does
 /// not. Text-only output stays a plain string.
 fn function_call_output_to_chat(output: &Value) -> ChatContent {
+    // A tool that returned JSON (an object, a number, a bool) reaches the
+    // upstream as that JSON serialised — a chat `tool` message carries a
+    // string, and rendering the value as an empty one erased the result.
+    // `null` stays the empty string.
+    match output {
+        Value::Object(_) | Value::Number(_) | Value::Bool(_) => {
+            return ChatContent {
+                text: serde_json::to_string(output).unwrap_or_default(),
+                blocks: None,
+            }
+        }
+        _ => {}
+    }
     let mut content = responses_content_to_chat(output);
     let Some(blocks) = content.blocks.take() else {
         return content;
@@ -429,49 +450,132 @@ fn responses_text_format_to_response_format(text: &Value) -> Option<Value> {
     }
 }
 
-/// Translate Responses-API `tools` (flat function shape `{type:"function",
-/// name, description, parameters}`) into OpenAI chat tools (`{type:
-/// "function", function:{name, description, parameters}}`). Non-function
-/// (hosted) tools have no chat equivalent and are dropped. Returns `None`
-/// when nothing translates so the field stays absent from the wire.
+/// Translate Responses-API `tools` into OpenAI chat tools.
+///
+///   * `{type:"function", name, description, parameters}` →
+///     `{type:"function", function:{name, description, parameters}}`
+///   * `{type:"custom", name, description, format}` → a function tool with
+///     the single-string schema in [`custom_tool_parameters`]; a freeform
+///     tool has no chat counterpart, and a function tool taking one string
+///     is the shape that keeps the model able to call it. A grammar under
+///     `format.definition` rides along in the description, the only place a
+///     chat upstream will read it.
+///   * hosted tools (`web_search*`, `file_search`, `code_interpreter`,
+///     `mcp`, `computer_use*`, `image_generation`, …) have no chat
+///     equivalent and are dropped.
+///
+/// Returns `None` when nothing translates so the field stays absent from
+/// the wire.
 fn responses_tools_to_chat(tools: &Value) -> Option<Value> {
     let arr = tools.as_array()?;
     let out: Vec<Value> = arr
         .iter()
-        .filter_map(|t| {
-            if t.get("type").and_then(|v| v.as_str()) != Some("function") {
-                return None;
+        .filter_map(|t| match t.get("type").and_then(|v| v.as_str()) {
+            Some("function") => {
+                let name = t.get("name").and_then(|v| v.as_str())?;
+                let mut func = Map::new();
+                func.insert("name".to_string(), json!(name));
+                if let Some(d) = t.get("description") {
+                    func.insert("description".to_string(), d.clone());
+                }
+                if let Some(p) = t.get("parameters") {
+                    func.insert("parameters".to_string(), p.clone());
+                }
+                Some(json!({"type": "function", "function": Value::Object(func)}))
             }
-            let name = t.get("name").and_then(|v| v.as_str())?;
-            let mut func = Map::new();
-            func.insert("name".to_string(), json!(name));
-            if let Some(d) = t.get("description") {
-                func.insert("description".to_string(), d.clone());
+            Some("custom") => {
+                let name = t.get("name").and_then(|v| v.as_str())?;
+                let mut description = t
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                description.push_str(&custom_tool_grammar_suffix(t.get("format")));
+                let mut func = Map::new();
+                func.insert("name".to_string(), json!(name));
+                if !description.is_empty() {
+                    func.insert("description".to_string(), json!(description));
+                }
+                func.insert("parameters".to_string(), custom_tool_parameters(name));
+                Some(json!({"type": "function", "function": Value::Object(func)}))
             }
-            if let Some(p) = t.get("parameters") {
-                func.insert("parameters".to_string(), p.clone());
-            }
-            Some(json!({"type": "function", "function": Value::Object(func)}))
+            _ => None,
         })
         .collect();
     (!out.is_empty()).then_some(Value::Array(out))
 }
 
-/// Translate Responses-API `tool_choice` to OpenAI chat shape:
-/// `"auto"|"none"|"required"` pass through; `{type:"function", name}` →
-/// `{type:"function", function:{name}}`. Hosted-tool choices have no chat
-/// equivalent and drop to `None`.
+/// The JSON-schema a `custom` tool takes once it is a function tool: one
+/// required string holding whatever the freeform tool would have received.
+fn custom_tool_parameters(name: &str) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": format!("The {name} content following the specified format"),
+            }
+        },
+        "required": ["content"],
+    })
+}
+
+/// A custom tool's grammar, rendered for the tail of its description. Empty
+/// when the tool carries no `format.definition`.
+fn custom_tool_grammar_suffix(format: Option<&Value>) -> String {
+    let Some(definition) = format
+        .and_then(|f| f.get("definition"))
+        .and_then(Value::as_str)
+        .filter(|d| !d.is_empty())
+    else {
+        return String::new();
+    };
+    let syntax = format
+        .and_then(|f| f.get("syntax"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    format!("\n\nFormat:\n```{syntax}\n{definition}\n```")
+}
+
+/// Translate Responses-API `tool_choice` to the provider-neutral OpenAI
+/// chat shape every provider bridge translates onwards:
+///
+///   * `"auto"` / `"none"` / `"required"` pass through
+///   * `{type:"function", name}`, `{type:"custom", name}`,
+///     `{type:"tool", name}` → `{type:"function", function:{name}}`
+///   * `{type:"allowed_tools", mode:"required"|"auto"}` → the bare mode;
+///     chat has no way to restrict the model to a subset of the tools it
+///     was given, so the subset itself is dropped
+///   * `{type:"any"}` → `"required"`
+///   * a choice naming a hosted tool type, or anything else → `None`, so
+///     the field stays off the wire
 fn responses_tool_choice_to_chat(tc: &Value) -> Option<Value> {
     match tc {
         Value::String(s) => Some(Value::String(s.clone())),
-        Value::Object(o) => {
-            if o.get("type").and_then(|v| v.as_str()) == Some("function") {
+        Value::Object(o) => match o.get("type").and_then(|v| v.as_str())? {
+            "function" | "custom" | "tool" => {
                 let name = o.get("name").and_then(|v| v.as_str())?;
                 Some(json!({"type": "function", "function": {"name": name}}))
-            } else {
+            }
+            "any" => Some(Value::String("required".to_string())),
+            "allowed_tools" => match o.get("mode").and_then(|v| v.as_str())? {
+                mode @ ("auto" | "required") => {
+                    tracing::debug!(
+                        %mode,
+                        "narrowing allowed_tools to its mode: the chat bridge cannot restrict the model to a subset of the tools"
+                    );
+                    Some(Value::String(mode.to_string()))
+                }
+                _ => None,
+            },
+            other => {
+                tracing::debug!(
+                    tool_choice = %other,
+                    "dropping tool_choice on the chat bridge: no chat equivalent"
+                );
                 None
             }
-        }
+        },
         _ => None,
     }
 }
@@ -2273,6 +2377,184 @@ mod tests {
         let chat = responses_request_to_chat("m", &hosted_only);
         assert!(!chat.extra.contains_key("tools"));
         assert!(!chat.extra.contains_key("tool_choice"));
+    }
+
+    #[test]
+    fn custom_tool_becomes_a_function_tool_taking_one_string() {
+        let body = json!({
+            "model": "m",
+            "input": "patch it",
+            "tools": [
+                {"type": "function", "name": "get_weather", "parameters": {"type": "object"}},
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Edit a file",
+                    "format": {"type": "grammar", "syntax": "lark", "definition": "start: TEXT"},
+                },
+                {"type": "web_search_preview"},
+            ],
+        });
+        let chat = responses_request_to_chat("m", &body);
+        let tools = chat.extra.get("tools").unwrap().as_array().unwrap();
+        // The hosted tool is still filtered out; the other two survive.
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[1]["type"], "function");
+        assert_eq!(tools[1]["function"]["name"], "apply_patch");
+        assert_eq!(
+            tools[1]["function"]["parameters"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "The apply_patch content following the specified format",
+                    }
+                },
+                "required": ["content"],
+            })
+        );
+        // The grammar the freeform tool carried is the only instruction
+        // the model gets about the expected shape.
+        let description = tools[1]["function"]["description"].as_str().unwrap();
+        assert_eq!(
+            description,
+            "Edit a file\n\nFormat:\n```lark\nstart: TEXT\n```"
+        );
+    }
+
+    #[test]
+    fn custom_tool_without_a_grammar_keeps_its_bare_description() {
+        let body = json!({
+            "model": "m",
+            "input": "go",
+            "tools": [{"type": "custom", "name": "freeform", "description": "d"}],
+        });
+        let chat = responses_request_to_chat("m", &body);
+        let tools = chat.extra.get("tools").unwrap().as_array().unwrap();
+        assert_eq!(tools[0]["function"]["description"], "d");
+    }
+
+    #[test]
+    fn tool_choice_forms_normalise_to_the_provider_neutral_chat_shape() {
+        let with_choice = |tc: Value| {
+            let body = json!({
+                "model": "m",
+                "input": "hi",
+                "tools": [{"type": "function", "name": "get_weather"}],
+                "tool_choice": tc,
+            });
+            responses_request_to_chat("m", &body)
+                .extra
+                .get("tool_choice")
+                .cloned()
+        };
+
+        for mode in ["auto", "none", "required"] {
+            assert_eq!(with_choice(json!(mode)), Some(json!(mode)));
+        }
+        // An allowed_tools choice keeps its mode; chat cannot express the
+        // subset restriction, so the subset is dropped.
+        assert_eq!(
+            with_choice(json!({
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [{"type": "function", "name": "get_weather"}],
+            })),
+            Some(json!("required"))
+        );
+        assert_eq!(
+            with_choice(json!({"type": "allowed_tools", "mode": "auto", "tools": []})),
+            Some(json!("auto"))
+        );
+        assert_eq!(with_choice(json!({"type": "any"})), Some(json!("required")));
+        // The three named forms all land on the one chat spelling — never
+        // a Responses-only shape a non-OpenAI bridge could not read.
+        for named in [
+            json!({"type": "function", "name": "get_weather"}),
+            json!({"type": "custom", "name": "get_weather"}),
+            json!({"type": "tool", "name": "get_weather"}),
+        ] {
+            assert_eq!(
+                with_choice(named),
+                Some(json!({"type": "function", "function": {"name": "get_weather"}}))
+            );
+        }
+        // A hosted-tool choice, an allowed_tools mode with no chat
+        // counterpart, and a named form missing its name all drop.
+        assert_eq!(with_choice(json!({"type": "file_search"})), None);
+        assert_eq!(
+            with_choice(json!({"type": "allowed_tools", "mode": "none"})),
+            None
+        );
+        assert_eq!(with_choice(json!({"type": "function"})), None);
+    }
+
+    #[test]
+    fn parallel_tool_calls_rides_along_with_a_surviving_tools_list() {
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "get_weather"}],
+            "parallel_tool_calls": false,
+        });
+        let chat = responses_request_to_chat("m", &body);
+        assert_eq!(chat.extra.get("parallel_tool_calls"), Some(&json!(false)));
+
+        // `true` is forwarded as sent, not normalised away.
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "get_weather"}],
+            "parallel_tool_calls": true,
+        });
+        let chat = responses_request_to_chat("m", &body);
+        assert_eq!(chat.extra.get("parallel_tool_calls"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn parallel_tool_calls_is_dropped_when_no_tool_survives_translation() {
+        // Same rule as `tool_choice`: a chat upstream rejects the field
+        // without an accompanying `tools` list.
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [{"type": "web_search_preview"}],
+            "parallel_tool_calls": false,
+        });
+        let chat = responses_request_to_chat("m", &body);
+        assert!(!chat.extra.contains_key("tools"));
+        assert!(!chat.extra.contains_key("parallel_tool_calls"));
+    }
+
+    #[test]
+    fn json_tool_output_reaches_the_upstream_as_a_json_string() {
+        let outputs = [
+            (json!({"temp": 21, "unit": "C"}), r#"{"temp":21,"unit":"C"}"#),
+            (json!(42), "42"),
+            (json!(true), "true"),
+            // `null` and an absent output are the empty string, not "null".
+            (json!(null), ""),
+        ];
+        for (output, expected) in outputs {
+            let body = json!({
+                "model": "m",
+                "input": [{"type": "function_call_output", "call_id": "c1", "output": output}],
+            });
+            let chat = responses_request_to_chat("m", &body);
+            let msg = chat.messages.last().unwrap();
+            assert!(matches!(msg.role, Role::Tool));
+            assert_eq!(msg.content.as_deref(), Some(expected));
+            assert!(msg.content_blocks.is_none());
+        }
+
+        // A string output is untouched — it is not re-encoded with quotes.
+        let body = json!({
+            "model": "m",
+            "input": [{"type": "function_call_output", "call_id": "c1", "output": "21C"}],
+        });
+        let chat = responses_request_to_chat("m", &body);
+        assert_eq!(chat.messages.last().unwrap().content.as_deref(), Some("21C"));
     }
 
     #[test]
