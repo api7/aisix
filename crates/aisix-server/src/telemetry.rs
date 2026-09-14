@@ -423,4 +423,62 @@ mod tests {
         };
         build_client(&mtls).expect("build_client must tolerate PEM without trailing newline");
     }
+
+    /// Regression for #535 (fix landed in #536): the telemetry client (a
+    /// separate copy of the CP-REST mTLS builder) must advertise **only**
+    /// `http/1.1` in its TLS ALPN — never `h2`. dp-manager multiplexes
+    /// kine/etcd gRPC and the `/dp/*` REST API on a single TLS port via
+    /// cmux; an h2 REST connection is misrouted away from the
+    /// HTTP/1.1-only gin listener and the request fails at the transport
+    /// layer. `.http1_only()` pins this. We inspect the raw ClientHello
+    /// rather than completing a TLS session, so the test needs no server
+    /// cert and can't flake.
+    #[tokio::test]
+    async fn cp_rest_client_advertises_only_http1_alpn() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let capture = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            buf.truncate(n);
+            buf
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        let client = build_client(&mtls).expect("build mTLS client");
+
+        // One request makes the client emit a ClientHello; we never
+        // reply, so it errors out — only the ClientHello matters.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            client
+                .get(format!("https://127.0.0.1:{}/dp/telemetry", addr.port()))
+                .send(),
+        )
+        .await;
+
+        let hello = tokio::time::timeout(Duration::from_secs(2), capture)
+            .await
+            .expect("ClientHello capture timed out")
+            .expect("capture task panicked");
+
+        // ALPN entries are length-prefixed: 0x08 "http/1.1", 0x02 "h2".
+        // Find the http/1.1 entry, then assert the 3 bytes right before
+        // it are NOT the h2 entry (where an [h2, http/1.1] list puts it).
+        let http11 = b"\x08http/1.1";
+        let pos = hello
+            .windows(http11.len())
+            .position(|w| w == http11)
+            .expect("ClientHello must advertise http/1.1 ALPN");
+        let preceded_by_h2 = pos >= 3 && &hello[pos - 3..pos] == b"\x02h2";
+        assert!(
+            !preceded_by_h2,
+            "telemetry ClientHello must NOT advertise h2 ALPN — dp-manager's \
+             cmux would misroute the h2 REST connection (#535)",
+        );
+    }
 }
