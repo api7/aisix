@@ -876,7 +876,7 @@ describe("direct-model effort mapping", () => {
   });
 
   test("leaves a thinking-stated effort for the upstream to resolve", async (ctx) => {
-    if (!etcdReachable || !app || !tokensAnthropic || !tokensCount) {
+    if (!etcdReachable || !app || !tokensAnthropic || !tokensCount || !tokensOpenai) {
       ctx.skip();
       return;
     }
@@ -920,6 +920,26 @@ describe("direct-model effort mapping", () => {
         JSON.stringify(thinking),
       ).not.toHaveProperty("output_config");
     }
+
+    // The leg the guard exists for. Dispatching to a provider that does
+    // not accept the Anthropic protocol, the gateway resolves the
+    // `thinking` block itself — a budget of 1024 reads as `low` — and an
+    // injected `output_config.effort` would have outranked it.
+    let crossBaseline = tokensOpenai!.receivedRequests.length;
+    await post(
+      "/v1/messages",
+      {
+        model: "effort-tokens-openai",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hello" }],
+        thinking: { type: "enabled", budget_tokens: 1024 },
+      },
+      "anthropic",
+    );
+    expect(
+      receivedSince(tokensOpenai!, crossBaseline, "/v1/chat/completions")
+        .reasoning_effort,
+    ).toBe("low");
 
     // The effort a `thinking` block states takes no part in matching: an
     // `output_config.effort` beside it maps exactly as it would alone.

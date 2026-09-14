@@ -396,6 +396,25 @@ mod tests {
         );
     }
 
+    /// A body that is not an object reads as `Foreign`. That is the
+    /// invariant the rewrite arms' `.expect` now stands on, since the
+    /// carrier is computed one function up and its type carries no tie to
+    /// the body it was read from.
+    #[test]
+    fn a_non_object_body_is_left_alone_even_with_a_not_set_entry() {
+        let model = token_model();
+        for body in [json!("hi"), json!([1, 2]), json!(null), json!(3)] {
+            assert!(
+                matches!(responses_request(&body, &model), Cow::Borrowed(_)),
+                "{body}"
+            );
+            assert!(
+                matches!(anthropic_request(&body, &model), Cow::Borrowed(_)),
+                "{body}"
+            );
+        }
+    }
+
     /// The effort a `thinking` block states takes no part in matching: an
     /// `output_config.effort` beside it is mapped exactly as it would be
     /// alone.
