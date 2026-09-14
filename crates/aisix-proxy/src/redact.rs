@@ -1813,6 +1813,22 @@ pub fn redact_responses_sse(
                     args_channels.entry(channel_key(data)).or_default().push(fi);
                 }
             }
+            // A custom tool's input is free-form text, not a JSON-encoded
+            // argument object, so it masks through the plain text channel
+            // rather than the args one. It needs a channel at all because
+            // `redact_responses_item` masks the same string on the
+            // terminal item: without this the caller is handed the masked
+            // text on `output_item.done` and the unmasked text on the
+            // delta it assembled the input from.
+            Some("response.custom_tool_call_input.delta") => {
+                if data
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| !t.is_empty())
+                {
+                    text_channels.entry(channel_key(data)).or_default().push(fi);
+                }
+            }
             _ => {}
         }
     }
@@ -1902,6 +1918,11 @@ pub fn redact_responses_sse(
                     let mut owned = std::mem::take(args);
                     redact_json_encoded(chain, Direction::Output, &mut owned, &mut local);
                     *args = owned;
+                }
+            }
+            "response.custom_tool_call_input.done" => {
+                if let Some(input) = data.get_mut("input") {
+                    apply_to_value_string(chain, Direction::Output, input, &mut local);
                 }
             }
             "response.output_item.done" => {
@@ -2840,6 +2861,29 @@ mod tests {
         let out = String::from_utf8(out).unwrap();
         assert!(!out.contains("a@"), "original fragments gone: {out}");
         assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
+        assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    /// A custom tool's input streams on its own event pair, and the same
+    /// string is masked on the terminal item by `redact_responses_item`.
+    /// Leave the pair out of this walk and the caller reads the masked
+    /// text on `output_item.done` and the raw match on the delta it
+    /// assembled the input from — one stream carrying both.
+    #[test]
+    fn responses_sse_masks_the_custom_tool_input_channel() {
+        let chain = both();
+        let raw = concat!(
+            "event: response.custom_tool_call_input.delta\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"ctc_1\",\"output_index\":0,\"delta\":\"mail a@x.com now\"}\n\n",
+            "event: response.custom_tool_call_input.done\ndata: {\"type\":\"response.custom_tool_call_input.done\",\"item_id\":\"ctc_1\",\"output_index\":0,\"input\":\"mail a@x.com now\"}\n\n",
+            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"id\":\"ctc_1\",\"call_id\":\"c1\",\"name\":\"apply_patch\",\"input\":\"mail a@x.com now\",\"status\":\"completed\"}}\n\n",
+        );
+        let (out, counts) = redact_responses_sse(chain.as_ref(), raw.as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            !out.contains("a@x.com"),
+            "the custom tool input reached the client unmasked: {out}"
+        );
+        assert_eq!(out.matches("[EMAIL_REDACTED]").count(), 3, "out: {out}");
         assert_eq!(counts.get("email"), Some(&1));
     }
 

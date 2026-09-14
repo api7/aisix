@@ -1063,47 +1063,66 @@ pub(crate) fn estimation_output_text(resp: &aisix_gateway::ChatResponse) -> Stri
 }
 
 /// Token-estimation fallback for a non-streaming `/v1/chat/completions`
-/// response (AISIX-Cloud#1074). Fills token counters the upstream never
-/// reported — per counter, so a number it did report always stands — and
-/// writes them onto `resp` itself, which is what `render_response`
-/// serialises. The client-visible usage and the usage record are one
-/// number: a caller told `completion_tokens: 0` for a reply it can read
-/// has no way to reconcile that with what the dashboard bills. Returns
-/// whether anything was estimated.
-///
-/// The sibling `/v1/messages` and `/v1/responses` paths fill the same way
-/// (`messages::fill_missing_anthropic_metrics`,
-/// `responses_bridge::ResponsesSseEncoder::set_estimated_usage`).
-fn fill_missing_chat_usage(
-    resp: &mut aisix_gateway::ChatResponse,
+/// response (AISIX-Cloud#1074): the token counters the upstream never
+/// reported, counted locally. Per counter, so a number it did report
+/// always stands. Returns `(prompt, completion, estimated)`.
+fn estimate_missing_chat_usage(
+    resp: &aisix_gateway::ChatResponse,
     upstream_model: &str,
     req: &ChatFormat,
-) -> bool {
-    if resp.usage.prompt_tokens != 0 && resp.usage.completion_tokens != 0 {
-        return false;
+) -> (u32, u32, bool) {
+    let (p, c) = (resp.usage.prompt_tokens, resp.usage.completion_tokens);
+    if p != 0 && c != 0 {
+        return (p, c, false);
     }
     let est = crate::token_estimate::Estimator::new(
         upstream_model,
         crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
     );
-    let filled = crate::token_estimate::fill_missing(
-        &est,
-        resp.usage.prompt_tokens,
-        resp.usage.completion_tokens,
-        Some(&estimation_output_text(resp)),
-    );
-    if !filled.estimated {
-        return false;
-    }
-    resp.usage.prompt_tokens = filled.prompt_tokens;
-    resp.usage.completion_tokens = filled.completion_tokens;
-    // A total the upstream reported beside a zero sub-counter was built
-    // from numbers the client is no longer being told. Zeroing it makes
-    // both the client-facing projection and the quota total derive
-    // prompt + completion — the arithmetic they already use when no total
-    // was reported at all.
-    resp.usage.total_tokens = 0;
-    true
+    let filled =
+        crate::token_estimate::fill_missing(&est, p, c, Some(&estimation_output_text(resp)));
+    (
+        filled.prompt_tokens,
+        filled.completion_tokens,
+        filled.estimated,
+    )
+}
+
+/// Carry the locally-estimated counters onto the response body the client
+/// receives, so the client-visible `usage` and the usage record are one
+/// number: a caller told `completion_tokens: 0` for a reply it can read
+/// has no way to reconcile that with what the dashboard bills. The
+/// estimate is reported in the ordinary usage shape — there is no
+/// client-facing marker saying it was estimated, and `usage_estimated` on
+/// the usage record stays the way to tell.
+///
+/// Applied at the client exit, and that placement carries two guarantees
+/// the call site cannot state for itself. It runs AFTER the cache write,
+/// so a cache entry stores what the UPSTREAM reported and a hit re-derives
+/// the estimate from its own request instead of replaying these numbers as
+/// the provider's — losing `usage_estimated` on every hit row. And it runs
+/// AFTER the quota total, which keeps reading the upstream's own
+/// `total_tokens` through `cache_inclusive_total`, so nothing about what
+/// is billed changes: a provider counting overhead we cannot see is still
+/// not corrected downward.
+///
+/// The bridged `/v1/messages` and `/v1/responses` exits fill the same way,
+/// for the same reason. Their NATIVE passthrough paths deliberately do
+/// not — the dividing line is whether the gateway serialises the body
+/// itself or relays the provider's bytes verbatim.
+fn apply_estimated_usage(
+    usage: &mut aisix_gateway::chat::UsageStats,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+) {
+    usage.prompt_tokens = prompt_tokens;
+    usage.completion_tokens = completion_tokens;
+    // A total reported beside a counter that was zero describes numbers
+    // the client is no longer being told, so it no longer adds up. Zeroing
+    // it makes the projection derive prompt + completion — the arithmetic
+    // it uses when no total was reported at all, and the rule the bridged
+    // `/v1/responses` exit already applies.
+    usage.total_tokens = 0;
 }
 
 /// #1074 ensemble sub-call token fallback. A sub-call backend (a panel
@@ -2730,6 +2749,19 @@ async fn dispatch(
                         CacheHitLayer::Semantic => "hit_semantic",
                     },
                 );
+                // AISIX-Cloud#1074: a hit replaying a body whose original
+                // upstream never reported usage answers the client with the
+                // same estimate its own usage row gets — the fresh-response
+                // exit below does this too, and a hit is not a different
+                // kind of answer to the caller.
+                let mut cached = cached;
+                if usage_estimated {
+                    apply_estimated_usage(
+                        &mut cached.usage,
+                        prompt.min(u64::from(u32::MAX)) as u32,
+                        completion.min(u64::from(u32::MAX)) as u32,
+                    );
+                }
                 let mut response = Json(render_response(now, cached, &req.model)).into_response();
                 response
                     .headers_mut()
@@ -3126,15 +3158,11 @@ async fn dispatch(
     // Token-estimation fallback (AISIX-Cloud#1074): when the upstream
     // response carries no usage block, fill the missing counters locally
     // BEFORE the quota commit and telemetry below so neither records
-    // silent zeros — and carry the SAME numbers into the response
-    // `render_response` builds. The client-visible usage and the usage
-    // record are one number: a caller told `completion_tokens: 0` for a
-    // reply it can read has no way to reconcile that with what the
-    // dashboard bills. The estimate is reported in the ordinary usage
-    // shape — there is no client-facing marker saying it was estimated.
-    let usage_estimated = fill_missing_chat_usage(&mut upstream, &upstream_model, req);
-    let prompt_tokens_u32 = upstream.usage.prompt_tokens;
-    let completion_tokens_u32 = upstream.usage.completion_tokens;
+    // silent zeros. The same numbers reach the client, but only at the
+    // exit below — see `apply_estimated_usage` for why the cache write and
+    // the quota total in between must still see the upstream's own.
+    let (prompt_tokens_u32, completion_tokens_u32, usage_estimated) =
+        estimate_missing_chat_usage(&upstream, &upstream_model, req);
     let prompt = prompt_tokens_u32 as u64;
     let completion = completion_tokens_u32 as u64;
     let total = cache_inclusive_total(
@@ -3332,6 +3360,17 @@ async fn dispatch(
         )
     });
 
+    // AISIX-Cloud#1074: the client reads the same counters the usage record
+    // got. Deliberately here and not at the estimate above — the cache
+    // entry and the quota total in between must see what the upstream
+    // itself reported.
+    if usage_estimated {
+        apply_estimated_usage(
+            &mut upstream.usage,
+            prompt_tokens_u32,
+            completion_tokens_u32,
+        );
+    }
     let mut response = Json(render_response(now, upstream, &req.model)).into_response();
     // Header only when the gate was open — policy-disabled requests have
     // no cache header at all so a user can tell at a glance whether the
@@ -6313,8 +6352,9 @@ mod complete_on_drop_tests {
     //! chunks delivered to the consumer", drop, observe the
     //! callback args.
     use super::{
-        cache_inclusive_total, effective_subcall_usage, estimate_subcall_tokens,
-        fill_missing_chat_usage, AtomicU32, CompleteOnDrop, StreamCompletion,
+        apply_estimated_usage, cache_inclusive_total, effective_subcall_usage,
+        estimate_missing_chat_usage, estimate_subcall_tokens, AtomicU32, CompleteOnDrop,
+        StreamCompletion,
     };
     use aisix_gateway::chat::UsageStats;
     use std::sync::{Arc, Mutex};
@@ -6445,8 +6485,8 @@ mod complete_on_drop_tests {
     /// reported stands, a zero is filled, and a total built beside that
     /// zero is recomputed from what the client is actually told.
     ///
-    /// `Usage::from_stats` is asserted alongside the stats because the
-    /// client reads the projection, not the struct: a filled
+    /// `Usage::from_stats` is asserted through `render_response` because
+    /// the client reads the projection, not the struct: a filled
     /// `completion_tokens` beside an echoed stale `total_tokens` would
     /// hand the caller a total that does not add up.
     #[test]
@@ -6456,10 +6496,13 @@ mod complete_on_drop_tests {
         // The upstream reported a total beside the zero completion count.
         resp.usage.total_tokens = 17;
 
-        assert!(fill_missing_chat_usage(&mut resp, "relay-model", &req));
-        assert_eq!(resp.usage.prompt_tokens, 17, "a reported counter stands");
-        assert_eq!(resp.usage.completion_tokens, 2, "the zero is filled");
+        let (prompt, completion, estimated) =
+            estimate_missing_chat_usage(&resp, "relay-model", &req);
+        assert!(estimated);
+        assert_eq!(prompt, 17, "a reported counter stands");
+        assert_eq!(completion, 2, "the zero is filled");
 
+        apply_estimated_usage(&mut resp.usage, prompt, completion);
         let rendered = crate::render::render_response(0, resp, "m");
         assert_eq!(rendered.usage.prompt_tokens, 17);
         assert_eq!(rendered.usage.completion_tokens, 2);
@@ -6470,19 +6513,58 @@ mod complete_on_drop_tests {
     }
 
     /// The mirror half: a response whose upstream reported both counters is
-    /// untouched, so no estimate can displace real numbers.
+    /// left alone, so no estimate can displace real numbers.
     #[test]
     fn non_streaming_usage_fill_leaves_reported_usage_alone() {
         let req = subcall_req("Hello");
         let mut resp = chat_response_for_estimation("Hello world", UsageStats::new(17, 23));
         resp.usage.total_tokens = 99;
 
-        assert!(!fill_missing_chat_usage(&mut resp, "relay-model", &req));
-        assert_eq!(resp.usage.prompt_tokens, 17);
-        assert_eq!(resp.usage.completion_tokens, 23);
+        let (prompt, completion, estimated) =
+            estimate_missing_chat_usage(&resp, "relay-model", &req);
+        assert!(!estimated);
+        assert_eq!((prompt, completion), (17, 23));
+
+        let rendered = crate::render::render_response(0, resp, "m");
+        assert_eq!(rendered.usage.prompt_tokens, 17);
+        assert_eq!(rendered.usage.completion_tokens, 23);
         assert_eq!(
-            resp.usage.total_tokens, 99,
+            rendered.usage.total_tokens, 99,
             "a total the upstream reported is not second-guessed"
+        );
+    }
+
+    /// The estimate must NOT reach the quota total or the cache entry —
+    /// only the client body. `estimate_missing_chat_usage` therefore leaves
+    /// the response untouched, and the upstream's own `total_tokens` is
+    /// still what `cache_inclusive_total` sees. A provider that reports a
+    /// bare total larger than the counters it broke out (overhead we
+    /// cannot see) would otherwise be silently corrected downward — i.e.
+    /// under-billed.
+    #[test]
+    fn estimating_does_not_change_what_is_billed() {
+        let req = subcall_req("Hello");
+        // A degenerate upstream: a bare total, no breakdown at all.
+        let resp = chat_response_for_estimation("Hello world", UsageStats::new(0, 0));
+        let mut resp = resp;
+        resp.usage.total_tokens = 42;
+
+        let (prompt, completion, estimated) =
+            estimate_missing_chat_usage(&resp, "relay-model", &req);
+        assert!(estimated);
+        assert_eq!(
+            (
+                resp.usage.prompt_tokens,
+                resp.usage.completion_tokens,
+                resp.usage.total_tokens
+            ),
+            (0, 0, 42),
+            "the response the cache stores is still the upstream's own",
+        );
+        assert_eq!(
+            cache_inclusive_total(u64::from(resp.usage.total_tokens), prompt, completion, 0, 0),
+            42,
+            "the reported total still wins over the smaller estimate",
         );
     }
 

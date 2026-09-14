@@ -268,11 +268,20 @@ describe("bridged custom tool calls come back as custom_tool_call items", () => 
       secret: "sk-mock",
       api_base: `${noUsageUpstream.baseUrl}/v1`,
     });
-    await seed.createModel({
-      display_name: "custom-tool-no-usage",
-      provider: "openai",
-      model_name: "relay-compat-x",
-      provider_key_id: noUsagePk.id,
+    for (const model of ["custom-tool-no-usage", "custom-tool-no-usage-cached"]) {
+      await seed.createModel({
+        display_name: model,
+        provider: "openai",
+        model_name: "relay-compat-x",
+        provider_key_id: noUsagePk.id,
+      });
+    }
+    // Scoped to the one model, so the other cases keep reaching their
+    // upstreams instead of replaying a cached body.
+    await seed.createCachePolicy({
+      name: "custom-tool-no-usage-cache",
+      enabled: true,
+      applies_to: "model:custom-tool-no-usage-cached",
     });
 
     // Seeded last: the key authenticating implies the whole seed set is
@@ -283,6 +292,7 @@ describe("bridged custom tool calls come back as custom_tool_call items", () => 
         "custom-tool-chat",
         "custom-tool-chat-stream",
         "custom-tool-no-usage",
+        "custom-tool-no-usage-cached",
       ],
     });
   });
@@ -465,5 +475,56 @@ describe("bridged custom tool calls come back as custom_tool_call items", () => 
     expect(body.usage.total_tokens).toBe(
       body.usage.prompt_tokens + body.usage.completion_tokens,
     );
+  });
+
+  test("/v1/chat/completions: a cache hit still reports its tokens as estimated", async (ctx) => {
+    if (!etcdReachable || !app || !sls) {
+      ctx.skip();
+      return;
+    }
+    await ready();
+
+    // The estimate reaches the client body, but must NOT reach the cache
+    // entry: a stored body carrying it would make every hit claim the
+    // numbers came from the provider, and `usage_estimated` is the only
+    // thing that says otherwise.
+    const call = async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: HEADERS,
+        body: JSON.stringify({
+          model: "custom-tool-no-usage-cached",
+          messages: [{ role: "user", content: "cache me" }],
+        }),
+      });
+      expect(res.status).toBe(200);
+      return {
+        requestId: res.headers.get("x-aisix-request-id") ?? "",
+        cache: res.headers.get("x-aisix-cache") ?? "",
+        body: (await res.json()) as Record<string, any>,
+      };
+    };
+
+    const miss = await call();
+    expect(miss.cache).toBe("miss");
+    const hit = await call();
+    expect(hit.cache, "the second call must be served from the cache").toBe(
+      "hit",
+    );
+
+    for (const { requestId, body } of [miss, hit]) {
+      const log = await waitForSlsLog(
+        sls,
+        LOGSTORE,
+        (l) => l.get("request_id") === requestId,
+        `usage row for ${requestId}`,
+        15_000,
+      );
+      expect(log.get("usage_estimated")).toBe("true");
+      expect(body.usage.prompt_tokens).toBe(Number(log.get("prompt_tokens")));
+      expect(body.usage.completion_tokens).toBe(
+        Number(log.get("completion_tokens")),
+      );
+    }
   });
 });

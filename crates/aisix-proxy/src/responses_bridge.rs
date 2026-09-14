@@ -611,7 +611,16 @@ fn unwrap_custom_tool_input(arguments: &str) -> String {
     serde_json::from_str::<Value>(arguments)
         .ok()
         .as_ref()
-        .and_then(|v| v.get(CUSTOM_TOOL_INPUT_PARAM))
+        .and_then(Value::as_object)
+        // Exactly the one member the wrapper has. A model that answered
+        // with its freeform payload verbatim may itself have produced a
+        // JSON object carrying a `content` field beside others — reading
+        // that as the wrapper would deliver the inner string and silently
+        // drop the rest, which is corruption rather than a fallback. An
+        // object that IS exactly `{"content": "…"}` stays ambiguous and is
+        // unwrapped; nothing on the wire can separate the two.
+        .filter(|o| o.len() == 1)
+        .and_then(|o| o.get(CUSTOM_TOOL_INPUT_PARAM))
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| arguments.to_string())
@@ -1402,7 +1411,16 @@ impl ResponsesSseEncoder {
                 }
                 if !name.is_empty() {
                     state.name = name.to_string();
-                    state.custom = custom;
+                    // Only until the item has been announced: `.added`
+                    // carries both the item id and the item type, and both
+                    // are derived from this flag. An upstream that splits
+                    // `function.name` across chunks overwrites the name on
+                    // each one, and letting a later fragment flip the flag
+                    // would leave `.done` disagreeing with the `.added`
+                    // the client already read.
+                    if !state.item_added {
+                        state.custom = custom;
+                    }
                 }
 
                 // Emit output_item.added once the call id + name are known.
@@ -3029,7 +3047,15 @@ mod tests {
     #[test]
     fn custom_tool_input_falls_back_to_the_raw_arguments() {
         let custom = BTreeSet::from(["apply_patch".to_string()]);
-        for arguments in ["not json at all", "{\"other\":\"x\"}", "{\"content\":42}"] {
+        for arguments in [
+            "not json at all",
+            "{\"other\":\"x\"}",
+            "{\"content\":42}",
+            // The model answered with its freeform payload verbatim and it
+            // happens to be JSON carrying a `content` field. Unwrapping
+            // that would deliver `"x"` and drop `keep`.
+            "{\"content\":\"x\",\"keep\":1}",
+        ] {
             let tcs = json!([{
                 "id": "c1",
                 "type": "function",
@@ -3299,6 +3325,64 @@ mod tests {
     /// A custom tool never streams the function-call argument events —
     /// they carry the single-string wrapper, which is gateway plumbing the
     /// caller never asked to see.
+    /// An upstream that splits `function.name` across chunks overwrites
+    /// the name on each one. The item id and the item type are both
+    /// derived from whether the name is a custom tool, so a later fragment
+    /// completing the name must not change what an already-emitted
+    /// `output_item.added` said — `.done` would name an item the client
+    /// never saw opened.
+    #[test]
+    fn a_tool_name_completed_after_the_item_opened_keeps_its_announced_identity() {
+        let mut enc = ResponsesSseEncoder::new(
+            "resp_1",
+            "m",
+            0,
+            BTreeSet::from(["apply_patch".to_string()]),
+        );
+        // First fragment carries a PREFIX of the custom tool's name, so the
+        // item opens as a plain function call.
+        let mut all = enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![json!({
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "apply_"},
+                })]),
+                ..Default::default()
+            },
+            finish_reason: None,
+            usage: None,
+        });
+        all.extend(enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![
+                    json!({"index": 0, "function": {"name": "apply_patch", "arguments": "{}"}}),
+                ]),
+                ..Default::default()
+            },
+            finish_reason: None,
+            usage: None,
+        }));
+        all.extend(enc.force_finish());
+
+        let added = all
+            .iter()
+            .find(|e| e.event_type == "response.output_item.added")
+            .expect("item announced");
+        let done = all
+            .iter()
+            .find(|e| e.event_type == "response.output_item.done")
+            .expect("item closed");
+        assert_eq!(added.data["item"]["id"], done.data["item"]["id"]);
+        assert_eq!(added.data["item"]["type"], done.data["item"]["type"]);
+        let final_item = &all.last().unwrap().data["response"]["output"][0];
+        assert_eq!(final_item["id"], added.data["item"]["id"]);
+        assert_eq!(final_item["type"], added.data["item"]["type"]);
+    }
+
     #[test]
     fn streaming_custom_tool_call_emits_no_function_call_argument_events() {
         let mut enc = ResponsesSseEncoder::new(
