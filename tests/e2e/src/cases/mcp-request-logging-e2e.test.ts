@@ -33,7 +33,7 @@ const KEY_GRANTED = "sk-mcp-log-granted";
 const NO_GRANT_WARN =
   "mcp tools/list returned no tools: no MCP access policy or key-level grant applies to this caller";
 const NO_MATCH_WARN =
-  "mcp tools/list returned no tools: no granted pattern matched any upstream tool";
+  "mcp tools/list returned no tools: the caller's effective MCP access rules (allow, deny and anonymous allowlist) exclude every upstream tool";
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 

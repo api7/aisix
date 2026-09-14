@@ -728,7 +728,7 @@ async fn dispatch(
                 tracing::warn!(
                     api_key_id = auth.entry.id.as_str(),
                     upstream_tools = counts.total,
-                    "mcp tools/list returned no tools: no granted pattern matched any upstream tool"
+                    "mcp tools/list returned no tools: the caller's effective MCP access rules (allow, deny and anonymous allowlist) exclude every upstream tool"
                 );
             } else {
                 tracing::warn!(
