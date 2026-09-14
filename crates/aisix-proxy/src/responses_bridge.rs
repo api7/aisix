@@ -11,12 +11,14 @@
 //! path of `/v1/messages` (`messages::cross_provider_dispatch`).
 //!
 //! Only the Responses fields that map cleanly onto chat completions are
-//! carried (`instructions`, `input`, `tools`, `tool_choice`,
-//! `temperature`, `top_p`, `max_output_tokens`, `stream`, and
-//! `reasoning.effort`). Other OpenAI-only knobs (`store`,
-//! `previous_response_id`, `text`, …) are dropped rather than forwarded —
-//! the downstream provider bridges flatten unknown `extra` fields onto the
-//! upstream wire, where an OpenAI-only key would 400 (e.g. Anthropic).
+//! carried (`instructions`, `input` — including its image / file / audio
+//! content parts —, `tools`, `tool_choice`, `temperature`, `top_p`,
+//! `max_output_tokens`, `stream`, `reasoning.effort`, and `text.format` as
+//! `response_format`). Other OpenAI-only knobs (`store`,
+//! `previous_response_id`, `text.verbosity`, …) are dropped rather than
+//! forwarded — the downstream provider bridges flatten unknown `extra`
+//! fields onto the upstream wire, where an OpenAI-only key would 400 (e.g.
+//! Anthropic).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -91,18 +93,35 @@ pub fn responses_request_to_chat(model: &str, body: &Value) -> ChatFormat {
             {
                 chat.extra.insert("tool_choice".to_string(), tc);
             }
+            // `parallel_tool_calls` is the same boolean in both APIs, and
+            // travels under the same condition as `tool_choice`.
+            if let Some(p) = body.get("parallel_tool_calls").and_then(Value::as_bool) {
+                chat.extra
+                    .insert("parallel_tool_calls".to_string(), Value::Bool(p));
+            }
         }
         // A caller that asked for a tool call and lost it to this filter
         // gets prose back instead of an upstream 400; say so, or the
         // downgrade is invisible from the logs.
-        None if body.get("tool_choice").is_some() => {
-            tracing::debug!("dropping tool_choice on the chat bridge: no tool survived translation")
+        None if body.get("tool_choice").is_some() || body.get("parallel_tool_calls").is_some() => {
+            tracing::debug!(
+                "dropping tool_choice/parallel_tool_calls on the chat bridge: no tool survived translation"
+            )
         }
         None => {}
     }
     if let Some(effort) = body.pointer("/reasoning/effort").and_then(Value::as_str) {
         chat.extra
             .insert("reasoning_effort".to_string(), effort.into());
+    }
+    // Structured outputs: Responses spells them `text.format`, chat spells
+    // them `response_format`. Dropping the field made a caller that asked for
+    // a schema get prose back.
+    if let Some(rf) = body
+        .get("text")
+        .and_then(responses_text_format_to_response_format)
+    {
+        chat.extra.insert("response_format".to_string(), rf);
     }
     chat
 }
@@ -147,12 +166,15 @@ fn append_input_item(messages: &mut Vec<ChatMessage>, item: &Value) {
                 .unwrap_or_default();
             let output = item
                 .get("output")
-                .map(responses_content_text)
-                .unwrap_or_default();
+                .map(function_call_output_to_chat)
+                .unwrap_or_else(|| ChatContent {
+                    text: String::new(),
+                    blocks: None,
+                });
             messages.push(ChatMessage {
                 role: Role::Tool,
-                content: Some(output),
-                content_blocks: None,
+                content: Some(output.text),
+                content_blocks: output.blocks,
                 name: None,
                 tool_call_id: Some(call_id.to_string()),
                 extra: Map::new(),
@@ -163,18 +185,24 @@ fn append_input_item(messages: &mut Vec<ChatMessage>, item: &Value) {
         // A `message` item (or an untyped `{role, content}` element).
         _ => {
             let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-            let text = item
+            let content = item
                 .get("content")
-                .map(responses_content_text)
-                .unwrap_or_default();
-            if text.is_empty() {
+                .map(responses_content_to_chat)
+                .unwrap_or_else(|| ChatContent {
+                    text: String::new(),
+                    blocks: None,
+                });
+            // A turn made only of images / files / audio still has to reach
+            // the upstream: it carries an array `content`, not the empty
+            // string that used to erase it here.
+            if content.is_empty() {
                 return;
             }
-            messages.push(match role {
-                "assistant" => ChatMessage::assistant(text),
-                "system" | "developer" => ChatMessage::system(text),
-                _ => ChatMessage::user(text),
-            });
+            messages.push(content.into_message(match role {
+                "assistant" => Role::Assistant,
+                "system" | "developer" => Role::System,
+                _ => Role::User,
+            }));
         }
     }
 }
@@ -204,64 +232,387 @@ fn push_tool_call(messages: &mut Vec<ChatMessage>, tc: Value) {
     });
 }
 
-/// Plain text of a Responses-API content slot: a bare string, or the
-/// concatenation of the `text` of an array of typed parts
-/// (`input_text` / `output_text` / `text`). Non-text parts are skipped.
-fn responses_content_text(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
+/// A Responses-API content slot rendered for a chat message: the
+/// concatenated text of its text parts, plus the OpenAI chat content-block
+/// array when the slot carried anything a chat message can only express as
+/// blocks (an image, a file, audio).
+///
+/// `blocks` stays `None` for a text-only slot so the common case keeps the
+/// bare-string wire shape it has always had; when it is `Some`, the
+/// OpenAI-compatible bridge forwards the array verbatim and the bridges that
+/// don't speak blocks (Anthropic / Gemini / Bedrock) fall back to `text` —
+/// the documented cross-provider content limitation.
+struct ChatContent {
+    text: String,
+    blocks: Option<Vec<Value>>,
+}
+
+impl ChatContent {
+    fn into_message(self, role: Role) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: Some(self.text),
+            content_blocks: self.blocks,
+            name: None,
+            tool_call_id: None,
+            extra: Map::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.is_empty() && self.blocks.is_none()
     }
 }
 
-/// Translate Responses-API `tools` (flat function shape `{type:"function",
-/// name, description, parameters}`) into OpenAI chat tools (`{type:
-/// "function", function:{name, description, parameters}}`). Non-function
-/// (hosted) tools have no chat equivalent and are dropped. Returns `None`
-/// when nothing translates so the field stays absent from the wire.
+/// Translate a Responses-API content slot (a bare string, or an array of
+/// typed input parts) into chat-completions content.
+///
+/// Part mapping, the OpenAI chat shape for each:
+///   * `input_text` / `output_text` / `text` → `{type:"text", text}`
+///   * `input_image` → `{type:"image_url", image_url:{url, detail?}}`, the
+///     `image_url` passed through as given (an https URL or a `data:` URL)
+///   * `input_file` → `{type:"file", file:{file_data?, filename?, file_id?}}`
+///   * `input_audio` → `{type:"input_audio", input_audio:{data, format}}`
+///
+/// Parts that carry none of the above are skipped.
+fn responses_content_to_chat(v: &Value) -> ChatContent {
+    match v {
+        Value::String(s) => ChatContent {
+            text: s.clone(),
+            blocks: None,
+        },
+        Value::Array(parts) => {
+            let mut text = String::new();
+            let mut blocks: Vec<Value> = Vec::new();
+            let mut has_non_text = false;
+            for part in parts {
+                // A bare string element is text, as it is at the top level.
+                if let Some(s) = part.as_str() {
+                    text.push_str(s);
+                    blocks.push(json!({"type": "text", "text": s}));
+                    continue;
+                }
+                match part.get("type").and_then(Value::as_str) {
+                    Some("input_image") => {
+                        if let Some(block) = input_image_block(part) {
+                            blocks.push(block);
+                            has_non_text = true;
+                        }
+                    }
+                    Some("input_file") => {
+                        if let Some(block) = input_file_block(part) {
+                            blocks.push(block);
+                            has_non_text = true;
+                        }
+                    }
+                    Some("input_audio") => {
+                        if let Some(block) = input_audio_block(part) {
+                            blocks.push(block);
+                            has_non_text = true;
+                        }
+                    }
+                    // `input_text` / `output_text` / `text`, and any other
+                    // part that carries a `text` member.
+                    _ => {
+                        if let Some(t) = part.get("text").and_then(Value::as_str) {
+                            text.push_str(t);
+                            blocks.push(json!({"type": "text", "text": t}));
+                        }
+                    }
+                }
+            }
+            ChatContent {
+                text,
+                // Text-only slots keep the bare-string shape.
+                blocks: has_non_text.then_some(blocks),
+            }
+        }
+        _ => ChatContent {
+            text: String::new(),
+            blocks: None,
+        },
+    }
+}
+
+/// `input_image` → the chat `image_url` part. `detail` rides along only
+/// when the caller set it, so an upstream applies its own default.
+///
+/// An `input_image` that carries only a `file_id` (an image uploaded to
+/// OpenAI's Files API) has no chat-completions equivalent — the chat part
+/// addresses an image by URL or `data:` URL and nothing else — so it maps
+/// to no block at all rather than to an `image_url` with an empty `url`,
+/// which every chat upstream rejects.
+fn input_image_block(part: &Value) -> Option<Value> {
+    let url = part
+        .get("image_url")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    let mut image_url = Map::new();
+    image_url.insert("url".to_string(), json!(url));
+    if let Some(detail) = part.get("detail").and_then(Value::as_str) {
+        image_url.insert("detail".to_string(), json!(detail));
+    }
+    Some(json!({"type": "image_url", "image_url": Value::Object(image_url)}))
+}
+
+/// `input_file` → the chat `file` part, carrying whichever of
+/// `file_data` / `filename` / `file_id` the caller sent.
+fn input_file_block(part: &Value) -> Option<Value> {
+    let mut file = Map::new();
+    for key in ["file_data", "filename", "file_id"] {
+        if let Some(v) = part.get(key).filter(|v| !v.is_null()) {
+            file.insert(key.to_string(), v.clone());
+        }
+    }
+    (!file.is_empty()).then(|| json!({"type": "file", "file": Value::Object(file)}))
+}
+
+/// `input_audio` → the chat `input_audio` part (`data` + `format`).
+fn input_audio_block(part: &Value) -> Option<Value> {
+    // The Responses part nests the pair under `input_audio`; tolerate the
+    // flattened spelling some clients send.
+    let src = part.get("input_audio").unwrap_or(part);
+    let mut audio = Map::new();
+    for key in ["data", "format"] {
+        if let Some(v) = src.get(key).filter(|v| !v.is_null()) {
+            audio.insert(key.to_string(), v.clone());
+        }
+    }
+    (!audio.is_empty()).then(|| json!({"type": "input_audio", "input_audio": Value::Object(audio)}))
+}
+
+/// A `function_call_output.output` rendered as chat `tool` content.
+///
+/// The chat `tool` role is text-only, so the output is always a plain
+/// string: OpenAI rejects a `tool` message carrying an `image_url` part
+/// outright ("Image URLs are only allowed for messages with role 'user'"),
+/// and the bridges that do not speak content blocks (Anthropic, Gemini,
+/// Bedrock) read the concatenated text anyway — so forwarding the image
+/// would turn a tool result that used to answer into a 400 without any
+/// upstream gaining the image. Non-text parts are dropped and their text
+/// siblings still reach the model.
+fn function_call_output_to_chat(output: &Value) -> ChatContent {
+    // A tool that returned JSON reaches the upstream as that JSON
+    // serialised — a chat `tool` message carries a string, and rendering
+    // the value as an empty one erased the result. An array is ambiguous:
+    // it is the Responses content-part shape when its elements are parts,
+    // and a plain JSON array (a list of records, say) otherwise, which
+    // would parse as parts and come out empty. An array that is both
+    // keeps its parts as text and serialises the rest in place, so no
+    // element the tool returned is silently dropped. `null` and an
+    // absent output stay the empty string.
+    match output {
+        Value::Object(_) | Value::Number(_) | Value::Bool(_) => {
+            return ChatContent {
+                text: serde_json::to_string(output).unwrap_or_default(),
+                blocks: None,
+            }
+        }
+        // An array holding no content part at all is one JSON value —
+        // a list of records, say — and is serialised whole.
+        Value::Array(items) if !items.is_empty() && !items.iter().any(is_content_part) => {
+            return ChatContent {
+                text: serde_json::to_string(output).unwrap_or_default(),
+                blocks: None,
+            }
+        }
+        // A mixed array is rendered element by element: every element
+        // the model would otherwise never see arrives as its own JSON,
+        // in the position the tool put it in.
+        Value::Array(items) => {
+            let mut text = String::new();
+            for item in items {
+                if is_content_part(item) {
+                    if let Some(s) = item.as_str() {
+                        text.push_str(s);
+                    } else if let Some(t) = item.get("text").and_then(Value::as_str) {
+                        text.push_str(t);
+                    }
+                    // A typed non-text part (an image, a file, audio) has
+                    // no text and no `tool`-role counterpart; it is the
+                    // one thing this role cannot carry.
+                } else {
+                    text.push_str(&serde_json::to_string(item).unwrap_or_default());
+                }
+            }
+            return ChatContent { text, blocks: None };
+        }
+        _ => {}
+    }
+    let mut content = responses_content_to_chat(output);
+    content.blocks = None;
+    content
+}
+
+/// Whether one array element is a Responses content part rather than a
+/// member of a plain JSON array: a bare string, a typed part this bridge
+/// maps, or anything carrying a `text` member.
+fn is_content_part(item: &Value) -> bool {
+    if item.is_string() {
+        return true;
+    }
+    if item.get("text").is_some_and(Value::is_string) {
+        return true;
+    }
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("input_text" | "output_text" | "text" | "input_image" | "input_file" | "input_audio")
+    )
+}
+
+/// Translate the Responses `text.format` object into the chat
+/// `response_format` object:
+///   * `{type:"json_schema", name, schema, strict, description}` →
+///     `{type:"json_schema", json_schema:{name, schema, strict, description}}`
+///     (members the caller omitted stay omitted)
+///   * `{type:"json_object"}` → `{type:"json_object"}`
+///   * `{type:"text"}`, anything else → `None`, so the field stays off the wire
+///
+/// `text.verbosity` has no chat-completions counterpart on this path and
+/// keeps being dropped.
+fn responses_text_format_to_response_format(text: &Value) -> Option<Value> {
+    let format = text.get("format")?;
+    match format.get("type").and_then(Value::as_str)? {
+        "json_schema" => {
+            let mut schema = Map::new();
+            for key in ["name", "schema", "strict", "description"] {
+                if let Some(v) = format.get(key).filter(|v| !v.is_null()) {
+                    schema.insert(key.to_string(), v.clone());
+                }
+            }
+            Some(json!({"type": "json_schema", "json_schema": Value::Object(schema)}))
+        }
+        "json_object" => Some(json!({"type": "json_object"})),
+        _ => None,
+    }
+}
+
+/// Translate Responses-API `tools` into OpenAI chat tools.
+///
+///   * `{type:"function", name, description, parameters}` →
+///     `{type:"function", function:{name, description, parameters}}`
+///   * `{type:"custom", name, description, format}` → a function tool with
+///     the single-string schema in [`custom_tool_parameters`]; a freeform
+///     tool has no chat counterpart, and a function tool taking one string
+///     is the shape that keeps the model able to call it. A grammar under
+///     `format.definition` rides along in the description, the only place a
+///     chat upstream will read it.
+///   * hosted tools (`web_search*`, `file_search`, `code_interpreter`,
+///     `mcp`, `computer_use*`, `image_generation`, …) have no chat
+///     equivalent and are dropped.
+///
+/// Returns `None` when nothing translates so the field stays absent from
+/// the wire.
 fn responses_tools_to_chat(tools: &Value) -> Option<Value> {
     let arr = tools.as_array()?;
     let out: Vec<Value> = arr
         .iter()
-        .filter_map(|t| {
-            if t.get("type").and_then(|v| v.as_str()) != Some("function") {
-                return None;
+        .filter_map(|t| match t.get("type").and_then(|v| v.as_str()) {
+            Some("function") => {
+                let name = t.get("name").and_then(|v| v.as_str())?;
+                let mut func = Map::new();
+                func.insert("name".to_string(), json!(name));
+                if let Some(d) = t.get("description") {
+                    func.insert("description".to_string(), d.clone());
+                }
+                if let Some(p) = t.get("parameters") {
+                    func.insert("parameters".to_string(), p.clone());
+                }
+                Some(json!({"type": "function", "function": Value::Object(func)}))
             }
-            let name = t.get("name").and_then(|v| v.as_str())?;
-            let mut func = Map::new();
-            func.insert("name".to_string(), json!(name));
-            if let Some(d) = t.get("description") {
-                func.insert("description".to_string(), d.clone());
+            Some("custom") => {
+                let name = t.get("name").and_then(|v| v.as_str())?;
+                let mut description = t
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                description.push_str(&custom_tool_grammar_suffix(t.get("format")));
+                let mut func = Map::new();
+                func.insert("name".to_string(), json!(name));
+                if !description.is_empty() {
+                    func.insert("description".to_string(), json!(description));
+                }
+                func.insert("parameters".to_string(), custom_tool_parameters(name));
+                Some(json!({"type": "function", "function": Value::Object(func)}))
             }
-            if let Some(p) = t.get("parameters") {
-                func.insert("parameters".to_string(), p.clone());
-            }
-            Some(json!({"type": "function", "function": Value::Object(func)}))
+            _ => None,
         })
         .collect();
     (!out.is_empty()).then_some(Value::Array(out))
 }
 
-/// Translate Responses-API `tool_choice` to OpenAI chat shape:
-/// `"auto"|"none"|"required"` pass through; `{type:"function", name}` →
-/// `{type:"function", function:{name}}`. Hosted-tool choices have no chat
-/// equivalent and drop to `None`.
+/// The JSON-schema a `custom` tool takes once it is a function tool: one
+/// required string holding whatever the freeform tool would have received.
+fn custom_tool_parameters(name: &str) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": format!("The {name} content following the specified format"),
+            }
+        },
+        "required": ["content"],
+    })
+}
+
+/// A custom tool's grammar, rendered for the tail of its description. Empty
+/// when the tool carries no `format.definition`.
+fn custom_tool_grammar_suffix(format: Option<&Value>) -> String {
+    let Some(definition) = format
+        .and_then(|f| f.get("definition"))
+        .and_then(Value::as_str)
+        .filter(|d| !d.is_empty())
+    else {
+        return String::new();
+    };
+    let syntax = format
+        .and_then(|f| f.get("syntax"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    format!("\n\nFormat:\n```{syntax}\n{definition}\n```")
+}
+
+/// Translate Responses-API `tool_choice` to the provider-neutral OpenAI
+/// chat shape every provider bridge translates onwards:
+///
+///   * `"auto"` / `"none"` / `"required"` pass through
+///   * `{type:"function", name}`, `{type:"custom", name}`,
+///     `{type:"tool", name}` → `{type:"function", function:{name}}`
+///   * `{type:"allowed_tools", mode:"required"|"auto"}` → the bare mode;
+///     chat has no way to restrict the model to a subset of the tools it
+///     was given, so the subset itself is dropped
+///   * `{type:"any"}` → `"required"`
+///   * a choice naming a hosted tool type, or anything else → `None`, so
+///     the field stays off the wire
 fn responses_tool_choice_to_chat(tc: &Value) -> Option<Value> {
     match tc {
         Value::String(s) => Some(Value::String(s.clone())),
-        Value::Object(o) => {
-            if o.get("type").and_then(|v| v.as_str()) == Some("function") {
+        Value::Object(o) => match o.get("type").and_then(|v| v.as_str())? {
+            "function" | "custom" | "tool" => {
                 let name = o.get("name").and_then(|v| v.as_str())?;
                 Some(json!({"type": "function", "function": {"name": name}}))
-            } else {
+            }
+            "any" => Some(Value::String("required".to_string())),
+            "allowed_tools" => match o.get("mode").and_then(|v| v.as_str())? {
+                mode @ ("auto" | "required") => {
+                    tracing::debug!(
+                        %mode,
+                        "narrowing allowed_tools to its mode: the chat bridge cannot restrict the model to a subset of the tools"
+                    );
+                    Some(Value::String(mode.to_string()))
+                }
+                _ => None,
+            },
+            other => {
+                tracing::debug!(
+                    tool_choice = %other,
+                    "dropping tool_choice on the chat bridge: no chat equivalent"
+                );
                 None
             }
-        }
+        },
         _ => None,
     }
 }
@@ -276,6 +627,7 @@ pub fn chat_response_to_responses_json(
 ) -> Value {
     let (status, incomplete_reason) = responses_status(&resp.finish_reason);
     let output = build_output_items(
+        message_reasoning_text(&resp.message),
         resp.message.content.as_deref(),
         resp.message
             .extra
@@ -308,10 +660,53 @@ fn responses_status(fr: &FinishReason) -> (&'static str, Option<&'static str>) {
     }
 }
 
-/// Assemble the `output` array: a `message` item carrying the assistant
+/// A completed `reasoning` output item. The chain-of-thought rides a
+/// `summary_text` part — the slot the Responses API defines for the
+/// human-readable reasoning a client is allowed to render (its `content`
+/// parts are the provider's own opaque/`reasoning_text` material, which a
+/// chat upstream does not give us).
+fn reasoning_item_json(item_id: &str, text: &str) -> Value {
+    json!({
+        "type": "reasoning",
+        "id": item_id,
+        "status": "completed",
+        "summary": [{"type": "summary_text", "text": text}],
+    })
+}
+
+/// The upstream's chain-of-thought on a bridged non-streaming response.
+///
+/// The OpenAI-compatible response parser already normalises both spellings
+/// the ecosystem uses — `message.reasoning_content` (DeepSeek / GLM / Qwen /
+/// vLLM / SGLang) and `message.reasoning` (aggregators) — into this one
+/// canonical slot on the way into [`ChatMessage`], so the bridge reads the
+/// slot rather than re-deriving the spellings here.
+fn message_reasoning_text(message: &ChatMessage) -> Option<&str> {
+    message
+        .extra
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+/// Assemble the `output` array: a `reasoning` item carrying the upstream's
+/// chain-of-thought (when any), then a `message` item carrying the assistant
 /// text (when any), followed by one `function_call` item per tool call.
-fn build_output_items(text: Option<&str>, tool_calls: Option<&Vec<Value>>) -> Vec<Value> {
+fn build_output_items(
+    reasoning: Option<&str>,
+    text: Option<&str>,
+    tool_calls: Option<&Vec<Value>>,
+) -> Vec<Value> {
     let mut output: Vec<Value> = Vec::new();
+    // Reasoning leads the output array, as it does on a native Responses
+    // upstream: a client renders the items in order, and the thinking that
+    // produced an answer belongs before it.
+    if let Some(reasoning) = reasoning {
+        output.push(reasoning_item_json(
+            &format!("rs_{}", Uuid::new_v4().simple()),
+            reasoning,
+        ));
+    }
     if let Some(text) = text.filter(|s| !s.is_empty()) {
         output.push(json!({
             "type": "message",
@@ -393,6 +788,20 @@ fn responses_usage_json(u: &UsageStats) -> Value {
 //   → response.function_call_arguments.done
 //   → response.output_item.done (function_call)
 //
+// A chat upstream that streams its chain-of-thought (`delta
+// .reasoning_content`) adds a `reasoning` item ahead of whatever it was
+// reasoning towards:
+//   response.output_item.added (reasoning)
+//   → response.reasoning_summary_part.added
+//   → response.reasoning_summary_text.delta ×N
+//   → response.reasoning_summary_text.done
+//   → response.reasoning_summary_part.done
+//   → response.output_item.done (reasoning)
+// It is closed by the first content/tool-call delta that follows (or by the
+// finish), so the message / function_call item that follows opens at the
+// NEXT output_index. Reasoning that arrives after a message item is already
+// open opens a further reasoning item rather than reopening the closed one.
+//
 // `response.completed` carries the final output + usage. When an
 // OpenAI-compatible upstream sends its usage frame AFTER the finish chunk
 // (`stream_options.include_usage`), the completed event is withheld until
@@ -416,6 +825,15 @@ impl ResponsesSseEvent {
             serde_json::to_string(&self.data).expect("serde_json::Value always serializes"),
         )
     }
+}
+
+/// Per-reasoning-item streaming state. One `reasoning` output item and the
+/// single `summary_text` part it streams into.
+#[derive(Debug)]
+struct ReasoningState {
+    item_id: String,
+    output_index: u32,
+    text: String,
 }
 
 /// Per-tool-call streaming state.
@@ -447,6 +865,11 @@ pub struct ResponsesSseEncoder {
     /// Set once the per-item `*.done` events have been emitted, so
     /// `close_items` is idempotent across the finish chunk + `force_finish`.
     items_closed: bool,
+    /// The reasoning item currently streaming, if any.
+    reasoning_open: Option<ReasoningState>,
+    /// Reasoning items already closed, kept so `response.completed` can
+    /// rebuild them into the final `output` array.
+    reasoning_done: Vec<ReasoningState>,
     // Tool-call items keyed by the OpenAI delta index.
     tool_calls: std::collections::BTreeMap<u64, ToolCallState>,
     /// Withheld terminal status + incomplete reason while waiting on a
@@ -483,6 +906,8 @@ impl ResponsesSseEncoder {
             text_output_index: 0,
             text_accum: String::new(),
             items_closed: false,
+            reasoning_open: None,
+            reasoning_done: Vec::new(),
             tool_calls: std::collections::BTreeMap::new(),
             pending_status: None,
             pending_reason: None,
@@ -530,6 +955,39 @@ impl ResponsesSseEncoder {
             self.cache_write_tokens = self.cache_write_tokens.max(u.cache_write_tokens);
             self.cache_creation_tokens = self.cache_creation_tokens.max(u.cache_creation_tokens);
             self.cache_read_tokens = self.cache_read_tokens.max(u.cache_read_tokens);
+        }
+    }
+
+    /// Adopt locally-estimated token counts as the client-visible usage,
+    /// for a bridged stream whose upstream left them unreported. The
+    /// internal usage record is filled from the same estimate, and a client
+    /// reading `response.completed.usage` must not be told zero while the
+    /// record says otherwise (AISIX-Cloud#1074). Per counter, and only
+    /// into a zero: a number the upstream actually reported is never
+    /// overridden, and a frame that reported one counter and left the
+    /// other at zero still gets that zero filled — the record fills it
+    /// the same way, and the two must not disagree. A no-op once the
+    /// terminal event has gone out: the client must never be handed
+    /// numbers contradicting what it was already sent.
+    pub fn set_estimated_usage(&mut self, prompt_tokens: u32, completion_tokens: u32) {
+        if self.finished {
+            return;
+        }
+        let mut filled = false;
+        if self.prompt_tokens == 0 && prompt_tokens > 0 {
+            self.prompt_tokens = prompt_tokens;
+            filled = true;
+        }
+        if self.completion_tokens == 0 && completion_tokens > 0 {
+            self.completion_tokens = completion_tokens;
+            filled = true;
+        }
+        if filled {
+            // A total the upstream reported beside a zero sub-counter no
+            // longer describes what the client is about to be told.
+            // Zeroing it makes the projection derive prompt + completion,
+            // the same arithmetic it uses when no total was reported.
+            self.total_tokens = 0;
         }
     }
 
@@ -595,6 +1053,9 @@ impl ResponsesSseEncoder {
     /// Rebuild the completed `output` array from accumulated state.
     fn final_output_items(&self) -> Vec<Value> {
         let mut items: Vec<(u32, Value)> = Vec::new();
+        for r in self.reasoning_done.iter().chain(self.reasoning_open.iter()) {
+            items.push((r.output_index, reasoning_item_json(&r.item_id, &r.text)));
+        }
         if let Some(id) = self.text_item_id.as_ref() {
             items.push((
                 self.text_output_index,
@@ -652,11 +1113,16 @@ impl ResponsesSseEncoder {
             .tool_calls
             .as_ref()
             .is_some_and(|v| !v.is_empty());
+        let has_reasoning = chunk
+            .delta
+            .reasoning_content
+            .as_deref()
+            .is_some_and(|s| !s.is_empty());
         let has_finish = chunk.finish_reason.is_some();
 
         let mut events = Vec::new();
 
-        if !self.sent_created && (has_content || has_tools || has_finish) {
+        if !self.sent_created && (has_content || has_tools || has_reasoning || has_finish) {
             self.sent_created = true;
             events.push(self.event(
                 "response.created",
@@ -666,6 +1132,61 @@ impl ResponsesSseEncoder {
                 "response.in_progress",
                 json!({"response": self.response_object("in_progress", false, false)}),
             ));
+        }
+
+        // ── Reasoning ──
+        //
+        // Emitted before the text/tool blocks below so a chunk carrying both
+        // reasoning and content renders the thinking first, then closes the
+        // reasoning item and opens the message item after it.
+        if has_reasoning {
+            let delta = chunk.delta.reasoning_content.clone().unwrap_or_default();
+            if self.reasoning_open.is_none() {
+                let item_id = format!("rs_{}", Uuid::new_v4().simple());
+                let output_index = self.next_output_index;
+                self.next_output_index += 1;
+                self.reasoning_open = Some(ReasoningState {
+                    item_id: item_id.clone(),
+                    output_index,
+                    text: String::new(),
+                });
+                events.push(self.event(
+                    "response.output_item.added",
+                    json!({
+                        "output_index": output_index,
+                        "item": {"type": "reasoning", "id": item_id, "status": "in_progress", "summary": []},
+                    }),
+                ));
+                events.push(self.event(
+                    "response.reasoning_summary_part.added",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "summary_index": 0,
+                        "part": {"type": "summary_text", "text": ""},
+                    }),
+                ));
+            }
+            let (item_id, output_index) = {
+                let r = self.reasoning_open.as_mut().expect("just opened");
+                r.text.push_str(&delta);
+                (r.item_id.clone(), r.output_index)
+            };
+            events.push(self.event(
+                "response.reasoning_summary_text.delta",
+                json!({
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "summary_index": 0,
+                    "delta": delta,
+                }),
+            ));
+        }
+
+        // The first content or tool-call delta after a reasoning run ends it,
+        // so the item that follows opens at the next `output_index`.
+        if has_content || has_tools {
+            events.extend(self.close_reasoning());
         }
 
         // ── Text content ──
@@ -799,6 +1320,44 @@ impl ResponsesSseEncoder {
         events
     }
 
+    /// Close the open `reasoning` item, if any: the summary text, then its
+    /// part, then the item. Empty when no reasoning item is open, so every
+    /// call site can invoke it unconditionally.
+    fn close_reasoning(&mut self) -> Vec<ResponsesSseEvent> {
+        let Some(r) = self.reasoning_open.take() else {
+            return Vec::new();
+        };
+        let (item_id, output_index, text) = (r.item_id.clone(), r.output_index, r.text.clone());
+        self.reasoning_done.push(r);
+        vec![
+            self.event(
+                "response.reasoning_summary_text.done",
+                json!({
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "summary_index": 0,
+                    "text": text,
+                }),
+            ),
+            self.event(
+                "response.reasoning_summary_part.done",
+                json!({
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": text},
+                }),
+            ),
+            self.event(
+                "response.output_item.done",
+                json!({
+                    "output_index": output_index,
+                    "item": reasoning_item_json(&item_id, &text),
+                }),
+            ),
+        ]
+    }
+
     /// Emit the per-item `*.done` closing events for the open text + tool
     /// items. Idempotent: a no-op after the first call, so the finish chunk
     /// and a later `force_finish` (when the completed event was withheld for
@@ -808,7 +1367,9 @@ impl ResponsesSseEncoder {
             return Vec::new();
         }
         self.items_closed = true;
-        let mut events = Vec::new();
+        // A stream that ended inside its reasoning run (nothing but thinking,
+        // or a truncation) still owes the item's closing events.
+        let mut events = self.close_reasoning();
         if self.text_item_id.is_some() {
             let item_id = self.text_item_id.clone().unwrap_or_default();
             let output_index = self.text_output_index;
@@ -1180,6 +1741,33 @@ pub fn build_responses_bridge_stream(
                 }
             }
         }
+        // Token-estimation fallback (AISIX-Cloud#1074), run HERE rather than
+        // from the Drop guard below: the terminal `response.completed` this
+        // relay is about to synthesize carries the client-visible usage, and
+        // it must be the same number the usage record gets — a client told
+        // `output_tokens: 0` for a response it can see the text of has no way
+        // to reconcile that with the dashboard. The guard keeps its own copy
+        // of this fill for the stream a consumer abandoned before EOF, where
+        // no terminal event is emitted at all.
+        if let Some(est) = guard.estimator.take() {
+            let filled = {
+                let comp = guard.comp();
+                crate::token_estimate::fill_missing(
+                    &est,
+                    comp.prompt_tokens,
+                    comp.completion_tokens,
+                    Some(comp.est_output_text.as_str()),
+                )
+            };
+            if filled.estimated {
+                let comp = guard.comp();
+                comp.prompt_tokens = filled.prompt_tokens;
+                comp.completion_tokens = filled.completion_tokens;
+                comp.usage_estimated = true;
+                encoder.set_estimated_usage(filled.prompt_tokens, filled.completion_tokens);
+            }
+        }
+
         if !encoder.is_finished() {
             for ev in encoder.force_finish() {
                 let b = bytes::Bytes::from(ev.to_sse_string());
@@ -1482,6 +2070,257 @@ mod tests {
         assert!(matches!(chat.messages[1].role, Role::Assistant));
     }
 
+    /// The content parts of one user message, as the OpenAI-compatible
+    /// bridge would put them on the wire.
+    fn user_blocks(body: &Value) -> Vec<Value> {
+        let chat = responses_request_to_chat("m", body);
+        chat.messages[0]
+            .content_blocks
+            .clone()
+            .expect("message carries typed content blocks")
+    }
+
+    fn image_body(image: Value) -> Value {
+        json!({
+            "model": "m",
+            "input": [{"role": "user", "content": [
+                {"type": "input_text", "text": "what is in this image?"},
+                image,
+            ]}],
+        })
+    }
+
+    #[test]
+    fn input_image_url_and_detail_become_a_chat_image_url_part() {
+        let blocks = user_blocks(&image_body(json!({
+            "type": "input_image",
+            "image_url": "https://example.com/cat.png",
+            "detail": "high",
+        })));
+        assert_eq!(
+            blocks,
+            vec![
+                json!({"type": "text", "text": "what is in this image?"}),
+                json!({"type": "image_url", "image_url": {
+                    "url": "https://example.com/cat.png",
+                    "detail": "high",
+                }}),
+            ]
+        );
+    }
+
+    #[test]
+    fn input_image_without_detail_leaves_detail_off_the_wire() {
+        let blocks = user_blocks(&image_body(json!({
+            "type": "input_image",
+            "image_url": "https://example.com/cat.png",
+        })));
+        assert_eq!(
+            blocks[1],
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}})
+        );
+    }
+
+    #[test]
+    fn data_url_image_passes_through_verbatim() {
+        let data_url = "data:image/png;base64,iVBORw0KGgo=";
+        let blocks = user_blocks(&image_body(json!({
+            "type": "input_image",
+            "image_url": data_url,
+        })));
+        assert_eq!(blocks[1]["image_url"]["url"], data_url);
+    }
+
+    /// An `input_image` addressed only by uploaded-file id has no
+    /// chat-completions counterpart; it must not become an `image_url` with
+    /// an empty `url`, which a chat upstream rejects outright.
+    #[test]
+    fn file_id_only_input_image_yields_no_image_part() {
+        let chat = responses_request_to_chat(
+            "m",
+            &image_body(json!({"type": "input_image", "file_id": "file-abc"})),
+        );
+        assert_eq!(chat.messages[0].content_str(), "what is in this image?");
+        assert!(chat.messages[0].content_blocks.is_none());
+    }
+
+    #[test]
+    fn input_file_becomes_a_chat_file_part_with_the_members_sent() {
+        let blocks = user_blocks(&json!({
+            "model": "m",
+            "input": [{"role": "user", "content": [{
+                "type": "input_file",
+                "filename": "draft.pdf",
+                "file_data": "data:application/pdf;base64,JVBERi0=",
+            }]}],
+        }));
+        assert_eq!(
+            blocks,
+            vec![json!({"type": "file", "file": {
+                "file_data": "data:application/pdf;base64,JVBERi0=",
+                "filename": "draft.pdf",
+            }})]
+        );
+    }
+
+    #[test]
+    fn input_audio_becomes_a_chat_input_audio_part() {
+        let blocks = user_blocks(&json!({
+            "model": "m",
+            "input": [{"role": "user", "content": [{
+                "type": "input_audio",
+                "input_audio": {"data": "UklGRg==", "format": "wav"},
+            }]}],
+        }));
+        assert_eq!(
+            blocks,
+            vec![json!({"type": "input_audio", "input_audio": {
+                "data": "UklGRg==",
+                "format": "wav",
+            }})]
+        );
+    }
+
+    /// A turn made only of non-text parts used to be erased: the empty
+    /// concatenated text dropped the whole message and the upstream never
+    /// saw the image.
+    #[test]
+    fn all_non_text_message_still_reaches_the_upstream() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({
+                "model": "m",
+                "input": [{"role": "user", "content": [
+                    {"type": "input_image", "image_url": "https://example.com/a.png"},
+                ]}],
+            }),
+        );
+        assert_eq!(chat.messages.len(), 1);
+        assert!(matches!(chat.messages[0].role, Role::User));
+        assert_eq!(
+            chat.messages[0].content_blocks.as_deref(),
+            Some(
+                [json!({"type": "image_url", "image_url": {"url": "https://example.com/a.png"}})]
+                    .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn text_only_message_keeps_the_bare_string_shape() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({
+                "model": "m",
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            }),
+        );
+        assert_eq!(chat.messages[0].content_str(), "hi");
+        assert!(chat.messages[0].content_blocks.is_none());
+    }
+
+    /// A tool result carrying an image forwards it as an `image_url` part;
+    /// a text-only tool result stays a plain string.
+    #[test]
+    fn tool_output_array_keeps_its_text_and_drops_the_image() {
+        // OpenAI answers 400 "Image URLs are only allowed for messages
+        // with role 'user'" to a `tool` message carrying an image part,
+        // and no bridge reads blocks off a tool message, so the image is
+        // dropped and its text siblings still reach the model.
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({
+                "model": "m",
+                "input": [{"type": "function_call_output", "call_id": "call_1", "output": [
+                    {"type": "input_text", "text": "screenshot:"},
+                    {"type": "input_image", "image_url": "https://example.com/s.png"},
+                ]}],
+            }),
+        );
+        assert!(matches!(chat.messages[0].role, Role::Tool));
+        assert_eq!(chat.messages[0].content_str(), "screenshot:");
+        assert!(chat.messages[0].content_blocks.is_none());
+    }
+
+    #[test]
+    fn text_only_tool_output_array_stays_a_string() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({
+                "model": "m",
+                "input": [{"type": "function_call_output", "call_id": "c", "output": [
+                    {"type": "output_text", "text": "done"},
+                ]}],
+            }),
+        );
+        assert_eq!(chat.messages[0].content_str(), "done");
+        assert!(chat.messages[0].content_blocks.is_none());
+    }
+
+    fn response_format(text: Value) -> Option<Value> {
+        let body = json!({"model": "m", "input": "hi", "text": text});
+        responses_request_to_chat("m", &body)
+            .extra
+            .get("response_format")
+            .cloned()
+    }
+
+    #[test]
+    fn text_format_json_schema_becomes_response_format() {
+        assert_eq!(
+            response_format(json!({"format": {
+                "type": "json_schema",
+                "name": "weather",
+                "schema": {"type": "object", "properties": {"c": {"type": "number"}}},
+                "strict": true,
+                "description": "a forecast",
+            }})),
+            Some(json!({"type": "json_schema", "json_schema": {
+                "name": "weather",
+                "schema": {"type": "object", "properties": {"c": {"type": "number"}}},
+                "strict": true,
+                "description": "a forecast",
+            }}))
+        );
+    }
+
+    #[test]
+    fn text_format_json_schema_omits_the_members_the_caller_omitted() {
+        assert_eq!(
+            response_format(json!({"format": {"type": "json_schema", "name": "n"}})),
+            Some(json!({"type": "json_schema", "json_schema": {"name": "n"}}))
+        );
+    }
+
+    #[test]
+    fn text_format_json_object_becomes_response_format() {
+        assert_eq!(
+            response_format(json!({"format": {"type": "json_object"}})),
+            Some(json!({"type": "json_object"}))
+        );
+    }
+
+    #[test]
+    fn text_format_text_and_absent_text_emit_no_response_format() {
+        assert_eq!(response_format(json!({"format": {"type": "text"}})), None);
+        assert_eq!(response_format(json!({})), None);
+        let chat = responses_request_to_chat("m", &json!({"model": "m", "input": "hi"}));
+        assert!(!chat.extra.contains_key("response_format"));
+    }
+
+    /// `text.verbosity` has no chat-completions counterpart on this path —
+    /// it must not leak onto the upstream wire, where the bridges flatten
+    /// `extra` and an unknown key 400s.
+    #[test]
+    fn text_verbosity_is_not_forwarded() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({"model": "m", "input": "hi", "text": {"verbosity": "low"}}),
+        );
+        assert!(!chat.extra.contains_key("verbosity"));
+        assert!(!chat.extra.contains_key("response_format"));
+    }
+
     #[test]
     fn function_call_and_output_become_assistant_tool_calls_and_tool_turn() {
         // The codex agent-loop history shape.
@@ -1588,6 +2427,256 @@ mod tests {
         let chat = responses_request_to_chat("m", &hosted_only);
         assert!(!chat.extra.contains_key("tools"));
         assert!(!chat.extra.contains_key("tool_choice"));
+    }
+
+    #[test]
+    fn custom_tool_becomes_a_function_tool_taking_one_string() {
+        let body = json!({
+            "model": "m",
+            "input": "patch it",
+            "tools": [
+                {"type": "function", "name": "get_weather", "parameters": {"type": "object"}},
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Edit a file",
+                    "format": {"type": "grammar", "syntax": "lark", "definition": "start: TEXT"},
+                },
+                {"type": "web_search_preview"},
+            ],
+        });
+        let chat = responses_request_to_chat("m", &body);
+        let tools = chat.extra.get("tools").unwrap().as_array().unwrap();
+        // The hosted tool is still filtered out; the other two survive.
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[1]["type"], "function");
+        assert_eq!(tools[1]["function"]["name"], "apply_patch");
+        assert_eq!(
+            tools[1]["function"]["parameters"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "The apply_patch content following the specified format",
+                    }
+                },
+                "required": ["content"],
+            })
+        );
+        // The grammar the freeform tool carried is the only instruction
+        // the model gets about the expected shape.
+        let description = tools[1]["function"]["description"].as_str().unwrap();
+        assert_eq!(
+            description,
+            "Edit a file\n\nFormat:\n```lark\nstart: TEXT\n```"
+        );
+    }
+
+    #[test]
+    fn custom_tool_without_a_grammar_keeps_its_bare_description() {
+        let body = json!({
+            "model": "m",
+            "input": "go",
+            "tools": [{"type": "custom", "name": "freeform", "description": "d"}],
+        });
+        let chat = responses_request_to_chat("m", &body);
+        let tools = chat.extra.get("tools").unwrap().as_array().unwrap();
+        assert_eq!(tools[0]["function"]["description"], "d");
+    }
+
+    #[test]
+    fn tool_choice_forms_normalise_to_the_provider_neutral_chat_shape() {
+        let with_choice = |tc: Value| {
+            let body = json!({
+                "model": "m",
+                "input": "hi",
+                "tools": [{"type": "function", "name": "get_weather"}],
+                "tool_choice": tc,
+            });
+            responses_request_to_chat("m", &body)
+                .extra
+                .get("tool_choice")
+                .cloned()
+        };
+
+        for mode in ["auto", "none", "required"] {
+            assert_eq!(with_choice(json!(mode)), Some(json!(mode)));
+        }
+        // An allowed_tools choice keeps its mode; chat cannot express the
+        // subset restriction, so the subset is dropped.
+        assert_eq!(
+            with_choice(json!({
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [{"type": "function", "name": "get_weather"}],
+            })),
+            Some(json!("required"))
+        );
+        assert_eq!(
+            with_choice(json!({"type": "allowed_tools", "mode": "auto", "tools": []})),
+            Some(json!("auto"))
+        );
+        assert_eq!(with_choice(json!({"type": "any"})), Some(json!("required")));
+        // The three named forms all land on the one chat spelling — never
+        // a Responses-only shape a non-OpenAI bridge could not read.
+        for named in [
+            json!({"type": "function", "name": "get_weather"}),
+            json!({"type": "custom", "name": "get_weather"}),
+            json!({"type": "tool", "name": "get_weather"}),
+        ] {
+            assert_eq!(
+                with_choice(named),
+                Some(json!({"type": "function", "function": {"name": "get_weather"}}))
+            );
+        }
+        // A hosted-tool choice, an allowed_tools mode with no chat
+        // counterpart, and a named form missing its name all drop.
+        assert_eq!(with_choice(json!({"type": "file_search"})), None);
+        assert_eq!(
+            with_choice(json!({"type": "allowed_tools", "mode": "none"})),
+            None
+        );
+        assert_eq!(with_choice(json!({"type": "function"})), None);
+    }
+
+    #[test]
+    fn parallel_tool_calls_rides_along_with_a_surviving_tools_list() {
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "get_weather"}],
+            "parallel_tool_calls": false,
+        });
+        let chat = responses_request_to_chat("m", &body);
+        assert_eq!(chat.extra.get("parallel_tool_calls"), Some(&json!(false)));
+
+        // `true` is forwarded as sent, not normalised away.
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "get_weather"}],
+            "parallel_tool_calls": true,
+        });
+        let chat = responses_request_to_chat("m", &body);
+        assert_eq!(chat.extra.get("parallel_tool_calls"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn parallel_tool_calls_is_dropped_when_no_tool_survives_translation() {
+        // Same rule as `tool_choice`: a chat upstream rejects the field
+        // without an accompanying `tools` list.
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [{"type": "web_search_preview"}],
+            "parallel_tool_calls": false,
+        });
+        let chat = responses_request_to_chat("m", &body);
+        assert!(!chat.extra.contains_key("tools"));
+        assert!(!chat.extra.contains_key("parallel_tool_calls"));
+    }
+
+    #[test]
+    fn json_tool_output_reaches_the_upstream_as_a_json_string() {
+        let outputs = [
+            (
+                json!({"temp": 21, "unit": "C"}),
+                r#"{"temp":21,"unit":"C"}"#,
+            ),
+            (json!(42), "42"),
+            (json!(true), "true"),
+            // `null` and an absent output are the empty string, not "null".
+            (json!(null), ""),
+        ];
+        for (output, expected) in outputs {
+            let body = json!({
+                "model": "m",
+                "input": [{"type": "function_call_output", "call_id": "c1", "output": output}],
+            });
+            let chat = responses_request_to_chat("m", &body);
+            let msg = chat.messages.last().unwrap();
+            assert!(matches!(msg.role, Role::Tool));
+            assert_eq!(msg.content.as_deref(), Some(expected));
+            assert!(msg.content_blocks.is_none());
+        }
+
+        // A string output is untouched — it is not re-encoded with quotes.
+        let body = json!({
+            "model": "m",
+            "input": [{"type": "function_call_output", "call_id": "c1", "output": "21C"}],
+        });
+        let chat = responses_request_to_chat("m", &body);
+        assert_eq!(
+            chat.messages.last().unwrap().content.as_deref(),
+            Some("21C")
+        );
+    }
+
+    #[test]
+    fn a_json_array_tool_output_is_serialised_not_parsed_as_content_parts() {
+        // A tool returning a list of records is a JSON array, not the
+        // Responses content-part array it would otherwise be parsed as —
+        // which recognised no part and emptied the whole tool message.
+        let body = json!({
+            "model": "m",
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": [{"id": 1, "name": "x"}, {"id": 2, "name": "y"}],
+            }],
+        });
+        let chat = responses_request_to_chat("m", &body);
+        assert_eq!(
+            chat.messages.last().unwrap().content.as_deref(),
+            Some(r#"[{"id":1,"name":"x"},{"id":2,"name":"y"}]"#)
+        );
+
+        // An array that IS content parts keeps the part handling: its
+        // text reaches the model unquoted.
+        let body = json!({
+            "model": "m",
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": [{"type": "input_text", "text": "21C"}],
+            }],
+        });
+        let chat = responses_request_to_chat("m", &body);
+        assert_eq!(
+            chat.messages.last().unwrap().content.as_deref(),
+            Some("21C")
+        );
+
+        // A mixed array keeps its parts as text and serialises every
+        // element that is not one, in place — nothing the tool returned
+        // is dropped on the floor.
+        let body = json!({
+            "model": "m",
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": [
+                    {"type": "text", "text": "rows: "},
+                    42,
+                    {"total": 3},
+                    "plain",
+                ],
+            }],
+        });
+        let chat = responses_request_to_chat("m", &body);
+        assert_eq!(
+            chat.messages.last().unwrap().content.as_deref(),
+            Some(r#"rows: 42{"total":3}plain"#)
+        );
+
+        // An empty array is not a value worth serialising as "[]".
+        let body = json!({
+            "model": "m",
+            "input": [{"type": "function_call_output", "call_id": "c1", "output": []}],
+        });
+        let chat = responses_request_to_chat("m", &body);
+        assert_eq!(chat.messages.last().unwrap().content.as_deref(), Some(""));
     }
 
     #[test]
@@ -1974,5 +3063,304 @@ mod tests {
                     .collect::<std::collections::BTreeSet<_>>(),
             );
         }
+    }
+
+    // ── Reasoning on the bridged path ────────────────────────────
+
+    fn reasoning_chunk(text: &str) -> ChatChunk {
+        ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                reasoning_content: Some(text.into()),
+                ..Default::default()
+            },
+            finish_reason: None,
+            usage: None,
+        }
+    }
+
+    fn finish_chunk(usage: Option<UsageStats>) -> ChatChunk {
+        ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta::default(),
+            finish_reason: Some(FinishReason::Stop),
+            usage,
+        }
+    }
+
+    /// A chat upstream that streamed nothing but its chain-of-thought still
+    /// owes the client a complete `reasoning` item — opened, summarised,
+    /// closed — rather than an empty response.
+    #[test]
+    fn streaming_reasoning_only_emits_a_closed_reasoning_item() {
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let mut all = enc.next_events(&reasoning_chunk("think"));
+        all.extend(enc.next_events(&reasoning_chunk("ing")));
+        all.extend(enc.next_events(&finish_chunk(Some(UsageStats::new(4, 6)))));
+        assert_eq!(
+            types_of(&all),
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        let added = &all[2];
+        assert_eq!(added.data["output_index"], 0);
+        assert_eq!(added.data["item"]["type"], "reasoning");
+        let item_id = added.data["item"]["id"].as_str().unwrap().to_string();
+        assert!(item_id.starts_with("rs_"), "reasoning ids are rs_-prefixed");
+        assert_eq!(all[3].data["item_id"], item_id);
+        assert_eq!(all[3].data["summary_index"], 0);
+        assert_eq!(all[3].data["part"]["type"], "summary_text");
+        assert_eq!(all[4].data["delta"], "think");
+        assert_eq!(all[6].data["text"], "thinking");
+        assert_eq!(all[7].data["part"]["text"], "thinking");
+        assert_eq!(all[8].data["item"]["summary"][0]["text"], "thinking");
+        // …and it is the only item in the completed response.
+        let output = &all[9].data["response"]["output"];
+        assert_eq!(output.as_array().unwrap().len(), 1);
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["summary"][0]["text"], "thinking");
+        // Sequence numbers keep counting across the reasoning events.
+        let seqs: Vec<u64> = all
+            .iter()
+            .map(|e| e.data["sequence_number"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, (0..all.len() as u64).collect::<Vec<_>>());
+    }
+
+    /// Reasoning, then prose, then a tool call: each opens at the NEXT
+    /// output_index, and the reasoning item is closed before the message
+    /// item opens.
+    #[test]
+    fn streaming_reasoning_then_content_then_tool_call_advances_output_index() {
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let mut all = enc.next_events(&reasoning_chunk("why"));
+        all.extend(enc.next_events(&content_chunk("because")));
+        all.extend(enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![json!({
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "shell", "arguments": "{}"},
+                })]),
+                ..Default::default()
+            },
+            finish_reason: None,
+            usage: None,
+        }));
+        all.extend(enc.next_events(&finish_chunk(Some(UsageStats::new(1, 2)))));
+        assert_eq!(
+            types_of(&all),
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added", // reasoning
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done", // closed by the content delta
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",  // reasoning
+                "response.output_item.added", // message
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_item.added", // function_call
+                "response.function_call_arguments.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done", // message
+                "response.function_call_arguments.done",
+                "response.output_item.done", // function_call
+                "response.completed",
+            ]
+        );
+        assert_eq!(all[2].data["output_index"], 0, "reasoning leads");
+        assert_eq!(all[8].data["output_index"], 1, "message follows it");
+        assert_eq!(all[11].data["output_index"], 2, "then the tool call");
+        let output = &all.last().unwrap().data["response"]["output"];
+        let kinds: Vec<&str> = output
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, vec!["reasoning", "message", "function_call"]);
+    }
+
+    /// Reasoning that arrives after a message item is already open opens a
+    /// SECOND reasoning item at the next output_index — the already-open
+    /// message item keeps its own index and its own accumulated text.
+    #[test]
+    fn streaming_reasoning_after_content_opens_a_further_reasoning_item() {
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let mut all = enc.next_events(&content_chunk("first"));
+        all.extend(enc.next_events(&reasoning_chunk("second thoughts")));
+        all.extend(enc.next_events(&finish_chunk(Some(UsageStats::new(1, 1)))));
+        let reasoning_added: Vec<&ResponsesSseEvent> = all
+            .iter()
+            .filter(|e| {
+                e.event_type == "response.output_item.added"
+                    && e.data["item"]["type"] == "reasoning"
+            })
+            .collect();
+        assert_eq!(reasoning_added.len(), 1);
+        assert_eq!(
+            reasoning_added[0].data["output_index"], 1,
+            "the message item kept index 0; reasoning takes the next one",
+        );
+        let output = &all.last().unwrap().data["response"]["output"];
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[0]["content"][0]["text"], "first");
+        assert_eq!(output[1]["type"], "reasoning");
+        assert_eq!(output[1]["summary"][0]["text"], "second thoughts");
+    }
+
+    /// A bridged non-streaming response surfaces the upstream's
+    /// chain-of-thought as a `reasoning` item ahead of the message item.
+    #[test]
+    fn non_streaming_reasoning_becomes_a_leading_reasoning_item() {
+        let mut resp = chat_response_with(Some("42"), None, FinishReason::Stop);
+        resp.message
+            .extra
+            .insert("reasoning_content".into(), json!("6 times 7"));
+        let out = chat_response_to_responses_json(&resp, "m", 1);
+        assert_eq!(out["output"][0]["type"], "reasoning");
+        assert!(out["output"][0]["id"].as_str().unwrap().starts_with("rs_"));
+        assert_eq!(out["output"][0]["summary"][0]["type"], "summary_text");
+        assert_eq!(out["output"][0]["summary"][0]["text"], "6 times 7");
+        assert_eq!(out["output"][1]["type"], "message");
+        assert_eq!(out["output"][1]["content"][0]["text"], "42");
+    }
+
+    /// An upstream that reported no reasoning adds no `reasoning` item —
+    /// an empty one would render as a blank thinking block.
+    #[test]
+    fn non_streaming_without_reasoning_emits_no_reasoning_item() {
+        let resp = chat_response_with(Some("42"), None, FinishReason::Stop);
+        let out = chat_response_to_responses_json(&resp, "m", 1);
+        assert_eq!(out["output"][0]["type"], "message");
+        assert!(out["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["type"] != "reasoning"));
+    }
+
+    /// The guardrail scan text is unchanged by reasoning: generated
+    /// reasoning is out of output-guardrail scope on every /v1/responses
+    /// path, so it must not reach the assembled assistant message.
+    #[test]
+    fn assembled_assistant_message_excludes_reasoning() {
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let _ = enc.next_events(&reasoning_chunk("SECRET"));
+        let _ = enc.next_events(&content_chunk("visible"));
+        let (text, tool_calls) = enc.assembled_assistant_message();
+        assert_eq!(text, "visible");
+        assert!(tool_calls.is_empty());
+    }
+
+    /// A stream whose upstream never sent a usage frame must report the
+    /// SAME numbers to the client as the usage record gets — the encoder
+    /// adopts the local estimate before the synthesized terminal event.
+    #[test]
+    fn force_finish_reports_the_estimate_the_usage_record_gets() {
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let _ = enc.next_events(&content_chunk("hello"));
+        let _ = enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta::default(),
+            finish_reason: Some(FinishReason::Stop),
+            usage: None,
+        });
+        // …the trailing usage frame never arrives; the relay hands the
+        // encoder the same estimate it wrote to the usage record.
+        enc.set_estimated_usage(11, 7);
+        let events = enc.force_finish();
+        let completed = events.last().unwrap();
+        assert_eq!(completed.event_type, "response.completed");
+        let usage = &completed.data["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 11);
+        assert_eq!(usage["output_tokens"], 7);
+        assert_eq!(usage["total_tokens"], 18);
+        // Standard usage shape only — nothing tells the client it is an
+        // estimate.
+        let keys: std::collections::BTreeSet<&str> = usage
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "input_tokens",
+                "input_tokens_details",
+                "output_tokens",
+                "output_tokens_details",
+                "total_tokens",
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        );
+    }
+
+    /// The estimate never overwrites what the upstream actually reported.
+    /// The relay hands the encoder an estimate whenever it computed one, so
+    /// a usage frame that landed WITHOUT a finish chunk — the shape an
+    /// OpenAI-compatible upstream sends — must still win at force_finish.
+    #[test]
+    fn a_usage_frame_reporting_only_one_counter_still_gets_the_other_filled() {
+        // A relay that streams `{prompt_tokens: 3, completion_tokens: 0}`
+        // used to block the whole estimate, so the client read
+        // `output_tokens: 0` while the usage record — which fills per
+        // counter — billed the estimate.
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let _ = enc.next_events(&content_chunk("hi"));
+        let mut partial = UsageStats::new(3, 0);
+        partial.total_tokens = 3;
+        let _ = enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta::default(),
+            finish_reason: None,
+            usage: Some(partial),
+        });
+        enc.set_estimated_usage(3, 7);
+        let events = enc.force_finish();
+        let usage = &events.last().unwrap().data["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 3, "the reported counter stands");
+        assert_eq!(usage["output_tokens"], 7, "the zero was filled");
+        // The total the frame carried described the pre-fill counters.
+        assert_eq!(usage["total_tokens"], 10);
+    }
+
+    #[test]
+    fn set_estimated_usage_is_ignored_once_a_usage_frame_landed() {
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let _ = enc.next_events(&content_chunk("hi"));
+        let _ = enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta::default(),
+            finish_reason: None,
+            usage: Some(UsageStats::new(3, 4)),
+        });
+        enc.set_estimated_usage(99, 99);
+        let events = enc.force_finish();
+        let usage = &events.last().unwrap().data["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 3, "the frame was read, not guessed");
+        assert_eq!(usage["output_tokens"], 4);
     }
 }

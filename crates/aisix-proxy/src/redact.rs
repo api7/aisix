@@ -2796,6 +2796,38 @@ mod tests {
         assert_eq!(counts.get("email"), Some(&1));
     }
 
+    /// The bridged encoder now emits reasoning-summary frames alongside the
+    /// message frames it always did. Generated reasoning is out of
+    /// output-guardrail scope, so an output mask that rewrites the held
+    /// stream has to leave those frames byte-identical while still masking
+    /// the message beside them — the mirror of
+    /// `responses_response_leaves_generated_reasoning_alone` at the wire
+    /// level, which is the layer the hold-back release actually goes through.
+    #[test]
+    fn responses_sse_leaves_reasoning_summary_frames_alone() {
+        let chain = both();
+        let reasoning = concat!(
+            "event: response.reasoning_summary_text.delta\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"delta\":\"ask a@x.com\"}\n\n",
+            "event: response.reasoning_summary_text.done\ndata: {\"type\":\"response.reasoning_summary_text.done\",\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"text\":\"ask a@x.com\"}\n\n",
+            "event: response.reasoning_summary_part.done\ndata: {\"type\":\"response.reasoning_summary_part.done\",\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"ask a@x.com\"}}\n\n",
+            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"status\":\"completed\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"ask a@x.com\"}]}}\n\n",
+        );
+        let raw = format!(
+            "{reasoning}{}",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":1,\"content_index\":0,\"delta\":\"reply to b@y.org\"}\n\n",
+        );
+        let (out, _) = redact_responses_sse(chain.as_ref(), raw.as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.starts_with(reasoning),
+            "every reasoning frame must survive byte-identical: {out}"
+        );
+        assert!(
+            out.contains("\"delta\":\"reply to [EMAIL_REDACTED]\""),
+            "…and the message beside them is still masked: {out}"
+        );
+    }
+
     #[test]
     fn responses_sse_masks_function_call_args_channel() {
         let chain = both();
