@@ -18,7 +18,7 @@
 use std::time::{Duration, Instant};
 
 use aisix_core::models::McpServerAllowlist;
-use aisix_obs::{AccessLog, UsageEvent};
+use aisix_obs::{AccessLog, McpAccessLog, UsageEvent};
 use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -34,6 +34,47 @@ use crate::state::ProxyState;
 /// model, and the tool name is caller-controlled (unbounded Prometheus
 /// cardinality, same rule as passthrough's #451 sentinel).
 const MCP_MODEL_LABEL: &str = "mcp";
+
+/// What this request turned out to be, filled in by `dispatch` as it learns
+/// it and read by the access log `serve` writes (#1181). Owned rather than
+/// borrowed because the body it is parsed from is consumed on the way to the
+/// gateway.
+#[derive(Default)]
+struct McpRequestLog {
+    /// JSON-RPC `method`, absent when the body is not a single JSON-RPC
+    /// message (a batch, or unparsable) — never invented. Truncated like
+    /// `tool`: an unknown method is caller-controlled text.
+    method: Option<String>,
+    /// `tools/call` only: the tool name as the caller spelled it, which is
+    /// the namespaced `<server>__<tool>` form on `/mcp`, truncated to
+    /// [`MAX_LOGGED_TOOL_BYTES`].
+    tool: Option<String>,
+    /// `tools/list` only: the upstream and post-ACL tool counts.
+    tools: Option<aisix_mcp::ToolsListCounts>,
+}
+
+/// Cap for the caller-controlled strings on the access line — the same bound
+/// the telemetry sinks apply to the tool name, on a UTF-8 boundary.
+const MAX_LOGGED_TOOL_BYTES: usize = 256;
+
+fn truncate_for_log(value: &str) -> String {
+    let mut end = MAX_LOGGED_TOOL_BYTES.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+impl McpRequestLog {
+    fn fields(&self) -> McpAccessLog<'_> {
+        McpAccessLog {
+            method: self.method.as_deref(),
+            tool: self.tool.as_deref(),
+            tools_total: self.tools.map(|c| c.total),
+            tools_returned: self.tools.map(|c| c.returned),
+        }
+    }
+}
 
 /// Just enough of a JSON-RPC request to tell a tool call apart from the MCP
 /// handshake / discovery methods, recover the called tool's name + arguments,
@@ -177,6 +218,7 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
     // the caller's team / user labels (the handle is an `Arc` clone).
     let caller_auth = auth.clone();
 
+    let mut mcp_log = McpRequestLog::default();
     let response = dispatch(
         auth,
         anonymous_allowlist.as_ref(),
@@ -185,6 +227,7 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
         request,
         &request_id,
         trace.as_ref(),
+        &mut mcp_log,
     )
     .await;
 
@@ -218,6 +261,10 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
+        // Complete by the time this runs: with `json_response = true` the
+        // transport awaits the handler's terminal message before returning a
+        // fully-buffered body, so `dispatch` has already read the counts.
+        mcp: Some(mcp_log.fields()),
     }
     .emit();
     crate::request_metrics::record(
@@ -235,6 +282,7 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
     response
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     auth: AuthenticatedKey,
     anonymous_allowlist: Option<&McpServerAllowlist>,
@@ -243,6 +291,7 @@ async fn dispatch(
     request: Request,
     request_id: &str,
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+    log: &mut McpRequestLog,
 ) -> Response {
     // One snapshot for the whole request: the scoped-server resolution below
     // and the gateway construction further down must see the same resource
@@ -292,6 +341,26 @@ async fn dispatch(
 
     let peek = serde_json::from_slice::<JsonRpcPeek>(&bytes).ok();
 
+    let is_tool_call = peek.as_ref().and_then(|p| p.method.as_deref()) == Some("tools/call");
+    // Recorded from the SAME parse the gates below use, and BEFORE the first
+    // of them: one `/mcp` POST carries every operation, so a request the
+    // protocol-version gate rejects needs the method on its line just as much
+    // as one that reaches the gateway (#1181). The tool name is capped the
+    // way the telemetry sinks cap it — it is caller-controlled and bounded
+    // only by the body limit.
+    log.method = peek
+        .as_ref()
+        .and_then(|p| p.method.as_deref())
+        .map(truncate_for_log);
+    log.tool = is_tool_call
+        .then(|| {
+            peek.as_ref()
+                .and_then(|p| p.params.as_ref())
+                .and_then(|p| p.name.as_deref())
+                .map(truncate_for_log)
+        })
+        .flatten();
+
     // Converge the accepted `MCP-Protocol-Version` set before any quota,
     // guardrail, or upstream work (AISIX-Cloud#1148). rmcp's own transport
     // check admits its whole hardcoded KNOWN_VERSIONS list — including
@@ -306,7 +375,6 @@ async fn dispatch(
         return response;
     }
 
-    let is_tool_call = peek.as_ref().and_then(|p| p.method.as_deref()) == Some("tools/call");
     // Resolve the called (server, tool) up front, owned, so it survives the
     // body being consumed when the request is rebuilt. Aggregated: split the
     // namespaced name. Scoped: the server comes from the path and the name is
@@ -600,6 +668,9 @@ async fn dispatch(
             None => resolved,
         }
     };
+    // Read before the ACL moves into the gateway: which of the two reasons an
+    // empty `tools/list` has is the one thing the counts alone cannot say.
+    let acl_has_grant = acl.has_grant();
     // The agent's own inbound headers, forwarded to every registered
     // server whose `forward_client_headers` admits them — an internal
     // server that authorizes on the end user's own credential rather than
@@ -628,6 +699,10 @@ async fn dispatch(
         None => aisix_mcp::McpGateway::from_snapshot_for_request(&snapshot, Some(&client_headers)),
     }
     .with_tool_acl(acl);
+    // Cloned out before the gateway is handed to the transport, which clones
+    // it per session; the slot itself is shared, so this handle sees what the
+    // handler writes.
+    let tools_list_counts = gateway.tools_list_counts();
     // The deployment's body cap replaces rmcp's own 4 MiB default inside
     // the service; the proxy-level read above already enforced the same
     // limit, so the two layers can never disagree.
@@ -641,6 +716,29 @@ async fn dispatch(
         Err(infallible) => match infallible {},
     };
     let latency = started.elapsed();
+
+    // `tools/list` only — nothing else writes the slot. An empty list where
+    // the upstreams did return tools is an ACL misconfiguration the operator
+    // has to be able to see without turning on debug logging; an upstream
+    // that returned nothing is not (and already warns when it failed).
+    if let Some(counts) = tools_list_counts.get().copied() {
+        log.tools = Some(counts);
+        if counts.returned == 0 && counts.total > 0 {
+            if acl_has_grant {
+                tracing::warn!(
+                    api_key_id = auth.entry.id.as_str(),
+                    upstream_tools = counts.total,
+                    "mcp tools/list returned no tools: the caller's effective MCP access rules (allow, deny and anonymous allowlist) exclude every upstream tool"
+                );
+            } else {
+                tracing::warn!(
+                    api_key_id = auth.entry.id.as_str(),
+                    upstream_tools = counts.total,
+                    "mcp tools/list returned no tools: no MCP access policy or key-level grant applies to this caller"
+                );
+            }
+        }
+    }
 
     // Output guardrails + mask write-back: scan the tool result before
     // returning it, rewriting masked spans in place. The response body is

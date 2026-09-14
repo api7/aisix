@@ -617,6 +617,7 @@ fn emit_access_log(
         routing_fallback_count: None,
         error_kind,
         error: error.as_deref(),
+        mcp: None,
     }
     .emit();
 }
