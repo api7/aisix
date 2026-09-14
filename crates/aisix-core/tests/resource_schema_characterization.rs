@@ -1059,6 +1059,8 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
             "/oneOf/1/not/anyOf",
             "/oneOf/2/not/anyOf",
             "/oneOf/3/not/anyOf",
+            "/properties/effort_mapping/additionalProperties/minLength",
+            "/properties/effort_mapping/properties//minLength",
         ],
     ),
 ];
