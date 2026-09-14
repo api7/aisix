@@ -24,10 +24,11 @@ use futures::StreamExt;
 use reqwest::{header, Client, StatusCode};
 use std::time::{Duration, Instant};
 
+use aisix_gateway::structured_output::{response_into_fake_stream_chunks, unwrap_json_tool_call};
+
 use crate::wire::{
-    build_request, inject_cache_breakpoints, response_into_chat_response,
-    response_into_fake_stream_chunks, split_system, structured_output_for, unwrap_json_tool_call,
-    AnthropicResponse, AnthropicStreamEvent, StreamState, StructuredOutput,
+    build_request, inject_cache_breakpoints, response_into_chat_response, split_system,
+    structured_output_for, AnthropicResponse, AnthropicStreamEvent, StreamState, StructuredOutput,
 };
 
 /// Matches the API header that Anthropic bakes backwards-compat into.
