@@ -555,20 +555,18 @@ pub fn build_request<'a>(
     }
 }
 
-/// Whether an OpenAI `tool_choice` says anything the structured-output
-/// tool route has to yield to.
+/// Whether the client stated a `tool_choice` of their own, which the
+/// structured-output tool route must yield to.
 ///
-/// `"auto"` does not: it is OpenAI's own default and plenty of clients
-/// send it on every request, so reading it as a deliberate choice would
-/// silently disable `response_format` for them. `"required"`, `"none"`
-/// and a named function are deliberate, and each outranks the forcing
-/// the gateway would otherwise add.
+/// Any value counts, `"auto"` included. `auto` is not an absence of
+/// intent: it is the client saying the model decides, and a client
+/// running an agent loop sends it alongside its own tools on every
+/// turn. Forcing the synthetic tool there would mean those tools could
+/// never be called for as long as `response_format` is set — the loop
+/// would simply stop working. The gateway forces only when the client
+/// left the choice unstated entirely.
 pub fn tool_choice_states_a_preference(tool_choice: Option<&serde_json::Value>) -> bool {
-    match tool_choice {
-        None => false,
-        Some(serde_json::Value::String(s)) => s != "auto",
-        Some(_) => true,
-    }
+    tool_choice.is_some()
 }
 
 /// Where a request's OpenAI `response_format` lands on the Anthropic wire.
@@ -6438,10 +6436,12 @@ mod tests {
     }
 
     #[test]
-    fn tool_choice_auto_is_not_a_preference_and_still_forces_the_json_tool() {
-        // `auto` is OpenAI's default and many clients send it on every
-        // request; reading it as a deliberate choice would silently
-        // disable `response_format` for them.
+    fn any_tool_choice_the_client_sent_outranks_forcing_the_json_tool() {
+        // `auto` included. A client running an agent loop sends it
+        // beside its own tools every turn; forcing the synthetic tool
+        // there would mean those tools could never be called for as long
+        // as `response_format` is set. The tool is still offered, so the
+        // model can reach the JSON on its own.
         let mut req = request_with_response_format(json_schema_format(person_schema()));
         req.extra.insert(
             "tools".into(),
@@ -6450,17 +6450,34 @@ mod tests {
                 "function": {"name": "get_weather", "parameters": {"type": "object"}},
             }]),
         );
-        req.extra.insert("tool_choice".into(), "auto".into());
+        for stated in [
+            serde_json::json!("auto"),
+            serde_json::json!("required"),
+            serde_json::json!("none"),
+            serde_json::json!({"type": "function", "function": {"name": "get_weather"}}),
+        ] {
+            req.extra.insert("tool_choice".into(), stated.clone());
+            let built = build(&req, "glm-4.5");
+            assert_ne!(
+                built.tool_choice,
+                Some(serde_json::json!({"type": "tool", "name": JSON_TOOL_NAME})),
+                "tool_choice {stated} must not be overridden"
+            );
+            assert!(
+                built
+                    .tools
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t["name"] == JSON_TOOL_NAME),
+                "the synthetic tool is still on offer for {stated}"
+            );
+        }
+
+        // With no choice stated at all, the gateway forces.
+        req.extra.remove("tool_choice");
         let built = build(&req, "glm-4.5");
         assert_eq!(
-            built.tool_choice,
-            Some(serde_json::json!({"type": "tool", "name": JSON_TOOL_NAME}))
-        );
-
-        // A deliberate choice still outranks it.
-        req.extra.insert("tool_choice".into(), "required".into());
-        let built = build(&req, "glm-4.5");
-        assert_ne!(
             built.tool_choice,
             Some(serde_json::json!({"type": "tool", "name": JSON_TOOL_NAME}))
         );

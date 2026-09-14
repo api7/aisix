@@ -333,6 +333,11 @@ fn prepare_outbound_body<T: serde::Serialize>(
 /// the schema must carry `additionalProperties: false` and list each of
 /// its declared properties in `required`, or the API rejects it.
 ///
+/// Public because every OpenAI-wire edge has to apply it — Azure
+/// OpenAI builds its own body from the same typed structs, and an
+/// edge that skips this rejects a strict schema the caller never had
+/// to write out in full.
+///
 /// This lives here rather than wherever the `response_format` was
 /// assembled because the promotion is only correct for *this* wire. The
 /// same normalised request also reaches the Anthropic, Bedrock and
@@ -341,7 +346,7 @@ fn prepare_outbound_body<T: serde::Serialize>(
 /// make their optional fields mandatory. A caller who sent `strict`
 /// themselves gets the same treatment they would have got from OpenAI's
 /// own validation, so a schema that was already complete is unchanged.
-fn close_strict_response_format_schema(body: &mut Value) {
+pub fn close_strict_response_format_schema(body: &mut Value) {
     let Some(json_schema) = body.pointer_mut("/response_format/json_schema") else {
         return;
     };

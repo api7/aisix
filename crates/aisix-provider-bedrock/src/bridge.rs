@@ -4244,13 +4244,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn converse_tool_path_still_forces_when_the_caller_sent_tool_choice_auto() {
+    async fn a_tool_choice_of_auto_still_outranks_forcing_the_synthetic_tool() {
+        // `auto` is the client saying the model decides. Overriding it
+        // would mean an agent loop's own tools could never be called
+        // while `response_format` is set. The synthetic tool is still
+        // offered, so the model can reach the JSON by itself.
         let mut req = structured_request(person_schema());
         req.extra.insert("tool_choice".into(), "auto".into());
         let body = capture_bedrock_body("amazon.nova-pro-v1:0", "converse", &req, false).await;
         assert_eq!(
-            body["toolConfig"]["toolChoice"]["tool"]["name"],
+            body["toolConfig"]["tools"][0]["toolSpec"]["name"],
             JSON_TOOL_NAME
+        );
+        assert!(
+            body["toolConfig"].get("toolChoice").is_none(),
+            "body={body}"
         );
     }
 

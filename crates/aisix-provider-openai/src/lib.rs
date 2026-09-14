@@ -15,4 +15,4 @@ mod bridge;
 pub mod overrides;
 pub mod wire;
 
-pub use bridge::{OpenAiBridge, OPENAI_DEFAULT_BASE};
+pub use bridge::{close_strict_response_format_schema, OpenAiBridge, OPENAI_DEFAULT_BASE};

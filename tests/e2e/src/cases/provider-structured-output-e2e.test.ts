@@ -43,6 +43,15 @@ const RESPONSE_FORMAT = {
 
 const ANSWER = '{"name":"Ada","nickname":"Countess"}';
 
+// The streaming budget bounds the gap between chunks; the request
+// budget bounds the whole call. The tool route answers a streaming
+// request with ONE non-streaming upstream call, so it has to be
+// measured against the second — these three values are what tells the
+// two apart.
+const STREAM_BUDGET_MS = 400;
+const REQUEST_BUDGET_MS = 30_000;
+const SLOW_UPSTREAM_MS = 1_200;
+
 interface RecordedRequest {
   path: string;
   body: string;
@@ -54,9 +63,14 @@ interface RecordingUpstream {
   close(): Promise<void>;
 }
 
-/** A JSON upstream that answers every route from one reply function. */
+/**
+ * A JSON upstream that answers every route from one reply function,
+ * optionally after a delay — which is how a completion slower than one
+ * streaming chunk-gap budget is reproduced.
+ */
 async function startJsonUpstream(
   reply: (path: string) => unknown,
+  delayMs = 0,
 ): Promise<RecordingUpstream> {
   const received: RecordedRequest[] = [];
   const server: Server = createServer((req, res) => {
@@ -66,9 +80,13 @@ async function startJsonUpstream(
     req.on("end", () => {
       const path = (req.url ?? "/").split("?")[0];
       received.push({ path, body: Buffer.concat(chunks).toString("utf8") });
-      res.statusCode = 200;
-      res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify(reply(path)));
+      const send = () => {
+        res.statusCode = 200;
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify(reply(path)));
+      };
+      if (delayMs > 0) setTimeout(send, delayMs);
+      else send();
     });
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -108,6 +126,7 @@ describe("chat response_format → Gemini and Bedrock", () => {
   let app: SpawnedApp | undefined;
   let gemini: RecordingUpstream | undefined;
   let bedrock: RecordingUpstream | undefined;
+  let slowBedrock: RecordingUpstream | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -160,6 +179,31 @@ describe("chat response_format → Gemini and Bedrock", () => {
             usage: { inputTokens: 7, outputTokens: 11, totalTokens: 18 },
             metrics: { latencyMs: 1 },
           },
+    );
+
+    // Answers the Converse route with the synthetic tool call, but only
+    // after longer than the streaming chunk-gap budget seeded below.
+    slowBedrock = await startJsonUpstream(
+      () => ({
+        output: {
+          message: {
+            role: "assistant",
+            content: [
+              {
+                toolUse: {
+                  toolUseId: "tooluse_slow",
+                  name: "json_tool_call",
+                  input: { name: "Ada", nickname: "Countess" },
+                },
+              },
+            ],
+          },
+        },
+        stopReason: "tool_use",
+        usage: { inputTokens: 7, outputTokens: 11, totalTokens: 18 },
+        metrics: { latencyMs: 1 },
+      }),
+      SLOW_UPSTREAM_MS,
     );
 
     app = await spawnApp();
@@ -216,6 +260,29 @@ describe("chat response_format → Gemini and Bedrock", () => {
       provider_key_id: bedrockPk.id,
     });
 
+    const slowPk = await seed.createProviderKey({
+      display_name: "structured-slow-bedrock-pk",
+      provider: "bedrock",
+      adapter: "bedrock",
+      secret: JSON.stringify({
+        access_key_id: "AKIA-structured-slow",
+        secret_access_key: "sk-structured-slow",
+        region: "us-west-2",
+      }),
+      api_base: slowBedrock.baseUrl,
+    });
+    // A chunk-gap budget the completion blows through, beside an
+    // end-to-end budget it fits inside — the shape an operator sets when
+    // they want slow-first-token failover but long completions.
+    await seed.createModel({
+      display_name: "json-nova-slow",
+      provider: "bedrock",
+      model_name: "amazon.nova-pro-v1:0",
+      provider_key_id: slowPk.id,
+      stream_timeout: STREAM_BUDGET_MS,
+      timeout: REQUEST_BUDGET_MS,
+    });
+
     // Seeded last, so this key authenticating implies the whole seed set
     // has reached the gateway's snapshot.
     await seed.createApiKey({
@@ -239,6 +306,37 @@ describe("chat response_format → Gemini and Bedrock", () => {
     await app?.exit();
     await gemini?.close();
     await bedrock?.close();
+    await slowBedrock?.close();
+  });
+
+  test("a streaming tool-route request is not cut by the chunk-gap budget", async (ctx) => {
+    if (!etcdReachable || !app || !slowBedrock) {
+      ctx.skip();
+      return;
+    }
+    // The model carries stream_timeout=400ms and timeout=30s, and the
+    // upstream takes 1.2s. Measured against the streaming budget — which
+    // is what the bridge's deadline is on a streaming dispatch — this
+    // call is cut off; measured against the request budget it is fine.
+    const res = await chat(app, {
+      model: "json-nova-slow",
+      messages: [{ role: "user", content: "who is Ada" }],
+      response_format: RESPONSE_FORMAT,
+      stream: true,
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    const raw = await res.text();
+    const frames = raw
+      .split("\n")
+      .filter((l) => l.startsWith("data: ") && !l.includes("[DONE]"))
+      .map((l) => JSON.parse(l.slice(6)));
+    const text = frames
+      .map((f) => f.choices?.[0]?.delta?.content ?? "")
+      .join("");
+    expect(JSON.parse(text)).toEqual({ name: "Ada", nickname: "Countess" });
+    // The upstream leg really did run non-streaming on the Converse route.
+    expect(slowBedrock.received.at(-1)?.path).toMatch(/\/converse$/);
   });
 
   test("gemini 2+ gets responseMimeType and responseJsonSchema", async (ctx) => {
