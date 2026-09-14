@@ -2530,7 +2530,10 @@ mod tests {
     #[test]
     fn json_tool_output_reaches_the_upstream_as_a_json_string() {
         let outputs = [
-            (json!({"temp": 21, "unit": "C"}), r#"{"temp":21,"unit":"C"}"#),
+            (
+                json!({"temp": 21, "unit": "C"}),
+                r#"{"temp":21,"unit":"C"}"#,
+            ),
             (json!(42), "42"),
             (json!(true), "true"),
             // `null` and an absent output are the empty string, not "null".
@@ -2554,7 +2557,10 @@ mod tests {
             "input": [{"type": "function_call_output", "call_id": "c1", "output": "21C"}],
         });
         let chat = responses_request_to_chat("m", &body);
-        assert_eq!(chat.messages.last().unwrap().content.as_deref(), Some("21C"));
+        assert_eq!(
+            chat.messages.last().unwrap().content.as_deref(),
+            Some("21C")
+        );
     }
 
     #[test]
