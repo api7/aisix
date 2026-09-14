@@ -311,6 +311,30 @@ describe("direct-model effort mapping", () => {
       provider_key_id: tokensCountKey.id,
       effort_mapping: tokens,
     });
+    // An ensemble whose judge carries the not-set entry: `judge_request`
+    // copies the caller's effort only when there is one, so a caller that
+    // sets none leaves the judge request for the `""` entry to fill.
+    await seed.createModel({
+      display_name: "effort-tokens-panel",
+      provider: "openai",
+      model_name: "glm-tokens-panel-wire",
+      provider_key_id: tokensOpenaiKey.id,
+    });
+    await seed.createModel({
+      display_name: "effort-tokens-judge",
+      provider: "openai",
+      model_name: "glm-tokens-judge-wire",
+      provider_key_id: tokensOpenaiKey.id,
+      effort_mapping: { "": "high" },
+    });
+    await seed.createModel({
+      display_name: "effort-tokens-ensemble",
+      ensemble: {
+        panel: [{ model: "effort-tokens-panel" }],
+        judge: { model: "effort-tokens-judge" },
+        min_responses: 1,
+      },
+    });
     await seed.createModel({
       display_name: "effort-map-group",
       routing: {
@@ -335,6 +359,7 @@ describe("direct-model effort mapping", () => {
         "effort-tokens-star",
         "effort-tokens-anthropic",
         "effort-tokens-count",
+        "effort-tokens-ensemble",
       ],
     });
     const proxy = new ProxyClient(app.proxyUrl, API_KEY);
@@ -790,6 +815,56 @@ describe("direct-model effort mapping", () => {
         carrier.reasoning_effort,
       );
     }
+  });
+
+  test("carries the reserved entries across the chat-to-Anthropic translation", async (ctx) => {
+    if (!etcdReachable || !app || !tokensAnthropic) {
+      ctx.skip();
+      return;
+    }
+
+    // Removal on this path is a relay between two functions: `chat_request`
+    // drops `reasoning_effort`, and the Anthropic translation then has
+    // nothing to turn into an `output_config`.
+    let baseline = tokensAnthropic.receivedRequests.length;
+    await post("/v1/chat/completions", {
+      model: "effort-tokens-anthropic",
+      messages: [{ role: "user", content: "hello" }],
+      reasoning_effort: "medium",
+    });
+    expect(
+      receivedSince(tokensAnthropic, baseline, "/v1/messages"),
+    ).not.toHaveProperty("output_config");
+
+    baseline = tokensAnthropic.receivedRequests.length;
+    await post("/v1/chat/completions", {
+      model: "effort-tokens-anthropic",
+      messages: [{ role: "user", content: "hello" }],
+    });
+    expect(
+      receivedSince(tokensAnthropic, baseline, "/v1/messages").output_config,
+    ).toEqual({ effort: "high" });
+  });
+
+  test("fills the ensemble judge request from the judge's own not-set entry", async (ctx) => {
+    if (!etcdReachable || !app || !tokensOpenai) {
+      ctx.skip();
+      return;
+    }
+
+    const baseline = tokensOpenai.receivedRequests.length;
+    await post("/v1/chat/completions", {
+      model: "effort-tokens-ensemble",
+      messages: [{ role: "user", content: "hello" }],
+    });
+    const requests = chatRequestsSince(tokensOpenai, baseline);
+    expect(
+      requests.find((request) => request.model === "glm-tokens-panel-wire"),
+    ).not.toHaveProperty("reasoning_effort");
+    expect(
+      requests.find((request) => request.model === "glm-tokens-judge-wire")
+        ?.reasoning_effort,
+    ).toBe("high");
   });
 
   test("passes an unset effort through when no entry matches it", async (ctx) => {
