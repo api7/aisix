@@ -91,6 +91,28 @@ pub struct AccessLog<'a> {
     /// kernel-level connect timeout, an upstream 500, and a blocked
     /// guardrail (AISIX-Cloud#1093).
     pub error: Option<&'a str>,
+    /// What the request was, on the `/mcp` endpoints — `None` everywhere
+    /// else. MCP tunnels every operation through one `POST`, so `method` and
+    /// `path` alone describe nothing (#1181).
+    pub mcp: Option<McpAccessLog<'a>>,
+}
+
+/// The `/mcp` half of an access-log line: which JSON-RPC method the single
+/// `POST` carried, and enough of its outcome to tell the three ways a
+/// `tools/list` can come back empty apart.
+#[derive(Debug, Clone, Default)]
+pub struct McpAccessLog<'a> {
+    /// JSON-RPC `method` — `initialize`, `tools/list`, `tools/call`, …
+    /// `None` when the body is not a single JSON-RPC message.
+    pub method: Option<&'a str>,
+    /// `tools/call` only: the tool name as the caller sent it.
+    pub tool: Option<&'a str>,
+    /// `tools/list` only: tools the upstreams returned, summed, before the
+    /// caller's ACL filtered them.
+    pub tools_total: Option<u32>,
+    /// `tools/list` only: tools left after ACL filtering — what the caller
+    /// actually received.
+    pub tools_returned: Option<u32>,
 }
 
 impl AccessLog<'_> {
@@ -99,6 +121,7 @@ impl AccessLog<'_> {
     /// wire shape — operators choose via `cfg.observability.log_level`
     /// and (later) a JSON/text knob.
     pub fn emit(&self) {
+        let mcp = self.mcp.as_ref();
         tracing::info!(
             method = self.method,
             path = self.path,
@@ -117,6 +140,10 @@ impl AccessLog<'_> {
             routing_fallback_count = self.routing_fallback_count,
             error_kind = self.error_kind,
             error = self.error,
+            mcp_method = mcp.and_then(|m| m.method),
+            mcp_tool = mcp.and_then(|m| m.tool),
+            tools_total = mcp.and_then(|m| m.tools_total),
+            tools_returned = mcp.and_then(|m| m.tools_returned),
             "proxy request completed",
         );
     }
@@ -184,6 +211,7 @@ mod tests {
                 routing_fallback_count: Some(1),
                 error_kind: None,
                 error: None,
+                mcp: None,
             }
             .emit();
         });
@@ -246,6 +274,7 @@ mod tests {
                 routing_fallback_count: None,
                 error_kind: Some("timeout"),
                 error: Some("upstream request timed out after 7167ms"),
+                mcp: None,
             }
             .emit();
         });
@@ -295,6 +324,7 @@ mod tests {
                 routing_fallback_count: None,
                 error_kind: None,
                 error: None,
+                mcp: None,
             }
             .emit();
         });

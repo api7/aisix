@@ -187,6 +187,7 @@ pub async fn a2a_endpoint(
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
+        mcp: None,
     }
     .emit();
     crate::request_metrics::record(

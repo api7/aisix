@@ -695,6 +695,7 @@ impl Drop for ClientCancelGuard {
             routing_fallback_count: None,
             error_kind: Some(CLIENT_DISCONNECTED_KIND),
             error: Some("client closed the request before the response head was written"),
+            mcp: None,
         }
         .emit();
         // Bound the labels the same way every other emit does: the model

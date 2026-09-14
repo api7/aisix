@@ -19,9 +19,11 @@
 //! serves that server's tools under their original, un-namespaced names while
 //! ACL decisions keep evaluating the namespaced form.
 //!
-//! The aggregator holds no per-request or per-session state, so governance
-//! never depends on a transport session — which keeps it aligned with the
-//! stateless direction of the MCP 2026-07-28 revision.
+//! The aggregator holds no per-session state, so governance never depends on
+//! a transport session — which keeps it aligned with the stateless direction
+//! of the MCP 2026-07-28 revision. Its only per-request state is the
+//! [`ToolsListCounts`] slot a `tools/list` fills in for the mount's access
+//! log, and a gateway is built per request.
 //!
 //! Wiring this endpoint behind the gateway's auth / per-tool ACL / quota /
 //! observability pipeline (and sourcing upstreams from the resource snapshot)
@@ -29,7 +31,7 @@
 //! yet mounted on any production listener.
 
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
@@ -128,6 +130,11 @@ pub struct ToolAcl {
     /// [`ToolAcl::narrowed_to_allowlist`] can now append one to any ACL,
     /// so the pairing is asserted there instead.
     servers: Arc<McpServerIndex>,
+    /// Whether any layer here came from actual configuration, as opposed to
+    /// the deny-by-default empty layer [`ToolAcl::resolve`] falls back to.
+    /// Read only by [`ToolAcl::has_grant`], to tell the two reasons an empty
+    /// `tools/list` can have apart.
+    granted: bool,
 }
 
 #[derive(Clone)]
@@ -219,6 +226,7 @@ impl ToolAcl {
             allow: vec![AllowLayer::All],
             deny: Vec::new(),
             servers: Arc::new(McpServerIndex::default()),
+            granted: true,
         }
     }
 
@@ -280,6 +288,7 @@ impl ToolAcl {
             allow: vec![AllowLayer::from_patterns(allowed.unwrap_or(&[]))],
             deny: Vec::new(),
             servers: Arc::new(McpServerIndex::default()),
+            granted: true,
         }
     }
 
@@ -357,6 +366,7 @@ impl ToolAcl {
         // Deny-by-default: an unconfigured key in an unconfigured
         // environment has no MCP access, rather than the empty conjunction's
         // "everything".
+        let granted = !allow.is_empty();
         if allow.is_empty() {
             allow.push(AllowLayer::Patterns(Vec::new()));
         }
@@ -364,7 +374,16 @@ impl ToolAcl {
             allow,
             deny,
             servers: servers.for_snapshot(snapshot),
+            granted,
         }
+    }
+
+    /// Whether any MCP grant applies to this caller at all — an environment
+    /// or team policy, or the key's own `mcp_access`. `false` means the ACL
+    /// is the deny-by-default fallback, which is why an empty `tools/list`
+    /// needs the two different explanations the `/mcp` mount logs.
+    pub fn has_grant(&self) -> bool {
+        self.granted
     }
 
     /// Whether `namespaced_tool` is permitted: every allow layer must admit
@@ -395,6 +414,17 @@ impl ToolAcl {
     }
 }
 
+/// What one `tools/list` produced, before and after the caller's ACL — the
+/// only way an operator can tell an empty list caused by the ACL apart from
+/// an upstream that has no tools.
+#[derive(Clone, Copy, Debug)]
+pub struct ToolsListCounts {
+    /// Tools the upstreams returned, summed across them, before filtering.
+    pub total: u32,
+    /// Tools left after the caller's ACL filtered the list.
+    pub returned: u32,
+}
+
 /// Aggregates N upstream MCP servers behind one downstream MCP server surface.
 /// Cheap to clone (the upstream set is shared); the Streamable HTTP transport
 /// clones it per session.
@@ -402,6 +432,11 @@ impl ToolAcl {
 pub struct McpGateway {
     upstreams: Arc<[NamedUpstream]>,
     tool_acl: ToolAcl,
+    /// This request's `tools/list` counts, written once by the handler and
+    /// read by the mount when it emits the access log. Shared with every
+    /// clone the transport makes, and scoped to one request because the
+    /// gateway itself is built per request.
+    tools_list: Arc<OnceLock<ToolsListCounts>>,
     /// When set, this gateway serves exactly one upstream under its **original**
     /// tool names: `tools/list` strips the `<server>__` namespace prefix and
     /// `tools/call` accepts both the bare and the prefixed form. ACL decisions
@@ -459,6 +494,7 @@ impl McpGateway {
             upstreams: deduped.into(),
             tool_acl: ToolAcl::allow_all(),
             scoped: None,
+            tools_list: Arc::new(OnceLock::new()),
         }
     }
 
@@ -468,6 +504,15 @@ impl McpGateway {
     pub fn with_tool_acl(mut self, acl: ToolAcl) -> Self {
         self.tool_acl = acl;
         self
+    }
+
+    /// Handle on this request's [`ToolsListCounts`], for the mount to read
+    /// after the transport has run the handler. Clone it BEFORE handing the
+    /// gateway to [`streamable_http_service`] — the slot is shared with every
+    /// clone the transport makes, so the counts the handler writes are
+    /// visible through this handle.
+    pub fn tools_list_counts(&self) -> Arc<OnceLock<ToolsListCounts>> {
+        self.tools_list.clone()
     }
 
     /// Build a gateway whose upstreams are the **enabled** `mcp_servers` in the
@@ -608,8 +653,16 @@ impl ServerHandler for McpGateway {
                 }
             }
         }
+        let total = tools.len() as u32;
         // Per-tool ACL: expose only the tools this caller's key permits.
         tools.retain(|tool| self.tool_acl.permits(tool.name.as_ref()));
+        // Recorded here rather than returned, because the handler's only
+        // channel back to the mount is the JSON-RPC result. `set` keeps the
+        // first write: one request is one `tools/list` on this transport.
+        let _ = self.tools_list.set(ToolsListCounts {
+            total,
+            returned: tools.len() as u32,
+        });
         // A scoped gateway serves its single upstream's tools under their
         // original names — the namespace prefix exists to disambiguate the
         // aggregate, and a single-server endpoint has nothing to disambiguate.
@@ -927,6 +980,7 @@ mod tests {
             allow: vec![AllowLayer::All],
             deny: Vec::new(),
             servers,
+            granted: true,
         }
     }
 
@@ -1019,6 +1073,7 @@ mod tests {
             allow: vec![AllowLayer::from_patterns(&["docs__search".to_string()])],
             deny: Vec::new(),
             servers: index,
+            granted: true,
         }
         .narrowed_to_allowlist(&ids(&["s-docs", "s-kb"]));
         assert!(by_id.permits("docs__search"));
