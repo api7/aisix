@@ -894,7 +894,15 @@ fn apply_effort_mapping_tokens(schema: &mut Value) {
         "additionalProperties".to_string(),
         json!({"type": ["string", "null"]}),
     );
-    node.insert("properties".to_string(), json!({"": {"type": "string"}}));
+    node.insert(
+        "properties".to_string(),
+        json!({
+            "": {
+                "description": "The entry for a request that sets no reasoning effort. Its value is sent upstream in place of the missing one, and may not be `null` — a request that sets no effort has no field to remove.",
+                "type": "string"
+            }
+        }),
+    );
 }
 
 /// Every `(type, name field, id field)` a model reference is written as.
