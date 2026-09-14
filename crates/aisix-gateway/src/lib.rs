@@ -52,8 +52,9 @@ pub use credential::credential_fingerprint;
 pub use hub::{upstream_protocol, Hub, UPSTREAM_PROTOCOL_UNKNOWN};
 pub use sse::{SseDecoder, SseEvent};
 pub use structured_output::{
-    close_object_schemas, json_schema_from_response_format, response_into_fake_stream_chunks,
-    seal_object_schemas, unwrap_json_tool_call, JSON_TOOL_DESCRIPTION, JSON_TOOL_NAME,
+    apply_schema_limits, close_object_schemas, json_schema_from_response_format,
+    response_into_fake_stream_chunks, seal_object_schemas, unwrap_json_tool_call, SchemaLimits,
+    ANTHROPIC_SCHEMA_LIMITS, GEMINI_OPENAPI_SCHEMA_LIMITS, JSON_TOOL_DESCRIPTION, JSON_TOOL_NAME,
 };
 pub use upstream_headers::{
     apply_request_headers, client_header_forwardable, header_forward_blocked,

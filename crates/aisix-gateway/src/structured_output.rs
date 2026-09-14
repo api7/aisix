@@ -125,6 +125,243 @@ fn walk_object_schemas(schema: &mut serde_json::Value, require_every_property: b
     }
 }
 
+/// The subset of JSON Schema one provider's constrained decoder accepts.
+///
+/// Every provider that compiles a schema into a decoding grammar
+/// supports only a subset of JSON Schema and returns a 400 for anything
+/// outside it — so a schema that worked against an OpenAI upstream
+/// fails outright once the gateway starts forwarding it. Rather than
+/// hand that error to a caller who did nothing wrong, each edge narrows
+/// the schema to what its provider takes, and says in the schema itself
+/// what it had to drop.
+pub struct SchemaLimits {
+    /// Scalar constraint keywords the provider rejects. Each is removed
+    /// and recorded in that node's `description`, so the constraint is
+    /// still stated to the model even though it is no longer enforced by
+    /// the decoder.
+    pub noted_constraints: &'static [&'static str],
+    /// Keywords the provider rejects that say nothing a sentence can
+    /// carry — structural combinators and applicators. Removed quietly.
+    pub dropped_keywords: &'static [&'static str],
+    /// `minItems` values the provider accepts. `None` = all of them.
+    pub allowed_min_items: Option<&'static [u64]>,
+    /// Rewrite `oneOf` into `anyOf`. The providers here document
+    /// `anyOf` and not `oneOf`; for constraining *output* the
+    /// difference (exactly-one vs at-least-one) does not bind, since a
+    /// document the model produces matches whichever branch it followed.
+    /// Renaming keeps the alternatives, which dropping would not.
+    pub relax_one_of: bool,
+    /// Inline internal `$ref`s and remove the definition blocks they
+    /// point at. For providers whose schema dialect has no `$ref` at
+    /// all; the ones that document internal references keep theirs.
+    pub inline_internal_refs: bool,
+}
+
+/// What Anthropic's structured outputs accept, per the "JSON Schema
+/// limitations" section of their structured-outputs guide. Bedrock
+/// documents the same subset for both its Converse `outputConfig` and
+/// the Anthropic Messages `/invoke` body, so both edges use this.
+///
+/// Internal `$ref` / `$defs` / `definitions` are supported by both and
+/// are left in place. Recursive schemas and external `$ref`s are not,
+/// and nothing this can do would make them legal, so they are left for
+/// the upstream to reject.
+pub const ANTHROPIC_SCHEMA_LIMITS: SchemaLimits = SchemaLimits {
+    noted_constraints: &[
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minLength",
+        "maxLength",
+        "maxItems",
+        "uniqueItems",
+    ],
+    dropped_keywords: &[],
+    allowed_min_items: Some(&[0, 1]),
+    relax_one_of: true,
+    inline_internal_refs: false,
+};
+
+/// What Gemini's older `responseSchema` dialect accepts. It is an
+/// OpenAPI 3.0 `Schema` object, not JSON Schema: unknown members are
+/// rejected by name, there is no `$ref`, and the applicator keywords
+/// have no equivalent. Numeric and string bounds *are* part of that
+/// dialect, so unlike Anthropic they survive.
+pub const GEMINI_OPENAPI_SCHEMA_LIMITS: SchemaLimits = SchemaLimits {
+    noted_constraints: &[
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "uniqueItems",
+    ],
+    dropped_keywords: &[
+        "allOf",
+        "not",
+        "if",
+        "then",
+        "else",
+        "const",
+        "contains",
+        "patternProperties",
+        "prefixItems",
+        "unevaluatedProperties",
+    ],
+    allowed_min_items: None,
+    relax_one_of: true,
+    inline_internal_refs: true,
+};
+
+/// Narrow `schema` to what `limits` says the provider accepts.
+pub fn apply_schema_limits(schema: &mut serde_json::Value, limits: &SchemaLimits) {
+    if limits.inline_internal_refs {
+        inline_internal_refs(schema);
+    }
+    narrow_schema_node(schema, limits);
+}
+
+fn narrow_schema_node(schema: &mut serde_json::Value, limits: &SchemaLimits) {
+    if let Some(array) = schema.as_array_mut() {
+        for item in array {
+            narrow_schema_node(item, limits);
+        }
+        return;
+    }
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+
+    // Collect the constraints being removed in the order they are
+    // declared on the limits, so the note reads the same every time.
+    let mut notes: Vec<String> = Vec::new();
+    for key in limits.noted_constraints {
+        if let Some(value) = obj.remove(*key) {
+            notes.push(format!("{key}: {}", render_constraint(&value)));
+        }
+    }
+    if let Some(allowed) = limits.allowed_min_items {
+        let out_of_range = obj
+            .get("minItems")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|v| !allowed.contains(&v));
+        if out_of_range {
+            if let Some(value) = obj.remove("minItems") {
+                notes.push(format!("minItems: {}", render_constraint(&value)));
+            }
+        }
+    }
+    if !notes.is_empty() {
+        let note = notes.join(", ");
+        let merged = match obj.get("description").and_then(|d| d.as_str()) {
+            Some(existing) if !existing.is_empty() => format!("{existing} ({note})"),
+            _ => note,
+        };
+        obj.insert("description".to_string(), merged.into());
+    }
+
+    for key in limits.dropped_keywords {
+        obj.remove(*key);
+    }
+    if limits.relax_one_of {
+        if let Some(branches) = obj.remove("oneOf") {
+            obj.entry("anyOf").or_insert(branches);
+        }
+    }
+
+    for value in obj.values_mut() {
+        narrow_schema_node(value, limits);
+    }
+}
+
+/// Render a constraint value for the description note. Strings keep
+/// their quotes off; everything else is its compact JSON form.
+fn render_constraint(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Replace every internal `$ref` with the definition it names and drop
+/// the definition blocks, for dialects that have no `$ref`.
+///
+/// A `$ref` this cannot resolve — external, or recursive past
+/// [`MAX_REF_DEPTH`] — is left exactly as it came in. Nothing this
+/// function could do would make such a schema legal, so the upstream's
+/// own rejection is the honest outcome.
+fn inline_internal_refs(schema: &mut serde_json::Value) {
+    // `$defs` and `definitions` are separate namespaces — a schema may
+    // define the same name in both — so the map is keyed by the pointer
+    // that reaches each one, not by the bare name.
+    let mut defs: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    for block in ["$defs", "definitions"] {
+        if let Some(entries) = schema.get(block).and_then(|d| d.as_object()) {
+            for (name, definition) in entries {
+                defs.insert(format!("{block}/{name}"), definition.clone());
+            }
+        }
+    }
+    if defs.is_empty() {
+        return;
+    }
+    substitute_refs(schema, &defs, 0);
+    if let Some(obj) = schema.as_object_mut() {
+        obj.remove("$defs");
+        obj.remove("definitions");
+    }
+}
+
+/// How many times one `$ref` chain is followed before giving up. A
+/// recursive definition is the only way to exceed it.
+const MAX_REF_DEPTH: usize = 8;
+
+fn substitute_refs(
+    node: &mut serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+    depth: usize,
+) {
+    if let Some(array) = node.as_array_mut() {
+        for item in array {
+            substitute_refs(item, defs, depth);
+        }
+        return;
+    }
+    let Some(obj) = node.as_object_mut() else {
+        return;
+    };
+    if let Some(reference) = obj.get("$ref").and_then(|r| r.as_str()) {
+        let Some(name) = internal_ref_name(reference) else {
+            return; // external reference: not ours to resolve
+        };
+        let Some(definition) = defs.get(name) else {
+            return;
+        };
+        if depth >= MAX_REF_DEPTH {
+            return; // recursive: leave the `$ref` and let the upstream say so
+        }
+        let mut expanded = definition.clone();
+        substitute_refs(&mut expanded, defs, depth + 1);
+        *node = expanded;
+        return;
+    }
+    for value in obj.values_mut() {
+        substitute_refs(value, defs, depth);
+    }
+}
+
+/// The `<block>/<name>` key a `#/$defs/Name` or `#/definitions/Name`
+/// pointer resolves to. `None` for anything else, which includes every
+/// external reference.
+fn internal_ref_name(reference: &str) -> Option<&str> {
+    let path = reference.strip_prefix("#/")?;
+    let (block, name) = path.split_once('/')?;
+    if !matches!(block, "$defs" | "definitions") || name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some(path)
+}
+
 /// Undo the tool route: turn the model's call to the synthetic
 /// [`JSON_TOOL_NAME`] tool back into the plain JSON content the caller
 /// asked for. Only ever applied to a response whose request carried the
@@ -335,6 +572,201 @@ mod tests {
             schema["properties"]["untyped"]["additionalProperties"],
             false
         );
+    }
+
+    // ── provider schema subsets ───────────────────────────────────
+
+    #[test]
+    fn anthropic_limits_strip_every_unsupported_constraint_and_say_so() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "age": {
+                    "type": "integer",
+                    "description": "the age",
+                    "minimum": 1,
+                    "maximum": 120,
+                    "exclusiveMinimum": 0,
+                    "exclusiveMaximum": 121,
+                    "multipleOf": 1,
+                },
+                "name": {"type": "string", "minLength": 2, "maxLength": 20},
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 3,
+                    "maxItems": 9,
+                    "uniqueItems": true,
+                },
+            },
+        });
+        apply_schema_limits(&mut schema, &ANTHROPIC_SCHEMA_LIMITS);
+
+        let age = &schema["properties"]["age"];
+        for keyword in [
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "multipleOf",
+        ] {
+            assert!(age.get(keyword).is_none(), "{keyword} must be stripped");
+        }
+        // An existing description keeps its own text and gains the note.
+        assert_eq!(
+            age["description"],
+            concat!(
+                "the age (minimum: 1, maximum: 120, exclusiveMinimum: 0, ",
+                "exclusiveMaximum: 121, multipleOf: 1)"
+            )
+        );
+
+        let name = &schema["properties"]["name"];
+        assert!(name.get("minLength").is_none());
+        assert!(name.get("maxLength").is_none());
+        // No description to begin with: the note becomes one.
+        assert_eq!(name["description"], "minLength: 2, maxLength: 20");
+
+        let tags = &schema["properties"]["tags"];
+        assert!(tags.get("maxItems").is_none());
+        assert!(tags.get("uniqueItems").is_none());
+        // `minItems` is supported only at 0 and 1, so 3 goes too.
+        assert!(tags.get("minItems").is_none());
+        assert_eq!(
+            tags["description"],
+            "maxItems: 9, uniqueItems: true, minItems: 3"
+        );
+    }
+
+    #[test]
+    fn anthropic_limits_keep_the_min_items_values_the_provider_takes() {
+        for kept in [0, 1] {
+            let mut schema =
+                serde_json::json!({"type": "array", "items": {"type": "string"}, "minItems": kept});
+            apply_schema_limits(&mut schema, &ANTHROPIC_SCHEMA_LIMITS);
+            assert_eq!(schema["minItems"], kept, "minItems {kept} is supported");
+            assert!(schema.get("description").is_none());
+        }
+    }
+
+    #[test]
+    fn one_of_is_relaxed_to_any_of_rather_than_dropped() {
+        // Neither provider documents `oneOf`; dropping it would take the
+        // alternatives with it, so the branches move to `anyOf`.
+        let mut schema = serde_json::json!({
+            "oneOf": [{"type": "string"}, {"type": "integer"}],
+        });
+        apply_schema_limits(&mut schema, &ANTHROPIC_SCHEMA_LIMITS);
+        assert!(schema.get("oneOf").is_none());
+        assert_eq!(
+            schema["anyOf"],
+            serde_json::json!([{"type": "string"}, {"type": "integer"}])
+        );
+    }
+
+    #[test]
+    fn anthropic_limits_leave_internal_references_in_place() {
+        // Anthropic and Bedrock both document internal `$ref`; only the
+        // dialects without one need inlining.
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {"pet": {"$ref": "#/$defs/Pet"}},
+            "$defs": {"Pet": {"type": "object", "properties": {"kind": {"type": "string"}}}},
+        });
+        apply_schema_limits(&mut schema, &ANTHROPIC_SCHEMA_LIMITS);
+        assert_eq!(schema["properties"]["pet"]["$ref"], "#/$defs/Pet");
+        assert!(schema["$defs"]["Pet"].is_object());
+    }
+
+    #[test]
+    fn gemini_limits_inline_internal_references_and_drop_the_blocks() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pet": {"$ref": "#/$defs/Pet"},
+                "other": {"$ref": "#/definitions/Pet"},
+            },
+            "$defs": {"Pet": {"type": "object", "properties": {"kind": {"type": "string"}}}},
+            "definitions": {"Pet": {"type": "string"}},
+        });
+        apply_schema_limits(&mut schema, &GEMINI_OPENAPI_SCHEMA_LIMITS);
+        assert_eq!(schema["properties"]["pet"]["type"], "object");
+        assert_eq!(
+            schema["properties"]["pet"]["properties"]["kind"]["type"],
+            "string"
+        );
+        assert_eq!(schema["properties"]["other"]["type"], "string");
+        assert!(schema.get("$defs").is_none());
+        assert!(schema.get("definitions").is_none());
+    }
+
+    #[test]
+    fn an_external_or_recursive_reference_is_left_for_the_upstream_to_reject() {
+        // Nothing inlining can do makes either legal, so the request
+        // goes as written and the provider says why.
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {"remote": {"$ref": "https://example.com/Pet.json"}},
+            "$defs": {"Pet": {"type": "string"}},
+        });
+        apply_schema_limits(&mut schema, &GEMINI_OPENAPI_SCHEMA_LIMITS);
+        assert_eq!(
+            schema["properties"]["remote"]["$ref"],
+            "https://example.com/Pet.json"
+        );
+
+        let mut recursive = serde_json::json!({
+            "$ref": "#/$defs/Node",
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "properties": {"child": {"$ref": "#/$defs/Node"}},
+                },
+            },
+        });
+        apply_schema_limits(&mut recursive, &GEMINI_OPENAPI_SCHEMA_LIMITS);
+        // Expansion stops at the depth cap rather than looping; the
+        // innermost `$ref` survives and Vertex rejects it.
+        let json = recursive.to_string();
+        assert!(json.contains("#/$defs/Node"), "{json}");
+    }
+
+    #[test]
+    fn gemini_limits_drop_the_applicators_the_dialect_has_no_member_for() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "string", "const": "x", "multipleOf": 2, "uniqueItems": true},
+            },
+            "allOf": [{"type": "object"}],
+            "not": {"type": "null"},
+            "if": {"type": "object"},
+            "then": {"type": "object"},
+            "else": {"type": "object"},
+            "patternProperties": {"^a": {"type": "string"}},
+            "prefixItems": [{"type": "string"}],
+        });
+        apply_schema_limits(&mut schema, &GEMINI_OPENAPI_SCHEMA_LIMITS);
+        for dropped in [
+            "allOf",
+            "not",
+            "if",
+            "then",
+            "else",
+            "patternProperties",
+            "prefixItems",
+        ] {
+            assert!(schema.get(dropped).is_none(), "{dropped} must be dropped");
+        }
+        let a = &schema["properties"]["a"];
+        assert!(a.get("const").is_none());
+        assert!(a.get("multipleOf").is_none());
+        assert_eq!(a["description"], "multipleOf: 2, uniqueItems: true");
+        // Bounds ARE part of the OpenAPI dialect, so they survive.
+        let mut bounded = serde_json::json!({"type": "integer", "minimum": 1, "maximum": 9});
+        apply_schema_limits(&mut bounded, &GEMINI_OPENAPI_SCHEMA_LIMITS);
+        assert_eq!(bounded["minimum"], 1);
+        assert_eq!(bounded["maximum"], 9);
     }
 
     #[test]

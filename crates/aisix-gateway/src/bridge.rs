@@ -100,7 +100,25 @@ pub struct BridgeContext {
     pub provider_key: std::sync::Arc<ProviderKey>,
     /// Deadline for the entire upstream call. Bridges are expected to
     /// honour this by cancelling any in-flight HTTP request.
+    ///
+    /// On a streaming dispatch this is the **streaming** budget, which
+    /// bounds the connect phase and the gap between chunks rather than
+    /// the whole completion. A bridge that answers a streaming request
+    /// with a non-streaming upstream leg must use
+    /// [`non_streaming_deadline`](Self::non_streaming_deadline) instead.
     pub deadline: Option<Duration>,
+    /// The end-to-end budget for a non-streaming upstream call, carried
+    /// alongside `deadline` on streaming dispatches.
+    ///
+    /// A structured-output request on the synthetic-tool route cannot be
+    /// streamed — the JSON only exists once the tool call is complete —
+    /// so those bridges run the upstream leg non-streaming and render
+    /// the result as chunks. Measured against the streaming budget, a
+    /// completion that takes longer than one chunk gap is supposed to
+    /// would be cut off; this is the budget that call is actually
+    /// entitled to. `None` on a non-streaming dispatch, where `deadline`
+    /// already is it.
+    pub non_streaming_deadline: Option<Duration>,
     /// The authenticated caller, for `${request.api_key.*}` header
     /// templates. Default (all-empty) on calls with no caller behind
     /// them — a background job poll, an internal embedding lookup.
@@ -160,6 +178,7 @@ impl BridgeContext {
             model,
             provider_key,
             deadline: None,
+            non_streaming_deadline: None,
             caller: CallerIdentity::default(),
             client_headers: None,
             model_id: String::new(),
@@ -170,6 +189,25 @@ impl BridgeContext {
     pub fn with_deadline(mut self, deadline: Duration) -> Self {
         self.deadline = Some(deadline);
         self
+    }
+
+    /// Record the end-to-end budget a non-streaming call would have got,
+    /// for the streaming dispatches whose `deadline` is the smaller
+    /// streaming budget. See
+    /// [`non_streaming_deadline`](Self::non_streaming_deadline).
+    pub fn with_non_streaming_deadline(mut self, deadline: Option<Duration>) -> Self {
+        self.non_streaming_deadline = deadline;
+        self
+    }
+
+    /// The deadline an upstream leg that is *not* streaming should run
+    /// under, whichever kind of dispatch this context came from.
+    pub fn non_streaming_ctx(&self) -> Self {
+        let mut ctx = self.clone();
+        if let Some(deadline) = self.non_streaming_deadline {
+            ctx.deadline = Some(deadline);
+        }
+        ctx
     }
 
     /// Attach the caller identity and inbound headers the outbound-header

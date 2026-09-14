@@ -738,7 +738,11 @@ impl Bridge for BedrockBridge {
             bedrock_structured_output(req, upstream_id),
             StructuredOutput::Tool(_)
         ) {
-            let chunks = response_into_fake_stream_chunks(self.chat(req, ctx).await?);
+            // The leg is not streaming, so it runs under the budget a
+            // non-streaming call would have got — the streaming budget
+            // this context carries bounds a chunk gap, not a completion.
+            let chunks =
+                response_into_fake_stream_chunks(self.chat(req, &ctx.non_streaming_ctx()).await?);
             return Ok(Box::pin(async_stream::stream! {
                 for chunk in chunks {
                     yield Ok(chunk);
@@ -4049,6 +4053,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_messages_request_to_bedrock_claude_keeps_its_optional_properties() {
+        // The `/v1/messages` inbound translation used to apply OpenAI
+        // strict mode's all-required promotion before any bridge saw the
+        // request, which made a caller's optional property mandatory on
+        // this edge. The promotion now happens at the OpenAI edge only.
+        let mut extra = serde_json::json!({
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "nickname": {"type": "string"},
+                        },
+                        "required": ["name"],
+                    },
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        aisix_provider_anthropic::wire::translate_extras_to_openai_shape(
+            &mut extra,
+            aisix_core::MappedEffort::AsWritten,
+        );
+        let mut req = ChatFormat::new("my-model", vec![ChatMessage::user("who are you")]);
+        req.extra = extra;
+
+        let body = capture_bedrock_body(
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "invoke",
+            &req,
+            false,
+        )
+        .await;
+        let schema = &body["output_config"]["format"]["schema"];
+        assert_eq!(schema["required"], serde_json::json!(["name"]));
+        // Sealing still happens — Bedrock rejects an open object.
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[tokio::test]
     async fn invoke_path_falls_back_to_the_synthetic_tool_on_an_older_claude() {
         let body = capture_bedrock_body(
             "anthropic.claude-3-5-sonnet-20240620-v1:0",
@@ -4096,6 +4144,34 @@ mod tests {
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(schema["required"], serde_json::json!(["name"]));
         assert!(body.get("toolConfig").is_none(), "body={body}");
+    }
+
+    #[tokio::test]
+    async fn converse_output_config_carries_the_narrowed_schema() {
+        // Bedrock documents the same unsupported-keyword set as
+        // Anthropic for its structured outputs, so what goes into the
+        // `outputConfig` string has already been narrowed.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"name": {"type": "string", "maxLength": 20}},
+        });
+        let mut req = structured_request(schema);
+        req.stream = Some(true);
+        let body = capture_bedrock_body(
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "converse-stream",
+            &req,
+            true,
+        )
+        .await;
+        let sent: serde_json::Value = serde_json::from_str(
+            body["outputConfig"]["textFormat"]["structure"]["jsonSchema"]["schema"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(sent["properties"]["name"].get("maxLength").is_none());
+        assert_eq!(sent["properties"]["name"]["description"], "maxLength: 20");
     }
 
     #[tokio::test]
@@ -4256,6 +4332,64 @@ mod tests {
         let converse = capture_bedrock_body("amazon.nova-pro-v1:0", "converse", &req, false).await;
         assert!(converse.get("outputConfig").is_none(), "body={converse}");
         assert!(converse.get("toolConfig").is_none(), "body={converse}");
+    }
+
+    #[tokio::test]
+    async fn a_small_stream_budget_does_not_cut_the_fake_stream_leg() {
+        // On a streaming dispatch `ctx.deadline` is the streaming budget,
+        // which bounds a chunk gap rather than a whole completion. The
+        // tool route's upstream leg is not streaming, so it runs under
+        // the end-to-end budget the context carries alongside it.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(250))
+                    .set_body_json(serde_json::json!({
+                        "id": "msg_json",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-3-5-sonnet-20240620-v1",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "toolu_json",
+                            "name": JSON_TOOL_NAME,
+                            "input": {"name": "Ada"},
+                        }],
+                        "stop_reason": "tool_use",
+                        "usage": {"input_tokens": 9, "output_tokens": 4},
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("anthropic.claude-3-5-sonnet-20240620-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        )
+        // A chunk-gap budget the completion would blow through, beside
+        // the end-to-end budget it fits inside.
+        .with_deadline(Duration::from_millis(50))
+        .with_non_streaming_deadline(Some(Duration::from_secs(30)));
+
+        let mut req = structured_request(person_schema());
+        req.stream = Some(true);
+        let stream = bridge
+            .chat_stream(&req, &ctx)
+            .await
+            .expect("the fake-stream leg must not be cut by the chunk-gap budget");
+        let chunks: Vec<ChatChunk> = futures::StreamExt::collect::<Vec<_>>(stream)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            chunks[1].delta.content.as_deref(),
+            Some(r#"{"name":"Ada"}"#)
+        );
     }
 
     #[tokio::test]

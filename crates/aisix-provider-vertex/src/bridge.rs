@@ -25,7 +25,8 @@
 use aisix_gateway::{
     sse::{SseDecoder, SseEvent},
     structured_output::{
-        json_schema_from_response_format, response_into_fake_stream_chunks, unwrap_json_tool_call,
+        apply_schema_limits, json_schema_from_response_format, response_into_fake_stream_chunks,
+        unwrap_json_tool_call, GEMINI_OPENAPI_SCHEMA_LIMITS,
     },
     Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatDelta, ChatFormat,
     ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest, EmbeddingResponse,
@@ -720,7 +721,11 @@ impl Bridge for VertexBridge {
                 StructuredOutput::Tool(_)
             )
         {
-            let chunks = response_into_fake_stream_chunks(self.chat(req, ctx).await?);
+            // The leg is not streaming, so it runs under the budget a
+            // non-streaming call would have got — the streaming budget
+            // this context carries bounds a chunk gap, not a completion.
+            let chunks =
+                response_into_fake_stream_chunks(self.chat(req, &ctx.non_streaming_ctx()).await?);
             return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
         }
         match publisher {
@@ -2014,10 +2019,17 @@ fn gemini_major_version(model: &str) -> Option<u32> {
 ///   * `propertyOrdering` fixes the order the model emits an object's
 ///     members in — omitted, the order is unspecified.
 ///
+/// Run after [`apply_schema_limits`], which has already removed the
+/// keywords the dialect has no member for and inlined its `$ref`s.
+///
 /// The ordering emitted is the order the properties appear in the schema
 /// as this gateway serialises it, so the request is self-consistent.
 fn gemini_openapi_schema(schema: &serde_json::Value) -> serde_json::Value {
     let mut out = schema.clone();
+    // First narrow the schema to the dialect's vocabulary — this is
+    // also what inlines `$ref`, which the dialect has no spelling for —
+    // then rewrite what survives into the dialect's own shape.
+    apply_schema_limits(&mut out, &GEMINI_OPENAPI_SCHEMA_LIMITS);
     rewrite_gemini_openapi_schema(&mut out);
     out
 }
@@ -2061,18 +2073,6 @@ fn rewrite_gemini_openapi_schema(schema: &mut serde_json::Value) {
         if let Some(branches) = obj.get_mut(key).and_then(|b| b.as_array_mut()) {
             for branch in branches {
                 rewrite_gemini_openapi_schema(branch);
-            }
-        }
-    }
-    // Reached by `$ref` rather than by nesting, so the walk above never
-    // visits them — and a `$def` that keeps its `additionalProperties`
-    // or a lower-case type name fails the whole request. Every
-    // schema generator that emits nested models (Pydantic among them)
-    // produces these.
-    for key in ["$defs", "definitions"] {
-        if let Some(defs) = obj.get_mut(key).and_then(|d| d.as_object_mut()) {
-            for def in defs.values_mut() {
-                rewrite_gemini_openapi_schema(def);
             }
         }
     }
@@ -3096,11 +3096,12 @@ mod tests {
     }
 
     #[test]
-    fn gemini_openapi_dialect_reaches_definitions_and_union_types() {
-        // `$defs` is reached by `$ref`, not by nesting, so the ordinary
-        // walk never visits it — and a `$def` that keeps its
-        // `additionalProperties` or a lower-case type name fails the
-        // whole request.
+    fn gemini_openapi_dialect_inlines_definitions_and_uppercases_union_types() {
+        // The dialect is an OpenAPI `Schema` object: it rejects members
+        // by name, so `$defs` cannot ride along and `$ref` has no
+        // spelling. The definitions are inlined and the blocks removed
+        // before the dialect rewrite, so what `$ref` pointed at gets the
+        // same upper-casing as everything else.
         let req = gemini_request_with_response_format(json_schema_format(serde_json::json!({
             "type": "object",
             "properties": {
@@ -3120,12 +3121,12 @@ mod tests {
             .unwrap()
             .response_schema
             .unwrap();
-        assert_eq!(schema["$defs"]["Pet"]["type"], "OBJECT");
-        assert_eq!(
-            schema["$defs"]["Pet"]["properties"]["kind"]["type"],
-            "STRING"
-        );
-        assert!(schema["$defs"]["Pet"].get("additionalProperties").is_none());
+        assert!(schema.get("$defs").is_none(), "{schema}");
+        let pet = &schema["properties"]["pet"];
+        assert!(pet.get("$ref").is_none(), "{schema}");
+        assert_eq!(pet["type"], "OBJECT");
+        assert_eq!(pet["properties"]["kind"]["type"], "STRING");
+        assert!(pet.get("additionalProperties").is_none());
         assert_eq!(
             schema["properties"]["nickname"]["type"],
             serde_json::json!(["STRING", "NULL"])

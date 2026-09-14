@@ -2096,6 +2096,12 @@ async fn cross_provider_dispatch(
     if let Some(d) = connect_deadline {
         ctx = ctx.with_deadline(d);
     }
+    // See chat.rs: the structured-output tool route answers a streaming
+    // request with a non-streaming upstream leg, which is entitled to
+    // the end-to-end budget rather than the per-chunk one.
+    if is_stream {
+        ctx = ctx.with_non_streaming_deadline(timeouts.request);
+    }
     let provider_label = provider.to_ascii_lowercase();
     let provider_key_id = model.provider_key_id.as_deref().unwrap_or("unknown");
     let upstream_model = model.upstream_model().unwrap_or("unknown").to_string();

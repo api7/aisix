@@ -25,8 +25,8 @@ use std::borrow::Cow;
 
 use aisix_core::MappedEffort;
 use aisix_gateway::structured_output::{
-    close_object_schemas, json_schema_from_response_format, seal_object_schemas,
-    JSON_TOOL_DESCRIPTION, JSON_TOOL_NAME,
+    apply_schema_limits, json_schema_from_response_format, seal_object_schemas,
+    ANTHROPIC_SCHEMA_LIMITS, JSON_TOOL_DESCRIPTION, JSON_TOOL_NAME,
 };
 use aisix_gateway::{
     BridgeError, ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, FinishReason, Role,
@@ -631,6 +631,10 @@ pub fn structured_output_for(req: &ChatFormat, upstream_model: &str) -> Structur
 fn response_format_schema(response_format: &serde_json::Value) -> Option<serde_json::Value> {
     let mut schema = json_schema_from_response_format(response_format)?;
     seal_object_schemas(&mut schema);
+    // Anthropic compiles the schema into a decoding grammar and 400s on
+    // any keyword outside its documented subset, so the constraints it
+    // cannot take are moved into the descriptions the model reads.
+    apply_schema_limits(&mut schema, &ANTHROPIC_SCHEMA_LIMITS);
     Some(schema)
 }
 
@@ -1210,20 +1214,25 @@ const ANTHROPIC_DEFAULT_EFFORT: &str = "high";
 /// `response_format` shape. Anthropic's structured outputs are
 /// constrained-decoded, so the OpenAI side is emitted with
 /// `strict: true` to keep that guarantee rather than degrading it to a
-/// best-effort hint; strict mode in turn requires every object schema to
-/// close over its properties (LiteLLM normalises the schema the same
-/// way). Returns `None` for any other shape, which is then dropped.
+/// best-effort hint.
+///
+/// The schema itself is carried **verbatim**. Strict mode's requirement
+/// that every declared property be listed in `required` is applied by
+/// the OpenAI request builder, at the edge where `strict: true` actually
+/// goes on the wire — doing it here would rewrite the caller's schema
+/// for every downstream, and this translation also feeds the Anthropic
+/// and Bedrock edges, where an optional property must stay optional.
+/// Returns `None` for any other shape, which is then dropped.
 fn anthropic_output_format_to_response_format(
     output_format: serde_json::Value,
 ) -> Option<serde_json::Value> {
     if output_format.get("type").and_then(|t| t.as_str())? != "json_schema" {
         return None;
     }
-    let mut schema = output_format.get("schema")?.clone();
+    let schema = output_format.get("schema")?.clone();
     if schema.is_null() {
         return None;
     }
-    close_object_schemas(&mut schema);
     Some(serde_json::json!({
         "type": "json_schema",
         "json_schema": {
@@ -4971,13 +4980,27 @@ mod tests {
         let rf = extra.get("response_format").expect("response_format set");
         assert_eq!(rf["type"], serde_json::json!("json_schema"));
         assert_eq!(rf["json_schema"]["strict"], serde_json::json!(true));
-        let schema = &rf["json_schema"]["schema"];
-        // Strict mode closes every object level, not just the root.
-        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
-        assert_eq!(schema["required"], serde_json::json!(["city", "days"]));
-        let item = &schema["properties"]["days"]["items"];
-        assert_eq!(item["additionalProperties"], serde_json::json!(false));
-        assert_eq!(item["required"], serde_json::json!(["high"]));
+        // The schema is carried verbatim. Strict mode's closing is
+        // applied by the OpenAI request builder, the edge where
+        // `strict: true` actually goes on the wire — this normalised
+        // request also reaches the Anthropic, Bedrock and Gemini edges,
+        // where the caller's `required` is theirs to keep.
+        assert_eq!(
+            rf["json_schema"]["schema"],
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "days": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"high": {"type": "number"}},
+                        },
+                    },
+                },
+            })
+        );
         assert!(!extra.contains_key("output_config"));
     }
 
@@ -5000,8 +5023,8 @@ mod tests {
         .clone();
         translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
         assert_eq!(
-            extra["response_format"]["json_schema"]["schema"]["required"],
-            serde_json::json!(["legacy"])
+            extra["response_format"]["json_schema"]["schema"]["properties"],
+            serde_json::json!({"legacy": {"type": "string"}})
         );
         assert!(!extra.contains_key("output_format"));
     }
@@ -6273,6 +6296,46 @@ mod tests {
         let input_schema = &tool.tools.as_ref().unwrap()[0]["input_schema"];
         assert_eq!(input_schema["required"], serde_json::json!(["name"]));
         assert_eq!(input_schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn constraints_anthropic_rejects_move_into_the_description_on_both_paths() {
+        // Anthropic compiles the schema into a decoding grammar and 400s
+        // on any keyword outside its documented subset, so a schema a
+        // generator produced from typed models would fail outright. The
+        // constraints are stated to the model instead.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "full name", "maxLength": 20},
+                "age": {"type": "integer", "minimum": 1},
+            },
+        });
+        let req = request_with_response_format(json_schema_format(schema));
+
+        for (model, on_the_wire) in [
+            ("claude-sonnet-4-5", None),
+            ("claude-3-5-haiku-20241022", Some(JSON_TOOL_NAME)),
+        ] {
+            let built = build(&req, model);
+            let sent = match on_the_wire {
+                None => built.extra["output_config"]["format"]["schema"].clone(),
+                Some(_) => built.tools.as_ref().unwrap()[0]["input_schema"].clone(),
+            };
+            assert!(
+                sent["properties"]["name"].get("maxLength").is_none(),
+                "{model}: maxLength must not reach the wire"
+            );
+            assert_eq!(
+                sent["properties"]["name"]["description"], "full name (maxLength: 20)",
+                "{model}"
+            );
+            assert!(
+                sent["properties"]["age"].get("minimum").is_none(),
+                "{model}"
+            );
+            assert_eq!(sent["properties"]["age"]["description"], "minimum: 1");
+        }
     }
 
     #[test]

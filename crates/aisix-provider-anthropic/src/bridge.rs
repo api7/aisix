@@ -428,7 +428,11 @@ impl Bridge for AnthropicBridge {
             structured_output_for(req, upstream),
             StructuredOutput::Tool(_)
         ) {
-            let chunks = response_into_fake_stream_chunks(self.chat(req, ctx).await?);
+            // The leg is not streaming, so it runs under the budget a
+            // non-streaming call would have got — the streaming budget
+            // this context carries bounds a chunk gap, not a completion.
+            let chunks =
+                response_into_fake_stream_chunks(self.chat(req, &ctx.non_streaming_ctx()).await?);
             return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
         }
 

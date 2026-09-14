@@ -2224,6 +2224,12 @@ async fn responses_cross_provider_to_target(
     if let Some(d) = connect_deadline {
         ctx = ctx.with_deadline(d);
     }
+    // See chat.rs: the structured-output tool route answers a streaming
+    // request with a non-streaming upstream leg, which is entitled to
+    // the end-to-end budget rather than the per-chunk one.
+    if is_stream {
+        ctx = ctx.with_non_streaming_deadline(timeouts.request);
+    }
     let provider_label = provider.to_ascii_lowercase();
 
     // least_busy: count this target as in-flight for the upstream call
