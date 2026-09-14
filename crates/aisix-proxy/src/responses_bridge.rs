@@ -76,15 +76,20 @@ pub fn responses_request_to_chat(model: &str, body: &Value) -> ChatFormat {
 
     // Tools/tool_choice ride `extra` in OpenAI chat shape; every provider
     // bridge translates that shape to its own (Anthropic, Gemini, …), so
-    // emitting it here is all that's needed.
+    // emitting it here is all that's needed. `tool_choice` only travels
+    // with a surviving `tools` list: a chat-completions upstream rejects
+    // it on its own ("'tool_choice' is only allowed when 'tools' are
+    // specified"), and the Responses API accepts requests that carry an
+    // empty or hosted-tools-only list alongside one — a shape the Codex
+    // CLI sends on every context compaction (AISIX-Cloud#1614).
     if let Some(tools) = body.get("tools").and_then(responses_tools_to_chat) {
         chat.extra.insert("tools".to_string(), tools);
-    }
-    if let Some(tc) = body
-        .get("tool_choice")
-        .and_then(responses_tool_choice_to_chat)
-    {
-        chat.extra.insert("tool_choice".to_string(), tc);
+        if let Some(tc) = body
+            .get("tool_choice")
+            .and_then(responses_tool_choice_to_chat)
+        {
+            chat.extra.insert("tool_choice".to_string(), tc);
+        }
     }
     if let Some(effort) = body.pointer("/reasoning/effort").and_then(Value::as_str) {
         chat.extra
@@ -1545,6 +1550,35 @@ mod tests {
         assert_eq!(chat.extra.get("reasoning_effort"), Some(&json!("high")));
         assert!(!chat.extra.contains_key("reasoning"));
         assert!(!chat.extra.contains_key("store"));
+    }
+
+    #[test]
+    fn tool_choice_is_dropped_when_no_tool_survives_translation() {
+        // The Codex CLI serialises its context-compaction call with an
+        // empty tool list and `tool_choice: "auto"`. The Responses API
+        // accepts that pair; a chat-completions upstream rejects the
+        // choice without a `tools` key (AISIX-Cloud#1614).
+        let empty = json!({
+            "model": "m",
+            "input": "Summarise",
+            "tools": [],
+            "tool_choice": "auto",
+        });
+        let chat = responses_request_to_chat("m", &empty);
+        assert!(!chat.extra.contains_key("tools"));
+        assert!(!chat.extra.contains_key("tool_choice"));
+
+        // Same when the list holds only tools with no chat equivalent,
+        // so translation filters every entry out.
+        let hosted_only = json!({
+            "model": "m",
+            "input": "Summarise",
+            "tools": [{"type": "web_search_preview"}],
+            "tool_choice": {"type": "function", "name": "get_weather"},
+        });
+        let chat = responses_request_to_chat("m", &hosted_only);
+        assert!(!chat.extra.contains_key("tools"));
+        assert!(!chat.extra.contains_key("tool_choice"));
     }
 
     #[test]

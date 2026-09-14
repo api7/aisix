@@ -441,13 +441,17 @@ pub fn build_request<'a>(
     // verbatim. Forwarding the OpenAI tool_choice shape would 400
     // upstream — the field is removed from `extra` even when the
     // translation returns None (e.g. unrecognised value), to avoid
-    // a shape-mismatch double-emit.
+    // a shape-mismatch double-emit. `tool_choice` is also dropped when
+    // no tool survives translation: upstream rejects the field without
+    // an accompanying `tools` list (AISIX-Cloud#1614).
     let mut extras = req.extra.clone();
     let tools = extras
         .remove("tools")
         .and_then(translate_openai_tools_to_anthropic);
-    let tool_choice = extras
-        .remove("tool_choice")
+    let requested_tool_choice = extras.remove("tool_choice");
+    let tool_choice = tools
+        .as_ref()
+        .and(requested_tool_choice)
         .and_then(translate_openai_tool_choice_to_anthropic);
     translate_reasoning_effort_to_anthropic(&mut extras);
     AnthropicRequest {
@@ -863,6 +867,15 @@ pub fn translate_extras_to_openai_shape(extra: &mut serde_json::Map<String, serd
                 );
             }
         }
+    }
+
+    // An OpenAI-compatible upstream rejects `tool_choice` that arrives
+    // without `tools` ("'tool_choice' is only allowed when 'tools' are
+    // specified"), so a caller-supplied choice is dropped whenever no
+    // tool survived translation — an empty list, or one holding only
+    // entries this bridge cannot express (AISIX-Cloud#1614).
+    if !extra.contains_key("tools") {
+        extra.remove("tool_choice");
     }
 
     if let Some(effort) = reasoning_effort_for(thinking.as_ref(), output_config.as_ref()) {
@@ -3836,6 +3849,13 @@ mod tests {
         let req = ChatFormat {
             extra: {
                 let mut m = serde_json::Map::new();
+                m.insert(
+                    "tools".to_string(),
+                    serde_json::json!([{
+                        "type": "function",
+                        "function": {"name": "get_time", "parameters": {"type": "object"}},
+                    }]),
+                );
                 m.insert("tool_choice".to_string(), serde_json::json!("auto"));
                 m.insert("custom_field".to_string(), serde_json::json!("kept"));
                 m
@@ -3852,6 +3872,38 @@ mod tests {
             built.extra.get("custom_field"),
             Some(&serde_json::json!("kept"))
         );
+    }
+
+    #[test]
+    fn build_request_drops_tool_choice_when_no_tool_survives_translation() {
+        // Anthropic rejects `tool_choice` sent without `tools`, so a
+        // caller's choice goes nowhere once the tool list translates to
+        // nothing — whether it arrived empty or held only entries with
+        // no Anthropic equivalent (AISIX-Cloud#1614).
+        let cases = [
+            (serde_json::json!([]), serde_json::json!("auto")),
+            (
+                serde_json::json!([{"type": "web_search_preview"}]),
+                serde_json::json!({"type": "function", "function": {"name": "get_time"}}),
+            ),
+        ];
+        for (tools, tool_choice) in cases {
+            let req = ChatFormat {
+                extra: {
+                    let mut m = serde_json::Map::new();
+                    m.insert("tools".to_string(), tools.clone());
+                    m.insert("tool_choice".to_string(), tool_choice.clone());
+                    m
+                },
+                ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+            };
+            let (_system, messages) = split_system(&req).unwrap();
+            let built = build_request(&req, "c-name", None, messages, false);
+            assert!(built.tools.is_none(), "tools for {tools}");
+            assert!(built.tool_choice.is_none(), "tool_choice for {tools}");
+            assert!(!built.extra.contains_key("tools"));
+            assert!(!built.extra.contains_key("tool_choice"));
+        }
     }
 
     #[test]
@@ -4233,6 +4285,28 @@ mod tests {
             extra.get("tool_choice"),
             Some(&serde_json::json!("required"))
         );
+    }
+
+    #[test]
+    fn extras_shape_drops_tool_choice_when_no_tool_survives_translation() {
+        // An OpenAI-compatible upstream rejects `tool_choice` without
+        // `tools`, so the choice goes nowhere once the list translates
+        // to nothing — an absent list, an empty one, or one holding
+        // only unmappable entries (AISIX-Cloud#1614).
+        let cases = [
+            serde_json::json!({"tool_choice": {"type": "auto"}}),
+            serde_json::json!({"tools": [], "tool_choice": {"type": "auto"}}),
+            serde_json::json!({
+                "tools": [{"description": "no name"}],
+                "tool_choice": {"type": "tool", "name": "get_time"},
+            }),
+        ];
+        for case in cases {
+            let mut extra = case.as_object().unwrap().clone();
+            translate_extras_to_openai_shape(&mut extra);
+            assert!(!extra.contains_key("tools"), "tools for {case}");
+            assert!(!extra.contains_key("tool_choice"), "tool_choice for {case}");
+        }
     }
 
     #[test]
