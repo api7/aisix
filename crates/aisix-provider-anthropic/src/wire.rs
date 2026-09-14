@@ -446,7 +446,7 @@ pub fn build_request<'a>(
     // no tool survives translation: upstream rejects the field without
     // an accompanying `tools` list (AISIX-Cloud#1614).
     let mut extras = req.extra.clone();
-    let tools = extras
+    let mut tools = extras
         .remove("tools")
         .and_then(translate_openai_tools_to_anthropic);
     let requested_tool_choice = extras.remove("tool_choice");
@@ -462,6 +462,7 @@ pub fn build_request<'a>(
         .as_ref()
         .and_then(serde_json::Value::as_bool)
         == Some(false);
+    let client_set_tool_choice = requested_tool_choice.is_some();
     let mut tool_choice = tools
         .as_ref()
         .and(requested_tool_choice)
@@ -483,14 +484,58 @@ pub fn build_request<'a>(
         }
     }
     translate_reasoning_effort_to_anthropic(&mut extras);
-    // `response_format` is the OpenAI spelling of structured outputs and
-    // has no top-level Anthropic counterpart, so it would ride `extra`
-    // onto the body and be rejected as an unknown parameter. It reaches
-    // this bridge from a chat caller and from the `/v1/responses`
-    // translation of `text.format`; both are dropped here, as every
-    // OpenAI-only knob with no provider-neutral equivalent is.
-    if extras.remove("response_format").is_some() {
-        tracing::debug!("dropping response_format: no Anthropic counterpart on this path");
+    // `response_format` is the OpenAI spelling of structured outputs. It
+    // has no top-level Anthropic counterpart, so it is always consumed
+    // here — riding `extra` onto the body would be rejected as an unknown
+    // parameter. What it becomes instead depends on the target model; see
+    // [`StructuredOutput`]. It reaches this bridge from a chat caller and
+    // from the `/v1/responses` translation of `text.format`.
+    let structured_output = structured_output_for(req, upstream_model);
+    extras.remove("response_format");
+    match structured_output {
+        StructuredOutput::None => {}
+        StructuredOutput::Native(schema) => {
+            let format = serde_json::json!({"type": "json_schema", "schema": schema});
+            match extras.get_mut("output_config") {
+                // `output_config` is a carrier shared with `effort` and
+                // `task_budget`; merge beside whatever is already there.
+                // A `format` the caller sent natively is the more
+                // specific statement of the same setting and wins.
+                Some(serde_json::Value::Object(config)) => {
+                    config.entry("format").or_insert(format);
+                }
+                // Not an object: Anthropic rejects the shape either way,
+                // and replacing it would lose what the caller meant.
+                Some(_) => {}
+                None => {
+                    extras.insert(
+                        "output_config".to_string(),
+                        serde_json::json!({"format": format}),
+                    );
+                }
+            }
+        }
+        StructuredOutput::Tool(schema) => {
+            tools.get_or_insert_with(Vec::new).push(serde_json::json!({
+                "name": JSON_TOOL_NAME,
+                "description": JSON_TOOL_DESCRIPTION,
+                "input_schema": schema,
+            }));
+            // Forcing the tool is what makes the reply JSON rather than a
+            // suggestion the model may ignore. Two things outrank it: a
+            // `tool_choice` the caller set themselves, and extended
+            // thinking, which Anthropic rejects outright beside a forced
+            // choice. Both leave the synthetic tool on offer under the
+            // model's own `auto`.
+            let thinking_enabled = extras
+                .get("thinking")
+                .and_then(|t| t.get("type"))
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t != "disabled");
+            if !client_set_tool_choice && !thinking_enabled {
+                tool_choice = Some(serde_json::json!({"type": "tool", "name": JSON_TOOL_NAME}));
+            }
+        }
     }
     AnthropicRequest {
         model: upstream_model,
@@ -504,6 +549,120 @@ pub fn build_request<'a>(
         tool_choice,
         extra: extras,
     }
+}
+
+/// Name of the synthetic tool the tool path asks the model to call. The
+/// response decoder recognises it by this name to translate the call back
+/// into plain JSON content, so the two sides must agree.
+pub const JSON_TOOL_NAME: &str = "json_tool_call";
+
+const JSON_TOOL_DESCRIPTION: &str =
+    "Respond by calling this tool with your answer as JSON matching its input schema.";
+
+/// Where a request's OpenAI `response_format` lands on the Anthropic wire.
+///
+/// Anthropic has two ways to get JSON out of a model and they are not
+/// interchangeable: `output_config.format` constrains decoding but only
+/// the newest Claude families accept it, while a forced tool call works
+/// on every model that supports tools at all — including the non-Claude
+/// models served behind Anthropic-compatible endpoints. The target
+/// model's name picks between them; see
+/// [`supports_native_structured_output`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StructuredOutput {
+    /// Nothing goes on the wire: the caller sent no `response_format`, or
+    /// sent one carrying no schema (`{"type":"json_object"}`, which has
+    /// no Anthropic counterpart on either path — Anthropic's JSON
+    /// controls are schema-driven).
+    None,
+    /// `output_config.format` — the model's own structured-output field.
+    Native(serde_json::Value),
+    /// A synthetic [`JSON_TOOL_NAME`] tool whose input *is* the answer;
+    /// the reply is translated back into content by
+    /// [`unwrap_json_tool_call`].
+    Tool(serde_json::Value),
+}
+
+/// Decide what the request's `response_format` becomes for
+/// `upstream_model`. Pure, so the bridge can ask the same question again
+/// on the streaming path without rebuilding the body.
+pub fn structured_output_for(req: &ChatFormat, upstream_model: &str) -> StructuredOutput {
+    let Some(schema) = req
+        .extra
+        .get("response_format")
+        .and_then(response_format_schema)
+    else {
+        return StructuredOutput::None;
+    };
+    if supports_native_structured_output(upstream_model) {
+        StructuredOutput::Native(schema)
+    } else {
+        StructuredOutput::Tool(schema)
+    }
+}
+
+/// Pull the JSON schema out of an OpenAI `response_format`, closed over
+/// its properties. Anthropic requires every object in the schema to carry
+/// `additionalProperties: false` on both paths — the native field rejects
+/// an open object outright, and a tool `input_schema` that leaves one
+/// open invites the model to invent members — so the schema is closed
+/// regardless of the caller's `strict` flag. This is the mirror of
+/// [`anthropic_output_format_to_response_format`], which closes the same
+/// way in the other direction.
+fn response_format_schema(response_format: &serde_json::Value) -> Option<serde_json::Value> {
+    if response_format.get("type").and_then(|t| t.as_str())? != "json_schema" {
+        return None;
+    }
+    let mut schema = response_format
+        .get("json_schema")?
+        .get("schema")
+        .filter(|s| !s.is_null())?
+        .clone();
+    close_object_schemas(&mut schema);
+    Some(schema)
+}
+
+/// Whether `model` names a Claude family that accepts Anthropic's native
+/// structured-output control, `output_config.format`. That is Claude 4.5
+/// and later: `claude-{sonnet,opus,haiku}-4-5`, every `claude-*-4-6` and
+/// above, and every `claude-*-5*`.
+///
+/// The gateway holds only the operator-supplied upstream model name — it
+/// has no capability map — so the family version is read off the name.
+/// Anthropic has used two orderings (`claude-3-5-haiku-…` and
+/// `claude-sonnet-4-5-…`), so the version is the first one- or two-digit
+/// segment rather than a fixed position; the trailing release date is
+/// eight digits and so can never be mistaken for a minor, which is what
+/// keeps `claude-sonnet-4-20250514` at 4.0. `@` splits alongside `-` for
+/// the `claude-sonnet-4-5@20250929` spelling.
+///
+/// Everything this returns `false` for — older Claude families, unparsable
+/// names, and every non-Claude name reached through an
+/// Anthropic-compatible endpoint — takes the tool path, which needs no
+/// capability beyond tool calling.
+pub fn supports_native_structured_output(model: &str) -> bool {
+    claude_family_version(model).is_some_and(|version| version >= (4, 5))
+}
+
+fn claude_family_version(model: &str) -> Option<(u32, u32)> {
+    let lowered = model.trim().to_ascii_lowercase();
+    let segments: Vec<&str> = lowered.split(['-', '@']).collect();
+    if segments.first()? != &"claude" {
+        return None;
+    }
+    // A version segment is one or two digits; anything longer is a
+    // release date (`20250514`) or a build id, never a family number.
+    fn is_version(s: &str) -> bool {
+        (1..=2).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
+    }
+    let major_at = segments.iter().position(|s| is_version(s))?;
+    let major: u32 = segments[major_at].parse().ok()?;
+    let minor = segments
+        .get(major_at + 1)
+        .filter(|s| is_version(s))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    Some((major, minor))
 }
 
 /// Rewrite an OpenAI-shape `reasoning_effort` into Anthropic's effort
@@ -1259,6 +1418,104 @@ pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
         finish_reason: map_stop_reason(raw.stop_reason.as_deref()),
         usage,
     }
+}
+
+/// Undo the tool path: turn the model's call to the synthetic
+/// [`JSON_TOOL_NAME`] tool back into the plain JSON content the caller
+/// asked for. Only ever applied to a response whose request carried
+/// [`StructuredOutput::Tool`], so a caller's own tool of that name is
+/// never touched.
+///
+/// The call's arguments are already the JSON-encoded tool input, which is
+/// exactly the document the schema describes. When it is the only call
+/// the response becomes an ordinary text completion — no `tool_calls`, and
+/// `stop_reason: tool_use` demoted to `stop`, which is what a client that
+/// never offered a tool must see. When the model called real tools
+/// alongside it, those and their finish reason are left untouched and the
+/// JSON is appended to the content.
+pub fn unwrap_json_tool_call(resp: &mut ChatResponse) {
+    let mut json_parts: Vec<String> = Vec::new();
+    let mut real_calls_remain = false;
+    if let Some(serde_json::Value::Array(calls)) = resp.message.extra.get_mut("tool_calls") {
+        calls.retain(|call| {
+            let name = call
+                .pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default();
+            if name != JSON_TOOL_NAME {
+                return true;
+            }
+            if let Some(args) = call.pointer("/function/arguments").and_then(|a| a.as_str()) {
+                json_parts.push(args.to_string());
+            }
+            false
+        });
+        real_calls_remain = !calls.is_empty();
+    }
+    if json_parts.is_empty() {
+        return;
+    }
+    if !real_calls_remain {
+        resp.message.extra.remove("tool_calls");
+        resp.finish_reason = FinishReason::Stop;
+    }
+    let json = json_parts.join("\n");
+    resp.message.content = Some(match resp.message.content.take() {
+        Some(text) if !text.is_empty() => format!("{text}\n{json}"),
+        _ => json,
+    });
+}
+
+/// Render a complete response as the chunk sequence a streaming client
+/// expects: role, content, finish, usage.
+///
+/// The tool path cannot stream — the JSON only exists once the tool call
+/// is complete — so the bridge runs that request non-streaming and
+/// fake-streams the result through here. Keeping the usage on its own
+/// terminal chunk matches what a real upstream emits, so the proxy's
+/// accounting and every downstream encoder (the Anthropic SSE re-encoder
+/// and the Responses bridge included) see an ordinary stream.
+pub fn response_into_fake_stream_chunks(resp: ChatResponse) -> Vec<ChatChunk> {
+    let ChatResponse {
+        id,
+        model,
+        message,
+        finish_reason,
+        usage,
+    } = resp;
+    let chunk = |delta, finish_reason, usage| ChatChunk {
+        id: id.clone(),
+        model: model.clone(),
+        delta,
+        finish_reason,
+        usage,
+    };
+    let tool_calls = message
+        .extra
+        .get("tool_calls")
+        .and_then(|c| c.as_array())
+        .cloned();
+    vec![
+        chunk(
+            ChatDelta {
+                role: Some(Role::Assistant),
+                ..ChatDelta::default()
+            },
+            None,
+            None,
+        ),
+        chunk(
+            ChatDelta {
+                content: Some(message.content.unwrap_or_default()),
+                tool_calls,
+                ..ChatDelta::default()
+            },
+            None,
+            None,
+        ),
+        chunk(ChatDelta::default(), Some(finish_reason), None),
+        chunk(ChatDelta::default(), None, Some(usage)),
+    ]
 }
 
 fn map_stop_reason(raw: Option<&str>) -> FinishReason {
@@ -6005,5 +6262,334 @@ mod tests {
             serde_json::to_value(parse_inbound_request_for_scan(&body).unwrap()).unwrap(),
             serde_json::to_value(parse_inbound_request(&body).unwrap()).unwrap(),
         );
+    }
+
+    // ── structured outputs: chat `response_format` → Anthropic ────────
+
+    /// A `response_format` asking for a schema, the shape both a chat
+    /// caller and the `/v1/responses` translation of `text.format` send.
+    fn json_schema_format(schema: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {"name": "answer", "schema": schema, "strict": true},
+        })
+    }
+
+    fn person_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "pet": {"type": "object", "properties": {"kind": {"type": "string"}}},
+            },
+        })
+    }
+
+    fn request_with_response_format(response_format: serde_json::Value) -> ChatFormat {
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("who are you")]);
+        req.extra.insert("response_format".into(), response_format);
+        req
+    }
+
+    fn build<'a>(req: &'a ChatFormat, upstream_model: &'a str) -> AnthropicRequest<'a> {
+        let (system, messages) = split_system(req).unwrap();
+        build_request(req, upstream_model, system, messages, false)
+    }
+
+    #[test]
+    fn native_structured_output_gate_admits_4_5_and_later_only() {
+        // Anthropic has used two name orderings and appends a release
+        // date; the gate reads the family version out of both without a
+        // capability map. Everything it rejects takes the tool path.
+        for name in [
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-5@20250929",
+            "claude-opus-4-5",
+            "claude-haiku-4-5",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8-20260101",
+            "claude-fable-5-1",
+            "claude-mythos-5",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "CLAUDE-SONNET-4-5",
+        ] {
+            assert!(
+                supports_native_structured_output(name),
+                "{name} should take the native path"
+            );
+        }
+        for name in [
+            // The bare "4" family: the trailing eight-digit release date
+            // is not a minor version.
+            "claude-sonnet-4-20250514",
+            "claude-opus-4-1",
+            "claude-opus-4-1-20250805",
+            "claude-3-7-sonnet-20250219",
+            "claude-3-5-haiku-20241022",
+            "claude-3-opus-20240229",
+            "claude-2.1",
+            "claude-instant-1.2",
+            "claude",
+            // Non-Claude names reached through an Anthropic-compatible
+            // endpoint, and Bedrock/Vertex-prefixed spellings.
+            "glm-4.5",
+            "deepseek-chat",
+            "anthropic.claude-sonnet-4-5-v1:0",
+            "",
+        ] {
+            assert!(
+                !supports_native_structured_output(name),
+                "{name} should take the tool path"
+            );
+        }
+    }
+
+    #[test]
+    fn native_path_emits_output_config_format_and_closes_the_schema() {
+        let req = request_with_response_format(json_schema_format(person_schema()));
+        let built = build(&req, "claude-sonnet-4-5");
+        let format = &built.extra["output_config"]["format"];
+        assert_eq!(format["type"], "json_schema");
+        // Every object in the schema, nested ones included, is closed —
+        // Anthropic rejects an open object.
+        assert_eq!(format["schema"]["additionalProperties"], false);
+        assert_eq!(
+            format["schema"]["properties"]["pet"]["additionalProperties"],
+            false
+        );
+        // The OpenAI spelling never reaches the body, and the native
+        // path adds no tool.
+        assert!(!built.extra.contains_key("response_format"));
+        assert!(built.tools.is_none());
+        assert!(built.tool_choice.is_none());
+    }
+
+    #[test]
+    fn native_format_merges_beside_a_translated_effort() {
+        // `output_config` is a shared carrier: the format must land
+        // beside the effort `reasoning_effort` translates into, not
+        // replace it.
+        let mut req = request_with_response_format(json_schema_format(person_schema()));
+        req.extra.insert("reasoning_effort".into(), "high".into());
+        let built = build(&req, "claude-opus-4-7");
+        assert_eq!(built.extra["output_config"]["effort"], "high");
+        assert_eq!(
+            built.extra["output_config"]["format"]["type"],
+            "json_schema"
+        );
+    }
+
+    #[test]
+    fn native_format_yields_to_one_the_caller_sent_natively() {
+        let mut req = request_with_response_format(json_schema_format(person_schema()));
+        req.extra.insert(
+            "output_config".into(),
+            serde_json::json!({"format": {"type": "json_schema", "schema": {"type": "string"}}}),
+        );
+        let built = build(&req, "claude-sonnet-4-5");
+        assert_eq!(
+            built.extra["output_config"]["format"]["schema"],
+            serde_json::json!({"type": "string"})
+        );
+    }
+
+    #[test]
+    fn json_object_without_a_schema_emits_nothing_on_either_path() {
+        // Anthropic's JSON controls are schema-driven on both paths, so
+        // a schemaless `json_object` has nothing to translate into. It
+        // is still consumed — forwarding it would 400 upstream.
+        for model in ["claude-sonnet-4-5", "claude-3-5-haiku-20241022"] {
+            let req = request_with_response_format(serde_json::json!({"type": "json_object"}));
+            let built = build(&req, model);
+            assert!(!built.extra.contains_key("response_format"));
+            assert!(!built.extra.contains_key("output_config"));
+            assert!(built.tools.is_none());
+            assert!(built.tool_choice.is_none());
+        }
+    }
+
+    #[test]
+    fn tool_path_appends_the_synthetic_tool_and_forces_it() {
+        let req = request_with_response_format(json_schema_format(person_schema()));
+        let built = build(&req, "claude-3-5-haiku-20241022");
+        let tools = built.tools.as_ref().expect("synthetic tool on the wire");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], JSON_TOOL_NAME);
+        assert!(tools[0]["description"].as_str().unwrap().contains("JSON"));
+        assert_eq!(tools[0]["input_schema"]["additionalProperties"], false);
+        assert_eq!(
+            built.tool_choice,
+            Some(serde_json::json!({"type": "tool", "name": JSON_TOOL_NAME}))
+        );
+        assert!(!built.extra.contains_key("response_format"));
+        assert!(!built.extra.contains_key("output_config"));
+    }
+
+    #[test]
+    fn tool_path_keeps_the_callers_own_tools() {
+        let mut req = request_with_response_format(json_schema_format(person_schema()));
+        req.extra.insert(
+            "tools".into(),
+            serde_json::json!([{
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {"type": "object"}},
+            }]),
+        );
+        let built = build(&req, "glm-4.5");
+        let tools = built.tools.as_ref().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"], "get_weather");
+        assert_eq!(tools[1]["name"], JSON_TOOL_NAME);
+    }
+
+    #[test]
+    fn a_tool_choice_the_caller_sent_outranks_the_forced_json_tool() {
+        let mut req = request_with_response_format(json_schema_format(person_schema()));
+        req.extra.insert(
+            "tools".into(),
+            serde_json::json!([{
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {"type": "object"}},
+            }]),
+        );
+        req.extra.insert(
+            "tool_choice".into(),
+            serde_json::json!({"type": "function", "function": {"name": "get_weather"}}),
+        );
+        let built = build(&req, "glm-4.5");
+        assert_eq!(
+            built.tool_choice,
+            Some(serde_json::json!({"type": "tool", "name": "get_weather"}))
+        );
+    }
+
+    #[test]
+    fn extended_thinking_leaves_the_synthetic_tool_on_auto() {
+        // Anthropic rejects a forced tool choice beside extended
+        // thinking, so the tool is offered rather than forced.
+        let mut req = request_with_response_format(json_schema_format(person_schema()));
+        req.extra.insert(
+            "thinking".into(),
+            serde_json::json!({"type": "enabled", "budget_tokens": 2048}),
+        );
+        let built = build(&req, "claude-3-7-sonnet-20250219");
+        assert_eq!(built.tools.as_ref().unwrap()[0]["name"], JSON_TOOL_NAME);
+        assert!(built.tool_choice.is_none());
+
+        // Thinking the caller switched off is no obstacle.
+        let mut req = request_with_response_format(json_schema_format(person_schema()));
+        req.extra
+            .insert("thinking".into(), serde_json::json!({"type": "disabled"}));
+        let built = build(&req, "claude-3-7-sonnet-20250219");
+        assert_eq!(
+            built.tool_choice,
+            Some(serde_json::json!({"type": "tool", "name": JSON_TOOL_NAME}))
+        );
+    }
+
+    /// The bridge's own decode of an upstream reply that called the
+    /// synthetic tool, plus any real tool calls the model made too.
+    fn synthetic_tool_reply(extra_blocks: serde_json::Value) -> ChatResponse {
+        let mut content = vec![serde_json::json!({
+            "type": "tool_use",
+            "id": "toolu_json",
+            "name": JSON_TOOL_NAME,
+            "input": {"name": "Ada"},
+        })];
+        content.extend(extra_blocks.as_array().unwrap().iter().cloned());
+        let body = serde_json::json!({
+            "id": "msg_json_01",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-3-5-haiku-20241022",
+            "content": content,
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 9, "output_tokens": 4},
+        });
+        response_into_chat_response(serde_json::from_value(body).unwrap())
+    }
+
+    #[test]
+    fn unwrapping_the_only_synthetic_call_yields_a_plain_json_completion() {
+        let mut resp = synthetic_tool_reply(serde_json::json!([]));
+        unwrap_json_tool_call(&mut resp);
+        assert_eq!(resp.message.content.as_deref(), Some(r#"{"name":"Ada"}"#));
+        assert!(!resp.message.extra.contains_key("tool_calls"));
+        // A client that never offered a tool must not be told the model
+        // stopped to call one.
+        assert_eq!(resp.finish_reason, FinishReason::Stop);
+    }
+
+    #[test]
+    fn unwrapping_beside_a_real_call_keeps_the_real_call_and_its_finish_reason() {
+        let mut resp = synthetic_tool_reply(serde_json::json!([
+            {"type": "text", "text": "checking"},
+            {"type": "tool_use", "id": "toolu_w", "name": "get_weather", "input": {"city": "SF"}},
+        ]));
+        unwrap_json_tool_call(&mut resp);
+        let calls = resp.message.extra["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(
+            resp.message.content.as_deref(),
+            Some("checking\n{\"name\":\"Ada\"}")
+        );
+        assert_eq!(resp.finish_reason, FinishReason::ToolCalls);
+    }
+
+    #[test]
+    fn unwrapping_leaves_a_response_without_the_synthetic_call_alone() {
+        let body = serde_json::json!({
+            "id": "msg_plain",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-3-5-haiku-20241022",
+            "content": [
+                {"type": "tool_use", "id": "toolu_w", "name": "get_weather", "input": {}},
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        });
+        let mut resp = response_into_chat_response(serde_json::from_value(body).unwrap());
+        let before = serde_json::to_value(&resp).unwrap();
+        unwrap_json_tool_call(&mut resp);
+        assert_eq!(serde_json::to_value(&resp).unwrap(), before);
+    }
+
+    #[test]
+    fn fake_stream_emits_role_content_finish_and_usage_in_order() {
+        let mut resp = synthetic_tool_reply(serde_json::json!([]));
+        unwrap_json_tool_call(&mut resp);
+        let usage = resp.usage.clone();
+        let chunks = response_into_fake_stream_chunks(resp);
+        assert_eq!(chunks.len(), 4);
+        assert!(chunks.iter().all(|c| c.id == "msg_json_01"));
+        assert_eq!(chunks[0].delta.role, Some(Role::Assistant));
+        assert!(chunks[0].delta.content.is_none());
+        assert_eq!(
+            chunks[1].delta.content.as_deref(),
+            Some(r#"{"name":"Ada"}"#)
+        );
+        assert!(chunks[1].delta.tool_calls.is_none());
+        assert_eq!(chunks[2].finish_reason, Some(FinishReason::Stop));
+        assert!(chunks[0..3].iter().all(|c| c.usage.is_none()));
+        assert_eq!(chunks[3].usage, Some(usage));
+        assert!(chunks[3].finish_reason.is_none());
+    }
+
+    #[test]
+    fn fake_stream_carries_real_tool_calls_through() {
+        let mut resp = synthetic_tool_reply(serde_json::json!([
+            {"type": "tool_use", "id": "toolu_w", "name": "get_weather", "input": {"city": "SF"}},
+        ]));
+        unwrap_json_tool_call(&mut resp);
+        let chunks = response_into_fake_stream_chunks(resp);
+        let calls = chunks[1].delta.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(chunks[2].finish_reason, Some(FinishReason::ToolCalls));
     }
 }

@@ -25,8 +25,9 @@ use reqwest::{header, Client, StatusCode};
 use std::time::{Duration, Instant};
 
 use crate::wire::{
-    build_request, inject_cache_breakpoints, response_into_chat_response, split_system,
-    AnthropicResponse, AnthropicStreamEvent, StreamState,
+    build_request, inject_cache_breakpoints, response_into_chat_response,
+    response_into_fake_stream_chunks, split_system, structured_output_for, unwrap_json_tool_call,
+    AnthropicResponse, AnthropicStreamEvent, StreamState, StructuredOutput,
 };
 
 /// Matches the API header that Anthropic bakes backwards-compat into.
@@ -360,6 +361,10 @@ impl Bridge for AnthropicBridge {
         let (system, messages) =
             split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
         let mut body = build_request(req, upstream, system, messages, false);
+        let synthetic_json_tool = matches!(
+            structured_output_for(req, upstream),
+            StructuredOutput::Tool(_)
+        );
         maybe_inject_cache_breakpoints(&mut body, ctx);
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
@@ -396,7 +401,11 @@ impl Bridge for AnthropicBridge {
                 .json()
                 .await
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-            Ok(response_into_chat_response(parsed))
+            let mut chat = response_into_chat_response(parsed);
+            if synthetic_json_tool {
+                unwrap_json_tool_call(&mut chat);
+            }
+            Ok(chat)
         })
         .await
     }
@@ -408,6 +417,19 @@ impl Bridge for AnthropicBridge {
     ) -> Result<ChatChunkStream, BridgeError> {
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
+
+        // The tool path's JSON only exists once the synthetic tool call
+        // has been assembled, so it cannot be streamed as it arrives.
+        // Run the request non-streaming and fake-stream the translated
+        // result: the client sees an ordinary chunk sequence, and usage
+        // rides its own terminal chunk exactly as on a real stream.
+        if matches!(
+            structured_output_for(req, upstream),
+            StructuredOutput::Tool(_)
+        ) {
+            let chunks = response_into_fake_stream_chunks(self.chat(req, ctx).await?);
+            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+        }
 
         let (system, messages) =
             split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
