@@ -20,14 +20,13 @@ The **Surface** column shows where a capability lands: **Gateway** is the AISIX 
 | Enterprise SSO | Single sign-on through SAML and generic OIDC, beyond today's social logins. | Cloud |
 | Directory sync (SCIM) | Provision and deprovision users and groups from your identity provider. | Cloud |
 | Service accounts | Login-less, first-class principals for automated callers. | Cloud |
-| Semantic caching | Serve responses for prompts close in meaning, on top of today's exact-match cache. | Gateway |
 
 ## Next
 
 | Capability | What's planned | Surface |
 | --- | --- | --- |
 | Fine-grained authorization | Custom roles with per-resource and per-action permissions, beyond today's fixed roles and read/write scopes. | Cloud |
-| Conditional and wildcard routing | Route on request metadata, headers, and tags, and match upstreams by wildcard names such as `provider/*`. | Gateway |
+| Conditional routing | Route on request metadata and arbitrary headers, beyond today's tag-conditional targets and wildcard model names such as `provider/*`. | Gateway |
 | Prompt management | Store, version, and reuse prompt templates with variables, resolved at the gateway. | Gateway · Cloud |
 | Caller key rotation experience | Self-service key rotation in the dashboard, plus scheduled auto-rotation with a grace overlap. | Cloud |
 | Production-path playground | Run the Cloud playground through a connected AISIX gateway so it reflects real routing, caching, guardrails, and rate limiting. | Cloud |
