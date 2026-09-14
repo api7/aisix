@@ -82,14 +82,23 @@ pub fn responses_request_to_chat(model: &str, body: &Value) -> ChatFormat {
     // specified"), and the Responses API accepts requests that carry an
     // empty or hosted-tools-only list alongside one — a shape the Codex
     // CLI sends on every context compaction (AISIX-Cloud#1614).
-    if let Some(tools) = body.get("tools").and_then(responses_tools_to_chat) {
-        chat.extra.insert("tools".to_string(), tools);
-        if let Some(tc) = body
-            .get("tool_choice")
-            .and_then(responses_tool_choice_to_chat)
-        {
-            chat.extra.insert("tool_choice".to_string(), tc);
+    match body.get("tools").and_then(responses_tools_to_chat) {
+        Some(tools) => {
+            chat.extra.insert("tools".to_string(), tools);
+            if let Some(tc) = body
+                .get("tool_choice")
+                .and_then(responses_tool_choice_to_chat)
+            {
+                chat.extra.insert("tool_choice".to_string(), tc);
+            }
         }
+        // A caller that asked for a tool call and lost it to this filter
+        // gets prose back instead of an upstream 400; say so, or the
+        // downgrade is invisible from the logs.
+        None if body.get("tool_choice").is_some() => {
+            tracing::debug!("dropping tool_choice on the chat bridge: no tool survived translation")
+        }
+        None => {}
     }
     if let Some(effort) = body.pointer("/reasoning/effort").and_then(Value::as_str) {
         chat.extra

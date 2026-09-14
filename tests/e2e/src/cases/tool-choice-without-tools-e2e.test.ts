@@ -185,7 +185,7 @@ describe("tool_choice without tools is dropped at every bridge (#1614)", () => {
     expect(sent).not.toHaveProperty("tools");
   });
 
-  test("/v1/messages: an Anthropic tool_choice with no tools does not reach a chat upstream", async (ctx) => {
+  test("/v1/messages: an Anthropic tool_choice whose tools all filter out does not reach a chat upstream", async (ctx) => {
     if (!etcdReachable || !app || !chatUpstream) {
       ctx.skip();
       return;
@@ -200,6 +200,11 @@ describe("tool_choice without tools is dropped at every bridge (#1614)", () => {
         model: "tc1614-chat",
         max_tokens: 32,
         messages: [{ role: "user", content: "Summarise: hello" }],
+        // A non-empty list that translates to nothing — the Anthropic →
+        // chat converter keeps only entries carrying a `name`. Both keys
+        // must therefore be absent upstream, which an empty list here
+        // would not have proved.
+        tools: [{ description: "no name" }],
         tool_choice: { type: "auto" },
       }),
     });

@@ -449,6 +449,9 @@ pub fn build_request<'a>(
         .remove("tools")
         .and_then(translate_openai_tools_to_anthropic);
     let requested_tool_choice = extras.remove("tool_choice");
+    if tools.is_none() && requested_tool_choice.is_some() {
+        tracing::debug!("dropping tool_choice: no tool survived translation to Anthropic");
+    }
     let tool_choice = tools
         .as_ref()
         .and(requested_tool_choice)
@@ -874,8 +877,8 @@ pub fn translate_extras_to_openai_shape(extra: &mut serde_json::Map<String, serd
     // specified"), so a caller-supplied choice is dropped whenever no
     // tool survived translation — an empty list, or one holding only
     // entries this bridge cannot express (AISIX-Cloud#1614).
-    if !extra.contains_key("tools") {
-        extra.remove("tool_choice");
+    if !extra.contains_key("tools") && extra.remove("tool_choice").is_some() {
+        tracing::debug!("dropping tool_choice: no tool survived translation to OpenAI shape");
     }
 
     if let Some(effort) = reasoning_effort_for(thinking.as_ref(), output_config.as_ref()) {
@@ -3872,6 +3875,23 @@ mod tests {
             built.extra.get("custom_field"),
             Some(&serde_json::json!("kept"))
         );
+
+        // The unrecognised half of the invariant, alongside a tool list
+        // that does survive: the typed field stays empty and the value
+        // still must not fall back into `extra`.
+        let req = ChatFormat {
+            extra: {
+                let mut m = req.extra.clone();
+                m.insert("tool_choice".to_string(), serde_json::json!("bogus"));
+                m
+            },
+            ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+        };
+        let (_system, messages) = split_system(&req).unwrap();
+        let built = build_request(&req, "c-name", None, messages, false);
+        assert!(built.tools.is_some());
+        assert!(built.tool_choice.is_none());
+        assert!(!built.extra.contains_key("tool_choice"));
     }
 
     #[test]
