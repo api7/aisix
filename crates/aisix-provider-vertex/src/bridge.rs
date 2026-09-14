@@ -3042,6 +3042,37 @@ mod tests {
     }
 
     #[test]
+    fn gemini_property_ordering_matches_the_schema_as_it_goes_on_the_wire() {
+        // `propertyOrdering` is only useful if it names the properties
+        // in the order the request itself presents them; a list that
+        // disagrees with the accompanying `properties` object would fix
+        // an order the schema does not show.
+        let req = gemini_request_with_response_format(json_schema_format(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "zeta": {"type": "string"},
+                "alpha": {"type": "string"},
+                "mid": {"type": "string"},
+            },
+        })));
+        let body = serde_json::to_value(build_gemini_request(&req, "gemini-1.5-pro")).unwrap();
+        let schema = &body["generationConfig"]["responseSchema"];
+        let on_the_wire: Vec<&str> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let ordering: Vec<&str> = schema["propertyOrdering"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(ordering, on_the_wire);
+    }
+
+    #[test]
     fn gemini_json_object_asks_for_json_without_a_schema() {
         for model in ["gemini-2.5-flash", "gemini-1.5-pro"] {
             let req =
