@@ -2015,7 +2015,9 @@ fn gemini_major_version(model: &str) -> Option<u32> {
 /// reads out of `responseSchema`:
 ///
 ///   * `type` is an upper-case OpenAPI type name (`OBJECT`, `STRING`),
-///   * `additionalProperties` does not exist and is rejected,
+///   * members outside the `Schema` type — `additionalProperties`
+///     among them — do not exist and are rejected by name, which
+///     [`apply_schema_limits`] has already dealt with,
 ///   * `propertyOrdering` fixes the order the model emits an object's
 ///     members in — omitted, the order is unspecified.
 ///
@@ -2038,8 +2040,6 @@ fn rewrite_gemini_openapi_schema(schema: &mut serde_json::Value) {
     let Some(obj) = schema.as_object_mut() else {
         return;
     };
-    obj.remove("additionalProperties");
-    obj.remove("$schema");
     match obj.get_mut("type") {
         Some(serde_json::Value::String(ty)) => *ty = ty.to_ascii_uppercase(),
         // A union type (`["string","null"]`, how strict mode spells an
@@ -2066,8 +2066,20 @@ fn rewrite_gemini_openapi_schema(schema: &mut serde_json::Value) {
             rewrite_gemini_openapi_schema(property);
         }
     }
-    if let Some(items) = obj.get_mut("items") {
-        rewrite_gemini_openapi_schema(items);
+    // `items` also has the draft-07 tuple form. Gemini's `Schema.items`
+    // is a single schema, so a tuple array is a shape this dialect
+    // cannot express at all and Vertex rejects it — the same standing
+    // as an unresolvable `$ref`. The elements are still rewritten, so
+    // the two walkers agree about where schemas live and the request
+    // that goes up is the caller's own, not a half-converted one.
+    match obj.get_mut("items") {
+        Some(serde_json::Value::Array(items)) => {
+            for item in items {
+                rewrite_gemini_openapi_schema(item);
+            }
+        }
+        Some(items) => rewrite_gemini_openapi_schema(items),
+        None => {}
     }
     for key in ["anyOf", "oneOf", "allOf"] {
         if let Some(branches) = obj.get_mut(key).and_then(|b| b.as_array_mut()) {

@@ -70,6 +70,78 @@ pub fn close_object_schemas(schema: &mut serde_json::Value) {
     walk_object_schemas(schema, true);
 }
 
+/// Every member of a schema object that itself holds a schema, or a
+/// collection of them.
+///
+/// Both walkers in this module run off this one list. They used to carry
+/// their own, which is how they came to disagree and how each came to
+/// miss the applicator keywords entirely: a `maximum` under an
+/// `if`/`then` branch stayed on the wire, and the object a
+/// `Dict[str, Model]` field compiles to — `additionalProperties` in its
+/// schema form — was never sealed.
+///
+/// Three member shapes are handled: a map whose *values* are schemas
+/// (`properties`, `$defs`, `patternProperties`, `dependentSchemas`), a
+/// list of schemas (`anyOf`, `prefixItems`), and a single schema
+/// (`items`, `not`, `contains`, …) — with `items` also taking the
+/// draft-07 tuple form, so both shapes are tried for every one of those.
+/// A map's keys are never schemas and never keywords: they are names the
+/// caller chose.
+fn for_each_subschema(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    visit: &mut impl FnMut(&mut serde_json::Value),
+) {
+    const SCHEMA_MAPS: &[&str] = &[
+        "properties",
+        "patternProperties",
+        "dependentSchemas",
+        "$defs",
+        "definitions",
+    ];
+    const SCHEMA_LISTS: &[&str] = &["anyOf", "oneOf", "allOf", "prefixItems"];
+    const SCHEMA_VALUES: &[&str] = &[
+        "items",
+        "not",
+        "if",
+        "then",
+        "else",
+        "contains",
+        "propertyNames",
+        "additionalProperties",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+    ];
+
+    for key in SCHEMA_MAPS {
+        if let Some(entries) = obj.get_mut(*key).and_then(|m| m.as_object_mut()) {
+            for entry in entries.values_mut() {
+                visit(entry);
+            }
+        }
+    }
+    for key in SCHEMA_LISTS {
+        if let Some(entries) = obj.get_mut(*key).and_then(|l| l.as_array_mut()) {
+            for entry in entries {
+                visit(entry);
+            }
+        }
+    }
+    for key in SCHEMA_VALUES {
+        match obj.get_mut(*key) {
+            // The tuple form of `items`.
+            Some(serde_json::Value::Array(entries)) => {
+                for entry in entries {
+                    visit(entry);
+                }
+            }
+            // `additionalProperties: false` and friends are booleans,
+            // not schemas.
+            Some(value) if value.is_object() => visit(value),
+            _ => {}
+        }
+    }
+}
+
 /// Whether a schema node describes an object and therefore has to be
 /// sealed. `type` is not always the bare string `"object"`: the
 /// canonical strict-mode spelling of an optional nested object is the
@@ -100,39 +172,10 @@ fn walk_object_schemas(schema: &mut serde_json::Value, require_every_property: b
                 obj.insert("required".to_string(), required.into());
             }
         }
-        if let Some(properties) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
-            for property in properties.values_mut() {
-                walk_object_schemas(property, require_every_property);
-            }
-        }
     }
-    // `items` holds either one schema or, in the draft-07 tuple form, an
-    // array of them — one per position. The array form is a list of
-    // schemas, not a schema, so walking it as one would skip every
-    // element and leave those objects open.
-    match obj.get_mut("items") {
-        Some(serde_json::Value::Array(items)) => {
-            for item in items {
-                walk_object_schemas(item, require_every_property);
-            }
-        }
-        Some(items) => walk_object_schemas(items, require_every_property),
-        None => {}
-    }
-    for key in ["anyOf", "oneOf", "allOf"] {
-        if let Some(branches) = obj.get_mut(key).and_then(|b| b.as_array_mut()) {
-            for branch in branches {
-                walk_object_schemas(branch, require_every_property);
-            }
-        }
-    }
-    for key in ["$defs", "definitions"] {
-        if let Some(defs) = obj.get_mut(key).and_then(|d| d.as_object_mut()) {
-            for def in defs.values_mut() {
-                walk_object_schemas(def, require_every_property);
-            }
-        }
-    }
+    for_each_subschema(obj, &mut |sub| {
+        walk_object_schemas(sub, require_every_property)
+    });
 }
 
 /// The subset of JSON Schema one provider's constrained decoder accepts.
@@ -206,7 +249,17 @@ pub const GEMINI_OPENAPI_SCHEMA_LIMITS: SchemaLimits = SchemaLimits {
         "multipleOf",
         "uniqueItems",
     ],
+    // Everything the `Schema` type has no member for, taken from
+    // Google's own discovery document rather than from prose:
+    // `GET https://generativelanguage.googleapis.com/$discovery/rest?version=v1beta`,
+    // whose `schemas.Schema.properties` is exactly `anyOf`, `default`,
+    // `description`, `enum`, `example`, `format`, `items`, `maxItems`,
+    // `maxLength`, `maxProperties`, `maximum`, `minItems`, `minLength`,
+    // `minProperties`, `minimum`, `nullable`, `pattern`, `properties`,
+    // `propertyOrdering`, `required`, `title`, `type`. Anything else is
+    // rejected by name, so it cannot simply ride along.
     dropped_keywords: &[
+        "additionalProperties",
         "allOf",
         "not",
         "if",
@@ -216,7 +269,20 @@ pub const GEMINI_OPENAPI_SCHEMA_LIMITS: SchemaLimits = SchemaLimits {
         "contains",
         "patternProperties",
         "prefixItems",
+        "propertyNames",
+        "dependentSchemas",
+        "dependentRequired",
         "unevaluatedProperties",
+        "unevaluatedItems",
+        "readOnly",
+        "writeOnly",
+        "deprecated",
+        "contentEncoding",
+        "contentMediaType",
+        "$schema",
+        "$id",
+        "$comment",
+        "$anchor",
     ],
     allowed_min_items: None,
     relax_one_of: true,
@@ -273,40 +339,12 @@ fn narrow_schema_node(schema: &mut serde_json::Value, limits: &SchemaLimits) {
         }
     }
 
-    // Only the positions that hold a schema are descended into. A blind
-    // walk over every member would read the keys of `properties` as
-    // keywords, so a caller whose document has a field called `minimum`
-    // or `const` would lose that field and gain a `description` built
-    // out of its own property names.
-    if let Some(properties) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
-        for property in properties.values_mut() {
-            narrow_schema_node(property, limits);
-        }
-    }
-    // Both `items` forms — one schema, or the draft-07 tuple array.
-    match obj.get_mut("items") {
-        Some(serde_json::Value::Array(items)) => {
-            for item in items {
-                narrow_schema_node(item, limits);
-            }
-        }
-        Some(items) => narrow_schema_node(items, limits),
-        None => {}
-    }
-    for key in ["anyOf", "oneOf", "allOf"] {
-        if let Some(branches) = obj.get_mut(key).and_then(|b| b.as_array_mut()) {
-            for branch in branches {
-                narrow_schema_node(branch, limits);
-            }
-        }
-    }
-    for key in ["$defs", "definitions"] {
-        if let Some(defs) = obj.get_mut(key).and_then(|d| d.as_object_mut()) {
-            for def in defs.values_mut() {
-                narrow_schema_node(def, limits);
-            }
-        }
-    }
+    // Every position that holds a schema, from the one list both walkers
+    // read. A blind walk over the members would read the keys of
+    // `properties` as keywords, so a caller whose document has a field
+    // called `minimum` or `const` would lose that field and gain a
+    // `description` built out of its own property names.
+    for_each_subschema(obj, &mut |sub| narrow_schema_node(sub, limits));
 }
 
 /// Render a constraint value for the description note. Strings keep
@@ -350,10 +388,22 @@ fn inline_internal_refs(schema: &mut serde_json::Value) {
     // as the caller wrote them and the provider rejects what it cannot
     // resolve, which is the same outcome as any other unresolvable
     // reference here.
+    // Each definition's serialised size, measured once. The count alone
+    // does not bound the work: a definition carrying a few hundred
+    // kilobytes of `description` reaches a hundred megabytes well inside
+    // any sane expansion count, and that document is then serialised
+    // again on its way upstream.
+    let mut budget = RefBudget {
+        expansions: MAX_REF_EXPANSIONS,
+        bytes: MAX_REF_BYTES,
+        sizes: defs
+            .iter()
+            .map(|(name, definition)| (name.clone(), definition.to_string().len()))
+            .collect(),
+    };
     let mut working = schema.clone();
-    let mut budget = MAX_REF_EXPANSIONS;
     if !substitute_refs(&mut working, &defs, 0, &mut budget) {
-        tracing::debug!("leaving $ref in place: inlining exceeded {MAX_REF_EXPANSIONS} expansions");
+        tracing::debug!("leaving $ref in place: inlining exceeded its expansion budget");
         return;
     }
     if let Some(obj) = working.as_object_mut() {
@@ -371,9 +421,39 @@ const MAX_REF_DEPTH: usize = 8;
 
 /// Total `$ref` expansions allowed for one schema. Comfortably above
 /// any hand-written or generated schema — a large typed model produces
-/// tens — and far below the point where expansion costs real time or
-/// memory.
+/// tens — and far below the point where expansion costs real time.
 const MAX_REF_EXPANSIONS: usize = 2_000;
+
+/// Total bytes of definition allowed to be spliced in. The count bounds
+/// how many times a definition is copied; this bounds how large the
+/// copies are, which is the half that decides how much memory the
+/// expanded schema — and its re-serialisation on the way upstream —
+/// occupies.
+const MAX_REF_BYTES: usize = 4 * 1024 * 1024;
+
+/// What one inlining pass is allowed to spend.
+struct RefBudget {
+    expansions: usize,
+    bytes: usize,
+    /// Serialised size of each definition, by the key that reaches it.
+    sizes: std::collections::HashMap<String, usize>,
+}
+
+impl RefBudget {
+    /// Charge one expansion of `name`. `false` once either half is gone.
+    fn charge(&mut self, name: &str) -> bool {
+        let Some(expansions) = self.expansions.checked_sub(1) else {
+            return false;
+        };
+        let size = self.sizes.get(name).copied().unwrap_or(0);
+        let Some(bytes) = self.bytes.checked_sub(size) else {
+            return false;
+        };
+        self.expansions = expansions;
+        self.bytes = bytes;
+        true
+    }
+}
 
 /// Expand every resolvable internal `$ref` in `node`. Returns `false`
 /// when `budget` ran out, in which case `node` is left partly rewritten
@@ -382,7 +462,7 @@ fn substitute_refs(
     node: &mut serde_json::Value,
     defs: &serde_json::Map<String, serde_json::Value>,
     depth: usize,
-    budget: &mut usize,
+    budget: &mut RefBudget,
 ) -> bool {
     if let Some(array) = node.as_array_mut() {
         for item in array {
@@ -405,10 +485,9 @@ fn substitute_refs(
         if depth >= MAX_REF_DEPTH {
             return true; // recursive chain: leave the `$ref` in place
         }
-        let Some(remaining) = budget.checked_sub(1) else {
+        if !budget.charge(name) {
             return false;
-        };
-        *budget = remaining;
+        }
         let mut expanded = definition.clone();
         if !substitute_refs(&mut expanded, defs, depth + 1, budget) {
             return false;
@@ -976,6 +1055,156 @@ mod tests {
             schema["properties"]["c"]["items"]["properties"]["leaf"]["type"],
             "string"
         );
+    }
+
+    /// Every position a sub-schema can sit in, with the node to place
+    /// there and the pointer that reaches it once placed. Both walkers
+    /// run off one list, so a position missing from that list is missing
+    /// from both — which is how the applicator keywords came to be
+    /// skipped by each of them at once.
+    fn subschema_positions() -> Vec<(&'static str, serde_json::Value, &'static str)> {
+        let object = serde_json::json!({"type": "object", "properties": {"n": {"type": "string"}}});
+        vec![
+            (
+                "properties",
+                serde_json::json!({"child": object}),
+                "/properties/child",
+            ),
+            ("items", object.clone(), "/items"),
+            ("items (tuple)", serde_json::json!([object]), "/items/0"),
+            ("prefixItems", serde_json::json!([object]), "/prefixItems/0"),
+            ("anyOf", serde_json::json!([object]), "/anyOf/0"),
+            ("allOf", serde_json::json!([object]), "/allOf/0"),
+            ("$defs", serde_json::json!({"D": object}), "/$defs/D"),
+            (
+                "definitions",
+                serde_json::json!({"D": object}),
+                "/definitions/D",
+            ),
+            (
+                "additionalProperties",
+                object.clone(),
+                "/additionalProperties",
+            ),
+            (
+                "patternProperties",
+                serde_json::json!({"^a": object}),
+                "/patternProperties/^a",
+            ),
+            (
+                "dependentSchemas",
+                serde_json::json!({"a": object}),
+                "/dependentSchemas/a",
+            ),
+            ("not", object.clone(), "/not"),
+            ("if", object.clone(), "/if"),
+            ("then", object.clone(), "/then"),
+            ("else", object.clone(), "/else"),
+            ("contains", object.clone(), "/contains"),
+            ("propertyNames", object.clone(), "/propertyNames"),
+            (
+                "unevaluatedProperties",
+                object.clone(),
+                "/unevaluatedProperties",
+            ),
+            ("unevaluatedItems", object, "/unevaluatedItems"),
+        ]
+    }
+
+    #[test]
+    fn sealing_reaches_every_sub_schema_position() {
+        for (name, value, pointer) in subschema_positions() {
+            let mut schema = serde_json::json!({});
+            schema[name.split_whitespace().next().unwrap()] = value;
+            seal_object_schemas(&mut schema);
+            assert_eq!(
+                schema
+                    .pointer(pointer)
+                    .and_then(|s| s.get("additionalProperties")),
+                Some(&serde_json::Value::Bool(false)),
+                "{name}: the schema under {pointer} was never sealed"
+            );
+        }
+    }
+
+    #[test]
+    fn narrowing_reaches_every_sub_schema_position() {
+        for (name, value, pointer) in subschema_positions() {
+            let key = name.split_whitespace().next().unwrap();
+            // Put a constraint the Anthropic subset rejects on the leaf,
+            // so reaching the node is observable.
+            let mut value = value;
+            let leaf_pointer = pointer.trim_start_matches(&format!("/{key}")).to_string();
+            let leaf = match leaf_pointer.as_str() {
+                "" => &mut value,
+                p => value.pointer_mut(p).unwrap(),
+            };
+            leaf["properties"]["n"]["maxLength"] = 7.into();
+
+            let mut schema = serde_json::json!({});
+            schema[key] = value;
+            apply_schema_limits(&mut schema, &ANTHROPIC_SCHEMA_LIMITS);
+
+            let leaf = schema
+                .pointer(&format!("{pointer}/properties/n"))
+                .unwrap_or_else(|| panic!("{name}: {pointer} vanished"));
+            assert!(
+                leaf.get("maxLength").is_none(),
+                "{name}: maxLength under {pointer} reached the wire"
+            );
+            assert_eq!(leaf["description"], "maxLength: 7", "{name}");
+        }
+    }
+
+    #[test]
+    fn a_definition_too_large_to_splice_is_left_as_a_reference() {
+        // The expansion COUNT alone does not bound the work. This schema
+        // is nowhere near the count budget — twenty references, no
+        // recursion — but each one splices in 400KB, so the document
+        // that would go upstream is megabytes of duplicated text, and it
+        // is serialised again on the way out.
+        let big = "x".repeat(400 * 1024);
+        let mut properties = serde_json::Map::new();
+        for i in 0..20 {
+            properties.insert(format!("f{i}"), serde_json::json!({"$ref": "#/$defs/Big"}));
+        }
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": properties,
+            "$defs": {"Big": {"type": "string", "description": big}},
+        });
+
+        let mut narrowed = schema.clone();
+        apply_schema_limits(&mut narrowed, &GEMINI_OPENAPI_SCHEMA_LIMITS);
+
+        // Sent exactly as the caller wrote it, references intact; the
+        // provider says why it cannot take them.
+        assert_eq!(narrowed["properties"]["f0"]["$ref"], "#/$defs/Big");
+        assert!(narrowed["$defs"]["Big"].is_object());
+        assert!(
+            narrowed.to_string().len() < 2 * big.len(),
+            "nothing should have been spliced in"
+        );
+    }
+
+    #[test]
+    fn a_handful_of_large_references_still_inlines() {
+        // The byte budget must not be so tight that an ordinary schema
+        // with a couple of well-documented models stops inlining.
+        let text = "x".repeat(8 * 1024);
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": {"$ref": "#/$defs/Doc"},
+                "b": {"$ref": "#/$defs/Doc"},
+            },
+            "$defs": {"Doc": {"type": "string", "description": text}},
+        });
+        let mut narrowed = schema;
+        apply_schema_limits(&mut narrowed, &GEMINI_OPENAPI_SCHEMA_LIMITS);
+        assert!(narrowed.get("$defs").is_none());
+        assert_eq!(narrowed["properties"]["a"]["type"], "string");
+        assert_eq!(narrowed["properties"]["b"]["type"], "string");
     }
 
     #[test]

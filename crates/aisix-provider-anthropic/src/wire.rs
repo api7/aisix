@@ -565,8 +565,15 @@ pub fn build_request<'a>(
 /// never be called for as long as `response_format` is set — the loop
 /// would simply stop working. The gateway forces only when the client
 /// left the choice unstated entirely.
+///
+/// An explicit JSON `null` counts as unstated: it is the wire spelling
+/// of "unset" that SDKs emit for an absent optional, and nothing
+/// downstream makes a choice out of it either — the translation maps it
+/// to no `tool_choice` at all. Reading it as a preference would leave a
+/// request that asks for JSON, forces nothing and states nothing, so
+/// the model answers in prose.
 pub fn tool_choice_states_a_preference(tool_choice: Option<&serde_json::Value>) -> bool {
-    tool_choice.is_some()
+    tool_choice.is_some_and(|choice| !choice.is_null())
 }
 
 /// Where a request's OpenAI `response_format` lands on the Anthropic wire.
@@ -6474,13 +6481,21 @@ mod tests {
             );
         }
 
-        // With no choice stated at all, the gateway forces.
-        req.extra.remove("tool_choice");
-        let built = build(&req, "glm-4.5");
-        assert_eq!(
-            built.tool_choice,
-            Some(serde_json::json!({"type": "tool", "name": JSON_TOOL_NAME}))
-        );
+        // With no choice stated at all, the gateway forces — and an
+        // explicit JSON `null` is the wire spelling of unstated, which
+        // SDKs emit for an absent optional.
+        for unstated in [None, Some(serde_json::Value::Null)] {
+            match unstated {
+                Some(v) => req.extra.insert("tool_choice".into(), v),
+                None => req.extra.remove("tool_choice"),
+            };
+            let built = build(&req, "glm-4.5");
+            assert_eq!(
+                built.tool_choice,
+                Some(serde_json::json!({"type": "tool", "name": JSON_TOOL_NAME})),
+                "an unstated tool_choice must not suppress the forcing"
+            );
+        }
     }
 
     #[test]
