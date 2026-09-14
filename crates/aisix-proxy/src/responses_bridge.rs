@@ -11,12 +11,14 @@
 //! path of `/v1/messages` (`messages::cross_provider_dispatch`).
 //!
 //! Only the Responses fields that map cleanly onto chat completions are
-//! carried (`instructions`, `input`, `tools`, `tool_choice`,
-//! `temperature`, `top_p`, `max_output_tokens`, `stream`, and
-//! `reasoning.effort`). Other OpenAI-only knobs (`store`,
-//! `previous_response_id`, `text`, …) are dropped rather than forwarded —
-//! the downstream provider bridges flatten unknown `extra` fields onto the
-//! upstream wire, where an OpenAI-only key would 400 (e.g. Anthropic).
+//! carried (`instructions`, `input` — including its image / file / audio
+//! content parts —, `tools`, `tool_choice`, `temperature`, `top_p`,
+//! `max_output_tokens`, `stream`, `reasoning.effort`, and `text.format` as
+//! `response_format`). Other OpenAI-only knobs (`store`,
+//! `previous_response_id`, `text.verbosity`, …) are dropped rather than
+//! forwarded — the downstream provider bridges flatten unknown `extra`
+//! fields onto the upstream wire, where an OpenAI-only key would 400 (e.g.
+//! Anthropic).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -104,6 +106,15 @@ pub fn responses_request_to_chat(model: &str, body: &Value) -> ChatFormat {
         chat.extra
             .insert("reasoning_effort".to_string(), effort.into());
     }
+    // Structured outputs: Responses spells them `text.format`, chat spells
+    // them `response_format`. Dropping the field made a caller that asked for
+    // a schema get prose back.
+    if let Some(rf) = body
+        .get("text")
+        .and_then(responses_text_format_to_response_format)
+    {
+        chat.extra.insert("response_format".to_string(), rf);
+    }
     chat
 }
 
@@ -147,12 +158,15 @@ fn append_input_item(messages: &mut Vec<ChatMessage>, item: &Value) {
                 .unwrap_or_default();
             let output = item
                 .get("output")
-                .map(responses_content_text)
-                .unwrap_or_default();
+                .map(function_call_output_to_chat)
+                .unwrap_or_else(|| ChatContent {
+                    text: String::new(),
+                    blocks: None,
+                });
             messages.push(ChatMessage {
                 role: Role::Tool,
-                content: Some(output),
-                content_blocks: None,
+                content: Some(output.text),
+                content_blocks: output.blocks,
                 name: None,
                 tool_call_id: Some(call_id.to_string()),
                 extra: Map::new(),
@@ -163,18 +177,24 @@ fn append_input_item(messages: &mut Vec<ChatMessage>, item: &Value) {
         // A `message` item (or an untyped `{role, content}` element).
         _ => {
             let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-            let text = item
+            let content = item
                 .get("content")
-                .map(responses_content_text)
-                .unwrap_or_default();
-            if text.is_empty() {
+                .map(responses_content_to_chat)
+                .unwrap_or_else(|| ChatContent {
+                    text: String::new(),
+                    blocks: None,
+                });
+            // A turn made only of images / files / audio still has to reach
+            // the upstream: it carries an array `content`, not the empty
+            // string that used to erase it here.
+            if content.is_empty() {
                 return;
             }
-            messages.push(match role {
-                "assistant" => ChatMessage::assistant(text),
-                "system" | "developer" => ChatMessage::system(text),
-                _ => ChatMessage::user(text),
-            });
+            messages.push(content.into_message(match role {
+                "assistant" => Role::Assistant,
+                "system" | "developer" => Role::System,
+                _ => Role::User,
+            }));
         }
     }
 }
@@ -204,18 +224,207 @@ fn push_tool_call(messages: &mut Vec<ChatMessage>, tc: Value) {
     });
 }
 
-/// Plain text of a Responses-API content slot: a bare string, or the
-/// concatenation of the `text` of an array of typed parts
-/// (`input_text` / `output_text` / `text`). Non-text parts are skipped.
-fn responses_content_text(v: &Value) -> String {
+/// A Responses-API content slot rendered for a chat message: the
+/// concatenated text of its text parts, plus the OpenAI chat content-block
+/// array when the slot carried anything a chat message can only express as
+/// blocks (an image, a file, audio).
+///
+/// `blocks` stays `None` for a text-only slot so the common case keeps the
+/// bare-string wire shape it has always had; when it is `Some`, the
+/// OpenAI-compatible bridge forwards the array verbatim and the bridges that
+/// don't speak blocks (Anthropic / Gemini / Bedrock) fall back to `text` —
+/// the documented cross-provider content limitation.
+struct ChatContent {
+    text: String,
+    blocks: Option<Vec<Value>>,
+}
+
+impl ChatContent {
+    fn into_message(self, role: Role) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: Some(self.text),
+            content_blocks: self.blocks,
+            name: None,
+            tool_call_id: None,
+            extra: Map::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.is_empty() && self.blocks.is_none()
+    }
+}
+
+/// Translate a Responses-API content slot (a bare string, or an array of
+/// typed input parts) into chat-completions content.
+///
+/// Part mapping, the OpenAI chat shape for each:
+///   * `input_text` / `output_text` / `text` → `{type:"text", text}`
+///   * `input_image` → `{type:"image_url", image_url:{url, detail?}}`, the
+///     `image_url` passed through as given (an https URL or a `data:` URL)
+///   * `input_file` → `{type:"file", file:{file_data?, filename?, file_id?}}`
+///   * `input_audio` → `{type:"input_audio", input_audio:{data, format}}`
+/// Parts that carry none of the above are skipped.
+fn responses_content_to_chat(v: &Value) -> ChatContent {
     match v {
-        Value::String(s) => s.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
+        Value::String(s) => ChatContent {
+            text: s.clone(),
+            blocks: None,
+        },
+        Value::Array(parts) => {
+            let mut text = String::new();
+            let mut blocks: Vec<Value> = Vec::new();
+            let mut has_non_text = false;
+            for part in parts {
+                // A bare string element is text, as it is at the top level.
+                if let Some(s) = part.as_str() {
+                    text.push_str(s);
+                    blocks.push(json!({"type": "text", "text": s}));
+                    continue;
+                }
+                match part.get("type").and_then(Value::as_str) {
+                    Some("input_image") => {
+                        if let Some(block) = input_image_block(part) {
+                            blocks.push(block);
+                            has_non_text = true;
+                        }
+                    }
+                    Some("input_file") => {
+                        if let Some(block) = input_file_block(part) {
+                            blocks.push(block);
+                            has_non_text = true;
+                        }
+                    }
+                    Some("input_audio") => {
+                        if let Some(block) = input_audio_block(part) {
+                            blocks.push(block);
+                            has_non_text = true;
+                        }
+                    }
+                    // `input_text` / `output_text` / `text`, and any other
+                    // part that carries a `text` member.
+                    _ => {
+                        if let Some(t) = part.get("text").and_then(Value::as_str) {
+                            text.push_str(t);
+                            blocks.push(json!({"type": "text", "text": t}));
+                        }
+                    }
+                }
+            }
+            ChatContent {
+                text,
+                // Text-only slots keep the bare-string shape.
+                blocks: has_non_text.then_some(blocks),
+            }
+        }
+        _ => ChatContent {
+            text: String::new(),
+            blocks: None,
+        },
+    }
+}
+
+/// `input_image` → the chat `image_url` part. `detail` rides along only
+/// when the caller set it, so an upstream applies its own default.
+///
+/// An `input_image` that carries only a `file_id` (an image uploaded to
+/// OpenAI's Files API) has no chat-completions equivalent — the chat part
+/// addresses an image by URL or `data:` URL and nothing else — so it maps
+/// to no block at all rather than to an `image_url` with an empty `url`,
+/// which every chat upstream rejects.
+fn input_image_block(part: &Value) -> Option<Value> {
+    let url = part
+        .get("image_url")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    let mut image_url = Map::new();
+    image_url.insert("url".to_string(), json!(url));
+    if let Some(detail) = part.get("detail").and_then(Value::as_str) {
+        image_url.insert("detail".to_string(), json!(detail));
+    }
+    Some(json!({"type": "image_url", "image_url": Value::Object(image_url)}))
+}
+
+/// `input_file` → the chat `file` part, carrying whichever of
+/// `file_data` / `filename` / `file_id` the caller sent.
+fn input_file_block(part: &Value) -> Option<Value> {
+    let mut file = Map::new();
+    for key in ["file_data", "filename", "file_id"] {
+        if let Some(v) = part.get(key).filter(|v| !v.is_null()) {
+            file.insert(key.to_string(), v.clone());
+        }
+    }
+    (!file.is_empty()).then(|| json!({"type": "file", "file": Value::Object(file)}))
+}
+
+/// `input_audio` → the chat `input_audio` part (`data` + `format`).
+fn input_audio_block(part: &Value) -> Option<Value> {
+    // The Responses part nests the pair under `input_audio`; tolerate the
+    // flattened spelling some clients send.
+    let src = part.get("input_audio").unwrap_or(part);
+    let mut audio = Map::new();
+    for key in ["data", "format"] {
+        if let Some(v) = src.get(key).filter(|v| !v.is_null()) {
+            audio.insert(key.to_string(), v.clone());
+        }
+    }
+    (!audio.is_empty()).then(|| json!({"type": "input_audio", "input_audio": Value::Object(audio)}))
+}
+
+/// A `function_call_output.output` rendered as chat `tool` content.
+///
+/// The chat `tool` role is text-first: it carries a string, or an array of
+/// parts. Only text and images translate — a file or audio part in a tool
+/// result has no `tool`-role counterpart and is dropped, and an image is
+/// forwarded as an `image_url` part, which the providers whose adapters
+/// accept multimodal tool results consume and a strict chat upstream does
+/// not. Text-only output stays a plain string.
+fn function_call_output_to_chat(output: &Value) -> ChatContent {
+    let mut content = responses_content_to_chat(output);
+    let Some(blocks) = content.blocks.take() else {
+        return content;
+    };
+    let kept: Vec<Value> = blocks
+        .into_iter()
+        .filter(|b| {
+            matches!(
+                b.get("type").and_then(Value::as_str),
+                Some("text") | Some("image_url")
+            )
+        })
+        .collect();
+    content.blocks = kept
+        .iter()
+        .any(|b| b.get("type").and_then(Value::as_str) == Some("image_url"))
+        .then_some(kept);
+    content
+}
+
+/// Translate the Responses `text.format` object into the chat
+/// `response_format` object:
+///   * `{type:"json_schema", name, schema, strict, description}` →
+///     `{type:"json_schema", json_schema:{name, schema, strict, description}}`
+///     (members the caller omitted stay omitted)
+///   * `{type:"json_object"}` → `{type:"json_object"}`
+///   * `{type:"text"}`, anything else → `None`, so the field stays off the wire
+///
+/// `text.verbosity` has no chat-completions counterpart on this path and
+/// keeps being dropped.
+fn responses_text_format_to_response_format(text: &Value) -> Option<Value> {
+    let format = text.get("format")?;
+    match format.get("type").and_then(Value::as_str)? {
+        "json_schema" => {
+            let mut schema = Map::new();
+            for key in ["name", "schema", "strict", "description"] {
+                if let Some(v) = format.get(key).filter(|v| !v.is_null()) {
+                    schema.insert(key.to_string(), v.clone());
+                }
+            }
+            Some(json!({"type": "json_schema", "json_schema": Value::Object(schema)}))
+        }
+        "json_object" => Some(json!({"type": "json_object"})),
+        _ => None,
     }
 }
 
@@ -1699,6 +1908,262 @@ mod tests {
         assert!(matches!(chat.messages[0].role, Role::User));
         assert_eq!(chat.messages[0].content_str(), "part1part2");
         assert!(matches!(chat.messages[1].role, Role::Assistant));
+    }
+
+    /// The content parts of one user message, as the OpenAI-compatible
+    /// bridge would put them on the wire.
+    fn user_blocks(body: &Value) -> Vec<Value> {
+        let chat = responses_request_to_chat("m", body);
+        chat.messages[0]
+            .content_blocks
+            .clone()
+            .expect("message carries typed content blocks")
+    }
+
+    fn image_body(image: Value) -> Value {
+        json!({
+            "model": "m",
+            "input": [{"role": "user", "content": [
+                {"type": "input_text", "text": "what is in this image?"},
+                image,
+            ]}],
+        })
+    }
+
+    #[test]
+    fn input_image_url_and_detail_become_a_chat_image_url_part() {
+        let blocks = user_blocks(&image_body(json!({
+            "type": "input_image",
+            "image_url": "https://example.com/cat.png",
+            "detail": "high",
+        })));
+        assert_eq!(
+            blocks,
+            vec![
+                json!({"type": "text", "text": "what is in this image?"}),
+                json!({"type": "image_url", "image_url": {
+                    "url": "https://example.com/cat.png",
+                    "detail": "high",
+                }}),
+            ]
+        );
+    }
+
+    #[test]
+    fn input_image_without_detail_leaves_detail_off_the_wire() {
+        let blocks = user_blocks(&image_body(json!({
+            "type": "input_image",
+            "image_url": "https://example.com/cat.png",
+        })));
+        assert_eq!(
+            blocks[1],
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}})
+        );
+    }
+
+    #[test]
+    fn data_url_image_passes_through_verbatim() {
+        let data_url = "data:image/png;base64,iVBORw0KGgo=";
+        let blocks = user_blocks(&image_body(json!({
+            "type": "input_image",
+            "image_url": data_url,
+        })));
+        assert_eq!(blocks[1]["image_url"]["url"], data_url);
+    }
+
+    /// An `input_image` addressed only by uploaded-file id has no
+    /// chat-completions counterpart; it must not become an `image_url` with
+    /// an empty `url`, which a chat upstream rejects outright.
+    #[test]
+    fn file_id_only_input_image_yields_no_image_part() {
+        let chat = responses_request_to_chat(
+            "m",
+            &image_body(json!({"type": "input_image", "file_id": "file-abc"})),
+        );
+        assert_eq!(chat.messages[0].content_str(), "what is in this image?");
+        assert!(chat.messages[0].content_blocks.is_none());
+    }
+
+    #[test]
+    fn input_file_becomes_a_chat_file_part_with_the_members_sent() {
+        let blocks = user_blocks(&json!({
+            "model": "m",
+            "input": [{"role": "user", "content": [{
+                "type": "input_file",
+                "filename": "draft.pdf",
+                "file_data": "data:application/pdf;base64,JVBERi0=",
+            }]}],
+        }));
+        assert_eq!(
+            blocks,
+            vec![json!({"type": "file", "file": {
+                "file_data": "data:application/pdf;base64,JVBERi0=",
+                "filename": "draft.pdf",
+            }})]
+        );
+    }
+
+    #[test]
+    fn input_audio_becomes_a_chat_input_audio_part() {
+        let blocks = user_blocks(&json!({
+            "model": "m",
+            "input": [{"role": "user", "content": [{
+                "type": "input_audio",
+                "input_audio": {"data": "UklGRg==", "format": "wav"},
+            }]}],
+        }));
+        assert_eq!(
+            blocks,
+            vec![json!({"type": "input_audio", "input_audio": {
+                "data": "UklGRg==",
+                "format": "wav",
+            }})]
+        );
+    }
+
+    /// A turn made only of non-text parts used to be erased: the empty
+    /// concatenated text dropped the whole message and the upstream never
+    /// saw the image.
+    #[test]
+    fn all_non_text_message_still_reaches_the_upstream() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({
+                "model": "m",
+                "input": [{"role": "user", "content": [
+                    {"type": "input_image", "image_url": "https://example.com/a.png"},
+                ]}],
+            }),
+        );
+        assert_eq!(chat.messages.len(), 1);
+        assert!(matches!(chat.messages[0].role, Role::User));
+        assert_eq!(
+            chat.messages[0].content_blocks.as_deref(),
+            Some(
+                [json!({"type": "image_url", "image_url": {"url": "https://example.com/a.png"}})]
+                    .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn text_only_message_keeps_the_bare_string_shape() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({
+                "model": "m",
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            }),
+        );
+        assert_eq!(chat.messages[0].content_str(), "hi");
+        assert!(chat.messages[0].content_blocks.is_none());
+    }
+
+    /// A tool result carrying an image forwards it as an `image_url` part;
+    /// a text-only tool result stays a plain string.
+    #[test]
+    fn tool_output_array_carries_text_and_image_parts() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({
+                "model": "m",
+                "input": [{"type": "function_call_output", "call_id": "call_1", "output": [
+                    {"type": "input_text", "text": "screenshot:"},
+                    {"type": "input_image", "image_url": "https://example.com/s.png"},
+                ]}],
+            }),
+        );
+        assert!(matches!(chat.messages[0].role, Role::Tool));
+        assert_eq!(chat.messages[0].content_str(), "screenshot:");
+        assert_eq!(
+            chat.messages[0].content_blocks.as_deref(),
+            Some(
+                [
+                    json!({"type": "text", "text": "screenshot:"}),
+                    json!({"type": "image_url", "image_url": {"url": "https://example.com/s.png"}}),
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn text_only_tool_output_array_stays_a_string() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({
+                "model": "m",
+                "input": [{"type": "function_call_output", "call_id": "c", "output": [
+                    {"type": "output_text", "text": "done"},
+                ]}],
+            }),
+        );
+        assert_eq!(chat.messages[0].content_str(), "done");
+        assert!(chat.messages[0].content_blocks.is_none());
+    }
+
+    fn response_format(text: Value) -> Option<Value> {
+        let body = json!({"model": "m", "input": "hi", "text": text});
+        responses_request_to_chat("m", &body)
+            .extra
+            .get("response_format")
+            .cloned()
+    }
+
+    #[test]
+    fn text_format_json_schema_becomes_response_format() {
+        assert_eq!(
+            response_format(json!({"format": {
+                "type": "json_schema",
+                "name": "weather",
+                "schema": {"type": "object", "properties": {"c": {"type": "number"}}},
+                "strict": true,
+                "description": "a forecast",
+            }})),
+            Some(json!({"type": "json_schema", "json_schema": {
+                "name": "weather",
+                "schema": {"type": "object", "properties": {"c": {"type": "number"}}},
+                "strict": true,
+                "description": "a forecast",
+            }}))
+        );
+    }
+
+    #[test]
+    fn text_format_json_schema_omits_the_members_the_caller_omitted() {
+        assert_eq!(
+            response_format(json!({"format": {"type": "json_schema", "name": "n"}})),
+            Some(json!({"type": "json_schema", "json_schema": {"name": "n"}}))
+        );
+    }
+
+    #[test]
+    fn text_format_json_object_becomes_response_format() {
+        assert_eq!(
+            response_format(json!({"format": {"type": "json_object"}})),
+            Some(json!({"type": "json_object"}))
+        );
+    }
+
+    #[test]
+    fn text_format_text_and_absent_text_emit_no_response_format() {
+        assert_eq!(response_format(json!({"format": {"type": "text"}})), None);
+        assert_eq!(response_format(json!({})), None);
+        let chat = responses_request_to_chat("m", &json!({"model": "m", "input": "hi"}));
+        assert!(!chat.extra.contains_key("response_format"));
+    }
+
+    /// `text.verbosity` has no chat-completions counterpart on this path —
+    /// it must not leak onto the upstream wire, where the bridges flatten
+    /// `extra` and an unknown key 400s.
+    #[test]
+    fn text_verbosity_is_not_forwarded() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({"model": "m", "input": "hi", "text": {"verbosity": "low"}}),
+        );
+        assert!(!chat.extra.contains_key("verbosity"));
+        assert!(!chat.extra.contains_key("response_format"));
     }
 
     #[test]

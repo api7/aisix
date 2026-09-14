@@ -2456,11 +2456,20 @@ async fn cross_provider_dispatch(
         downstream_latency_ms: 0,
     };
     // Token-estimation fallback (AISIX-Cloud#1074): fill counters the
-    // bridged upstream never reported. Telemetry only — the rendered
-    // Anthropic JSON below carries the upstream's own usage.
+    // bridged upstream never reported, and carry the SAME numbers into the
+    // Anthropic JSON rendered below. The client-visible usage and the usage
+    // record are one number: a caller told `output_tokens: 0` for a
+    // response it can read the text of has no way to reconcile that with
+    // what the dashboard bills. The estimate is reported in the ordinary
+    // usage shape — there is no client-facing marker saying it was
+    // estimated.
     fill_missing_anthropic_metrics(&mut metrics, &upstream_model, body, || {
         crate::chat::estimation_output_text(&resp)
     });
+    if metrics.usage_estimated {
+        resp.usage.prompt_tokens = metrics.prompt_tokens;
+        resp.usage.completion_tokens = metrics.completion_tokens;
+    }
     // Capture the prompt (the Anthropic request body) + assembled assistant
     // text for content-capturing exporters (gated); threaded to `fan_out` via
     // `DispatchOutcome`, never to the CP sink.
@@ -2802,6 +2811,30 @@ fn build_anthropic_sse_stream(
                 if encoder.is_finished() {
                     break;
                 }
+            }
+        }
+        // Token-estimation fallback (AISIX-Cloud#1074), run HERE rather than
+        // only from the Drop guard below: the closing `message_delta` this
+        // relay is about to force out carries the client-visible usage, and
+        // it must be the same number the usage record gets. The guard keeps
+        // its own copy of this fill for the stream a consumer abandoned
+        // before EOF, where no closing pair is emitted at all.
+        if let Some(est) = guard.estimator.take() {
+            let filled = {
+                let comp = guard.comp();
+                crate::token_estimate::fill_missing(
+                    &est,
+                    comp.prompt_tokens,
+                    comp.completion_tokens,
+                    Some(comp.est_output_text.as_str()),
+                )
+            };
+            if filled.estimated {
+                let comp = guard.comp();
+                comp.prompt_tokens = filled.prompt_tokens;
+                comp.completion_tokens = filled.completion_tokens;
+                comp.usage_estimated = true;
+                encoder.set_estimated_usage(filled.prompt_tokens, filled.completion_tokens);
             }
         }
         if !encoder.is_finished() {

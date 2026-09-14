@@ -2450,6 +2450,22 @@ impl AnthropicSseEncoder {
     /// usage frame exists and always reports 0, so this is the only
     /// place the client can learn the prompt token count. The same goes
     /// for the cache counters (AISIX-Cloud#1405).
+    /// Adopt locally-estimated token counts as the client-visible usage,
+    /// for a bridged stream whose upstream never sent a usage frame. The
+    /// internal usage record is filled from the same estimate, and a client
+    /// reading the closing `message_delta` must not be told
+    /// `output_tokens: 0` for a response it can read the text of
+    /// (AISIX-Cloud#1074). A no-op once a real usage frame landed, or once
+    /// the closing pair has already gone out — the client must never be
+    /// handed numbers that contradict what it was sent.
+    pub fn set_estimated_usage(&mut self, prompt_tokens: u32, completion_tokens: u32) {
+        if self.usage_seen || self.finished {
+            return;
+        }
+        self.seen_input_tokens = self.seen_input_tokens.max(prompt_tokens);
+        self.seen_output_tokens = self.seen_output_tokens.max(completion_tokens);
+    }
+
     fn closing_pair(&mut self, stop_reason: &'static str) -> Vec<AnthropicSseEvent> {
         let input = AnthropicInputUsage::from_usage(&UsageStats {
             prompt_tokens: self.seen_input_tokens,
@@ -5095,6 +5111,47 @@ mod tests {
         assert_eq!(events[0].data["usage"]["input_tokens"], 17);
         assert_eq!(events[0].data["usage"]["output_tokens"], 23);
         assert!(enc.is_finished());
+    }
+
+    /// AISIX-Cloud#1074, streaming half of the bridged `/v1/messages`
+    /// path: an upstream that never sent a usage frame left the forced
+    /// closing pair reporting `output_tokens: 0` while the usage record
+    /// carried the local estimate. The client-visible numbers are now the
+    /// recorded ones.
+    #[test]
+    fn sse_encoder_force_finish_reports_the_adopted_estimate() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "alias", 0);
+        let _ = enc.next_events(&delta_chunk("hi"));
+        enc.set_estimated_usage(31, 7);
+        let events = enc.force_finish();
+        let delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("closing pair emitted");
+        assert_eq!(delta.data["usage"]["input_tokens"], 31);
+        assert_eq!(delta.data["usage"]["output_tokens"], 7);
+    }
+
+    /// The estimate never overrides what an upstream actually reported.
+    #[test]
+    fn sse_encoder_set_estimated_usage_is_ignored_once_a_usage_frame_landed() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "alias", 0);
+        let _ = enc.next_events(&delta_chunk("hi"));
+        let events = enc.next_events(&ChatChunk {
+            id: "cmpl-1".into(),
+            model: "u".into(),
+            delta: ChatDelta::default(),
+            finish_reason: Some(FinishReason::Stop),
+            usage: Some(UsageStats::new(5, 2)),
+        });
+        enc.set_estimated_usage(900, 900);
+        let delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("closing pair emitted");
+        assert_eq!(delta.data["usage"]["input_tokens"], 5);
+        assert_eq!(delta.data["usage"]["output_tokens"], 2);
+        assert!(enc.force_finish().is_empty());
     }
 
     /// AISIX-Cloud#1405, streaming half: an OpenAI-compatible upstream
