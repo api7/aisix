@@ -432,10 +432,12 @@ pub struct ToolsListCounts {
 pub struct McpGateway {
     upstreams: Arc<[NamedUpstream]>,
     tool_acl: ToolAcl,
-    /// This request's `tools/list` counts, written once by the handler and
-    /// read by the mount when it emits the access log. Shared with every
-    /// clone the transport makes, and scoped to one request because the
-    /// gateway itself is built per request.
+    /// The `tools/list` counts, written once by the handler and read by the
+    /// mount when it emits the access log. Shared with every clone the
+    /// transport makes. It holds the FIRST list a gateway served, which is
+    /// the request's own only for a per-request gateway — the `/mcp` mount
+    /// builds one from `*_for_request`; a gateway kept alive across requests
+    /// (conformance server, tests) keeps the first numbers forever.
     tools_list: Arc<OnceLock<ToolsListCounts>>,
     /// When set, this gateway serves exactly one upstream under its **original**
     /// tool names: `tools/list` strips the `<server>__` namespace prefix and
@@ -510,7 +512,9 @@ impl McpGateway {
     /// after the transport has run the handler. Clone it BEFORE handing the
     /// gateway to [`streamable_http_service`] — the slot is shared with every
     /// clone the transport makes, so the counts the handler writes are
-    /// visible through this handle.
+    /// visible through this handle. Only meaningful on a gateway built per
+    /// request ([`McpGateway::from_snapshot_for_request`] and its scoped
+    /// twin); the slot is written once for the life of the gateway.
     pub fn tools_list_counts(&self) -> Arc<OnceLock<ToolsListCounts>> {
         self.tools_list.clone()
     }

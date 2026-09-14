@@ -42,7 +42,8 @@ const MCP_MODEL_LABEL: &str = "mcp";
 #[derive(Default)]
 struct McpRequestLog {
     /// JSON-RPC `method`, absent when the body is not a single JSON-RPC
-    /// message (a batch, or unparsable) — never invented.
+    /// message (a batch, or unparsable) — never invented. Truncated like
+    /// `tool`: an unknown method is caller-controlled text.
     method: Option<String>,
     /// `tools/call` only: the tool name as the caller spelled it, which is
     /// the namespaced `<server>__<tool>` form on `/mcp`, truncated to
@@ -52,7 +53,7 @@ struct McpRequestLog {
     tools: Option<aisix_mcp::ToolsListCounts>,
 }
 
-/// Cap for a caller-controlled string on the access line — the same bound
+/// Cap for the caller-controlled strings on the access line — the same bound
 /// the telemetry sinks apply to the tool name, on a UTF-8 boundary.
 const MAX_LOGGED_TOOL_BYTES: usize = 256;
 
@@ -347,7 +348,10 @@ async fn dispatch(
     // as one that reaches the gateway (#1181). The tool name is capped the
     // way the telemetry sinks cap it — it is caller-controlled and bounded
     // only by the body limit.
-    log.method = peek.as_ref().and_then(|p| p.method.clone());
+    log.method = peek
+        .as_ref()
+        .and_then(|p| p.method.as_deref())
+        .map(truncate_for_log);
     log.tool = is_tool_call
         .then(|| {
             peek.as_ref()
