@@ -230,6 +230,39 @@ describe("mcp request logging e2e: JSON-RPC method, tool counts, ACL warning", (
     expect(warns).toEqual([]);
   });
 
+  test("a request the protocol gate rejects still names its method", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+
+    // 400 before the gateway is ever built — the line the operator sees for
+    // it is this access line, so the method has to survive the early return.
+    const res = await fetch(`${app.proxyUrl}/mcp`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${KEY_GRANTED}`,
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "mcp-protocol-version": "2024-11-05",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 9,
+        method: "tools/list",
+        params: {},
+      }),
+    });
+    expect(res.status).toBe(400);
+
+    const line = await waitForLine(
+      (l) =>
+        l.includes("proxy request completed") &&
+        l.includes(`api_key_id="${keyIds[KEY_GRANTED]}"`) &&
+        l.includes('mcp_method="tools/list"') &&
+        l.includes("status=400"),
+      "the access-log line for the rejected protocol version",
+    );
+    expect(line).not.toContain("tools_total");
+  });
+
   test("tools/call names the tool; the handshake names itself", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
 

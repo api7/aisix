@@ -44,11 +44,24 @@ struct McpRequestLog {
     /// JSON-RPC `method`, absent when the body is not a single JSON-RPC
     /// message (a batch, or unparsable) — never invented.
     method: Option<String>,
-    /// `tools/call` only: the tool name exactly as the caller spelled it,
-    /// which is the namespaced `<server>__<tool>` form on `/mcp`.
+    /// `tools/call` only: the tool name as the caller spelled it, which is
+    /// the namespaced `<server>__<tool>` form on `/mcp`, truncated to
+    /// [`MAX_LOGGED_TOOL_BYTES`].
     tool: Option<String>,
     /// `tools/list` only: the upstream and post-ACL tool counts.
     tools: Option<aisix_mcp::ToolsListCounts>,
+}
+
+/// Cap for a caller-controlled string on the access line — the same bound
+/// the telemetry sinks apply to the tool name, on a UTF-8 boundary.
+const MAX_LOGGED_TOOL_BYTES: usize = 256;
+
+fn truncate_for_log(value: &str) -> String {
+    let mut end = MAX_LOGGED_TOOL_BYTES.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 impl McpRequestLog {
@@ -327,6 +340,23 @@ async fn dispatch(
 
     let peek = serde_json::from_slice::<JsonRpcPeek>(&bytes).ok();
 
+    let is_tool_call = peek.as_ref().and_then(|p| p.method.as_deref()) == Some("tools/call");
+    // Recorded from the SAME parse the gates below use, and BEFORE the first
+    // of them: one `/mcp` POST carries every operation, so a request the
+    // protocol-version gate rejects needs the method on its line just as much
+    // as one that reaches the gateway (#1181). The tool name is capped the
+    // way the telemetry sinks cap it — it is caller-controlled and bounded
+    // only by the body limit.
+    log.method = peek.as_ref().and_then(|p| p.method.clone());
+    log.tool = is_tool_call
+        .then(|| {
+            peek.as_ref()
+                .and_then(|p| p.params.as_ref())
+                .and_then(|p| p.name.as_deref())
+                .map(truncate_for_log)
+        })
+        .flatten();
+
     // Converge the accepted `MCP-Protocol-Version` set before any quota,
     // guardrail, or upstream work (AISIX-Cloud#1148). rmcp's own transport
     // check admits its whole hardcoded KNOWN_VERSIONS list — including
@@ -341,18 +371,6 @@ async fn dispatch(
         return response;
     }
 
-    let is_tool_call = peek.as_ref().and_then(|p| p.method.as_deref()) == Some("tools/call");
-    // Recorded from the SAME parse the gates below use — one `/mcp` POST
-    // carries every operation, so without the method the access log says
-    // nothing about what the request was (#1181).
-    log.method = peek.as_ref().and_then(|p| p.method.clone());
-    log.tool = is_tool_call
-        .then(|| {
-            peek.as_ref()
-                .and_then(|p| p.params.as_ref())
-                .and_then(|p| p.name.clone())
-        })
-        .flatten();
     // Resolve the called (server, tool) up front, owned, so it survives the
     // body being consumed when the request is rebuilt. Aggregated: split the
     // namespaced name. Scoped: the server comes from the path and the name is
