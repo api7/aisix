@@ -276,6 +276,7 @@ pub fn chat_response_to_responses_json(
 ) -> Value {
     let (status, incomplete_reason) = responses_status(&resp.finish_reason);
     let output = build_output_items(
+        message_reasoning_text(&resp.message),
         resp.message.content.as_deref(),
         resp.message
             .extra
@@ -308,10 +309,53 @@ fn responses_status(fr: &FinishReason) -> (&'static str, Option<&'static str>) {
     }
 }
 
-/// Assemble the `output` array: a `message` item carrying the assistant
+/// A completed `reasoning` output item. The chain-of-thought rides a
+/// `summary_text` part — the slot the Responses API defines for the
+/// human-readable reasoning a client is allowed to render (its `content`
+/// parts are the provider's own opaque/`reasoning_text` material, which a
+/// chat upstream does not give us).
+fn reasoning_item_json(item_id: &str, text: &str) -> Value {
+    json!({
+        "type": "reasoning",
+        "id": item_id,
+        "status": "completed",
+        "summary": [{"type": "summary_text", "text": text}],
+    })
+}
+
+/// The upstream's chain-of-thought on a bridged non-streaming response.
+///
+/// The OpenAI-compatible response parser already normalises both spellings
+/// the ecosystem uses — `message.reasoning_content` (DeepSeek / GLM / Qwen /
+/// vLLM / SGLang) and `message.reasoning` (aggregators) — into this one
+/// canonical slot on the way into [`ChatMessage`], so the bridge reads the
+/// slot rather than re-deriving the spellings here.
+fn message_reasoning_text(message: &ChatMessage) -> Option<&str> {
+    message
+        .extra
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+/// Assemble the `output` array: a `reasoning` item carrying the upstream's
+/// chain-of-thought (when any), then a `message` item carrying the assistant
 /// text (when any), followed by one `function_call` item per tool call.
-fn build_output_items(text: Option<&str>, tool_calls: Option<&Vec<Value>>) -> Vec<Value> {
+fn build_output_items(
+    reasoning: Option<&str>,
+    text: Option<&str>,
+    tool_calls: Option<&Vec<Value>>,
+) -> Vec<Value> {
     let mut output: Vec<Value> = Vec::new();
+    // Reasoning leads the output array, as it does on a native Responses
+    // upstream: a client renders the items in order, and the thinking that
+    // produced an answer belongs before it.
+    if let Some(reasoning) = reasoning {
+        output.push(reasoning_item_json(
+            &format!("rs_{}", Uuid::new_v4().simple()),
+            reasoning,
+        ));
+    }
     if let Some(text) = text.filter(|s| !s.is_empty()) {
         output.push(json!({
             "type": "message",
@@ -393,6 +437,20 @@ fn responses_usage_json(u: &UsageStats) -> Value {
 //   → response.function_call_arguments.done
 //   → response.output_item.done (function_call)
 //
+// A chat upstream that streams its chain-of-thought (`delta
+// .reasoning_content`) adds a `reasoning` item ahead of whatever it was
+// reasoning towards:
+//   response.output_item.added (reasoning)
+//   → response.reasoning_summary_part.added
+//   → response.reasoning_summary_text.delta ×N
+//   → response.reasoning_summary_text.done
+//   → response.reasoning_summary_part.done
+//   → response.output_item.done (reasoning)
+// It is closed by the first content/tool-call delta that follows (or by the
+// finish), so the message / function_call item that follows opens at the
+// NEXT output_index. Reasoning that arrives after a message item is already
+// open opens a further reasoning item rather than reopening the closed one.
+//
 // `response.completed` carries the final output + usage. When an
 // OpenAI-compatible upstream sends its usage frame AFTER the finish chunk
 // (`stream_options.include_usage`), the completed event is withheld until
@@ -416,6 +474,15 @@ impl ResponsesSseEvent {
             serde_json::to_string(&self.data).expect("serde_json::Value always serializes"),
         )
     }
+}
+
+/// Per-reasoning-item streaming state. One `reasoning` output item and the
+/// single `summary_text` part it streams into.
+#[derive(Debug)]
+struct ReasoningState {
+    item_id: String,
+    output_index: u32,
+    text: String,
 }
 
 /// Per-tool-call streaming state.
@@ -447,6 +514,11 @@ pub struct ResponsesSseEncoder {
     /// Set once the per-item `*.done` events have been emitted, so
     /// `close_items` is idempotent across the finish chunk + `force_finish`.
     items_closed: bool,
+    /// The reasoning item currently streaming, if any.
+    reasoning_open: Option<ReasoningState>,
+    /// Reasoning items already closed, kept so `response.completed` can
+    /// rebuild them into the final `output` array.
+    reasoning_done: Vec<ReasoningState>,
     // Tool-call items keyed by the OpenAI delta index.
     tool_calls: std::collections::BTreeMap<u64, ToolCallState>,
     /// Withheld terminal status + incomplete reason while waiting on a
@@ -483,6 +555,8 @@ impl ResponsesSseEncoder {
             text_output_index: 0,
             text_accum: String::new(),
             items_closed: false,
+            reasoning_open: None,
+            reasoning_done: Vec::new(),
             tool_calls: std::collections::BTreeMap::new(),
             pending_status: None,
             pending_reason: None,
@@ -531,6 +605,21 @@ impl ResponsesSseEncoder {
             self.cache_creation_tokens = self.cache_creation_tokens.max(u.cache_creation_tokens);
             self.cache_read_tokens = self.cache_read_tokens.max(u.cache_read_tokens);
         }
+    }
+
+    /// Adopt locally-estimated token counts as the client-visible usage,
+    /// for a bridged stream whose upstream never sent a usage frame. The
+    /// internal usage record is filled from the same estimate, and a client
+    /// reading `response.completed.usage` must not be told zero while the
+    /// record says otherwise (AISIX-Cloud#1074). A no-op once a real usage
+    /// frame landed, or once the terminal event has already gone out — the
+    /// client must never be handed numbers that contradict what it was sent.
+    pub fn set_estimated_usage(&mut self, prompt_tokens: u32, completion_tokens: u32) {
+        if self.usage_seen || self.finished {
+            return;
+        }
+        self.prompt_tokens = self.prompt_tokens.max(prompt_tokens);
+        self.completion_tokens = self.completion_tokens.max(completion_tokens);
     }
 
     fn usage_value(&self) -> Value {
@@ -595,6 +684,9 @@ impl ResponsesSseEncoder {
     /// Rebuild the completed `output` array from accumulated state.
     fn final_output_items(&self) -> Vec<Value> {
         let mut items: Vec<(u32, Value)> = Vec::new();
+        for r in self.reasoning_done.iter().chain(self.reasoning_open.iter()) {
+            items.push((r.output_index, reasoning_item_json(&r.item_id, &r.text)));
+        }
         if let Some(id) = self.text_item_id.as_ref() {
             items.push((
                 self.text_output_index,
@@ -652,11 +744,16 @@ impl ResponsesSseEncoder {
             .tool_calls
             .as_ref()
             .is_some_and(|v| !v.is_empty());
+        let has_reasoning = chunk
+            .delta
+            .reasoning_content
+            .as_deref()
+            .is_some_and(|s| !s.is_empty());
         let has_finish = chunk.finish_reason.is_some();
 
         let mut events = Vec::new();
 
-        if !self.sent_created && (has_content || has_tools || has_finish) {
+        if !self.sent_created && (has_content || has_tools || has_reasoning || has_finish) {
             self.sent_created = true;
             events.push(self.event(
                 "response.created",
@@ -666,6 +763,61 @@ impl ResponsesSseEncoder {
                 "response.in_progress",
                 json!({"response": self.response_object("in_progress", false, false)}),
             ));
+        }
+
+        // ── Reasoning ──
+        //
+        // Emitted before the text/tool blocks below so a chunk carrying both
+        // reasoning and content renders the thinking first, then closes the
+        // reasoning item and opens the message item after it.
+        if has_reasoning {
+            let delta = chunk.delta.reasoning_content.clone().unwrap_or_default();
+            if self.reasoning_open.is_none() {
+                let item_id = format!("rs_{}", Uuid::new_v4().simple());
+                let output_index = self.next_output_index;
+                self.next_output_index += 1;
+                self.reasoning_open = Some(ReasoningState {
+                    item_id: item_id.clone(),
+                    output_index,
+                    text: String::new(),
+                });
+                events.push(self.event(
+                    "response.output_item.added",
+                    json!({
+                        "output_index": output_index,
+                        "item": {"type": "reasoning", "id": item_id, "status": "in_progress", "summary": []},
+                    }),
+                ));
+                events.push(self.event(
+                    "response.reasoning_summary_part.added",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "summary_index": 0,
+                        "part": {"type": "summary_text", "text": ""},
+                    }),
+                ));
+            }
+            let (item_id, output_index) = {
+                let r = self.reasoning_open.as_mut().expect("just opened");
+                r.text.push_str(&delta);
+                (r.item_id.clone(), r.output_index)
+            };
+            events.push(self.event(
+                "response.reasoning_summary_text.delta",
+                json!({
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "summary_index": 0,
+                    "delta": delta,
+                }),
+            ));
+        }
+
+        // The first content or tool-call delta after a reasoning run ends it,
+        // so the item that follows opens at the next `output_index`.
+        if has_content || has_tools {
+            events.extend(self.close_reasoning());
         }
 
         // ── Text content ──
@@ -799,6 +951,44 @@ impl ResponsesSseEncoder {
         events
     }
 
+    /// Close the open `reasoning` item, if any: the summary text, then its
+    /// part, then the item. Empty when no reasoning item is open, so every
+    /// call site can invoke it unconditionally.
+    fn close_reasoning(&mut self) -> Vec<ResponsesSseEvent> {
+        let Some(r) = self.reasoning_open.take() else {
+            return Vec::new();
+        };
+        let (item_id, output_index, text) = (r.item_id.clone(), r.output_index, r.text.clone());
+        self.reasoning_done.push(r);
+        vec![
+            self.event(
+                "response.reasoning_summary_text.done",
+                json!({
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "summary_index": 0,
+                    "text": text,
+                }),
+            ),
+            self.event(
+                "response.reasoning_summary_part.done",
+                json!({
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": text},
+                }),
+            ),
+            self.event(
+                "response.output_item.done",
+                json!({
+                    "output_index": output_index,
+                    "item": reasoning_item_json(&item_id, &text),
+                }),
+            ),
+        ]
+    }
+
     /// Emit the per-item `*.done` closing events for the open text + tool
     /// items. Idempotent: a no-op after the first call, so the finish chunk
     /// and a later `force_finish` (when the completed event was withheld for
@@ -808,7 +998,9 @@ impl ResponsesSseEncoder {
             return Vec::new();
         }
         self.items_closed = true;
-        let mut events = Vec::new();
+        // A stream that ended inside its reasoning run (nothing but thinking,
+        // or a truncation) still owes the item's closing events.
+        let mut events = self.close_reasoning();
         if self.text_item_id.is_some() {
             let item_id = self.text_item_id.clone().unwrap_or_default();
             let output_index = self.text_output_index;
@@ -1180,6 +1372,33 @@ pub fn build_responses_bridge_stream(
                 }
             }
         }
+        // Token-estimation fallback (AISIX-Cloud#1074), run HERE rather than
+        // from the Drop guard below: the terminal `response.completed` this
+        // relay is about to synthesize carries the client-visible usage, and
+        // it must be the same number the usage record gets — a client told
+        // `output_tokens: 0` for a response it can see the text of has no way
+        // to reconcile that with the dashboard. The guard keeps its own copy
+        // of this fill for the stream a consumer abandoned before EOF, where
+        // no terminal event is emitted at all.
+        if let Some(est) = guard.estimator.take() {
+            let filled = {
+                let comp = guard.comp();
+                crate::token_estimate::fill_missing(
+                    &est,
+                    comp.prompt_tokens,
+                    comp.completion_tokens,
+                    Some(comp.est_output_text.as_str()),
+                )
+            };
+            if filled.estimated {
+                let comp = guard.comp();
+                comp.prompt_tokens = filled.prompt_tokens;
+                comp.completion_tokens = filled.completion_tokens;
+                comp.usage_estimated = true;
+                encoder.set_estimated_usage(filled.prompt_tokens, filled.completion_tokens);
+            }
+        }
+
         if !encoder.is_finished() {
             for ev in encoder.force_finish() {
                 let b = bytes::Bytes::from(ev.to_sse_string());
@@ -1974,5 +2193,278 @@ mod tests {
                     .collect::<std::collections::BTreeSet<_>>(),
             );
         }
+    }
+
+    // ── Reasoning on the bridged path ────────────────────────────
+
+    fn reasoning_chunk(text: &str) -> ChatChunk {
+        ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                reasoning_content: Some(text.into()),
+                ..Default::default()
+            },
+            finish_reason: None,
+            usage: None,
+        }
+    }
+
+    fn finish_chunk(usage: Option<UsageStats>) -> ChatChunk {
+        ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta::default(),
+            finish_reason: Some(FinishReason::Stop),
+            usage,
+        }
+    }
+
+    /// A chat upstream that streamed nothing but its chain-of-thought still
+    /// owes the client a complete `reasoning` item — opened, summarised,
+    /// closed — rather than an empty response.
+    #[test]
+    fn streaming_reasoning_only_emits_a_closed_reasoning_item() {
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let mut all = enc.next_events(&reasoning_chunk("think"));
+        all.extend(enc.next_events(&reasoning_chunk("ing")));
+        all.extend(enc.next_events(&finish_chunk(Some(UsageStats::new(4, 6)))));
+        assert_eq!(
+            types_of(&all),
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        let added = &all[2];
+        assert_eq!(added.data["output_index"], 0);
+        assert_eq!(added.data["item"]["type"], "reasoning");
+        let item_id = added.data["item"]["id"].as_str().unwrap().to_string();
+        assert!(item_id.starts_with("rs_"), "reasoning ids are rs_-prefixed");
+        assert_eq!(all[3].data["item_id"], item_id);
+        assert_eq!(all[3].data["summary_index"], 0);
+        assert_eq!(all[3].data["part"]["type"], "summary_text");
+        assert_eq!(all[4].data["delta"], "think");
+        assert_eq!(all[6].data["text"], "thinking");
+        assert_eq!(all[7].data["part"]["text"], "thinking");
+        assert_eq!(all[8].data["item"]["summary"][0]["text"], "thinking");
+        // …and it is the only item in the completed response.
+        let output = &all[9].data["response"]["output"];
+        assert_eq!(output.as_array().unwrap().len(), 1);
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["summary"][0]["text"], "thinking");
+        // Sequence numbers keep counting across the reasoning events.
+        let seqs: Vec<u64> = all
+            .iter()
+            .map(|e| e.data["sequence_number"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, (0..all.len() as u64).collect::<Vec<_>>());
+    }
+
+    /// Reasoning, then prose, then a tool call: each opens at the NEXT
+    /// output_index, and the reasoning item is closed before the message
+    /// item opens.
+    #[test]
+    fn streaming_reasoning_then_content_then_tool_call_advances_output_index() {
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let mut all = enc.next_events(&reasoning_chunk("why"));
+        all.extend(enc.next_events(&content_chunk("because")));
+        all.extend(enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![json!({
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "shell", "arguments": "{}"},
+                })]),
+                ..Default::default()
+            },
+            finish_reason: None,
+            usage: None,
+        }));
+        all.extend(enc.next_events(&finish_chunk(Some(UsageStats::new(1, 2)))));
+        assert_eq!(
+            types_of(&all),
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added", // reasoning
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done", // closed by the content delta
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",  // reasoning
+                "response.output_item.added", // message
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_item.added", // function_call
+                "response.function_call_arguments.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done", // message
+                "response.function_call_arguments.done",
+                "response.output_item.done", // function_call
+                "response.completed",
+            ]
+        );
+        assert_eq!(all[2].data["output_index"], 0, "reasoning leads");
+        assert_eq!(all[8].data["output_index"], 1, "message follows it");
+        assert_eq!(all[11].data["output_index"], 2, "then the tool call");
+        let output = &all.last().unwrap().data["response"]["output"];
+        let kinds: Vec<&str> = output
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, vec!["reasoning", "message", "function_call"]);
+    }
+
+    /// Reasoning that arrives after a message item is already open opens a
+    /// SECOND reasoning item at the next output_index — the already-open
+    /// message item keeps its own index and its own accumulated text.
+    #[test]
+    fn streaming_reasoning_after_content_opens_a_further_reasoning_item() {
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let mut all = enc.next_events(&content_chunk("first"));
+        all.extend(enc.next_events(&reasoning_chunk("second thoughts")));
+        all.extend(enc.next_events(&finish_chunk(Some(UsageStats::new(1, 1)))));
+        let reasoning_added: Vec<&ResponsesSseEvent> = all
+            .iter()
+            .filter(|e| {
+                e.event_type == "response.output_item.added"
+                    && e.data["item"]["type"] == "reasoning"
+            })
+            .collect();
+        assert_eq!(reasoning_added.len(), 1);
+        assert_eq!(
+            reasoning_added[0].data["output_index"], 1,
+            "the message item kept index 0; reasoning takes the next one",
+        );
+        let output = &all.last().unwrap().data["response"]["output"];
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[0]["content"][0]["text"], "first");
+        assert_eq!(output[1]["type"], "reasoning");
+        assert_eq!(output[1]["summary"][0]["text"], "second thoughts");
+    }
+
+    /// A bridged non-streaming response surfaces the upstream's
+    /// chain-of-thought as a `reasoning` item ahead of the message item.
+    #[test]
+    fn non_streaming_reasoning_becomes_a_leading_reasoning_item() {
+        let mut resp = chat_response_with(Some("42"), None, FinishReason::Stop);
+        resp.message
+            .extra
+            .insert("reasoning_content".into(), json!("6 times 7"));
+        let out = chat_response_to_responses_json(&resp, "m", 1);
+        assert_eq!(out["output"][0]["type"], "reasoning");
+        assert!(out["output"][0]["id"].as_str().unwrap().starts_with("rs_"));
+        assert_eq!(out["output"][0]["summary"][0]["type"], "summary_text");
+        assert_eq!(out["output"][0]["summary"][0]["text"], "6 times 7");
+        assert_eq!(out["output"][1]["type"], "message");
+        assert_eq!(out["output"][1]["content"][0]["text"], "42");
+    }
+
+    /// An upstream that reported no reasoning adds no `reasoning` item —
+    /// an empty one would render as a blank thinking block.
+    #[test]
+    fn non_streaming_without_reasoning_emits_no_reasoning_item() {
+        let resp = chat_response_with(Some("42"), None, FinishReason::Stop);
+        let out = chat_response_to_responses_json(&resp, "m", 1);
+        assert_eq!(out["output"][0]["type"], "message");
+        assert!(out["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["type"] != "reasoning"));
+    }
+
+    /// The guardrail scan text is unchanged by reasoning: generated
+    /// reasoning is out of output-guardrail scope on every /v1/responses
+    /// path, so it must not reach the assembled assistant message.
+    #[test]
+    fn assembled_assistant_message_excludes_reasoning() {
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let _ = enc.next_events(&reasoning_chunk("SECRET"));
+        let _ = enc.next_events(&content_chunk("visible"));
+        let (text, tool_calls) = enc.assembled_assistant_message();
+        assert_eq!(text, "visible");
+        assert!(tool_calls.is_empty());
+    }
+
+    /// A stream whose upstream never sent a usage frame must report the
+    /// SAME numbers to the client as the usage record gets — the encoder
+    /// adopts the local estimate before the synthesized terminal event.
+    #[test]
+    fn force_finish_reports_the_estimate_the_usage_record_gets() {
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let _ = enc.next_events(&content_chunk("hello"));
+        let _ = enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta::default(),
+            finish_reason: Some(FinishReason::Stop),
+            usage: None,
+        });
+        // …the trailing usage frame never arrives; the relay hands the
+        // encoder the same estimate it wrote to the usage record.
+        enc.set_estimated_usage(11, 7);
+        let events = enc.force_finish();
+        let completed = events.last().unwrap();
+        assert_eq!(completed.event_type, "response.completed");
+        let usage = &completed.data["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 11);
+        assert_eq!(usage["output_tokens"], 7);
+        assert_eq!(usage["total_tokens"], 18);
+        // Standard usage shape only — nothing tells the client it is an
+        // estimate.
+        let keys: std::collections::BTreeSet<&str> = usage
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "input_tokens",
+                "input_tokens_details",
+                "output_tokens",
+                "output_tokens_details",
+                "total_tokens",
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        );
+    }
+
+    /// The estimate never overwrites what the upstream actually reported.
+    /// The relay hands the encoder an estimate whenever it computed one, so
+    /// a usage frame that landed WITHOUT a finish chunk — the shape an
+    /// OpenAI-compatible upstream sends — must still win at force_finish.
+    #[test]
+    fn set_estimated_usage_is_ignored_once_a_usage_frame_landed() {
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let _ = enc.next_events(&content_chunk("hi"));
+        let _ = enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta::default(),
+            finish_reason: None,
+            usage: Some(UsageStats::new(3, 4)),
+        });
+        enc.set_estimated_usage(99, 99);
+        let events = enc.force_finish();
+        let usage = &events.last().unwrap().data["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 3, "the frame was read, not guessed");
+        assert_eq!(usage["output_tokens"], 4);
     }
 }

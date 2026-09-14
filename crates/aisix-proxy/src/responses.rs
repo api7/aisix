@@ -2537,8 +2537,13 @@ async fn responses_cross_provider_to_target(
             provider_request_id: crate::usage_attr::sanitize_provider_response_id(&resp.id),
         };
         // Token-estimation fallback (AISIX-Cloud#1074): fill counters the
-        // bridged upstream never reported. Telemetry only — the re-encoded
-        // Responses JSON below carries the upstream's own usage.
+        // bridged upstream never reported, and carry the SAME numbers into
+        // the Responses JSON re-encoded below. The client-visible usage and
+        // the usage record are one number: a caller told `output_tokens: 0`
+        // for a response it can read the text of has no way to reconcile
+        // that with what the dashboard bills. The estimate is reported in
+        // the ordinary usage shape — there is no client-facing marker
+        // saying it was estimated.
         if u.prompt_tokens == 0 || u.completion_tokens == 0 {
             let est = crate::token_estimate::Estimator::new(
                 model.upstream_model().unwrap_or("unknown"),
@@ -2554,6 +2559,8 @@ async fn responses_cross_provider_to_target(
                 u.prompt_tokens = filled.prompt_tokens;
                 u.completion_tokens = filled.completion_tokens;
                 u.usage_estimated = true;
+                resp.usage.prompt_tokens = filled.prompt_tokens;
+                resp.usage.completion_tokens = filled.completion_tokens;
             }
         }
         u
