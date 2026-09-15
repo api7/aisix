@@ -35,6 +35,8 @@ const SLS_PROJECT = "aisix-e2e-obs";
 const LOGSTORE = "cancel-events";
 
 const GROUP = "c1571-group";
+/** A passthrough route onto the same slow upstream: a surface with no model. */
+const ROUTE = "c1571-tunnel";
 const TARGET = "c1571-target";
 const UPSTREAM_MODEL = "gpt-4o-mini";
 /** A direct model on a fast upstream, for the success-path line below. */
@@ -123,9 +125,19 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
       model_name: FAST_UPSTREAM_MODEL,
       provider_key_id: fastPk.id,
     });
+    await seed.createPassthroughRoute({
+      name: ROUTE,
+      path_prefix: "/passthrough/c1571",
+      target_url: slow.baseUrl,
+      provider_key_id: pk.id,
+    });
     // Seeded last, so it authenticating implies everything above is in the
     // snapshot (tests/e2e/AGENTS.md).
-    await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["*"],
+      allowed_routes: ["*"],
+    });
     const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
     await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
   });
@@ -212,6 +224,63 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
       expect(line).toContain(`model="${GROUP}"`);
       expect(line).toContain(`upstream_model="${UPSTREAM_MODEL}"`);
       expect(line).toContain(`provider_key_id="${providerKeyId}"`);
+    },
+    60_000,
+  );
+
+  // A surface that names no model at all. The gateway still spent an
+  // upstream's time on the caller's behalf, so the row has to exist — and
+  // it is attributed by the route, which is all this family has.
+  test(
+    "an abandoned passthrough request is metered against its route",
+    async (ctx) => {
+      if (!etcdReachable || !app || !slow || !sls) {
+        ctx.skip();
+        return;
+      }
+      const before = slow.receivedRequests.length;
+      const controller = new AbortController();
+      const inflight = fetch(`${app.proxyUrl}/passthrough/c1571/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ model: "anything", messages: [] }),
+        signal: controller.signal,
+      });
+
+      // Abort once the relay has reached the upstream, which is 30s from
+      // answering — so the response head is unwritten when the caller goes
+      // away. A fixed sleep could fire before the relay dispatched.
+      for (let i = 0; i < 200 && slow.receivedRequests.length === before; i++) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      expect(
+        slow.receivedRequests.length,
+        "the relay never reached the upstream",
+      ).toBeGreaterThan(before);
+      controller.abort();
+      await expect(inflight).rejects.toThrow();
+
+      const row = await waitForSlsLog(
+        sls,
+        LOGSTORE,
+        (log) => log.get("operation") === "passthrough",
+        `a usage row for the cancelled passthrough request to ${ROUTE}`,
+        20_000,
+      );
+
+      expect(row.get("status_code")).toBe("499");
+      expect(row.get("error_class")).toBe("client_disconnected");
+      expect(row.get("error_message")).toContain("before the response head");
+      expect(row.get("passthrough_route_name")).toBe(ROUTE);
+      // This surface resolves no model, and the row says so rather than
+      // borrowing one — `model_id` is what the control plane prices on.
+      expect(row.get("requested_model") ?? "").toBe("");
+      expect(row.get("model_id") ?? "").toBe("");
+      // Attributable all the same: the key is resolved before any of this.
+      expect(row.get("api_key_id") ?? "").not.toBe("");
     },
     60_000,
   );

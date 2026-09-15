@@ -391,6 +391,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "futures",
+ "http-body 1.0.1",
  "http-body-util",
  "ipnet",
  "jsonwebtoken",
