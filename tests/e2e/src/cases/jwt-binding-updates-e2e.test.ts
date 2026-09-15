@@ -12,6 +12,7 @@ test("warmed JWT bindings follow key edits, revocation, ambiguity and claim fall
   let app: SpawnedApp | undefined;
   let idp: MockIdp | undefined;
   let upstream: OpenAiUpstream | undefined;
+  const errors: unknown[] = [];
   try {
     upstream = await startOpenAiUpstream();
     idp = await startMockIdp();
@@ -78,11 +79,15 @@ test("warmed JWT bindings follow key edits, revocation, ambiguity and claim fall
     await seed.update("api_keys", binding.id, binding.value);
     await applied();
     expect((await request("direct-model")).status).toBe(200);
-  } finally {
-    const cleanup = await Promise.allSettled([
-      app?.exit(), app && etcd.deletePrefix(app.etcdPrefix), upstream?.close(), idp?.close(),
-    ]);
-    const failed = cleanup.filter((result) => result.status === "rejected");
-    if (failed.length) throw new AggregateError(failed.map((result) => result.reason), "JWT fixture cleanup");
+  } catch (error) {
+    errors.push(error);
   }
+  const cleanup = await Promise.allSettled([
+    app?.exit(), app && etcd.deletePrefix(app.etcdPrefix), upstream?.close(), idp?.close(),
+  ]);
+  for (const result of cleanup) {
+    if (result.status === "rejected") errors.push(result.reason);
+  }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new AggregateError(errors, "JWT binding E2E failure");
 });
