@@ -25,7 +25,7 @@
 //!   WebSocket upgrade immediately; the line is written by `run_session` on
 //!   a detached task once the session closes, so it carries the close status
 //!   and the session's real token totals.
-//! - **Caller hung up before the response head** — written from
+//! - **Caller hung up before the response was delivered** — written from
 //!   `ClientCancelGuard::drop`, with no handler involved. Status is `499`,
 //!   and the fields it can fill are the ones the request published to its
 //!   attribution cell as it resolved: `model`, `provider`, and the
@@ -34,6 +34,10 @@
 //!   counts — stay `None`, because the future was dropped before it could
 //!   produce them. Such a request also emits a `499` usage event carrying
 //!   the same identities (AISIX-Cloud#1571), keyed by this `request_id`.
+//!   Only the no-response-head case writes one: a request whose head DID go
+//!   out already has its handler's line, and a second one under a second
+//!   status would make one request read as two. That request's `499` lives
+//!   on its usage event alone.
 //!
 //! So do not add a field whose value only exists once the upstream has
 //! responded and expect it on every line: it is silently empty on the

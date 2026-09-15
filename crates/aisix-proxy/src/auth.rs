@@ -197,6 +197,24 @@ pub(crate) async fn authenticate_token(
     token: &str,
     ctx: DenialContext<'_>,
 ) -> Result<AuthenticatedKey, ProxyError> {
+    let authed = authenticate_token_inner(state, token, ctx).await?;
+    // Hand the principal to the request's attribution cell, so a caller
+    // that hangs up still files an ATTRIBUTABLE usage row
+    // (AISIX-Cloud#1571). Here rather than in the extractor above because
+    // three surfaces authenticate without it — a passthrough route's own
+    // `auth_mode`, `/v1/realtime`'s WebSocket subprotocol, and `/mcp` —
+    // and two of them build no `ClientContext` either. The two places that
+    // mint an ANONYMOUS principal instead of verifying a credential note it
+    // themselves (`mcp::resolve_caller`, `passthrough_route::authenticate`).
+    crate::attribution::note_authenticated(&authed);
+    Ok(authed)
+}
+
+async fn authenticate_token_inner(
+    state: &ProxyState,
+    token: &str,
+    ctx: DenialContext<'_>,
+) -> Result<AuthenticatedKey, ProxyError> {
     let snapshot = state.snapshot.load();
     // Provider gate first: it is O(1) when no trust provider is
     // configured, so key-only deployments never pay the structural JWT

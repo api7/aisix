@@ -109,14 +109,61 @@ pub(crate) struct SettledWinner {
     pub latency_ms: u32,
 }
 
+/// What a route that never names a model reports in place of one.
+///
+/// `/mcp`, `/a2a/:agent` and the passthrough namespace tunnel to an upstream
+/// the caller addressed by route rather than by model, and their own usage
+/// events are attributed by those names instead. A cancelled request on one
+/// of them has to carry the same ones, or its row is the only one of that
+/// family an operator cannot tell apart from any other (AISIX-Cloud#1571).
+/// Every field is empty on the model-named families.
+#[derive(Clone, Default)]
+pub(crate) struct RouteIdentity {
+    pub passthrough_route: String,
+    pub mcp_server: String,
+    /// The tool the JSON-RPC body named, once it has been parsed — a cancel
+    /// landing before that leaves it empty rather than guessing.
+    pub mcp_tool: String,
+    pub a2a_agent: String,
+    /// The caller's raw JSON-RPC method, unbounded by nature.
+    pub a2a_method: String,
+    /// The canonical operation that method names, from a fixed set — what a
+    /// per-operation figure groups by, and what the completed row carries.
+    pub a2a_operation: String,
+}
+
 /// What a cancelled request needs to emit its own usage events. See the
 /// module docs for why it does not live in [`Resolved`].
 #[derive(Default)]
 pub(crate) struct CancelContext {
     /// The caller, as the [`ClientContext`] extractor resolved it. `None`
-    /// until that extractor has run, which is how the cancel path tells a
-    /// request that authenticated from one that hung up during body upload.
+    /// on the routes that resolve their principal themselves — `/mcp` and
+    /// `/a2a` never run that extractor — where [`auth`](Self::auth) carries
+    /// the identity instead and the two IP-derived fields stay empty,
+    /// exactly as those families' own events leave them.
     pub client: Option<ClientContext>,
+    /// The authenticated principal, from the one extractor every
+    /// authenticated route passes through. Carries the caller identity and
+    /// the anonymous flag for the families that build no [`ClientContext`].
+    pub auth: Option<crate::auth::AuthenticatedKey>,
+    /// See [`RouteIdentity`].
+    pub route: RouteIdentity,
+    /// The surface the request RESOLVED, when the path cannot say.
+    ///
+    /// The cancel guard otherwise reads the surface off the normalized
+    /// endpoint label, which is right for every typed route and wrong for a
+    /// passthrough route that is not mounted under `/passthrough/`: a
+    /// custom `path_prefix` normalizes to `other`, and a HOST-matched route
+    /// keeps whatever path the caller sent — `/v1/chat/completions` on a
+    /// forward-proxied upstream normalizes to the CHAT surface. The row
+    /// would then be filed as an abandoned chat call with no model.
+    pub surface: Option<crate::operation::Surface>,
+    /// Set by a route that files no usage row at ANY outcome but shares a
+    /// normalized endpoint label with a metering sibling — the A2A agent
+    /// card, which normalizes to `/a2a` like the calls do. The guard has
+    /// only the label, so the route has to say so itself or a cancelled
+    /// discovery fetch is filed as an agent call.
+    pub unmetered: bool,
     /// The authenticated `api_key` row's id. Empty on an unauthenticated
     /// path, which the cancel emitter treats as "nothing to attribute".
     pub api_key_id: String,
@@ -147,14 +194,16 @@ pub(crate) struct CancelContext {
     /// record holds nothing, so there would be nothing to bill it with —
     /// and skipping it also keeps the happy path allocation-free here.
     pub failed_attempts: Vec<AttemptRecord>,
-    /// Whether the handler already emitted a usage event for this request,
-    /// and whether one of them was the terminal one.
+    /// Whether a usage event has already been emitted for this request, and
+    /// whether one of them was the terminal one.
     ///
-    /// The window is microseconds wide — between an emission and the
-    /// middleware disarming the guard — but a second, contradicting set of
-    /// rows for one request is worse than the row the cancel path would
-    /// have added, so the guard defers to whatever the handler managed to
-    /// write.
+    /// Two windows write it. On the head phase it is microseconds wide —
+    /// between an emission and the middleware advancing the guard past it.
+    /// On the body phase it is the whole interlock: the body is dropped
+    /// inside this cell's scope ([`sync_scope`]), so a family whose stream
+    /// emitter fires there says so here. Either way a second, contradicting
+    /// set of rows for one request is worse than the row the cancel path
+    /// would have added, so the guard defers to whatever was written.
     pub emitted_any: bool,
     pub emitted_terminal: bool,
 }
@@ -200,6 +249,17 @@ pub(crate) fn scope<F: Future>(
     fut: F,
 ) -> impl Future<Output = F::Output> {
     CURRENT.scope(attribution, fut)
+}
+
+/// Install `cell` for the duration of one synchronous call.
+///
+/// Used to drop the response body inside the request's own cell
+/// (`TelemetryBody`): two families build their stream's terminal emitter
+/// OUTSIDE the generator, so it fires even on a body that was never polled
+/// — and the cancel guard must be able to see that it did, or it writes a
+/// second, contradicting row for the same request.
+pub(crate) fn sync_scope<T>(cell: &Arc<RequestAttribution>, f: impl FnOnce() -> T) -> T {
+    CURRENT.sync_scope(cell.clone(), f)
 }
 
 /// Run `fut` against a throwaway cell, so a sub-call the request makes ON
@@ -295,8 +355,78 @@ fn with_cancel(f: impl FnOnce(&mut CancelContext)) {
 /// extractor that publishes the api_key row.
 pub(crate) fn note_client(client: &ClientContext, api_key_id: &str) {
     with_cancel(|c| {
-        c.api_key_id = api_key_id.to_string();
+        // Never blank an id the auth chokepoint already resolved: this
+        // extractor reads the api_key EXTENSION, which a route that
+        // authenticates inside its own handler (passthrough, `/mcp`) has
+        // not set yet, and an empty write here would undo it.
+        if !api_key_id.is_empty() {
+            c.api_key_id = api_key_id.to_string();
+        }
         c.client = Some(client.clone());
+    });
+}
+
+/// Note the authenticated principal. Called from the `AuthenticatedKey`
+/// extractor — the one place every authenticated route resolves who is
+/// calling, including the two that build no [`ClientContext`] and would
+/// otherwise reach the cancel emitter with nothing to attribute the row to.
+///
+/// `api_key_id` is written here as well as by [`note_client`]. Both assign
+/// unconditionally, so the later writer wins — which changes nothing,
+/// because both read the id off the same `api_key` row extension.
+pub(crate) fn note_authenticated(auth: &crate::auth::AuthenticatedKey) {
+    with_cancel(|c| {
+        c.api_key_id = auth.entry.id.clone();
+        c.auth = Some(auth.clone());
+    });
+}
+
+/// Note that this route files no usage row whatever the outcome. See
+/// [`CancelContext::unmetered`]; the census in [`crate::operation`] is where
+/// the routes that need it are named.
+pub(crate) fn note_unmetered_route() {
+    with_cancel(|c| c.unmetered = true);
+}
+
+/// Note the passthrough route this request matched, for the row a cancelled
+/// one files. Called once, after `match_route`.
+pub(crate) fn note_passthrough_route(route: &str) {
+    with_cancel(|c| {
+        c.route.passthrough_route = route.to_string();
+        // The one point that KNOWS this is passthrough traffic. See
+        // [`CancelContext::surface`] for the two route shapes whose path
+        // says something else entirely.
+        c.surface = Some(crate::operation::PASSTHROUGH);
+    });
+}
+
+/// Note the MCP server the request addressed, and the tool its JSON-RPC body
+/// named. Called twice: once with an empty `tool` before the body is read,
+/// so a cancel during the upload still reports the server a scoped entry
+/// named in its path, and again once the body has been parsed. Empty
+/// arguments never overwrite what is already there.
+pub(crate) fn note_mcp_call(server: &str, tool: &str) {
+    with_cancel(|c| {
+        if !server.is_empty() {
+            c.route.mcp_server = server.to_string();
+        }
+        if !tool.is_empty() {
+            c.route.mcp_tool = tool.to_string();
+        }
+    });
+}
+
+/// Note the A2A agent the request addressed and the JSON-RPC method it
+/// called.
+pub(crate) fn note_a2a_call(agent: &str, method: &str, operation: &str) {
+    with_cancel(|c| {
+        c.route.a2a_agent = agent.to_string();
+        if !method.is_empty() {
+            c.route.a2a_method = method.to_string();
+        }
+        if !operation.is_empty() {
+            c.route.a2a_operation = operation.to_string();
+        }
     });
 }
 
@@ -410,12 +540,10 @@ mod tests {
     /// handler runs there. tokio installs the value during that drop, so
     /// `note_usage_emitted` reaches the cell and the guard stays quiet.
     ///
-    /// The streaming families do not rely on this today: their
-    /// `CompleteOnDrop` guards are constructed inside `async_stream!`
-    /// bodies, which first run when the response body is polled — by which
-    /// time the middleware has long disarmed the guard. What the interlock
-    /// actually covers is the handler emitting on its own task and then
-    /// awaiting again (a cache write, a content capture) before returning.
+    /// What the interlock covers on this side is the handler emitting on
+    /// its own task and then awaiting again (a cache write, a content
+    /// capture) before returning. The streaming families reach the same
+    /// cell from the body phase instead — see [`sync_scope`].
     /// This test pins the drop half anyway, because it is the half nothing
     /// else would notice losing: were tokio to stop installing the value, a
     /// future `Drop` emitter would silently write nowhere and one cancelled

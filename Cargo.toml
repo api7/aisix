@@ -54,6 +54,11 @@ tokio-rustls = "0.26"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "limit", "compression-gzip", "set-header"] }
 http = "1.2"
+# Direct because the proxy implements `Body` itself: the response body
+# carries the request's telemetry guards, and only a real implementation
+# can observe the first poll (AISIX-Cloud#1571). Already in the tree via
+# axum/hyper; this adds an edge, not a crate.
+http-body = "1"
 http-body-util = "0.1"
 # Trusted-proxy CIDR matching for real-ip resolution (#492)
 ipnet = "2"

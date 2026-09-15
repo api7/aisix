@@ -288,6 +288,10 @@ pub async fn entry(
     };
 
     let route_name = matched.entry.value.name.clone();
+    // The route is this family's attribution — it names no model — so the
+    // cancel guard needs it to file a row for a caller that hangs up while
+    // the upstream is still thinking (AISIX-Cloud#1571).
+    crate::attribution::note_passthrough_route(&route_name);
 
     // Filled inside `dispatch` at chain resolution, so the failure branch
     // — where an input-guardrail block lands — stamps the enforced hits
@@ -1044,11 +1048,17 @@ async fn authenticate(
                 return Err(ProxyError::ApiKeyExpired);
             }
             state.metrics.record_auth_decision("anonymous", true, "");
-            Ok(AuthenticatedKey {
+            let authed = AuthenticatedKey {
                 entry,
                 jwt: None,
                 anonymous: true,
-            })
+            };
+            // Verified credentials are noted inside `authenticate_token`;
+            // a minted anonymous principal has to note itself, or a caller
+            // that hangs up on an anonymous route files no row at all
+            // (AISIX-Cloud#1571).
+            crate::attribution::note_authenticated(&authed);
+            Ok(authed)
         }
     }
 }
