@@ -506,7 +506,9 @@ const CLIENT_DISCONNECTED_KIND: &str = "client_disconnected";
 /// request's usage events (`crate::cancel`) — the attempts that had
 /// already failed, then a terminal `499`. Everything it needs comes off
 /// the request's attribution cell, which the handlers fill at
-/// chokepoints they already pass through.
+/// chokepoints they already pass through. The LINE is written only when
+/// no response head went out at all; past that point the handler has
+/// written the request's line already, and the guard adds the row alone.
 ///
 /// A cancelled future is only observable from `Drop`, so arm a guard,
 /// disarm it once the inner service yields a response, and emit from
@@ -531,8 +533,14 @@ const CLIENT_DISCONNECTED_KIND: &str = "client_disconnected";
 /// before it emits nothing anywhere. The guard rides the body precisely
 /// to cover that window — see `GuardPhase` and `TelemetryBody`.
 ///
-/// All three shapes report `499` with `error_class =
+/// All three shapes report `499` on the usage event with `error_class =
 /// "client_disconnected"`; only the message says where the caller left.
+/// A streamed request's LINE keeps saying `200` in all of them, because
+/// its handler writes it when the head goes out — one line per request,
+/// whose latency is time-to-first-token by deliberate choice
+/// (AISIX-Cloud#1394). Converging the two onto one end-of-stream line is
+/// per-family work in each streaming handler, not something this layer
+/// can do for them.
 async fn record_request_telemetry(
     State(state): State<ProxyState>,
     request: Request<axum::body::Body>,
@@ -847,35 +855,45 @@ impl Drop for ClientCancelGuard {
         if matches!(phase, cancel::Phase::BeforeBody) && cancel_ctx.emitted_terminal {
             return;
         }
-        let target = attribution::AccessLogTarget::from_resolved(resolved.clone());
-        AccessLog {
-            method: self.method.as_str(),
-            path: self.uri.path(),
-            status: CLIENT_CLOSED_REQUEST,
-            latency,
-            // The log line takes the RAW names: it is bounded by request
-            // volume, not by label cardinality, so it can say exactly
-            // which target the abandoned request was waiting on.
-            provider: (!resolved.provider.is_empty()).then_some(resolved.provider.as_str()),
-            model: (!resolved.requested_model.is_empty())
-                .then_some(resolved.requested_model.as_str()),
-            upstream_model: target.upstream_model(),
-            provider_key_id: target.provider_key_id(),
-            api_key_id: (!cancel_ctx.api_key_id.is_empty())
-                .then_some(cancel_ctx.api_key_id.as_str()),
-            prompt_tokens: None,
-            completion_tokens: None,
-            total_tokens: None,
-            request_id: &self.request_id,
-            provider_request_id: None,
-            served_by_model: None,
-            routing_attempt_count: None,
-            routing_fallback_count: None,
-            error_kind: Some(CLIENT_DISCONNECTED_KIND),
-            error: Some(phase.message()),
-            mcp: None,
+        // The LINE is the head phase's alone. A request whose head went out
+        // already has its handler's line, written when the stream was
+        // handed over; adding a second one here under a different status
+        // would make one request two, which is the opposite of the picture
+        // this change is for. Converging the streamed families on a single
+        // end-of-stream line is real work in each of them and reverses a
+        // deliberate decision about what a streamed line's latency means
+        // (AISIX-Cloud#1394) — it is not this change's to make.
+        if matches!(phase, cancel::Phase::BeforeHead) {
+            let target = attribution::AccessLogTarget::from_resolved(resolved.clone());
+            AccessLog {
+                method: self.method.as_str(),
+                path: self.uri.path(),
+                status: CLIENT_CLOSED_REQUEST,
+                latency,
+                // The log line takes the RAW names: it is bounded by request
+                // volume, not by label cardinality, so it can say exactly
+                // which target the abandoned request was waiting on.
+                provider: (!resolved.provider.is_empty()).then_some(resolved.provider.as_str()),
+                model: (!resolved.requested_model.is_empty())
+                    .then_some(resolved.requested_model.as_str()),
+                upstream_model: target.upstream_model(),
+                provider_key_id: target.provider_key_id(),
+                api_key_id: (!cancel_ctx.api_key_id.is_empty())
+                    .then_some(cancel_ctx.api_key_id.as_str()),
+                prompt_tokens: None,
+                completion_tokens: None,
+                total_tokens: None,
+                request_id: &self.request_id,
+                provider_request_id: None,
+                served_by_model: None,
+                routing_attempt_count: None,
+                routing_fallback_count: None,
+                error_kind: Some(CLIENT_DISCONNECTED_KIND),
+                error: Some(phase.message()),
+                mcp: None,
+            }
+            .emit();
         }
-        .emit();
         // The usage events the dropped handler never got to write
         // (AISIX-Cloud#1571). After the line, so the two land in the order
         // an operator reads them.
@@ -8676,7 +8694,7 @@ data: [DONE]\n\n",
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK, "the head must exist");
 
-        let logs = capture_access_log(|| drop_body_unpolled(response));
+        drop_body_unpolled(response);
 
         let event = next_event(&mut rx).await;
         assert_body_phase_cancel(&event);
@@ -8690,21 +8708,6 @@ data: [DONE]\n\n",
         assert_eq!(event.attempt_kind, "initial");
         assert_eq!(event.operation, "chat");
         assert!(rx.try_recv().is_err(), "one request, one row");
-
-        // The line beside it says the same thing. Before this change the
-        // request's only line was the handler's `200`, written when the
-        // stream was handed over and never corrected.
-        let line = logs
-            .lines()
-            .find(|l| l.contains("status=499"))
-            .unwrap_or_else(|| panic!("no 499 access-log line in:\n{logs}"));
-        assert!(
-            line.contains("error_kind=\"client_disconnected\""),
-            "{line}"
-        );
-        assert!(line.contains(cancel::CANCELLED_BEFORE_BODY), "{line}");
-        assert!(line.contains("model=\"smart\""), "{line}");
-        assert!(line.contains("upstream_model=\"gpt-4o\""), "{line}");
     }
 
     /// The same window on a second family, reached through a different
@@ -9024,6 +9027,86 @@ data: [DONE]\n\n",
         );
     }
 
+    /// One request, one access-log line — on all three ways a streamed
+    /// response can end.
+    ///
+    /// The line and the usage event are meant to give the same picture of a
+    /// request, which they cannot do if one request writes two lines under
+    /// two statuses. This counts them; what each line SAYS is a separate
+    /// question (a streamed request's line is written when the head goes
+    /// out, so its status is `200` and its latency is time-to-first-token —
+    /// see the `access_log` module docs and AISIX-Cloud#1394).
+    #[tokio::test]
+    async fn a_streamed_request_writes_exactly_one_access_log_line() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(sse_chat_response())
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_routing_group("smart", &[("m-primary", "primary", &upstream.uri())]);
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        let streaming_request = || {
+            let mut req = cancellable_chat_request("smart");
+            *req.body_mut() = Body::from(
+                serde_json::json!({
+                    "model": "smart",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": true
+                })
+                .to_string(),
+            );
+            req
+        };
+
+        // 1. Read to the end.
+        {
+            let (buf, _capture) = access_log_capture();
+            let response = app.clone().oneshot(streaming_request()).await.unwrap();
+            let _ = to_bytes(response.into_body(), 65536).await.unwrap();
+            assert_eq!(
+                access_log_lines(&buf),
+                1,
+                "a delivered stream must write one line",
+            );
+        }
+
+        // 2. Read one chunk, then walk away mid-stream.
+        {
+            let (buf, _capture) = access_log_capture();
+            let response = app.clone().oneshot(streaming_request()).await.unwrap();
+            let mut body = response.into_body().into_data_stream();
+            let _first = futures::StreamExt::next(&mut body).await;
+            drop(body);
+            assert_eq!(
+                access_log_lines(&buf),
+                1,
+                "a stream abandoned mid-flight must write one line",
+            );
+        }
+
+        // 3. Never read it at all — the window this change covers.
+        {
+            let (buf, _capture) = access_log_capture();
+            let response = app.clone().oneshot(streaming_request()).await.unwrap();
+            drop_body_unpolled(response);
+            assert_eq!(
+                access_log_lines(&buf),
+                1,
+                "a stream dropped before its first poll must write one line, not a second one \
+                 under a different status",
+            );
+        }
+    }
+
     /// A relayed body the caller never reads, on a family that meters at
     /// its own tail and streams the bytes afterwards (`/v1/audio/speech`,
     /// billed per input character).
@@ -9286,16 +9369,19 @@ data: [DONE]\n\n",
         }
     }
 
-    /// Run `f` with a log-capturing subscriber installed and return what it
-    /// wrote. `f` is synchronous because the only thing captured here is a
-    /// `Drop` running on this very thread — `set_default` is thread-local.
-    ///
-    /// The global registry is what keeps this honest under the parallel
-    /// harness: a callsite's `Interest` is cached process-wide the first
-    /// time it is hit, so a sibling test hitting the access log with no
-    /// subscriber installed would otherwise cache `never` and this capture
-    /// would read empty (see the same guard in `auth.rs`'s tests).
-    fn capture_access_log<T>(f: impl FnOnce() -> T) -> String {
+    /// The access log's own `tracing` message. Counting occurrences of it is
+    /// how a test asks "how many lines did this request write" without
+    /// matching the other events the same subscriber sees.
+    const ACCESS_LOG_MESSAGE: &str = "proxy request completed";
+
+    /// Install a capturing subscriber on THIS thread and hand back the
+    /// buffer plus its guard, so a caller can hold it across awaits — a
+    /// `#[tokio::test]` runs its future on the calling thread, which is
+    /// where the handler's own line is written.
+    fn access_log_capture() -> (
+        Arc<std::sync::Mutex<Vec<u8>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
@@ -9305,16 +9391,15 @@ data: [DONE]\n\n",
             .with_ansi(false)
             .with_writer(LogBuf(buf.clone()))
             .finish();
-        {
-            let _guard = tracing::subscriber::set_default(subscriber);
-            f();
-        }
-        let captured = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
-        assert!(
-            !captured.is_empty(),
-            "the access-log capture read nothing at all — the assertions on it would be vacuous",
-        );
-        captured
+        let guard = tracing::subscriber::set_default(subscriber);
+        (buf, guard)
+    }
+
+    /// How many access-log lines the capture holds.
+    fn access_log_lines(buf: &Arc<std::sync::Mutex<Vec<u8>>>) -> usize {
+        String::from_utf8_lossy(&buf.lock().unwrap())
+            .matches(ACCESS_LOG_MESSAGE)
+            .count()
     }
 
     /// A passthrough route names no model at all, so the row a cancelled one

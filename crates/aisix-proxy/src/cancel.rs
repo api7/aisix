@@ -64,8 +64,11 @@ pub(crate) const CANCELLED_MID_STREAM: &str =
 /// It is its own phase because nothing else speaks for it. A streaming
 /// family's own terminal emitter lives in a `Drop` guard built INSIDE the
 /// stream's generator, and a generator first runs on the body's first poll
-/// — so a body dropped before that emits nothing at all, and the request
-/// leaves a `200` access-log line with no usage row (AISIX-Cloud#1571).
+/// — so a body dropped before that emits no usage row at all
+/// (AISIX-Cloud#1571). The request's access-log line is not missing: its
+/// handler wrote one when it handed the stream over, saying `200`. This
+/// phase therefore writes the row and nothing else — a second line under a
+/// second status would make one request read as two.
 pub(crate) const CANCELLED_BEFORE_BODY: &str =
     "client closed the request before the response body was streamed";
 
@@ -81,9 +84,8 @@ pub(crate) enum Phase {
 }
 
 impl Phase {
-    /// The `error_message` of both the usage event and the access-log line
-    /// — the same sentence on both, so a row in the usage log can be joined
-    /// to the line that explains it.
+    /// The `error_message` the terminal event carries, and — on the head
+    /// phase, the one phase that writes a line — the line's too.
     pub(crate) fn message(self) -> &'static str {
         match self {
             Phase::BeforeHead => CANCELLED_BEFORE_HEAD,

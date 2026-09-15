@@ -34,10 +34,10 @@
 //!   counts — stay `None`, because the future was dropped before it could
 //!   produce them. Such a request also emits a `499` usage event carrying
 //!   the same identities (AISIX-Cloud#1571), keyed by this `request_id`.
-//!   There are two of these, told apart by `error` alone: no response head
-//!   at all, and a head whose body the caller never read — the second is
-//!   the only line a request has TWO of, because its handler had already
-//!   written a `200` when it handed the stream over.
+//!   Only the no-response-head case writes one: a request whose head DID go
+//!   out already has its handler's line, and a second one under a second
+//!   status would make one request read as two. That request's `499` lives
+//!   on its usage event alone.
 //!
 //! So do not add a field whose value only exists once the upstream has
 //! responded and expect it on every line: it is silently empty on the
