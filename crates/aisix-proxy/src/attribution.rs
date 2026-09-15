@@ -340,6 +340,48 @@ mod tests {
         .await;
     }
 
+    struct EmitOnDrop;
+    impl Drop for EmitOnDrop {
+        fn drop(&mut self) {
+            note_usage_emitted(true);
+        }
+    }
+
+    /// The double-emission interlock rests on one property of tokio's
+    /// task-local scope: the value is still installed while the scoped
+    /// future is being DROPPED. That is what lets an emitter living inside
+    /// the handler — `chat::build_sse_stream`'s `CompleteOnDrop` and its
+    /// siblings — record its terminal event on the cell as cancellation
+    /// unwinds, so [`CancelContext::emitted_terminal`] is already set by
+    /// the time the cancel guard reads it and the guard stays quiet.
+    ///
+    /// Nothing else pins it. If tokio stopped installing the value during
+    /// drop, `note_usage_emitted` would silently become a no-op on exactly
+    /// the path the interlock exists for, and one cancelled stream would
+    /// report two contradicting terminal rows.
+    #[tokio::test]
+    async fn the_cell_is_writable_while_the_scoped_future_is_dropped() {
+        let cell = Arc::new(RequestAttribution::default());
+        let mut fut = Box::pin(scope(cell.clone(), async {
+            let _emitter = EmitOnDrop;
+            std::future::pending::<()>().await;
+        }));
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(
+            std::future::Future::poll(fut.as_mut(), &mut cx).is_pending(),
+            "premise: the future must be parked mid-flight, not finished",
+        );
+        // Cancellation, exactly as axum performs it.
+        drop(fut);
+        assert!(
+            cell.take_cancel_context().emitted_terminal,
+            "a Drop-time emitter inside the handler could not reach the cell — \
+             the cancel guard would now emit a second terminal event for the \
+             same request",
+        );
+    }
+
     /// The caller-addressed name is the FIRST one noted: a routed request
     /// resolves its group, then each target, and the `model` label belongs
     /// to what the client asked for.
