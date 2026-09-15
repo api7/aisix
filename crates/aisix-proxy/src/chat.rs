@@ -1764,12 +1764,16 @@ async fn dispatch(
             );
 
             for attempt_idx in 0..=budget.attempts {
-                let (idx, kind) = stream_routing.begin_attempt(&model.display_name);
                 let target_model = if is_routing_request {
                     model.display_name.clone()
                 } else {
                     String::new()
                 };
+                let (idx, kind) = stream_routing.begin_attempt(crate::attempt::AttemptTarget {
+                    display_name: &model.display_name,
+                    target_model: &target_model,
+                    model_id: &attempt.id,
+                });
                 // Reserve THIS target's own model rate-limit layers before
                 // dispatching to it (AISIX-Cloud#1087). Over-limit → record a
                 // 429 attempt and move on to the remaining targets in strategy
@@ -2944,7 +2948,6 @@ async fn dispatch(
             // Per-attempt telemetry kind (#655): the first attempt overall
             // is "initial"; a different target than the previous attempt is
             // a "fallback"; the same target again is a "retry".
-            let (attempt_index, kind) = routing.begin_attempt(&model.display_name);
             // Routing target name only for routing groups; a direct model
             // leaves it empty since `model_id` already identifies it.
             let target_model = if is_routing_request {
@@ -2952,6 +2955,11 @@ async fn dispatch(
             } else {
                 String::new()
             };
+            let (attempt_index, kind) = routing.begin_attempt(crate::attempt::AttemptTarget {
+                display_name: &model.display_name,
+                target_model: &target_model,
+                model_id: &attempt.id,
+            });
 
             // Reserve THIS target's own model rate-limit layers before
             // dispatching to it (AISIX-Cloud#1087). Over-limit → record a
@@ -5006,6 +5014,7 @@ fn emit_access_log(
     // plane), carrying user-perceived `latency` + the final status plus a
     // routing summary. The per-attempt detail lives in telemetry only.
     let served_by = routing.winner().map(|w| w.target_model.as_str());
+    let target = crate::attribution::AccessLogTarget::current();
     AccessLog {
         method,
         path,
@@ -5013,6 +5022,8 @@ fn emit_access_log(
         latency,
         provider,
         model,
+        upstream_model: target.upstream_model(),
+        provider_key_id: target.provider_key_id(),
         api_key_id,
         prompt_tokens,
         completion_tokens,

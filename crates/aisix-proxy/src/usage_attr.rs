@@ -747,6 +747,18 @@ pub(crate) fn emit_usage(
     // present on a family's success path and missing from its error or
     // streaming one (AISIX-Cloud#1461).
     event.operation = surface.operation.to_string();
+    // Same reasoning, for the other shape of a caller walking away
+    // (AISIX-Cloud#1571). A stream the consumer abandoned is reported as
+    // 499 by six different families, each through its own emit helper and
+    // none of them naming the outcome; a head-phase cancel names it
+    // explicitly and would otherwise be the only 499 an operator could
+    // filter on. Filling it only when the class is still empty keeps this
+    // from overwriting a more specific one, and leaves the head-phase
+    // event's own message alone.
+    if event.status_code == crate::CLIENT_CLOSED_REQUEST && event.error_class.is_empty() {
+        event.error_class = crate::CLIENT_DISCONNECTED_KIND.to_string();
+        event.error_message = crate::cancel::CANCELLED_MID_STREAM.to_string();
+    }
     // Request-level guardrail blocks are recorded from the terminal event,
     // not from an individual timed execution. Some fail-closed paths (for
     // example a streamed-output buffer overflow) reject before a guardrail
@@ -764,6 +776,11 @@ pub(crate) fn emit_usage(
             dispatched,
         )
     });
+    // Tell the request's own cell that an event has gone out, so a cancel
+    // landing in the moments after cannot double it (AISIX-Cloud#1571). A
+    // no-op outside a request scope, which is where the detached stream
+    // emitters and the cancel guard itself both run.
+    crate::attribution::note_usage_emitted(terminal);
     state
         .usage_sink
         .try_emit(surface.handler, event.clone(), labels);

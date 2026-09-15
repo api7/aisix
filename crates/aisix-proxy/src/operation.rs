@@ -99,6 +99,46 @@ pub(crate) const PASSTHROUGH: Surface = Surface::split("passthrough_route", "pas
 /// traffic that submitted it.
 pub(crate) const BATCH_COMPLETION: Surface = Surface::split("batch", "batch_completion");
 
+/// The surface of a route that resolves a caller-named model before it
+/// dispatches, keyed by [`crate::normalize_endpoint_label`] output.
+///
+/// Exists for the emitters that run with no handler: `ClientCancelGuard`
+/// serves a request whose caller hung up before the response head entirely
+/// from `Drop`, so it has the route but none of the handler's own values
+/// (AISIX-Cloud#1571). `None` means "this route does not report a cancel as
+/// a usage event", and the three groups that answer `None` do so for
+/// different reasons, all of them deliberate:
+///
+/// - `/livez`, `/readyz`, `/v1/models` and the discovery routes meter
+///   nothing at all, cancelled or not;
+/// - `/mcp`, `/a2a/:agent` and the passthrough namespace tunnel to an
+///   upstream the caller never named a model for, so a cancel there has no
+///   model, no attempt and no target to report — only the access-log line
+///   and the cancel counter, which it already gets;
+/// - `/v1/realtime` and the `/v1/files|batches|fine_tuning` management
+///   routes meter, but not per caller-named model in the shape this event
+///   describes: realtime's terminal event is written by the session task
+///   long after the handler returned its upgrade, and a jobs route may
+///   auto-select the model itself.
+pub(crate) fn surface_for_endpoint(endpoint: &str) -> Option<Surface> {
+    Some(match endpoint {
+        "/v1/chat/completions" => CHAT,
+        "/v1/completions" => COMPLETIONS,
+        "/v1/embeddings" => EMBEDDINGS,
+        "/v1/images/generations" => IMAGE_GENERATION,
+        "/v1/images/edits" => IMAGE_EDIT,
+        "/v1/messages" => MESSAGES,
+        "/v1/messages/count_tokens" => COUNT_TOKENS,
+        "/v1/rerank" => RERANK,
+        "/v1/responses" => RESPONSES,
+        "/v1/audio/transcriptions" => TRANSCRIPTION,
+        "/v1/audio/translations" => TRANSLATION,
+        "/v1/audio/speech" => SPEECH,
+        "/v1/videos" => VIDEO_GENERATION,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +356,65 @@ mod tests {
                 "the {:?} surface renamed a shipped Prometheus handler label",
                 surface.operation,
             );
+        }
+    }
+
+    /// Metering routes that deliberately report NO usage event when the
+    /// caller hangs up before the response head. See
+    /// [`surface_for_endpoint`] for why each one is here.
+    const CANCEL_EXEMPT: &[&str] = &[
+        "/v1/realtime",
+        "/v1/files",
+        "/v1/files/:id",
+        "/v1/files/:id/content",
+        "/v1/batches",
+        "/v1/batches/:id",
+        "/v1/batches/:id/cancel",
+        "/v1/fine_tuning/jobs",
+        "/v1/fine_tuning/jobs/:id",
+        "/v1/fine_tuning/jobs/:id/cancel",
+        "/mcp",
+        "/mcp/",
+        "/mcp/:server",
+        "/a2a/:agent",
+        FALLBACK_SURFACE,
+    ];
+
+    /// A cancelled request's usage event must be indistinguishable from the
+    /// one its handler would have emitted, so the cancel guard's route
+    /// lookup has to agree with the route table — not merely exist. And a
+    /// new metering route must DECIDE: either it maps, or it is named
+    /// exempt with a reason. Left to itself, a new route silently joins the
+    /// set that reports nothing, which is the AISIX-Cloud#1571 bug arriving
+    /// one route at a time.
+    #[test]
+    fn every_metering_route_decides_what_a_head_phase_cancel_reports() {
+        for (route, emits) in ROUTE_OPERATIONS {
+            let Emits::Usage(surface) = emits else {
+                // A route that meters nothing has nothing to report when
+                // its caller goes away either.
+                assert!(
+                    surface_for_endpoint(crate::normalize_endpoint_label(route)).is_none(),
+                    "{route} meters nothing yet reports a cancelled usage event",
+                );
+                continue;
+            };
+            let endpoint = crate::normalize_endpoint_label(route);
+            let got = surface_for_endpoint(endpoint);
+            if CANCEL_EXEMPT.contains(route) {
+                assert!(
+                    got.is_none(),
+                    "{route} is listed as cancel-exempt but maps to {got:?}",
+                );
+            } else {
+                assert_eq!(
+                    got,
+                    Some(*surface),
+                    "{route} meters as {:?} but a head-phase cancel there reports {got:?} — \
+                     map it in surface_for_endpoint, or name it in CANCEL_EXEMPT and say why",
+                    surface.operation,
+                );
+            }
         }
     }
 

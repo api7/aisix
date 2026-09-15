@@ -647,6 +647,7 @@ pub(crate) fn emit_access_log(
         }
         None => (None, None),
     };
+    let target = crate::attribution::AccessLogTarget::current();
     AccessLog {
         method: "POST",
         path: endpoint,
@@ -654,6 +655,8 @@ pub(crate) fn emit_access_log(
         latency,
         provider: Some(provider),
         model: Some(model),
+        upstream_model: target.upstream_model(),
+        provider_key_id: target.provider_key_id(),
         api_key_id: Some(api_key_id),
         prompt_tokens: None,
         completion_tokens: None,

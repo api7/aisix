@@ -737,12 +737,16 @@ async fn dispatch(
                 });
                 tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32, hint)).await;
             }
-            let (idx, kind) = routing.begin_attempt(&target.model.display_name);
             let target_model = if is_routing_request {
                 target.model.display_name.clone()
             } else {
                 String::new()
             };
+            let (idx, kind) = routing.begin_attempt(crate::attempt::AttemptTarget {
+                display_name: &target.model.display_name,
+                target_model: &target_model,
+                model_id: &target.id,
+            });
             let attempt_started = Instant::now();
             // Winning-attempt classification (#655) for the streaming path's
             // end-of-stream UsageEvent. The non-streaming / buffered paths emit
@@ -3799,6 +3803,7 @@ fn emit_access_log(
         .winner()
         .map(|w| w.target_model.as_str())
         .filter(|s| !s.is_empty());
+    let target = crate::attribution::AccessLogTarget::current();
     AccessLog {
         method: "POST",
         path: "/v1/responses",
@@ -3806,6 +3811,8 @@ fn emit_access_log(
         latency: elapsed,
         provider: Some(provider),
         model: Some(model),
+        upstream_model: target.upstream_model(),
+        provider_key_id: target.provider_key_id(),
         api_key_id: Some(api_key_id),
         prompt_tokens: None,
         completion_tokens: None,

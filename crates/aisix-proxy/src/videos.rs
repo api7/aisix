@@ -1459,6 +1459,7 @@ impl Telemetry<'_> {
             }
             None => (None, None),
         };
+        let log_target = crate::attribution::AccessLogTarget::current();
         AccessLog {
             method: self.method,
             path: &self.path,
@@ -1466,6 +1467,8 @@ impl Telemetry<'_> {
             latency: elapsed,
             provider: Some(provider).filter(|p| !p.is_empty()),
             model: Some(model_label),
+            upstream_model: log_target.upstream_model(),
+            provider_key_id: log_target.provider_key_id(),
             api_key_id: Some(&self.auth.entry.id),
             prompt_tokens: None,
             completion_tokens: None,

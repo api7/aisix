@@ -97,6 +97,22 @@ pub(crate) struct RoutingTelemetry {
     trace: Option<std::sync::Arc<aisix_obs::RequestTraceBundle>>,
 }
 
+/// The target of an attempt about to be dispatched, as
+/// [`RoutingTelemetry::begin_attempt`] needs to describe it.
+#[derive(Clone, Copy)]
+pub(crate) struct AttemptTarget<'a> {
+    /// The target Model's configured name. Drives the
+    /// initial/retry/fallback classification, so it is the real name even
+    /// for a direct model — unlike `target_model` below.
+    pub display_name: &'a str,
+    /// What [`AttemptRecord::target_model`] will carry: the routing target
+    /// display name, or empty for a direct model, where `model_id` already
+    /// identifies the single model.
+    pub target_model: &'a str,
+    /// What [`AttemptRecord::target_model_id`] will carry.
+    pub model_id: &'a str,
+}
+
 impl RoutingTelemetry {
     /// Start a request's telemetry knowing what the caller asked for.
     /// Use in place of `default()` on the dispatch loops so the fallback
@@ -147,28 +163,47 @@ impl RoutingTelemetry {
         if let Some(trace) = &self.trace {
             trace.end_attempt(rec.index);
         }
+        // …and hand the settled record to the attribution cell, so a cancel
+        // arriving later still emits the attempts that already failed
+        // (AISIX-Cloud#1571). The handler's own `emit_failed_attempts` runs
+        // only when the handler runs; exactly one of the two ever fires.
+        crate::attribution::note_attempt_settled(&rec);
         self.attempts.push(rec);
     }
 
-    /// Classify the next attempt against `display_name` and advance the
-    /// last-target tracker. Returns `(index, kind)` to stamp onto the
+    /// Classify the next attempt against `target.display_name` and advance
+    /// the last-target tracker. Returns `(index, kind)` to stamp onto the
     /// `AttemptRecord` the caller pushes once the attempt resolves. Call
     /// once per attempt, before dispatch.
-    pub fn begin_attempt(&mut self, display_name: &str) -> (u32, &'static str) {
+    ///
+    /// Takes the whole target rather than just its name because this is
+    /// also where the attempt is published to the request's attribution
+    /// cell (AISIX-Cloud#1571): a caller that hangs up mid-attempt is
+    /// served entirely from `Drop`, and the guard can only name the target
+    /// it was waiting on if the target was recorded BEFORE the dispatch it
+    /// may never come back from.
+    pub fn begin_attempt(&mut self, target: AttemptTarget<'_>) -> (u32, &'static str) {
         let index = self.attempts.len() as u32;
         let kind = if self.attempts.is_empty() {
             "initial"
-        } else if self.last_target.as_deref() != Some(display_name) {
+        } else if self.last_target.as_deref() != Some(target.display_name) {
             "fallback"
         } else {
             "retry"
         };
-        self.last_target = Some(display_name.to_string());
+        self.last_target = Some(target.display_name.to_string());
         // Mint the attempt's span id and stamp its start at the real
         // dispatch boundary (AISIX-Cloud#1279).
         if let Some(trace) = &self.trace {
             trace.start_attempt(index);
         }
+        crate::attribution::note_attempt_started(crate::attribution::InFlightAttempt {
+            index,
+            kind,
+            target_model: target.target_model.to_string(),
+            model_id: target.model_id.to_string(),
+            started: Instant::now(),
+        });
         (index, kind)
     }
 
