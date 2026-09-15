@@ -109,7 +109,10 @@ impl Phase {
 /// fields empty; what it cannot do is file an UNATTRIBUTABLE one, because
 /// the api_key is resolved before the body is read. An unauthenticated path
 /// — the health and discovery routes, a rejected credential — stays silent,
-/// where the pre-dispatch rejections in [`crate::reject`] already sit.
+/// where the pre-dispatch rejections in [`crate::reject`] already sit. So
+/// does a route that declared itself unmetered
+/// ([`CancelContext::unmetered`]), which it must do whenever it files no row
+/// at any outcome yet shares a label with a metering sibling.
 pub(crate) fn emit(
     state: &ProxyState,
     endpoint: &'static str,
@@ -123,10 +126,16 @@ pub(crate) fn emit(
     // its access-log line names.
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
 ) {
-    let Some(surface) = crate::operation::surface_for_endpoint(endpoint) else {
+    // What the request RESOLVED wins over what its path looks like — see
+    // [`CancelContext::surface`]; the label is right for every typed route
+    // and cannot see a passthrough route mounted anywhere else.
+    let Some(surface) = ctx
+        .surface
+        .or_else(|| crate::operation::surface_for_endpoint(endpoint))
+    else {
         return;
     };
-    if ctx.api_key_id.is_empty() {
+    if ctx.api_key_id.is_empty() || ctx.unmetered {
         return;
     }
     // `/mcp` and `/a2a` resolve their principal without this extractor, so
@@ -134,7 +143,14 @@ pub(crate) fn emit(
     // or user agent either, which is exactly what the default renders.
     let client = ctx.client.clone().unwrap_or_default();
     let snap = state.snapshot.load();
-    let inbound_protocol = crate::inbound_protocol_for_endpoint(endpoint);
+    // Same reason: this family's own events state their protocol outright,
+    // and a host-matched route's path would otherwise report it as whatever
+    // typed surface the caller's path resembles.
+    let inbound_protocol = if surface == crate::operation::PASSTHROUGH {
+        "passthrough"
+    } else {
+        crate::inbound_protocol_for_endpoint(endpoint)
+    };
 
     // The attempts that had already failed. Non-terminal, exactly as the
     // handler's own emitter marks them — the terminal event below is what
@@ -312,6 +328,7 @@ fn base_event(
         mcp_tool_name: ctx.route.mcp_tool.clone(),
         a2a_agent_name: ctx.route.a2a_agent.clone(),
         a2a_method: ctx.route.a2a_method.clone(),
+        a2a_operation: ctx.route.a2a_operation.clone(),
         ..Default::default()
     };
     // The caller's identity, from the [`ClientContext`] the client-facing

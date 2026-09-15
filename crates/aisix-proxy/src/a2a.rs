@@ -268,11 +268,13 @@ async fn dispatch(
         .unwrap_or_default()
         .to_string();
     let rpc_id = value.get("id").cloned();
+    let operation = canonical_operation(&method);
     // To the request's attribution cell, so a caller that hangs up while the
     // agent is still thinking files a row naming the agent and the call
-    // rather than an anonymous 499 (AISIX-Cloud#1571).
-    crate::attribution::note_a2a_call(agent, &method);
-    let operation = canonical_operation(&method);
+    // rather than an anonymous 499 (AISIX-Cloud#1571). Both spellings: the
+    // raw method, and the canonical operation a per-operation figure groups
+    // by — the completed row carries both, so this one must too.
+    crate::attribution::note_a2a_call(agent, &method, operation);
     let mut call = A2aCall {
         operation,
         method,
@@ -646,6 +648,11 @@ pub async fn a2a_agent_card(
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
+    // Discovery files no usage row on any outcome, and it normalizes to the
+    // same `/a2a` label the calls do — so it has to say so, or a caller that
+    // hangs up during the card fetch below (a real upstream round trip) is
+    // filed as an abandoned agent call (AISIX-Cloud#1571).
+    crate::attribution::note_unmetered_route();
     let snapshot = state.snapshot.load();
     let entry = match snapshot.a2a_agents.get_by_name(&agent) {
         Some(entry) if entry.value.enabled => entry,
@@ -1207,9 +1214,69 @@ mod tests {
         assert_eq!(event.inbound_protocol, "a2a");
         assert_eq!(event.a2a_agent_name, "invoice");
         assert_eq!(event.a2a_method, "message/send");
+        // The raw method is unbounded caller text; the canonical operation
+        // is what a per-operation figure groups by, so a row carrying only
+        // the first one falls out of every A2A breakdown.
+        assert_eq!(event.a2a_operation, "message/send");
         assert_eq!(event.requested_model, "", "this surface names no model");
         assert_eq!(event.model_id, "");
         assert!(rx.try_recv().is_err(), "one call, one row");
+    }
+
+    /// An agent whose CARD fetch never answers, so a test can abandon the
+    /// discovery request while it is in flight.
+    async fn spawn_unresponsive_card_agent() -> String {
+        let app = axum::Router::new().fallback(|| async {
+            std::future::pending::<()>().await;
+            axum::Json(serde_json::json!({}))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}/a2a")
+    }
+
+    /// Discovery is not a call. A caller that hangs up while the gateway is
+    /// fetching the agent's card files NO usage row — the route meters
+    /// nothing at any outcome, and it only reaches the cancel guard's `/a2a`
+    /// surface because it normalizes to the same label the calls do.
+    #[tokio::test]
+    async fn an_abandoned_agent_card_fetch_is_not_metered_as_a_call() {
+        use aisix_obs::{UsageEvent, UsageSink};
+
+        let agent_url = spawn_unresponsive_card_agent().await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UsageEvent>(8);
+        let handle = SnapshotHandle::new(snapshot_with(&agent_url, true, serde_json::json!(["*"])));
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle, hub, &proxy_cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let router = build_router(state);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            router.oneshot(
+                HttpRequest::get("/a2a/invoice/.well-known/agent-card.json")
+                    .header("host", "gw.example.com")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the card fetch answered — this is not modelling a cancel",
+        );
+
+        assert!(
+            rx.try_recv().is_err(),
+            "an abandoned card fetch was filed as an abandoned agent call",
+        );
     }
 
     /// An agent that answers `message/send` with a Task in the state the

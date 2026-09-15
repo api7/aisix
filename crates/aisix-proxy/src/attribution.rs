@@ -125,7 +125,11 @@ pub(crate) struct RouteIdentity {
     /// landing before that leaves it empty rather than guessing.
     pub mcp_tool: String,
     pub a2a_agent: String,
+    /// The caller's raw JSON-RPC method, unbounded by nature.
     pub a2a_method: String,
+    /// The canonical operation that method names, from a fixed set — what a
+    /// per-operation figure groups by, and what the completed row carries.
+    pub a2a_operation: String,
 }
 
 /// What a cancelled request needs to emit its own usage events. See the
@@ -144,6 +148,22 @@ pub(crate) struct CancelContext {
     pub auth: Option<crate::auth::AuthenticatedKey>,
     /// See [`RouteIdentity`].
     pub route: RouteIdentity,
+    /// The surface the request RESOLVED, when the path cannot say.
+    ///
+    /// The cancel guard otherwise reads the surface off the normalized
+    /// endpoint label, which is right for every typed route and wrong for a
+    /// passthrough route that is not mounted under `/passthrough/`: a
+    /// custom `path_prefix` normalizes to `other`, and a HOST-matched route
+    /// keeps whatever path the caller sent — `/v1/chat/completions` on a
+    /// forward-proxied upstream normalizes to the CHAT surface. The row
+    /// would then be filed as an abandoned chat call with no model.
+    pub surface: Option<crate::operation::Surface>,
+    /// Set by a route that files no usage row at ANY outcome but shares a
+    /// normalized endpoint label with a metering sibling — the A2A agent
+    /// card, which normalizes to `/a2a` like the calls do. The guard has
+    /// only the label, so the route has to say so itself or a cancelled
+    /// discovery fetch is filed as an agent call.
+    pub unmetered: bool,
     /// The authenticated `api_key` row's id. Empty on an unauthenticated
     /// path, which the cancel emitter treats as "nothing to attribute".
     pub api_key_id: String,
@@ -335,7 +355,13 @@ fn with_cancel(f: impl FnOnce(&mut CancelContext)) {
 /// extractor that publishes the api_key row.
 pub(crate) fn note_client(client: &ClientContext, api_key_id: &str) {
     with_cancel(|c| {
-        c.api_key_id = api_key_id.to_string();
+        // Never blank an id the auth chokepoint already resolved: this
+        // extractor reads the api_key EXTENSION, which a route that
+        // authenticates inside its own handler (passthrough, `/mcp`) has
+        // not set yet, and an empty write here would undo it.
+        if !api_key_id.is_empty() {
+            c.api_key_id = api_key_id.to_string();
+        }
         c.client = Some(client.clone());
     });
 }
@@ -345,9 +371,9 @@ pub(crate) fn note_client(client: &ClientContext, api_key_id: &str) {
 /// calling, including the two that build no [`ClientContext`] and would
 /// otherwise reach the cancel emitter with nothing to attribute the row to.
 ///
-/// `api_key_id` is written here as well as by [`note_client`]: the two
-/// read the same `api_key` row, and whichever runs first wins, so they
-/// cannot disagree.
+/// `api_key_id` is written here as well as by [`note_client`]. Both assign
+/// unconditionally, so the later writer wins — which changes nothing,
+/// because both read the id off the same `api_key` row extension.
 pub(crate) fn note_authenticated(auth: &crate::auth::AuthenticatedKey) {
     with_cancel(|c| {
         c.api_key_id = auth.entry.id.clone();
@@ -355,15 +381,30 @@ pub(crate) fn note_authenticated(auth: &crate::auth::AuthenticatedKey) {
     });
 }
 
+/// Note that this route files no usage row whatever the outcome. See
+/// [`CancelContext::unmetered`]; the census in [`crate::operation`] is where
+/// the routes that need it are named.
+pub(crate) fn note_unmetered_route() {
+    with_cancel(|c| c.unmetered = true);
+}
+
 /// Note the passthrough route this request matched, for the row a cancelled
 /// one files. Called once, after `match_route`.
 pub(crate) fn note_passthrough_route(route: &str) {
-    with_cancel(|c| c.route.passthrough_route = route.to_string());
+    with_cancel(|c| {
+        c.route.passthrough_route = route.to_string();
+        // The one point that KNOWS this is passthrough traffic. See
+        // [`CancelContext::surface`] for the two route shapes whose path
+        // says something else entirely.
+        c.surface = Some(crate::operation::PASSTHROUGH);
+    });
 }
 
 /// Note the MCP server the request addressed, and the tool its JSON-RPC body
-/// named once that has been parsed. Called with an empty `tool` before the
-/// body is read, so a cancel in the upstream wait reports the server alone.
+/// named. Called twice: once with an empty `tool` before the body is read,
+/// so a cancel during the upload still reports the server a scoped entry
+/// named in its path, and again once the body has been parsed. Empty
+/// arguments never overwrite what is already there.
 pub(crate) fn note_mcp_call(server: &str, tool: &str) {
     with_cancel(|c| {
         if !server.is_empty() {
@@ -377,11 +418,14 @@ pub(crate) fn note_mcp_call(server: &str, tool: &str) {
 
 /// Note the A2A agent the request addressed and the JSON-RPC method it
 /// called.
-pub(crate) fn note_a2a_call(agent: &str, method: &str) {
+pub(crate) fn note_a2a_call(agent: &str, method: &str, operation: &str) {
     with_cancel(|c| {
         c.route.a2a_agent = agent.to_string();
         if !method.is_empty() {
             c.route.a2a_method = method.to_string();
+        }
+        if !operation.is_empty() {
+            c.route.a2a_operation = operation.to_string();
         }
     });
 }

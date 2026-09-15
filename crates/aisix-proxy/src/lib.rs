@@ -693,12 +693,14 @@ impl axum::body::HttpBody for TelemetryBody {
         }
     }
 
-    fn size_hint(&self) -> http_body::SizeHint {
-        self.inner
-            .as_ref()
-            .map(|b| b.size_hint())
-            .unwrap_or_default()
-    }
+    // `size_hint` is deliberately NOT forwarded, matching the `map_frame`
+    // wrapper this replaces: `MapFrame` does not override it either, so every
+    // response leaving this middleware has always had an unknown size and
+    // been framed chunked unless its handler set `Content-Length` itself.
+    // Forwarding it here would change the framing of every response on the
+    // listener — a wire-visible change that has nothing to do with
+    // telemetry. (`owed` reads the hint off the INNER body, before the
+    // wrap, so it is unaffected.)
 
     fn is_end_stream(&self) -> bool {
         self.inner.as_ref().is_none_or(|b| b.is_end_stream())
@@ -808,6 +810,27 @@ impl Drop for ClientCancelGuard {
             // stream guard owns (the mid-stream shape). Not this guard's.
             GuardPhase::Body { polled: true, .. } => return,
             GuardPhase::Body { owed: false, .. } => return,
+            // A `HEAD` response carries no body BY PROTOCOL: hyper drops it
+            // without a poll on every such request, whatever the handler
+            // built. That is the protocol working, not a caller walking
+            // away — and on a route that relays an open-ended body there is
+            // nothing else to tell the two apart, so a client sizing a
+            // download before fetching it would raise the cancel counter on
+            // every probe.
+            GuardPhase::Body { .. } if self.method == axum::http::Method::HEAD => return,
+            // …and nothing at all on a route that files no usage row, where
+            // the line and the counter would be its whole record — one an
+            // operator cannot find in the usage log by its `request_id`,
+            // which is the shape this change exists to remove. The HEAD
+            // phase keeps its line on such a route, because there the
+            // request produced no record anywhere else either.
+            // (`/v1/videos/:id/content` is the live case: it relays an
+            // open-ended body and was metered by the submission.)
+            GuardPhase::Body { .. }
+                if crate::operation::surface_for_endpoint(self.endpoint).is_none() =>
+            {
+                return
+            }
             GuardPhase::Body { .. } => cancel::Phase::BeforeBody,
         };
         let latency = self.started.elapsed();
@@ -8841,6 +8864,166 @@ data: [DONE]\n\n",
         );
     }
 
+    /// A HOST-matched passthrough route, whose caller keeps the upstream's
+    /// own path space — the forward-proxy shape.
+    fn host_matched_route_entry(target_url: &str) -> ResourceEntry<aisix_core::PassthroughRoute> {
+        let cfg = format!(
+            r#"{{
+                "name": "forwarded-openai",
+                "hosts": ["api.openai.example"],
+                "target_url": "{target_url}",
+                "provider_key_id": "{PK_ID}"
+            }}"#
+        );
+        let route: aisix_core::PassthroughRoute = serde_json::from_str(&cfg).unwrap();
+        ResourceEntry::new("route-id-host", route, 1)
+    }
+
+    /// A cancelled request on a passthrough route the PATH cannot identify.
+    ///
+    /// A host-matched route relays the upstream's own path space, so the
+    /// caller's path is `/v1/chat/completions` — which normalizes to the
+    /// chat label. Reading the surface off that label files the row as an
+    /// abandoned chat call carrying no model, under an `operation` a
+    /// per-operation figure counts as chat traffic. The route the request
+    /// actually matched is what decides, and it says `passthrough` on both
+    /// fields, exactly as this family's completed rows do.
+    #[tokio::test]
+    async fn a_cancelled_host_matched_relay_is_filed_as_passthrough() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({})),
+            )
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        snap.passthrough_routes
+            .insert(host_matched_route_entry(&upstream.uri()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            // The gateway's own chat path, on someone else's host.
+            .uri("/v1/chat/completions")
+            .header("host", "api.openai.example")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"model": "gpt-4o", "messages": []}).to_string(),
+            ))
+            .unwrap();
+        cancel_in_flight(app, req).await;
+
+        let event = next_event(&mut rx).await;
+        assert_head_phase_cancel(&event);
+        assert_eq!(
+            event.operation, "passthrough",
+            "the route it matched decides, not the path it arrived on",
+        );
+        assert_eq!(event.inbound_protocol, "passthrough");
+        assert_eq!(event.passthrough_route_name, "forwarded-openai");
+        assert_eq!(event.requested_model, "", "this family names no model");
+        assert_eq!(event.model_id, "");
+    }
+
+    /// Build a guard in its body phase, as the middleware leaves one when a
+    /// handler has returned an open-ended body nobody has read yet.
+    ///
+    /// Driven directly, the way `cancel_guard_stays_silent_during_unwind`
+    /// is: both arms below are decisions the guard makes from values no
+    /// route in the tree currently combines, and a router-level test would
+    /// be answered by one of the other interlocks before reaching them.
+    fn body_phase_guard(
+        state: &ProxyState,
+        method: axum::http::Method,
+        endpoint: &'static str,
+    ) -> ClientCancelGuard {
+        ClientCancelGuard {
+            phase: GuardPhase::Body {
+                owed: true,
+                polled: false,
+            },
+            state: state.clone(),
+            attribution: std::sync::Arc::new(attribution::RequestAttribution::default()),
+            endpoint,
+            method,
+            uri: endpoint.parse().unwrap(),
+            request_id: "req-body-phase".to_string(),
+            trace: None,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// A `HEAD` response's body is dropped unpolled on every such request —
+    /// hyper never writes one, whatever the handler built. Counting that as
+    /// a client cancel would make the signal fire on a download route's
+    /// ordinary size probes, which is what an operator alerts on.
+    #[test]
+    fn a_head_response_is_never_a_client_cancel() {
+        let state = build_state(AisixSnapshot::new(), Arc::new(Hub::new()));
+        let probe = state.metrics.clone();
+
+        drop(body_phase_guard(
+            &state,
+            axum::http::Method::HEAD,
+            "/v1/files/:id",
+        ));
+
+        assert!(
+            !probe.render().contains(CANCEL_METRIC),
+            "a HEAD probe was counted as a client cancel: {}",
+            probe.render(),
+        );
+    }
+
+    /// …and a route that files no usage row writes nothing in the body
+    /// phase either.
+    ///
+    /// The line and the counter would be the request's whole record, and it
+    /// would be one an operator cannot find in the usage log by its
+    /// `request_id` — the exact shape this change exists to remove.
+    /// `/v1/videos/:id/content` is the live case: it relays an open-ended
+    /// body and was metered by the submission instead.
+    #[test]
+    fn the_body_phase_is_silent_on_a_route_that_files_no_row() {
+        let state = build_state(AisixSnapshot::new(), Arc::new(Hub::new()));
+        let probe = state.metrics.clone();
+
+        drop(body_phase_guard(
+            &state,
+            axum::http::Method::GET,
+            "/v1/videos/:id",
+        ));
+
+        assert!(
+            !probe.render().contains(CANCEL_METRIC),
+            "a route with no usage row still reported a cancel: {}",
+            probe.render(),
+        );
+
+        // Not vacuous: the same guard on a metering route DOES report one.
+        drop(body_phase_guard(
+            &state,
+            axum::http::Method::GET,
+            "/v1/files/:id",
+        ));
+        assert!(
+            probe.render().contains(CANCEL_METRIC),
+            "the probe cannot detect a cancel at all: {}",
+            probe.render(),
+        );
+    }
+
     /// A relayed body the caller never reads, on a family that meters at
     /// its own tail and streams the bytes afterwards (`/v1/audio/speech`,
     /// billed per input character).
@@ -8940,6 +9123,14 @@ data: [DONE]\n\n",
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_ne!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream"),
+            "premise: this relay must be BUFFERED — a streamed one takes the other branch",
+        );
         drop_body_unpolled(response);
 
         let event = next_event(&mut rx).await;

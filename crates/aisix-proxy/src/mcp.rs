@@ -221,6 +221,12 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
     // the caller's team / user labels (the handle is an `Arc` clone).
     let caller_auth = auth.clone();
 
+    // The server a scoped entry named in its PATH, before the body is read
+    // — a caller that hangs up mid-upload still files a row naming what it
+    // addressed (AISIX-Cloud#1571). The method and tool follow once the
+    // body has been parsed, inside `dispatch`.
+    crate::attribution::note_mcp_call(scope.as_deref().unwrap_or_default(), "");
+
     let mut mcp_log = McpRequestLog::default();
     let response = dispatch(
         auth,
@@ -371,8 +377,25 @@ async fn dispatch(
     // what it called (AISIX-Cloud#1571). Split the way the gateway itself
     // splits it below, so the cancelled row and the completed one carry the
     // same two values rather than one carrying the namespaced spelling.
-    let (cancel_server, cancel_tool) = match (scope, log.tool.as_deref()) {
-        (Some(server), Some(tool)) => (server, tool),
+    // The name as PARSED, not `log.tool` — that one has been through
+    // `truncate_for_log`, and the completed row is built from the untruncated
+    // peek. The event's own sinks cap it.
+    let called_tool = is_tool_call
+        .then(|| {
+            peek.as_ref()
+                .and_then(|p| p.params.as_ref())
+                .and_then(|p| p.name.as_deref())
+        })
+        .flatten();
+    let (cancel_server, cancel_tool) = match (scope, called_tool) {
+        // A scoped entry accepts the bare name AND the namespaced one, and
+        // resolves both to the bare tool — so strip the prefix here too, or
+        // a caller that spells it out files a row naming a tool the
+        // completed row would have called something else.
+        (Some(server), Some(tool)) => (
+            server,
+            aisix_mcp::strip_server_prefix(server, tool).unwrap_or(tool),
+        ),
         (None, Some(tool)) => tool
             .split_once(aisix_mcp::TOOL_NAMESPACE_SEPARATOR)
             .unwrap_or(("", "")),
@@ -2479,6 +2502,82 @@ mod tests {
         assert_eq!(event.model_id, "");
         assert_eq!(event.prompt_tokens, 0);
         assert!(rx.try_recv().is_err(), "one call, one row");
+    }
+
+    /// The same cancel on the SCOPED entry, where the caller may spell the
+    /// tool either way.
+    ///
+    /// `/mcp/ghost` accepts `tool` and `ghost__tool` alike and resolves both
+    /// to the bare name, so a cancelled row has to resolve it the same way —
+    /// otherwise one request's two records name two different tools, and a
+    /// per-tool count splits by how each caller happened to spell it.
+    #[tokio::test]
+    async fn a_cancelled_scoped_call_files_the_tool_under_its_bare_name() {
+        use aisix_obs::{UsageEvent, UsageSink};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let scanner = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({})),
+            )
+            .mount(&scanner)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UsageEvent>(8);
+        let handle = SnapshotHandle::new(snapshot_with_key());
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle.clone(), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let router = build_router(state);
+        seed_mcp_server(&handle, "mcp-ghost", "ghost");
+        seed_guardrail_with_attachment(
+            &handle,
+            &format!(
+                r#"{{"name":"slow-input","kind":"azure_content_safety_text_moderation","hook_point":"input","endpoint":"{}","api_key":"k"}}"#,
+                scanner.uri()
+            ),
+            r#"{"guardrail_id":"g1","scope_type":"mcp_server","scope_id":"mcp-ghost","priority":50}"#,
+        );
+
+        // The namespaced spelling, on the scoped entry that also accepts the
+        // bare one.
+        let req = HttpRequest::post("/mcp/ghost")
+            .header("host", "mcp.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": { "name": "ghost__tool", "arguments": {} }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_millis(500), router.oneshot(req)).await;
+        assert!(
+            outcome.is_err(),
+            "the call answered on its own — this is not modelling a cancel",
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a cancelled scoped /mcp call emitted no usage event")
+            .expect("sender dropped without sending");
+        assert_eq!(event.status_code, crate::CLIENT_CLOSED_REQUEST, "{event:?}");
+        assert_eq!(event.mcp_server_name, "ghost");
+        assert_eq!(
+            event.mcp_tool_name, "tool",
+            "the namespaced spelling must resolve to the same tool the completed row names",
+        );
     }
 
     #[tokio::test]

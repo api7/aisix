@@ -388,15 +388,37 @@ mod tests {
     /// fallback. A hand-written exemption list would let a route be quietly
     /// dropped from the emitting side while its own sibling still meters,
     /// which is the AISIX-Cloud#1571 bug arriving one route at a time.
+    /// Routes that file no usage row at any outcome yet NORMALIZE to a label
+    /// a metering route also uses. The guard sees only the label, so each of
+    /// these must call `attribution::note_unmetered_route()` itself — there
+    /// is nothing else that can tell it apart from its metering sibling.
+    ///
+    /// Listed here so the pairing is visible: adding a route to a shared
+    /// label without that call means a cancelled request on it is filed as
+    /// its sibling's traffic.
+    const UNMETERED_ON_A_SHARED_LABEL: &[&str] = &[
+        "/a2a/:agent/.well-known/agent-card.json",
+        // Both normalize to `other`, which IS the passthrough family (every
+        // path no typed route claims reaches its fallback). Unauthenticated
+        // today, so the api_key gate would also hold — but that is a
+        // property of the handler, not of the label, and this list is where
+        // the label question is answered.
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp",
+    ];
+
     #[test]
     fn every_route_the_guard_wraps_reports_a_cancel_it_can_name() {
         // label -> the surface its metering routes agree on, if any.
         let mut by_label: std::collections::BTreeMap<&str, Option<Surface>> =
             std::collections::BTreeMap::new();
+        let mut silent_by_label: std::collections::BTreeMap<&str, Vec<&str>> =
+            std::collections::BTreeMap::new();
         for (route, emits) in ROUTE_OPERATIONS {
             let label = crate::normalize_endpoint_label(route);
             let entry = by_label.entry(label).or_insert(None);
             let Emits::Usage(surface) = emits else {
+                silent_by_label.entry(label).or_default().push(route);
                 continue;
             };
             if let Some(prev) = entry {
@@ -409,6 +431,38 @@ mod tests {
                 );
             }
             *entry = Some(*surface);
+        }
+
+        // A silent route that shares a label with a metering one can only be
+        // silent by declaring itself so.
+        for (label, silent) in &silent_by_label {
+            if by_label.get(label).copied().flatten().is_none() {
+                continue;
+            }
+            for route in silent {
+                assert!(
+                    UNMETERED_ON_A_SHARED_LABEL.contains(route),
+                    "{route} files no usage row, but normalizes to {label:?}, which a metering \
+                     route reports — so a cancelled request on it is filed as that route's \
+                     traffic. Call attribution::note_unmetered_route() in its handler and name \
+                     it in UNMETERED_ON_A_SHARED_LABEL.",
+                );
+            }
+        }
+
+        // A label NO metering route reaches must report nothing — the half
+        // that keeps `/livez`, `/readyz`, `/v1/models` and the video polls
+        // from being given a surface by accident.
+        for (label, silent) in &silent_by_label {
+            if by_label.get(label).copied().flatten().is_some() {
+                continue;
+            }
+            assert!(
+                surface_for_endpoint(label).is_none(),
+                "{silent:?} meter nothing at any outcome, yet {label:?} reports {:?} on a \
+                 cancel",
+                surface_for_endpoint(label),
+            );
         }
 
         for (label, expected) in by_label {
