@@ -37,14 +37,19 @@ const LOGSTORE = "cancel-events";
 const GROUP = "c1571-group";
 const TARGET = "c1571-target";
 const UPSTREAM_MODEL = "gpt-4o-mini";
+/** A direct model on a fast upstream, for the success-path line below. */
+const FAST_MODEL = "c1571-fast";
+const FAST_UPSTREAM_MODEL = "gpt-4o-fast";
 
 describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
   let etcdReachable = false;
   let slow: OpenAiUpstream | undefined;
+  let fast: OpenAiUpstream | undefined;
   let sls: MockSls | undefined;
   let app: SpawnedApp | undefined;
   let targetModelId = "";
   let providerKeyId = "";
+  let fastProviderKeyId = "";
 
   beforeAll(async () => {
     etcdReachable = await new EtcdClient().ping();
@@ -54,6 +59,18 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
     slow = await startOpenAiUpstream({
       responseDelayMs: 30_000,
       streamEvents: ["[DONE]"],
+    });
+    fast = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "chatcmpl-c1571",
+        object: "chat.completion",
+        created: 1_700_000_000,
+        model: FAST_UPSTREAM_MODEL,
+        choices: [
+          { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+        ],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      },
     });
     sls = await startMockSls();
 
@@ -94,6 +111,18 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
       provider_key_id: pk.id,
     });
     targetModelId = target.id;
+    const fastPk = await seed.createProviderKey({
+      display_name: "c1571-fast-pk",
+      secret: PROVIDER_SECRET,
+      api_base: `${fast.baseUrl}/v1`,
+    });
+    fastProviderKeyId = fastPk.id;
+    await seed.createModel({
+      display_name: FAST_MODEL,
+      provider: "openai",
+      model_name: FAST_UPSTREAM_MODEL,
+      provider_key_id: fastPk.id,
+    });
     // Seeded last, so it authenticating implies everything above is in the
     // snapshot (tests/e2e/AGENTS.md).
     await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
@@ -104,13 +133,14 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
   afterAll(async () => {
     await app?.exit();
     await slow?.close();
+    await fast?.close();
     await sls?.close();
   });
 
   test(
     "an abandoned request is metered, and names the target it was waiting on",
     async (ctx) => {
-      if (!etcdReachable || !app || !slow || !sls) {
+      if (!etcdReachable || !app || !slow || !fast || !sls) {
         ctx.skip();
         return;
       }
@@ -185,4 +215,37 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
     },
     60_000,
   );
+
+  // The pair is not a 499-only field. Asserting it only on the cancel line
+  // would leave a version that fills it from the guard and nowhere else
+  // looking entirely correct.
+  test("an ordinary completed request names its target on the line too", async (ctx) => {
+    if (!etcdReachable || !app || !fast) {
+      ctx.skip();
+      return;
+    }
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: FAST_MODEL,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    await res.arrayBuffer();
+    expect(res.status).toBe(200);
+    const requestId = res.headers.get("x-aisix-request-id") ?? "";
+    expect(requestId).not.toBe("");
+
+    const line = app
+      .output()
+      .split("\n")
+      .find((l) => l.includes(`request_id="${requestId}"`) && l.includes("status=200"));
+    expect(line, `no 200 access-log line for ${requestId} in:\n${app.output()}`).toBeTruthy();
+    expect(line).toContain(`upstream_model="${FAST_UPSTREAM_MODEL}"`);
+    expect(line).toContain(`provider_key_id="${fastProviderKeyId}"`);
+  });
 });
