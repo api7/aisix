@@ -420,6 +420,32 @@ pub(crate) async fn embed_texts(
     request_id: &str,
     texts: &[String],
 ) -> Result<Vec<Vec<f32>>, ProxyError> {
+    // Detached: this is a dispatch the GATEWAY decided to make — for a
+    // semantic guardrail, a semantic route, or the semantic cache — not one
+    // the caller addressed. Two of its three callers run after the winning
+    // attempt has already settled, so letting it commit the embedding model
+    // to the request's attribution cell would put that model on the
+    // request's own access-log line and usage event
+    // (see `attribution::detached`).
+    crate::attribution::detached(embed_texts_inner(
+        hub,
+        snapshot,
+        embed_entry,
+        timeout,
+        request_id,
+        texts,
+    ))
+    .await
+}
+
+async fn embed_texts_inner(
+    hub: &aisix_gateway::Hub,
+    snapshot: &AisixSnapshot,
+    embed_entry: &ResourceEntry<Model>,
+    timeout: Option<std::time::Duration>,
+    request_id: &str,
+    texts: &[String],
+) -> Result<Vec<Vec<f32>>, ProxyError> {
     let model = &embed_entry.value;
     crate::dispatch::require_provider(model)?;
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -515,6 +541,84 @@ mod tests {
                 "match": {"threshold": 0.5}
             }"#,
         )
+    }
+
+    /// Embedding is a dispatch the GATEWAY decides to make, and two of its
+    /// three callers — a semantic guardrail's OUTPUT hook, and the semantic
+    /// cache's write — run after the winning attempt has already settled.
+    ///
+    /// The request's attribution cell records the last target
+    /// `resolve_provider_key` committed to, and the access-log line and the
+    /// cancelled-request usage event both read it. So without a cell of its
+    /// own, an ordinary request that happens to run a semantic guardrail
+    /// would report the EMBEDDING model as the upstream it dispatched to —
+    /// on the very line an operator reads to find out which member of a
+    /// routing group served them (AISIX-Cloud#1571). Wrong, not merely
+    /// absent, which is the worse of the two.
+    #[tokio::test]
+    async fn embedding_does_not_overwrite_the_caller_s_target() {
+        use aisix_core::snapshot::ResourceTable;
+
+        let embed_model: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "bge-m3",
+            "provider": "openai",
+            "model_name": "text-embedding-3-small",
+            "provider_key_id": "pk-embed",
+        }))
+        .unwrap();
+        let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
+            "display_name": "embed-key",
+            "secret": "sk-embed",
+            "api_base": "http://127.0.0.1:1",
+            "provider": "openai",
+            "adapter": "openai",
+        }))
+        .unwrap();
+        let provider_keys = ResourceTable::default();
+        provider_keys.insert(ResourceEntry::new("pk-embed", pk, 1));
+        let snapshot = AisixSnapshot {
+            provider_keys,
+            ..Default::default()
+        };
+        let embed_entry = ResourceEntry::new("m-embed", embed_model, 1);
+
+        let cell = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+        crate::attribution::scope(cell.clone(), async {
+            // What the CALLER addressed and the gateway dispatched to.
+            let served: Model = serde_json::from_value(serde_json::json!({
+                "display_name": "served-by",
+                "provider": "anthropic",
+                "model_name": "claude-sonnet-4",
+                "provider_key_id": "pk-chat",
+            }))
+            .unwrap();
+            crate::attribution::note_target(&served, "pk-chat");
+
+            // An empty `Hub` means no bridge, so this fails — but only
+            // AFTER `resolve_provider_key` has committed the embedding
+            // target, which is the write under test.
+            let err = embed_texts(
+                &aisix_gateway::Hub::new(),
+                &snapshot,
+                &embed_entry,
+                None,
+                "req-embed",
+                &["scan me".to_string()],
+            )
+            .await
+            .expect_err("premise: no bridge is registered, so this must fail");
+            assert!(
+                matches!(err, ProxyError::ProviderUnavailable),
+                "premise: it must fail at bridge resolution, i.e. after the \
+                 provider key was resolved — got {err}",
+            );
+
+            let resolved = crate::attribution::current().expect("in scope");
+            assert_eq!(resolved.upstream_model, "claude-sonnet-4");
+            assert_eq!(resolved.provider, "anthropic");
+            assert_eq!(resolved.provider_key_id, "pk-chat");
+        })
+        .await;
     }
 
     #[test]

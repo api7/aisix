@@ -164,6 +164,7 @@ pub async fn a2a_endpoint(
 
     let elapsed = started.elapsed();
     let status = response.status().as_u16();
+    let target = crate::attribution::AccessLogTarget::current();
     AccessLog {
         method: http_method.as_str(),
         path: "/a2a",
@@ -171,6 +172,8 @@ pub async fn a2a_endpoint(
         latency: elapsed,
         provider: Some("a2a"),
         model: None,
+        upstream_model: target.upstream_model(),
+        provider_key_id: target.provider_key_id(),
         api_key_id: Some(&api_key_id),
         // Counted inside `dispatch`, which hands back only a rendered
         // `Response` — and for a stream, not until its drop guard fires, long

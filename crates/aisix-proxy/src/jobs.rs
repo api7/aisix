@@ -702,6 +702,7 @@ fn emit_access_log(
         }
         None => (None, None),
     };
+    let log_target = crate::attribution::AccessLogTarget::current();
     AccessLog {
         method: method.as_str(),
         path,
@@ -709,6 +710,8 @@ fn emit_access_log(
         latency: elapsed,
         provider: target.map(|t| t.provider_label()).filter(|p| !p.is_empty()),
         model: target.map(|t| t.display_name()),
+        upstream_model: log_target.upstream_model(),
+        provider_key_id: log_target.provider_key_id(),
         api_key_id: Some(api_key_id),
         prompt_tokens: None,
         completion_tokens: None,

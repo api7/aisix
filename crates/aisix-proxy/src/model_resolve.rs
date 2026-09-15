@@ -32,10 +32,14 @@ pub(crate) fn resolve_model(
     // the request's attribution cell (see `attribution`).
     if let Some(exact) = snapshot.models.get_by_name(requested) {
         crate::attribution::note_requested_model(requested);
+        note_dispatchable_entry(&exact);
         return Some(exact);
     }
     let (entry, upstream) = best_wildcard_row(snapshot, requested)?;
     crate::attribution::note_requested_model(requested);
+    // A wildcard row is a direct model, and attribution stays on the ROW
+    // (see the module docs), so the synthetic clone below inherits its id.
+    note_dispatchable_entry(&entry);
     let mut model = entry.value.clone();
     model.model_name = Some(upstream);
     Some(Arc::new(ResourceEntry::new(
@@ -43,6 +47,20 @@ pub(crate) fn resolve_model(
         model,
         entry.revision,
     )))
+}
+
+/// Record the resolved entry's uuid for the terminal emitters that run
+/// after the handler is gone (AISIX-Cloud#1571) — but only when the entry
+/// dispatches to an upstream itself. A routing group, an ensemble and a
+/// semantic router are addressed by the caller and served by something
+/// else; their uuid prices nothing, so the cancel path leaves `model_id`
+/// empty for them and takes the target's id from the attempt instead.
+fn note_dispatchable_entry(entry: &ResourceEntry<Model>) {
+    let model = &entry.value;
+    if model.is_routing() || model.is_ensemble() || model.is_semantic() {
+        return;
+    }
+    crate::attribution::note_resolved_entry(&entry.id);
 }
 
 /// Wildcard fallback: the most specific direct Model whose `*`-glob

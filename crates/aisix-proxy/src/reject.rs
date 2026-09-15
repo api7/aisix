@@ -73,6 +73,8 @@ pub(crate) fn reject_before_dispatch(
         // body naming the model is exactly what we refused to read.
         provider: None,
         model: None,
+        upstream_model: None,
+        provider_key_id: None,
         api_key_id,
         prompt_tokens: None,
         completion_tokens: None,

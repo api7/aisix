@@ -26,9 +26,14 @@
 //!   a detached task once the session closes, so it carries the close status
 //!   and the session's real token totals.
 //! - **Caller hung up before the response head** — written from
-//!   `ClientCancelGuard::drop`, with no handler involved. Status is `499`
-//!   and every resolved field is `None`, because the handler future was
-//!   dropped before it could fill any of them.
+//!   `ClientCancelGuard::drop`, with no handler involved. Status is `499`,
+//!   and the fields it can fill are the ones the request published to its
+//!   attribution cell as it resolved: `model`, `provider`, and the
+//!   dispatched target (`upstream_model` + `provider_key_id`). The
+//!   handler-side figures — tokens, `provider_request_id`, the routing
+//!   counts — stay `None`, because the future was dropped before it could
+//!   produce them. Such a request also emits a `499` usage event carrying
+//!   the same identities (AISIX-Cloud#1571), keyed by this `request_id`.
 //!
 //! So do not add a field whose value only exists once the upstream has
 //! responded and expect it on every line: it is silently empty on the
@@ -51,7 +56,18 @@ pub struct AccessLog<'a> {
     pub status: u16,
     pub latency: Duration,
     pub provider: Option<&'a str>,
+    /// The model name the CALLER addressed — for a routing group, the group
+    /// itself, never the target it dispatched to. See `upstream_model`
+    /// below for the other half.
     pub model: Option<&'a str>,
+    /// The upstream model id of the target this request last selected, and
+    /// the ProviderKey it dispatched through. `model` alone cannot answer
+    /// "which provider actually served this", and on a line written before
+    /// any response exists — a `499` — nothing else names the target at all
+    /// (AISIX-Cloud#1571). Both are `None` until a target was selected, and
+    /// on the emitters that run detached from the request task.
+    pub upstream_model: Option<&'a str>,
+    pub provider_key_id: Option<&'a str>,
     pub api_key_id: Option<&'a str>,
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
@@ -129,6 +145,8 @@ impl AccessLog<'_> {
             latency_ms = self.latency.as_millis() as u64,
             provider = self.provider,
             model = self.model,
+            upstream_model = self.upstream_model,
+            provider_key_id = self.provider_key_id,
             api_key_id = self.api_key_id,
             prompt_tokens = self.prompt_tokens,
             completion_tokens = self.completion_tokens,
@@ -200,6 +218,8 @@ mod tests {
                 latency: Duration::from_millis(42),
                 provider: Some("openai"),
                 model: Some("my-gpt4"),
+                upstream_model: Some("gpt-4o"),
+                provider_key_id: Some("pk-1"),
                 api_key_id: Some("key-id-1"),
                 prompt_tokens: Some(2),
                 completion_tokens: Some(1),
@@ -237,6 +257,18 @@ mod tests {
         );
         assert!(out.contains("routing_attempt_count=2"));
         assert!(out.contains("routing_fallback_count=1"));
+        // AISIX-Cloud#1571: `model` is what the caller addressed, so the
+        // target it actually dispatched to has to be named separately —
+        // otherwise a routing request's line says only the group, and a
+        // `499` line names no target at all.
+        assert!(
+            out.contains("upstream_model=\"gpt-4o\"") || out.contains("upstream_model=gpt-4o"),
+            "{out}"
+        );
+        assert!(
+            out.contains("provider_key_id=\"pk-1\"") || out.contains("provider_key_id=pk-1"),
+            "{out}"
+        );
         // A success line must not carry failure fields at all — an
         // always-present `error=""` would defeat filtering on it.
         assert!(!out.contains("error_kind"), "{out}");
@@ -263,6 +295,8 @@ mod tests {
                 latency: Duration::from_millis(7167),
                 provider: None,
                 model: Some("claude-sonnet-4"),
+                upstream_model: None,
+                provider_key_id: None,
                 api_key_id: Some("key-id-1"),
                 prompt_tokens: None,
                 completion_tokens: None,
@@ -313,6 +347,8 @@ mod tests {
                 latency: Duration::from_millis(1),
                 provider: None,
                 model: None,
+                upstream_model: None,
+                provider_key_id: None,
                 api_key_id: None,
                 prompt_tokens: None,
                 completion_tokens: None,
@@ -334,5 +370,10 @@ mod tests {
         // The fmt layer elides Option::None values; we should *not* see
         // a concrete provider rendered when the caller supplied None.
         assert!(!out.contains("provider=\"openai\""));
+        // Same for the target pair (AISIX-Cloud#1571): a line written
+        // before a target was selected must carry no target-derived field
+        // at all, not an empty one an operator would have to filter out.
+        assert!(!out.contains("upstream_model"), "{out}");
+        assert!(!out.contains("provider_key_id"), "{out}");
     }
 }

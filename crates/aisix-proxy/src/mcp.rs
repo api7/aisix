@@ -240,6 +240,7 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
     } else {
         "/mcp"
     };
+    let target = crate::attribution::AccessLogTarget::current();
     AccessLog {
         method: method.as_str(),
         path: endpoint,
@@ -247,6 +248,8 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
         latency: elapsed,
         provider: Some("mcp"),
         model: None,
+        upstream_model: target.upstream_model(),
+        provider_key_id: target.provider_key_id(),
         api_key_id: Some(&api_key_id),
         prompt_tokens: None,
         completion_tokens: None,
