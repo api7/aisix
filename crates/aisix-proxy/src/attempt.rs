@@ -202,7 +202,6 @@ impl RoutingTelemetry {
             kind,
             target_model: target.target_model.to_string(),
             model_id: target.model_id.to_string(),
-            started: Instant::now(),
         });
         (index, kind)
     }

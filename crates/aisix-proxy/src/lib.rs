@@ -8336,6 +8336,123 @@ data: [DONE]\n\n";
         assert!(rx.try_recv().is_err(), "two attempts, two events");
     }
 
+    /// A cancel does not only land INSIDE an attempt. Here the winning
+    /// attempt has already settled and the handler is in its post-dispatch
+    /// work — an output guardrail scan — when the caller goes away.
+    ///
+    /// There is no attempt to name at that point, but there is very much a
+    /// target: the access-log line names it, and so must the row. Clearing
+    /// the in-flight marker on settle without keeping the target's identity
+    /// put a routing request right back to reporting a `499` that names no
+    /// model at all.
+    #[tokio::test]
+    async fn head_phase_cancel_after_the_winner_settled_still_names_the_target() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-won",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "answered"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&upstream)
+            .await;
+        // The upstream answers at once; the OUTPUT scan is what the request
+        // is still waiting on when the caller hangs up.
+        let scanner = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({})),
+            )
+            .mount(&scanner)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_routing_group("smart", &[("m-primary", "primary", &upstream.uri())]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        seed_guardrail(
+            &state.snapshot,
+            "g-slow-output",
+            &format!(
+                r#"{{"name":"slow-output","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{}","api_key":"k"}}"#,
+                scanner.uri()
+            ),
+        );
+        let app = build_router(state);
+
+        cancel_in_flight(app, cancellable_chat_request("smart")).await;
+
+        let event = next_event(&mut rx).await;
+        assert_head_phase_cancel(&event);
+        assert_eq!(event.requested_model, "smart");
+        assert_eq!(
+            event.model_id, "m-primary",
+            "a target HAD been selected — the row must not report the request as \
+             having reached nothing",
+        );
+        // The winner's own event is the one the handler never got to write,
+        // so nothing of this request carries its index yet and the terminal
+        // event can name it in full.
+        assert_eq!(event.attempt_model, "primary");
+        assert_eq!(event.attempt_index, 0);
+        assert_eq!(event.attempt_kind, "initial");
+        assert!(
+            rx.try_recv().is_err(),
+            "the winner succeeded, so it is the only row"
+        );
+    }
+
+    /// A caller that authenticates and then walks away while its BODY is
+    /// still uploading leaves no usage row.
+    ///
+    /// The `auth` and `ClientContext` extractors both run before the body
+    /// one, so an api_key alone is reached long before any model is named.
+    /// Emitting on that would mint a row with no model, no target and no
+    /// cost — unattributable, and a cheap way for a client to fill the
+    /// usage log — and would put this path on the opposite side of the line
+    /// from the pre-dispatch rejections in `reject.rs`, which stay silent.
+    #[tokio::test]
+    async fn a_cancel_before_the_model_is_named_emits_nothing() {
+        use aisix_obs::UsageSink;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://127.0.0.1:1");
+        let state = build_state(snap, Arc::new(Hub::new())).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        // A body that starts as valid JSON and never finishes, so the Json
+        // extractor is still awaiting bytes when the future is dropped.
+        let body = Body::from_stream(async_stream::stream! {
+            yield Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"{\"model\":\"my-"));
+            std::future::pending::<()>().await;
+            yield Ok(axum::body::Bytes::new());
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap();
+        cancel_in_flight(app, req).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "an abandoned upload named no model, so it has no row to file",
+        );
+    }
+
     /// The single-target families have no attempt loop, so their cancel
     /// event takes its `model_id` from the entry the caller addressed —
     /// which for them IS the target. Embeddings stands for the family;

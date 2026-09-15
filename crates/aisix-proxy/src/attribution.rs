@@ -88,9 +88,25 @@ pub(crate) struct InFlightAttempt {
     pub target_model: String,
     /// UUID of the concrete Model row this attempt dispatched to.
     pub model_id: String,
-    /// When the attempt began, so a cancelled request can say how long the
-    /// caller waited on THIS target rather than on the whole request.
-    pub started: std::time::Instant,
+}
+
+/// The attempt that WON, once it has settled.
+///
+/// Its own event is written by the handler after the response is processed
+/// — so on the cancel path it was never written at all, and unlike a failed
+/// attempt there is no row of this request already carrying its index. That
+/// is what lets the terminal event name it in full.
+#[derive(Clone)]
+pub(crate) struct SettledWinner {
+    pub index: u32,
+    pub kind: &'static str,
+    pub target_model: String,
+    pub model_id: String,
+    /// The attempt's own measured duration, as recorded. Taken from the
+    /// record rather than measured here, so it does not absorb the
+    /// post-dispatch work (the output scan, the cache write) the cancel
+    /// actually landed in.
+    pub latency_ms: u32,
 }
 
 /// What a cancelled request needs to emit its own usage events. See the
@@ -112,6 +128,18 @@ pub(crate) struct CancelContext {
     /// The attempt begun and not yet settled, if the cancel landed inside
     /// one.
     pub in_flight: Option<InFlightAttempt>,
+    /// The winning attempt, once it settled. See [`SettledWinner`].
+    pub won: Option<SettledWinner>,
+    /// The Model uuid of the last target that SETTLED, win or lose.
+    ///
+    /// Covers the gap `won` does not: a cancel during the retry backoff
+    /// between two FAILED attempts. A target had been selected — the
+    /// access-log line names it — so the event must too, or a routing
+    /// request reports a row naming no target at all, which is the thing
+    /// this whole path exists to remove. Only the identity is carried:
+    /// repeating that attempt's index would put two rows of one request
+    /// under the same `attempt_index`, since the guard emits its event.
+    pub last_settled_model_id: String,
     /// Attempts that settled as failures. On the cancel path these never
     /// reach the handler's own `emit_failed_attempts`, so the guard emits
     /// them. A SUCCESSFUL attempt is not kept: its event is built from the
@@ -172,6 +200,22 @@ pub(crate) fn scope<F: Future>(
     fut: F,
 ) -> impl Future<Output = F::Output> {
     CURRENT.scope(attribution, fut)
+}
+
+/// Run `fut` against a throwaway cell, so a sub-call the request makes ON
+/// ITS OWN BEHALF cannot be mistaken for the target the CALLER addressed.
+///
+/// The cell records the last target `resolve_provider_key` committed to,
+/// which is right for every dispatch the caller asked for and wrong for
+/// every one the gateway decided to make: a semantic guardrail and the
+/// semantic cache both call an embedding model, and the guardrail's output
+/// hook and the cache write both run AFTER the winning attempt. Without
+/// this, the request's own access-log line would name the embedding model
+/// as the upstream it dispatched to — a field that is wrong rather than
+/// merely absent, on exactly the line an operator reads to find out which
+/// member of a routing group served them (AISIX-Cloud#1571).
+pub(crate) fn detached<F: Future>(fut: F) -> impl Future<Output = F::Output> {
+    CURRENT.scope(Arc::new(RequestAttribution::default()), fut)
 }
 
 /// Note the model name the caller addressed. Called once per request from
@@ -278,14 +322,27 @@ pub(crate) fn note_attempt_started(attempt: InFlightAttempt) {
 
 /// Note that the attempt in flight resolved, one way or the other.
 ///
-/// Clearing `in_flight` is deliberate: the settled attempt now has its own
-/// record, so a cancel landing in the gap before the next attempt begins
-/// reports no target rather than naming one whose event already went out
-/// under the same attempt index.
+/// A settled attempt is kept, not discarded — a cancel lands in the gaps too
+/// (the retry backoff; the output scan and cache write after the winner), and
+/// a target HAD been selected there. How much of it is kept depends on
+/// whether its own event exists yet: a FAILED attempt's does, so only its
+/// model id survives (`last_settled_model_id`) and repeating its index would
+/// put two rows under one `attempt_index`; a WINNING attempt's does not,
+/// because the handler writes that one after processing the response, so it
+/// is kept whole (`won`).
 pub(crate) fn note_attempt_settled(rec: &AttemptRecord) {
     with_cancel(|c| {
         c.in_flight = None;
-        if !rec.success {
+        c.last_settled_model_id = rec.target_model_id.clone();
+        if rec.success {
+            c.won = Some(SettledWinner {
+                index: rec.index,
+                kind: rec.kind,
+                target_model: rec.target_model.clone(),
+                model_id: rec.target_model_id.clone(),
+                latency_ms: rec.latency_ms,
+            });
+        } else {
             c.failed_attempts.push(rec.clone());
         }
     });
@@ -347,18 +404,22 @@ mod tests {
         }
     }
 
-    /// The double-emission interlock rests on one property of tokio's
-    /// task-local scope: the value is still installed while the scoped
-    /// future is being DROPPED. That is what lets an emitter living inside
-    /// the handler — `chat::build_sse_stream`'s `CompleteOnDrop` and its
-    /// siblings — record its terminal event on the cell as cancellation
-    /// unwinds, so [`CancelContext::emitted_terminal`] is already set by
-    /// the time the cancel guard reads it and the guard stays quiet.
+    /// The double-emission interlock rests on the cell being writable for as
+    /// long as the handler's own code can still run — which includes the
+    /// scoped future being DROPPED, since a `Drop` emitter inside the
+    /// handler runs there. tokio installs the value during that drop, so
+    /// `note_usage_emitted` reaches the cell and the guard stays quiet.
     ///
-    /// Nothing else pins it. If tokio stopped installing the value during
-    /// drop, `note_usage_emitted` would silently become a no-op on exactly
-    /// the path the interlock exists for, and one cancelled stream would
-    /// report two contradicting terminal rows.
+    /// The streaming families do not rely on this today: their
+    /// `CompleteOnDrop` guards are constructed inside `async_stream!`
+    /// bodies, which first run when the response body is polled — by which
+    /// time the middleware has long disarmed the guard. What the interlock
+    /// actually covers is the handler emitting on its own task and then
+    /// awaiting again (a cache write, a content capture) before returning.
+    /// This test pins the drop half anyway, because it is the half nothing
+    /// else would notice losing: were tokio to stop installing the value, a
+    /// future `Drop` emitter would silently write nowhere and one cancelled
+    /// request would report two contradicting terminal rows.
     #[tokio::test]
     async fn the_cell_is_writable_while_the_scoped_future_is_dropped() {
         let cell = Arc::new(RequestAttribution::default());

@@ -56,11 +56,15 @@ pub(crate) const CANCELLED_MID_STREAM: &str =
 /// Emit a cancelled request's usage events. Called once, from
 /// `ClientCancelGuard::drop`.
 ///
-/// Silent for a request that never authenticated — a caller that hung up
-/// during body upload is in the same position as the pre-dispatch
-/// rejections in [`crate::reject`], which emit no usage event either: there
-/// is no api_key to attribute the row to. Silent, too, for a route whose
-/// surface reports no cancel (see [`crate::operation::surface_for_endpoint`]).
+/// Silent unless the request got far enough to be worth a row: it must have
+/// authenticated AND named a model the gateway resolved. A caller that hangs
+/// up while its body is still uploading has done neither — the auth and
+/// `ClientContext` extractors run before the body one, so the api_key alone
+/// would let an aborted upload mint a row with no model and no cost, which
+/// is both unattributable and a cheap way to fill the usage log. That leaves
+/// it where the pre-dispatch rejections in [`crate::reject`] already sit,
+/// which emit no usage event either. Silent, too, for a route whose surface
+/// reports no cancel (see [`crate::operation::surface_for_endpoint`]).
 pub(crate) fn emit(
     state: &ProxyState,
     endpoint: &'static str,
@@ -74,7 +78,7 @@ pub(crate) fn emit(
     let Some(client) = ctx.client.as_ref() else {
         return;
     };
-    if ctx.api_key_id.is_empty() {
+    if ctx.api_key_id.is_empty() || resolved.requested_model.is_empty() {
         return;
     }
     let snap = state.snapshot.load();
@@ -105,7 +109,16 @@ pub(crate) fn emit(
             error_message: rec.error_message.clone(),
             ..base_event(request_id, resolved, &ctx, client, inbound_protocol, &pk)
         };
-        emit_one(state, surface, event, &pk, client, false, rec.dispatched);
+        emit_one(
+            state,
+            &snap,
+            surface,
+            event,
+            &pk,
+            client,
+            false,
+            rec.dispatched,
+        );
     }
 
     // The request's own terminal event — unless the handler got its own
@@ -113,7 +126,41 @@ pub(crate) fn emit(
     if ctx.emitted_terminal {
         return;
     }
-    let in_flight = ctx.in_flight.as_ref();
+    // The attempt this event speaks for: the one in flight, else the one
+    // that WON and was still being processed when the caller left. A failed
+    // attempt is never chosen — the loop above already emitted its event,
+    // under this same index.
+    let attempt = ctx
+        .in_flight
+        .as_ref()
+        .map(|a| Attempt {
+            index: a.index,
+            kind: a.kind,
+            target_model: a.target_model.as_str(),
+            model_id: a.model_id.as_str(),
+            // `begin_attempt` publishes an attempt BEFORE the target's own
+            // rate-limit reservation and before the bridge assembles the
+            // request, so an attempt in flight has not necessarily reached
+            // a provider — `AttemptRecord::dispatched` records exactly that
+            // case as false. Claiming it would make `emit_usage` fabricate
+            // an upstream span for a call nobody made, and there is no
+            // latency to report that would mean what an attempt's normally
+            // means.
+            dispatched: false,
+            latency_ms: 0,
+        })
+        .or_else(|| {
+            ctx.won.as_ref().map(|w| Attempt {
+                index: w.index,
+                kind: w.kind,
+                target_model: w.target_model.as_str(),
+                model_id: w.model_id.as_str(),
+                // This one did reach the provider, and its own measured
+                // duration is what the winner's event would have carried.
+                dispatched: true,
+                latency_ms: w.latency_ms,
+            })
+        });
     let pk = ResolvedPk::resolve(&snap, &resolved.provider_key_id);
     let event = UsageEvent {
         // NO-GUARDRAIL-CHAIN: this emitter runs from `Drop` with no
@@ -124,41 +171,49 @@ pub(crate) fn emit(
         // ten opt-in call sites is the drift this whole design exists
         // to avoid. A cancelled request therefore reports no guardrail
         // attribution at all rather than a wrong one.
-        // The target that was in flight, or — when no attempt had begun —
-        // the entry the caller addressed, but only if that entry dispatches
-        // itself. A routing group's own id prices nothing, so it stays
-        // empty, the same convention a `model_not_found` event uses.
-        model_id: in_flight
-            .map(|a| a.model_id.clone())
+        // The target this request had committed to, in narrowing order: the
+        // attempt above, else the last attempt that settled (the cancel
+        // landed in the retry backoff between two failures), else the entry
+        // the caller addressed, but only if that entry dispatches itself. A
+        // routing group's own id prices nothing, so it stays empty there,
+        // the same convention a `model_not_found` event uses.
+        model_id: attempt
+            .as_ref()
+            .map(|a| a.model_id.to_string())
+            .filter(|id| !id.is_empty())
+            .or_else(|| Some(ctx.last_settled_model_id.clone()).filter(|id| !id.is_empty()))
             .unwrap_or_else(|| ctx.entry_model_id.clone()),
         status_code: crate::CLIENT_CLOSED_REQUEST,
-        // How long the caller waited on THIS target, not on the whole
-        // request: the failed attempts above account for their own time and
-        // the access-log line keeps the request-level figure.
-        upstream_latency_ms: in_flight
-            .map(|a| crate::attempt::ms_since(a.started))
-            .unwrap_or(0),
-        attempt_index: in_flight.map(|a| a.index).unwrap_or(0),
-        attempt_kind: in_flight.map(|a| a.kind.to_string()).unwrap_or_default(),
-        attempt_model: in_flight
-            .map(|a| a.target_model.clone())
+        upstream_latency_ms: attempt.as_ref().map(|a| a.latency_ms).unwrap_or(0),
+        attempt_index: attempt.as_ref().map(|a| a.index).unwrap_or(0),
+        attempt_kind: attempt
+            .as_ref()
+            .map(|a| a.kind.to_string())
+            .unwrap_or_default(),
+        attempt_model: attempt
+            .as_ref()
+            .map(|a| a.target_model.to_string())
             .unwrap_or_default(),
         error_class: crate::CLIENT_DISCONNECTED_KIND.to_string(),
         error_message: CANCELLED_BEFORE_HEAD.to_string(),
         ..base_event(request_id, resolved, &ctx, client, inbound_protocol, &pk)
     };
-    // `dispatched` says whether this event describes work that reached an
-    // upstream, which decides whether a CLIENT span is derived from the
-    // latency above. Only an attempt in flight can claim that.
-    emit_one(
-        state,
-        surface,
-        event,
-        &pk,
-        client,
-        true,
-        in_flight.is_some(),
-    );
+    let dispatched = attempt.as_ref().is_some_and(|a| a.dispatched);
+    emit_one(state, &snap, surface, event, &pk, client, true, dispatched);
+}
+
+/// The attempt the terminal event speaks for, once the two shapes that can
+/// supply one are collapsed.
+struct Attempt<'a> {
+    index: u32,
+    kind: &'static str,
+    target_model: &'a str,
+    model_id: &'a str,
+    /// Whether this attempt is KNOWN to have reached a provider. See the
+    /// two construction sites — they answer it differently, and that is the
+    /// whole reason this type exists rather than a bare `Option<&…>`.
+    dispatched: bool,
+    latency_ms: u32,
 }
 
 /// The fields every event on this path shares: who called, what they asked
@@ -208,8 +263,17 @@ fn base_event(
     event
 }
 
+/// Emit one built event.
+///
+/// Takes the caller's `snap` rather than loading its own: the ProviderKey
+/// tags and the model label on a single event have to come from ONE
+/// generation, and the two events of one cancelled request from the same
+/// one — a config update landing between two loads would otherwise make
+/// them disagree.
+#[allow(clippy::too_many_arguments)]
 fn emit_one(
     state: &ProxyState,
+    snap: &aisix_core::AisixSnapshot,
     surface: crate::operation::Surface,
     event: UsageEvent,
     pk: &ResolvedPk<'_>,
@@ -217,11 +281,10 @@ fn emit_one(
     terminal: bool,
     dispatched: bool,
 ) {
-    let snap = state.snapshot.load();
-    let model = usage_attr::usage_event_model_label(&snap, &event.requested_model).into_owned();
+    let model = usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
     usage_attr::emit_usage(
         state,
-        &snap,
+        snap,
         surface,
         event,
         usage_attr::usage_event_labels(&model, pk),
