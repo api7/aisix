@@ -221,6 +221,19 @@ writes the legacy `aisix_requests_total` **and** the detailed `aisix_proxy_*` /
 directly silently produces a request that exists in one family and not the
 others — the bug AISIX-Cloud#1234 fixed across ten endpoints.
 
+There is a third shape, and it reaches no tail at all: a caller that hangs up
+before the response head is written. axum **drops** the handler future, so the
+access log, the metrics and the usage events are all continuation code that
+never runs — and nothing errors, exactly as above. `ClientCancelGuard` writes
+the line, the cancel counter and the usage events from `Drop` instead
+(`cancel.rs`). What that costs everyone else is a
+standing rule: **anything a cancelled request must report has to be published to
+the request's attribution cell (`attribution.rs`) at a chokepoint the handlers
+already pass through — never held only in a handler local.** A value kept in a
+local is correct on every path except the one nobody tests, and the symptom is a
+missing row rather than an error (AISIX-Cloud#1571, where a fallback chain's
+failed attempts lived in a `RoutingTelemetry` local).
+
 ## A passthrough route that detects an envelope must observe what the typed endpoint does
 
 `passthrough_route.rs` relays bytes verbatim, but it *detects* the request
