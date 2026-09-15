@@ -208,6 +208,22 @@ impl<T: Resource> ResourceTable<T> {
         self.by_id.iter().map(|kv| kv.value().clone()).collect()
     }
 
+    /// Collect only matching rows without cloning handles for the rest of the
+    /// table. The predicate runs under a shard guard and must not reenter it.
+    pub fn matching_entries(
+        &self,
+        pred: impl Fn(&ResourceEntry<T>) -> bool,
+    ) -> Vec<Arc<ResourceEntry<T>>> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        self.by_id
+            .iter()
+            .filter(|kv| pred(kv.value()))
+            .map(|kv| kv.value().clone())
+            .collect()
+    }
+
     /// True when any entry satisfies `pred`, without materialising the
     /// table into a `Vec`. Cheaper than `entries().iter().any(...)` on the
     /// hot path (no allocation, no per-row `Arc` clone). A DashMap shard

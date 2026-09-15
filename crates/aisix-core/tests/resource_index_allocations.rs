@@ -92,3 +92,26 @@ fn name_lookup_does_not_allocate_an_id_string() {
         "name lookup must only acquire existing handles"
     );
 }
+
+#[test]
+fn filtered_entries_do_not_collect_or_clone_unrelated_rows() {
+    let table = ResourceTable::new();
+    for i in 0..4096 {
+        table.insert(ResourceEntry::new(
+            format!("key-{i}"),
+            Item(format!("name-{i}")),
+            1,
+        ));
+    }
+    let held = table.get_by_id("key-0").unwrap();
+    let none = table.matching_entries(|entry| {
+        if entry.id == held.id {
+            assert_eq!(std::sync::Arc::strong_count(&held), 2);
+        }
+        false
+    });
+    assert!(none.is_empty());
+    let selected = table.matching_entries(|entry| entry.id == "key-0");
+    assert_eq!(selected.len(), 1);
+    assert!(std::sync::Arc::ptr_eq(&selected[0], &held));
+}

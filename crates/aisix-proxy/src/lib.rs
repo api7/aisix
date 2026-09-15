@@ -57,6 +57,7 @@ mod images_edits;
 mod jobs;
 mod json_splice;
 mod jwt;
+mod jwt_index;
 mod mcp;
 mod mcp_auth;
 mod messages;
