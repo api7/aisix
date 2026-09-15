@@ -87,6 +87,14 @@ pub(crate) fn emit(
     for rec in ctx.failed_attempts.iter().filter(|_| !ctx.emitted_any) {
         let pk = ResolvedPk::resolve(&snap, &rec.provider_key_id);
         let event = UsageEvent {
+            // NO-GUARDRAIL-CHAIN: this emitter runs from `Drop` with no
+            // handler. `applied_guardrails`, the enforced hits, the scores
+            // and the bypass reason all come off a chain each handler
+            // resolves for itself, inside a crate this side cannot call
+            // back into — there is no chokepoint a guard could read, and
+            // ten opt-in call sites is the drift this whole design exists
+            // to avoid. A cancelled request therefore reports no guardrail
+            // attribution at all rather than a wrong one.
             model_id: rec.target_model_id.clone(),
             status_code: rec.status,
             upstream_latency_ms: rec.latency_ms,
@@ -108,6 +116,14 @@ pub(crate) fn emit(
     let in_flight = ctx.in_flight.as_ref();
     let pk = ResolvedPk::resolve(&snap, &resolved.provider_key_id);
     let event = UsageEvent {
+        // NO-GUARDRAIL-CHAIN: this emitter runs from `Drop` with no
+        // handler. `applied_guardrails`, the enforced hits, the scores
+        // and the bypass reason all come off a chain each handler
+        // resolves for itself, inside a crate this side cannot call
+        // back into — there is no chokepoint a guard could read, and
+        // ten opt-in call sites is the drift this whole design exists
+        // to avoid. A cancelled request therefore reports no guardrail
+        // attribution at all rather than a wrong one.
         // The target that was in flight, or — when no attempt had begun —
         // the entry the caller addressed, but only if that entry dispatches
         // itself. A routing group's own id prices nothing, so it stays
@@ -134,7 +150,15 @@ pub(crate) fn emit(
     // `dispatched` says whether this event describes work that reached an
     // upstream, which decides whether a CLIENT span is derived from the
     // latency above. Only an attempt in flight can claim that.
-    emit_one(state, surface, event, &pk, client, true, in_flight.is_some());
+    emit_one(
+        state,
+        surface,
+        event,
+        &pk,
+        client,
+        true,
+        in_flight.is_some(),
+    );
 }
 
 /// The fields every event on this path shares: who called, what they asked
@@ -149,6 +173,14 @@ fn base_event(
 ) -> UsageEvent {
     let tags = pk.telemetry_tags();
     let mut event = UsageEvent {
+        // NO-GUARDRAIL-CHAIN: this emitter runs from `Drop` with no
+        // handler. `applied_guardrails`, the enforced hits, the scores
+        // and the bypass reason all come off a chain each handler
+        // resolves for itself, inside a crate this side cannot call
+        // back into — there is no chokepoint a guard could read, and
+        // ten opt-in call sites is the drift this whole design exists
+        // to avoid. A cancelled request therefore reports no guardrail
+        // attribution at all rather than a wrong one.
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         api_key_id: ctx.api_key_id.clone(),

@@ -8105,7 +8105,11 @@ data: [DONE]\n\n";
     fn assert_head_phase_cancel(event: &aisix_obs::UsageEvent) {
         assert_eq!(event.status_code, CLIENT_CLOSED_REQUEST, "{event:?}");
         assert_eq!(event.error_class, CLIENT_DISCONNECTED_KIND, "{event:?}");
-        assert_eq!(event.error_message, cancel::CANCELLED_BEFORE_HEAD, "{event:?}");
+        assert_eq!(
+            event.error_message,
+            cancel::CANCELLED_BEFORE_HEAD,
+            "{event:?}"
+        );
         assert_eq!(event.prompt_tokens, 0);
         assert_eq!(event.completion_tokens, 0);
         assert_eq!(event.cost_usd, 0.0);
@@ -8115,14 +8119,12 @@ data: [DONE]\n\n";
 
     /// A routing group pointing at `targets`, keyed so the tests can assert
     /// on the TARGET's Model uuid rather than the group's.
-    fn seed_routing_group(
-        group: &str,
-        targets: &[(&str, &str, &str)],
-    ) -> AisixSnapshot {
+    fn seed_routing_group(group: &str, targets: &[(&str, &str, &str)]) -> AisixSnapshot {
         let snap = AisixSnapshot::new();
         for (model_id, name, api_base) in targets {
             let pk_id = format!("pk-{model_id}");
-            snap.provider_keys.insert(pk_entry_with_id(&pk_id, api_base));
+            snap.provider_keys
+                .insert(pk_entry_with_id(&pk_id, api_base));
             snap.models
                 .insert(model_entry_with_id(model_id, name, &pk_id));
         }

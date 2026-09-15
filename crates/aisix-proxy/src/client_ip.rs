@@ -245,10 +245,7 @@ where
         // request's usage events when the handler future is dropped before
         // it can. The api_key id comes from the same extension the `caller`
         // above does, so the two cannot disagree.
-        crate::attribution::note_client(
-            &ctx,
-            api_key.map(|e| e.id.as_str()).unwrap_or_default(),
-        );
+        crate::attribution::note_client(&ctx, api_key.map(|e| e.id.as_str()).unwrap_or_default());
         Ok(ctx)
     }
 }
