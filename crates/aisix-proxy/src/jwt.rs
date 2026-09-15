@@ -171,14 +171,12 @@ fn provider_for_issuer(
 /// `(jwt_provider, jwt_subject)` uniqueness and the file loader rejects
 /// duplicates, so this only guards a transient race.
 fn key_for_subject(
+    index: &crate::jwt_index::LiveJwtBindings,
     snapshot: &AisixSnapshot,
     provider_name: &str,
     subject: &str,
 ) -> (Option<Arc<ResourceEntry<ApiKey>>>, bool) {
-    let (found, ambiguous) = snapshot.apikeys.find_unique_by(|e| {
-        e.value.jwt_subject.as_deref() == Some(subject)
-            && e.value.jwt_provider.as_deref() == Some(provider_name)
-    });
+    let (found, ambiguous) = index.resolve(&snapshot.apikeys, provider_name, subject);
     // Ambiguity is not logged here: the caller's `deny` site carries the
     // full request context (issuer, subject, route, source ip) in one line.
     (found, ambiguous)
@@ -400,7 +398,7 @@ pub(crate) async fn authenticate_jwt(
     // bound, just not resolvably, and letting it fall through to the
     // mappings would hand a mis-provisioned identity whatever a rule
     // grants.
-    let (bound, ambiguous) = key_for_subject(snapshot, &prov.name, subject);
+    let (bound, ambiguous) = key_for_subject(&state.jwt_bindings, snapshot, &prov.name, subject);
     if ambiguous {
         return Err(deny(
             d,
@@ -1644,6 +1642,7 @@ jyxumGxNpoIV8LlzsMsaWQ==
     #[test]
     fn key_selection_namespaces_by_provider_and_fails_closed_on_duplicate() {
         let snapshot = AisixSnapshot::new();
+        let index = crate::jwt_index::LiveJwtBindings::default();
         let mk_key = |id: &str, subject: Option<&str>, provider: Option<&str>| {
             let mut k: ApiKey =
                 serde_json::from_str(r#"{"key_hash":"h","allowed_models":["*"]}"#).unwrap();
@@ -1660,15 +1659,21 @@ jyxumGxNpoIV8LlzsMsaWQ==
         // the cross-provider impersonation guard (audit H1).
         mk_key("k-5", Some("agent-1"), Some("partner"));
         assert_eq!(
-            key_for_subject(&snapshot, "corp", "agent-1").0.unwrap().id,
+            key_for_subject(&index, &snapshot, "corp", "agent-1")
+                .0
+                .unwrap()
+                .id,
             "k-1"
         );
         assert_eq!(
-            key_for_subject(&snapshot, "corp", "agent-2").0.unwrap().id,
+            key_for_subject(&index, &snapshot, "corp", "agent-2")
+                .0
+                .unwrap()
+                .id,
             "k-3"
         );
         assert_eq!(
-            key_for_subject(&snapshot, "partner", "agent-1")
+            key_for_subject(&index, &snapshot, "partner", "agent-1")
                 .0
                 .unwrap()
                 .id,
@@ -1677,11 +1682,11 @@ jyxumGxNpoIV8LlzsMsaWQ==
         // No provider match -> no key, even though the subject exists —
         // and no ambiguity signal either.
         assert!(matches!(
-            key_for_subject(&snapshot, "unknown", "agent-1"),
+            key_for_subject(&index, &snapshot, "unknown", "agent-1"),
             (None, false)
         ));
         assert!(matches!(
-            key_for_subject(&snapshot, "corp", "agent-9"),
+            key_for_subject(&index, &snapshot, "corp", "agent-9"),
             (None, false)
         ));
 
@@ -1690,7 +1695,7 @@ jyxumGxNpoIV8LlzsMsaWQ==
         // falling through to the claim mappings.
         mk_key("k-1-dup", Some("agent-1"), Some("corp"));
         assert!(matches!(
-            key_for_subject(&snapshot, "corp", "agent-1"),
+            key_for_subject(&index, &snapshot, "corp", "agent-1"),
             (None, true)
         ));
     }
