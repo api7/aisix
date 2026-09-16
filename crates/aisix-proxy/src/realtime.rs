@@ -790,9 +790,40 @@ async fn run_session(
                 Some((&provider_label, &requested_model)),
                 Some(&connect_err),
             );
+            // One load shared by the ProviderKey resolution below and the
+            // usage event, like the session's own terminal path (#941) —
+            // and, as there, not by `request_metrics::record`, which takes
+            // its own for the model-label collapse.
+            let snap = state.snapshot.load();
+            // Count the failure like the session that did open, and like
+            // every pre-dispatch rejection above — logs and the
+            // request-rate metrics must not disagree about whether these
+            // requests exist. Attribution is fully resolved here: `prepare`
+            // has already picked the model and the ProviderKey, so this
+            // carries the same labels a successful session would, not the
+            // `unknown` placeholders of a path that never selected a
+            // target.
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &pk_id);
+            crate::request_metrics::record(
+                &state,
+                "/v1/realtime",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &provider_label,
+                    model: &model_entry.value.display_name,
+                    upstream_model: model_entry
+                        .value
+                        .upstream_model()
+                        .unwrap_or(crate::request_metrics::UNKNOWN),
+                    pk: pk.labels(),
+                    ..Default::default()
+                },
+                502,
+                started.elapsed(),
+            );
             crate::usage_attr::emit_error_usage_event(
                 &state,
-                &state.snapshot.load(),
+                &snap,
                 crate::operation::REALTIME,
                 "realtime",
                 &request_id,
@@ -998,8 +1029,10 @@ async fn run_session(
     );
     // A realtime session can run for minutes, so its terminal emits read a
     // FRESH snapshot rather than the one `prepare` resolved against (#941) —
-    // one load and one ProviderKey lookup shared by the request metric, the
-    // usage event and `record_usage` below, where each used to do its own.
+    // one ProviderKey lookup shared by the request metric, the usage event
+    // and `record_usage` below, where each used to do its own. The load
+    // itself is shared by everything here except `request_metrics::record`,
+    // which takes its own for the model-label collapse.
     let snap = state.snapshot.load();
     let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &pk_id);
     // Priced off the same fresh snapshot, through the index every other
