@@ -405,15 +405,21 @@ fn root_store(tls: &TlsSettings) -> rustls::RootCertStore {
 
 // ─── AWS SDK (Bedrock) ───────────────────────────────────────────────
 
-/// The smithy builder [`aws_http_client`] starts from, carrying the
-/// shared `upstream` pool settings.
+/// The smithy builder [`aws_http_client`] starts from, carrying
+/// `upstream.pool_idle_timeout`.
 ///
 /// Split out because `build_https` returns an opaque `SharedHttpClient`:
 /// this builder is the last point at which a test can observe the value.
 /// Without the setting the SDK keeps hyper's own 90s idle lifetime —
 /// longer than a typical hop's idle timeout, which is exactly the stale
-/// pooled connection `upstream.pool_idle_timeout` exists to prevent, and
-/// which no other outbound client in the process is exposed to.
+/// pooled connection `upstream.pool_idle_timeout` exists to prevent.
+///
+/// It is the only one of the `upstream` connection knobs this stack can
+/// take. `pool_max_idle_per_host` and the three `tcp_keepalive_*`
+/// settings have no entry point on the smithy builder or its connector
+/// builder, so they still stop at the reqwest clients — the same shape
+/// as the two `upstream.tls` knobs [`warn_unsupported_for_aws`] calls
+/// out, and worth knowing before assuming the whole block reaches here.
 #[cfg(feature = "aws")]
 fn aws_pooled_builder() -> aws_smithy_http_client::Builder {
     aws_smithy_http_client::Builder::new()
@@ -421,7 +427,7 @@ fn aws_pooled_builder() -> aws_smithy_http_client::Builder {
 }
 
 /// The HTTP client every Bedrock SDK client is built on, carrying the
-/// deployment's extra trust roots and its upstream pool settings.
+/// deployment's extra trust roots and `upstream.pool_idle_timeout`.
 ///
 /// Built once and shared: the AWS SDK otherwise constructs a connector
 /// per client, and each construction re-reads the platform trust store.
@@ -561,12 +567,12 @@ mod tests {
         params.self_signed(&kp).unwrap().pem().into_bytes()
     }
 
-    /// The Bedrock stack is the one outbound client that does not go
-    /// through `upstream_http::client_builder`, so nothing else makes it
-    /// honour `upstream.pool_idle_timeout`. Left unset it keeps hyper's
-    /// 90s idle lifetime — the value `upstream_http`'s own default guard
-    /// rejects, because it outlives a typical hop's idle timeout and the
-    /// pool then hands out connections the far end has already closed.
+    /// The AWS SDK stack does not go through
+    /// `upstream_http::client_builder`, so nothing else makes it honour
+    /// `upstream.pool_idle_timeout`. Left unset it keeps hyper's 90s idle
+    /// lifetime — the value `upstream_http`'s own default guard rejects,
+    /// because it outlives a typical hop's idle timeout and the pool then
+    /// hands out connections the far end has already closed.
     #[cfg(feature = "aws")]
     #[test]
     fn the_aws_builder_carries_the_configured_pool_idle_timeout() {

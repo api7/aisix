@@ -1337,9 +1337,9 @@ mod tests {
     /// The guardrail's Bedrock client is the process's second AWS SDK
     /// client, and it used to carry no `TimeoutConfig` at all — so the
     /// SDK's default plugins quietly substituted their own 3.1s dial
-    /// budget and `upstream.connect_timeout` reached every outbound
-    /// client except this one. Nothing else notices: the call still
-    /// works, it just dials on a budget the operator never set.
+    /// budget in place of `upstream.connect_timeout`. Nothing else
+    /// notices: the call still works, it just dials on a budget the
+    /// operator never set.
     #[test]
     fn the_guardrail_client_dials_on_the_configured_connect_timeout() {
         let configured = aisix_gateway::upstream_http::config().connect_timeout;
