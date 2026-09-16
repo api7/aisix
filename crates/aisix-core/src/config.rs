@@ -1370,6 +1370,9 @@ pub struct UpstreamConfig {
     pub stream_timeout_ms: u64,
     /// Max time for DNS + TCP + TLS before an attempt fails. Without it a
     /// black-holed upstream is bounded only by the model's overall timeout.
+    /// On `/v1/realtime` it also covers the WebSocket handshake exchange,
+    /// which has no other deadline — the session idle limit only starts
+    /// once the socket is up.
     pub connect_timeout_ms: u64,
     /// Idle seconds before the kernel sends its first TCP keepalive probe.
     /// Keeps a long wait for a slow first token from being reaped by a NAT

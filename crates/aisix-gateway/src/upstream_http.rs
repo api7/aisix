@@ -71,6 +71,8 @@ const MAX_SOURCE_DEPTH: usize = 8;
 pub struct UpstreamHttpConfig {
     /// Max time for DNS + TCP + TLS before the attempt fails. Without it a
     /// black-holed upstream is only bounded by the model's overall timeout.
+    /// The Realtime dial — the one outbound stack with no deadline of its
+    /// own — spends it on the WebSocket handshake exchange too.
     pub connect_timeout: Option<Duration>,
     /// Idle time before the kernel sends the first TCP keepalive probe.
     /// Keeps a long wait for a slow first token from being reaped by a NAT
@@ -379,6 +381,25 @@ mod tests {
                 "rustls_client_config",
                 "the Realtime WebSocket connector must come from \
                  `upstream_tls::rustls_client_config()`",
+            ),
+            (
+                // Both WebSocket probes again, for the other half of the
+                // `upstream` block: the Realtime dial is the one upstream
+                // path with no deadline of its own — the session's idle
+                // cap only starts once the socket is up, so an unbounded
+                // dial hangs the upgrade until the kernel exhausts its
+                // SYN retries, minutes after every other route would have
+                // failed at `upstream.connect_timeout`.
+                "tokio_tungstenite::connect_async(",
+                "upstream_http::config().connect_timeout",
+                "the Realtime WebSocket dial must be bounded by \
+                 `upstream.connect_timeout`",
+            ),
+            (
+                "connect_async_tls_with_config",
+                "upstream_http::config().connect_timeout",
+                "the Realtime WebSocket dial must be bounded by \
+                 `upstream.connect_timeout`",
             ),
             (
                 "aws_config::SdkConfig::builder()",

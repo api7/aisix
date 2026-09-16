@@ -338,7 +338,10 @@ upstream:
   # stream_timeout_ms: 0
 
   # Max time for DNS + TCP + TLS before an attempt fails. Without it a
-  # black-holed upstream is bounded only by the model's own timeout.
+  # black-holed upstream is bounded only by the model's own timeout. On
+  # `/v1/realtime` it also covers the WebSocket handshake, which has no
+  # other deadline — the session idle limit only starts once the socket
+  # is up.
   # connect_timeout_ms: 5000
 
   # TCP keepalive. Idle time before the first probe, the interval

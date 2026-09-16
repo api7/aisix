@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { createServer, type Server, type Socket } from "node:net";
 import { WebSocket } from "undici";
 import {
   WebSocket as WsClient,
@@ -38,11 +39,22 @@ import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 //      upstream only when the caller asked for it. Sending it
 //      unconditionally made OpenAI's GA endpoint kill the session with
 //      `beta_api_shape_disabled`.
+//   6. The upstream dial is bounded by `upstream.connect_timeout_ms`.
+//      Only this layer can show it: the setting travels from the config
+//      file through the real binary into the one outbound stack that is
+//      not reqwest.
 
 const CALLER_PLAINTEXT = "sk-realtime-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
+
+/**
+ * `upstream.connect_timeout_ms` for this file's gateway. Well under the
+ * shipped 5s default so the black-hole case below stays quick, and far
+ * above anything a loopback dial needs, so no other case notices it.
+ */
+const CONNECT_TIMEOUT_MS = 1_500;
 
 interface RealtimeUpstream {
   port: number;
@@ -105,10 +117,43 @@ async function startRealtimeUpstream(): Promise<RealtimeUpstream> {
   };
 }
 
+/**
+ * An upstream that completes the TCP connect and then says nothing —
+ * the handshake never gets a response and the socket is never closed.
+ *
+ * A deterministic stand-in for a black-holed endpoint: an unroutable
+ * address depends on what the CI network does with it (a prompt ICMP
+ * unreachable would end the dial without the budget ever being read),
+ * whereas a socket that is accepted and held hangs identically
+ * everywhere.
+ */
+function startSilentUpstream(): Promise<{
+  port: number;
+  close(): Promise<void>;
+}> {
+  const held: Socket[] = [];
+  const server: Server = createServer((sock) => held.push(sock));
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      if (addr === null || typeof addr === "string") throw new Error("no port");
+      resolve({
+        port: addr.port,
+        close: () =>
+          new Promise<void>((done) => {
+            for (const sock of held) sock.destroy();
+            server.close(() => done());
+          }),
+      });
+    });
+  });
+}
+
 describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
   let app: SpawnedApp | undefined;
   let seed: SeedClient | undefined;
   let upstream: RealtimeUpstream | undefined;
+  let silent: { port: number; close(): Promise<void> } | undefined;
   let idp: MockIdp | undefined;
   let otlp: MockOtlp | undefined;
   let restrictedKey: { id: string } | undefined;
@@ -120,9 +165,13 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     if (!etcdReachable) return;
 
     // The access log emits at `info` (asserted by the #932 case below).
-    app = await spawnApp({ logLevel: "info" });
+    app = await spawnApp({
+      logLevel: "info",
+      extra: { upstream: { connect_timeout_ms: CONNECT_TIMEOUT_MS } },
+    });
     seed = new SeedClient(etcd, app.etcdPrefix);
     upstream = await startRealtimeUpstream();
+    silent = await startSilentUpstream();
     idp = await startMockIdp();
     otlp = await startMockOtlp();
 
@@ -159,6 +208,20 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
       provider: "openai",
       model_name: "gpt-realtime-mock",
       provider_key_id: fwdPk.id,
+    });
+
+    // A model whose upstream accepts the connection and then answers
+    // nothing — the subject of the connect-budget case below.
+    const silentPk = await seed.createProviderKey({
+      display_name: "realtime-e2e-silent-pk",
+      secret: "sk-upstream-realtime",
+      api_base: `http://127.0.0.1:${silent.port}/v1`,
+    });
+    await seed.createModel({
+      display_name: "realtime-e2e-silent-model",
+      provider: "openai",
+      model_name: "gpt-realtime-mock",
+      provider_key_id: silentPk.id,
     });
 
     // JWT identity resolving (via a claim mapping) to a key that may NOT
@@ -217,6 +280,7 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
   afterAll(async () => {
     await app?.exit();
     await upstream?.close();
+    await silent?.close();
     await idp?.close();
     await otlp?.close();
   });
@@ -446,6 +510,52 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
       );
     expect(logLine, "access log line for the refusal").toBeTruthy();
     expect(logLine).toContain(restrictedKey.id);
+  });
+
+  test("an unanswered upstream dial ends at upstream.connect_timeout_ms", async (ctx) => {
+    if (!etcdReachable || !app || !silent) {
+      ctx.skip();
+      return;
+    }
+    // The client upgrade succeeds — the gateway dials upstream only
+    // afterwards — so the failure arrives as the session's own error
+    // frame plus a 1011 close, the same pair any unreachable upstream
+    // produces. Unbudgeted, none of it ever arrives: the dial sat on an
+    // accepted-but-silent socket indefinitely, while every other route
+    // gave up at `connect_timeout_ms`.
+    const wsUrl = `${app.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=realtime-e2e-silent-model`;
+    const c = new WsClient(wsUrl, {
+      headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+    });
+    const started = Date.now();
+    const ended = await new Promise<{ frame?: string; code: number }>(
+      (resolve, reject) => {
+        let frame: string | undefined;
+        const giveUp = setTimeout(() => {
+          c.terminate();
+          reject(new Error("the gateway never gave up on the dial"));
+        }, 20_000);
+        c.on("message", (d: Buffer) => {
+          frame = d.toString();
+        });
+        c.on("close", (code: number) => {
+          clearTimeout(giveUp);
+          resolve({ frame, code });
+        });
+        c.on("unexpected-response", (_q, res) =>
+          reject(new Error(`upgrade refused: ${res.statusCode}`)),
+        );
+        c.on("error", (e: Error) => reject(e));
+      },
+    );
+    const elapsed = Date.now() - started;
+
+    expect(ended.code).toBe(1011);
+    expect(JSON.parse(ended.frame ?? "{}").error?.type).toBe("upstream_error");
+    // Lower bound too: a session that ended for any reason OTHER than
+    // the budget would not have waited for it.
+    expect(elapsed).toBeGreaterThanOrEqual(CONNECT_TIMEOUT_MS - 500);
+    expect(elapsed).toBeLessThan(CONNECT_TIMEOUT_MS + 4_000);
   });
 
   test("bad credentials reject the upgrade handshake", async (ctx) => {
