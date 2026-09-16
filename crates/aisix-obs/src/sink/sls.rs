@@ -351,8 +351,8 @@ fn base_url_for(endpoint: &str, project: &str) -> String {
 /// reference is upper-cased with non-alphanumerics folded to `_`, then read
 /// from `SLS_CRED_<REF>_AK_ID` / `SLS_CRED_<REF>_AK_SECRET`. The prefix is
 /// deliberately NOT `AISIX_`: that namespace is owned by the config loader
-/// (`Environment::with_prefix("AISIX")`), so an `AISIX_`-named secret would be
-/// reinterpreted as a config override. Returns `None` when either half is
+/// (`Environment::with_prefix("AISIX")`), which reads such a name as a
+/// configuration override or warns about it on every boot. Returns `None` when either half is
 /// unset or blank — the caller then lets the misconfiguration surface as a
 /// delivery-health auth error rather than signing with an empty key. BYOK
 /// variants (customer KMS / uploaded key) plug in here as alternative

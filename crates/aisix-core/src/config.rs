@@ -1656,10 +1656,29 @@ impl EnvOverrides {
             if NON_CONFIG_ENV_KEYS.contains(&key) {
                 continue;
             }
-            // A nested key is unambiguous — the operator spelled out a
-            // section — so it keeps reaching the deserializer, typo and
-            // all. Nothing else injects `AISIX_*__*`.
-            if key.contains("__") || TOP_LEVEL_ENV_KEYS.contains(&key) {
+            // Judged on the FIRST segment, not on whether the key is
+            // nested at all. A key whose head names a real section was
+            // meant as a setting, so it keeps reaching the deserializer
+            // typo and all (`AISIX_PROXY__BOGUS` still fails the boot);
+            // a key whose head names nothing cannot be one however deeply
+            // it is spelled. Nesting is `__`, but config-rs also treats a
+            // literal `.` as a path separator, so both split the head.
+            //
+            // Service names may contain consecutive hyphens, and kubelet
+            // folds each to `_` — so `aisix-oss--x` injects
+            // `AISIX_OSS__X_SERVICE_HOST`, which reads as nested and is
+            // exactly what a contains-`__` test would wave through into a
+            // failed boot. The residue is a Service named for a section
+            // (`aisix-proxy--x`), which is indistinguishable from an
+            // operator's typo and is treated as one.
+            let head = key
+                .split("__")
+                .next()
+                .unwrap_or(key)
+                .split('.')
+                .next()
+                .unwrap_or(key);
+            if TOP_LEVEL_ENV_KEYS.contains(&head) {
                 source.insert(name, value);
                 continue;
             }
@@ -1670,16 +1689,14 @@ impl EnvOverrides {
             // such a variable "ignored" is false on a deployment that
             // followed the shipped example.
             warnings.push(format!(
-                "{name} was not applied as a configuration override: it is not a \
-                 gateway configuration setting, and a nested setting is spelled \
-                 AISIX_<SECTION>__<KEY>, with two underscores. If the \
-                 configuration names this variable — etcd.password_env, a \
-                 credential reference, a resources-file interpolation — it is \
-                 read from the environment by that name and still applies. \
-                 Otherwise nothing reads it: Kubernetes injects variables of \
-                 this shape into every pod for each Service whose name starts \
-                 with \"aisix\", and enableServiceLinks: false on the pod spec \
-                 stops that."
+                "{name} was not applied as a configuration override: it names no \
+                 gateway setting, and a nested setting is spelled \
+                 AISIX_<SECTION>__<KEY>. If the configuration reads it by name \
+                 (etcd.password_env, a resources-file interpolation) it still \
+                 applies; otherwise nothing reads it — Kubernetes injects \
+                 variables of this shape for every Service named aisix or \
+                 aisix-*, which enableServiceLinks: false on the pod spec turns \
+                 off."
             ));
         }
 
@@ -2006,6 +2023,14 @@ mod tests {
         ("AISIX_OSS_PORT_9090_TCP_ADDR", "10.96.0.12"),
     ];
 
+    /// A Service name may carry consecutive hyphens, and kubelet folds
+    /// each one to `_` — so `aisix-oss--x` injects variables that read as
+    /// nested keys. They are still not settings.
+    const HYPHENATED_SERVICE_LINK_ENV: [(&str, &str); 2] = [
+        ("AISIX_OSS__X_SERVICE_HOST", "10.96.0.13"),
+        ("AISIX_OSS__X_PORT_9090_TCP_PROTO", "tcp"),
+    ];
+
     const ENV_TEST_CONFIG: &str = r#"
 etcd:
   endpoints: ["http://127.0.0.1:2379"]
@@ -2059,10 +2084,15 @@ admin:
         // the root struct rejects unknown fields — so before this filter
         // existed, deploying the gateway beside an `aisix-oss` Service
         // made it exit at boot with `unknown field`.
+        let injected: Vec<(&str, &str)> = SERVICE_LINK_ENV
+            .iter()
+            .chain(HYPHENATED_SERVICE_LINK_ENV.iter())
+            .copied()
+            .collect();
         if !in_child_with_env(
             "service_link_env_vars_are_ignored_instead_of_aborting_startup",
             "TEST_ENV_SERVICE_LINKS_CHILD",
-            &SERVICE_LINK_ENV,
+            &injected,
         ) {
             return;
         }
@@ -2072,8 +2102,8 @@ admin:
         assert_eq!(cfg.proxy.addr, "0.0.0.0:3000");
 
         let warnings = Config::ignored_env_overrides();
-        assert_eq!(warnings.len(), SERVICE_LINK_ENV.len());
-        for (name, _) in SERVICE_LINK_ENV {
+        assert_eq!(warnings.len(), injected.len());
+        for (name, _) in injected {
             assert!(
                 warnings.iter().any(|w| w.starts_with(&format!("{name} "))),
                 "no warning names {name}: {warnings:?}",
@@ -2133,6 +2163,65 @@ admin:
             Config::ignored_env_overrides().is_empty(),
             "deliberate variables must not warn: {:?}",
             Config::ignored_env_overrides(),
+        );
+    }
+
+    #[test]
+    fn a_flat_top_level_env_var_still_overrides_the_file() {
+        // The two scalar top-level settings have no `AISIX_<SECTION>__<KEY>`
+        // spelling, so the filter is the only thing standing between them
+        // and the deserializer. Nothing else in the suite drives one
+        // through `load_from_path`: the guards above stop at the partition,
+        // and a filter that handed config-rs a shape its collector does not
+        // expect would leave them all green.
+        if !in_child_with_env(
+            "a_flat_top_level_env_var_still_overrides_the_file",
+            "TEST_ENV_FLAT_TOP_LEVEL_CHILD",
+            &[("AISIX_BEDROCK_ENDPOINT_URL", "http://localstack:4566")],
+        ) {
+            return;
+        }
+
+        let f = write_yaml(ENV_TEST_CONFIG);
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(
+            cfg.bedrock_endpoint_url.as_deref(),
+            Some("http://localstack:4566"),
+        );
+        assert!(Config::ignored_env_overrides().is_empty());
+    }
+
+    #[test]
+    fn a_dot_spelled_nested_env_var_still_overrides_the_file() {
+        // config-rs reads the key as a path expression, in which `.` is a
+        // separator of its own — so this spelling reaches `etcd.endpoints`
+        // and has always worked. Undocumented, but dropping a working
+        // override is not something this filter may do silently.
+        if !in_child_with_env(
+            "a_dot_spelled_nested_env_var_still_overrides_the_file",
+            "TEST_ENV_DOT_SPELLED_CHILD",
+            &[("AISIX_ETCD.ENDPOINTS", "http://dotted:2379")],
+        ) {
+            return;
+        }
+
+        let f = write_yaml(ENV_TEST_CONFIG);
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.etcd.endpoints, vec!["http://dotted:2379".to_string()]);
+        assert!(Config::ignored_env_overrides().is_empty());
+    }
+
+    #[test]
+    fn a_reserved_name_never_shadows_a_real_setting() {
+        // The reserved names are matched first, so one that also named a
+        // top-level field would drop that setting's overrides — and the
+        // field-set guard above would stay green, because it only compares
+        // TOP_LEVEL_ENV_KEYS against the struct.
+        assert!(
+            NON_CONFIG_ENV_KEYS
+                .iter()
+                .all(|reserved| !TOP_LEVEL_ENV_KEYS.contains(reserved)),
+            "a reserved variable name shadows a configuration setting",
         );
     }
 
