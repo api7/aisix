@@ -791,9 +791,9 @@ async fn run_session(
                 Some(&connect_err),
             );
             // One load shared by the ProviderKey resolution below and the
-            // usage event, like the session's own terminal path (#941).
-            // `request_metrics::record` takes its own for the model-label
-            // collapse; that one is not this one.
+            // usage event, like the session's own terminal path (#941) —
+            // and, as there, not by `request_metrics::record`, which takes
+            // its own for the model-label collapse.
             let snap = state.snapshot.load();
             // Count the failure like the session that did open, and like
             // every pre-dispatch rejection above — logs and the
@@ -1029,8 +1029,10 @@ async fn run_session(
     );
     // A realtime session can run for minutes, so its terminal emits read a
     // FRESH snapshot rather than the one `prepare` resolved against (#941) —
-    // one load and one ProviderKey lookup shared by the request metric, the
-    // usage event and `record_usage` below, where each used to do its own.
+    // one ProviderKey lookup shared by the request metric, the usage event
+    // and `record_usage` below, where each used to do its own. The load
+    // itself is shared by everything here except `request_metrics::record`,
+    // which takes its own for the model-label collapse.
     let snap = state.snapshot.load();
     let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &pk_id);
     // Priced off the same fresh snapshot, through the index every other
