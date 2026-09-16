@@ -180,21 +180,41 @@ pub async fn messages(
             monitor_hits.extend(output_monitor_hits);
             let elapsed = started.elapsed();
             let status = response.status().as_u16();
-            emit_access_log(
-                &model_name,
-                &provider_label,
-                &api_key_id,
-                status,
-                elapsed,
-                &request_id,
-                // Empty on the streaming path — the id rides the
-                // `message_start` frame, which has not arrived yet. That case
-                // is covered by the per-attempt `provider call completed`
-                // line the usage sink emits (AISIX-Cloud#1289).
-                Some(metrics.provider_request_id.as_str()),
-                &routing,
-                None,
-            );
+            // Conjoined with the request's own streaming flag rather than
+            // resting on `usage_handled_by_stream` alone: a family that ever
+            // reuses that flag to mean "already emitted" on a BUFFERED path,
+            // the way chat's ensemble does, would park a line with no later
+            // emitter to write it — and lose it silently.
+            if stream_requested && usage_handled_by_stream {
+                // A streamed response has no outcome yet: the head exists, nothing
+                // has been delivered, and whether the caller reads it to the end
+                // or walks away is minutes from being known. Park the line and
+                // let whichever terminal emitter ends the request write it, with
+                // that emitter's status, tokens and message (AISIX-Cloud#1571).
+                crate::attribution::defer_access_log(
+                    crate::attribution::PendingAccessLog::new(
+                        "POST",
+                        "/v1/messages",
+                        &request_id,
+                        &api_key_id,
+                        started,
+                    )
+                    .with_model(&provider_label, &model_name)
+                    .with_routing(&routing),
+                );
+            } else {
+                emit_access_log(
+                    &model_name,
+                    &provider_label,
+                    &api_key_id,
+                    status,
+                    elapsed,
+                    &request_id,
+                    Some(metrics.provider_request_id.as_str()),
+                    &routing,
+                    None,
+                );
+            }
             // ONE ProviderKey lookup for both the metric emit and the
             // winner's usage event below (#941).
             let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &provider_key_id);
@@ -4204,6 +4224,7 @@ fn emit_access_log(
         path: "/v1/messages",
         status,
         latency,
+        duration: latency,
         provider: Some(provider),
         model: Some(model),
         upstream_model: target.upstream_model(),
@@ -5620,6 +5641,9 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             "max_tokens": 100,
             "stream": true,
         });
+        // The access-log line goes out with the terminal usage event now
+        // (AISIX-Cloud#1571), so it is captured for the same request.
+        let capture = crate::test_log::Capture::install();
         let resp = app.oneshot(make_req(body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
@@ -5663,6 +5687,29 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             "streaming /v1/messages telemetry must record TTFT",
         );
         assert!(rx.try_recv().is_err(), "usage event should be emitted once");
+
+        // AISIX-Cloud#1571: the line is written beside that event, so its
+        // token columns have to be the total the row bills. On this path
+        // `prompt_tokens` EXCLUDES the two cache dimensions, so a line that
+        // summed only the two visible columns would report 89 where the row
+        // bills 102 — and the two are supposed to be one record.
+        let line = capture.only("a streamed /v1/messages call");
+        assert_eq!(line.status(), 200);
+        assert_eq!(
+            line.num("total_tokens"),
+            Some(u64::from(
+                event.prompt_tokens
+                    + event.completion_tokens
+                    + event.cache_creation_tokens
+                    + event.cache_read_tokens
+            )),
+            "the line and the row must agree on what the request cost",
+        );
+        assert_eq!(line.num("total_tokens"), Some(102));
+        assert_eq!(
+            line.field("provider_request_id").as_deref(),
+            Some("msg_stream_245")
+        );
     }
 
     /// AISIX-Cloud#952: relay backends that ship NO usage on
@@ -6992,6 +7039,64 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         assert_eq!(
             v["error"]["type"].as_str().unwrap(),
             crate::error::anthropic_kind_from_status(axum::http::StatusCode::UNPROCESSABLE_ENTITY),
+        );
+    }
+
+    /// A streamed `/v1/messages` response writes ONE access-log line, at the
+    /// stream's end rather than when the head went out — so each of the
+    /// three endings a stream has reports its own outcome
+    /// (AISIX-Cloud#1571). Written at the handler tail, all three said
+    /// `200`, including the two where the caller was already gone and the
+    /// request's own usage event said `499`.
+    #[tokio::test]
+    async fn a_streamed_request_writes_one_line_per_stream_ending() {
+        use aisix_provider_openai::OpenAiBridge;
+
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1715000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1715000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1715000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("my-claude-alias"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let app = crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache());
+
+        let endings = crate::test_log::three_stream_endings(app, || {
+            make_req(serde_json::json!({
+                "model": "my-claude-alias",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100,
+                "stream": true,
+            }))
+        })
+        .await;
+        crate::test_log::assert_one_line_per_ending(&endings, "/v1/messages", "k-1");
+        crate::test_log::assert_latency_is_time_to_first_token(&endings);
+        assert_eq!(
+            endings.delivered.field("model").as_deref(),
+            Some("my-claude-alias"),
+        );
+        assert_eq!(
+            endings.abandoned.field("upstream_model").as_deref(),
+            Some("gpt-4o"),
+            "an abandoned stream must still name the target it was dispatched to",
         );
     }
 }

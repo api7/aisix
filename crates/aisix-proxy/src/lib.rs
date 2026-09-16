@@ -84,6 +84,8 @@ mod semantic;
 pub mod sse_keepalive;
 mod state;
 mod stream_timeout;
+#[cfg(test)]
+mod test_log;
 mod token_estimate;
 mod usage_attr;
 /// The `model` metric label for a request that resolved no model. Exported
@@ -533,14 +535,13 @@ const CLIENT_DISCONNECTED_KIND: &str = "client_disconnected";
 /// before it emits nothing anywhere. The guard rides the body precisely
 /// to cover that window — see `GuardPhase` and `TelemetryBody`.
 ///
-/// All three shapes report `499` on the usage event with `error_class =
+/// All three shapes report `499` with `error_class =
 /// "client_disconnected"`; only the message says where the caller left.
-/// A streamed request's LINE keeps saying `200` in all of them, because
-/// its handler writes it when the head goes out — one line per request,
-/// whose latency is time-to-first-token by deliberate choice
-/// (AISIX-Cloud#1394). Converging the two onto one end-of-stream line is
-/// per-family work in each streaming handler, not something this layer
-/// can do for them.
+/// The LINE says the same, because a streaming handler does not write it
+/// at all: it parks it on the request's cell
+/// (`attribution::PendingAccessLog`) and whichever terminal emitter ends
+/// the request writes it, with that emitter's status and message. One
+/// line per request, in every ending.
 async fn record_request_telemetry(
     State(state): State<ProxyState>,
     request: Request<axum::body::Body>,
@@ -695,8 +696,19 @@ impl axum::body::HttpBody for TelemetryBody {
         if let GuardPhase::Body { polled, .. } = &mut this.guard.phase {
             *polled = true;
         }
+        // Poll the stream inside the request's own attribution cell. The
+        // body is driven by the server long after the middleware returned,
+        // so without this the generator's end-of-stream emitter — which is
+        // where a streamed request's terminal usage event AND its
+        // access-log line go out (AISIX-Cloud#1571) — would run with no
+        // cell to read the parked line from, and a delivered stream would
+        // log nothing at all. `Drop` covers the abandoned endings; this
+        // covers the delivered one.
+        let cell = &this.guard.attribution;
         match this.inner.as_mut() {
-            Some(inner) => std::pin::Pin::new(inner).poll_frame(cx),
+            Some(inner) => {
+                attribution::sync_scope(cell, || std::pin::Pin::new(inner).poll_frame(cx))
+            }
             None => std::task::Poll::Ready(None),
         }
     }
@@ -855,21 +867,34 @@ impl Drop for ClientCancelGuard {
         if matches!(phase, cancel::Phase::BeforeBody) && cancel_ctx.emitted_terminal {
             return;
         }
-        // The LINE is the head phase's alone. A request whose head went out
-        // already has its handler's line, written when the stream was
-        // handed over; adding a second one here under a different status
-        // would make one request two, which is the opposite of the picture
-        // this change is for. Converging the streamed families on a single
-        // end-of-stream line is real work in each of them and reverses a
-        // deliberate decision about what a streamed line's latency means
-        // (AISIX-Cloud#1394) — it is not this change's to make.
-        if matches!(phase, cancel::Phase::BeforeHead) {
+        // The head phase builds its OWN line, because the handler normally
+        // never reached the tail that would have parked one. The body phase
+        // does not: a streamed response left its line on the cell, and that
+        // line rides the terminal usage event below, carrying the same
+        // `499` and the same message. Building a second one here would make
+        // one request read as two.
+        //
+        // "Normally" is why the head phase asks as well. A streaming family
+        // parks its line at its tail and can still be cancelled at the next
+        // await — chat peeks the rate limiter there, to fill the
+        // `x-ratelimit-*` headers — which lands here with the line already
+        // parked. That line is the fuller one (it names the model, the
+        // target and the routing counts) and `cancel::emit` below writes it
+        // under this same `499`, so this one stands down. It cannot fall
+        // between the two: a parked line means the request authenticated on
+        // a metering surface, which is exactly the gate `cancel::emit`
+        // applies before it emits the terminal event that carries the line.
+        if matches!(phase, cancel::Phase::BeforeHead) && !self.attribution.has_pending_access_log()
+        {
             let target = attribution::AccessLogTarget::from_resolved(resolved.clone());
             AccessLog {
                 method: self.method.as_str(),
                 path: self.uri.path(),
                 status: CLIENT_CLOSED_REQUEST,
                 latency,
+                // Nothing was ever delivered, so what the caller waited for
+                // IS how long the request ran.
+                duration: latency,
                 // The log line takes the RAW names: it is bounded by request
                 // volume, not by label cardinality, so it can say exactly
                 // which target the abandoned request was waiting on.
@@ -895,17 +920,22 @@ impl Drop for ClientCancelGuard {
             .emit();
         }
         // The usage events the dropped handler never got to write
-        // (AISIX-Cloud#1571). After the line, so the two land in the order
-        // an operator reads them.
-        cancel::emit(
-            &self.state,
-            self.endpoint,
-            &self.request_id,
-            &resolved,
-            cancel_ctx,
-            phase,
-            self.trace.as_ref(),
-        );
+        // (AISIX-Cloud#1571) — and, on the body phase, the request's parked
+        // access-log line, which goes out of the same chokepoint as the
+        // terminal event so the two agree on the outcome. `Drop` runs
+        // outside every scope, so the cell has to be installed for the call
+        // or the chokepoint has nothing to take the line from.
+        attribution::sync_scope(&self.attribution, || {
+            cancel::emit(
+                &self.state,
+                self.endpoint,
+                &self.request_id,
+                &resolved,
+                cancel_ctx,
+                phase,
+                self.trace.as_ref(),
+            )
+        });
         // Bound the labels the same way every other emit does: the model
         // through the configured set, the ProviderKey name off the row its
         // id names — a cancelled request must not be able to mint series
@@ -9050,7 +9080,7 @@ data: [DONE]\n\n",
         let hub = Arc::new(Hub::new());
         hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_routing_group("smart", &[("m-primary", "primary", &upstream.uri())]);
-        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
         let app = build_router(state);
 
@@ -9067,42 +9097,76 @@ data: [DONE]\n\n",
             req
         };
 
-        // 1. Read to the end.
-        {
-            let (buf, _capture) = access_log_capture();
-            let response = app.clone().oneshot(streaming_request()).await.unwrap();
-            let _ = to_bytes(response.into_body(), 65536).await.unwrap();
+        let endings = crate::test_log::three_stream_endings(app.clone(), streaming_request).await;
+        crate::test_log::assert_one_line_per_ending(&endings, "/v1/chat/completions", "key-id-1");
+        crate::test_log::assert_latency_is_time_to_first_token(&endings);
+
+        // The line and the row are ONE record of ONE request, so they agree
+        // on the outcome down to the sentence. They can only disagree if the
+        // line is written somewhere other than the terminal emit — which is
+        // exactly what writing it at the handler tail was.
+        for (what, line) in [
+            ("a delivered stream", &endings.delivered),
+            ("a stream abandoned mid-flight", &endings.abandoned),
+            ("a stream dropped before its first poll", &endings.unread),
+        ] {
+            let event = next_event(&mut rx).await;
             assert_eq!(
-                access_log_lines(&buf),
-                1,
-                "a delivered stream must write one line",
+                u64::from(event.status_code),
+                line.status(),
+                "{what}: the line and the usage event disagree on the status",
+            );
+            assert_eq!(
+                line.field("error").unwrap_or_default(),
+                event.error_message,
+                "{what}: the line and the usage event disagree on why",
+            );
+            assert_eq!(
+                line.field("error_kind").unwrap_or_default(),
+                event.error_class,
+                "{what}: the line and the usage event disagree on the class",
             );
         }
 
-        // 2. Read one chunk, then walk away mid-stream.
-        {
-            let (buf, _capture) = access_log_capture();
-            let response = app.clone().oneshot(streaming_request()).await.unwrap();
-            let mut body = response.into_body().into_data_stream();
-            let _first = futures::StreamExt::next(&mut body).await;
-            drop(body);
-            assert_eq!(
-                access_log_lines(&buf),
-                1,
-                "a stream abandoned mid-flight must write one line",
-            );
-        }
+        // The two abandoned endings are different phases and say so — the
+        // one message an operator reads to tell "left while it was
+        // streaming" from "never read a byte of it" apart.
+        assert_eq!(
+            endings.abandoned.field("error").as_deref(),
+            Some(cancel::CANCELLED_MID_STREAM),
+        );
+        assert_eq!(
+            endings.unread.field("error").as_deref(),
+            Some(cancel::CANCELLED_BEFORE_BODY),
+        );
 
-        // 3. Never read it at all — the window this change covers.
-        {
-            let (buf, _capture) = access_log_capture();
-            let response = app.clone().oneshot(streaming_request()).await.unwrap();
-            drop_body_unpolled(response);
+        // The delivered line carries what only the stream's END knows: the
+        // upstream's response id and the token counts. At head time neither
+        // existed, which is why the old line had to leave them out.
+        assert_eq!(
+            endings.delivered.field("provider_request_id").as_deref(),
+            Some("cmpl-body"),
+        );
+        assert!(
+            endings.delivered.num("total_tokens").is_some(),
+            "a delivered stream's line must carry the counts its event billed",
+        );
+        // And the target it dispatched to, on every ending — a routing
+        // group's own name answers "which member served this" nowhere.
+        for (what, line) in [
+            ("a delivered stream", &endings.delivered),
+            ("a stream abandoned mid-flight", &endings.abandoned),
+            ("a stream dropped before its first poll", &endings.unread),
+        ] {
+            assert_eq!(line.field("model").as_deref(), Some("smart"), "{what}");
             assert_eq!(
-                access_log_lines(&buf),
-                1,
-                "a stream dropped before its first poll must write one line, not a second one \
-                 under a different status",
+                line.field("upstream_model").as_deref(),
+                Some("gpt-4o"),
+                "{what}: the dispatched target is missing",
+            );
+            assert!(
+                line.field("provider_key_id").is_some(),
+                "{what}: the ProviderKey that served is missing",
             );
         }
     }
@@ -9350,58 +9414,6 @@ data: [DONE]\n\n",
         assert_eq!(event.operation, "embeddings");
     }
 
-    /// A tracing writer that appends every emitted byte into a shared buffer.
-    #[derive(Clone)]
-    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for LogBuf {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl tracing_subscriber::fmt::MakeWriter<'_> for LogBuf {
-        type Writer = LogBuf;
-        fn make_writer(&self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// The access log's own `tracing` message. Counting occurrences of it is
-    /// how a test asks "how many lines did this request write" without
-    /// matching the other events the same subscriber sees.
-    const ACCESS_LOG_MESSAGE: &str = "proxy request completed";
-
-    /// Install a capturing subscriber on THIS thread and hand back the
-    /// buffer plus its guard, so a caller can hold it across awaits — a
-    /// `#[tokio::test]` runs its future on the calling thread, which is
-    /// where the handler's own line is written.
-    fn access_log_capture() -> (
-        Arc<std::sync::Mutex<Vec<u8>>>,
-        tracing::subscriber::DefaultGuard,
-    ) {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
-        });
-        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(LogBuf(buf.clone()))
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        (buf, guard)
-    }
-
-    /// How many access-log lines the capture holds.
-    fn access_log_lines(buf: &Arc<std::sync::Mutex<Vec<u8>>>) -> usize {
-        String::from_utf8_lossy(&buf.lock().unwrap())
-            .matches(ACCESS_LOG_MESSAGE)
-            .count()
-    }
-
     /// A passthrough route names no model at all, so the row a cancelled one
     /// files is attributed by the ROUTE. Without that the request appears in
     /// the usage log as an anonymous `499` an operator cannot trace back to
@@ -9497,6 +9509,76 @@ data: [DONE]\n\n",
         assert!(
             !rendered.contains(CANCEL_METRIC),
             "a completed request was miscounted as a client cancel: {rendered}"
+        );
+    }
+
+    /// A cancel that lands AFTER the handler parked this request's line but
+    /// before it returned writes that line — not a second one beside it.
+    ///
+    /// The window is real rather than theoretical: a streaming family parks
+    /// its line at its tail and chat then awaits once more, peeking the rate
+    /// limiter to fill the `x-ratelimit-*` headers. A caller that hangs up
+    /// there leaves the guard in its HEAD phase with the line already on the
+    /// cell, and both emitters would speak — under the same `499`, with the
+    /// same message, so one request would read as two identical ones and a
+    /// count of `499` lines would double.
+    #[tokio::test]
+    async fn a_head_phase_cancel_writes_the_parked_line_instead_of_a_second_one() {
+        use aisix_obs::UsageSink;
+
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let state = build_state(snap, Arc::new(Hub::new())).with_usage_sink(UsageSink::new(tx));
+        let cell = std::sync::Arc::new(attribution::RequestAttribution::default());
+
+        // What a streaming handler leaves behind on its way out: the caller
+        // it authenticated, and its line.
+        attribution::sync_scope(&cell, || {
+            attribution::note_client(&crate::client_ip::ClientContext::default(), "key-id-1");
+            attribution::defer_access_log(
+                attribution::PendingAccessLog::new(
+                    "POST",
+                    "/v1/chat/completions",
+                    "req-parked",
+                    "key-id-1",
+                    std::time::Instant::now(),
+                )
+                .with_model("openai", "my-gpt4"),
+            );
+        });
+
+        let capture = crate::test_log::Capture::install();
+        drop(ClientCancelGuard {
+            phase: GuardPhase::Head,
+            state: state.clone(),
+            attribution: cell,
+            endpoint: "/v1/chat/completions",
+            method: axum::http::Method::POST,
+            uri: "/v1/chat/completions".parse().unwrap(),
+            request_id: "req-parked".to_string(),
+            trace: None,
+            started: std::time::Instant::now(),
+        });
+
+        let line = capture.only("a head-phase cancel with a parked line");
+        assert_eq!(line.status(), u64::from(CLIENT_CLOSED_REQUEST));
+        assert_eq!(
+            line.field("error_kind").as_deref(),
+            Some(CLIENT_DISCONNECTED_KIND),
+        );
+        // The PARKED line is the one that went out — the guard's own names
+        // no model, because nothing resolved one into the cell here.
+        assert_eq!(
+            line.field("model").as_deref(),
+            Some("my-gpt4"),
+            "the guard wrote its own, thinner line instead of the parked one",
+        );
+        let event = next_event(&mut rx).await;
+        assert_eq!(event.status_code, CLIENT_CLOSED_REQUEST);
+        assert_eq!(
+            u64::from(event.status_code),
+            line.status(),
+            "one record, one outcome",
         );
     }
 

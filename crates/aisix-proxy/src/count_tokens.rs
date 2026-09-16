@@ -901,6 +901,7 @@ fn emit_access_log(
         path: "/v1/messages/count_tokens",
         status,
         latency: elapsed,
+        duration: elapsed,
         provider: Some(provider),
         model: Some(model),
         upstream_model: target.upstream_model(),

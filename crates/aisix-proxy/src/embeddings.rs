@@ -603,6 +603,7 @@ fn emit_access_log(
         path: "/v1/embeddings",
         status,
         latency,
+        duration: latency,
         provider: Some(provider),
         model: Some(model),
         upstream_model: target.upstream_model(),

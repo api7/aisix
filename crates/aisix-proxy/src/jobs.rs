@@ -708,6 +708,7 @@ fn emit_access_log(
         path,
         status,
         latency: elapsed,
+        duration: elapsed,
         provider: target.map(|t| t.provider_label()).filter(|p| !p.is_empty()),
         model: target.map(|t| t.display_name()),
         upstream_model: log_target.upstream_model(),

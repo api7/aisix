@@ -164,35 +164,53 @@ pub async fn a2a_endpoint(
 
     let elapsed = started.elapsed();
     let status = response.status().as_u16();
-    let target = crate::attribution::AccessLogTarget::current();
-    AccessLog {
-        method: http_method.as_str(),
-        path: "/a2a",
-        status,
-        latency: elapsed,
-        provider: Some("a2a"),
-        model: None,
-        upstream_model: target.upstream_model(),
-        provider_key_id: target.provider_key_id(),
-        api_key_id: Some(&api_key_id),
-        // Counted inside `dispatch`, which hands back only a rendered
-        // `Response` — and for a stream, not until its drop guard fires, long
-        // after this line. The usage event carries them.
-        prompt_tokens: None,
-        completion_tokens: None,
-        total_tokens: None,
-        request_id: &request_id,
-        // Same as `/mcp`: `dispatch` returns an already-rendered `Response`,
-        // so no typed error reaches this point.
-        error_kind: None,
-        error: None,
-        provider_request_id: None,
-        served_by_model: None,
-        routing_attempt_count: None,
-        routing_fallback_count: None,
-        mcp: None,
+    if crate::attribution::stream_owns_access_log() {
+        // A streamed call ends when the agent's last event is relayed or
+        // the caller walks away, both of which are below this frame and
+        // minutes away. Park the line; `StreamUsageOnDrop` writes it beside
+        // the usage event that already reports that ending
+        // (AISIX-Cloud#1571).
+        crate::attribution::defer_access_log(
+            crate::attribution::PendingAccessLog::new(
+                http_method.as_str(),
+                "/a2a",
+                &request_id,
+                &api_key_id,
+                started,
+            )
+            .with_model("a2a", ""),
+        );
+    } else {
+        let target = crate::attribution::AccessLogTarget::current();
+        AccessLog {
+            method: http_method.as_str(),
+            path: "/a2a",
+            status,
+            latency: elapsed,
+            duration: elapsed,
+            provider: Some("a2a"),
+            model: None,
+            upstream_model: target.upstream_model(),
+            provider_key_id: target.provider_key_id(),
+            api_key_id: Some(&api_key_id),
+            // Counted inside `dispatch`, which hands back only a rendered
+            // `Response`. The usage event carries them.
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            request_id: &request_id,
+            // Same as `/mcp`: `dispatch` returns an already-rendered
+            // `Response`, so no typed error reaches this point.
+            error_kind: None,
+            error: None,
+            provider_request_id: None,
+            served_by_model: None,
+            routing_attempt_count: None,
+            routing_fallback_count: None,
+            mcp: None,
+        }
+        .emit();
     }
-    .emit();
     crate::request_metrics::record(
         &state,
         "/a2a",
@@ -630,6 +648,12 @@ async fn dispatch_stream(
         guard.call.stream.reached_end = true;
         drop(guard);
     });
+
+    // The endpoint tail below owns this request's access-log line, and from
+    // there the response is opaque — it cannot tell this stream from a
+    // rendered error. Say so here, so the tail parks the line for the guard
+    // above to write at the call's real end (AISIX-Cloud#1571).
+    crate::attribution::note_stream_owns_access_log();
 
     let mut response = axum::response::Sse::new(sse);
     if let Some(interval) = crate::sse_keepalive::interval() {
@@ -2141,5 +2165,42 @@ mod tests {
         assert_eq!(card["name"], "Invoice Agent");
         assert_eq!(card["version"], "2.1.0");
         assert_eq!(card["skills"][0]["id"], "extract");
+    }
+
+    /// A streamed `/a2a` call writes ONE access-log line, at the task's end
+    /// rather than when the head went out, so each of the three endings
+    /// reports its own outcome (AISIX-Cloud#1571). The tail that writes this
+    /// family's line sees only an opaque `Response`, so the streaming branch
+    /// tells it to park the line instead.
+    ///
+    /// `latency_ms` is deliberately NOT asserted to be a time-to-first-event
+    /// here: an agent's stream of task updates is the call's product rather
+    /// than a delivery mechanism, so `/a2a` records the WHOLE stream as what
+    /// the caller waited for — and the line reports the same figure its
+    /// usage event does.
+    #[tokio::test]
+    async fn a_streamed_call_writes_one_line_per_stream_ending() {
+        let agent_url = spawn_progressing_stream_agent().await;
+        let handle = SnapshotHandle::new(snapshot_with(&agent_url, true, serde_json::json!(["*"])));
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let router = build_router(ProxyState::new(handle, hub, &proxy_cfg()).without_cache());
+
+        let endings = crate::test_log::three_stream_endings(router, || {
+            HttpRequest::post("/a2a/invoice")
+                .header("host", "gw.example.com")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":"s","method":"message/stream"}"#,
+                ))
+                .unwrap()
+        })
+        .await;
+        crate::test_log::assert_one_line_per_ending(&endings, "/a2a", "ak-1");
+        assert_eq!(
+            endings.delivered.field("provider").as_deref(),
+            Some("a2a"),
+            "the line must keep naming the family it belongs to",
+        );
     }
 }

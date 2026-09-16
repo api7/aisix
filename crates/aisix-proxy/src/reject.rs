@@ -69,6 +69,7 @@ pub(crate) fn reject_before_dispatch(
         path,
         status,
         latency: elapsed,
+        duration: elapsed,
         // Nothing is resolved this early: no upstream was picked, and the
         // body naming the model is exactly what we refused to read.
         provider: None,

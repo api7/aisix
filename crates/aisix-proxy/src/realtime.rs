@@ -1152,6 +1152,7 @@ fn emit_access_log(
         path: "/v1/realtime",
         status,
         latency: elapsed,
+        duration: elapsed,
         provider: target.map(|(p, _)| p).filter(|p| !p.is_empty()),
         model: target.map(|(_, m)| m),
         upstream_model: log_target.upstream_model(),

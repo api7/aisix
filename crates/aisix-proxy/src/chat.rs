@@ -181,26 +181,46 @@ pub async fn chat_completions(
                 &success,
                 elapsed,
             );
-            emit_access_log(
-                method,
-                path,
-                status,
-                elapsed,
-                Some(success.provider.as_str()),
-                Some(&model_name),
-                Some(&api_key_id),
-                success.prompt_tokens,
-                success.completion_tokens,
-                success.total_tokens,
-                &request_id,
-                // Empty on the streaming path — the id rides the first
-                // upstream frame, which has not arrived yet. That case is
-                // covered by the per-attempt `provider call completed` line
-                // the usage sink emits (AISIX-Cloud#1289).
-                Some(success.provider_request_id.as_str()),
-                &success.routing,
-                None,
-            );
+            // `telemetry_handled_by_stream` alone is NOT "the response is a
+            // stream": the BUFFERED ensemble path sets it too, to mean "the
+            // sub-call emits already covered this request". That one has no
+            // later emitter to write a parked line, so the conjunction is
+            // what keeps its line from disappearing.
+            if req.is_streaming() && success.telemetry_handled_by_stream {
+                // A streamed response has no outcome yet: the head exists, nothing
+                // has been delivered, and whether the caller reads it to the end
+                // or walks away is minutes from being known. Park the line and
+                // let whichever terminal emitter ends the request write it, with
+                // that emitter's status, tokens and message (AISIX-Cloud#1571).
+                crate::attribution::defer_access_log(
+                    crate::attribution::PendingAccessLog::new(
+                        method,
+                        path,
+                        &request_id,
+                        &api_key_id,
+                        started,
+                    )
+                    .with_model(&success.provider, &model_name)
+                    .with_routing(&success.routing),
+                );
+            } else {
+                emit_access_log(
+                    method,
+                    path,
+                    status,
+                    elapsed,
+                    Some(success.provider.as_str()),
+                    Some(&model_name),
+                    Some(&api_key_id),
+                    success.prompt_tokens,
+                    success.completion_tokens,
+                    success.total_tokens,
+                    &request_id,
+                    Some(success.provider_request_id.as_str()),
+                    &success.routing,
+                    None,
+                );
+            }
             // Per #655: emit a zero-token event for each failed attempt
             // that preceded the winner (non-streaming fallover). No-op for
             // direct-model success, cache hits, and the single-attempt
@@ -5020,6 +5040,7 @@ fn emit_access_log(
         path,
         status,
         latency,
+        duration: latency,
         provider,
         model,
         upstream_model: target.upstream_model(),
