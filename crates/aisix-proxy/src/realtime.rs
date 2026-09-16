@@ -790,8 +790,10 @@ async fn run_session(
                 Some((&provider_label, &requested_model)),
                 Some(&connect_err),
             );
-            // One load shared by the request metric and the usage event,
-            // like the session's own terminal path (#941).
+            // One load shared by the ProviderKey resolution below and the
+            // usage event, like the session's own terminal path (#941).
+            // `request_metrics::record` takes its own for the model-label
+            // collapse; that one is not this one.
             let snap = state.snapshot.load();
             // Count the failure like the session that did open, and like
             // every pre-dispatch rejection above — logs and the

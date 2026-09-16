@@ -565,19 +565,29 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     // A black-holed realtime upstream now fails promptly and repeatedly,
     // so a session missing from these counters is a request-rate and
     // error-rate alert that never fires.
-    const after = await scrapeMetrics(app.metricsUrl);
-    expect(
-      metricDelta(before, after, "aisix_requests_total", {
-        model: "realtime-e2e-silent-model",
-        status: "502",
-      }),
-    ).toBe(1);
-    expect(
-      metricDelta(before, after, "aisix_proxy_requests_total", {
-        endpoint: "/v1/realtime",
-        status: "502",
-      }),
-    ).toBe(1);
+    //
+    // Polled, not scraped once: the session runs on a detached upgrade
+    // task that records AFTER it has written the close frame this test
+    // resolved on, so a single scrape races that task and would flake
+    // exactly like the regression it pins.
+    await expect
+      .poll(
+        async () => {
+          const after = await scrapeMetrics(app!.metricsUrl);
+          return {
+            legacy: metricDelta(before, after, "aisix_requests_total", {
+              model: "realtime-e2e-silent-model",
+              status: "502",
+            }),
+            proxy: metricDelta(before, after, "aisix_proxy_requests_total", {
+              endpoint: "/v1/realtime",
+              status: "502",
+            }),
+          };
+        },
+        { timeout: 5_000 },
+      )
+      .toEqual({ legacy: 1, proxy: 1 });
   });
 
   test("bad credentials reject the upgrade handshake", async (ctx) => {
