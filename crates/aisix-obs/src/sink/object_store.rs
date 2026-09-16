@@ -209,10 +209,18 @@ fn upstream_client_options() -> object_store::ClientOptions {
 /// `connect_timeout` default happens to equal ours today, which is not
 /// the same as honouring an operator who changed it.
 ///
+/// `None` is the operator's "off" (config `0`), not "use whatever the
+/// library defaults to" — so `connect_timeout` has to be disabled
+/// explicitly or `ClientOptions` puts its own 5s back, the same trap the
+/// Bedrock stack steps around. `pool_idle_timeout` has no disable entry
+/// point here, so `0` leaves reqwest's 90s instead of the never-expire
+/// the reqwest clients get; that is the pre-existing behaviour and the
+/// conservative direction, but it is a divergence.
+///
 /// The three `tcp_keepalive_*` settings have no entry point on
-/// `ClientOptions`, so they stop here — the same shape as the AWS SDK
-/// stack, and worth knowing before assuming the whole `upstream` block
-/// reaches this client.
+/// `ClientOptions` at all, so they stop here — the same shape as the AWS
+/// SDK stack, and worth knowing before assuming the whole `upstream`
+/// block reaches this client.
 fn client_options_for(
     cfg: &aisix_gateway::upstream_http::UpstreamHttpConfig,
 ) -> object_store::ClientOptions {
@@ -221,8 +229,9 @@ fn client_options_for(
     if let Some(d) = cfg.pool_idle_timeout {
         options = options.with_pool_idle_timeout(d);
     }
-    if let Some(d) = cfg.connect_timeout {
-        options = options.with_connect_timeout(d);
+    match cfg.connect_timeout {
+        Some(d) => options = options.with_connect_timeout(d),
+        None => options = options.with_connect_timeout_disabled(),
     }
     if let Some(n) = cfg.pool_max_idle_per_host {
         options = options.with_pool_max_idle_per_host(n);
@@ -695,6 +704,35 @@ mod tests {
                 "{key:?} did not reach the exporter client options",
             );
         }
+    }
+
+    /// `None` on these fields is the operator's "off" — `upstream_http`'s
+    /// loader maps config `0` to it, and every reqwest client and the
+    /// Bedrock SDK read it as unbounded. `ClientOptions` reads an unset
+    /// `connect_timeout` as "use mine" and would put 5s back, so a dial
+    /// the operator disabled would still be aborted, and only on the
+    /// export path.
+    #[test]
+    fn a_disabled_connect_timeout_is_disabled_on_the_exporter_client_too() {
+        use object_store::ClientConfigKey;
+
+        let cfg = aisix_gateway::upstream_http::UpstreamHttpConfig {
+            connect_timeout: None,
+            ..Default::default()
+        };
+        // `with_connect_timeout_disabled()` clears the field, which reads
+        // back as absent — distinct from the default's own 5s.
+        assert_eq!(
+            client_options_for(&cfg).get_config_value(&ClientConfigKey::ConnectTimeout),
+            None,
+            "a disabled connect timeout must not be replaced by object_store's own",
+        );
+        assert!(
+            object_store::ClientOptions::new()
+                .get_config_value(&ClientConfigKey::ConnectTimeout)
+                .is_some(),
+            "object_store stopped defaulting this, so the assertion above proves nothing",
+        );
     }
 
     /// The helper only helps the chains that call it, and
