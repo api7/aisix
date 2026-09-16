@@ -489,9 +489,11 @@ pub async fn chat_completions(
                 None,
                 &routing,
                 Some(&err),
-                // A failed request has no cache outcome to report: the
-                // gate either never ran or its miss is not what the line
-                // is about.
+                // This branch holds a `ProxyError` and never sees the cache
+                // gate, so it has no verdict of its own — `emit_access_log`
+                // falls back to the request's attribution cell, which is
+                // how a stored body the output guardrail refused still says
+                // the cache is what answered it.
                 None,
             );
             // `resolved_model_id` is populated by `dispatch` once
@@ -2648,7 +2650,7 @@ async fn dispatch(
                 // single-candidate pre-flight had written
                 // (AISIX-Cloud#1571).
                 let entry_model = &virtual_entry.value;
-                crate::attribution::note_cache_hit_entry(entry_model);
+                crate::attribution::note_cache_hit_entry(entry_model, hit_layer.as_str());
                 reservation.commit_tokens(0).await;
                 // #448: a cache hit is client-visible output just like a
                 // fresh upstream response, so it must run output guardrails
@@ -5055,9 +5057,11 @@ fn emit_access_log(
     provider_request_id: Option<&str>,
     routing: &RoutingTelemetry,
     error: Option<&ProxyError>,
-    // How the response cache answered. `Some` only on the buffered
-    // success exit — the one path that has a cache decision to report
-    // (AISIX-Cloud#1571).
+    // How the response cache answered, for a caller that holds the verdict
+    // — the buffered success exit, the only one that can tell a miss from
+    // a bypass. `None` falls back to the request's attribution cell, which
+    // records a HIT and nothing else, so an exit that never saw the gate
+    // still reports one (AISIX-Cloud#1571).
     cache: Option<aisix_obs::CacheAccessLog<'_>>,
 ) {
     let (error_kind, error) = match error {
@@ -5100,7 +5104,7 @@ fn emit_access_log(
         error_kind,
         error: error.as_deref(),
         mcp: None,
-        cache,
+        cache: cache.or_else(|| target.cache()),
     }
     .emit();
 }

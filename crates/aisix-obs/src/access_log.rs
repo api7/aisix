@@ -88,6 +88,14 @@ pub struct AccessLog<'a> {
     /// line, so theirs ends at the response head and does not span the
     /// relay.
     pub duration: Duration,
+    /// Vendor id of the target that served the request. Unlike the pair
+    /// below it reports the `unknown` SENTINEL rather than being omitted
+    /// when nothing resolved one — a cache hit on a Model Group, an
+    /// ensemble — because it is the same string the Prometheus `provider`
+    /// label carries for that request, where a label cannot be absent. The
+    /// two are read together often enough that spelling one condition two
+    /// ways costs more than the sentinel does; `cache_status` is what says
+    /// whether the cache is the reason.
     pub provider: Option<&'a str>,
     /// The model name the CALLER addressed — for a routing group, the group
     /// itself, never the target it dispatched to. See `upstream_model`

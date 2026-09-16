@@ -246,6 +246,11 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
     expect(field(line, "upstream_model"), line).toBeUndefined();
     expect(field(line, "provider_key_id"), line).toBeUndefined();
     expect(field(line, "served_by_model"), line).toBeUndefined();
+    // `provider` keeps the sentinel rather than being omitted like the
+    // three above: it is the same string the Prometheus `provider` label
+    // carries for this request, where a label cannot be absent. Pinned so
+    // the deliberate asymmetry cannot drift either way unnoticed.
+    expect(field(line, "provider"), line).toBe("unknown");
   });
 
   test("a one-target group's hit names no target either, and bills the hit to no key", async (ctx) => {
@@ -335,5 +340,43 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
     expect(field(line, "status"), line).toBe("422");
     expect(field(line, "upstream_model"), line).toBeUndefined();
     expect(field(line, "provider_key_id"), line).toBeUndefined();
+    // And it still says the cache is what answered — otherwise this 422 is
+    // indistinguishable from the same guardrail refusing a FRESH upstream
+    // response, which is the ambiguity the marker exists to remove.
+    expect(field(line, "cache_status"), line).toBe("hit");
+    expect(field(line, "cache_hit_layer"), line).toBe("exact");
+  });
+
+  // The streamed line is written by a different emitter — the request's
+  // parked `PendingAccessLog`, which reads the terminal usage event rather
+  // than anything the handler held — so it drops any field nobody forwards.
+  test("a streamed request's line reports the same cache status as its usage row", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "chit-solo",
+        messages: [{ role: "user", content: "streamed-cache-status" }],
+        stream: true,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const requestId = res.headers.get("x-aisix-request-id") ?? "";
+    await res.text();
+
+    const line = await accessLine(requestId);
+    // `disabled` is the constant the streaming path hardcodes on its own
+    // usage row (see the `TODO(streaming-cache)` in chat.rs) even under an
+    // enabled policy. What this pins is that the LINE reports whatever the
+    // ROW reports; when that constant is corrected, this moves with it.
+    expect(field(line, "cache_status"), line).toBe("disabled");
+    expect(field(line, "cache_hit_layer"), line).toBeUndefined();
   });
 });
