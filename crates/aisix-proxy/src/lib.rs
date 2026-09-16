@@ -5447,6 +5447,82 @@ data: [DONE]\n\n";
         assert_eq!(hit_event.completion_tokens, 11);
     }
 
+    /// AISIX-Cloud#1571: a cache hit answers "which model produced the body
+    /// you were served". That is the only thing on a hit row that names the
+    /// producer at all — a Model Group's hit reports no target, because
+    /// which of its targets wrote the entry is recorded nowhere else.
+    ///
+    /// The upstream below reports a model the Model row does NOT carry
+    /// (`model_name` is `gpt-4o`), so a passing assertion can only have
+    /// read it off the STORED response. `provider_request_id` stays empty
+    /// on the hit for the opposite reason: it is an identifier something
+    /// reconciles against, and this request never reached the upstream.
+    #[tokio::test]
+    async fn cache_hit_reports_the_model_that_produced_the_stored_response() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-producer",
+                "model": "gpt-4o-2026-09-16",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "cached"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 11, "total_tokens": 18}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        seed_cache_policy(&snap, "producer-cache");
+        let state = build_state_with_cache(snap, hub).with_usage_sink(UsageSink::new(tx));
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        let _ = run(build_router(state.clone()), make_req()).await;
+        let miss = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("miss event was never emitted")
+            .expect("sender dropped");
+        assert_eq!(miss.cache_status, "miss");
+        assert_eq!(miss.provider_model_version, "gpt-4o-2026-09-16");
+        assert_eq!(miss.provider_request_id, "cmpl-producer");
+
+        let _ = run(build_router(state), make_req()).await;
+        let hit = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("hit event was never emitted")
+            .expect("sender dropped");
+        assert_eq!(hit.cache_status, "hit");
+        // Same producer as the row for the original call — not the Model
+        // row's own `model_name`, and not empty.
+        assert_eq!(hit.provider_model_version, miss.provider_model_version);
+        assert_eq!(
+            hit.provider_request_id, "",
+            "a hit must not replay the provider's response id",
+        );
+    }
+
     #[tokio::test]
     async fn cache_miss_when_request_payload_differs() {
         let upstream = MockServer::start().await;

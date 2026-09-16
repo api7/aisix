@@ -5,8 +5,11 @@ import {
   ProxyClient,
   SeedClient,
   spawnApp,
+  startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForSlsLog,
+  type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -39,10 +42,32 @@ import {
 // own exit, the target fields by the request's attribution cell, and the
 // usage-event attribution by a third path that reads neither.
 
+const SLS_PROJECT = "aisix-e2e-chit";
+const LOGSTORE = "chit-usage";
+const CREDENTIAL_REF = "chitsls";
+
 const CALLER_PLAINTEXT = "sk-cache-hit-attr-caller";
 const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
+
+/** The harness's canned reply, with a caller-chosen `model` on it. */
+function mockBody(model: string): unknown {
+  return {
+    id: `chatcmpl-${model}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: "mock reply" },
+        finish_reason: "stop",
+      },
+    ],
+    usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+  };
+}
 
 /** Read one `name=value` field off a tracing text line, quoted or bare. */
 function field(line: string, name: string): string | undefined {
@@ -54,6 +79,9 @@ function field(line: string, name: string): string | undefined {
 describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
+  let upstreamA: OpenAiUpstream | undefined;
+  let upstreamB: OpenAiUpstream | undefined;
+  let sls: MockSls | undefined;
   let seed: SeedClient | undefined;
   let etcdReachable = false;
   let soloPkId = "";
@@ -104,6 +132,16 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
     return { status: res.status, requestId, cache };
   }
 
+  /** The exported usage row for one request id. */
+  async function usageRow(requestId: string): Promise<Map<string, string>> {
+    return waitForSlsLog(
+      sls!,
+      LOGSTORE,
+      (l) => l.get("request_id") === requestId,
+      `usage row for ${requestId}`,
+    );
+  }
+
   /** Sum `aisix_usage_events_emitted_total` over one `provider_key_id`. */
   async function usageEventsFor(providerKeyId: string): Promise<number> {
     const res = await fetch(`${app!.metricsUrl}/metrics`);
@@ -123,10 +161,37 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
+    // The two group targets answer from their OWN upstreams, each
+    // reporting a different `model`. That is what makes "the producer" a
+    // distinguishable value rather than a string every target would give.
+    // Both keep the canned `mock reply` text, which the output-guardrail
+    // case below blocks on.
+    upstreamA = await startOpenAiUpstream({
+      nonStreamBody: mockBody("produced-by-a"),
+    });
+    upstreamB = await startOpenAiUpstream({
+      nonStreamBody: mockBody("produced-by-b"),
+    });
+    sls = await startMockSls();
     // The access log is a `tracing::info!` event; the harness defaults the
     // gateway to `warn`.
-    app = await spawnApp({ extraEnv: { RUST_LOG: "info" } });
+    app = await spawnApp({
+      extraEnv: {
+        RUST_LOG: "info",
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "LTAI_mock_ak",
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock_ak_secret",
+      },
+    });
     seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createObservabilityExporter({
+      name: "chit-sls",
+      enabled: true,
+      kind: "aliyun_sls",
+      endpoint: sls.url,
+      project: SLS_PROJECT,
+      logstore: LOGSTORE,
+      credential_ref: CREDENTIAL_REF,
+    });
 
     const soloPk = await seed.createProviderKey({
       display_name: "chit-solo-pk",
@@ -146,7 +211,7 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
     const pkA = await seed.createProviderKey({
       display_name: "chit-a-pk",
       secret: "sk-mock",
-      api_base: `${upstream.baseUrl}/v1`,
+      api_base: `${upstreamA.baseUrl}/v1`,
     });
     targetAPkId = pkA.id;
     await seed.createModel({
@@ -158,7 +223,7 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
     const pkB = await seed.createProviderKey({
       display_name: "chit-b-pk",
       secret: "sk-mock",
-      api_base: `${upstream.baseUrl}/v1`,
+      api_base: `${upstreamB.baseUrl}/v1`,
     });
     await seed.createModel({
       display_name: "chit-target-b",
@@ -207,6 +272,9 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
   afterAll(async () => {
     await app?.exit();
     await upstream?.close();
+    await upstreamA?.close();
+    await upstreamB?.close();
+    await sls?.close();
   });
 
   test("a direct model's hit says the cache served it and keeps its own mapping", async (ctx) => {
@@ -297,6 +365,37 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
     expect(field(line, "upstream_model"), line).toMatch(/^up-model-[ab]$/);
     expect(field(line, "served_by_model"), line).toMatch(/^chit-target-[ab]$/);
     expect(field(line, "provider_key_id"), line).toBeTruthy();
+  });
+
+  // The one thing a hit CAN name: the producer. `provider_model_version` is
+  // read off the stored response, so it reports the model that actually
+  // wrote the body — which for a group is not the candidate this request's
+  // strategy ranked first, and is the only producer fact the entry holds.
+  test("a Model Group's hit names the model that produced the stored body", async (ctx) => {
+    if (!etcdReachable || !app || !sls) {
+      ctx.skip();
+      return;
+    }
+    const prompt = "group-producer-hit";
+    const miss = await chat("chit-pair", prompt);
+    expect(miss.cache).toBe("miss");
+    const missRow = await usageRow(miss.requestId);
+    // Whichever target the strategy picked, its own upstream's `model`.
+    const producer = missRow.get("provider_model_version") ?? "";
+    expect(["produced-by-a", "produced-by-b"]).toContain(producer);
+
+    const hit = await chat("chit-pair", prompt);
+    expect(hit.cache).toBe("hit");
+    const hitRow = await usageRow(hit.requestId);
+    // The SAME producer, not the target this request would have dispatched
+    // to: `round_robin` has advanced, so reading it off the candidate list
+    // would name the other one, and reading it off the entry would give a
+    // configured `up-model-*` name or nothing at all.
+    expect(hitRow.get("cache_status")).toBe("hit");
+    expect(hitRow.get("provider_model_version")).toBe(producer);
+    // ...while the response id still does not replay: it is an identifier
+    // something reconciles against and this request reached no upstream.
+    expect(hitRow.get("provider_request_id") ?? "").toBe("");
   });
 
   // LAST: this attaches an output guardrail to `chit-single`, which would

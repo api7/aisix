@@ -726,7 +726,9 @@ struct Success {
     /// message id) — empty when the cached path served the request
     /// (re-using a stored response's id would mislead reconciliation).
     provider_request_id: String,
-    /// Resolved model the provider actually billed.
+    /// Resolved model the provider actually billed. On a cache HIT it is
+    /// the model the ORIGINAL upstream reported for the stored body — the
+    /// producer — not anything about this request.
     provider_model_version: String,
     provider_key_id: String,
     upstream_model: String,
@@ -2715,6 +2717,13 @@ async fn dispatch(
                 let reasoning_tokens = cached.usage.reasoning_tokens;
                 let cache_creation_tokens = cached.usage.cache_creation_tokens;
                 let cache_read_tokens = cached.usage.cache_read_tokens;
+                // The model the ORIGINAL upstream reported for this body —
+                // the one fact the stored response records about the target
+                // that produced it, and the same field the fresh-response
+                // path fills from `upstream.model` (AISIX-Cloud#1571).
+                // Snapshotted here for the same reason as the counters
+                // above: `cached` moves into `render_response` below.
+                let producer_model = cached.model.clone();
                 // A hit dispatched to nothing, so every target-shaped
                 // field here describes the ENTRY the caller addressed and
                 // never a target. For a direct model the two coincide:
@@ -2756,9 +2765,7 @@ async fn dispatch(
                     // would be the same guess the block above just stopped
                     // making.
                     let est = crate::token_estimate::Estimator::new(
-                        entry_model
-                            .upstream_model()
-                            .unwrap_or(cached.model.as_str()),
+                        entry_model.upstream_model().unwrap_or(&producer_model),
                         crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
                     );
                     let filled = crate::token_estimate::fill_missing(
@@ -2852,12 +2859,18 @@ async fn dispatch(
                     reasoning_tokens,
                     cache_creation_tokens,
                     cache_read_tokens,
-                    // The cache stored the original provider response;
-                    // a stable id here would mislead reconciliation
-                    // (the request didn't actually hit the upstream),
-                    // so we leave these blank deliberately.
+                    // The stored response's `id` stays out: re-using a
+                    // provider response id would mislead reconciliation,
+                    // since this request never reached the upstream.
                     provider_request_id: String::new(),
-                    provider_model_version: String::new(),
+                    // The model version does NOT stay out. It answers
+                    // "which model produced the body you were served",
+                    // which a hit can still answer truthfully and which
+                    // nothing else on the row does — for a Model Group it
+                    // is the only thing that names the producer at all
+                    // (AISIX-Cloud#1571). Empty only when the stored
+                    // response carried no model name.
+                    provider_model_version: producer_model,
                     provider_key_id,
                     upstream_model,
                     finish_reason: String::new(),
