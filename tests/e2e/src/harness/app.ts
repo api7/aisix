@@ -72,6 +72,13 @@ export interface AppOverrides {
    */
   extraEnv?: Record<string, string>;
   /**
+   * Start the binary with NO `--config` argument, handing it the generated
+   * config's path through `AISIX_CONFIG` instead — the clap env fallback a
+   * `command:`-less container image relies on. Off by default: every other
+   * spec should exercise the argument, which is what the entrypoint passes.
+   */
+  configViaEnv?: boolean;
+  /**
    * `proxy.thread_per_core`. Omitted, the binary picks its platform
    * default, which is what the suite should normally exercise.
    *
@@ -405,8 +412,10 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   for (const [k, v] of Object.entries(overrides.extraEnv ?? {})) {
     childEnv[k] = v;
   }
+  if (overrides.configViaEnv) childEnv.AISIX_CONFIG = cfgPath;
 
-  const child = spawn(BIN_PATH, ["--config", cfgPath], {
+  const args = overrides.configViaEnv ? [] : ["--config", cfgPath];
+  const child = spawn(BIN_PATH, args, {
     stdio: ["ignore", "pipe", "pipe"],
     env: childEnv,
   });

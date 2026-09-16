@@ -357,6 +357,64 @@ jobs:
           docker logs smoke-aisix
           test -n "$ok"
 
+      # The image contract a restricted Kubernetes deployment relies on.
+      # Two halves, and each one alone reports green while the other is
+      # broken:
+      #
+      #   - `USER` must be NUMERIC. kubelet resolves `runAsNonRoot: true`
+      #     against the image's configured user and cannot prove a name is
+      #     non-root, so a named user fails the pod at admission with
+      #     CreateContainerConfigError. Nothing in a `docker run` notices.
+      #   - Nothing in the image may depend on the uid it was built for.
+      #     `docker inspect` cannot see that, so the image is run under an
+      #     unrelated uid with gid 0 and no passwd entry and has to serve
+      #     /livez. The file resource source keeps this to one container:
+      #     the subject is the boot, and no resource is needed to answer
+      #     /livez.
+      #
+      # What this does NOT cover, so that nobody reads it as more than it
+      # is: managed mode writes its mTLS bundle, gateway id and snapshot
+      # cache under /var/lib/aisix, which the image creates owned by uid
+      # 10001 and not group-writable. A managed gateway running as some
+      # other uid needs that directory supplied writable from outside —
+      # which is what the chart's state volume is for — and this step
+      # deliberately does not stand in for a deployment that arranges it.
+      - name: Smoke test — numeric USER, and boot under an arbitrary uid
+        if: github.event_name == 'pull_request'
+        run: |
+          set -eux
+          IMAGE="$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | head -n1)"
+          test "$(docker inspect --format '{{.Config.User}}' "$IMAGE")" = "10001"
+          mkdir -p /tmp/uid-smoke
+          printf '_format_version: "1"\n' > /tmp/uid-smoke/resources.yaml
+          cat > /tmp/uid-smoke/config.yaml <<'EOF'
+          resources_file: /etc/aisix/resources.yaml
+          proxy:
+            addr: "0.0.0.0:3000"
+          admin:
+            addr: "127.0.0.1:3001"
+            admin_keys: ["smoke-only"]
+          observability:
+            service_name: "aisix-uid-smoke"
+            log_level: "info"
+            metrics:
+              prometheus:
+                enabled: false
+          EOF
+          chmod 0644 /tmp/uid-smoke/config.yaml /tmp/uid-smoke/resources.yaml
+          docker run -d --name uid-smoke-aisix \
+            --user 1000760000:0 -p 13000:3000 \
+            -v /tmp/uid-smoke/config.yaml:/etc/aisix/config.yaml:ro \
+            -v /tmp/uid-smoke/resources.yaml:/etc/aisix/resources.yaml:ro \
+            "$IMAGE"
+          ok=""
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:13000/livez > /dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          docker logs uid-smoke-aisix
+          test -n "$ok"
+
       # The profiling contract from #847: the shipped binary must stay
       # profileable in the field, meaning the symbol table survives into
       # the image (function-level flame graphs). A future strip step,

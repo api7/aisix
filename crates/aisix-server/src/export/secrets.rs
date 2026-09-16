@@ -12,12 +12,12 @@
 //! The placeholder name is derived deterministically from the entry's
 //! identity and the field so it is stable across exports and greppable.
 //! It deliberately does **not** start with `AISIX_`: the gateway's
-//! config loader claims that prefix (`Environment::with_prefix("AISIX")`)
-//! and rejects unknown keys, so an `AISIX_…` secret variable set in the
-//! data plane's environment would be misread as a bad config override
-//! and fail boot. The same reason the e2e harness and the codebase's own
-//! `SLS_CRED_…` / `OBJSTORE_CRED_…` conventions keep secret variables off
-//! the `AISIX_` prefix.
+//! config loader owns that prefix (`Environment::with_prefix("AISIX")`),
+//! so a secret variable there is read as a configuration override when
+//! its first segment names a section, and otherwise warned about on every
+//! boot as a variable that overrode nothing. The same reason the e2e
+//! harness and the codebase's own `SLS_CRED_…` / `OBJSTORE_CRED_…`
+//! conventions keep secret variables off the `AISIX_` prefix.
 
 use serde_json::Value;
 

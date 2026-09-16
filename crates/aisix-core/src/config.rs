@@ -23,6 +23,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -1583,11 +1584,147 @@ impl Default for ShutdownConfig {
     }
 }
 
+/// Every top-level setting of [`Config`], spelled as the environment
+/// source sees it — `AISIX_` stripped and lowercased.
+///
+/// A variable outside this set, and without the `__` that marks a nested
+/// key, is not a setting at all and is dropped by [`EnvOverrides`] rather
+/// than handed to a root struct that rejects unknown fields.
+/// `config_top_level_keys_match_the_struct` fails the build when a field
+/// is added or renamed without this list following.
+const TOP_LEVEL_ENV_KEYS: [&str; 12] = [
+    "admin",
+    "bedrock_endpoint_url",
+    "cache",
+    "downstream",
+    "etcd",
+    "managed",
+    "observability",
+    "proxy",
+    "ratelimit",
+    "resources_file",
+    "shutdown",
+    "upstream",
+];
+
+/// `AISIX_*` variables the gateway reads by name somewhere other than the
+/// configuration loader. They are deliberate, so they are dropped without
+/// a warning.
+///
+/// Spelled as the environment source sees them, as in
+/// [`TOP_LEVEL_ENV_KEYS`]: `AISIX_CONFIG` → `config`.
+const NON_CONFIG_ENV_KEYS: [&str; 3] = [
+    // `--config`'s env fallback (clap, `aisix-server`).
+    "config",
+    // Selects which baked config the container entrypoint execs with.
+    "config_path",
+    // Upper bound on a cached budget decision's age (`aisix-proxy`).
+    "dp_budget_stale_max_seconds",
+];
+
+/// The `AISIX_*` variables the configuration loader consumes, split from
+/// the ones it must leave alone.
+struct EnvOverrides {
+    /// Handed to the `Environment` source in place of the real
+    /// environment.
+    source: HashMap<String, String>,
+    /// Warnings for variables that name no setting, one per variable.
+    /// Rendered here and emitted by the binary once the tracing
+    /// subscriber exists — config loading runs before it.
+    warnings: Vec<String>,
+}
+
+impl EnvOverrides {
+    fn from_env() -> Self {
+        Self::partition(std::env::vars())
+    }
+
+    fn partition(vars: impl Iterator<Item = (String, String)>) -> Self {
+        // config-rs lowercases before it matches the prefix, so the
+        // environment's own casing never decides whether a variable is an
+        // override. Match it.
+        const PREFIX: &str = "aisix_";
+        let mut source = HashMap::new();
+        let mut warnings = Vec::new();
+
+        for (name, value) in vars {
+            let lowered = name.to_lowercase();
+            let Some(key) = lowered.strip_prefix(PREFIX) else {
+                // Not ours; the environment source would skip it anyway.
+                continue;
+            };
+            if NON_CONFIG_ENV_KEYS.contains(&key) {
+                continue;
+            }
+            // Judged on the FIRST segment, not on whether the key is
+            // nested at all. A key whose head names a real section was
+            // meant as a setting, so it keeps reaching the deserializer
+            // typo and all (`AISIX_PROXY__BOGUS` still fails the boot);
+            // a key whose head names nothing cannot be one however deeply
+            // it is spelled. Nesting is `__`, but config-rs also treats a
+            // literal `.` as a path separator, so both split the head.
+            //
+            // Service names may contain consecutive hyphens, and kubelet
+            // folds each to `_` — so `aisix-oss--x` injects
+            // `AISIX_OSS__X_SERVICE_HOST`, which reads as nested and is
+            // exactly what a contains-`__` test would wave through into a
+            // failed boot. The residue is a Service named for a section
+            // (`aisix-proxy--x`), which is indistinguishable from an
+            // operator's typo and is treated as one.
+            let head = key
+                .split("__")
+                .next()
+                .unwrap_or(key)
+                .split('.')
+                .next()
+                .unwrap_or(key);
+            if TOP_LEVEL_ENV_KEYS.contains(&head) {
+                source.insert(name, value);
+                continue;
+            }
+            // Leads with what is certain. Whether anything reads the
+            // variable is NOT knowable here: the configuration that would
+            // name it (etcd.password_env, a credential reference, a
+            // resources-file `${…}`) has not been parsed yet, and calling
+            // such a variable "ignored" is false on a deployment that
+            // followed the shipped example.
+            warnings.push(format!(
+                "{name} was not applied as a configuration override: it names no \
+                 gateway setting, and a nested setting is spelled \
+                 AISIX_<SECTION>__<KEY>. If the configuration reads it by name \
+                 (etcd.password_env, a resources-file interpolation) it still \
+                 applies; otherwise nothing reads it — Kubernetes injects \
+                 variables of this shape for every Service named aisix or \
+                 aisix-*, which enableServiceLinks: false on the pod spec turns \
+                 off."
+            ));
+        }
+
+        Self { source, warnings }
+    }
+}
+
 impl Config {
+    /// Warnings about `AISIX_*` environment variables that name no
+    /// setting and were left out of the load.
+    ///
+    /// Returned rather than logged because the configuration is read
+    /// before the tracing subscriber is installed — the binary emits these
+    /// at WARN once it exists, the same way it reports retired settings.
+    pub fn ignored_env_overrides() -> Vec<String> {
+        EnvOverrides::from_env().warnings
+    }
+
     /// Load + merge + validate.
     ///
     /// - If `path` is Some, the file is loaded (format inferred from extension).
-    /// - Env vars prefixed `AISIX_` override anything in the file.
+    /// - Env vars prefixed `AISIX_` override anything in the file:
+    ///   `AISIX_<SECTION>__<KEY>` for a nested setting, `AISIX_<KEY>` for a
+    ///   top-level one. A variable matching neither is not a setting — it is
+    ///   ignored and reported by [`Config::ignored_env_overrides`], because
+    ///   an environment the gateway does not control injects them (a
+    ///   Kubernetes Service named `aisix-*` contributes seven per pod) and
+    ///   the root struct rejects unknown fields.
     /// - Basic invariants are checked (non-empty etcd endpoints, at least one
     ///   admin key, bind addresses parse).
     pub fn load_from_path(path: Option<&Path>) -> Result<Self, BootstrapError> {
@@ -1609,10 +1746,16 @@ impl Config {
         // first key segment, double underscore for nested keys).
         // Pin prefix_separator explicitly so the two shapes are
         // distinct: `AISIX_` strips the prefix, `__` splits keys.
+        let overrides = EnvOverrides::from_env();
         builder = builder.add_source(
             Environment::with_prefix("AISIX")
                 .prefix_separator("_")
                 .separator("__")
+                // Only the variables `EnvOverrides` kept. Handing the
+                // source an explicit map is what lets a variable this
+                // process did not name be dropped before config-rs turns
+                // it into a key the root struct has to recognise.
+                .source(Some(overrides.source))
                 // Per-key list parsing. Setting `list_separator`
                 // without explicit `with_list_parse_key` would force
                 // EVERY string env override through comma-splitting,
@@ -1865,6 +2008,279 @@ mod tests {
         let mut f = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
         f.write_all(body.as_bytes()).unwrap();
         f
+    }
+
+    /// The seven variables Kubernetes injects into every pod for a Service
+    /// named `aisix-oss` exposing port 9090 — the shape that made a
+    /// gateway exit at boot instead of starting.
+    const SERVICE_LINK_ENV: [(&str, &str); 7] = [
+        ("AISIX_OSS_SERVICE_HOST", "10.96.0.12"),
+        ("AISIX_OSS_SERVICE_PORT", "9090"),
+        ("AISIX_OSS_PORT", "tcp://10.96.0.12:9090"),
+        ("AISIX_OSS_PORT_9090_TCP", "tcp://10.96.0.12:9090"),
+        ("AISIX_OSS_PORT_9090_TCP_PROTO", "tcp"),
+        ("AISIX_OSS_PORT_9090_TCP_PORT", "9090"),
+        ("AISIX_OSS_PORT_9090_TCP_ADDR", "10.96.0.12"),
+    ];
+
+    /// A Service name may carry consecutive hyphens, and kubelet folds
+    /// each one to `_` — so `aisix-oss--x` injects variables that read as
+    /// nested keys. They are still not settings.
+    const HYPHENATED_SERVICE_LINK_ENV: [(&str, &str); 2] = [
+        ("AISIX_OSS__X_SERVICE_HOST", "10.96.0.13"),
+        ("AISIX_OSS__X_PORT_9090_TCP_PROTO", "tcp"),
+    ];
+
+    const ENV_TEST_CONFIG: &str = r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#;
+
+    /// Re-run this test's body in a child process carrying `vars` as the
+    /// only `AISIX_*` variables in its environment; returns `false` in the
+    /// parent, `true` once running as the child.
+    ///
+    /// Env-backed loading cannot be isolated any other way: the loader
+    /// reads the real process environment, and the rest of the suite runs
+    /// concurrently in the same one.
+    fn in_child_with_env(test: &str, marker: &str, vars: &[(&str, &str)]) -> bool {
+        if std::env::var_os(marker).is_some() {
+            return true;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.arg(test).arg("--test-threads=1").env(marker, "1");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("AISIX_") {
+                child.env_remove(key);
+            }
+        }
+        for (k, v) in vars {
+            child.env(k, v);
+        }
+        let output = child.output().unwrap();
+        assert!(
+            output.status.success(),
+            "child config test failed: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "child test did not run: {}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        false
+    }
+
+    #[test]
+    fn service_link_env_vars_are_ignored_instead_of_aborting_startup() {
+        // Kubernetes injects a variable per Service per port into every
+        // pod in the namespace, and a Service whose name starts with
+        // `aisix` produces `AISIX_*` names. None of them is a setting, and
+        // the root struct rejects unknown fields — so before this filter
+        // existed, deploying the gateway beside an `aisix-oss` Service
+        // made it exit at boot with `unknown field`.
+        let injected: Vec<(&str, &str)> = SERVICE_LINK_ENV
+            .iter()
+            .chain(HYPHENATED_SERVICE_LINK_ENV.iter())
+            .copied()
+            .collect();
+        if !in_child_with_env(
+            "service_link_env_vars_are_ignored_instead_of_aborting_startup",
+            "TEST_ENV_SERVICE_LINKS_CHILD",
+            &injected,
+        ) {
+            return;
+        }
+
+        let f = write_yaml(ENV_TEST_CONFIG);
+        let cfg = Config::load_from_path(Some(f.path())).expect("service links must not abort");
+        assert_eq!(cfg.proxy.addr, "0.0.0.0:3000");
+
+        let warnings = Config::ignored_env_overrides();
+        assert_eq!(warnings.len(), injected.len());
+        for (name, _) in injected {
+            assert!(
+                warnings.iter().any(|w| w.starts_with(&format!("{name} "))),
+                "no warning names {name}: {warnings:?}",
+            );
+        }
+        // The remedy has to be in the line itself: the operator reading it
+        // owns the pod spec, not this process's environment.
+        assert!(warnings[0].contains("enableServiceLinks: false"));
+    }
+
+    #[test]
+    fn a_nested_unknown_env_var_still_aborts_startup() {
+        // The filter drops only names that cannot be settings. An operator
+        // who spelled out a section meant a setting, so their typo still
+        // fails the boot rather than being silently ignored — the same
+        // strictness the config file gets.
+        if !in_child_with_env(
+            "a_nested_unknown_env_var_still_aborts_startup",
+            "TEST_ENV_NESTED_UNKNOWN_CHILD",
+            &[("AISIX_PROXY__BOGUS", "1")],
+        ) {
+            return;
+        }
+
+        let f = write_yaml(ENV_TEST_CONFIG);
+        let err = Config::load_from_path(Some(f.path())).unwrap_err();
+        assert!(
+            err.to_string().contains("bogus"),
+            "error should name the field: {err}",
+        );
+        assert!(Config::ignored_env_overrides().is_empty());
+    }
+
+    #[test]
+    fn the_gateways_own_non_config_env_vars_load_silently() {
+        // These three are read by name elsewhere — clap's `--config`
+        // fallback, the container entrypoint, the budget client — so they
+        // are set deliberately and a warning about them would be noise.
+        // `AISIX_CONFIG` is the one that used to stop `aisix` from
+        // starting from its own documented environment variable at all.
+        const OWN: [(&str, &str); 3] = [
+            ("AISIX_CONFIG", "/etc/aisix/config.yaml"),
+            ("AISIX_CONFIG_PATH", "/etc/aisix/config.managed.yaml"),
+            ("AISIX_DP_BUDGET_STALE_MAX_SECONDS", "30"),
+        ];
+        if !in_child_with_env(
+            "the_gateways_own_non_config_env_vars_load_silently",
+            "TEST_ENV_OWN_VARS_CHILD",
+            &OWN,
+        ) {
+            return;
+        }
+
+        let f = write_yaml(ENV_TEST_CONFIG);
+        Config::load_from_path(Some(f.path())).expect("the gateway's own variables must load");
+        assert!(
+            Config::ignored_env_overrides().is_empty(),
+            "deliberate variables must not warn: {:?}",
+            Config::ignored_env_overrides(),
+        );
+    }
+
+    #[test]
+    fn a_flat_top_level_env_var_still_overrides_the_file() {
+        // The two scalar top-level settings have no `AISIX_<SECTION>__<KEY>`
+        // spelling, so the filter is the only thing standing between them
+        // and the deserializer. Nothing else in the suite drives one
+        // through `load_from_path`: the guards above stop at the partition,
+        // and a filter that handed config-rs a shape its collector does not
+        // expect would leave them all green.
+        if !in_child_with_env(
+            "a_flat_top_level_env_var_still_overrides_the_file",
+            "TEST_ENV_FLAT_TOP_LEVEL_CHILD",
+            &[("AISIX_BEDROCK_ENDPOINT_URL", "http://localstack:4566")],
+        ) {
+            return;
+        }
+
+        let f = write_yaml(ENV_TEST_CONFIG);
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(
+            cfg.bedrock_endpoint_url.as_deref(),
+            Some("http://localstack:4566"),
+        );
+        assert!(Config::ignored_env_overrides().is_empty());
+    }
+
+    #[test]
+    fn a_dot_spelled_nested_env_var_still_overrides_the_file() {
+        // config-rs reads the key as a path expression, in which `.` is a
+        // separator of its own — so this spelling reaches `etcd.endpoints`
+        // and has always worked. Undocumented, but dropping a working
+        // override is not something this filter may do silently.
+        if !in_child_with_env(
+            "a_dot_spelled_nested_env_var_still_overrides_the_file",
+            "TEST_ENV_DOT_SPELLED_CHILD",
+            &[("AISIX_ETCD.ENDPOINTS", "http://dotted:2379")],
+        ) {
+            return;
+        }
+
+        let f = write_yaml(ENV_TEST_CONFIG);
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.etcd.endpoints, vec!["http://dotted:2379".to_string()]);
+        assert!(Config::ignored_env_overrides().is_empty());
+    }
+
+    #[test]
+    fn a_reserved_name_never_shadows_a_real_setting() {
+        // The reserved names are matched first, so one that also named a
+        // top-level field would drop that setting's overrides — and the
+        // field-set guard above would stay green, because it only compares
+        // TOP_LEVEL_ENV_KEYS against the struct.
+        assert!(
+            NON_CONFIG_ENV_KEYS
+                .iter()
+                .all(|reserved| !TOP_LEVEL_ENV_KEYS.contains(reserved)),
+            "a reserved variable name shadows a configuration setting",
+        );
+    }
+
+    #[test]
+    fn config_top_level_keys_match_the_struct() {
+        // TOP_LEVEL_ENV_KEYS decides which flat `AISIX_<KEY>` variables
+        // reach the deserializer. Left to drift, a newly added setting
+        // would be unreachable from the environment — silently, and only
+        // in the env-only deployments (the chart) that have no other way
+        // to set it.
+        //
+        // The expected set is taken from serde rather than restated here:
+        // `deny_unknown_fields` reports every field it would have
+        // accepted, so adding or renaming one moves this list.
+        let err = serde_json::from_str::<Config>(r#"{"not-a-config-field":0}"#)
+            .expect_err("the root struct rejects unknown fields");
+        let message = err.to_string();
+        let listed = message
+            .split_once("expected one of ")
+            .unwrap_or_else(|| panic!("unexpected serde error shape: {message}"))
+            .1;
+        // Backtick-delimited, so the trailing " at line 1 column N" the
+        // error carries is outside every pair and never read as a field.
+        let mut expected: Vec<&str> = listed.split('`').skip(1).step_by(2).collect();
+        expected.sort_unstable();
+        assert!(
+            expected.contains(&"proxy"),
+            "field list did not parse out of: {message}",
+        );
+
+        let mut have = TOP_LEVEL_ENV_KEYS.to_vec();
+        have.sort_unstable();
+        assert_eq!(
+            have, expected,
+            "TOP_LEVEL_ENV_KEYS must list exactly the root struct's fields",
+        );
+    }
+
+    #[test]
+    fn env_partition_matches_on_lowercased_names() {
+        // config-rs lowercases a variable's name before matching the
+        // prefix, so `aisix_proxy__addr` is an override to it. A filter
+        // that recognised only the upper-case spelling would drop an
+        // override that works and warn about it.
+        let overrides = EnvOverrides::partition(
+            [
+                ("aisix_proxy__addr", "127.0.0.1:1"),
+                ("Aisix_Bedrock_Endpoint_Url", "http://localhost:4566"),
+                ("PATH", "/usr/bin"),
+                ("AISIX_OSS_SERVICE_HOST", "10.96.0.12"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string())),
+        );
+        let mut kept: Vec<&str> = overrides.source.keys().map(String::as_str).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, ["Aisix_Bedrock_Endpoint_Url", "aisix_proxy__addr"]);
+        assert_eq!(overrides.warnings.len(), 1);
+        assert!(overrides.warnings[0].starts_with("AISIX_OSS_SERVICE_HOST "));
     }
 
     #[test]

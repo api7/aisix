@@ -373,7 +373,8 @@ fn is_loopback_site(site: &str) -> bool {
 /// is upper-cased with non-alphanumerics folded to `_`, then read from
 /// `DD_CRED_<REF>_API_KEY`. The prefix is deliberately NOT `AISIX_`: that
 /// namespace is owned by the config loader (`Environment::with_prefix("AISIX")`),
-/// so an `AISIX_`-named secret would be reinterpreted as a config override.
+/// which reads such a name as a configuration override or warns about it on
+/// every boot.
 /// Returns `None` when the key is unset or blank — the caller then lets the
 /// misconfiguration surface as a delivery-health auth error rather than POST
 /// with an empty key. (Mirrors `resolve_sls_credential` /

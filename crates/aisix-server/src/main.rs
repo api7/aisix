@@ -226,6 +226,12 @@ async fn async_main(cfg: Config) -> anyhow::Result<()> {
         tracing::warn!("{retired}");
     }
 
+    // `AISIX_*` variables that name no setting. Same reason for the
+    // placement: the load that dropped them ran before the subscriber.
+    for ignored in Config::ignored_env_overrides() {
+        tracing::warn!("{ignored}");
+    }
+
     // After tracing so the enable outcome is observable in the logs; the
     // returned outcome is already logged inside.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
