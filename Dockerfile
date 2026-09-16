@@ -122,10 +122,16 @@ ARG PGO=on
 # silently producing a 4K-page arm64 binary.
 ARG TARGETARCH
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    --mount=type=cache,target=/src/target-pgo-gen \
-    --mount=type=cache,target=/src/target-pgo \
+# The cache mounts are keyed per architecture. A cache mount's default id is
+# its target path, so a single builder asked for both platforms at once
+# (`docker build --platform linux/amd64,linux/arm64 .`) would run the two
+# stage variants against one `/src/target` — where they share a cargo lock
+# and both write `release/aisix`, so the copy below can pick up the other
+# architecture's binary.
+RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=target-${TARGETARCH},target=/src/target \
+    --mount=type=cache,id=target-pgo-gen-${TARGETARCH},target=/src/target-pgo-gen \
+    --mount=type=cache,id=target-pgo-${TARGETARCH},target=/src/target-pgo \
     set -eu; \
     if [ "$TARGETARCH" = "arm64" ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi; \
     mkdir -p /usr/local/share/aisix; \

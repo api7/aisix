@@ -391,16 +391,18 @@ jobs:
             || { echo "::error::jemalloc symbols missing from shipped binary"; exit 1; }
 
       # Hand this leg's digest to the merge job, which turns the set of
-      # them into one manifest list per registry. The file name is the bare
-      # digest; its content is irrelevant.
+      # them into one manifest list per registry. File name is the bare
+      # digest, content is this leg's architecture — the merge job checks
+      # it received one of each before it moves a tag.
       - name: Export digest
         if: github.event_name != 'pull_request'
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -eu
           mkdir -p "${{ runner.temp }}/digests"
-          touch "${{ runner.temp }}/digests/${DIGEST#sha256:}"
+          printf '%s\n' "$ARCH" > "${{ runner.temp }}/digests/${DIGEST#sha256:}"
 
       - name: Upload digest
         if: github.event_name != 'pull_request'
@@ -449,6 +451,20 @@ jobs:
           registry: ${{ secrets.DOCKER_REGISTRY }}
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # Both legs must be accounted for BEFORE any tag moves. `Verify every
+      # published tag is multi-arch` below is the authoritative check but can
+      # only report after `:latest` already points at the bad index, and a
+      # single digest reaching this job produces a perfectly valid
+      # single-platform image that nothing else would reject. Note
+      # `download-artifact` with a `pattern` succeeds on zero matches.
+      - name: Verify both architectures reported a digest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -eu
+          archs="$(cat -- * | sort -u | paste -sd,)"
+          echo "digests: $(ls | tr '\n' ' ')-> ${archs}"
+          test "$archs" = "amd64,arm64"
 
       # Group the tag set by repository and create one manifest list per
       # repository from every digest the build job exported.
