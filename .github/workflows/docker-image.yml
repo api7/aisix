@@ -87,12 +87,6 @@ jobs:
             # not QEMU — see the architecture note at the top.
             runner: ubuntu-24.04-arm
             platform: linux/arm64
-    outputs:
-      # The tag set is derived from the ref, not the architecture, so both
-      # legs write the identical string here and which one lands is
-      # immaterial. Publishing it keeps the tag strategy defined once, in
-      # the metadata-action block below, rather than copied into `merge`.
-      tags: ${{ steps.meta.outputs.tags }}
     # A PGO build (#967) compiles the workspace twice (instrumented +
     # optimized) with a training run in between — ~30 min against ~11 min
     # for the single-compile build. Only stable release tags take that path
@@ -471,6 +465,34 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      # The tag set the merge job publishes, carried as an artifact rather
+      # than a job output. GitHub drops a job output whose value contains a
+      # masked secret, and these refs embed the org name, which is one — the
+      # first multi-arch run on main logged `Skip output 'tags' since it may
+      # contain secret.` here, handed `merge` an empty tag set, and published
+      # nothing. The artifact path is not redacted.
+      #
+      # Both legs compute the identical string (it derives from the ref, not
+      # the architecture), so one leg uploads it; the choice of leg is
+      # arbitrary and `merge` fails by name if the file never arrives.
+      - name: Export the tag set
+        if: github.event_name != 'pull_request' && matrix.arch == 'amd64'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -eu
+          mkdir -p "${{ runner.temp }}/tagset"
+          printf '%s\n' "$TAGS" > "${{ runner.temp }}/tagset/tags.txt"
+
+      - name: Upload the tag set
+        if: github.event_name != 'pull_request' && matrix.arch == 'amd64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: tagset
+          path: ${{ runner.temp }}/tagset/tags.txt
+          if-no-files-found: error
+          retention-days: 1
+
   # Tagging happens here and nowhere else: one manifest list per registry,
   # carrying the full tag set, assembled from the per-architecture digests
   # both legs pushed. Signing and the OpenAPI publishing moved here with it —
@@ -491,6 +513,12 @@ jobs:
           path: ${{ runner.temp }}/digests
           pattern: digests-*
           merge-multiple: true
+
+      - name: Download the tag set
+        uses: actions/download-artifact@v8
+        with:
+          name: tagset
+          path: ${{ runner.temp }}/tagset
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -529,10 +557,11 @@ jobs:
       - name: Create manifest lists
         id: manifest
         working-directory: ${{ runner.temp }}/digests
-        env:
-          TAGS: ${{ needs.build.outputs.tags }}
         run: |
           set -eu
+          TAGS="$(cat "$RUNNER_TEMP/tagset/tags.txt")"
+          test -n "$TAGS" \
+            || { echo "::error::empty tag set — nothing would be published"; exit 1; }
           repos=""
           for ref in $TAGS; do
             repo="${ref%:*}"
@@ -567,10 +596,9 @@ jobs:
       # green run, because the surviving leg publishes a perfectly valid
       # single-platform image.
       - name: Verify every published tag is multi-arch
-        env:
-          TAGS: ${{ needs.build.outputs.tags }}
         run: |
           set -eu
+          TAGS="$(cat "$RUNNER_TEMP/tagset/tags.txt")"
           for ref in $TAGS; do
             platforms="$(docker buildx imagetools inspect --raw "$ref" \
               | jq -r '[.manifests[].platform | .os + "/" + .architecture] | unique | join(",")')"
@@ -588,8 +616,8 @@ jobs:
       - name: Sign images with cosign
         env:
           DIGEST: ${{ steps.manifest.outputs.digest }}
-          TAGS: ${{ needs.build.outputs.tags }}
         run: |
+          TAGS="$(cat "$RUNNER_TEMP/tagset/tags.txt")"
           signed=""
           for ref in ${TAGS}; do
             repo="${ref%:*}"
