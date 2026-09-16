@@ -867,13 +867,25 @@ impl Drop for ClientCancelGuard {
         if matches!(phase, cancel::Phase::BeforeBody) && cancel_ctx.emitted_terminal {
             return;
         }
-        // The head phase builds its OWN line, because the handler never
-        // reached the tail that would have parked one. The body phase does
-        // not: a streamed response left its line on the cell, and that line
-        // rides the terminal usage event below, carrying the same `499` and
-        // the same message. Building a second one here would make one
-        // request read as two.
-        if matches!(phase, cancel::Phase::BeforeHead) {
+        // The head phase builds its OWN line, because the handler normally
+        // never reached the tail that would have parked one. The body phase
+        // does not: a streamed response left its line on the cell, and that
+        // line rides the terminal usage event below, carrying the same
+        // `499` and the same message. Building a second one here would make
+        // one request read as two.
+        //
+        // "Normally" is why the head phase asks as well. A streaming family
+        // parks its line at its tail and can still be cancelled at the next
+        // await — chat peeks the rate limiter there, to fill the
+        // `x-ratelimit-*` headers — which lands here with the line already
+        // parked. That line is the fuller one (it names the model, the
+        // target and the routing counts) and `cancel::emit` below writes it
+        // under this same `499`, so this one stands down. It cannot fall
+        // between the two: a parked line means the request authenticated on
+        // a metering surface, which is exactly the gate `cancel::emit`
+        // applies before it emits the terminal event that carries the line.
+        if matches!(phase, cancel::Phase::BeforeHead) && !self.attribution.has_pending_access_log()
+        {
             let target = attribution::AccessLogTarget::from_resolved(resolved.clone());
             AccessLog {
                 method: self.method.as_str(),
@@ -9497,6 +9509,76 @@ data: [DONE]\n\n",
         assert!(
             !rendered.contains(CANCEL_METRIC),
             "a completed request was miscounted as a client cancel: {rendered}"
+        );
+    }
+
+    /// A cancel that lands AFTER the handler parked this request's line but
+    /// before it returned writes that line — not a second one beside it.
+    ///
+    /// The window is real rather than theoretical: a streaming family parks
+    /// its line at its tail and chat then awaits once more, peeking the rate
+    /// limiter to fill the `x-ratelimit-*` headers. A caller that hangs up
+    /// there leaves the guard in its HEAD phase with the line already on the
+    /// cell, and both emitters would speak — under the same `499`, with the
+    /// same message, so one request would read as two identical ones and a
+    /// count of `499` lines would double.
+    #[tokio::test]
+    async fn a_head_phase_cancel_writes_the_parked_line_instead_of_a_second_one() {
+        use aisix_obs::UsageSink;
+
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let state = build_state(snap, Arc::new(Hub::new())).with_usage_sink(UsageSink::new(tx));
+        let cell = std::sync::Arc::new(attribution::RequestAttribution::default());
+
+        // What a streaming handler leaves behind on its way out: the caller
+        // it authenticated, and its line.
+        attribution::sync_scope(&cell, || {
+            attribution::note_client(&crate::client_ip::ClientContext::default(), "key-id-1");
+            attribution::defer_access_log(
+                attribution::PendingAccessLog::new(
+                    "POST",
+                    "/v1/chat/completions",
+                    "req-parked",
+                    "key-id-1",
+                    std::time::Instant::now(),
+                )
+                .with_model("openai", "my-gpt4"),
+            );
+        });
+
+        let capture = crate::test_log::Capture::install();
+        drop(ClientCancelGuard {
+            phase: GuardPhase::Head,
+            state: state.clone(),
+            attribution: cell,
+            endpoint: "/v1/chat/completions",
+            method: axum::http::Method::POST,
+            uri: "/v1/chat/completions".parse().unwrap(),
+            request_id: "req-parked".to_string(),
+            trace: None,
+            started: std::time::Instant::now(),
+        });
+
+        let line = capture.only("a head-phase cancel with a parked line");
+        assert_eq!(line.status(), u64::from(CLIENT_CLOSED_REQUEST));
+        assert_eq!(
+            line.field("error_kind").as_deref(),
+            Some(CLIENT_DISCONNECTED_KIND),
+        );
+        // The PARKED line is the one that went out — the guard's own names
+        // no model, because nothing resolved one into the cell here.
+        assert_eq!(
+            line.field("model").as_deref(),
+            Some("my-gpt4"),
+            "the guard wrote its own, thinner line instead of the parked one",
+        );
+        let event = next_event(&mut rx).await;
+        assert_eq!(event.status_code, CLIENT_CLOSED_REQUEST);
+        assert_eq!(
+            u64::from(event.status_code),
+            line.status(),
+            "one record, one outcome",
         );
     }
 

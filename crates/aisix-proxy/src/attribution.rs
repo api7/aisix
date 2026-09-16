@@ -396,6 +396,13 @@ impl RequestAttribution {
         std::mem::take(&mut self.lock().cancel)
     }
 
+    /// Whether this request still has a parked line — i.e. whether a
+    /// terminal emitter is still owed one. Read by the cancel guard before
+    /// it builds a line of its own.
+    pub(crate) fn has_pending_access_log(&self) -> bool {
+        self.lock().pending_log.is_some()
+    }
+
     /// Emit the request's deferred line, if it still has one, against the
     /// outcome `event` reports. Returns whether a line went out.
     ///
