@@ -71,6 +71,8 @@ const MAX_SOURCE_DEPTH: usize = 8;
 pub struct UpstreamHttpConfig {
     /// Max time for DNS + TCP + TLS before the attempt fails. Without it a
     /// black-holed upstream is only bounded by the model's overall timeout.
+    /// The Realtime dial — the one outbound stack with no deadline of its
+    /// own — spends it on the WebSocket handshake exchange too.
     pub connect_timeout: Option<Duration>,
     /// Idle time before the kernel sends the first TCP keepalive probe.
     /// Keeps a long wait for a slow first token from being reaped by a NAT
