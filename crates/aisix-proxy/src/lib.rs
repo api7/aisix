@@ -916,6 +916,7 @@ impl Drop for ClientCancelGuard {
                 error_kind: Some(CLIENT_DISCONNECTED_KIND),
                 error: Some(phase.message()),
                 mcp: None,
+                cache: None,
             }
             .emit();
         }

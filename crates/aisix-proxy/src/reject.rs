@@ -88,6 +88,7 @@ pub(crate) fn reject_before_dispatch(
         error_kind: Some(error_kind),
         error: Some(&error),
         mcp: None,
+        cache: None,
     }
     .emit();
     // `path` must be normalized, not passed through: `AisixPath` below hands

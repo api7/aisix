@@ -39,6 +39,14 @@
 //! responded and expect it on every line: it is silently empty on the
 //! cancelled ones, where the request never got that far.
 //!
+//! A fifth case is not about WHEN the line is written but about what
+//! happened: a **cache hit** is written from the handler like any other
+//! buffered response, and contacted no upstream at all. Its line says so
+//! through [`CacheAccessLog`], and the fields that describe a dispatch
+//! (`upstream_model`, `provider_key_id`, `served_by_model`,
+//! `provider_request_id`) report only what the request can honestly claim
+//! without one — see `upstream_model` below.
+//!
 //! # `latency` and `duration` answer two different questions
 //!
 //! - `latency_ms` is what the CALLER waited for: the first token forwarded
@@ -91,6 +99,15 @@ pub struct AccessLog<'a> {
     /// any response exists — a `499` — nothing else names the target at all
     /// (AISIX-Cloud#1571). Both are `None` until a target was selected, and
     /// on the emitters that run detached from the request task.
+    ///
+    /// **A cache hit (`cache.status == "hit"`) selected no target**, and
+    /// these two do not claim one. What a hit may still carry is the
+    /// entry's own static mapping: a direct model's `model_name` and
+    /// `provider_key_id` are properties of the row the caller addressed,
+    /// true whether or not a request ever left the gateway. A Model Group
+    /// has neither of its own, and nothing records which of its targets
+    /// produced the stored entry, so a group's hit line carries neither
+    /// field rather than naming a target that did not run.
     pub upstream_model: Option<&'a str>,
     pub provider_key_id: Option<&'a str>,
     pub api_key_id: Option<&'a str>,
@@ -137,6 +154,32 @@ pub struct AccessLog<'a> {
     /// else. MCP tunnels every operation through one `POST`, so `method` and
     /// `path` alone describe nothing (#1181).
     pub mcp: Option<McpAccessLog<'a>>,
+    /// How the response cache answered — `None` on every line that had no
+    /// cache decision to report. See [`CacheAccessLog`].
+    pub cache: Option<CacheAccessLog<'a>>,
+}
+
+/// The response-cache half of an access-log line (AISIX-Cloud#1571).
+///
+/// Only `/v1/chat/completions` caches responses, and only its buffered
+/// exit reports one: a streamed response is never cached, and a line
+/// written before the handler produced a response — an error, a `499` —
+/// had no cache decision to report at all.
+///
+/// Without it the line has NO marker for a cache hit, so a request served
+/// entirely out of Redis is indistinguishable from one that went to the
+/// provider except by the absence of fields that are also absent for other
+/// reasons. The two names match the usage event's `cache_status` /
+/// `cache_hit_layer` exactly, so a line and the row cp-api stores for the
+/// same `request_id` read the same way.
+#[derive(Debug, Clone, Default)]
+pub struct CacheAccessLog<'a> {
+    /// `disabled` / `miss` / `hit` / `bypass`, as the usage event spells
+    /// it.
+    pub status: &'a str,
+    /// Which matching layer served a hit — `exact` or `semantic`. `None`
+    /// on every non-hit status.
+    pub hit_layer: Option<&'a str>,
 }
 
 /// The `/mcp` half of an access-log line: which JSON-RPC method the single
@@ -185,6 +228,8 @@ impl AccessLog<'_> {
             routing_fallback_count = self.routing_fallback_count,
             error_kind = self.error_kind,
             error = self.error,
+            cache_status = self.cache.as_ref().map(|c| c.status),
+            cache_hit_layer = self.cache.as_ref().and_then(|c| c.hit_layer),
             mcp_method = mcp.and_then(|m| m.method),
             mcp_tool = mcp.and_then(|m| m.tool),
             tools_total = mcp.and_then(|m| m.tools_total),
@@ -260,6 +305,7 @@ mod tests {
                 error_kind: None,
                 error: None,
                 mcp: None,
+                cache: None,
             }
             .emit();
         });
@@ -344,6 +390,7 @@ mod tests {
                 error_kind: Some("timeout"),
                 error: Some("upstream request timed out after 7167ms"),
                 mcp: None,
+                cache: None,
             }
             .emit();
         });
@@ -397,6 +444,7 @@ mod tests {
                 error_kind: None,
                 error: None,
                 mcp: None,
+                cache: None,
             }
             .emit();
         });
@@ -411,5 +459,117 @@ mod tests {
         // at all, not an empty one an operator would have to filter out.
         assert!(!out.contains("upstream_model"), "{out}");
         assert!(!out.contains("provider_key_id"), "{out}");
+        // And no cache verdict: a line with no cache decision must not
+        // claim one, since `cache_status` absent is how a reader tells
+        // "this surface has no cache" from "the cache missed".
+        assert!(!out.contains("cache_status"), "{out}");
+    }
+
+    /// AISIX-Cloud#1571: a response served out of the cache says so on the
+    /// line. Without a marker there, the only evidence is the ABSENCE of
+    /// target fields — which is also what a pre-dispatch failure looks
+    /// like, so an operator cannot tell a Redis-served answer from a
+    /// request that never reached a provider.
+    #[test]
+    fn emit_renders_the_cache_verdict() {
+        let writer = VecWriter::default();
+        let subscriber = fmt()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_target(false)
+            .with_env_filter(EnvFilter::new("info"))
+            .finish();
+
+        with_default(subscriber, || {
+            AccessLog {
+                method: "POST",
+                path: "/v1/chat/completions",
+                status: 200,
+                latency: Duration::from_millis(1),
+                duration: Duration::from_millis(1),
+                provider: Some("unknown"),
+                model: Some("my-group"),
+                upstream_model: None,
+                provider_key_id: None,
+                api_key_id: Some("key-id-1"),
+                prompt_tokens: Some(2),
+                completion_tokens: Some(1),
+                total_tokens: Some(3),
+                request_id: "req-cached",
+                provider_request_id: None,
+                served_by_model: None,
+                routing_attempt_count: None,
+                routing_fallback_count: None,
+                error_kind: None,
+                error: None,
+                mcp: None,
+                cache: Some(CacheAccessLog {
+                    status: "hit",
+                    hit_layer: Some("semantic"),
+                }),
+            }
+            .emit();
+        });
+        let out = writer.contents();
+        assert!(
+            out.contains("cache_status=\"hit\"") || out.contains("cache_status=hit"),
+            "{out}"
+        );
+        assert!(
+            out.contains("cache_hit_layer=\"semantic\"")
+                || out.contains("cache_hit_layer=semantic"),
+            "{out}"
+        );
+    }
+
+    /// A non-hit reports its status and no layer — an always-present
+    /// `cache_hit_layer=""` would defeat filtering on it, the same rule
+    /// `error_kind` and `provider_request_id` follow above.
+    #[test]
+    fn emit_omits_the_hit_layer_on_a_miss() {
+        let writer = VecWriter::default();
+        let subscriber = fmt()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_target(false)
+            .with_env_filter(EnvFilter::new("info"))
+            .finish();
+
+        with_default(subscriber, || {
+            AccessLog {
+                method: "POST",
+                path: "/v1/chat/completions",
+                status: 200,
+                latency: Duration::from_millis(1),
+                duration: Duration::from_millis(1),
+                provider: Some("openai"),
+                model: Some("my-gpt4"),
+                upstream_model: Some("gpt-4o"),
+                provider_key_id: Some("pk-1"),
+                api_key_id: Some("key-id-1"),
+                prompt_tokens: Some(2),
+                completion_tokens: Some(1),
+                total_tokens: Some(3),
+                request_id: "req-miss",
+                provider_request_id: Some("chatcmpl-1"),
+                served_by_model: None,
+                routing_attempt_count: None,
+                routing_fallback_count: None,
+                error_kind: None,
+                error: None,
+                mcp: None,
+                cache: Some(CacheAccessLog {
+                    status: "miss",
+                    hit_layer: None,
+                }),
+            }
+            .emit();
+        });
+        let out = writer.contents();
+        assert!(
+            out.contains("cache_status=\"miss\"") || out.contains("cache_status=miss"),
+            "{out}"
+        );
+        assert!(!out.contains("cache_hit_layer"), "{out}");
     }
 }

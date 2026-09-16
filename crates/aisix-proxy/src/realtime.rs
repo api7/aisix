@@ -1169,6 +1169,7 @@ fn emit_access_log(
         error_kind,
         error: error.as_deref(),
         mcp: None,
+        cache: None,
     }
     .emit();
 }

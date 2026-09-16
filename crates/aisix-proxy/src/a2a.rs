@@ -208,6 +208,7 @@ pub async fn a2a_endpoint(
             routing_attempt_count: None,
             routing_fallback_count: None,
             mcp: None,
+            cache: None,
         }
         .emit();
     }

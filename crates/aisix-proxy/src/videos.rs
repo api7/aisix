@@ -1487,6 +1487,7 @@ impl Telemetry<'_> {
             error_kind,
             error: error.as_deref(),
             mcp: None,
+            cache: None,
         }
         .emit();
         // AISIX-Cloud#1325: this tail never took `upstream_model` or the

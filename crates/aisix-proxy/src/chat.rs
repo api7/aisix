@@ -219,6 +219,10 @@ pub async fn chat_completions(
                     Some(success.provider_request_id.as_str()),
                     &success.routing,
                     None,
+                    Some(aisix_obs::CacheAccessLog {
+                        status: success.cache_status.as_str(),
+                        hit_layer: success.cache_hit_layer.map(|l| l.as_str()),
+                    }),
                 );
             }
             // Per #655: emit a zero-token event for each failed attempt
@@ -485,6 +489,10 @@ pub async fn chat_completions(
                 None,
                 &routing,
                 Some(&err),
+                // A failed request has no cache outcome to report: the
+                // gate either never ran or its miss is not what the line
+                // is about.
+                None,
             );
             // `resolved_model_id` is populated by `dispatch` once
             // `req.model` resolves against the snapshot, so a guardrail /
@@ -2696,25 +2704,37 @@ async fn dispatch(
                 let reasoning_tokens = cached.usage.reasoning_tokens;
                 let cache_creation_tokens = cached.usage.cache_creation_tokens;
                 let cache_read_tokens = cached.usage.cache_read_tokens;
-                // The provider label points at the first attempt — for a
-                // cache hit we don't know (or care) which target ran the
-                // original call; the fingerprint identified the answer.
-                let provider_label = attempt_models[0]
-                    .model
+                // A hit dispatched to nothing, so every target-shaped
+                // field here describes the ENTRY the caller addressed and
+                // never a target. For a direct model the two coincide:
+                // provider / provider_key_id / model_name are static
+                // properties of its row, true whether or not a request
+                // ever left. For a Model Group they do not exist, and
+                // reading them off `attempt_models[0]` — whichever
+                // candidate THIS request's strategy happened to rank first
+                // — named a target that never ran, and named a different
+                // one on every hit of the same entry under `round_robin`
+                // (AISIX-Cloud#1571). Which target produced the entry is
+                // recorded nowhere, so a group hit reports `unknown`
+                // rather than a guess.
+                let entry_model = &virtual_entry.value;
+                let provider_label = entry_model
                     .provider
                     .as_deref()
                     .map(|p| p.to_ascii_lowercase())
                     .unwrap_or_else(|| "unknown".into());
-                let provider_key_id = attempt_models[0]
-                    .model
+                let provider_key_id = entry_model
                     .provider_key_id
                     .clone()
                     .unwrap_or_else(|| "unknown".into());
-                let upstream_model = attempt_models[0]
-                    .model
+                let upstream_model = entry_model
                     .upstream_model()
                     .unwrap_or("unknown")
                     .to_string();
+                // The same correction for the access-log line, which reads
+                // the attribution cell rather than this `Success` — see
+                // `note_cache_hit_entry` for why it must overwrite.
+                crate::attribution::note_cache_hit_entry(entry_model);
                 // Token-estimation fallback (AISIX-Cloud#1074): a stored
                 // response whose original upstream never reported usage
                 // replays zeros — fill them like the fresh-response path
@@ -2722,8 +2742,17 @@ async fn dispatch(
                 // silent zeros.
                 let (prompt, completion, total, usage_estimated) = if prompt == 0 || completion == 0
                 {
+                    // Tokenizer encoding for the replayed body: the entry's
+                    // own upstream mapping when it has one, and otherwise
+                    // the model the STORED response reports — the one fact
+                    // the entry holds about the target that produced it. A
+                    // group has no mapping of its own, and a candidate's
+                    // would be the same guess the block above just stopped
+                    // making.
                     let est = crate::token_estimate::Estimator::new(
-                        &upstream_model,
+                        entry_model
+                            .upstream_model()
+                            .unwrap_or(cached.model.as_str()),
                         crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
                     );
                     let filled = crate::token_estimate::fill_missing(
@@ -5022,6 +5051,10 @@ fn emit_access_log(
     provider_request_id: Option<&str>,
     routing: &RoutingTelemetry,
     error: Option<&ProxyError>,
+    // How the response cache answered. `Some` only on the buffered
+    // success exit — the one path that has a cache decision to report
+    // (AISIX-Cloud#1571).
+    cache: Option<aisix_obs::CacheAccessLog<'_>>,
 ) {
     let (error_kind, error) = match error {
         Some(e) => {
@@ -5063,6 +5096,7 @@ fn emit_access_log(
         error_kind,
         error: error.as_deref(),
         mcp: None,
+        cache,
     }
     .emit();
 }

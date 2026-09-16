@@ -362,6 +362,7 @@ impl PendingAccessLog {
             error_kind: (!event.error_class.is_empty()).then_some(event.error_class.as_str()),
             error: (!event.error_message.is_empty()).then_some(event.error_message.as_str()),
             mcp: None,
+            cache: None,
         }
         .emit();
     }
@@ -487,6 +488,26 @@ pub(crate) fn note_target(model: &Model, provider_key_id: &str) {
         r.upstream_model = model.upstream_model().unwrap_or_default().to_string();
         r.provider_key_id = provider_key_id.to_string();
     });
+}
+
+/// Overwrite the target half with what a CACHE HIT may honestly claim.
+///
+/// A hit contacts no upstream, so nothing was dispatched to and the line
+/// must not report one. What survives is the entry's own static mapping: a
+/// DIRECT model's `model_name` and `provider_key_id` are properties of the
+/// row the caller addressed, true whether or not a request ever left the
+/// gateway. A Model Group has neither of its own, and which of its targets
+/// produced the stored entry is recorded nowhere, so its line names no
+/// target at all rather than the candidate this request happened to rank
+/// first (AISIX-Cloud#1571).
+///
+/// It OVERWRITES rather than fills, and that is the whole point: the
+/// pre-flight in [`crate::dispatch::resolve_provider_key`] runs before the
+/// cache is consulted and has already written a target for every entry
+/// that resolved to a SINGLE candidate — including a one-target routing
+/// group, whose candidate is no more the producer than any other.
+pub(crate) fn note_cache_hit_entry(entry: &Model) {
+    note_target(entry, entry.provider_key_id.as_deref().unwrap_or_default());
 }
 
 /// What the current request has resolved, or `None` outside a request.
@@ -742,6 +763,56 @@ mod tests {
             assert_eq!(r.provider, "anthropic");
             assert_eq!(r.upstream_model, "claude-3-5-sonnet");
             assert_eq!(r.provider_key_id, "pk-anthropic");
+        })
+        .await;
+    }
+
+    fn group_model() -> Model {
+        serde_json::from_value(serde_json::json!({
+            "display_name": "my-group",
+            "routing": {
+                "targets": [{"model": "a"}, {"model": "b"}],
+            },
+        }))
+        .unwrap()
+    }
+
+    /// A cache hit on a GROUP must leave no target behind, even though the
+    /// pre-flight already wrote one: a routing group with a single eligible
+    /// candidate reaches `resolve_provider_key` before the cache is
+    /// consulted, and that candidate did not serve the stored answer
+    /// (AISIX-Cloud#1571).
+    #[tokio::test]
+    async fn a_group_cache_hit_erases_the_preflight_target() {
+        scope(Arc::new(RequestAttribution::default()), async {
+            note_requested_model("my-group");
+            note_target(&model("openai", "gpt-4o"), "pk-openai");
+            note_cache_hit_entry(&group_model());
+            let r = current().expect("in scope");
+            assert_eq!(r.requested_model, "my-group");
+            assert_eq!(r.provider, "");
+            assert_eq!(r.upstream_model, "");
+            assert_eq!(r.provider_key_id, "");
+            let target = AccessLogTarget::from_resolved(r);
+            assert_eq!(target.upstream_model(), None);
+            assert_eq!(target.provider_key_id(), None);
+        })
+        .await;
+    }
+
+    /// A direct entry keeps its own mapping across the same call: those
+    /// fields are properties of the row the caller addressed, not evidence
+    /// that anything was dispatched.
+    #[tokio::test]
+    async fn a_direct_cache_hit_keeps_the_entrys_own_mapping() {
+        scope(Arc::new(RequestAttribution::default()), async {
+            let direct = model("openai", "gpt-4o");
+            note_requested_model("m");
+            note_cache_hit_entry(&direct);
+            let r = current().expect("in scope");
+            assert_eq!(r.provider, "openai");
+            assert_eq!(r.upstream_model, "gpt-4o");
+            assert_eq!(r.provider_key_id, "pk-1");
         })
         .await;
     }
