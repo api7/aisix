@@ -400,19 +400,23 @@ mod tests {
                  `upstream_http::config()`",
             ),
             (
+                // `object_store`'s own `ClientOptions` defaults carry
+                // neither the deployment's trust roots nor its pool and
+                // dial budgets — it leaves `pool_idle_timeout` unset,
+                // which is reqwest's 90s.
                 "AmazonS3Builder::",
-                "tls_client_options",
-                "object-store exporters must pass `tls_client_options()` as client options",
+                "upstream_client_options",
+                "object-store exporters must pass `upstream_client_options()` as client options",
             ),
             (
                 "MicrosoftAzureBuilder::",
-                "tls_client_options",
-                "object-store exporters must pass `tls_client_options()` as client options",
+                "upstream_client_options",
+                "object-store exporters must pass `upstream_client_options()` as client options",
             ),
             (
                 "GoogleCloudStorageBuilder::",
-                "tls_client_options",
-                "object-store exporters must pass `tls_client_options()` as client options",
+                "upstream_client_options",
+                "object-store exporters must pass `upstream_client_options()` as client options",
             ),
         ];
 
