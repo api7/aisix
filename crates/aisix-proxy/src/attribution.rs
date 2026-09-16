@@ -308,18 +308,29 @@ impl PendingAccessLog {
     /// Write the line, taking its outcome from the terminal usage event.
     fn emit(self, target: &Resolved, event: &aisix_obs::UsageEvent) {
         let duration = self.started.elapsed();
-        // What the CALLER waited for, and the same figure the event
-        // reports: the first token forwarded downstream on a stream that
-        // delivered one. A stream that delivered nothing — the caller left
-        // before the first frame — has no such moment, so the line falls
-        // back to the whole request, which is all it waited for.
-        let latency = match event.downstream_latency_ms {
-            0 => duration,
-            ms => Duration::from_millis(u64::from(ms)),
-        };
+        // What the CALLER waited for, taken VERBATIM off the event: the
+        // first token forwarded downstream on a stream that delivered one.
+        // Not re-derived, and no sentinel handling — the line and the row
+        // are one record of one request, so they must not be able to report
+        // two different waits, and a sub-millisecond first frame is a real
+        // `0` rather than a missing stamp. It reads `0` exactly where the
+        // event says the caller received nothing, which the `499` beside it
+        // explains. Deliberately NOT the length of the stream, which
+        // `duration` is (AISIX-Cloud#1394).
+        let latency = Duration::from_millis(u64::from(event.downstream_latency_ms));
         let prompt = u64::from(event.prompt_tokens);
         let completion = u64::from(event.completion_tokens);
-        let total = prompt + completion;
+        // Cache-inclusive, the way every emitter in this crate computes a
+        // request's total: `prompt_tokens` excludes the cache dimensions on
+        // the Anthropic-shaped paths, so summing the two visible columns
+        // would put a cached request's line an order of magnitude under the
+        // row it was emitted beside.
+        let total = crate::usage_attr::total_tokens_with_cache(
+            event.prompt_tokens,
+            event.completion_tokens,
+            event.cache_creation_tokens,
+            event.cache_read_tokens,
+        );
         // Keep a token-less outcome out of the token columns entirely,
         // rather than logging an abandoned stream as a zero-token success —
         // the same rule the rest of this line follows for `error_kind` and

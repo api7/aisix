@@ -245,7 +245,9 @@ pub async fn responses(
             monitor_hits.extend(success.output_monitor_hits.clone());
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
-            if success.usage_handled_by_stream {
+            // See the note in `messages.rs`: the flag alone is not "the
+            // response is a stream".
+            if stream_requested && success.usage_handled_by_stream {
                 // A streamed response has no outcome yet: the head exists, nothing
                 // has been delivered, and whether the caller reads it to the end
                 // or walks away is minutes from being known. Park the line and

@@ -150,6 +150,13 @@ pub async fn transcriptions(
             // Actual status, not a hardcoded 200 — the #696 billed-then-
             // output-blocked path returns Ok(success) carrying a 422.
             let status = success.response.status().as_u16();
+            // On this family the flag IS "the response is a live relay" — it
+            // is set only inside the `is_event_stream` branch and is what
+            // labels the metric as streaming — so there is no second
+            // predicate to conjoin, unlike `/v1/messages` and
+            // `/v1/responses`. If it ever comes to mean "already emitted"
+            // too, park on the relay itself instead: a parked line with no
+            // later emitter is a line silently lost.
             if success.usage_handled_by_stream {
                 // A relayed transcription stream has no outcome yet — the caller may
                 // read it to the terminal event or walk away. Park the line and

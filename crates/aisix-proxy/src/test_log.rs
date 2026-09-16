@@ -169,10 +169,18 @@ pub(crate) async fn three_stream_endings(
             response.status(),
         );
         let mut body = response.into_body().into_data_stream();
+        // `Some(Err(_))` is a BROKEN body, not a delivered frame — accepting
+        // it would let a stream that failed on its first poll pass as the
+        // delivered ending, which is the one ending whose line says 200.
         let first = body.next().await;
-        assert!(first.is_some(), "premise: the stream delivered no frame");
+        assert!(
+            matches!(first, Some(Ok(_))),
+            "premise: the stream delivered no frame: {first:?}",
+        );
         tokio::time::sleep(SLOW_DRAIN).await;
-        while body.next().await.is_some() {}
+        while let Some(frame) = body.next().await {
+            frame.expect("the delivered stream must read cleanly to its end");
+        }
         drop(body);
         capture.only("a delivered stream")
     };
@@ -182,7 +190,10 @@ pub(crate) async fn three_stream_endings(
         let response = app.clone().oneshot(request()).await.unwrap();
         let mut body = response.into_body().into_data_stream();
         let first = body.next().await;
-        assert!(first.is_some(), "premise: the stream delivered no frame");
+        assert!(
+            matches!(first, Some(Ok(_))),
+            "premise: the stream delivered no frame to abandon: {first:?}",
+        );
         drop(body);
         capture.only("a stream abandoned mid-flight")
     };

@@ -67,8 +67,18 @@ pub struct AccessLog<'a> {
     /// What the caller waited for — see the module docs. On a streamed
     /// response this is time-to-first-token, NOT how long the stream ran.
     pub latency: Duration,
-    /// How long the request occupied the gateway, arrival to last byte out.
-    /// Equal to `latency` on everything that is not streamed.
+    /// How long the request occupied the gateway: from arrival to the point
+    /// this line is written. Equal to `latency` on everything that is not
+    /// streamed.
+    ///
+    /// "The point this line is written" is the request's end on every
+    /// surface whose record is written at completion — which is all of them
+    /// except the two that meter at their handler tail and relay an
+    /// open-ended body afterwards (`/v1/audio/speech`, billed per input
+    /// character, and `/v1/videos/{id}/content`, metered by the
+    /// submission). Those two have no completion-time emitter to carry a
+    /// line, so theirs ends at the response head and does not span the
+    /// relay.
     pub duration: Duration,
     pub provider: Option<&'a str>,
     /// The model name the CALLER addressed — for a routing group, the group

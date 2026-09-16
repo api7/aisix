@@ -180,7 +180,12 @@ pub async fn messages(
             monitor_hits.extend(output_monitor_hits);
             let elapsed = started.elapsed();
             let status = response.status().as_u16();
-            if usage_handled_by_stream {
+            // Conjoined with the request's own streaming flag rather than
+            // resting on `usage_handled_by_stream` alone: a family that ever
+            // reuses that flag to mean "already emitted" on a BUFFERED path,
+            // the way chat's ensemble does, would park a line with no later
+            // emitter to write it — and lose it silently.
+            if stream_requested && usage_handled_by_stream {
                 // A streamed response has no outcome yet: the head exists, nothing
                 // has been delivered, and whether the caller reads it to the end
                 // or walks away is minutes from being known. Park the line and
@@ -5636,6 +5641,9 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             "max_tokens": 100,
             "stream": true,
         });
+        // The access-log line goes out with the terminal usage event now
+        // (AISIX-Cloud#1571), so it is captured for the same request.
+        let capture = crate::test_log::Capture::install();
         let resp = app.oneshot(make_req(body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
@@ -5679,6 +5687,29 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             "streaming /v1/messages telemetry must record TTFT",
         );
         assert!(rx.try_recv().is_err(), "usage event should be emitted once");
+
+        // AISIX-Cloud#1571: the line is written beside that event, so its
+        // token columns have to be the total the row bills. On this path
+        // `prompt_tokens` EXCLUDES the two cache dimensions, so a line that
+        // summed only the two visible columns would report 89 where the row
+        // bills 102 — and the two are supposed to be one record.
+        let line = capture.only("a streamed /v1/messages call");
+        assert_eq!(line.status(), 200);
+        assert_eq!(
+            line.num("total_tokens"),
+            Some(u64::from(
+                event.prompt_tokens
+                    + event.completion_tokens
+                    + event.cache_creation_tokens
+                    + event.cache_read_tokens
+            )),
+            "the line and the row must agree on what the request cost",
+        );
+        assert_eq!(line.num("total_tokens"), Some(102));
+        assert_eq!(
+            line.field("provider_request_id").as_deref(),
+            Some("msg_stream_245")
+        );
     }
 
     /// AISIX-Cloud#952: relay backends that ship NO usage on

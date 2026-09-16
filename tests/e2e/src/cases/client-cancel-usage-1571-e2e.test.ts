@@ -403,7 +403,12 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
       const first = await reader.read();
       expect(first.done, "the stream delivered nothing to abandon").toBe(false);
       controller.abort();
-      await reader.cancel().catch(() => {});
+      // `cancel()` races the abort: it resolves when cancellation wins and
+      // rejects with the body's `AbortError` when the abort does. Any other
+      // rejection is a real failure and must not be swallowed.
+      await reader.cancel().catch((err: unknown) => {
+        if (!(err instanceof Error) || err.name !== "AbortError") throw err;
+      });
 
       const row = await waitForSlsLog(
         sls,
