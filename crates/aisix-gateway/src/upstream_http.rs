@@ -349,17 +349,19 @@ mod tests {
 
     /// The outbound stacks that are *not* reqwest each have exactly one
     /// sanctioned construction site, and each of those sites is the only
-    /// thing standing between `upstream.tls` and a client that quietly
-    /// trusts the wrong set of roots.
+    /// thing standing between the `upstream` block and a client that
+    /// quietly trusts the wrong set of roots or dials on a budget nobody
+    /// configured.
     ///
     /// Nothing else catches a regression here: a client built without the
-    /// shared trust material works perfectly against every public
-    /// provider and fails only against the private CA the setting exists
-    /// for — which is to say, only in the customer's environment.
+    /// shared material works perfectly against every public provider and
+    /// fails only against the private CA the setting exists for, or only
+    /// once a hop starts reaping connections — which is to say, only in
+    /// the customer's environment.
     ///
     /// Each entry is (probe, what the file must also mention, why).
     #[test]
-    fn every_non_reqwest_outbound_stack_applies_the_shared_tls_settings() {
+    fn every_non_reqwest_outbound_stack_applies_the_shared_upstream_settings() {
         const RULES: &[(&str, &str, &str)] = &[
             (
                 // Catches a *new* WebSocket call site: `connect_async`
@@ -385,6 +387,17 @@ mod tests {
                 // production call site must NOT reach.
                 "upstream_tls::aws_http_client()",
                 "Bedrock SDK clients must be built on `upstream_tls::aws_http_client()`",
+            ),
+            (
+                // A `SdkConfig` without one does not fall back to the
+                // shared settings: the SDK's own default plugins put
+                // their 3.1s connect timeout back, so the operator's
+                // `upstream.connect_timeout` reaches every outbound
+                // client except this one.
+                "aws_config::SdkConfig::builder()",
+                "timeout_config",
+                "Bedrock SDK clients must carry a `TimeoutConfig` built from \
+                 `upstream_http::config()`",
             ),
             (
                 "AmazonS3Builder::",
@@ -417,7 +430,7 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "these reach an external service without the deployment's outbound TLS \
-             trust:\n{}",
+             trust or its connection settings:\n{}",
             offenders.join("\n"),
         );
     }
