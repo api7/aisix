@@ -20,7 +20,10 @@ Pushing the tag triggers two workflows:
   mirrors the release tag to `docker.io/api7/aisix` for private/offline
   deployments, signs the images with cosign, and stamps the version into the
   binary so a running gateway self-reports `X.Y.Z` (`--version`, `Server`
-  header) and `X.Y.Z+sha-<short>` in its managed-mode heartbeat.
+  header) and `X.Y.Z+sha-<short>` in its managed-mode heartbeat. Every tag
+  is a `linux/amd64` + `linux/arm64` manifest list: one native runner per
+  architecture, assembled and signed by the workflow's `merge` job, which
+  fails if a published tag is missing either platform.
 - **`release-draft.yml`** creates a **draft** GitHub Release for the tag. The
   draft already leads with a version-stamped **Get started + Download** header
   (from [`.github/release-notes-header.md`](.github/release-notes-header.md):
@@ -37,8 +40,12 @@ Any phase failing — instrumented build, training, profile merge, optimized
 build — fails the image build; there is no fallback to a plain build. After
 the push, the workflow asserts the `pgo-verified.json` proof marker inside
 the image (shape count, profile size) before signing. If a release build
-fails in a PGO phase, fix the cause; never ship around it. To inspect a
-shipped image's marker:
+fails in a PGO phase, fix the cause; never ship around it. Each architecture
+trains and asserts its own profile on its own native runner — an instrumented
+binary cannot self-train under emulation, which is why the workflow builds
+natively rather than under QEMU. To inspect a shipped image's marker (the
+command runs the image, so read the other architecture's from a host of that
+architecture):
 
 ```bash
 docker run --rm --entrypoint cat ghcr.io/api7/aisix:X.Y.Z \
