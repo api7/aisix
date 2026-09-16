@@ -215,7 +215,7 @@ describe("provider_request_id reaches the access log and the plain log", () => {
     expect(res.requestId).not.toBe(NONSTREAM_ID);
   });
 
-  test("streaming: the provider-call line carries the id the access log cannot", async (ctx) => {
+  test("streaming: the access-log line and the per-attempt line both carry the id", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
       return;
@@ -229,9 +229,22 @@ describe("provider_request_id reaches the access log and the plain log", () => {
     expect(res.status).toBe(200);
     expect(res.text).toContain("[DONE]");
 
-    // The whole point of the per-attempt line: the id only exists once the
-    // first upstream frame lands, by which time the access-log line for this
-    // request has already been written.
+    // The id only exists once the first upstream frame lands — which used to
+    // be after this request's access-log line had been written. The line is
+    // written at the stream's END now (AISIX-Cloud#1571), so it carries the
+    // winning call's id like a buffered one does.
+    const access = await waitForLogLine(
+      app,
+      (l) =>
+        l.includes("proxy request completed") &&
+        l.includes(`request_id="${res.requestId}"`),
+      "the access-log line for this streamed request",
+    );
+    expect(access).toContain(`provider_request_id="${STREAM_ID}"`);
+
+    // The per-attempt line is still the one that identifies an INDIVIDUAL
+    // provider call: `request_id` + `attempt_index`, one per attempt of a
+    // retried or failed-over request, where the access log has one row.
     const line = await waitForLogLine(
       app,
       (l) =>
@@ -240,8 +253,6 @@ describe("provider_request_id reaches the access log and the plain log", () => {
       "the provider-call line for this streamed request",
     );
     expect(line).toContain(`provider_request_id="${STREAM_ID}"`);
-    // `request_id` + `attempt_index` is what identifies an individual
-    // provider call across a retried / failed-over request.
     expect(line).toContain("attempt_index=");
   });
 
