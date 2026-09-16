@@ -381,6 +381,25 @@ mod tests {
                  `upstream_tls::rustls_client_config()`",
             ),
             (
+                // Both WebSocket probes again, for the other half of the
+                // `upstream` block: the Realtime dial is the one upstream
+                // path with no deadline of its own — the session's idle
+                // cap only starts once the socket is up, so an unbounded
+                // dial hangs the upgrade until the kernel exhausts its
+                // SYN retries, minutes after every other route would have
+                // failed at `upstream.connect_timeout`.
+                "tokio_tungstenite::connect_async(",
+                "upstream_http::config().connect_timeout",
+                "the Realtime WebSocket dial must be bounded by \
+                 `upstream.connect_timeout`",
+            ),
+            (
+                "connect_async_tls_with_config",
+                "upstream_http::config().connect_timeout",
+                "the Realtime WebSocket dial must be bounded by \
+                 `upstream.connect_timeout`",
+            ),
+            (
                 "aws_config::SdkConfig::builder()",
                 // Spelled in full: `build_aws_http_client()` contains
                 // the bare name, and it is the un-memoized builder a

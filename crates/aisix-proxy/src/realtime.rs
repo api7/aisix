@@ -150,8 +150,18 @@ fn client_requested_beta_realtime(headers: &HeaderMap) -> bool {
         || header_list_has(headers, "sec-websocket-protocol", SUBPROTOCOL_BETA_ITEM)
 }
 
+type UpstreamDial = Result<
+    (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    tokio_tungstenite::tungstenite::Error,
+>;
+
 /// Dial the upstream Realtime endpoint under the deployment's outbound
-/// TLS trust.
+/// TLS trust, on the deployment's connect budget.
 ///
 /// `connect_async` would build its own connector over the compiled-in
 /// root set only, which leaves this the one upstream path that ignores
@@ -160,18 +170,47 @@ fn client_requested_beta_realtime(headers: &HeaderMap) -> bool {
 /// provider's `/v1/chat/completions` worked.
 async fn connect_upstream(
     request: tokio_tungstenite::tungstenite::handshake::client::Request,
-) -> Result<
-    (
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        tokio_tungstenite::tungstenite::handshake::client::Response,
-    ),
-    tokio_tungstenite::tungstenite::Error,
-> {
+) -> UpstreamDial {
+    connect_upstream_within(
+        aisix_gateway::upstream_http::config().connect_timeout,
+        request,
+    )
+    .await
+}
+
+/// The dial itself, budget passed in so a test can use one far shorter
+/// than the deployment default.
+///
+/// The budget covers the WHOLE dial — DNS, TCP, TLS *and* the WebSocket
+/// handshake exchange — where the HTTP routes' `connect_timeout` stops
+/// at the end of TLS. tokio-tungstenite exposes no seam between those
+/// phases, and the extra phase is the one that matters most here: an
+/// upstream that completes TLS and then never answers the upgrade is as
+/// stuck as one that never answers the SYN, and nothing downstream
+/// bounds it — the session's idle deadline only starts once the socket
+/// is up. Left unbounded the upgrade hangs until the kernel exhausts its
+/// SYN retries, minutes after every other route would have failed.
+async fn connect_upstream_within(
+    budget: Option<Duration>,
+    request: tokio_tungstenite::tungstenite::handshake::client::Request,
+) -> UpstreamDial {
     let connector =
         tokio_tungstenite::Connector::Rustls(aisix_gateway::upstream_tls::rustls_client_config());
-    tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector)).await
+    let dial =
+        tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector));
+    let Some(budget) = budget else {
+        return dial.await;
+    };
+    tokio::time::timeout(budget, dial)
+        .await
+        .unwrap_or_else(|_| {
+            Err(tokio_tungstenite::tungstenite::Error::Io(
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("upstream connect exceeded upstream.connect_timeout ({budget:?})"),
+                ),
+            ))
+        })
 }
 
 pub(crate) async fn realtime(
@@ -1235,6 +1274,66 @@ mod tests {
     use futures::{SinkExt, StreamExt};
     use std::sync::{Arc, Mutex};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    /// An upstream that accepts the connection and then never answers
+    /// the upgrade must fail on the configured budget. Without one the
+    /// dial has no deadline at all — the session's idle cap only starts
+    /// once the socket is up — so the upgrade hangs for as long as the
+    /// far end keeps the socket open.
+    #[tokio::test]
+    async fn a_silent_upstream_fails_the_dial_on_its_budget() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept and hold: the sockets stay open and unanswered for as
+        // long as this task lives.
+        let _silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let request = format!("ws://{addr}/v1/realtime")
+            .into_client_request()
+            .unwrap();
+        let budget = Duration::from_millis(300);
+        // The outer bound is the assertion: unbudgeted, the dial simply
+        // never returns, so a plain `.await` here would hang the suite
+        // rather than fail it.
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_upstream_within(Some(budget), request),
+        )
+        .await
+        .expect("the dial must end on its own budget")
+        .expect_err("a silent upstream cannot complete the handshake");
+        assert!(
+            matches!(&err, tokio_tungstenite::tungstenite::Error::Io(e)
+                if e.kind() == std::io::ErrorKind::TimedOut),
+            "the failure must reach `run_session`'s upstream-connect branch \
+             as a transport error, not as something it reports differently: {err}"
+        );
+    }
+
+    /// [`connect_upstream_within`] takes its budget as an argument, so
+    /// only its production caller binds it to the operator's setting. The
+    /// workspace scan in `upstream_http` cannot see that binding — this
+    /// module names the config too — so pin it to the function body.
+    #[test]
+    fn the_production_dial_takes_its_budget_from_the_upstream_config() {
+        let src = include_str!("realtime.rs");
+        let body = src
+            .split_once("async fn connect_upstream(")
+            .expect("connect_upstream is defined in this file")
+            .1
+            .split_once("\n}\n")
+            .expect("its body ends at a top-level brace")
+            .0;
+        assert!(
+            body.contains("upstream_http::config().connect_timeout"),
+            "the Realtime dial must pass `upstream.connect_timeout` as its budget: {body}"
+        );
+    }
 
     fn cfg() -> ProxyConfig {
         ProxyConfig {
