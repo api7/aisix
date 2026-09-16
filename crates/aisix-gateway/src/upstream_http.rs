@@ -380,7 +380,10 @@ mod tests {
             ),
             (
                 "aws_config::SdkConfig::builder()",
-                "aws_http_client",
+                // Spelled in full: `build_aws_http_client()` contains
+                // the bare name, and it is the un-memoized builder a
+                // production call site must NOT reach.
+                "upstream_tls::aws_http_client()",
                 "Bedrock SDK clients must be built on `upstream_tls::aws_http_client()`",
             ),
             (

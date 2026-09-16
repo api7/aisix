@@ -406,9 +406,10 @@ fn build_client(
         .region(Region::new(creds.region.clone()))
         .credentials_provider(SharedCredentialsProvider::new(aws_creds))
         .timeout_config(timeouts.build())
-        // Shared HTTP stack carrying `upstream.tls.ca_file`, so a
+        // The HTTP stack carrying `upstream.tls.ca_file`, so a
         // Bedrock-compatible endpoint behind a private CA is reachable
-        // on the same setting every other upstream uses.
+        // on the same setting every other upstream uses. Shared across
+        // the process in production; see `sdk_http_client`.
         .http_client(sdk_http_client())
         // Retries belong to the gateway's own budget
         // (`routing::effective_retries`), which emits per-attempt telemetry

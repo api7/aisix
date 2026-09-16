@@ -427,7 +427,9 @@ pub fn aws_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClie
 }
 
 /// The same client, built fresh and therefore carrying its own
-/// connection pool.
+/// connection pool. Test harnesses only — a production call site wants
+/// [`aws_http_client`], and the outbound-TLS scan in `upstream_http`
+/// fails any file that builds an SDK client without naming it.
 ///
 /// Sharing one pool is right for the gateway, which runs a single
 /// tokio runtime for the life of the process. It is wrong for a test

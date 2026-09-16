@@ -179,7 +179,7 @@ impl BedrockGuardrail {
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(cfg.region.clone()))
             .credentials_provider(SharedCredentialsProvider::new(creds))
-            // Same shared HTTP stack as the Bedrock provider bridge, so
+            // Same HTTP stack as the Bedrock provider bridge, so
             // `upstream.tls.ca_file` covers the guardrail call too.
             .http_client(sdk_http_client())
             // The retry sleep_impl is needed for the SDK's built-in
