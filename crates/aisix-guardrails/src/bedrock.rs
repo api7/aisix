@@ -93,6 +93,25 @@ pub struct BedrockGuardrail {
     client: Arc<Client>,
 }
 
+/// The HTTP stack this guardrail's SDK client is built on.
+///
+/// One pool for the process is right for the gateway, which runs a
+/// single tokio runtime for as long as it lives, and wrong for this
+/// crate's test binary, where each `#[tokio::test]` owns a runtime and
+/// drops it while the process-wide pool keeps the connections spawned
+/// on it — a later test handed one gets hyper's `DispatchGone` instead
+/// of the upstream's answer. Under test, one pool per client. Same
+/// reasoning, same shape, as the Bedrock provider bridge.
+#[cfg(not(test))]
+fn sdk_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    aisix_gateway::upstream_tls::aws_http_client()
+}
+
+#[cfg(test)]
+fn sdk_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    aisix_gateway::upstream_tls::build_aws_http_client()
+}
+
 impl BedrockGuardrail {
     /// Build the dispatcher from a parsed [`BedrockConfig`]. Caller
     /// owns the row's `name`, `hook_point`, and `fail_open` (they
@@ -159,10 +178,10 @@ impl BedrockGuardrail {
         );
         // The dial budget the operator configured, exactly as the
         // provider bridge applies it. Without a `TimeoutConfig` the SDK's
-        // default plugins substitute their own 3.1s, so `upstream
-        // .connect_timeout` would reach every outbound client in the
-        // process except this one. `0` (disabled) has to be passed on
-        // explicitly, or those same plugins put the 3.1s back.
+        // default plugins substitute their own 3.1s and
+        // `upstream.connect_timeout` never reaches this client at all.
+        // `0` (disabled) has to be passed on explicitly, or those same
+        // plugins put the 3.1s back.
         let mut timeouts = TimeoutConfig::builder();
         match aisix_gateway::upstream_http::config().connect_timeout {
             Some(d) => timeouts = timeouts.connect_timeout(d),
@@ -173,10 +192,10 @@ impl BedrockGuardrail {
             .region(Region::new(cfg.region.clone()))
             .credentials_provider(SharedCredentialsProvider::new(creds))
             .timeout_config(timeouts.build())
-            // Same shared HTTP stack as the Bedrock provider bridge, so
-            // `upstream.tls.ca_file` covers the guardrail call too, and
+            // Same HTTP stack as the Bedrock provider bridge, so
+            // `upstream.tls.ca_file` covers the guardrail call too and
             // pooled connections expire on `upstream.pool_idle_timeout`.
-            .http_client(aisix_gateway::upstream_tls::aws_http_client())
+            .http_client(sdk_http_client())
             // The retry sleep_impl is needed for the SDK's built-in
             // retries; aws-config's default features set this when
             // the rt-tokio feature is on (see workspace Cargo.toml).
