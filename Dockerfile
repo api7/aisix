@@ -197,7 +197,12 @@ RUN chmod 0755 /usr/local/bin/aisix-entrypoint
 # Proxy + admin + metrics listeners from config.example.yaml.
 EXPOSE 3000 3001 9090
 
-USER aisix
+# Numeric, not `aisix`: kubelet resolves `runAsNonRoot: true` against the
+# image's configured user, and a name it cannot prove is non-root fails
+# the container at admission with CreateContainerConfigError. The uid is
+# the `aisix` passwd entry's, so the default runtime identity — and the
+# ownership of /etc/aisix and /var/lib/aisix — is unchanged.
+USER 10001
 
 # tini forwards signals cleanly to the aisix process; entrypoint script
 # resolves the config path from env, then execs the binary.
