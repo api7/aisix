@@ -706,6 +706,38 @@ mod tests {
         }
     }
 
+    /// The five production chains call `upstream_client_options()`, not
+    /// `client_options_for`, so the tests above say nothing about the
+    /// one-line join between them. Left unpinned that accessor can be
+    /// reduced to a bare `ClientOptions::new()` with every guard here
+    /// still green — and it would take the `upstream.tls` trust material
+    /// this helper already carried down with it, which is the private-CA
+    /// support the TLS matrix in the docs promises for these exporters.
+    ///
+    /// `PoolIdleTimeout` is the key that can carry this: no test binary
+    /// calls `upstream_http::init()`, so `config()` is the 30s default,
+    /// while `ClientOptions` leaves the same key unset. `ConnectTimeout`
+    /// is 5s on both sides and would pin nothing.
+    #[test]
+    fn the_production_accessor_reads_the_process_upstream_config() {
+        use object_store::ClientConfigKey;
+
+        let key = ClientConfigKey::PoolIdleTimeout;
+        let from_process_config = client_options_for(aisix_gateway::upstream_http::config());
+        assert_ne!(
+            from_process_config.get_config_value(&key),
+            object_store::ClientOptions::new().get_config_value(&key),
+            "the process config must differ from object_store's default here, \
+             or the next assertion holds for a client that read neither",
+        );
+        assert_eq!(
+            upstream_client_options().get_config_value(&key),
+            from_process_config.get_config_value(&key),
+            "`upstream_client_options()` must be \
+             `client_options_for(upstream_http::config())`",
+        );
+    }
+
     /// `None` on these fields is the operator's "off" — `upstream_http`'s
     /// loader maps config `0` to it, and every reqwest client and the
     /// Bedrock SDK read it as unbounded. `ClientOptions` reads an unset
