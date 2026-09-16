@@ -312,13 +312,20 @@ jobs:
       #     against the image's configured user and cannot prove a name is
       #     non-root, so a named user fails the pod at admission with
       #     CreateContainerConfigError. Nothing in a `docker run` notices.
-      #   - The gateway must still start when the platform assigns it some
-      #     other uid and gid 0 with no passwd entry (OpenShift's
-      #     restricted-v2 SCC, and any chart that stops pinning runAsUser).
-      #     `docker inspect` cannot see that.
+      #   - Nothing in the image may depend on the uid it was built for.
+      #     `docker inspect` cannot see that, so the image is run under an
+      #     unrelated uid with gid 0 and no passwd entry and has to serve
+      #     /livez. The file resource source keeps this to one container:
+      #     the subject is the boot, and no resource is needed to answer
+      #     /livez.
       #
-      # The file resource source keeps this to one container: the subject
-      # is the boot, and no resource is needed to answer /livez.
+      # What this does NOT cover, so that nobody reads it as more than it
+      # is: managed mode writes its mTLS bundle, gateway id and snapshot
+      # cache under /var/lib/aisix, which the image creates owned by uid
+      # 10001 and not group-writable. A managed gateway running as some
+      # other uid needs that directory supplied writable from outside —
+      # which is what the chart's state volume is for — and this step
+      # deliberately does not stand in for a deployment that arranges it.
       - name: Smoke test — numeric USER, and boot under an arbitrary uid
         if: github.event_name == 'pull_request'
         run: |

@@ -56,7 +56,9 @@ describe("unrecognised AISIX_* environment variables", () => {
     // something they may believe they configured, so the line has to name
     // the variable and say what to do about it.
     const log = app.output();
-    expect(log).toContain("AISIX_OSS_PORT_9090_TCP_PROTO");
+    expect(log).toContain(
+      "AISIX_OSS_PORT_9090_TCP_PROTO was not applied as a configuration override",
+    );
     expect(log).toContain("enableServiceLinks: false");
   });
 
@@ -65,8 +67,9 @@ describe("unrecognised AISIX_* environment variables", () => {
 
     const livez = await fetch(`${app.proxyUrl}/livez`);
     expect(livez.status).toBe(200);
-    // The variable the binary acted on is its own, so nothing is ignored
-    // and nothing is warned about.
-    expect(app.output()).not.toContain("was ignored");
+    // The variable the binary acted on is its own, so nothing is warned
+    // about. Asserted on the warning's own opening phrase, which the
+    // other case proves is emitted when there IS something to report.
+    expect(app.output()).not.toContain("was not applied as a configuration override");
   });
 });

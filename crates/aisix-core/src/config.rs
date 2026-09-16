@@ -1663,14 +1663,23 @@ impl EnvOverrides {
                 source.insert(name, value);
                 continue;
             }
+            // Leads with what is certain. Whether anything reads the
+            // variable is NOT knowable here: the configuration that would
+            // name it (etcd.password_env, a credential reference, a
+            // resources-file `${…}`) has not been parsed yet, and calling
+            // such a variable "ignored" is false on a deployment that
+            // followed the shipped example.
             warnings.push(format!(
-                "{name} is not a gateway configuration setting and was ignored \
-                 (a nested setting is spelled AISIX_<SECTION>__<KEY>, with two \
-                 underscores). Kubernetes injects variables of this shape into \
-                 every pod for each Service whose name starts with \"aisix\" — \
-                 set enableServiceLinks: false on the pod spec to stop it. A \
-                 variable the configuration references by name, such as one \
-                 named by etcd.password_env, is read separately and still applies."
+                "{name} was not applied as a configuration override: it is not a \
+                 gateway configuration setting, and a nested setting is spelled \
+                 AISIX_<SECTION>__<KEY>, with two underscores. If the \
+                 configuration names this variable — etcd.password_env, a \
+                 credential reference, a resources-file interpolation — it is \
+                 read from the environment by that name and still applies. \
+                 Otherwise nothing reads it: Kubernetes injects variables of \
+                 this shape into every pod for each Service whose name starts \
+                 with \"aisix\", and enableServiceLinks: false on the pod spec \
+                 stops that."
             ));
         }
 
