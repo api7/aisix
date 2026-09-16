@@ -186,17 +186,47 @@ pub enum ObjectStoreCredentials {
     },
 }
 
-/// HTTP client options carrying the deployment's outbound TLS trust, so
-/// an on-prem object store — a MinIO or an internal S3-compatible host
-/// behind an enterprise CA — is reachable on the same `upstream.tls`
-/// setting the provider bridges use.
+/// HTTP client options carrying the deployment's `upstream` settings, so
+/// the exporters reach an object store on the same trust and connection
+/// settings the provider bridges use — an on-prem MinIO or internal
+/// S3-compatible host sits behind the same enterprise CA and the same
+/// LB/NAT hops the rest of the gateway's outbound traffic crosses.
 ///
 /// Applied first in every builder chain: `with_client_options` replaces
 /// the whole options value, so a later `with_allow_http` layers onto
 /// this rather than the other way round.
-fn tls_client_options() -> object_store::ClientOptions {
-    let tls = &aisix_gateway::upstream_http::config().tls;
+fn upstream_client_options() -> object_store::ClientOptions {
+    client_options_for(aisix_gateway::upstream_http::config())
+}
+
+/// The options themselves, over an explicit config so a test can watch a
+/// value that is not also the default arrive.
+///
+/// `object_store`'s own defaults leave `pool_idle_timeout` unset, which
+/// is reqwest's 90s idle lifetime — the value `upstream_http`'s default
+/// guard rejects, because it outlives a typical hop's idle timer and the
+/// pool then hands out connections the far end has already closed. Its
+/// `connect_timeout` default happens to equal ours today, which is not
+/// the same as honouring an operator who changed it.
+///
+/// The three `tcp_keepalive_*` settings have no entry point on
+/// `ClientOptions`, so they stop here — the same shape as the AWS SDK
+/// stack, and worth knowing before assuming the whole `upstream` block
+/// reaches this client.
+fn client_options_for(
+    cfg: &aisix_gateway::upstream_http::UpstreamHttpConfig,
+) -> object_store::ClientOptions {
+    let tls = &cfg.tls;
     let mut options = object_store::ClientOptions::new();
+    if let Some(d) = cfg.pool_idle_timeout {
+        options = options.with_pool_idle_timeout(d);
+    }
+    if let Some(d) = cfg.connect_timeout {
+        options = options.with_connect_timeout(d);
+    }
+    if let Some(n) = cfg.pool_max_idle_per_host {
+        options = options.with_pool_max_idle_per_host(n);
+    }
     if let Some(pem) = &tls.extra_ca_pem {
         // Validated at boot by `TlsSettings::load`.
         match object_store::Certificate::from_pem_bundle(pem) {
@@ -239,7 +269,7 @@ pub fn build_object_store(
             },
         ) => {
             let mut b = object_store::aws::AmazonS3Builder::new()
-                .with_client_options(tls_client_options())
+                .with_client_options(upstream_client_options())
                 .with_bucket_name(bucket)
                 .with_access_key_id(access_key_id)
                 .with_secret_access_key(secret_access_key);
@@ -275,7 +305,7 @@ pub fn build_object_store(
             // the service-account JSON's `gcs_base_url` field instead, so the
             // `endpoint` config is intentionally not applied for GCS.
             let b = object_store::gcp::GoogleCloudStorageBuilder::new()
-                .with_client_options(tls_client_options())
+                .with_client_options(upstream_client_options())
                 .with_bucket_name(bucket)
                 .with_service_account_key(service_account_key);
             let store = b
@@ -291,7 +321,7 @@ pub fn build_object_store(
             },
         ) => {
             let mut b = object_store::azure::MicrosoftAzureBuilder::new()
-                .with_client_options(tls_client_options())
+                .with_client_options(upstream_client_options())
                 .with_container_name(bucket)
                 .with_account(account)
                 .with_access_key(access_key);
@@ -347,7 +377,7 @@ pub fn build_object_store_ambient(
                 ));
             }
             let mut b = object_store::aws::AmazonS3Builder::from_env()
-                .with_client_options(tls_client_options())
+                .with_client_options(upstream_client_options())
                 .with_bucket_name(bucket);
             if let Some(r) = region {
                 b = b.with_region(r);
@@ -361,7 +391,7 @@ pub fn build_object_store_ambient(
             // No service-account key set → `object_store` sources Application
             // Default Credentials (GKE Workload Identity / GCE metadata).
             let store = object_store::gcp::GoogleCloudStorageBuilder::new()
-                .with_client_options(tls_client_options())
+                .with_client_options(upstream_client_options())
                 .with_bucket_name(bucket)
                 .build()
                 .map_err(|e| {
@@ -617,6 +647,101 @@ mod tests {
 
     fn sink(store: Arc<dyn ObjectStore>, compression: ObjectStoreCompression) -> ObjectStoreSink {
         ObjectStoreSink::new("obj-test", store, "ai-gateway", compression)
+    }
+
+    /// `object_store::ClientOptions` starts from its OWN defaults, not the
+    /// deployment's: it leaves `pool_idle_timeout` unset, which is
+    /// reqwest's 90s idle lifetime, and its `connect_timeout` happens to
+    /// equal ours today — which is not the same as honouring an operator
+    /// who changed either one. Nothing else makes these exporters read
+    /// the `upstream` block, and a client on budgets nobody configured
+    /// works against every public bucket and fails only where the
+    /// settings exist, which is to say in the customer's environment.
+    ///
+    /// The values below are none of the defaults on either side, so the
+    /// comparison cannot pass on a coincidence.
+    #[test]
+    fn the_configured_upstream_connection_settings_reach_the_exporter_client_options() {
+        use object_store::ClientConfigKey;
+
+        let cfg = aisix_gateway::upstream_http::UpstreamHttpConfig {
+            pool_idle_timeout: Some(std::time::Duration::from_secs(17)),
+            connect_timeout: Some(std::time::Duration::from_secs(11)),
+            pool_max_idle_per_host: Some(7),
+            ..Default::default()
+        };
+        let applied = client_options_for(&cfg);
+        // `ClientOptions` exposes no getters for these; `get_config_value`
+        // is the only readback. Comparing against options built straight
+        // from the same values keeps the assertion off its string format.
+        let expected = object_store::ClientOptions::new()
+            .with_pool_idle_timeout(cfg.pool_idle_timeout.unwrap())
+            .with_connect_timeout(cfg.connect_timeout.unwrap())
+            .with_pool_max_idle_per_host(cfg.pool_max_idle_per_host.unwrap());
+        for key in [
+            ClientConfigKey::PoolIdleTimeout,
+            ClientConfigKey::ConnectTimeout,
+            ClientConfigKey::PoolMaxIdlePerHost,
+        ] {
+            assert_ne!(
+                expected.get_config_value(&key),
+                object_store::ClientOptions::new().get_config_value(&key),
+                "{key:?} was given the object_store default, so the next assertion \
+                 would hold whether or not the setting was applied",
+            );
+            assert_eq!(
+                applied.get_config_value(&key),
+                expected.get_config_value(&key),
+                "{key:?} did not reach the exporter client options",
+            );
+        }
+    }
+
+    /// The helper only helps the chains that call it, and
+    /// `with_client_options` REPLACES the whole options value — so one
+    /// chain left on `object_store`'s defaults exports on the wrong
+    /// trust and the wrong budgets while every test here, which hands
+    /// the sink an `InMemory` store and never builds a backend, stays
+    /// green.
+    ///
+    /// Scoped to the production half: this module's own text names all
+    /// of these. The sibling scan in `aisix-gateway`'s `upstream_http`
+    /// catches a chain moved to another file; this one catches a chain
+    /// in this file losing the call, and a new chain added without it.
+    #[test]
+    fn every_exporter_builder_chain_takes_the_shared_client_options() {
+        let production = include_str!("object_store.rs")
+            .split_once("\n#[cfg(test)]\nmod ")
+            .expect("this file has a test module")
+            .0;
+
+        let chains: usize = [
+            "AmazonS3Builder::new()",
+            "AmazonS3Builder::from_env()",
+            "GoogleCloudStorageBuilder::new()",
+            "MicrosoftAzureBuilder::new()",
+        ]
+        .iter()
+        .map(|c| production.matches(c).count())
+        .sum();
+        assert_eq!(
+            chains, 5,
+            "the exporter backends are built in 5 chains (s3 / gcs / azure on \
+             credential_ref, s3 / gcs on cloud identity); a new one needs the \
+             shared client options too, then this count",
+        );
+        assert_eq!(
+            production
+                .matches("with_client_options(upstream_client_options())")
+                .count(),
+            chains,
+            "every builder chain must take `upstream_client_options()`",
+        );
+        assert_eq!(
+            production.matches("with_client_options(").count(),
+            chains,
+            "no builder chain may pass client options from anywhere else",
+        );
     }
 
     #[tokio::test]
