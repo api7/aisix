@@ -208,7 +208,8 @@ impl DistributionSeries {
 
 struct Storage {
     distributions: DistributionBuilder,
-    generation: Arc<AtomicUsize>,
+    // Counter, gauge and histogram membership invalidate independently.
+    generation: Arc<[AtomicUsize; 3]>,
 }
 
 impl metrics_util::registry::Storage<Key> for Storage {
@@ -217,11 +218,11 @@ impl metrics_util::registry::Storage<Key> for Storage {
     type Histogram = Arc<DistributionSeries>;
 
     fn counter(&self, key: &Key) -> Self::Counter {
-        self.generation.fetch_add(1, Ordering::Release);
+        self.generation[0].fetch_add(1, Ordering::Release);
         Arc::new(Scalar::new(key))
     }
     fn gauge(&self, key: &Key) -> Self::Gauge {
-        self.generation.fetch_add(1, Ordering::Release);
+        self.generation[1].fetch_add(1, Ordering::Release);
         Arc::new(Scalar::new(key))
     }
     fn histogram(&self, key: &Key) -> Self::Histogram {
@@ -230,7 +231,7 @@ impl metrics_util::registry::Storage<Key> for Storage {
             Distribution::Histogram(_) => "histogram",
             Distribution::Summary(..) => "summary",
         };
-        self.generation.fetch_add(1, Ordering::Release);
+        self.generation[2].fetch_add(1, Ordering::Release);
         Arc::new(DistributionSeries {
             labels: Labels::new(key),
             kind,
@@ -242,22 +243,22 @@ impl metrics_util::registry::Storage<Key> for Storage {
 
 #[derive(Default)]
 struct Series {
-    counters: Vec<Arc<Scalar>>,
-    gauges: Vec<Arc<Scalar>>,
-    distributions: Vec<Arc<DistributionSeries>>,
+    counters: Arc<Vec<Arc<Scalar>>>,
+    gauges: Arc<Vec<Arc<Scalar>>>,
+    distributions: Arc<Vec<Arc<DistributionSeries>>>,
 }
 
 pub(crate) struct Recorder {
     registry: Registry<Key, Storage>,
     descriptions: Mutex<HashMap<String, SharedString>>,
     previous_render_bytes: AtomicUsize,
-    generation: Arc<AtomicUsize>,
-    series: Mutex<Option<(usize, Arc<Series>)>>,
+    generation: Arc<[AtomicUsize; 3]>,
+    series: Mutex<Option<([usize; 3], Arc<Series>)>>,
 }
 
 impl Recorder {
     pub(crate) fn new(distributions: DistributionBuilder) -> Self {
-        let generation = Arc::new(AtomicUsize::new(0));
+        let generation = Arc::new(std::array::from_fn(|_| AtomicUsize::new(0)));
         Self {
             registry: Registry::new(Storage {
                 distributions,
@@ -275,35 +276,57 @@ impl Recorder {
         // Read before visiting: a concurrent insertion can be absent from
         // this snapshot, but must invalidate it for the next visit. Storage
         // increments under the registry's insertion lock, which visits read.
-        let generation = self.generation.load(Ordering::Acquire);
+        let generation = std::array::from_fn(|i| self.generation[i].load(Ordering::Acquire));
         if let Some((previous, series)) = &*cached {
             if *previous == generation {
                 return series.clone();
             }
         }
-        let mut series = Series::default();
-        self.registry
-            .visit_counters(|_, value| series.counters.push(value.clone()));
-        self.registry
-            .visit_gauges(|_, value| series.gauges.push(value.clone()));
-        self.registry
-            .visit_histograms(|_, value| series.distributions.push(value.clone()));
-        series
-            .counters
-            .sort_unstable_by(|a, b| a.labels.name.cmp(&b.labels.name));
-        series
-            .gauges
-            .sort_unstable_by(|a, b| a.labels.name.cmp(&b.labels.name));
-        series
-            .distributions
-            .sort_unstable_by(|a, b| a.labels.name.cmp(&b.labels.name));
+        let series = Series {
+            counters: if let Some((_, existing)) = cached
+                .as_ref()
+                .filter(|(previous, _)| previous[0] == generation[0])
+            {
+                existing.counters.clone()
+            } else {
+                let mut values = Vec::new();
+                self.registry
+                    .visit_counters(|_, value| values.push(value.clone()));
+                values.sort_unstable_by(|a, b| a.labels.name.cmp(&b.labels.name));
+                Arc::new(values)
+            },
+            gauges: if let Some((_, existing)) = cached
+                .as_ref()
+                .filter(|(previous, _)| previous[1] == generation[1])
+            {
+                existing.gauges.clone()
+            } else {
+                let mut values = Vec::new();
+                self.registry
+                    .visit_gauges(|_, value| values.push(value.clone()));
+                values.sort_unstable_by(|a, b| a.labels.name.cmp(&b.labels.name));
+                Arc::new(values)
+            },
+            distributions: if let Some((_, existing)) = cached
+                .as_ref()
+                .filter(|(previous, _)| previous[2] == generation[2])
+            {
+                existing.distributions.clone()
+            } else {
+                let mut values = Vec::new();
+                self.registry
+                    .visit_histograms(|_, value| values.push(value.clone()));
+                values.sort_unstable_by(|a, b| a.labels.name.cmp(&b.labels.name));
+                Arc::new(values)
+            },
+        };
         let series = Arc::new(series);
         *cached = Some((generation, series.clone()));
         series
     }
 
     pub(crate) fn run_upkeep(&self) {
-        for value in &self.series().distributions {
+        for value in self.series().distributions.iter() {
             value.upkeep();
         }
     }
@@ -320,7 +343,7 @@ impl Recorder {
         let mut output = String::with_capacity(previous_bytes.saturating_add(previous_bytes / 8));
         let series = self.series();
         let mut previous = "";
-        for value in &series.counters {
+        for value in series.counters.iter() {
             write_header(
                 &mut output,
                 &descriptions,
@@ -333,7 +356,7 @@ impl Recorder {
                 .write(&mut output, None, None, value.value.load(Ordering::Acquire));
         }
         previous = "";
-        for value in &series.gauges {
+        for value in series.gauges.iter() {
             write_header(
                 &mut output,
                 &descriptions,
@@ -349,7 +372,7 @@ impl Recorder {
             );
         }
         previous = "";
-        for value in &series.distributions {
+        for value in series.distributions.iter() {
             write_header(
                 &mut output,
                 &descriptions,
@@ -475,6 +498,58 @@ mod tests {
             .increment(7);
         assert!(recorder.render().contains("new_requests 7\n"));
         assert!(!Arc::ptr_eq(&catalog, &recorder.series()));
+    }
+
+    #[test]
+    fn new_membership_reuses_unrelated_metric_catalogs() {
+        let recorder = Recorder::new(distributions());
+        let metadata = Metadata::new("test", metrics::Level::INFO, None);
+        let counter = recorder.register_counter(&Key::from_name("requests"), &metadata);
+        let gauge = recorder.register_gauge(&Key::from_name("active"), &metadata);
+        let histogram = recorder.register_histogram(&Key::from_name("latency"), &metadata);
+        let mut unexpected = Vec::new();
+        for kind in 0..3 {
+            let before = recorder.series();
+            match kind {
+                0 => recorder
+                    .register_counter(&Key::from_name("new_requests"), &metadata)
+                    .increment(7),
+                1 => recorder
+                    .register_gauge(&Key::from_name("new_active"), &metadata)
+                    .set(8.0),
+                _ => recorder
+                    .register_histogram(&Key::from_name("new_latency"), &metadata)
+                    .record(0.5),
+            }
+            counter.increment(1);
+            gauge.set(2.0);
+            histogram.record(0.5);
+            recorder.run_upkeep();
+            let after = recorder.series();
+            let reused = [
+                before.counters.as_ptr() == after.counters.as_ptr(),
+                before.gauges.as_ptr() == after.gauges.as_ptr(),
+                before.distributions.as_ptr() == after.distributions.as_ptr(),
+            ];
+            if reused != std::array::from_fn(|i| i != kind) {
+                unexpected.push((kind, reused));
+            }
+            let output = recorder.render();
+            assert!(output.contains(&format!("requests {}\n", kind + 1)));
+            assert!(output.contains("active 2\n"));
+            assert!(output.contains(&format!("latency_count {}\n", kind + 1)));
+            assert!(output.contains("new_requests 7\n"));
+            if kind >= 1 {
+                assert!(output.contains("new_active 8\n"));
+            }
+            if kind == 2 {
+                assert!(output.contains("new_latency_count 1\n"));
+            }
+        }
+        assert!(
+            unexpected.is_empty(),
+            "unrelated catalogs rebuilt: {unexpected:?}"
+        );
     }
 
     #[test]

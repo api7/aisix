@@ -8,6 +8,7 @@ import {
   waitConfigPropagation,
   type SpawnedApp,
 } from "../harness/index.js";
+import { metricDelta, scrapeMetrics } from "../harness/metrics.js";
 
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
@@ -86,7 +87,10 @@ test("configuration digests match the written rows through updates, rejection, d
           applied?: { config_hash: string };
           rejected: unknown[];
         };
+        const metrics = await scrapeMetrics(app!.metricsUrl);
+        const current = metrics.filter((sample) => sample.name === "aisix_config_hash_info" && sample.value === 1);
         return (
+          current.length === 1 && current[0].labels.hash === servedHash &&
           status.source.source_hash === sourceHash &&
           status.applied?.config_hash === servedHash &&
           status.rejected.length === rejected
@@ -148,6 +152,8 @@ test("configuration digests match the written rows through updates, rejection, d
 
     // Spaced updates and key deletion must publish the same final bytes
     // regardless of how many watch events the gateway groups together.
+    const beforeTraffic = await scrapeMetrics(app.metricsUrl);
+    let requests = 0;
     let writesFinished = false;
     await Promise.all([
       (async () => {
@@ -167,9 +173,16 @@ test("configuration digests match the written rows through updates, rejection, d
           expect(await scrape.text()).toContain("aisix_proxy_requests_total");
           const serving = await chatByName("hash-model-255");
           expect(serving.status, JSON.stringify(serving.body)).toBe(200);
+          requests++;
         } while (!writesFinished);
       })(),
     ]);
+    expect(requests).toBeGreaterThan(0);
+    await expect.poll(async () => {
+      const after = await scrapeMetrics(app!.metricsUrl);
+      return ["aisix_proxy_requests_total", "aisix_proxy_request_duration_seconds_count", "aisix_llm_request_duration_seconds_count"]
+        .map((name) => metricDelta(beforeTraffic, after, name, { model: "hash-model-255" }));
+    }, { timeout: 10_000, interval: 100 }).toEqual([requests, requests, requests]);
     const callerConfig = rows.get(caller)!;
     await remove(caller);
     await check();
