@@ -38,6 +38,11 @@
 //! [`crate::attempt::RoutingTelemetry`] — so no endpoint has to opt in and
 //! none of them can drift out.
 //!
+//! The cell carries one more thing for the same reason: a streamed
+//! response's access-log LINE ([`PendingAccessLog`]). Its handler returns
+//! when the head goes out, minutes before the request ends, so the line is
+//! parked here and written by whichever terminal emitter ends the request.
+//!
 //! It is kept BESIDE [`Resolved`] rather than inside it because every
 //! failed request reads `Resolved` back by value for its metric labels
 //! ([`current`]); folding a `Vec<AttemptRecord>` and a `ClientContext` into
@@ -45,6 +50,7 @@
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use aisix_core::Model;
 
@@ -208,10 +214,157 @@ pub(crate) struct CancelContext {
     pub emitted_terminal: bool,
 }
 
+/// A streamed response's access-log line, parked by its handler until the
+/// request has an outcome to report.
+///
+/// A streaming handler returns the moment the response HEAD exists — before
+/// a single frame has been polled, and often minutes before the request
+/// ends. Writing the line there is what made a stream the caller abandoned
+/// log `200` beside its own `499` usage event, and left every streamed line
+/// without the token counts and `provider_request_id` that arrive with the
+/// response (AISIX-Cloud#1571).
+///
+/// So the handler parks here the fields only it can resolve, and the line
+/// goes out beside the request's TERMINAL usage event — from
+/// [`crate::usage_attr::emit_usage`], the one point every terminal event of
+/// every family passes through. That is what makes the two agree on
+/// `status`, `error_kind` and `error` by construction rather than by each
+/// family remembering to.
+///
+/// Taking it out of the cell is also the interlock: whichever completion
+/// point gets there first emits, and the rest find nothing. A request can
+/// therefore never write two lines, however many of its terminal emitters
+/// race (see `crate::GuardPhase`).
+pub(crate) struct PendingAccessLog {
+    method: String,
+    /// Bounded route template, never the caller's raw path (#451).
+    path: String,
+    provider: String,
+    /// The model name the CALLER addressed. The dispatched target is read
+    /// off [`Resolved`] at emit time instead, exactly as the handler's own
+    /// line reads it through [`AccessLogTarget`].
+    model: String,
+    api_key_id: String,
+    request_id: String,
+    served_by_model: String,
+    routing_attempt_count: Option<u32>,
+    routing_fallback_count: Option<u32>,
+    /// The request clock, so the line can report how long the whole request
+    /// occupied the gateway — which on a stream is not what the caller
+    /// waited for (see `AccessLog::duration`).
+    started: Instant,
+}
+
+impl PendingAccessLog {
+    /// What every family can say: who called, where, and when the request
+    /// started. `started` is the REQUEST clock, not the attempt's.
+    pub(crate) fn new(
+        method: &str,
+        path: &str,
+        request_id: &str,
+        api_key_id: &str,
+        started: Instant,
+    ) -> Self {
+        Self {
+            method: method.to_string(),
+            path: path.to_string(),
+            provider: String::new(),
+            model: String::new(),
+            api_key_id: api_key_id.to_string(),
+            request_id: request_id.to_string(),
+            served_by_model: String::new(),
+            routing_attempt_count: None,
+            routing_fallback_count: None,
+            started,
+        }
+    }
+
+    /// The vendor and the model name the CALLER addressed.
+    pub(crate) fn with_model(mut self, provider: &str, model: &str) -> Self {
+        self.provider = provider.to_string();
+        self.model = model.to_string();
+        self
+    }
+
+    /// The routing summary, for the families that dispatch through a group.
+    /// Same shape their own inline line carries: the winner's display name,
+    /// and the two counts, each absent when zero.
+    pub(crate) fn with_routing(mut self, routing: &crate::attempt::RoutingTelemetry) -> Self {
+        self.served_by_model = routing
+            .winner()
+            .map(|w| w.target_model.clone())
+            .unwrap_or_default();
+        self.routing_attempt_count = match routing.attempt_count() {
+            0 => None,
+            n => Some(n),
+        };
+        self.routing_fallback_count = match routing.fallback_count() {
+            0 => None,
+            n => Some(n),
+        };
+        self
+    }
+
+    /// Write the line, taking its outcome from the terminal usage event.
+    fn emit(self, target: &Resolved, event: &aisix_obs::UsageEvent) {
+        let duration = self.started.elapsed();
+        // What the CALLER waited for, and the same figure the event
+        // reports: the first token forwarded downstream on a stream that
+        // delivered one. A stream that delivered nothing — the caller left
+        // before the first frame — has no such moment, so the line falls
+        // back to the whole request, which is all it waited for.
+        let latency = match event.downstream_latency_ms {
+            0 => duration,
+            ms => Duration::from_millis(u64::from(ms)),
+        };
+        let prompt = u64::from(event.prompt_tokens);
+        let completion = u64::from(event.completion_tokens);
+        let total = prompt + completion;
+        // Keep a token-less outcome out of the token columns entirely,
+        // rather than logging an abandoned stream as a zero-token success —
+        // the same rule the rest of this line follows for `error_kind` and
+        // `provider_request_id`.
+        let counted = total > 0;
+        aisix_obs::AccessLog {
+            method: &self.method,
+            path: &self.path,
+            status: event.status_code,
+            latency,
+            duration,
+            provider: (!self.provider.is_empty()).then_some(self.provider.as_str()),
+            model: (!self.model.is_empty()).then_some(self.model.as_str()),
+            upstream_model: (!target.upstream_model.is_empty())
+                .then_some(target.upstream_model.as_str()),
+            provider_key_id: (!target.provider_key_id.is_empty())
+                .then_some(target.provider_key_id.as_str()),
+            api_key_id: (!self.api_key_id.is_empty()).then_some(self.api_key_id.as_str()),
+            prompt_tokens: counted.then_some(prompt),
+            completion_tokens: counted.then_some(completion),
+            total_tokens: counted.then_some(total),
+            request_id: &self.request_id,
+            provider_request_id: (!event.provider_request_id.is_empty())
+                .then_some(event.provider_request_id.as_str()),
+            served_by_model: (!self.served_by_model.is_empty())
+                .then_some(self.served_by_model.as_str()),
+            routing_attempt_count: self.routing_attempt_count,
+            routing_fallback_count: self.routing_fallback_count,
+            error_kind: (!event.error_class.is_empty()).then_some(event.error_class.as_str()),
+            error: (!event.error_message.is_empty()).then_some(event.error_message.as_str()),
+            mcp: None,
+        }
+        .emit();
+    }
+}
+
 #[derive(Default)]
 struct Cell {
     resolved: Resolved,
     cancel: CancelContext,
+    /// See [`PendingAccessLog`]. `Some` only between a streaming handler
+    /// returning and the request's terminal usage event going out.
+    pending_log: Option<PendingAccessLog>,
+    /// See [`note_stream_owns_access_log`].
+    stream_owns_log: bool,
 }
 
 /// The per-request cell. Attempts within a request are sequential, so the
@@ -230,6 +383,23 @@ impl RequestAttribution {
     /// `Vec<AttemptRecord>` off every other read of this cell.
     pub(crate) fn take_cancel_context(&self) -> CancelContext {
         std::mem::take(&mut self.lock().cancel)
+    }
+
+    /// Emit the request's deferred line, if it still has one, against the
+    /// outcome `event` reports. Returns whether a line went out.
+    ///
+    /// Read through the cell handle rather than the task-local because the
+    /// cancel guard holds the handle and runs from `Drop`, outside every
+    /// scope.
+    pub(crate) fn emit_deferred_access_log(&self, event: &aisix_obs::UsageEvent) -> bool {
+        let mut cell = self.lock();
+        let Some(pending) = cell.pending_log.take() else {
+            return false;
+        };
+        let target = cell.resolved.clone();
+        drop(cell);
+        pending.emit(&target, event);
+        true
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Cell> {
@@ -476,6 +646,37 @@ pub(crate) fn note_attempt_settled(rec: &AttemptRecord) {
             c.failed_attempts.push(rec.clone());
         }
     });
+}
+
+/// Park this request's access-log line until its outcome is known. Called
+/// by a streaming handler in place of writing the line itself — see
+/// [`PendingAccessLog`].
+pub(crate) fn defer_access_log(pending: PendingAccessLog) {
+    let _ = CURRENT.try_with(|a| a.lock().pending_log = Some(pending));
+}
+
+/// Note that this request answered with a stream whose own terminal
+/// emitter will write the access-log line.
+///
+/// For the handlers that wrap their whole dispatch and log the wrapper's
+/// status (`/a2a`): the streaming branch is several frames below the tail
+/// that owns the line's fields, so it raises a flag there and the tail
+/// parks the line instead of writing it.
+pub(crate) fn note_stream_owns_access_log() {
+    let _ = CURRENT.try_with(|a| a.lock().stream_owns_log = true);
+}
+
+/// Whether [`note_stream_owns_access_log`] was raised on this request.
+pub(crate) fn stream_owns_access_log() -> bool {
+    CURRENT
+        .try_with(|a| a.lock().stream_owns_log)
+        .unwrap_or(false)
+}
+
+/// Emit the deferred line of the request running on this task, if it has
+/// one. Called from the terminal-usage-event chokepoint.
+pub(crate) fn emit_deferred_access_log(event: &aisix_obs::UsageEvent) {
+    let _ = CURRENT.try_with(|a| a.emit_deferred_access_log(event));
 }
 
 /// Note that a usage event has just left the emission chokepoint on this

@@ -5,27 +5,27 @@
 //!
 //! # When the line is written, and what that costs
 //!
-//! WHEN differs by path, and it decides which fields can be filled at all.
-//! Four cases, and only the first is "at the end of the request":
+//! Exactly one line per request, whatever the outcome — but WHEN it is
+//! written differs by path, and that decides which fields can be filled at
+//! all. Four cases:
 //!
 //! - **Non-streamed response** — from the handler, on its way out, with
 //!   everything it resolved available.
-//! - **Streamed response** — from the handler too, but when the SSE body is
-//!   handed to the server, BEFORE a single frame is polled. The upstream has
-//!   produced nothing yet, so the token counts and `provider_request_id` are
-//!   necessarily absent, and `status` is the response-OPEN status: a stream
-//!   that later aborts, or whose consumer walks away, still logged `200`.
-//!   `latency` is time-to-first-token for the same reason, NOT how long the
-//!   stream ran — the two differ by the whole length of the stream, which
-//!   for an LLM is routinely minutes. A stream's real end is only on its
-//!   `UsageEvent`; reading this line as the end of the request is how a
-//!   long-running stream gets mistaken for a connection sitting idle
-//!   (AISIX-Cloud#1394).
+//! - **Streamed response** — NOT when the SSE head is handed to the server.
+//!   The handler defers the line to the request's attribution cell
+//!   (`attribution::defer_access_log`) and it goes out beside the request's
+//!   TERMINAL usage event, at the point the stream's outcome is known:
+//!   fully consumed, abandoned mid-stream, or dropped before its first
+//!   poll. It therefore reports the same `status`, `error_kind` and `error`
+//!   as that event — a stream whose consumer walked away reads `499` /
+//!   `client_disconnected` on both — and it can carry the token counts and
+//!   `provider_request_id`, which only exist once the upstream has answered
+//!   (AISIX-Cloud#1571).
 //! - **`/v1/realtime`** — the opposite extreme. The handler returns the
 //!   WebSocket upgrade immediately; the line is written by `run_session` on
 //!   a detached task once the session closes, so it carries the close status
 //!   and the session's real token totals.
-//! - **Caller hung up before the response was delivered** — written from
+//! - **Caller hung up before the response head was written** — from
 //!   `ClientCancelGuard::drop`, with no handler involved. Status is `499`,
 //!   and the fields it can fill are the ones the request published to its
 //!   attribution cell as it resolved: `model`, `provider`, and the
@@ -33,18 +33,24 @@
 //!   handler-side figures — tokens, `provider_request_id`, the routing
 //!   counts — stay `None`, because the future was dropped before it could
 //!   produce them. Such a request also emits a `499` usage event carrying
-//!   the same identities (AISIX-Cloud#1571), keyed by this `request_id`.
-//!   Only the no-response-head case writes one: a request whose head DID go
-//!   out already has its handler's line, and a second one under a second
-//!   status would make one request read as two. That request's `499` lives
-//!   on its usage event alone.
+//!   the same identities, keyed by this `request_id`.
 //!
 //! So do not add a field whose value only exists once the upstream has
 //! responded and expect it on every line: it is silently empty on the
-//! streamed and cancelled ones. A streamed request's completion-time figures
-//! live on the per-attempt `UsageEvent` (and, for the provider response id,
-//! on the `provider call completed` line `UsageSink::try_emit` writes),
-//! keyed by the same `request_id`.
+//! cancelled ones, where the request never got that far.
+//!
+//! # `latency` and `duration` answer two different questions
+//!
+//! - `latency_ms` is what the CALLER waited for: the first token forwarded
+//!   downstream on a streamed response, the complete response on a buffered
+//!   one. It is the same figure the request's terminal `UsageEvent` reports
+//!   as `downstream_latency_ms`. Deliberately not the length of the stream
+//!   (AISIX-Cloud#1394) — reading a minutes-long stream's wait as its
+//!   time-to-first-token is what makes a working stream look like a
+//!   connection sitting idle.
+//! - `duration_ms` is how long the request occupied the gateway, arrival to
+//!   last byte out. On a non-streamed request the two coincide; on a
+//!   streamed one they differ by the whole length of the stream.
 
 use std::time::Duration;
 
@@ -58,7 +64,12 @@ pub struct AccessLog<'a> {
     pub method: &'a str,
     pub path: &'a str,
     pub status: u16,
+    /// What the caller waited for — see the module docs. On a streamed
+    /// response this is time-to-first-token, NOT how long the stream ran.
     pub latency: Duration,
+    /// How long the request occupied the gateway, arrival to last byte out.
+    /// Equal to `latency` on everything that is not streamed.
+    pub duration: Duration,
     pub provider: Option<&'a str>,
     /// The model name the CALLER addressed — for a routing group, the group
     /// itself, never the target it dispatched to. See `upstream_model`
@@ -85,13 +96,14 @@ pub struct AccessLog<'a> {
     ///
     /// `None` whenever no id exists by the time this line is written:
     /// the request never reached an upstream (guardrail block,
-    /// pre-dispatch error), it was served from cache, the endpoint's
+    /// pre-dispatch error), it was served from cache, or the endpoint's
     /// provider response carries no id at all (embeddings / audio /
-    /// images / count_tokens), or the response is **streamed** — there the
-    /// id arrives in the first frame, after this line. Streamed and
-    /// mid-stream-failed-over calls are covered instead by the per-attempt
-    /// `provider call completed` line (see `UsageSink::try_emit`), which
-    /// shares this `request_id`.
+    /// images / count_tokens). A **streamed** response does carry it —
+    /// the id arrives in the first frame and the line is written at the
+    /// stream's end (AISIX-Cloud#1571) — unless the caller walked away
+    /// before that frame. Mid-stream-failed-over calls are covered by the
+    /// per-attempt `provider call completed` line (see
+    /// `UsageSink::try_emit`), which shares this `request_id`.
     pub provider_request_id: Option<&'a str>,
     /// Routing target that ultimately served the request (the winning
     /// attempt's display name). `None` for direct models / cache hits.
@@ -147,6 +159,7 @@ impl AccessLog<'_> {
             path = self.path,
             status = self.status,
             latency_ms = self.latency.as_millis() as u64,
+            duration_ms = self.duration.as_millis() as u64,
             provider = self.provider,
             model = self.model,
             upstream_model = self.upstream_model,
@@ -220,6 +233,7 @@ mod tests {
                 path: "/v1/chat/completions",
                 status: 200,
                 latency: Duration::from_millis(42),
+                duration: Duration::from_millis(9_000),
                 provider: Some("openai"),
                 model: Some("my-gpt4"),
                 upstream_model: Some("gpt-4o"),
@@ -245,6 +259,12 @@ mod tests {
         assert!(out.contains("method=\"POST\"") || out.contains("method=POST"));
         assert!(out.contains("status=200"));
         assert!(out.contains("latency_ms=42"));
+        // AISIX-Cloud#1571: the two figures are separate fields because on
+        // a streamed line they are separate questions — what the caller
+        // waited for, and how long the request held the gateway. This one
+        // is deliberately the longer of the two, so transposing them at the
+        // emit site cannot pass.
+        assert!(out.contains("duration_ms=9000"), "{out}");
         assert!(out.contains("provider=\"openai\"") || out.contains("provider=openai"));
         assert!(out.contains("total_tokens=3"));
         assert!(out.contains("request_id=\"req-abc\"") || out.contains("request_id=req-abc"));
@@ -297,6 +317,7 @@ mod tests {
                 path: "/v1/messages",
                 status: 504,
                 latency: Duration::from_millis(7167),
+                duration: Duration::from_millis(7167),
                 provider: None,
                 model: Some("claude-sonnet-4"),
                 upstream_model: None,
@@ -349,6 +370,7 @@ mod tests {
                 path: "/v1/chat/completions",
                 status: 401,
                 latency: Duration::from_millis(1),
+                duration: Duration::from_millis(1),
                 provider: None,
                 model: None,
                 upstream_model: None,

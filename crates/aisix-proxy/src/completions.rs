@@ -910,6 +910,7 @@ fn emit_access_log(
         path: "/v1/completions",
         status,
         latency,
+        duration: latency,
         provider: Some(provider),
         model: Some(model),
         upstream_model: target.upstream_model(),
@@ -1900,5 +1901,51 @@ mod tests {
         assert_eq!(ev.guardrail_enforced_hits[0].action, "masked");
         let wire = serde_json::to_string(&ev).unwrap();
         assert!(!wire.contains("9.9.9"), "{wire}");
+    }
+
+    /// `/v1/completions` refuses `stream: true`, so it has no stream to
+    /// defer its line to and writes it where it always did — at the handler
+    /// tail. What AISIX-Cloud#1571 adds here is the second figure, and on a
+    /// buffered request the two are the same number: the caller waited for
+    /// the whole response, which is the whole request.
+    #[tokio::test]
+    async fn a_buffered_request_reports_one_line_whose_duration_is_its_latency() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-abc",
+                "object": "text_completion",
+                "created": 1_700_000_000i64,
+                "model": "gpt-3.5-turbo-instruct",
+                "choices": [{"text": " is a test", "index": 0, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 4, "total_tokens": 9}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        let capture = crate::test_log::Capture::install();
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            make_req(serde_json::json!({"model": "instruct", "prompt": "Say this"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = to_bytes(resp.into_body(), 65536).await.unwrap();
+
+        let line = capture.only("a buffered request");
+        assert_eq!(line.status(), 200);
+        assert_eq!(line.field("path").as_deref(), Some("/v1/completions"));
+        assert_eq!(
+            line.num("duration_ms"),
+            line.num("latency_ms"),
+            "nothing is streamed here, so the wait and the request are the same span",
+        );
     }
 }

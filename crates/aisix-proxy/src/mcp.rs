@@ -255,6 +255,7 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
         path: endpoint,
         status,
         latency: elapsed,
+        duration: elapsed,
         provider: Some("mcp"),
         model: None,
         upstream_model: target.upstream_model(),

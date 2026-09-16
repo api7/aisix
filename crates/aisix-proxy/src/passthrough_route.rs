@@ -314,6 +314,7 @@ pub async fn entry(
                 api_key_id,
                 status,
                 elapsed,
+                elapsed,
                 &request_id,
                 None,
                 Some(&error),
@@ -2220,6 +2221,18 @@ impl RouteTelemetry {
             &self.route_name,
             &self.api_key_id,
             self.status,
+            // Same rule as the typed streaming endpoints, and the same
+            // figure this emit puts on the usage event below: a streamed
+            // relay reports the wait to its first relayed frame, a buffered
+            // one the whole response. A relay that delivered nothing waited
+            // the whole request for nothing, which is what `elapsed` says.
+            if self.streaming {
+                self.downstream_first_ms
+                    .map(|ms| Duration::from_millis(u64::from(ms)))
+                    .unwrap_or(elapsed)
+            } else {
+                elapsed
+            },
             elapsed,
             &self.request_id,
             Some(AccessLogTokens {
@@ -2381,7 +2394,13 @@ fn emit_access_log(
     route: &str,
     api_key_id: &str,
     status: u16,
-    elapsed: Duration,
+    // What the caller waited for: the first relayed frame on a streamed
+    // relay, the whole response otherwise — the same figure the usage
+    // event reports as `downstream_latency_ms`.
+    latency: Duration,
+    // How long the relay held the gateway, arrival to last byte out. On a
+    // streamed relay the two differ by the length of the stream.
+    duration: Duration,
     request_id: &str,
     tokens: Option<AccessLogTokens>,
     error: Option<&ProxyError>,
@@ -2398,7 +2417,8 @@ fn emit_access_log(
         method: method.as_str(),
         path,
         status,
-        latency: elapsed,
+        latency,
+        duration,
         provider: Some(route),
         model: None,
         upstream_model: target.upstream_model(),

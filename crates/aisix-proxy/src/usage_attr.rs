@@ -759,6 +759,15 @@ pub(crate) fn emit_usage(
         event.error_class = crate::CLIENT_DISCONNECTED_KIND.to_string();
         event.error_message = crate::cancel::CANCELLED_MID_STREAM.to_string();
     }
+    // The request's access-log line, for the families that deferred it to
+    // their stream (AISIX-Cloud#1571). Here, and after the stamping above,
+    // so the line and the event cannot disagree about the outcome: one
+    // status, one error class, one message, whichever of a stream's three
+    // endings this is. A request that wrote its line inline — everything
+    // non-streamed — parked nothing, and this is a no-op for it.
+    if terminal {
+        crate::attribution::emit_deferred_access_log(&event);
+    }
     // Request-level guardrail blocks are recorded from the terminal event,
     // not from an individual timed execution. Some fail-closed paths (for
     // example a streamed-output buffer overflow) reject before a guardrail

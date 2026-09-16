@@ -1465,6 +1465,7 @@ impl Telemetry<'_> {
             path: &self.path,
             status,
             latency: elapsed,
+            duration: elapsed,
             provider: Some(provider).filter(|p| !p.is_empty()),
             model: Some(model_label),
             upstream_model: log_target.upstream_model(),

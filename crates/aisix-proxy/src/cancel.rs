@@ -44,8 +44,8 @@ use crate::client_ip::ClientContext;
 use crate::state::ProxyState;
 use crate::usage_attr::{self, ResolvedPk};
 
-/// `error_message` of the terminal event, and of the access-log line the
-/// guard writes beside it — one sentence, the same on both, so a row in the
+/// `error_message` of the terminal event, and of the access-log line that
+/// goes out beside it — one sentence, the same on both, so a row in the
 /// usage log can be joined to the line that explains it.
 pub(crate) const CANCELLED_BEFORE_HEAD: &str =
     "client closed the request before the response head was written";
@@ -64,11 +64,9 @@ pub(crate) const CANCELLED_MID_STREAM: &str =
 /// It is its own phase because nothing else speaks for it. A streaming
 /// family's own terminal emitter lives in a `Drop` guard built INSIDE the
 /// stream's generator, and a generator first runs on the body's first poll
-/// — so a body dropped before that emits no usage row at all
-/// (AISIX-Cloud#1571). The request's access-log line is not missing: its
-/// handler wrote one when it handed the stream over, saying `200`. This
-/// phase therefore writes the row and nothing else — a second line under a
-/// second status would make one request read as two.
+/// — so a body dropped before that emits neither the usage row nor the
+/// access-log line its handler parked on the cell (AISIX-Cloud#1571). This
+/// phase writes both, under this message.
 pub(crate) const CANCELLED_BEFORE_BODY: &str =
     "client closed the request before the response body was streamed";
 
@@ -84,8 +82,9 @@ pub(crate) enum Phase {
 }
 
 impl Phase {
-    /// The `error_message` the terminal event carries, and — on the head
-    /// phase, the one phase that writes a line — the line's too.
+    /// The `error_message` the terminal event carries, and the line's too —
+    /// the line rides that event out of [`usage_attr::emit_usage`] on the
+    /// body phase, and is built beside it on the head phase.
     pub(crate) fn message(self) -> &'static str {
         match self {
             Phase::BeforeHead => CANCELLED_BEFORE_HEAD,

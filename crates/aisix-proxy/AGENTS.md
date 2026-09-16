@@ -200,6 +200,20 @@ nothing, and nothing errors: the caller gets a correct status while the gateway
 keeps no record of the request, which is indistinguishable from the request never
 arriving.
 
+One exception, and it is the whole of it: **a STREAMED response's line is not
+the handler's to write.** Its tail runs when the head goes out, which is not
+when the request ends — so it parks the line on the attribution cell
+(`attribution::PendingAccessLog`) and the line goes out from
+`usage_attr::emit_usage` with the request's TERMINAL usage event, whichever of
+the stream's endings produced it. That is what makes the line and the row agree
+on `status`, `error_class` and `error_message` by construction; writing the line
+at the tail instead reported every abandoned stream as a `200` beside its own
+`499` row (AISIX-Cloud#1571). Two consequences for a new streaming family: park
+the line whenever the response IS a stream (a "telemetry already emitted" flag
+is NOT the same predicate — chat's buffered ensemble sets one), and make sure
+the stream really does emit a terminal usage event, because that emit is now
+the only thing that writes the line.
+
 Two shapes give up early, and both must answer through
 `reject::reject_before_dispatch` (it renders the envelope *and* emits the
 telemetry, so the two can't drift apart):

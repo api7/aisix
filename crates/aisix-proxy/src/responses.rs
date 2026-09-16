@@ -245,24 +245,39 @@ pub async fn responses(
             monitor_hits.extend(success.output_monitor_hits.clone());
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
-            emit_access_log(
-                &model_name,
-                &success.provider,
-                &api_key_id,
-                status,
-                elapsed,
-                &request_id,
-                // `None` on the streaming path — `usage` is filled by the
-                // stream's completion callback, long after this line. That
-                // case is covered by the per-attempt `provider call
-                // completed` line the usage sink emits (AISIX-Cloud#1289).
-                success
-                    .usage
-                    .as_ref()
-                    .map(|u| u.provider_request_id.as_str()),
-                &success.routing,
-                None,
-            );
+            if success.usage_handled_by_stream {
+                // A streamed response has no outcome yet: the head exists, nothing
+                // has been delivered, and whether the caller reads it to the end
+                // or walks away is minutes from being known. Park the line and
+                // let whichever terminal emitter ends the request write it, with
+                // that emitter's status, tokens and message (AISIX-Cloud#1571).
+                crate::attribution::defer_access_log(
+                    crate::attribution::PendingAccessLog::new(
+                        "POST",
+                        "/v1/responses",
+                        &request_id,
+                        &api_key_id,
+                        started,
+                    )
+                    .with_model(&success.provider, &model_name)
+                    .with_routing(&success.routing),
+                );
+            } else {
+                emit_access_log(
+                    &model_name,
+                    &success.provider,
+                    &api_key_id,
+                    status,
+                    elapsed,
+                    &request_id,
+                    success
+                        .usage
+                        .as_ref()
+                        .map(|u| u.provider_request_id.as_str()),
+                    &success.routing,
+                    None,
+                );
+            }
             // ONE ProviderKey lookup for both the metric emit and the
             // winner's usage event below (#941).
             let pk = ResolvedPk::resolve(&snapshot, &success.provider_key_id);
@@ -3809,6 +3824,7 @@ fn emit_access_log(
         path: "/v1/responses",
         status,
         latency: elapsed,
+        duration: elapsed,
         provider: Some(provider),
         model: Some(model),
         upstream_model: target.upstream_model(),
@@ -6904,5 +6920,48 @@ data: [DONE]\n\n";
         let scanned = super::responses_item_text(&item);
         assert!(scanned.contains("REASONINGSECRET"), "got {scanned:?}");
         assert!(scanned.contains("SUMMARYSECRET"), "got {scanned:?}");
+    }
+
+    /// A streamed `/v1/responses` relay writes ONE access-log line, at the
+    /// stream's end rather than when the head went out, so each of the three
+    /// endings reports its own outcome (AISIX-Cloud#1571).
+    ///
+    /// The upstream is a real chunked SSE server rather than a canned body:
+    /// this family relays BYTES, so an upstream that answers in one chunk
+    /// would hand the caller the whole stream in a single frame and the
+    /// "walked away mid-stream" ending could not happen at all.
+    #[tokio::test]
+    async fn a_streamed_relay_writes_one_line_per_stream_ending() {
+        let upstream = crate::test_log::spawn_sse_upstream(vec![
+            "event: response.output_text.delta\n\
+             data: {\"type\":\"response.output_text.delta\",\"delta\":\"a \"}\n\n"
+                .to_string(),
+            "event: response.output_text.delta\n\
+             data: {\"type\":\"response.output_text.delta\",\"delta\":\"clean answer\"}\n\n"
+                .to_string(),
+            "event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream\",\
+             \"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}\n\n"
+                .to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ])
+        .await;
+
+        let snap = new_snap_openai(&upstream);
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        let endings = crate::test_log::three_stream_endings(app, || {
+            make_req(serde_json::json!({"model":"gpt-4o-resp","input":"hi","stream":true}))
+        })
+        .await;
+        crate::test_log::assert_one_line_per_ending(&endings, "/v1/responses", "k-1");
+        crate::test_log::assert_latency_is_time_to_first_token(&endings);
+        assert_eq!(
+            endings.delivered.field("provider_request_id").as_deref(),
+            Some("resp_stream"),
+            "the id rides the terminal frame, which only the end-of-stream line can see",
+        );
     }
 }

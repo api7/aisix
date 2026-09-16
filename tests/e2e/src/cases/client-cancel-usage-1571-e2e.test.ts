@@ -42,16 +42,23 @@ const UPSTREAM_MODEL = "gpt-4o-mini";
 /** A direct model on a fast upstream, for the success-path line below. */
 const FAST_MODEL = "c1571-fast";
 const FAST_UPSTREAM_MODEL = "gpt-4o-fast";
+/** A direct model on an upstream that trickles its stream, for the
+ *  mid-stream abandon below — the head IS written there, which is the
+ *  ending the handler tail used to log as a `200`. */
+const STREAM_MODEL = "c1571-stream";
+const STREAM_UPSTREAM_MODEL = "gpt-4o-stream";
 
 describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
   let etcdReachable = false;
   let slow: OpenAiUpstream | undefined;
   let fast: OpenAiUpstream | undefined;
+  let trickle: OpenAiUpstream | undefined;
   let sls: MockSls | undefined;
   let app: SpawnedApp | undefined;
   let targetModelId = "";
   let providerKeyId = "";
   let fastProviderKeyId = "";
+  let streamProviderKeyId = "";
 
   beforeAll(async () => {
     etcdReachable = await new EtcdClient().ping();
@@ -73,6 +80,35 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
         ],
         usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
       },
+    });
+    // Half a second between events, so a caller can read the first one and
+    // abort while the rest is still coming — the mid-stream ending.
+    trickle = await startOpenAiUpstream({
+      eventDelayMs: 500,
+      streamEvents: [
+        JSON.stringify({
+          id: "chatcmpl-c1571-stream",
+          object: "chat.completion.chunk",
+          created: 1_700_000_000,
+          model: STREAM_UPSTREAM_MODEL,
+          choices: [{ index: 0, delta: { role: "assistant", content: "one" } }],
+        }),
+        JSON.stringify({
+          id: "chatcmpl-c1571-stream",
+          object: "chat.completion.chunk",
+          created: 1_700_000_000,
+          model: STREAM_UPSTREAM_MODEL,
+          choices: [{ index: 0, delta: { content: "two" } }],
+        }),
+        JSON.stringify({
+          id: "chatcmpl-c1571-stream",
+          object: "chat.completion.chunk",
+          created: 1_700_000_000,
+          model: STREAM_UPSTREAM_MODEL,
+          choices: [{ index: 0, delta: { content: "three" }, finish_reason: "stop" }],
+        }),
+        "[DONE]",
+      ],
     });
     sls = await startMockSls();
 
@@ -125,6 +161,18 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
       model_name: FAST_UPSTREAM_MODEL,
       provider_key_id: fastPk.id,
     });
+    const streamPk = await seed.createProviderKey({
+      display_name: "c1571-stream-pk",
+      secret: PROVIDER_SECRET,
+      api_base: `${trickle.baseUrl}/v1`,
+    });
+    streamProviderKeyId = streamPk.id;
+    await seed.createModel({
+      display_name: STREAM_MODEL,
+      provider: "openai",
+      model_name: STREAM_UPSTREAM_MODEL,
+      provider_key_id: streamPk.id,
+    });
     await seed.createPassthroughRoute({
       name: ROUTE,
       path_prefix: "/passthrough/c1571",
@@ -146,6 +194,7 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
     await app?.exit();
     await slow?.close();
     await fast?.close();
+    await trickle?.close();
     await sls?.close();
   });
 
@@ -317,4 +366,80 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
     expect(line).toContain(`upstream_model="${FAST_UPSTREAM_MODEL}"`);
     expect(line).toContain(`provider_key_id="${fastProviderKeyId}"`);
   });
+
+  // The other half of the same request: a caller that walks away AFTER the
+  // response head — the ordinary ending for a long stream. The row was
+  // already a 499 before this change; the LINE said 200, because the handler
+  // wrote it when it handed the stream over, minutes before the request
+  // ended. One request read as two, under two statuses, and nothing in the
+  // log said which one was the outcome.
+  test(
+    "a stream abandoned mid-flight writes exactly one line, and it says what the row says",
+    async (ctx) => {
+      if (!etcdReachable || !app || !trickle || !sls) {
+        ctx.skip();
+        return;
+      }
+      const controller = new AbortController();
+      const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: STREAM_MODEL,
+          messages: [{ role: "user", content: "start streaming" }],
+          stream: true,
+        }),
+        signal: controller.signal,
+      });
+      expect(res.status, "the head must go out — this is the mid-stream ending").toBe(200);
+      const requestId = res.headers.get("x-aisix-request-id") ?? "";
+      expect(requestId).not.toBe("");
+
+      // Read one event, then hang up with the rest still coming.
+      const reader = res.body!.getReader();
+      const first = await reader.read();
+      expect(first.done, "the stream delivered nothing to abandon").toBe(false);
+      controller.abort();
+      await reader.cancel().catch(() => {});
+
+      const row = await waitForSlsLog(
+        sls,
+        LOGSTORE,
+        (log) => log.get("request_id") === requestId,
+        `a usage row for the abandoned stream ${requestId}`,
+        20_000,
+      );
+      expect(row.get("status_code")).toBe("499");
+      expect(row.get("error_class")).toBe("client_disconnected");
+      expect(row.get("error_message")).toContain("while the response was streaming");
+
+      const lines = app
+        .output()
+        .split("\n")
+        .filter(
+          (l) => l.includes("proxy request completed") && l.includes(`request_id="${requestId}"`),
+        );
+      expect(
+        lines.length,
+        `one request, one line — got ${lines.length} for ${requestId}:\n${lines.join("\n")}`,
+      ).toBe(1);
+      const line = lines[0];
+      expect(line).toContain("status=499");
+      expect(line).toContain(`error_kind="client_disconnected"`);
+      expect(line).toContain("while the response was streaming");
+      // The target is still named — the line an operator reads to find out
+      // which upstream the abandoned call was costing them.
+      expect(line).toContain(`model="${STREAM_MODEL}"`);
+      expect(line).toContain(`upstream_model="${STREAM_UPSTREAM_MODEL}"`);
+      expect(line).toContain(`provider_key_id="${streamProviderKeyId}"`);
+      // And the two spans the line now separates: what the caller waited for
+      // (the first token) inside how long the request ran.
+      expect(line).toMatch(/\blatency_ms=\d+/);
+      expect(line).toMatch(/\bduration_ms=\d+/);
+    },
+    60_000,
+  );
 });

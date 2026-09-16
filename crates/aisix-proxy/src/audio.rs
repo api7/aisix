@@ -150,17 +150,34 @@ pub async fn transcriptions(
             // Actual status, not a hardcoded 200 — the #696 billed-then-
             // output-blocked path returns Ok(success) carrying a 422.
             let status = success.response.status().as_u16();
-            emit_access_log(
-                "POST",
-                "/v1/audio/transcriptions",
-                &success.model_name,
-                &success.provider,
-                &api_key_id,
-                status,
-                elapsed,
-                &request_id,
-                None,
-            );
+            if success.usage_handled_by_stream {
+                // A relayed transcription stream has no outcome yet — the caller may
+                // read it to the terminal event or walk away. Park the line and
+                // let the relay's own Drop emitter write it beside the usage
+                // event it already owns (AISIX-Cloud#1571).
+                crate::attribution::defer_access_log(
+                    crate::attribution::PendingAccessLog::new(
+                        "POST",
+                        "/v1/audio/transcriptions",
+                        &request_id,
+                        &api_key_id,
+                        started,
+                    )
+                    .with_model(&success.provider, &success.model_name),
+                );
+            } else {
+                emit_access_log(
+                    "POST",
+                    "/v1/audio/transcriptions",
+                    &success.model_name,
+                    &success.provider,
+                    &api_key_id,
+                    status,
+                    elapsed,
+                    &request_id,
+                    None,
+                );
+            }
             // ONE ProviderKey lookup for both terminal emits (#941).
             let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
             record_audio_metrics(
@@ -314,17 +331,34 @@ pub async fn translations(
             // Actual status, not a hardcoded 200 — the #696 billed-then-
             // output-blocked path returns Ok(success) carrying a 422.
             let status = success.response.status().as_u16();
-            emit_access_log(
-                "POST",
-                "/v1/audio/translations",
-                &success.model_name,
-                &success.provider,
-                &api_key_id,
-                status,
-                elapsed,
-                &request_id,
-                None,
-            );
+            if success.usage_handled_by_stream {
+                // A relayed transcription stream has no outcome yet — the caller may
+                // read it to the terminal event or walk away. Park the line and
+                // let the relay's own Drop emitter write it beside the usage
+                // event it already owns (AISIX-Cloud#1571).
+                crate::attribution::defer_access_log(
+                    crate::attribution::PendingAccessLog::new(
+                        "POST",
+                        "/v1/audio/translations",
+                        &request_id,
+                        &api_key_id,
+                        started,
+                    )
+                    .with_model(&success.provider, &success.model_name),
+                );
+            } else {
+                emit_access_log(
+                    "POST",
+                    "/v1/audio/translations",
+                    &success.model_name,
+                    &success.provider,
+                    &api_key_id,
+                    status,
+                    elapsed,
+                    &request_id,
+                    None,
+                );
+            }
             // ONE ProviderKey lookup for both terminal emits (#941).
             let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
             record_audio_metrics(
@@ -2263,6 +2297,7 @@ fn emit_access_log(
         path,
         status,
         latency,
+        duration: latency,
         provider: Some(provider),
         model: Some(model),
         upstream_model: target.upstream_model(),
@@ -4199,5 +4234,51 @@ data: [DONE]\n\n";
         assert_eq!(ev.guardrail_enforced_hits[0].action, "masked");
         let wire = serde_json::to_string(&ev).unwrap();
         assert!(!wire.contains("9.9.9"), "{wire}");
+    }
+
+    /// A streamed transcription relay writes ONE access-log line, at the
+    /// relay's end rather than when the head went out, so each of the three
+    /// endings reports its own outcome (AISIX-Cloud#1571).
+    ///
+    /// `latency_ms` is deliberately NOT asserted to be a time-to-first-frame
+    /// here: this relay's usage event reports the WHOLE relay as what the
+    /// caller waited for, and the line reports the same figure the event
+    /// does. Changing that would be a change to the usage event's meaning,
+    /// not to this line.
+    #[tokio::test]
+    async fn a_streamed_transcription_writes_one_line_per_stream_ending() {
+        let upstream = crate::test_log::spawn_sse_upstream(vec![
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\"hello\"}\n\n".to_string(),
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\" world\"}\n\n".to_string(),
+            "data: {\"type\":\"transcript.text.done\",\"text\":\"hello world\",\
+             \"usage\":{\"type\":\"tokens\",\"total_tokens\":38,\"input_tokens\":26,\
+             \"output_tokens\":12}}\n\n"
+                .to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ])
+        .await;
+
+        let snap = new_snap(&upstream);
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        let endings = crate::test_log::three_stream_endings(app, || {
+            let (ct, body) = streaming_transcription_multipart("my-transcribe");
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", ct)
+                .body(body)
+                .unwrap()
+        })
+        .await;
+        crate::test_log::assert_one_line_per_ending(&endings, "/v1/audio/transcriptions", "k-1");
+        assert_eq!(
+            endings.delivered.num("total_tokens"),
+            Some(38),
+            "the terminal frame's counts belong on the line that reports the relay's end",
+        );
     }
 }
