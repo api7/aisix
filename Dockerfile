@@ -109,17 +109,25 @@ ARG PGO=on
 # retrained profile at a fixed path would silently reuse stale artifacts
 # from the persistent target cache mount.
 #
-# If this ever builds for linux/arm64: jemalloc bakes the build host's
-# page size into the binary, and QEMU reports 4K — set
-# JEMALLOC_SYS_WITH_LG_PAGE=16 here or the image aborts at startup on
-# 64K-page kernels (see crates/aisix-server/src/main.rs). PGO training
-# additionally requires a native arm64 builder: an instrumented binary
-# cannot self-train under QEMU emulation.
+# linux/arm64 (AISIX-Cloud#903) carries two constraints:
+#   - jemalloc bakes the build host's page size into the binary, so a
+#     4K-page build aborts at startup on a 64K-page kernel. Building with
+#     lg-page 16 yields a binary that runs on both (see
+#     crates/aisix-server/src/main.rs). Keyed on TARGETARCH below so a
+#     plain `docker build` on an arm64 host is right too, not only CI.
+#   - PGO training runs the instrumented binary, so it needs a NATIVE
+#     arm64 builder — it cannot self-train under emulation. CI gives each
+#     architecture its own runner for that reason; do not reintroduce QEMU.
+# Supplied by BuildKit; an absent value trips `set -u` below rather than
+# silently producing a 4K-page arm64 binary.
+ARG TARGETARCH
+
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     --mount=type=cache,target=/src/target-pgo-gen \
     --mount=type=cache,target=/src/target-pgo \
     set -eu; \
+    if [ "$TARGETARCH" = "arm64" ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi; \
     mkdir -p /usr/local/share/aisix; \
     if [ "$PGO" = "on" ]; then \
         RUSTFLAGS="-Cprofile-generate=/tmp/pgo-data" CARGO_TARGET_DIR=/src/target-pgo-gen \
