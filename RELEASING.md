@@ -43,8 +43,9 @@ the image (shape count, profile size) before signing. If a release build
 fails in a PGO phase, fix the cause; never ship around it. Each architecture
 trains and asserts its own profile on its own native runner — an instrumented
 binary cannot self-train under emulation, which is why the workflow builds
-natively rather than under QEMU. To inspect a shipped image's marker (add
-`--platform` to pick the other architecture):
+natively rather than under QEMU. To inspect a shipped image's marker (the
+command runs the image, so read the other architecture's from a host of that
+architecture):
 
 ```bash
 docker run --rm --entrypoint cat ghcr.io/api7/aisix:X.Y.Z \
