@@ -39,6 +39,7 @@ use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_credential_types::Credentials;
+use aws_sdk_bedrockruntime::config::timeout::TimeoutConfig;
 use aws_sdk_bedrockruntime::config::{BehaviorVersion, Region};
 use aws_sdk_bedrockruntime::operation::apply_guardrail::{
     ApplyGuardrailError, ApplyGuardrailOutput,
@@ -156,12 +157,25 @@ impl BedrockGuardrail {
             None,
             "aisix-guardrails-bedrock",
         );
+        // The dial budget the operator configured, exactly as the
+        // provider bridge applies it. Without a `TimeoutConfig` the SDK's
+        // default plugins substitute their own 3.1s, so `upstream
+        // .connect_timeout` would reach every outbound client in the
+        // process except this one. `0` (disabled) has to be passed on
+        // explicitly, or those same plugins put the 3.1s back.
+        let mut timeouts = TimeoutConfig::builder();
+        match aisix_gateway::upstream_http::config().connect_timeout {
+            Some(d) => timeouts = timeouts.connect_timeout(d),
+            None => timeouts = timeouts.disable_connect_timeout(),
+        }
         let mut builder = aws_config::SdkConfig::builder()
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(cfg.region.clone()))
             .credentials_provider(SharedCredentialsProvider::new(creds))
+            .timeout_config(timeouts.build())
             // Same shared HTTP stack as the Bedrock provider bridge, so
-            // `upstream.tls.ca_file` covers the guardrail call too.
+            // `upstream.tls.ca_file` covers the guardrail call too, and
+            // pooled connections expire on `upstream.pool_idle_timeout`.
             .http_client(aisix_gateway::upstream_tls::aws_http_client())
             // The retry sleep_impl is needed for the SDK's built-in
             // retries; aws-config's default features set this when
@@ -1319,6 +1333,26 @@ mod tests {
     use serde_json::json;
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The guardrail's Bedrock client is the process's second AWS SDK
+    /// client, and it used to carry no `TimeoutConfig` at all — so the
+    /// SDK's default plugins quietly substituted their own 3.1s dial
+    /// budget and `upstream.connect_timeout` reached every outbound
+    /// client except this one. Nothing else notices: the call still
+    /// works, it just dials on a budget the operator never set.
+    #[test]
+    fn the_guardrail_client_dials_on_the_configured_connect_timeout() {
+        let configured = aisix_gateway::upstream_http::config().connect_timeout;
+        assert!(configured.is_some(), "the default must bound the dial");
+        let g = build_with_endpoint("http://127.0.0.1:1".into(), false);
+        assert_eq!(
+            g.client
+                .config()
+                .timeout_config()
+                .and_then(|t| t.connect_timeout()),
+            configured,
+        );
+    }
 
     fn build_with_endpoint(endpoint: String, fail_open: bool) -> BedrockGuardrail {
         BedrockGuardrail::with_endpoint(

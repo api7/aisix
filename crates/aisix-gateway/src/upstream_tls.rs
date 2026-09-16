@@ -405,8 +405,23 @@ fn root_store(tls: &TlsSettings) -> rustls::RootCertStore {
 
 // ─── AWS SDK (Bedrock) ───────────────────────────────────────────────
 
+/// The smithy builder [`aws_http_client`] starts from, carrying the
+/// shared `upstream` pool settings.
+///
+/// Split out because `build_https` returns an opaque `SharedHttpClient`:
+/// this builder is the last point at which a test can observe the value.
+/// Without the setting the SDK keeps hyper's own 90s idle lifetime —
+/// longer than a typical hop's idle timeout, which is exactly the stale
+/// pooled connection `upstream.pool_idle_timeout` exists to prevent, and
+/// which no other outbound client in the process is exposed to.
+#[cfg(feature = "aws")]
+fn aws_pooled_builder() -> aws_smithy_http_client::Builder {
+    aws_smithy_http_client::Builder::new()
+        .pool_idle_timeout(crate::upstream_http::config().pool_idle_timeout)
+}
+
 /// The HTTP client every Bedrock SDK client is built on, carrying the
-/// deployment's extra trust roots.
+/// deployment's extra trust roots and its upstream pool settings.
 ///
 /// Built once and shared: the AWS SDK otherwise constructs a connector
 /// per client, and each construction re-reads the platform trust store.
@@ -438,7 +453,7 @@ pub fn aws_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClie
                 .build()
                 .expect("TLS context from a bundle validated at boot");
 
-            aws_smithy_http_client::Builder::new()
+            aws_pooled_builder()
                 .tls_provider(tls::Provider::rustls(
                     tls::rustls_provider::CryptoMode::AwsLc,
                 ))
@@ -544,6 +559,42 @@ mod tests {
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         params.self_signed(&kp).unwrap().pem().into_bytes()
+    }
+
+    /// The Bedrock stack is the one outbound client that does not go
+    /// through `upstream_http::client_builder`, so nothing else makes it
+    /// honour `upstream.pool_idle_timeout`. Left unset it keeps hyper's
+    /// 90s idle lifetime — the value `upstream_http`'s own default guard
+    /// rejects, because it outlives a typical hop's idle timeout and the
+    /// pool then hands out connections the far end has already closed.
+    #[cfg(feature = "aws")]
+    #[test]
+    fn the_aws_builder_carries_the_configured_pool_idle_timeout() {
+        let configured = crate::upstream_http::config().pool_idle_timeout;
+        assert!(configured.is_some(), "the default must set a timeout");
+        // `Builder`'s fields are private; its derived `Debug` is the only
+        // way to read back what was applied. `None` there means the
+        // setting never reached the builder.
+        let applied = format!("{:?}", aws_pooled_builder());
+        assert!(
+            applied.contains(&format!("pool_idle_timeout: Some({:?})", configured)),
+            "the configured pool idle timeout did not reach the AWS builder: {applied}"
+        );
+        // …and the shared client must be built from that builder, not
+        // from a bare `Builder::new()` alongside it. Scoped to the
+        // function body: this test's own text mentions the helper too.
+        let src = include_str!("upstream_tls.rs");
+        let body = src
+            .split_once("pub fn aws_http_client()")
+            .expect("aws_http_client is defined in this file")
+            .1
+            .split_once("\n}\n")
+            .expect("its body ends at a top-level brace")
+            .0;
+        assert!(
+            body.contains("aws_pooled_builder()"),
+            "aws_http_client must build on `aws_pooled_builder()`: {body}"
+        );
     }
 
     #[test]
