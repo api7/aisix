@@ -564,6 +564,7 @@ mod tests {
             provider: "OpenAI".to_string(),
             upstream_model: "gpt-4o-mini".to_string(),
             provider_key_id: "pk-1".to_string(),
+            cache_hit_layer: None,
         }
     }
 

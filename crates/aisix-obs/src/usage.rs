@@ -260,6 +260,16 @@ pub struct UsageEvent {
     /// Resolved model the provider actually billed (e.g.
     /// `gpt-4o-2024-08-06` when the request said `gpt-4o`). Differs
     /// from cp-api's `model_id` which points at the dashboard alias.
+    ///
+    /// On a **cache hit** it names the model that PRODUCED the stored
+    /// body, read off the cached response rather than off this request —
+    /// the same value the row for the original call carried. That makes it
+    /// the one field on a hit that names the producer at all: a Model
+    /// Group's hit reports no target, because which of its targets wrote
+    /// the entry is recorded nowhere else (AISIX-Cloud#1571). Empty only
+    /// when the stored response carried no model name. Unlike
+    /// `provider_request_id`, which a hit deliberately leaves empty, this
+    /// is not an identifier anything reconciles against.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider_model_version: String,
 

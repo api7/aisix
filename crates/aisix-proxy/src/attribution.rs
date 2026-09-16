@@ -75,6 +75,17 @@ pub(crate) struct Resolved {
     /// it at read time, so the pair is byte-identical to the one the
     /// success path emits.
     pub provider_key_id: String,
+    /// Which cache layer answered this request, once one has — `Some`
+    /// exactly when the response came out of the cache.
+    ///
+    /// It sits beside the target fields because it is the same fact from
+    /// the other side: nothing was dispatched to BECAUSE the cache
+    /// answered. Both exits from a hit need it and only one of them can
+    /// see the cache — the output guardrail can still refuse a stored
+    /// body, and that request leaves through the handler's error branch,
+    /// which holds a `ProxyError` and no cache verdict at all
+    /// (AISIX-Cloud#1571).
+    pub cache_hit_layer: Option<&'static str>,
 }
 
 /// One upstream attempt that has begun and not yet settled.
@@ -362,6 +373,15 @@ impl PendingAccessLog {
             error_kind: (!event.error_class.is_empty()).then_some(event.error_class.as_str()),
             error: (!event.error_message.is_empty()).then_some(event.error_message.as_str()),
             mcp: None,
+            // Off the EVENT, not the cell: this emitter writes the line
+            // beside the row cp-api stores, and the two must not be able to
+            // disagree about the same request. Empty means the surface had
+            // no cache decision (`/v1/realtime`, a cancel before the gate).
+            cache: (!event.cache_status.is_empty()).then(|| aisix_obs::CacheAccessLog {
+                status: event.cache_status.as_str(),
+                hit_layer: (!event.cache_hit_layer.is_empty())
+                    .then_some(event.cache_hit_layer.as_str()),
+            }),
         }
         .emit();
     }
@@ -489,6 +509,27 @@ pub(crate) fn note_target(model: &Model, provider_key_id: &str) {
     });
 }
 
+/// Overwrite the target half with what a CACHE HIT may honestly claim.
+///
+/// A hit contacts no upstream, so nothing was dispatched to and the line
+/// must not report one. What survives is the entry's own static mapping: a
+/// DIRECT model's `model_name` and `provider_key_id` are properties of the
+/// row the caller addressed, true whether or not a request ever left the
+/// gateway. A Model Group has neither of its own, and which of its targets
+/// produced the stored entry is recorded nowhere, so its line names no
+/// target at all rather than the candidate this request happened to rank
+/// first (AISIX-Cloud#1571).
+///
+/// It OVERWRITES rather than fills, and that is the whole point: the
+/// pre-flight in [`crate::dispatch::resolve_provider_key`] runs before the
+/// cache is consulted and has already written a target for every entry
+/// that resolved to a SINGLE candidate — including a one-target routing
+/// group, whose candidate is no more the producer than any other.
+pub(crate) fn note_cache_hit_entry(entry: &Model, hit_layer: &'static str) {
+    note_target(entry, entry.provider_key_id.as_deref().unwrap_or_default());
+    with(|r| r.cache_hit_layer = Some(hit_layer));
+}
+
 /// What the current request has resolved, or `None` outside a request.
 pub(crate) fn current() -> Option<Resolved> {
     CURRENT.try_with(|a| a.get()).ok()
@@ -525,6 +566,19 @@ impl AccessLogTarget {
 
     pub(crate) fn provider_key_id(&self) -> Option<&str> {
         (!self.0.provider_key_id.is_empty()).then_some(self.0.provider_key_id.as_str())
+    }
+
+    /// The cache verdict for an emitter that has none of its own. Only a
+    /// HIT is ever recorded on the cell, so this is `None` on every other
+    /// outcome — including a miss, which the buffered success exit reports
+    /// from the verdict it holds directly.
+    pub(crate) fn cache(&self) -> Option<aisix_obs::CacheAccessLog<'_>> {
+        self.0
+            .cache_hit_layer
+            .map(|layer| aisix_obs::CacheAccessLog {
+                status: "hit",
+                hit_layer: Some(layer),
+            })
     }
 }
 
@@ -738,10 +792,70 @@ mod tests {
             // target, so that is the one the terminal emit must name.
             note_target(&model("anthropic", "claude-3-5-sonnet"), "pk-anthropic");
             let r = current().expect("in scope");
+            // Nothing but a cache hit writes this, so a dispatched request
+            // must not look like one.
+            assert_eq!(r.cache_hit_layer, None);
+            assert!(AccessLogTarget::from_resolved(r.clone()).cache().is_none());
             assert_eq!(r.requested_model, "my-group");
             assert_eq!(r.provider, "anthropic");
             assert_eq!(r.upstream_model, "claude-3-5-sonnet");
             assert_eq!(r.provider_key_id, "pk-anthropic");
+        })
+        .await;
+    }
+
+    fn group_model() -> Model {
+        serde_json::from_value(serde_json::json!({
+            "display_name": "my-group",
+            "routing": {
+                "targets": [{"model": "a"}, {"model": "b"}],
+            },
+        }))
+        .unwrap()
+    }
+
+    /// A cache hit on a GROUP must leave no target behind, even though the
+    /// pre-flight already wrote one: a routing group with a single eligible
+    /// candidate reaches `resolve_provider_key` before the cache is
+    /// consulted, and that candidate did not serve the stored answer
+    /// (AISIX-Cloud#1571).
+    #[tokio::test]
+    async fn a_group_cache_hit_erases_the_preflight_target() {
+        scope(Arc::new(RequestAttribution::default()), async {
+            note_requested_model("my-group");
+            note_target(&model("openai", "gpt-4o"), "pk-openai");
+            note_cache_hit_entry(&group_model(), "exact");
+            let r = current().expect("in scope");
+            assert_eq!(r.requested_model, "my-group");
+            assert_eq!(r.provider, "");
+            assert_eq!(r.upstream_model, "");
+            assert_eq!(r.provider_key_id, "");
+            let target = AccessLogTarget::from_resolved(r);
+            assert_eq!(target.upstream_model(), None);
+            assert_eq!(target.provider_key_id(), None);
+            // ...and the same call says WHY there is no target, for the
+            // emitters that hold a `ProxyError` and never saw the cache.
+            let cache = target.cache().expect("a hit was recorded");
+            assert_eq!(cache.status, "hit");
+            assert_eq!(cache.hit_layer, Some("exact"));
+        })
+        .await;
+    }
+
+    /// A direct entry keeps its own mapping across the same call: those
+    /// fields are properties of the row the caller addressed, not evidence
+    /// that anything was dispatched.
+    #[tokio::test]
+    async fn a_direct_cache_hit_keeps_the_entrys_own_mapping() {
+        scope(Arc::new(RequestAttribution::default()), async {
+            let direct = model("openai", "gpt-4o");
+            note_requested_model("m");
+            note_cache_hit_entry(&direct, "semantic");
+            let r = current().expect("in scope");
+            assert_eq!(r.provider, "openai");
+            assert_eq!(r.upstream_model, "gpt-4o");
+            assert_eq!(r.provider_key_id, "pk-1");
+            assert_eq!(r.cache_hit_layer, Some("semantic"));
         })
         .await;
     }

@@ -278,6 +278,7 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
         // transport awaits the handler's terminal message before returning a
         // fully-buffered body, so `dispatch` has already read the counts.
         mcp: Some(mcp_log.fields()),
+        cache: None,
     }
     .emit();
     crate::request_metrics::record(
