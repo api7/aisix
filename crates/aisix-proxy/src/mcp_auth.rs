@@ -305,6 +305,11 @@ pub(crate) async fn protected_resource_metadata(
     method: axum::http::Method,
     State(state): State<ProxyState>,
 ) -> Response {
+    // Discovery files no usage row on any outcome, and an unrecognised path
+    // normalizes to the passthrough family's own label — so it says so,
+    // rather than resting on being unauthenticated today
+    // (AISIX-Cloud#1571).
+    crate::attribution::note_unmetered_route();
     let snapshot = state.snapshot.load();
     let Some(identity) = discovery_identity(&snapshot) else {
         return StatusCode::NOT_FOUND.into_response();

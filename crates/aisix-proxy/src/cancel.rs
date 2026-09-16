@@ -20,9 +20,13 @@
 //!   `client_disconnected`, zero tokens and zero cost, naming the target
 //!   that was in flight when the caller went away.
 //!
-//! Exactly one of the two paths ever fires for a given request: the guard
-//! emits only while armed, and it is disarmed the moment the inner service
-//! yields a response.
+//! Exactly one emitter ever speaks for a given request. The guard rides the
+//! request from the middleware to the end of its response body and writes
+//! the terminal event only where nothing else can (`crate::GuardPhase`): no
+//! response head at all, or a head whose body was dropped before its first
+//! poll — the window in which a streaming family's own `Drop` emitter does
+//! not yet exist. Once the body has been polled, or once the handler has
+//! emitted its own terminal event, the guard stays silent.
 //!
 //! Two things this path deliberately does NOT carry. A cancelled request's
 //! events have no guardrail attribution (`applied_guardrails`,
@@ -53,36 +57,102 @@ pub(crate) const CANCELLED_BEFORE_HEAD: &str =
 pub(crate) const CANCELLED_MID_STREAM: &str =
     "client closed the request while the response was streaming";
 
+/// `error_message` of the third shape, between the other two: the handler
+/// produced a response head and the caller went away before the body was
+/// read even once.
+///
+/// It is its own phase because nothing else speaks for it. A streaming
+/// family's own terminal emitter lives in a `Drop` guard built INSIDE the
+/// stream's generator, and a generator first runs on the body's first poll
+/// — so a body dropped before that emits no usage row at all
+/// (AISIX-Cloud#1571). The request's access-log line is not missing: its
+/// handler wrote one when it handed the stream over, saying `200`. This
+/// phase therefore writes the row and nothing else — a second line under a
+/// second status would make one request read as two.
+pub(crate) const CANCELLED_BEFORE_BODY: &str =
+    "client closed the request before the response body was streamed";
+
+/// Which side of the response the caller left on. Chosen by the guard from
+/// how far the request had got (`crate::GuardPhase`), and the only thing
+/// that differs between the two records it can write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Phase {
+    /// No response head was ever produced.
+    BeforeHead,
+    /// The head was produced; the body was never read.
+    BeforeBody,
+}
+
+impl Phase {
+    /// The `error_message` the terminal event carries, and — on the head
+    /// phase, the one phase that writes a line — the line's too.
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Phase::BeforeHead => CANCELLED_BEFORE_HEAD,
+            Phase::BeforeBody => CANCELLED_BEFORE_BODY,
+        }
+    }
+}
+
 /// Emit a cancelled request's usage events. Called once, from
 /// `ClientCancelGuard::drop`.
 ///
-/// Silent unless the request got far enough to be worth a row: it must have
-/// authenticated AND named a model the gateway resolved. A caller that hangs
-/// up while its body is still uploading has done neither — the auth and
-/// `ClientContext` extractors run before the body one, so the api_key alone
-/// would let an aborted upload mint a row with no model and no cost, which
-/// is both unattributable and a cheap way to fill the usage log. That leaves
-/// it where the pre-dispatch rejections in [`crate::reject`] already sit,
-/// which emit no usage event either. Silent, too, for a route whose surface
-/// reports no cancel (see [`crate::operation::surface_for_endpoint`]).
+/// Silent unless the request got far enough to be ATTRIBUTABLE: it must have
+/// authenticated, and its route must be one that meters (see
+/// [`crate::operation::surface_for_endpoint`]). Those two together are the
+/// whole gate.
+///
+/// It is deliberately not "and named a model". The row exists so that every
+/// request the guard writes a `499` access-log line for can be found in the
+/// usage log by the same `request_id`, with the same picture — and three of
+/// the metering families never name a model at all (`/mcp`, `/a2a`,
+/// passthrough), while a fourth can auto-select one (the jobs surface). A
+/// caller that hangs up mid-upload therefore does file a row, with the model
+/// fields empty; what it cannot do is file an UNATTRIBUTABLE one, because
+/// the api_key is resolved before the body is read. An unauthenticated path
+/// — the health and discovery routes, a rejected credential — stays silent,
+/// where the pre-dispatch rejections in [`crate::reject`] already sit. So
+/// does a route that declared itself unmetered
+/// ([`CancelContext::unmetered`]), which it must do whenever it files no row
+/// at any outcome yet shares a label with a metering sibling.
 pub(crate) fn emit(
     state: &ProxyState,
     endpoint: &'static str,
     request_id: &str,
     resolved: &Resolved,
     ctx: CancelContext,
+    phase: Phase,
+    // The request's trace bundle, read off its extensions by the middleware
+    // — not off the `ClientContext`, which two of the metering families
+    // never build. Keeps a cancelled request's spans under the same trace
+    // its access-log line names.
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
 ) {
-    let Some(surface) = crate::operation::surface_for_endpoint(endpoint) else {
+    // What the request RESOLVED wins over what its path looks like — see
+    // [`CancelContext::surface`]; the label is right for every typed route
+    // and cannot see a passthrough route mounted anywhere else.
+    let Some(surface) = ctx
+        .surface
+        .or_else(|| crate::operation::surface_for_endpoint(endpoint))
+    else {
         return;
     };
-    let Some(client) = ctx.client.as_ref() else {
-        return;
-    };
-    if ctx.api_key_id.is_empty() || resolved.requested_model.is_empty() {
+    if ctx.api_key_id.is_empty() || ctx.unmetered {
         return;
     }
+    // `/mcp` and `/a2a` resolve their principal without this extractor, so
+    // they reach here with none — and their own events carry no source IP
+    // or user agent either, which is exactly what the default renders.
+    let client = ctx.client.clone().unwrap_or_default();
     let snap = state.snapshot.load();
-    let inbound_protocol = crate::inbound_protocol_for_endpoint(endpoint);
+    // Same reason: this family's own events state their protocol outright,
+    // and a host-matched route's path would otherwise report it as whatever
+    // typed surface the caller's path resembles.
+    let inbound_protocol = if surface == crate::operation::PASSTHROUGH {
+        "passthrough"
+    } else {
+        crate::inbound_protocol_for_endpoint(endpoint)
+    };
 
     // The attempts that had already failed. Non-terminal, exactly as the
     // handler's own emitter marks them — the terminal event below is what
@@ -107,7 +177,7 @@ pub(crate) fn emit(
             attempt_model: rec.target_model.clone(),
             error_class: rec.error_class.clone(),
             error_message: rec.error_message.clone(),
-            ..base_event(request_id, resolved, &ctx, client, inbound_protocol, &pk)
+            ..base_event(request_id, resolved, &ctx, &client, inbound_protocol, &pk)
         };
         emit_one(
             state,
@@ -115,7 +185,7 @@ pub(crate) fn emit(
             surface,
             event,
             &pk,
-            client,
+            trace,
             false,
             rec.dispatched,
         );
@@ -195,11 +265,11 @@ pub(crate) fn emit(
             .map(|a| a.target_model.to_string())
             .unwrap_or_default(),
         error_class: crate::CLIENT_DISCONNECTED_KIND.to_string(),
-        error_message: CANCELLED_BEFORE_HEAD.to_string(),
-        ..base_event(request_id, resolved, &ctx, client, inbound_protocol, &pk)
+        error_message: phase.message().to_string(),
+        ..base_event(request_id, resolved, &ctx, &client, inbound_protocol, &pk)
     };
     let dispatched = attempt.as_ref().is_some_and(|a| a.dispatched);
-    emit_one(state, &snap, surface, event, &pk, client, true, dispatched);
+    emit_one(state, &snap, surface, event, &pk, trace, true, dispatched);
 }
 
 /// The attempt the terminal event speaks for, once the two shapes that can
@@ -252,14 +322,43 @@ fn base_event(
         byo_label: crate::chat::sanitize_tag(tags.byo_label.unwrap_or_default()),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        // What a model-less family is attributed by instead of a model.
+        // Empty everywhere else, exactly as those families' own events
+        // leave the fields they do not fill.
+        passthrough_route_name: ctx.route.passthrough_route.clone(),
+        mcp_server_name: ctx.route.mcp_server.clone(),
+        mcp_tool_name: ctx.route.mcp_tool.clone(),
+        a2a_agent_name: ctx.route.a2a_agent.clone(),
+        a2a_method: ctx.route.a2a_method.clone(),
+        a2a_operation: ctx.route.a2a_operation.clone(),
         ..Default::default()
     };
-    usage_attr::apply_caller_identity(
-        &mut event,
-        client.jwt.as_ref(),
-        client.caller.user_id.as_deref(),
-        client.caller.user_name.as_deref(),
-    );
+    // The caller's identity, from the [`ClientContext`] the client-facing
+    // families resolve, or from the auth extractor alone on `/mcp` and
+    // `/a2a`, which never build one. Both read the same `api_key` row.
+    match ctx.client.as_ref() {
+        Some(client) => usage_attr::apply_caller_identity(
+            &mut event,
+            client.jwt.as_ref(),
+            client.caller.user_id.as_deref(),
+            client.caller.user_name.as_deref(),
+        ),
+        None => {
+            if let Some(auth) = ctx.auth.as_ref() {
+                usage_attr::apply_caller_identity(
+                    &mut event,
+                    auth.jwt.as_ref(),
+                    auth.key().user_id.as_deref(),
+                    auth.key().user_name.as_deref(),
+                );
+            }
+        }
+    }
+    // Anonymous traffic must not read as the principal's own here either
+    // (see `AuthenticatedKey::anonymous`).
+    if let Some(auth) = ctx.auth.as_ref() {
+        usage_attr::apply_auth_type(&mut event, auth);
+    }
     event
 }
 
@@ -277,7 +376,7 @@ fn emit_one(
     surface: crate::operation::Surface,
     event: UsageEvent,
     pk: &ResolvedPk<'_>,
-    client: &ClientContext,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
     terminal: bool,
     dispatched: bool,
 ) {
@@ -289,7 +388,7 @@ fn emit_one(
         event,
         usage_attr::usage_event_labels(&model, pk),
         None,
-        client.trace.as_ref(),
+        trace,
         terminal,
         dispatched,
     );

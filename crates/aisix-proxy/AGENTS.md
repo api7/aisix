@@ -234,6 +234,19 @@ local is correct on every path except the one nobody tests, and the symptom is a
 missing row rather than an error (AISIX-Cloud#1571, where a fallback chain's
 failed attempts lived in a `RoutingTelemetry` local).
 
+That guard's lifetime does **not** end when the handler returns: it rides the
+response body (`TelemetryBody`), because a streaming family's own terminal
+emitter is built INSIDE its `async_stream!` generator and so does not exist
+until the body's first poll — a body dropped before that emits nothing
+anywhere. Two rules follow for anything that touches the middleware's response
+handling. Keep the body's first poll observable: wrapping it in a combinator
+that hides `poll_frame` (`map_frame` sees only delivered frames, not the poll
+that returned `Pending`) hands every delivered stream a second, contradicting
+`499` row. And keep the body's **drop** inside the request's attribution scope
+(`attribution::sync_scope`): two families build their emitter outside the
+generator, so it fires on an unpolled drop, and that scope is the only reason
+the guard can see that it already spoke.
+
 ## A passthrough route that detects an envelope must observe what the typed endpoint does
 
 `passthrough_route.rs` relays bytes verbatim, but it *detects* the request
