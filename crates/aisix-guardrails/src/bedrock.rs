@@ -92,6 +92,25 @@ pub struct BedrockGuardrail {
     client: Arc<Client>,
 }
 
+/// The HTTP stack this guardrail's SDK client is built on.
+///
+/// One pool for the process is right for the gateway, which runs a
+/// single tokio runtime for as long as it lives, and wrong for this
+/// crate's test binary, where each `#[tokio::test]` owns a runtime and
+/// drops it while the process-wide pool keeps the connections spawned
+/// on it — a later test handed one gets hyper's `DispatchGone` instead
+/// of the upstream's answer. Under test, one pool per client. Same
+/// reasoning, same shape, as the Bedrock provider bridge.
+#[cfg(not(test))]
+fn sdk_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    aisix_gateway::upstream_tls::aws_http_client()
+}
+
+#[cfg(test)]
+fn sdk_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    aisix_gateway::upstream_tls::build_aws_http_client()
+}
+
 impl BedrockGuardrail {
     /// Build the dispatcher from a parsed [`BedrockConfig`]. Caller
     /// owns the row's `name`, `hook_point`, and `fail_open` (they
@@ -160,9 +179,9 @@ impl BedrockGuardrail {
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(cfg.region.clone()))
             .credentials_provider(SharedCredentialsProvider::new(creds))
-            // Same shared HTTP stack as the Bedrock provider bridge, so
+            // Same HTTP stack as the Bedrock provider bridge, so
             // `upstream.tls.ca_file` covers the guardrail call too.
-            .http_client(aisix_gateway::upstream_tls::aws_http_client())
+            .http_client(sdk_http_client())
             // The retry sleep_impl is needed for the SDK's built-in
             // retries; aws-config's default features set this when
             // the rt-tokio feature is on (see workspace Cargo.toml).

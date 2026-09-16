@@ -380,7 +380,10 @@ mod tests {
             ),
             (
                 "aws_config::SdkConfig::builder()",
-                "aws_http_client",
+                // Spelled in full: `build_aws_http_client()` contains
+                // the bare name, and it is the un-memoized builder a
+                // production call site must NOT reach.
+                "upstream_tls::aws_http_client()",
                 "Bedrock SDK clients must be built on `upstream_tls::aws_http_client()`",
             ),
             (
@@ -417,6 +420,68 @@ mod tests {
              trust:\n{}",
             offenders.join("\n"),
         );
+    }
+
+    /// A file-level scan cannot bind the rule above to the production
+    /// call site: one qualified mention of `aws_http_client()` anywhere
+    /// in the file would excuse a `cfg(not(test))` branch that reached
+    /// the un-memoized builder instead. That branch would rebuild the
+    /// connector, and re-read the platform trust store, on every Bedrock
+    /// request — `build_client` runs per call. So every CALL of the
+    /// builder must sit in a function the compiler drops from a release
+    /// build.
+    #[test]
+    fn the_uncached_aws_client_is_only_called_under_cfg_test() {
+        let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+        let mut offenders = Vec::new();
+        for file in rust_sources(crates_dir) {
+            // This file names the probe in the scan's own source; the
+            // builders it guards live in `upstream_tls`.
+            if file.ends_with("aisix-gateway/src/upstream_http.rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&file).expect("read source");
+            let lines: Vec<&str> = src.lines().collect();
+            for (n, line) in lines.iter().enumerate() {
+                let trimmed = line.trim();
+                if !trimmed.contains("build_aws_http_client()")
+                    // The declaration itself, and prose about it.
+                    || trimmed.contains("fn build_aws_http_client()")
+                    || trimmed.starts_with("//")
+                {
+                    continue;
+                }
+                if !cfg_test_gated(&lines, n) {
+                    offenders.push(format!("{}:{}", file.display(), n + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "`build_aws_http_client()` is the un-memoized constructor and must only be \
+             called from a `#[cfg(test)]` function; production calls \
+             `upstream_tls::aws_http_client()`:\n{}",
+            offenders.join("\n"),
+        );
+    }
+
+    /// Whether the function containing line `n` is `#[cfg(test)]`:
+    /// walk back to its signature, then over the attributes and doc
+    /// comments stacked above it.
+    fn cfg_test_gated(lines: &[&str], n: usize) -> bool {
+        let Some(sig) = lines[..n].iter().rposition(|l| {
+            l.trim_start().starts_with("fn ") || l.trim_start().starts_with("pub fn ")
+        }) else {
+            return false;
+        };
+        lines[..sig]
+            .iter()
+            .rev()
+            .take_while(|l| {
+                let t = l.trim();
+                t.starts_with('#') || t.starts_with("///") || t.starts_with("//")
+            })
+            .any(|l| l.trim() == "#[cfg(test)]")
     }
 
     /// The part of a source file that is not the test module.

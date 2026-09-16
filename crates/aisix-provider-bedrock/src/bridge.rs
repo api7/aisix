@@ -338,6 +338,26 @@ impl BedrockSecret {
     }
 }
 
+/// The HTTP stack every Bedrock SDK client is built on.
+///
+/// One pool for the process is right for the gateway, which runs a
+/// single tokio runtime for as long as it lives. It is wrong for this
+/// crate's test binary, where each `#[tokio::test]` owns a runtime and
+/// drops it while the process-wide pool keeps the connections that were
+/// spawned on it. A later test handed such a connection gets hyper's
+/// `DispatchGone` — "runtime dropped the dispatch task" — which arrives
+/// here as a transport error in place of whatever the upstream
+/// answered. Under test, therefore, one pool per client.
+#[cfg(not(test))]
+fn sdk_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    aisix_gateway::upstream_tls::aws_http_client()
+}
+
+#[cfg(test)]
+fn sdk_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    aisix_gateway::upstream_tls::build_aws_http_client()
+}
+
 /// Build a Bedrock SDK Client from the parsed credentials plus the
 /// optional endpoint override.
 fn build_client(
@@ -386,10 +406,11 @@ fn build_client(
         .region(Region::new(creds.region.clone()))
         .credentials_provider(SharedCredentialsProvider::new(aws_creds))
         .timeout_config(timeouts.build())
-        // Shared HTTP stack carrying `upstream.tls.ca_file`, so a
+        // The HTTP stack carrying `upstream.tls.ca_file`, so a
         // Bedrock-compatible endpoint behind a private CA is reachable
-        // on the same setting every other upstream uses.
-        .http_client(aisix_gateway::upstream_tls::aws_http_client())
+        // on the same setting every other upstream uses. Shared across
+        // the process in production; see `sdk_http_client`.
+        .http_client(sdk_http_client())
         // Retries belong to the gateway's own budget
         // (`routing::effective_retries`), which emits per-attempt telemetry
         // and honours per-model config. Left at its default the SDK would

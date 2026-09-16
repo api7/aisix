@@ -421,31 +421,44 @@ fn root_store(tls: &TlsSettings) -> rustls::RootCertStore {
 /// — is fully served by `ca_file`.
 #[cfg(feature = "aws")]
 pub fn aws_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
-    use aws_smithy_http_client::tls;
     static CLIENT: OnceLock<aws_smithy_runtime_api::client::http::SharedHttpClient> =
         OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            let tls_cfg = &crate::upstream_http::config().tls;
-            warn_unsupported_for_aws(tls_cfg);
+    CLIENT.get_or_init(build_aws_http_client).clone()
+}
 
-            let mut trust_store = tls::TrustStore::default();
-            if let Some(pem) = &tls_cfg.extra_ca_pem {
-                trust_store = trust_store.with_pem_certificate(pem.as_slice());
-            }
-            let context = tls::TlsContext::builder()
-                .with_trust_store(trust_store)
-                .build()
-                .expect("TLS context from a bundle validated at boot");
+/// The same client, built fresh and therefore carrying its own
+/// connection pool. Test harnesses only — a production call site wants
+/// [`aws_http_client`], and the outbound-TLS scan in `upstream_http`
+/// fails any file that builds an SDK client without naming it.
+///
+/// Sharing one pool is right for the gateway, which runs a single
+/// tokio runtime for the life of the process. It is wrong for a test
+/// binary, where every `#[tokio::test]` builds and drops a runtime of
+/// its own: a connection pooled under one test's runtime outlives that
+/// runtime, and reaching it again once the OS has recycled the mock
+/// server's ephemeral port fails the request with hyper's
+/// "runtime dropped the dispatch task" instead of reaching the server.
+#[cfg(feature = "aws")]
+pub fn build_aws_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    use aws_smithy_http_client::tls;
+    let tls_cfg = &crate::upstream_http::config().tls;
+    warn_unsupported_for_aws(tls_cfg);
 
-            aws_smithy_http_client::Builder::new()
-                .tls_provider(tls::Provider::rustls(
-                    tls::rustls_provider::CryptoMode::AwsLc,
-                ))
-                .tls_context(context)
-                .build_https()
-        })
-        .clone()
+    let mut trust_store = tls::TrustStore::default();
+    if let Some(pem) = &tls_cfg.extra_ca_pem {
+        trust_store = trust_store.with_pem_certificate(pem.as_slice());
+    }
+    let context = tls::TlsContext::builder()
+        .with_trust_store(trust_store)
+        .build()
+        .expect("TLS context from a bundle validated at boot");
+
+    aws_smithy_http_client::Builder::new()
+        .tls_provider(tls::Provider::rustls(
+            tls::rustls_provider::CryptoMode::AwsLc,
+        ))
+        .tls_context(context)
+        .build_https()
 }
 
 /// Say out loud which `upstream.tls` knobs the AWS SDK stack cannot
