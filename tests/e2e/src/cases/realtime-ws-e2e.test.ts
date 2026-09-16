@@ -10,6 +10,8 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   agentClaims,
   EtcdClient,
+  metricDelta,
+  scrapeMetrics,
   SeedClient,
   spawnApp,
   startMockIdp,
@@ -39,10 +41,11 @@ import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 //      upstream only when the caller asked for it. Sending it
 //      unconditionally made OpenAI's GA endpoint kill the session with
 //      `beta_api_shape_disabled`.
-//   6. The upstream dial is bounded by `upstream.connect_timeout_ms`.
-//      Only this layer can show it: the setting travels from the config
-//      file through the real binary into the one outbound stack that is
-//      not reqwest.
+//   6. The upstream dial is bounded by `upstream.connect_timeout_ms`,
+//      and the failure it produces is COUNTED. Only this layer can show
+//      either: the setting travels from the config file through the real
+//      binary into the one outbound stack that is not reqwest, and the
+//      counters are read off the real scrape.
 
 const CALLER_PLAINTEXT = "sk-realtime-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -524,6 +527,7 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     // accepted-but-silent socket indefinitely, while every other route
     // gave up at `connect_timeout_ms`.
     const wsUrl = `${app.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=realtime-e2e-silent-model`;
+    const before = await scrapeMetrics(app.metricsUrl);
     const c = new WsClient(wsUrl, {
       headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
     });
@@ -556,6 +560,24 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     // the budget would not have waited for it.
     expect(elapsed).toBeGreaterThanOrEqual(CONNECT_TIMEOUT_MS - 500);
     expect(elapsed).toBeLessThan(CONNECT_TIMEOUT_MS + 4_000);
+
+    // …and the request exists in the metrics, not only in the access log.
+    // A black-holed realtime upstream now fails promptly and repeatedly,
+    // so a session missing from these counters is a request-rate and
+    // error-rate alert that never fires.
+    const after = await scrapeMetrics(app.metricsUrl);
+    expect(
+      metricDelta(before, after, "aisix_requests_total", {
+        model: "realtime-e2e-silent-model",
+        status: "502",
+      }),
+    ).toBe(1);
+    expect(
+      metricDelta(before, after, "aisix_proxy_requests_total", {
+        endpoint: "/v1/realtime",
+        status: "502",
+      }),
+    ).toBe(1);
   });
 
   test("bad credentials reject the upgrade handshake", async (ctx) => {
