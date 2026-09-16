@@ -58,6 +58,7 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
   let etcdReachable = false;
   let soloPkId = "";
   let targetAPkId = "";
+  let singleModelId = "";
 
   /**
    * Poll the DP's captured output for this request's access-log line.
@@ -175,13 +176,15 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
     });
     // A group with ONE target still reaches the single-candidate pre-flight,
     // which is what made its hit line name a target.
-    await seed.createModel({
-      display_name: "chit-single",
-      routing: {
-        strategy: "round_robin",
-        targets: [{ model: "chit-target-a" }],
-      },
-    });
+    singleModelId = (
+      await seed.createModel({
+        display_name: "chit-single",
+        routing: {
+          strategy: "round_robin",
+          targets: [{ model: "chit-target-a" }],
+        },
+      })
+    ).id;
 
     await seed.createCachePolicy({
       name: "chit-policy",
@@ -255,6 +258,7 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
     // Snapshot AFTER the miss: the miss did dispatch through this key and
     // its event is rightly attributed to it. Only the hit is under test.
     const before = await usageEventsFor(targetAPkId);
+    const beforeUnknown = await usageEventsFor("unknown");
     const hit = await chat("chit-single", prompt);
     expect(hit.cache).toBe("hit");
 
@@ -269,7 +273,9 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
     // same fabrication: the hit must not add to the key's event count.
     await new Promise((r) => setTimeout(r, 200));
     expect(await usageEventsFor(targetAPkId)).toBe(before);
-    expect(await usageEventsFor("unknown")).toBeGreaterThan(0);
+    // ...and lands on the no-key series instead, so "did not increment
+    // pkA" cannot pass by the event going missing altogether.
+    expect(await usageEventsFor("unknown")).toBe(beforeUnknown + 1);
   });
 
   test("a group request NOT served from cache still names the target it dispatched to", async (ctx) => {
@@ -286,5 +292,48 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
     expect(field(line, "upstream_model"), line).toMatch(/^up-model-[ab]$/);
     expect(field(line, "served_by_model"), line).toMatch(/^chit-target-[ab]$/);
     expect(field(line, "provider_key_id"), line).toBeTruthy();
+  });
+
+  // LAST: this attaches an output guardrail to `chit-single`, which would
+  // block the other cases' replies if it ran before them. Model-scoped so
+  // it cannot reach `chit-solo` / `chit-pair` at all.
+  test("a cache hit BLOCKED by an output guardrail names no target either", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    const prompt = "blocked-group-hit";
+    // Cache the reply while nothing blocks it.
+    expect((await chat("chit-single", prompt)).cache).toBe("miss");
+
+    const guardrail = await seed.createGuardrail(
+      {
+        name: "chit-output-keyword",
+        enabled: true,
+        hook_point: "output",
+        kind: "keyword",
+        patterns: [{ kind: "literal", value: "reply" }],
+      },
+      { attach: false },
+    );
+    await seed.attachGuardrailToModel(guardrail.id, singleModelId);
+    // Gate on a FRESH prompt (a miss, so it dispatches) being refused.
+    await waitConfigPropagation(
+      async () =>
+        (await chat("chit-single", `blocked-probe-${Math.random()}`)).status ===
+        422,
+    );
+
+    const blocked = await chat("chit-single", prompt);
+    expect(blocked.status).toBe(422);
+
+    // The request still reached only the cache, so the pre-flight's target
+    // is no more true here than on the success exit — and this line is
+    // written by the handler's ERROR branch, which never sees the cache at
+    // all and can only read the attribution cell.
+    const line = await accessLine(blocked.requestId);
+    expect(field(line, "status"), line).toBe("422");
+    expect(field(line, "upstream_model"), line).toBeUndefined();
+    expect(field(line, "provider_key_id"), line).toBeUndefined();
   });
 });

@@ -2640,6 +2640,15 @@ async fn dispatch(
         };
         match resolved {
             Some((mut cached, hit_layer, hit_similarity)) => {
+                // The request is now answered from the cache and will
+                // contact no upstream, whichever way it exits — so correct
+                // the target attribution HERE, before the output guardrail
+                // below can return a block. Doing it at the success exit
+                // left a blocked hit reporting the target the
+                // single-candidate pre-flight had written
+                // (AISIX-Cloud#1571).
+                let entry_model = &virtual_entry.value;
+                crate::attribution::note_cache_hit_entry(entry_model);
                 reservation.commit_tokens(0).await;
                 // #448: a cache hit is client-visible output just like a
                 // fresh upstream response, so it must run output guardrails
@@ -2717,7 +2726,6 @@ async fn dispatch(
                 // (AISIX-Cloud#1571). Which target produced the entry is
                 // recorded nowhere, so a group hit reports `unknown`
                 // rather than a guess.
-                let entry_model = &virtual_entry.value;
                 let provider_label = entry_model
                     .provider
                     .as_deref()
@@ -2731,10 +2739,6 @@ async fn dispatch(
                     .upstream_model()
                     .unwrap_or("unknown")
                     .to_string();
-                // The same correction for the access-log line, which reads
-                // the attribution cell rather than this `Success` — see
-                // `note_cache_hit_entry` for why it must overwrite.
-                crate::attribution::note_cache_hit_entry(entry_model);
                 // Token-estimation fallback (AISIX-Cloud#1074): a stored
                 // response whose original upstream never reported usage
                 // replays zeros — fill them like the fresh-response path
