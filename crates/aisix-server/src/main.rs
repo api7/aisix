@@ -617,7 +617,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                     )
                 })?;
             Some(heartbeat::HeartbeatConfig::sanitised(
-                format!("{}/dp/heartbeat", cp_base.trim_end_matches('/')),
+                heartbeat::heartbeat_url(cp_base),
                 p.dp_id,
                 std::time::Duration::from_secs(cfg.managed.heartbeat_interval_secs),
                 heartbeat::MtlsBundle {
@@ -838,12 +838,9 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // + same cp_base URL host. We derive the
     // /dp/telemetry URL from the /dp/heartbeat URL by swapping the
     // path suffix so the two stay in lock-step on cp_base changes.
-    let telemetry_cfg = heartbeat_cfg.as_ref().map(|h| {
-        telemetry::TelemetryConfig::new(
-            h.url.replace("/dp/heartbeat", "/dp/telemetry"),
-            h.mtls.clone(),
-        )
-    });
+    let telemetry_cfg = heartbeat_cfg
+        .as_ref()
+        .map(|h| telemetry::TelemetryConfig::new(telemetry_url(&h.url), h.mtls.clone()));
     // Budget gate. Same on-disk mTLS bundle as heartbeat; URL is the
     // dpmgr origin (heartbeat URL minus the /dp/heartbeat suffix), the
     // BudgetClient appends /dp/budget_check itself. See prd-09b rev 2
@@ -851,11 +848,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // logs and falls back to the default disabled() (allow-all) — a
     // mid-boot config glitch shouldn't take the proxy down.
     let budget_client = heartbeat_cfg.as_ref().and_then(|h| {
-        let dpmgr_base = h
-            .url
-            .strip_suffix("/dp/heartbeat")
-            .unwrap_or(h.url.as_str())
-            .to_string();
+        let dpmgr_base = dpmgr_origin(&h.url).to_string();
         match heartbeat::build_mtls_client(&h.mtls) {
             Ok(http) => Some(Arc::new(BudgetClient::new(dpmgr_base, http))),
             Err(e) => {
@@ -1637,6 +1630,21 @@ fn default_domain_from_endpoint(endpoint: &str) -> anyhow::Result<String> {
     Ok(host.to_string())
 }
 
+/// Origin the budget gate asks cp-api on: the heartbeat URL with its
+/// path stripped back off. `BudgetClient` appends
+/// `/dp/budget_check` itself.
+fn dpmgr_origin(heartbeat_url: &str) -> &str {
+    heartbeat_url
+        .strip_suffix(heartbeat::HEARTBEAT_PATH)
+        .unwrap_or(heartbeat_url)
+}
+
+/// Telemetry URL, derived from the heartbeat URL by swapping the path
+/// suffix so the two stay in lock-step on a `cp_base_url` change.
+fn telemetry_url(heartbeat_url: &str) -> String {
+    heartbeat_url.replace(heartbeat::HEARTBEAT_PATH, telemetry::TELEMETRY_PATH)
+}
+
 /// Derive the etcd endpoint from `managed.cp_base_url` or
 /// `managed.cp_etcd_endpoint`. Returns a fully-qualified
 /// `https://<host:port>` URL for the etcd gRPC dial.
@@ -1696,7 +1704,7 @@ fn load_heartbeat_config_from_disk(
     if dp_id.is_empty() {
         anyhow::bail!("dp_id file {} is empty", managed.dp_id_file);
     }
-    let url = format!("{}/dp/heartbeat", base.trim_end_matches('/'));
+    let url = heartbeat::heartbeat_url(base);
     Ok(heartbeat::HeartbeatConfig::sanitised(
         url,
         dp_id,
@@ -3167,6 +3175,59 @@ models:
             derive_cp_etcd_url(&m).unwrap(),
             "https://dpm.example.com:7944"
         );
+    }
+
+    /// All four consumers of `managed.cp_base_url` must read the same
+    /// origin. Before AISIX-Cloud#1643 only the etcd dial attached a
+    /// scheme of its own, so a bare `host:port` connected to etcd — the
+    /// console showed the gateway healthy — while heartbeat, telemetry
+    /// and budget check each concatenated a path onto a value reqwest
+    /// cannot parse, and the budget gate's sticky-deny fallback turned
+    /// every proxied request into a 429.
+    #[test]
+    fn managed_urls_agree_on_a_scheme_less_cp_base_url() {
+        let file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+managed:
+  enabled: true
+  cp_base_url: "dpm.example.com:7944"
+"#,
+        )
+        .unwrap();
+        let cfg = aisix_core::Config::load_from_path(Some(file.path())).unwrap();
+        let base = cfg.managed.cp_base_url.as_deref().unwrap();
+
+        let hb = heartbeat::heartbeat_url(base);
+        assert_eq!(hb, "https://dpm.example.com:7944/dp/heartbeat");
+        assert_eq!(
+            telemetry_url(&hb),
+            "https://dpm.example.com:7944/dp/telemetry"
+        );
+        assert_eq!(dpmgr_origin(&hb), "https://dpm.example.com:7944");
+        assert_eq!(
+            derive_cp_etcd_url(&cfg.managed).unwrap(),
+            "https://dpm.example.com:7944"
+        );
+    }
+
+    /// A trailing slash on the base must not double up in the derived
+    /// paths — normalisation deliberately leaves it in place and the
+    /// call sites own the trimming.
+    #[test]
+    fn managed_urls_tolerate_a_trailing_slash_on_the_base() {
+        let hb = heartbeat::heartbeat_url("https://dpm.example.com:7944/");
+        assert_eq!(hb, "https://dpm.example.com:7944/dp/heartbeat");
+        assert_eq!(dpmgr_origin(&hb), "https://dpm.example.com:7944");
     }
 
     #[test]

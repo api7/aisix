@@ -207,6 +207,12 @@ pub struct ManagedConfig {
 
     /// aisix.cloud CP base URL, e.g. "https://api.us.aisix.cloud".
     /// Required for heartbeat when managed mode is enabled.
+    ///
+    /// Normalised once by [`normalise_cp_base_url`] at load, so every
+    /// consumer — heartbeat, telemetry, budget check, the etcd dial —
+    /// reads the same scheme-qualified value. A scheme-less
+    /// `host:port` is accepted and defaults to `https://`; anything
+    /// that is not an http(s) URL fails the boot.
     #[serde(default)]
     pub cp_base_url: Option<String>,
 
@@ -356,6 +362,53 @@ impl ManagedConfig {
     const fn default_heartbeat_interval_secs() -> u64 {
         15
     }
+}
+
+/// Environment variable that sets `managed.cp_base_url`. Named in the
+/// rejection so an operator who set it through the environment (the
+/// only way a container deployment can) is told which variable to fix.
+const CP_BASE_URL_ENV: &str = "AISIX_MANAGED__CP_BASE_URL";
+
+/// Give `managed.cp_base_url` a scheme once, at load, so every
+/// consumer agrees on it.
+///
+/// The etcd dial strips whatever scheme is there and re-attaches
+/// `https://`, so a scheme-less `host:port` reached etcd and the
+/// console reported the gateway healthy — while the three REST
+/// consumers (heartbeat, telemetry, budget check) concatenated a path
+/// onto a value reqwest cannot parse as a URL, failed at request
+/// build, and logged one WARN per tick. The budget gate's no-cache
+/// fallback is a sticky deny, so every proxied request answered
+/// `429 budget_exceeded` (AISIX-Cloud#1643).
+///
+/// The control plane normalises its own copy of this value by the same
+/// rule; keep the two in step.
+fn normalise_cp_base_url(raw: &str) -> Result<String, BootstrapError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(trimmed.to_string());
+    }
+    // A value that already names a scheme keeps it — including a
+    // misspelt one, which is then reported as the typo it is rather
+    // than silently prefixed into `https://htts://host`.
+    let qualified = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+    let parsed = url::Url::parse(&qualified).ok().filter(|u| {
+        matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty())
+    });
+    if parsed.is_none() {
+        return Err(BootstrapError::Config(format!(
+            "managed.cp_base_url ({CP_BASE_URL_ENV}) must be an http(s) URL such as \
+             https://dpm.example.com:7944, got {raw:?}"
+        )));
+    }
+    // Return the qualified *input*, not `Url::to_string()`: the latter
+    // appends a root path to an origin, and the call sites own their
+    // own trailing-slash handling.
+    Ok(qualified)
 }
 
 /// Default is the "unconfigured" shape (no endpoints) so a
@@ -1794,9 +1847,13 @@ impl Config {
             .build()
             .map_err(|e| BootstrapError::Config(format!("build: {e}")))?;
 
-        let cfg: Self = raw
+        let mut cfg: Self = raw
             .try_deserialize()
             .map_err(|e| BootstrapError::Config(format!("deserialize: {e}")))?;
+
+        if let Some(raw_base) = cfg.managed.cp_base_url.as_deref() {
+            cfg.managed.cp_base_url = Some(normalise_cp_base_url(raw_base)?);
+        }
 
         cfg.validate()?;
         Ok(cfg)
@@ -2545,6 +2602,140 @@ admin:
                 );
             }
         }
+    }
+
+    /// `managed.cp_base_url` reaches four consumers with two different
+    /// appetites: the etcd dial strips whatever scheme is there and
+    /// re-attaches `https://`, while heartbeat / telemetry / budget
+    /// concatenate a path onto the value verbatim. A scheme-less
+    /// `host:port` therefore used to dial etcd happily — so the console
+    /// showed the gateway connected — while every REST call failed at
+    /// request build and the budget gate's no-cache fallback turned
+    /// every proxied request into `429 budget_exceeded`
+    /// (AISIX-Cloud#1643). Normalising once at load is what keeps the
+    /// four readings identical.
+    fn load_with_cp_base_url(value: &str) -> Result<Config, BootstrapError> {
+        let f = write_yaml(&format!(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+managed:
+  enabled: true
+  cp_base_url: "{value}"
+"#
+        ));
+        Config::load_from_path(Some(f.path()))
+    }
+
+    #[test]
+    fn cp_base_url_without_a_scheme_defaults_to_https() {
+        let cfg = load_with_cp_base_url("dpm.example.com:7944").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://dpm.example.com:7944")
+        );
+        // A host with no port is just as valid a bare value.
+        let cfg = load_with_cp_base_url("dpm.example.com").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://dpm.example.com")
+        );
+        // ...as is a bare IPv4 host:port, the shape a private
+        // deployment points `controlPlane.baseURL` at.
+        let cfg = load_with_cp_base_url("127.0.0.1:7944").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://127.0.0.1:7944")
+        );
+    }
+
+    #[test]
+    fn cp_base_url_keeps_an_explicit_scheme_path_and_trailing_slash() {
+        for value in [
+            "https://dpm.example.com:7944",
+            "http://localhost:7944",
+            "https://cp.example.com/api",
+            "https://dpm.example.com:7944/",
+        ] {
+            let cfg = load_with_cp_base_url(value).unwrap();
+            assert_eq!(
+                cfg.managed.cp_base_url.as_deref(),
+                Some(value),
+                "{value} must survive the load unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn cp_base_url_is_trimmed_before_the_scheme_is_applied() {
+        let cfg = load_with_cp_base_url("  dpm.example.com:7944  ").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://dpm.example.com:7944")
+        );
+        let cfg = load_with_cp_base_url("  https://dpm.example.com:7944 ").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://dpm.example.com:7944")
+        );
+    }
+
+    #[test]
+    fn cp_base_url_rejects_a_value_that_is_not_an_http_url() {
+        // A misspelt scheme is reported as the typo it is rather than
+        // being prefixed into `https://htts://host`; a value that is no
+        // URL at all fails the same way. Both used to boot fine and
+        // then deny every request at runtime.
+        for value in [
+            "htts://dpm.example.com",
+            "not a url",
+            "ftp://dpm.example.com",
+        ] {
+            let err = load_with_cp_base_url(value)
+                .expect_err("{value} must not load")
+                .to_string();
+            assert!(
+                err.contains("AISIX_MANAGED__CP_BASE_URL"),
+                "rejection for {value:?} must name the variable to fix, got: {err}"
+            );
+            assert!(
+                err.contains(value),
+                "rejection for {value:?} must quote the offending value, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn cp_base_url_unset_or_empty_stays_that_way() {
+        // Unset means "not managed by a control plane"; an empty string
+        // is the same absence expressed by an environment that always
+        // sets the variable. Neither is a URL to validate, and the
+        // consumers already fail with their own message.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+managed:
+  enabled: true
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(cfg.managed.cp_base_url.is_none());
+
+        let cfg = load_with_cp_base_url("").unwrap();
+        assert_eq!(cfg.managed.cp_base_url.as_deref(), Some(""));
     }
 
     #[test]

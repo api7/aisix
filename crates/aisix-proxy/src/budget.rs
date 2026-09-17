@@ -342,12 +342,16 @@ struct WireBudget {
     reset_seconds: Option<Value>,
 }
 
+/// Path the budget gate asks cp-api on, under the dpmgr origin the
+/// heartbeat worker uses.
+pub const BUDGET_CHECK_PATH: &str = "/dp/budget_check";
+
 async fn fetch_decision(
     http: &reqwest::Client,
     base_url: &str,
     api_key_id: &str,
 ) -> Result<Decision, reqwest::Error> {
-    let url = format!("{base_url}/dp/budget_check");
+    let url = format!("{base_url}{BUDGET_CHECK_PATH}");
     let resp = http
         .get(url)
         .query(&[("api_key_id", api_key_id)])
@@ -410,6 +414,63 @@ mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The budget gate is handed the dpmgr origin `main` derives from
+    /// `managed.cp_base_url`. A scheme-less value used to make that
+    /// `127.0.0.1:7944/dp/budget_check`, which reqwest rejects at
+    /// request BUILD — and since a build failure is indistinguishable
+    /// from an unreachable CP, `fallback()` with no cache sticky-denies,
+    /// so every proxied request answered `429 budget_exceeded` while
+    /// etcd stayed connected and the console showed the gateway healthy
+    /// (AISIX-Cloud#1643).
+    ///
+    /// Pointing at a port nothing listens on separates the two: a
+    /// builder error means no request was formed, a connect error means
+    /// one was and only the peer was missing.
+    #[tokio::test]
+    async fn budget_check_request_is_built_from_a_scheme_less_cp_base_url() {
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            format!(
+                r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+managed:
+  enabled: true
+  cp_base_url: "127.0.0.1:{port}"
+"#
+            ),
+        )
+        .unwrap();
+        let loaded = aisix_core::Config::load_from_path(Some(file.path())).unwrap();
+        // `main` hands BudgetClient the heartbeat URL minus its path,
+        // which for a base carrying no trailing slash is the base itself.
+        let base = loaded.managed.cp_base_url.clone().unwrap();
+        assert_eq!(base, format!("https://127.0.0.1:{port}"));
+
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let err = fetch_decision(&http, &base, "ak_test")
+            .await
+            .expect_err("nothing listens on that port");
+        assert!(
+            !err.is_builder(),
+            "the budget_check request was never built: {err}"
+        );
+    }
 
     #[tokio::test]
     async fn disabled_client_always_allows() {

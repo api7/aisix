@@ -123,6 +123,21 @@ pub struct MtlsBundle {
     pub extra_ca_pem: Option<Vec<u8>>,
 }
 
+/// Path the DP POSTs a heartbeat to, under `managed.cp_base_url`. The
+/// budget gate derives its own origin by stripping this suffix back
+/// off, and the telemetry worker by swapping it for `/dp/telemetry`.
+pub const HEARTBEAT_PATH: &str = "/dp/heartbeat";
+
+/// Build the heartbeat URL from `managed.cp_base_url`.
+///
+/// Both managed boot paths (fresh provision, persisted bundle) derive
+/// it here so they cannot drift, and so a test can exercise the same
+/// derivation the binary uses. The base already carries a scheme —
+/// `aisix_core::Config` normalises it at load.
+pub fn heartbeat_url(cp_base: &str) -> String {
+    format!("{}{HEARTBEAT_PATH}", cp_base.trim_end_matches('/'))
+}
+
 /// Configuration captured at register time. `url`, `dp_id`, `interval`
 /// come from the register response (or are synthesised on bundle-on-disk
 /// boots); `mtls` points at the persisted bundle.
@@ -667,6 +682,60 @@ mod tests {
             Duration::from_millis(50),
             mtls,
         )
+    }
+
+    /// A scheme-less `managed.cp_base_url` used to produce
+    /// `127.0.0.1:7944/dp/heartbeat`, which reqwest rejects when the
+    /// request is BUILT — so the beat never left the process and the
+    /// only symptom was one WARN per interval, while etcd (which
+    /// attaches its own scheme) stayed connected and the console showed
+    /// the gateway healthy (AISIX-Cloud#1643).
+    ///
+    /// The probe is the error kind: a builder error means no request was
+    /// ever formed; a connect error means one was, and only the peer was
+    /// missing. Pointing at a port nothing listens on is what makes the
+    /// two distinguishable without a server.
+    #[tokio::test]
+    async fn heartbeat_request_is_built_from_a_scheme_less_cp_base_url() {
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            format!(
+                r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+managed:
+  enabled: true
+  cp_base_url: "127.0.0.1:{port}"
+"#
+            ),
+        )
+        .unwrap();
+        let loaded = aisix_core::Config::load_from_path(Some(file.path())).unwrap();
+        let url = heartbeat_url(loaded.managed.cp_base_url.as_deref().unwrap());
+        assert_eq!(url, format!("https://127.0.0.1:{port}/dp/heartbeat"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_bundle(url, write_test_bundle(dir.path()));
+        let err = send(&plain_client(), &cfg, 0).await.unwrap_err();
+        let source = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<reqwest::Error>())
+            .unwrap_or_else(|| panic!("expected a reqwest failure, got: {err:#}"));
+        assert!(
+            !source.is_builder(),
+            "the heartbeat request was never built: {source}"
+        );
     }
 
     fn plain_client() -> reqwest::Client {

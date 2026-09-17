@@ -19,6 +19,12 @@
 #   AISIX_MANAGED__CP_KEY_PEM=...
 #   AISIX_MANAGED__CP_CA_PEM=...
 #
+# `CP_BASE_URL` may omit the scheme — a bare `host:port` is read as
+# `https://host:port`. Set `http://` explicitly for a plaintext control
+# plane. A value that is not an http(s) URL fails the boot rather than
+# being carried into the heartbeat, telemetry and budget-check calls.
+# `CP_ETCD_ENDPOINT` is different: it is always bare `host:port`.
+#
 # Plus optionally `AISIX_PROXY__ADDR`, `AISIX_OBSERVABILITY__LOG_LEVEL`,
 # `AISIX_CACHE__BACKEND`, etc. — every config field is reachable via
 # `AISIX_<UPPER>__<UPPER>` (see crates/aisix-core/src/config.rs).
