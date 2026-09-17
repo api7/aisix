@@ -466,20 +466,24 @@ fn normalise_cp_base_url(raw: &str) -> Result<String, BootstrapError> {
     Ok(qualified)
 }
 
-/// Replace the userinfo in `qualified` with `***`, keeping the scheme,
-/// host and everything after the authority.
+/// Replace the userinfo in `value` with `***`, keeping the scheme, the
+/// host and everything after the authority. A value with no scheme is
+/// treated as a bare authority, which is the shape `cp_etcd_endpoint`
+/// arrives in.
 ///
-/// Used only by the userinfo rejection, so the operator is told which
-/// host they pointed at without the rejection logging the credential.
-fn redact_userinfo(qualified: &str) -> String {
-    let Some((scheme, rest)) = qualified.split_once("://") else {
-        return qualified.to_string();
+/// Used only by the two userinfo rejections, so the operator is told
+/// which host they pointed at without the rejection logging the
+/// credential it is rejecting them for.
+fn redact_userinfo(value: &str) -> String {
+    let (prefix, rest) = match value.split_once("://") {
+        Some((scheme, rest)) => (format!("{scheme}://"), rest),
+        None => (String::new(), value),
     };
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(authority_end);
     match authority.rfind('@') {
-        Some(at) => format!("{scheme}://***{}{tail}", &authority[at..]),
-        None => qualified.to_string(),
+        Some(at) => format!("{prefix}***{}{tail}", &authority[at..]),
+        None => value.to_string(),
     }
 }
 
@@ -524,9 +528,19 @@ fn normalise_cp_etcd_endpoint(raw: &str) -> Result<String, BootstrapError> {
             .and_then(|u| u.host_str().map(|h| !h.is_empty()))
             .unwrap_or(false);
     if !is_bare_authority {
+        // Same reasoning as the `cp_base_url` userinfo branch: an
+        // endpoint pasted from a URL that carried credentials must not
+        // have them read back into the startup log. Every other
+        // rejection here quotes the value byte for byte, because the
+        // operator needs to see what they wrote.
+        let shown = if bare.contains('@') {
+            redact_userinfo(trimmed)
+        } else {
+            raw.to_string()
+        };
         return Err(BootstrapError::Config(format!(
             "managed.cp_etcd_endpoint ({CP_ETCD_ENDPOINT_ENV}) must be a bare host:port \
-             such as etcd.example.com:7943, got {raw:?}"
+             such as etcd.example.com:7943, got {shown:?}"
         )));
     }
     Ok(bare.to_string())
@@ -2974,6 +2988,41 @@ managed:
         }
     }
 
+    /// An etcd endpoint pasted from a URL that carried credentials is
+    /// rejected — and, like its `cp_base_url` counterpart, the
+    /// rejection must not read the credential back into the startup
+    /// log it is being written to.
+    #[test]
+    fn cp_etcd_endpoint_rejects_credentials_without_echoing_them() {
+        let err = match load_with_cp_etcd_endpoint("https://user:secret@etcd.example.com:7943") {
+            Ok(cfg) => panic!(
+                "an endpoint carrying credentials must not load, got cp_etcd_endpoint = {:?}",
+                cfg.managed.cp_etcd_endpoint
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("AISIX_MANAGED__CP_ETCD_ENDPOINT"),
+            "the rejection must name the variable to fix, got: {err}"
+        );
+        assert!(
+            err.contains("***@etcd.example.com:7943"),
+            "the rejection must still show which host was named, got: {err}"
+        );
+        assert!(
+            !err.contains("secret"),
+            "the rejection must not echo the credential, got: {err}"
+        );
+
+        // The scheme-less form is the same value with the prefix the
+        // operator happened not to paste.
+        let err = load_with_cp_etcd_endpoint("user:secret@etcd.example.com:7943")
+            .expect_err("a bare authority carrying credentials must not load")
+            .to_string();
+        assert!(err.contains("***@etcd.example.com:7943"), "got: {err}");
+        assert!(!err.contains("secret"), "got: {err}");
+    }
+
     #[test]
     fn cp_etcd_endpoint_leaves_a_bare_authority_alone() {
         for value in ["etcd.example.com:7943", "[::1]:7943", "etcd.example.com"] {
@@ -2993,7 +3042,6 @@ managed:
         for value in [
             "https://etcd.example.com:7943/path",
             "etcd.example.com:7943?x=1",
-            "user@etcd.example.com:7943",
             "etcd.example.com:abc",
             "https://",
         ] {
