@@ -692,15 +692,23 @@ mod tests {
     /// the gateway healthy (AISIX-Cloud#1643).
     ///
     /// The probe is the error kind: a builder error means no request was
-    /// ever formed; a connect error means one was, and only the peer was
-    /// missing. Pointing at a port nothing listens on is what makes the
-    /// two distinguishable without a server.
+    /// ever formed, while any transport error means one was and only the
+    /// exchange failed. A peer that accepts and hangs up is what makes
+    /// the two distinguishable without standing up a control plane.
     #[tokio::test]
     async fn heartbeat_request_is_built_from_a_scheme_less_cp_base_url() {
-        let port = {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            probe.local_addr().unwrap().port()
-        };
+        // The listener is HELD for the whole test and answers by
+        // closing the connection immediately. Binding a port and
+        // dropping it would leave a window in which another process on
+        // a busy CI box takes it, and the probe below needs the peer's
+        // behaviour to be deterministic, not merely likely.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
         let file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
         std::fs::write(
             file.path(),

@@ -424,15 +424,23 @@ mod tests {
     /// etcd stayed connected and the console showed the gateway healthy
     /// (AISIX-Cloud#1643).
     ///
-    /// Pointing at a port nothing listens on separates the two: a
-    /// builder error means no request was formed, a connect error means
-    /// one was and only the peer was missing.
+    /// A peer that accepts and hangs up separates the two: a builder
+    /// error means no request was formed, any transport error means one
+    /// was and only the exchange failed.
     #[tokio::test]
     async fn budget_check_request_is_built_from_a_scheme_less_cp_base_url() {
-        let port = {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            probe.local_addr().unwrap().port()
-        };
+        // The listener is HELD for the whole test and answers by
+        // closing the connection immediately. Binding a port and
+        // dropping it would leave a window in which another process on
+        // a busy CI box takes it, and the probe below needs the peer's
+        // behaviour to be deterministic, not merely likely.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
         let file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
         std::fs::write(
             file.path(),
@@ -465,7 +473,7 @@ managed:
             .unwrap();
         let err = fetch_decision(&http, &base, "ak_test")
             .await
-            .expect_err("nothing listens on that port");
+            .expect_err("the peer hangs up without answering");
         assert!(
             !err.is_builder(),
             "the budget_check request was never built: {err}"
