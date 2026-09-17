@@ -425,11 +425,21 @@ fn normalise_cp_base_url(raw: &str) -> Result<String, BootstrapError> {
     let authority_ok = qualified
         .split_once("://")
         .is_some_and(|(_, rest)| !rest.starts_with(['/', '\\']));
-    let host_ok = url::Url::parse(&qualified)
-        .ok()
-        .and_then(|u| u.host_str().map(|h| !h.is_empty()))
-        .unwrap_or(false);
-    if !scheme_ok || !authority_ok || !host_ok {
+    // The authority must be a host, with no credentials in front of it.
+    // dp-manager authenticates a gateway by its mTLS client certificate
+    // and nothing else, so userinfo here is never meaningful — it is
+    // either a secret about to be written to the log (the heartbeat
+    // worker reports its URL at INFO and repeats it in every failed
+    // beat's WARN) or a pasted-wrong value silently pointing the
+    // gateway elsewhere, as `mailto:user@example.com` does once it is
+    // prefixed. The sibling `cp_etcd_endpoint` rejects `@` for the same
+    // reason.
+    let authority_is_host_only = url::Url::parse(&qualified).ok().is_some_and(|u| {
+        u.host_str().is_some_and(|h| !h.is_empty())
+            && u.username().is_empty()
+            && u.password().is_none()
+    });
+    if !scheme_ok || !authority_ok || !authority_is_host_only {
         return Err(BootstrapError::Config(format!(
             "managed.cp_base_url ({CP_BASE_URL_ENV}) must be an http(s) URL such as \
              https://dpm.example.com:7944, got {raw:?}"
@@ -2746,6 +2756,12 @@ managed:
             Some("https://[::1]:7944")
         );
         assert!(load_with_cp_base_url("::1:7944").is_err());
+        // An ordinary host:port is unaffected by the userinfo rule.
+        let cfg = load_with_cp_base_url("https://cp.example.com:7944").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://cp.example.com:7944")
+        );
         // A path on a scheme-less value is still scheme-less: the `:/`
         // probe must not mistake the port separator for a scheme.
         let cfg = load_with_cp_base_url("dpm.example.com:7944/path").unwrap();
@@ -2819,6 +2835,16 @@ managed:
             // A Windows-style separator is a `://` typo, and must not
             // be prefixed into a URL whose host is the literal "https".
             r"https:\\dpm.example.com",
+            // Credentials in the authority. dp-manager authenticates by
+            // mTLS alone, so these are never meaningful — and the
+            // heartbeat worker logs its URL, so accepting one would
+            // write a secret to INFO and to every failed beat's WARN.
+            "https://user:secret@dpm.example.com:7944",
+            "https://user@dpm.example.com:7944",
+            // Pasted from the wrong field: no `:/`, so the prefixed
+            // form parses to userinfo `mailto:user` with host
+            // `example.com`, and the gateway would quietly talk to it.
+            "mailto:user@example.com",
         ] {
             let err = match load_with_cp_base_url(value) {
                 Ok(cfg) => panic!(
