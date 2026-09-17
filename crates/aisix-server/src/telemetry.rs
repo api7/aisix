@@ -49,6 +49,11 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 /// request hot path.
 const QUEUE_CAPACITY: usize = 1024;
 
+/// Path the telemetry worker POSTs to, under `managed.cp_base_url`.
+/// Derived from the heartbeat URL by swapping the suffix, so the two
+/// stay in lock-step on a `cp_base_url` change.
+pub const TELEMETRY_PATH: &str = "/dp/telemetry";
+
 /// Configuration for the sender. Mirrors `HeartbeatConfig` — the URL
 /// is the absolute `/dp/telemetry` endpoint on cp-api, the bundle is
 /// the externally provisioned on-disk mTLS material, and `interval`

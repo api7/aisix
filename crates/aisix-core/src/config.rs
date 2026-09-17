@@ -207,6 +207,12 @@ pub struct ManagedConfig {
 
     /// aisix.cloud CP base URL, e.g. "https://api.us.aisix.cloud".
     /// Required for heartbeat when managed mode is enabled.
+    ///
+    /// Normalised once by [`normalise_cp_base_url`] at load, so every
+    /// consumer — heartbeat, telemetry, budget check, the etcd dial —
+    /// reads the same scheme-qualified value. A scheme-less
+    /// `host:port` is accepted and defaults to `https://`; anything
+    /// that is not an http(s) URL fails the boot.
     #[serde(default)]
     pub cp_base_url: Option<String>,
 
@@ -215,6 +221,13 @@ pub struct ManagedConfig {
     /// (prd-09a §9A.7.2) no longer ships it back, so the DP must
     /// know its etcd endpoint at boot. Bare `host:port` without
     /// scheme — the DP attaches `https://` for the gRPC dial.
+    ///
+    /// Reduced to that bare form once by
+    /// [`normalise_cp_etcd_endpoint`] at load: a leading `http://` or
+    /// `https://` and one trailing `/` are stripped, and anything that
+    /// is still not a bare `host[:port]` fails the boot. Note the
+    /// convention is the mirror image of `cp_base_url`'s, which keeps
+    /// its scheme.
     #[serde(default)]
     pub cp_etcd_endpoint: Option<String>,
 
@@ -356,6 +369,187 @@ impl ManagedConfig {
     const fn default_heartbeat_interval_secs() -> u64 {
         15
     }
+}
+
+/// Environment variable that sets `managed.cp_base_url`. Named in the
+/// rejection so an operator who set it through the environment (the
+/// only way a container deployment can) is told which variable to fix.
+const CP_BASE_URL_ENV: &str = "AISIX_MANAGED__CP_BASE_URL";
+
+/// Give `managed.cp_base_url` a scheme once, at load, so every
+/// consumer agrees on it.
+///
+/// The etcd dial strips whatever scheme is there and re-attaches
+/// `https://`, so a scheme-less `host:port` reached etcd and the
+/// console reported the gateway healthy — while the three REST
+/// consumers (heartbeat, telemetry, budget check) concatenated a path
+/// onto a value reqwest cannot parse as a URL, failed at request
+/// build, and logged one WARN per tick. The budget gate's no-cache
+/// fallback is a sticky deny, so every proxied request answered
+/// `429 budget_exceeded` (AISIX-Cloud#1643).
+///
+/// The control plane normalises its own copy of this value by the same
+/// rule; keep the two in step.
+fn normalise_cp_base_url(raw: &str) -> Result<String, BootstrapError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(trimmed.to_string());
+    }
+    // A value that already attempts a scheme keeps it, so a misspelt
+    // one is reported as the typo it is rather than prefixed into
+    // `https://htts://host`. The probe is a colon followed by either
+    // slash, not `://`: `https:/host` would otherwise become
+    // `https://https:/host` and `https:\\host` would become
+    // `https://https:\\host` — both parse to the host "https" and
+    // would have sailed through. A URL parser reads `\\` as `/`, so a
+    // Windows-style separator is an attempt at a scheme just the same.
+    let qualified = if trimmed.contains(":/") || trimmed.contains(":\\") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+    // The scheme check is a byte comparison, not `Url::scheme()`: the
+    // url crate normalises `HTTPS://host` and accepts `https:/host`,
+    // while `derive_cp_etcd_url` strips the scheme case-sensitively —
+    // so an uppercase scheme would serve the REST calls and silently
+    // break the etcd dial, the mirror image of the bug this function
+    // exists to prevent.
+    let scheme_ok = qualified.starts_with("http://") || qualified.starts_with("https://");
+    // The authority has to start immediately after `://`. A URL parser
+    // skips extra leading slashes and backslashes, so `//host` and
+    // `\\host` are prefixed into `https:////host` / `https://\\host`
+    // and still resolve to the right host for the REST calls — but
+    // `derive_cp_etcd_url` strips the scheme by byte prefix and hands
+    // the leftovers straight to the gRPC dial, which rejects them. That
+    // is this bug wearing the other mask: REST fine, etcd dead.
+    let authority_ok = qualified
+        .split_once("://")
+        .is_some_and(|(_, rest)| !rest.starts_with(['/', '\\']));
+    // The authority must be a host, with no credentials in front of it.
+    // dp-manager authenticates a gateway by its mTLS client certificate
+    // and nothing else, so userinfo here is never meaningful — it is
+    // either a secret about to be written to the log (the heartbeat
+    // worker reports its URL at INFO and repeats it in every failed
+    // beat's WARN) or a pasted-wrong value silently pointing the
+    // gateway elsewhere, as `mailto:user@example.com` does once it is
+    // prefixed. The sibling `cp_etcd_endpoint` rejects `@` for the same
+    // reason.
+    let parsed = url::Url::parse(&qualified).ok();
+    let host_ok = parsed
+        .as_ref()
+        .and_then(|u| u.host_str().map(|h| !h.is_empty()))
+        .unwrap_or(false);
+    let has_userinfo = parsed
+        .as_ref()
+        .is_some_and(|u| !u.username().is_empty() || u.password().is_some());
+    if !scheme_ok || !authority_ok || !host_ok || has_userinfo {
+        // What to quote is decided from the INPUT, never from the parse
+        // result: `https://user:secret@dpm.example.com:abc` fails on its
+        // port, so a parse-derived answer says "no userinfo here" and
+        // echoes the secret — from the branch that exists to keep it out
+        // of the log. `redact_userinfo` hands back its input untouched
+        // when the authority carries no `@`, so comparing the two covers
+        // every rejection branch at once. A value without credentials is
+        // still quoted byte for byte: the operator has to see what they
+        // wrote to fix it.
+        let redacted = redact_userinfo(&qualified);
+        let shown = if redacted == qualified {
+            raw.to_string()
+        } else {
+            redacted
+        };
+        return Err(BootstrapError::Config(format!(
+            "managed.cp_base_url ({CP_BASE_URL_ENV}) must be an http(s) URL such as \
+             https://dpm.example.com:7944, got {shown:?}"
+        )));
+    }
+    // Return the qualified *input* byte for byte, never
+    // `Url::to_string()`: the latter appends a root path to an origin
+    // and re-encodes, and the control plane must derive the same bytes
+    // from the same input. Trailing slash, path, query and case stay as
+    // typed; the call sites own their own trailing-slash handling.
+    Ok(qualified)
+}
+
+/// Replace the userinfo in `value` with `***`, keeping the scheme, the
+/// host and everything after the authority. A value with no scheme is
+/// treated as a bare authority, which is the shape `cp_etcd_endpoint`
+/// arrives in.
+///
+/// Used only by the two userinfo rejections, so the operator is told
+/// which host they pointed at without the rejection logging the
+/// credential it is rejecting them for.
+fn redact_userinfo(value: &str) -> String {
+    let (prefix, rest) = match value.split_once("://") {
+        Some((scheme, rest)) => (format!("{scheme}://"), rest),
+        None => (String::new(), value),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    match authority.rfind('@') {
+        Some(at) => format!("{prefix}***{}{tail}", &authority[at..]),
+        None => value.to_string(),
+    }
+}
+
+/// Environment variable that sets `managed.cp_etcd_endpoint`.
+const CP_ETCD_ENDPOINT_ENV: &str = "AISIX_MANAGED__CP_ETCD_ENDPOINT";
+
+/// Reduce `managed.cp_etcd_endpoint` to the bare `host[:port]` that
+/// `derive_cp_etcd_url` expects.
+///
+/// This field's convention is the mirror image of `cp_base_url`'s: the
+/// etcd dial prepends `https://` itself, so a value that already names
+/// one produced `https://https://etcd.example.com:7943`. The gRPC dial
+/// rejects that, the supervisor retries it forever, and the proxy
+/// listener never binds — with nothing in the error pointing at the
+/// variable to fix. Now that the neighbouring field accepts a scheme,
+/// writing one here too is the natural next mistake, so a leading
+/// scheme is stripped rather than left to fail at dial time.
+///
+/// Anything that is still not a bare `host[:port]` afterwards fails the
+/// boot, for the same reason `cp_base_url` does: a path or a query the
+/// dial would silently drop is a value whose author expected something
+/// this field cannot do.
+fn normalise_cp_etcd_endpoint(raw: &str) -> Result<String, BootstrapError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(trimmed.to_string());
+    }
+    // Exact lower case, matching what `derive_cp_etcd_url` strips off
+    // `cp_base_url` — an uppercase scheme here is a typo, not a value.
+    let bare = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let bare = bare.strip_suffix('/').unwrap_or(bare);
+    // `@` would smuggle userinfo into a field the dial reads as an
+    // authority, and the rest are the separators that begin a component
+    // `host[:port]` has no room for.
+    let is_bare_authority = !bare.is_empty()
+        && !bare.contains(['/', '?', '#', '@', '\\'])
+        && url::Url::parse(&format!("https://{bare}"))
+            .ok()
+            .and_then(|u| u.host_str().map(|h| !h.is_empty()))
+            .unwrap_or(false);
+    if !is_bare_authority {
+        // Same reasoning, and the same input-derived test, as the
+        // `cp_base_url` branch above: an endpoint pasted from a URL that
+        // carried credentials must not have them read back into the
+        // startup log, in any rejection branch. Everything without
+        // credentials is still quoted byte for byte.
+        let redacted = redact_userinfo(trimmed);
+        let shown = if redacted == trimmed {
+            raw.to_string()
+        } else {
+            redacted
+        };
+        return Err(BootstrapError::Config(format!(
+            "managed.cp_etcd_endpoint ({CP_ETCD_ENDPOINT_ENV}) must be a bare host:port \
+             such as etcd.example.com:7943, got {shown:?}"
+        )));
+    }
+    Ok(bare.to_string())
 }
 
 /// Default is the "unconfigured" shape (no endpoints) so a
@@ -1794,9 +1988,16 @@ impl Config {
             .build()
             .map_err(|e| BootstrapError::Config(format!("build: {e}")))?;
 
-        let cfg: Self = raw
+        let mut cfg: Self = raw
             .try_deserialize()
             .map_err(|e| BootstrapError::Config(format!("deserialize: {e}")))?;
+
+        if let Some(raw_base) = cfg.managed.cp_base_url.as_deref() {
+            cfg.managed.cp_base_url = Some(normalise_cp_base_url(raw_base)?);
+        }
+        if let Some(raw_endpoint) = cfg.managed.cp_etcd_endpoint.as_deref() {
+            cfg.managed.cp_etcd_endpoint = Some(normalise_cp_etcd_endpoint(raw_endpoint)?);
+        }
 
         cfg.validate()?;
         Ok(cfg)
@@ -2545,6 +2746,372 @@ admin:
                 );
             }
         }
+    }
+
+    /// `managed.cp_base_url` reaches four consumers with two different
+    /// appetites: the etcd dial strips whatever scheme is there and
+    /// re-attaches `https://`, while heartbeat / telemetry / budget
+    /// concatenate a path onto the value verbatim. A scheme-less
+    /// `host:port` therefore used to dial etcd happily — so the console
+    /// showed the gateway connected — while every REST call failed at
+    /// request build and the budget gate's no-cache fallback turned
+    /// every proxied request into `429 budget_exceeded`
+    /// (AISIX-Cloud#1643). Normalising once at load is what keeps the
+    /// four readings identical.
+    fn load_with_cp_base_url(value: &str) -> Result<Config, BootstrapError> {
+        let f = write_yaml(&format!(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+managed:
+  enabled: true
+  cp_base_url: "{value}"
+"#
+        ));
+        Config::load_from_path(Some(f.path()))
+    }
+
+    #[test]
+    fn cp_base_url_without_a_scheme_defaults_to_https() {
+        let cfg = load_with_cp_base_url("dpm.example.com:7944").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://dpm.example.com:7944")
+        );
+        // A host with no port is just as valid a bare value.
+        let cfg = load_with_cp_base_url("dpm.example.com").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://dpm.example.com")
+        );
+        // ...as is a bare IPv4 host:port, the shape a private
+        // deployment points `controlPlane.baseURL` at.
+        let cfg = load_with_cp_base_url("127.0.0.1:7944").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://127.0.0.1:7944")
+        );
+        // A bracketed IPv6 literal survives the prefixing; an
+        // unbracketed one is ambiguous with the port separator and is
+        // rejected, the same way the etcd endpoint parser reads it.
+        let cfg = load_with_cp_base_url("[::1]:7944").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://[::1]:7944")
+        );
+        assert!(load_with_cp_base_url("::1:7944").is_err());
+        // An ordinary host:port is unaffected by the userinfo rule.
+        let cfg = load_with_cp_base_url("https://cp.example.com:7944").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://cp.example.com:7944")
+        );
+        // A path on a scheme-less value is still scheme-less: the `:/`
+        // probe must not mistake the port separator for a scheme.
+        let cfg = load_with_cp_base_url("dpm.example.com:7944/path").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://dpm.example.com:7944/path")
+        );
+    }
+
+    #[test]
+    fn cp_base_url_keeps_an_explicit_scheme_path_and_trailing_slash() {
+        for value in [
+            "https://dpm.example.com:7944",
+            "http://localhost:7944",
+            "https://cp.example.com/api",
+            "https://dpm.example.com:7944/",
+        ] {
+            let cfg = load_with_cp_base_url(value).unwrap();
+            assert_eq!(
+                cfg.managed.cp_base_url.as_deref(),
+                Some(value),
+                "{value} must survive the load unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn cp_base_url_is_trimmed_before_the_scheme_is_applied() {
+        let cfg = load_with_cp_base_url("  dpm.example.com:7944  ").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://dpm.example.com:7944")
+        );
+        let cfg = load_with_cp_base_url("  https://dpm.example.com:7944 ").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://dpm.example.com:7944")
+        );
+    }
+
+    #[test]
+    fn cp_base_url_rejects_a_value_that_is_not_an_http_url() {
+        // Each of these used to boot fine and then deny every request
+        // at runtime. Grouped by what they get wrong:
+        //
+        // - a misspelt or non-http scheme, which must be reported as
+        //   the typo it is rather than prefixed into `https://htts://…`;
+        // - a slash count that is off, where the naive `://` probe
+        //   would have produced `https://https:/host` — a URL whose
+        //   host is "https" — and let it through;
+        // - an uppercase scheme, which the REST calls tolerate but
+        //   `derive_cp_etcd_url` strips case-sensitively, so it would
+        //   break the etcd dial instead;
+        // - the shipped placeholder left unreplaced, which can never
+        //   reach a control plane whichever way it is read;
+        // - a value that is no URL at all.
+        for value in [
+            "htts://dpm.example.com",
+            "ftp://dpm.example.com",
+            "https:/dpm.example.com:7944",
+            "https:dpm.example.com:7944",
+            "HTTPS://dpm.example.com:7944",
+            "https://<your-dp-manager>:7944",
+            "not a url",
+            // Extra leading separators: a URL parser skips them and
+            // resolves the right host, so the REST calls would work
+            // while the etcd dial — which strips the scheme by byte
+            // prefix — gets handed `https:////host` and dies.
+            "//dpm.example.com:7944",
+            r"\\dpm.example.com",
+            // A Windows-style separator is a `://` typo, and must not
+            // be prefixed into a URL whose host is the literal "https".
+            r"https:\\dpm.example.com",
+        ] {
+            let err = match load_with_cp_base_url(value) {
+                Ok(cfg) => panic!(
+                    "{value:?} must not load, got cp_base_url = {:?}",
+                    cfg.managed.cp_base_url
+                ),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("AISIX_MANAGED__CP_BASE_URL"),
+                "rejection for {value:?} must name the variable to fix, got: {err}"
+            );
+            assert!(
+                err.contains(value),
+                "rejection for {value:?} must quote the offending value, got: {err}"
+            );
+        }
+    }
+
+    /// `cp_etcd_endpoint` carries the opposite convention to
+    /// `cp_base_url`: the etcd dial prepends `https://` itself, so a
+    /// value naming a scheme produced `https://https://etcd…:7943`.
+    /// The gRPC dial rejects it, the supervisor retries forever and the
+    /// proxy listener never binds — with nothing in the error naming
+    /// the variable. Now that the neighbouring field takes a scheme,
+    /// writing one here is the natural next mistake.
+    fn load_with_cp_etcd_endpoint(value: &str) -> Result<Config, BootstrapError> {
+        let f = write_yaml(&format!(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+managed:
+  enabled: true
+  cp_base_url: "https://dpm.example.com:7944"
+  cp_etcd_endpoint: "{value}"
+"#
+        ));
+        Config::load_from_path(Some(f.path()))
+    }
+
+    /// Credentials in the authority are rejected — dp-manager
+    /// authenticates a gateway by its mTLS client certificate alone, so
+    /// userinfo is never meaningful, and the heartbeat worker reports
+    /// its URL at INFO and repeats it in every failed beat's WARN.
+    ///
+    /// The rejection therefore has to break the rule every other
+    /// rejection follows: it quotes the host but not the credential,
+    /// because echoing the value verbatim would write the secret into
+    /// the log this branch exists to keep it out of.
+    #[test]
+    fn cp_base_url_rejects_credentials_without_echoing_them() {
+        let err = match load_with_cp_base_url("https://user:secret@dpm.example.com:7944") {
+            Ok(cfg) => panic!(
+                "a URL carrying credentials must not load, got cp_base_url = {:?}",
+                cfg.managed.cp_base_url
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("AISIX_MANAGED__CP_BASE_URL"),
+            "the rejection must name the variable to fix, got: {err}"
+        );
+        assert!(
+            err.contains("***@dpm.example.com:7944"),
+            "the rejection must still show which host was named, got: {err}"
+        );
+        assert!(
+            !err.contains("secret"),
+            "the rejection must not echo the credential, got: {err}"
+        );
+
+        // The credential must not survive a rejection that fires
+        // BEFORE the userinfo check: this one fails on its port, so a
+        // parse-derived answer would report no userinfo and echo the
+        // value whole.
+        let err = load_with_cp_base_url("https://user:secret@dpm.example.com:abc")
+            .expect_err("a URL with an invalid port must not load")
+            .to_string();
+        assert!(err.contains("***@dpm.example.com:abc"), "got: {err}");
+        assert!(!err.contains("secret"), "got: {err}");
+
+        // A username with no password is the same class of value.
+        let err = load_with_cp_base_url("https://user@dpm.example.com:7944")
+            .expect_err("a URL carrying a username must not load")
+            .to_string();
+        assert!(err.contains("***@dpm.example.com:7944"), "got: {err}");
+        assert!(!err.contains("user@"), "got: {err}");
+
+        // Pasted from the wrong field: no `:/`, so the prefixed form
+        // parses to userinfo `mailto:user` with host `example.com` —
+        // a gateway quietly talking to somewhere nobody chose.
+        let err = load_with_cp_base_url("mailto:user@example.com")
+            .expect_err("a mailto: address must not load")
+            .to_string();
+        assert!(err.contains("***@example.com"), "got: {err}");
+    }
+
+    #[test]
+    fn cp_etcd_endpoint_strips_a_scheme_and_trailing_slash() {
+        for (input, expected) in [
+            ("https://etcd.example.com:7943", "etcd.example.com:7943"),
+            ("http://etcd.example.com:7943/", "etcd.example.com:7943"),
+            ("  https://etcd.example.com:7943  ", "etcd.example.com:7943"),
+        ] {
+            let cfg = load_with_cp_etcd_endpoint(input).unwrap();
+            assert_eq!(
+                cfg.managed.cp_etcd_endpoint.as_deref(),
+                Some(expected),
+                "{input} must reduce to the bare authority"
+            );
+        }
+    }
+
+    /// An etcd endpoint pasted from a URL that carried credentials is
+    /// rejected — and, like its `cp_base_url` counterpart, the
+    /// rejection must not read the credential back into the startup
+    /// log it is being written to.
+    #[test]
+    fn cp_etcd_endpoint_rejects_credentials_without_echoing_them() {
+        let err = match load_with_cp_etcd_endpoint("https://user:secret@etcd.example.com:7943") {
+            Ok(cfg) => panic!(
+                "an endpoint carrying credentials must not load, got cp_etcd_endpoint = {:?}",
+                cfg.managed.cp_etcd_endpoint
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("AISIX_MANAGED__CP_ETCD_ENDPOINT"),
+            "the rejection must name the variable to fix, got: {err}"
+        );
+        assert!(
+            err.contains("***@etcd.example.com:7943"),
+            "the rejection must still show which host was named, got: {err}"
+        );
+        assert!(
+            !err.contains("secret"),
+            "the rejection must not echo the credential, got: {err}"
+        );
+
+        // The scheme-less form is the same value with the prefix the
+        // operator happened not to paste.
+        let err = load_with_cp_etcd_endpoint("user:secret@etcd.example.com:7943")
+            .expect_err("a bare authority carrying credentials must not load")
+            .to_string();
+        assert!(err.contains("***@etcd.example.com:7943"), "got: {err}");
+        assert!(!err.contains("secret"), "got: {err}");
+
+        // And it must survive a rejection reached on a different
+        // ground — here the port, which fails the parse first.
+        let err = load_with_cp_etcd_endpoint("https://user:secret@etcd.example.com:abc")
+            .expect_err("an endpoint with an invalid port must not load")
+            .to_string();
+        assert!(err.contains("***@etcd.example.com:abc"), "got: {err}");
+        assert!(!err.contains("secret"), "got: {err}");
+    }
+
+    #[test]
+    fn cp_etcd_endpoint_leaves_a_bare_authority_alone() {
+        for value in ["etcd.example.com:7943", "[::1]:7943", "etcd.example.com"] {
+            let cfg = load_with_cp_etcd_endpoint(value).unwrap();
+            assert_eq!(
+                cfg.managed.cp_etcd_endpoint.as_deref(),
+                Some(value),
+                "{value} is already bare and must survive byte for byte"
+            );
+        }
+    }
+
+    #[test]
+    fn cp_etcd_endpoint_rejects_anything_that_is_not_a_bare_authority() {
+        // A path or a query the gRPC dial would silently drop, a port
+        // that is not a port, and a scheme with nothing behind it.
+        for value in [
+            "https://etcd.example.com:7943/path",
+            "etcd.example.com:7943?x=1",
+            "etcd.example.com:abc",
+            "https://",
+        ] {
+            let err = match load_with_cp_etcd_endpoint(value) {
+                Ok(cfg) => panic!(
+                    "{value:?} must not load, got cp_etcd_endpoint = {:?}",
+                    cfg.managed.cp_etcd_endpoint
+                ),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("AISIX_MANAGED__CP_ETCD_ENDPOINT"),
+                "rejection for {value:?} must name the variable to fix, got: {err}"
+            );
+            assert!(
+                err.contains(value),
+                "rejection for {value:?} must quote the offending value, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn cp_base_url_unset_or_empty_stays_that_way() {
+        // Unset means "not managed by a control plane"; an empty string
+        // is the same absence expressed by an environment that always
+        // sets the variable. Neither is a URL to validate, and the
+        // consumers already fail with their own message.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+managed:
+  enabled: true
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(cfg.managed.cp_base_url.is_none());
+
+        let cfg = load_with_cp_base_url("").unwrap();
+        assert_eq!(cfg.managed.cp_base_url.as_deref(), Some(""));
     }
 
     #[test]
