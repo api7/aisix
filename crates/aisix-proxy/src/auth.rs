@@ -508,6 +508,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1 << 20,
             tls: None,
+            listeners: Vec::new(),
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),

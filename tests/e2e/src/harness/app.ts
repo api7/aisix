@@ -56,6 +56,20 @@ export interface AppOverrides {
    */
   urlRewrites?: Array<{ name?: string; hosts?: string[]; match: string; rewrite: string }>;
   /**
+   * `proxy.listeners` — the COMPLETE set of proxy listeners, replacing
+   * the single `proxy.addr` one (AISIX-Cloud#1662). One harness-picked
+   * free port per entry; the bound URLs come back as
+   * `SpawnedApp.proxyUrls`, in the same order, `https://` for an entry
+   * that carries `tls`.
+   *
+   * `proxy.addr` is still written — the field stays required — and is
+   * NOT bound. At least one entry has to be plaintext: readiness and
+   * `SpawnedApp.proxyUrl` use the first one that is, and a set with no
+   * plaintext listener would leave the harness probing a port nothing
+   * serves plain HTTP on.
+   */
+  proxyListeners?: Array<{ tls?: { cert_file: string; key_file: string } }>;
+  /**
    * `proxy.request_body_limit_bytes`. A dedicated override (like
    * `realIp`) because `extra` replaces whole top-level blocks and the
    * proxy block carries the harness-picked listener addr. `0` disables
@@ -161,7 +175,17 @@ export interface AppOverrides {
 }
 
 export interface SpawnedApp {
+  /**
+   * The proxy base URL to drive. With `proxyListeners`, the first
+   * plaintext listener of the set; otherwise the single `proxy.addr`
+   * listener.
+   */
   proxyUrl: string;
+  /**
+   * Every bound proxy listener, in configured order. One element unless
+   * `proxyListeners` asked for more.
+   */
+  proxyUrls: string[];
   adminUrl: string;
   adminKey: string;
   etcdPrefix: string;
@@ -314,7 +338,16 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
       );
     }
   }
-  const [proxyPort, adminPort, metricsPort] = await pickFreePorts(3);
+  const listenerSpecs = overrides.proxyListeners;
+  if (listenerSpecs && !listenerSpecs.some((l) => l.tls === undefined)) {
+    throw new Error(
+      "spawnApp: `proxyListeners` needs at least one plaintext entry — readiness " +
+        "and `proxyUrl` use the first one, and the harness has no TLS-trusting client",
+    );
+  }
+  const [proxyPort, adminPort, metricsPort, ...listenerPorts] = await pickFreePorts(
+    3 + (listenerSpecs?.length ?? 0),
+  );
   const adminKey = overrides.adminKey ?? `admin-${randomUUID()}`;
   const etcdPrefix = overrides.etcdPrefix ?? `/aisix-e2e-${randomUUID()}`;
 
@@ -349,6 +382,14 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
         ? { thread_per_core: overrides.threadPerCore ?? suiteThreadPerCore }
         : {}),
       ...(overrides.urlRewrites ? { url_rewrites: overrides.urlRewrites } : {}),
+      ...(listenerSpecs
+        ? {
+            listeners: listenerSpecs.map((listener, i) => ({
+              addr: `127.0.0.1:${listenerPorts[i]}`,
+              ...(listener.tls ? { tls: listener.tls } : {}),
+            })),
+          }
+        : {}),
     },
     admin: adminEnabled
       ? { addr: `127.0.0.1:${adminPort}`, admin_keys: [adminKey] }
@@ -441,7 +482,16 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     });
   });
 
-  const proxyUrl = `http://127.0.0.1:${proxyPort}`;
+  const proxyUrls = listenerSpecs
+    ? listenerSpecs.map(
+        (listener, i) =>
+          `${listener.tls ? "https" : "http"}://127.0.0.1:${listenerPorts[i]}`,
+      )
+    : [`http://127.0.0.1:${proxyPort}`];
+  // `proxy.addr` is unbound once a listener set is configured, so every
+  // gate and every client the harness hands back has to speak to a
+  // listener that exists.
+  const proxyUrl = proxyUrls.find((url) => url.startsWith("http://"))!;
   const adminUrl = `http://127.0.0.1:${adminPort}`;
   const metricsUrl = `http://127.0.0.1:${metricsPort}`;
 
@@ -500,6 +550,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
 
   return {
     proxyUrl,
+    proxyUrls,
     adminUrl,
     adminKey,
     etcdPrefix,

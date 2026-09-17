@@ -570,6 +570,7 @@ mod tests {
                 addr: "127.0.0.1:0".into(),
                 request_body_limit_bytes: 1_048_576,
                 tls: None,
+                listeners: Vec::new(),
                 real_ip: Default::default(),
                 request_id: Default::default(),
                 thread_per_core: None,
