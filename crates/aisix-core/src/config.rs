@@ -390,11 +390,13 @@ fn normalise_cp_base_url(raw: &str) -> Result<String, BootstrapError> {
     }
     // A value that already attempts a scheme keeps it, so a misspelt
     // one is reported as the typo it is rather than prefixed into
-    // `https://htts://host`. The probe is `:/`, not `://`: a
-    // single-slash `https:/host` would otherwise become
-    // `https://https:/host`, which parses to the host "https" and
-    // would have sailed through.
-    let qualified = if trimmed.contains(":/") {
+    // `https://htts://host`. The probe is a colon followed by either
+    // slash, not `://`: `https:/host` would otherwise become
+    // `https://https:/host` and `https:\\host` would become
+    // `https://https:\\host` — both parse to the host "https" and
+    // would have sailed through. A URL parser reads `\\` as `/`, so a
+    // Windows-style separator is an attempt at a scheme just the same.
+    let qualified = if trimmed.contains(":/") || trimmed.contains(":\\") {
         trimmed.to_string()
     } else {
         format!("https://{trimmed}")
@@ -406,11 +408,21 @@ fn normalise_cp_base_url(raw: &str) -> Result<String, BootstrapError> {
     // break the etcd dial, the mirror image of the bug this function
     // exists to prevent.
     let scheme_ok = qualified.starts_with("http://") || qualified.starts_with("https://");
+    // The authority has to start immediately after `://`. A URL parser
+    // skips extra leading slashes and backslashes, so `//host` and
+    // `\\host` are prefixed into `https:////host` / `https://\\host`
+    // and still resolve to the right host for the REST calls — but
+    // `derive_cp_etcd_url` strips the scheme by byte prefix and hands
+    // the leftovers straight to the gRPC dial, which rejects them. That
+    // is this bug wearing the other mask: REST fine, etcd dead.
+    let authority_ok = qualified
+        .split_once("://")
+        .is_some_and(|(_, rest)| !rest.starts_with(['/', '\\']));
     let host_ok = url::Url::parse(&qualified)
         .ok()
         .and_then(|u| u.host_str().map(|h| !h.is_empty()))
         .unwrap_or(false);
-    if !scheme_ok || !host_ok {
+    if !scheme_ok || !authority_ok || !host_ok {
         return Err(BootstrapError::Config(format!(
             "managed.cp_base_url ({CP_BASE_URL_ENV}) must be an http(s) URL such as \
              https://dpm.example.com:7944, got {raw:?}"
@@ -2739,6 +2751,15 @@ managed:
             "HTTPS://dpm.example.com:7944",
             "https://<your-dp-manager>:7944",
             "not a url",
+            // Extra leading separators: a URL parser skips them and
+            // resolves the right host, so the REST calls would work
+            // while the etcd dial — which strips the scheme by byte
+            // prefix — gets handed `https:////host` and dies.
+            "//dpm.example.com:7944",
+            r"\\dpm.example.com",
+            // A Windows-style separator is a `://` typo, and must not
+            // be prefixed into a URL whose host is the literal "https".
+            r"https:\\dpm.example.com",
         ] {
             let err = match load_with_cp_base_url(value) {
                 Ok(cfg) => panic!(

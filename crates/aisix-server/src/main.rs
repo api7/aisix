@@ -1641,8 +1641,18 @@ fn dpmgr_origin(heartbeat_url: &str) -> &str {
 
 /// Telemetry URL, derived from the heartbeat URL by swapping the path
 /// suffix so the two stay in lock-step on a `cp_base_url` change.
+///
+/// Built on `dpmgr_origin` rather than a `replace`, so the two
+/// derivations cannot read one base differently: a replace rewrites
+/// every occurrence, and a base that itself ends in `/dp/heartbeat`
+/// would then yield `…/dp/telemetry/dp/telemetry` while the budget
+/// gate's suffix strip left the origin alone.
 fn telemetry_url(heartbeat_url: &str) -> String {
-    heartbeat_url.replace(heartbeat::HEARTBEAT_PATH, telemetry::TELEMETRY_PATH)
+    format!(
+        "{}{}",
+        dpmgr_origin(heartbeat_url),
+        telemetry::TELEMETRY_PATH
+    )
 }
 
 /// Derive the etcd endpoint from `managed.cp_base_url` or
@@ -3228,6 +3238,31 @@ managed:
         let hb = heartbeat::heartbeat_url("https://dpm.example.com:7944/");
         assert_eq!(hb, "https://dpm.example.com:7944/dp/heartbeat");
         assert_eq!(dpmgr_origin(&hb), "https://dpm.example.com:7944");
+    }
+
+    /// A base carrying a path is accepted (the shipped managed example
+    /// uses one), and the three derivations must still agree on it. The
+    /// telemetry URL is the one that can drift: derived by rewriting
+    /// every `/dp/heartbeat` it finds, a base ending in that path would
+    /// have produced `…/dp/telemetry/dp/telemetry` while the budget
+    /// gate's suffix strip returned the origin untouched.
+    #[test]
+    fn managed_urls_agree_on_a_base_carrying_a_path() {
+        let hb = heartbeat::heartbeat_url("https://cp.example.com/api");
+        assert_eq!(hb, "https://cp.example.com/api/dp/heartbeat");
+        assert_eq!(
+            telemetry_url(&hb),
+            "https://cp.example.com/api/dp/telemetry"
+        );
+        assert_eq!(dpmgr_origin(&hb), "https://cp.example.com/api");
+
+        let hb = heartbeat::heartbeat_url("https://cp.example.com/dp/heartbeat");
+        assert_eq!(hb, "https://cp.example.com/dp/heartbeat/dp/heartbeat");
+        assert_eq!(
+            telemetry_url(&hb),
+            "https://cp.example.com/dp/heartbeat/dp/telemetry"
+        );
+        assert_eq!(dpmgr_origin(&hb), "https://cp.example.com/dp/heartbeat");
     }
 
     #[test]

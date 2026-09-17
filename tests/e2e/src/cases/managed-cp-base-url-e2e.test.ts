@@ -21,14 +21,18 @@ import { spawnApp, type SpawnedApp } from "../harness/index.js";
 // gateway that refuses all traffic.
 
 describe("managed.cp_base_url scheme handling", () => {
+  // This one pins that the new validation is not over-strict: it is
+  // green on `main` too, because the gateway spawned here is NOT in
+  // managed mode (no cert bundle, so `managed.enabled` stays false and
+  // nothing reads the value) — the reject spec below is the one that
+  // goes red without the fix. Managed mode proper has no counterpart
+  // in this harness; it needs a real control plane to register against.
   test("a scheme-less control-plane URL is accepted and the gateway boots", async () => {
     let app: SpawnedApp | undefined;
     try {
       app = await spawnApp({
         extra: { managed: { cp_base_url: "cp.example.com:7944" } },
       });
-      // Booting to a serving /livez is the assertion: `spawnApp` only
-      // returns once the proxy listener answers 200.
       const res = await fetch(`${app.proxyUrl}/livez`);
       expect(res.status).toBe(200);
     } finally {
