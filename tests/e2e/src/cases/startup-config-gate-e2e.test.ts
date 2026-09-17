@@ -20,7 +20,7 @@ import {
 // "this instance is ready" routed client traffic to a gateway that knew
 // no API keys and answered every request 401 invalid_api_key.
 //
-// Both specs drive the gateway through a TCP relay standing in for etcd,
+// These specs drive the gateway through a TCP relay standing in for etcd,
 // which is what makes the first read's timing controllable: held (the
 // read never completes), refused (the read fails and the supervisor
 // retries), or forwarding.
@@ -125,13 +125,13 @@ describe("the proxy listener waits for the first configuration", () => {
       // endpoint or re-arm the readiness gate without a type error.
       ...overrides,
       etcdPrefix: prefix,
-      // The subject of both specs is that this listener is NOT up yet.
+      // The subject of these specs is that this listener is NOT up yet.
       awaitProxyListener: false,
       // No dial/request timeouts. `etcd.request_timeout_ms` would abort
       // the held read, and writing one here would suggest a timeout is
       // driving the retries when the supervisor's backoff is. Unset —
       // the shipped default — leaves the read unbounded, which is what
-      // makes "held" mean "still in flight" for these two specs.
+      // makes "held" mean "still in flight" for these specs.
       extra: { etcd: { endpoints: [relay.endpoint], prefix } },
     });
     apps.push(app);
@@ -236,5 +236,33 @@ describe("the proxy listener waits for the first configuration", () => {
       .split("\n")
       .filter((line) => line.includes("aisix listening") && line.includes('label="proxy"'));
     expect(bindLines).toHaveLength(1);
+  });
+
+  test("SIGTERM exits while the initial configuration read remains unanswered", async (ctx) => {
+    if (!etcdReachable) {
+      ctx.skip();
+      return;
+    }
+    const prefix = `/aisix-e2e-gate-cancel-${randomUUID()}`;
+    const relay = await startEtcdRelay();
+    relays.push(relay);
+    await relay.hold();
+    await seedFixtures(prefix);
+    const app = await spawnBehindRelay(relay, prefix, { logLevel: "info" });
+    expect(
+      await waitForOutput(
+        app,
+        "waiting for the first configuration before binding the proxy listener",
+        5_000,
+      ),
+    ).toBe(true);
+    expect((await fetch(`${app.metricsUrl}/status/ready`)).status).toBe(503);
+    expect(await tcpAccepts(proxyPort(app))).toBe(false);
+
+    const exited = app.waitForExit(5_000);
+    app.signal("SIGTERM");
+    await exited;
+    expect(await waitForOutput(app, "aisix shut down cleanly", 1_000)).toBe(true);
+    expect(app.output()).not.toContain("first configuration applied — binding the proxy listener");
   });
 });

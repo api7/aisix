@@ -1634,10 +1634,11 @@ impl<P: ConfigProvider> Supervisor<P> {
         &self,
         cancel: &tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), SupervisorError> {
-        let load = self
-            .load_all_prefixes()
-            .await
-            .map_err(SupervisorError::Provider)?;
+        let load = tokio::select! {
+            biased;
+            _ = wait_for_cancel(cancel.clone()) => return Err(SupervisorError::Cancelled),
+            load = self.load_all_prefixes() => load.map_err(SupervisorError::Provider)?,
+        };
         let revision = load.applied_revision();
 
         // ONE resync over the union: the snapshot is published only after
@@ -1655,7 +1656,12 @@ impl<P: ConfigProvider> Supervisor<P> {
             // maximum across prefixes. A prefix whose read was refused
             // has no revision to resume from and no stream this cycle.
             let Some(from) = *from else { continue };
-            match source.provider.watch(from + 1).await {
+            let watch = tokio::select! {
+                biased;
+                _ = wait_for_cancel(cancel.clone()) => return Err(SupervisorError::Cancelled),
+                watch = source.provider.watch(from + 1) => watch,
+            };
+            match watch {
                 Ok(stream) => streams.push(stream),
                 Err(err) if source.tolerates(&err) => {
                     // No stream for this prefix this cycle. It is retried
