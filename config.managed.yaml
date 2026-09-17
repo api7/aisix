@@ -28,8 +28,12 @@
 # too. The scheme governs those three REST calls only; the etcd channel
 # is mTLS whatever is set here, so an `http://` base does not give you a
 # plaintext gateway — it gives you REST calls that cannot reach a TLS
-# control plane. `CP_ETCD_ENDPOINT` is different: always bare
-# `host:port`, never a scheme.
+# control plane. `CP_ETCD_ENDPOINT` carries the opposite convention: it
+# is a bare `host:port` by contract, because the gateway attaches
+# `https://` to it itself. A leading `http://` or `https://` written
+# there is stripped rather than doubled up; anything else that is not a
+# bare `host[:port]` — a path, a query, userinfo, a port that is not a
+# number — fails the boot naming the variable.
 #
 # Plus optionally `AISIX_PROXY__ADDR`, `AISIX_OBSERVABILITY__LOG_LEVEL`,
 # `AISIX_CACHE__BACKEND`, etc. — every config field is reachable via

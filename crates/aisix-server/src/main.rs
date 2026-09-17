@@ -3230,6 +3230,40 @@ managed:
         );
     }
 
+    /// `cp_etcd_endpoint` is the field with the opposite convention:
+    /// `derive_cp_etcd_url` prepends `https://` itself, so an operator
+    /// who writes one — the natural mistake now that the neighbouring
+    /// field takes a scheme — used to get
+    /// `https://https://etcd.example.com:7943`, a dial the supervisor
+    /// retries forever while the proxy listener never binds.
+    #[test]
+    fn managed_etcd_url_survives_a_scheme_on_the_endpoint() {
+        let file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+managed:
+  enabled: true
+  cp_base_url: "dpm.example.com:7944"
+  cp_etcd_endpoint: "https://etcd.example.com:7943"
+"#,
+        )
+        .unwrap();
+        let cfg = aisix_core::Config::load_from_path(Some(file.path())).unwrap();
+        assert_eq!(
+            derive_cp_etcd_url(&cfg.managed).unwrap(),
+            "https://etcd.example.com:7943"
+        );
+    }
+
     /// A trailing slash on the base must not double up in the derived
     /// paths — normalisation deliberately leaves it in place and the
     /// call sites own the trimming.

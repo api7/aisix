@@ -221,6 +221,13 @@ pub struct ManagedConfig {
     /// (prd-09a §9A.7.2) no longer ships it back, so the DP must
     /// know its etcd endpoint at boot. Bare `host:port` without
     /// scheme — the DP attaches `https://` for the gRPC dial.
+    ///
+    /// Reduced to that bare form once by
+    /// [`normalise_cp_etcd_endpoint`] at load: a leading `http://` or
+    /// `https://` and one trailing `/` are stripped, and anything that
+    /// is still not a bare `host[:port]` fails the boot. Note the
+    /// convention is the mirror image of `cp_base_url`'s, which keeps
+    /// its scheme.
     #[serde(default)]
     pub cp_etcd_endpoint: Option<String>,
 
@@ -434,6 +441,55 @@ fn normalise_cp_base_url(raw: &str) -> Result<String, BootstrapError> {
     // from the same input. Trailing slash, path, query and case stay as
     // typed; the call sites own their own trailing-slash handling.
     Ok(qualified)
+}
+
+/// Environment variable that sets `managed.cp_etcd_endpoint`.
+const CP_ETCD_ENDPOINT_ENV: &str = "AISIX_MANAGED__CP_ETCD_ENDPOINT";
+
+/// Reduce `managed.cp_etcd_endpoint` to the bare `host[:port]` that
+/// `derive_cp_etcd_url` expects.
+///
+/// This field's convention is the mirror image of `cp_base_url`'s: the
+/// etcd dial prepends `https://` itself, so a value that already names
+/// one produced `https://https://etcd.example.com:7943`. The gRPC dial
+/// rejects that, the supervisor retries it forever, and the proxy
+/// listener never binds — with nothing in the error pointing at the
+/// variable to fix. Now that the neighbouring field accepts a scheme,
+/// writing one here too is the natural next mistake, so a leading
+/// scheme is stripped rather than left to fail at dial time.
+///
+/// Anything that is still not a bare `host[:port]` afterwards fails the
+/// boot, for the same reason `cp_base_url` does: a path or a query the
+/// dial would silently drop is a value whose author expected something
+/// this field cannot do.
+fn normalise_cp_etcd_endpoint(raw: &str) -> Result<String, BootstrapError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(trimmed.to_string());
+    }
+    // Exact lower case, matching what `derive_cp_etcd_url` strips off
+    // `cp_base_url` — an uppercase scheme here is a typo, not a value.
+    let bare = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let bare = bare.strip_suffix('/').unwrap_or(bare);
+    // `@` would smuggle userinfo into a field the dial reads as an
+    // authority, and the rest are the separators that begin a component
+    // `host[:port]` has no room for.
+    let is_bare_authority = !bare.is_empty()
+        && !bare.contains(['/', '?', '#', '@', '\\'])
+        && url::Url::parse(&format!("https://{bare}"))
+            .ok()
+            .and_then(|u| u.host_str().map(|h| !h.is_empty()))
+            .unwrap_or(false);
+    if !is_bare_authority {
+        return Err(BootstrapError::Config(format!(
+            "managed.cp_etcd_endpoint ({CP_ETCD_ENDPOINT_ENV}) must be a bare host:port \
+             such as etcd.example.com:7943, got {raw:?}"
+        )));
+    }
+    Ok(bare.to_string())
 }
 
 /// Default is the "unconfigured" shape (no endpoints) so a
@@ -1879,6 +1935,9 @@ impl Config {
         if let Some(raw_base) = cfg.managed.cp_base_url.as_deref() {
             cfg.managed.cp_base_url = Some(normalise_cp_base_url(raw_base)?);
         }
+        if let Some(raw_endpoint) = cfg.managed.cp_etcd_endpoint.as_deref() {
+            cfg.managed.cp_etcd_endpoint = Some(normalise_cp_etcd_endpoint(raw_endpoint)?);
+        }
 
         cfg.validate()?;
         Ok(cfg)
@@ -2770,6 +2829,90 @@ managed:
             };
             assert!(
                 err.contains("AISIX_MANAGED__CP_BASE_URL"),
+                "rejection for {value:?} must name the variable to fix, got: {err}"
+            );
+            assert!(
+                err.contains(value),
+                "rejection for {value:?} must quote the offending value, got: {err}"
+            );
+        }
+    }
+
+    /// `cp_etcd_endpoint` carries the opposite convention to
+    /// `cp_base_url`: the etcd dial prepends `https://` itself, so a
+    /// value naming a scheme produced `https://https://etcd…:7943`.
+    /// The gRPC dial rejects it, the supervisor retries forever and the
+    /// proxy listener never binds — with nothing in the error naming
+    /// the variable. Now that the neighbouring field takes a scheme,
+    /// writing one here is the natural next mistake.
+    fn load_with_cp_etcd_endpoint(value: &str) -> Result<Config, BootstrapError> {
+        let f = write_yaml(&format!(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+managed:
+  enabled: true
+  cp_base_url: "https://dpm.example.com:7944"
+  cp_etcd_endpoint: "{value}"
+"#
+        ));
+        Config::load_from_path(Some(f.path()))
+    }
+
+    #[test]
+    fn cp_etcd_endpoint_strips_a_scheme_and_trailing_slash() {
+        for (input, expected) in [
+            ("https://etcd.example.com:7943", "etcd.example.com:7943"),
+            ("http://etcd.example.com:7943/", "etcd.example.com:7943"),
+            ("  https://etcd.example.com:7943  ", "etcd.example.com:7943"),
+        ] {
+            let cfg = load_with_cp_etcd_endpoint(input).unwrap();
+            assert_eq!(
+                cfg.managed.cp_etcd_endpoint.as_deref(),
+                Some(expected),
+                "{input} must reduce to the bare authority"
+            );
+        }
+    }
+
+    #[test]
+    fn cp_etcd_endpoint_leaves_a_bare_authority_alone() {
+        for value in ["etcd.example.com:7943", "[::1]:7943", "etcd.example.com"] {
+            let cfg = load_with_cp_etcd_endpoint(value).unwrap();
+            assert_eq!(
+                cfg.managed.cp_etcd_endpoint.as_deref(),
+                Some(value),
+                "{value} is already bare and must survive byte for byte"
+            );
+        }
+    }
+
+    #[test]
+    fn cp_etcd_endpoint_rejects_anything_that_is_not_a_bare_authority() {
+        // A path or a query the gRPC dial would silently drop, a port
+        // that is not a port, and a scheme with nothing behind it.
+        for value in [
+            "https://etcd.example.com:7943/path",
+            "etcd.example.com:7943?x=1",
+            "user@etcd.example.com:7943",
+            "etcd.example.com:abc",
+            "https://",
+        ] {
+            let err = match load_with_cp_etcd_endpoint(value) {
+                Ok(cfg) => panic!(
+                    "{value:?} must not load, got cp_etcd_endpoint = {:?}",
+                    cfg.managed.cp_etcd_endpoint
+                ),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("AISIX_MANAGED__CP_ETCD_ENDPOINT"),
                 "rejection for {value:?} must name the variable to fix, got: {err}"
             );
             assert!(
