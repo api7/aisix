@@ -485,7 +485,7 @@ async fn dispatch(
         ),
     );
 
-    let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
+    let client = crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
     // Send, check the status, and read the body as one retryable unit, so a
     // transient fault anywhere in that sequence is retried rather than
     // surfacing to the caller. `note_failure` runs per attempt, matching

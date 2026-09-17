@@ -14,6 +14,7 @@
 //! `display_name`.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -101,6 +102,44 @@ pub struct ProviderKey {
     /// gateway's deployment-wide trust settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<ProviderKeyTls>,
+
+    /// IP addresses the gateway connects to for this key's `api_base`
+    /// host, instead of resolving that host through DNS. Each entry is an
+    /// IPv4 or IPv6 address literal, without a port and without brackets.
+    ///
+    /// Use this when the upstream is reached over a private link that has
+    /// no DNS entry, while the provider still requires its own hostname in
+    /// the request. Only the connection target changes: the `Host` header,
+    /// the HTTP/2 `:authority`, the TLS server name and the certificate
+    /// check all keep using the hostname from `api_base`, and the port and
+    /// scheme keep coming from `api_base` too.
+    ///
+    /// Several addresses are tried in the order given, as a resolver's
+    /// answer would be: the next one is attempted when a connection cannot
+    /// be established, which is how a private link that terminates on one
+    /// address per availability zone stays reachable when one is down.
+    ///
+    /// Scoped to the `api_base` hostname and nothing else. An `apis` entry
+    /// that serves a second protocol from the same host is reached over
+    /// the same link, because it is the same hostname; one that names a
+    /// different host is resolved normally. A key with no `api_base`, or
+    /// whose `api_base` is already an address literal, has no hostname to
+    /// override and is dispatched unchanged.
+    ///
+    /// Honoured on every surface that dispatches through the Provider
+    /// Key's own client: chat completions, completions, embeddings,
+    /// images, audio, `/v1/messages` (and `count_tokens`), `/v1/responses`,
+    /// rerank, videos, the files/batches/fine-tuning surface and
+    /// `/passthrough/*`. Not honoured for Amazon Bedrock or `/v1/realtime`,
+    /// which connect on their own transports — the same two that
+    /// `tls` does not reach.
+    ///
+    /// Not applicable when the gateway reaches its upstreams through a
+    /// forward proxy (`HTTPS_PROXY` / `ALL_PROXY` in the gateway's
+    /// environment): the proxy is given the hostname and resolves it
+    /// itself, so nothing here is consulted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolve_addresses: Option<Vec<IpAddr>>,
 
     /// Filled in by the snapshot loader from the etcd key path.
     #[serde(skip)]
@@ -237,6 +276,82 @@ impl ProviderKeyTls {
     /// settings would build it, so the shared client can be reused.
     pub fn is_noop(&self) -> bool {
         self.ca_cert.as_ref().is_none_or(|p| p.trim().is_empty()) && self.verify
+    }
+}
+
+/// The connection-level overrides one Provider Key applies to every
+/// upstream request dispatched on its behalf.
+///
+/// Built from the key rather than read field-by-field at the dispatch
+/// sites, so the gateway's per-key client cache has one key covering
+/// every input that changes how the connection is made. `Hash` for that
+/// cache; two keys configured identically share one connection pool.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UpstreamConnection {
+    /// Trust settings for the connection, when they differ from the
+    /// gateway's deployment-wide ones.
+    pub tls: Option<ProviderKeyTls>,
+
+    /// Hostname-to-addresses overrides applied instead of DNS resolution,
+    /// from `resolve_addresses`. Empty when the key sets none; each entry
+    /// carries its addresses in the order they are tried.
+    pub resolve: Vec<(String, Vec<IpAddr>)>,
+}
+
+impl UpstreamConnection {
+    /// Whether this leaves the connection exactly as the deployment-wide
+    /// settings would build it, so the shared pool can be reused.
+    ///
+    /// [`ProviderKey::upstream_connection`] already answers `None` in that
+    /// case, but the fields are public and the constructor is not the only
+    /// way to reach [`client_for_provider_key`]: a value that configures
+    /// nothing must not split the connection pool, and must not lose the
+    /// per-worker pool it would otherwise dispatch on.
+    ///
+    /// [`client_for_provider_key`]: https://docs.rs/aisix-gateway
+    pub fn is_noop(&self) -> bool {
+        self.resolve.is_empty() && self.tls.as_ref().is_none_or(ProviderKeyTls::is_noop)
+    }
+}
+
+impl ProviderKey {
+    /// The overrides this key's upstream connections are made with, or
+    /// `None` when it configures none — the overwhelmingly common case,
+    /// and the one that must keep sharing the gateway's connection pool.
+    pub fn upstream_connection(&self) -> Option<UpstreamConnection> {
+        let tls = self.tls.clone().filter(|t| !t.is_noop());
+        let addresses = self
+            .resolve_addresses
+            .as_deref()
+            .filter(|addrs| !addrs.is_empty());
+        let resolve: Vec<(String, Vec<IpAddr>)> = match (addresses, self.base_hostname()) {
+            (Some(addrs), Some(host)) => vec![(host, addrs.to_vec())],
+            _ => Vec::new(),
+        };
+        if tls.is_none() && resolve.is_empty() {
+            return None;
+        }
+        Some(UpstreamConnection { tls, resolve })
+    }
+
+    /// The hostname `api_base` dials, if it names one.
+    ///
+    /// Deliberately narrow. Resolving only what `api_base` names keeps the
+    /// override to the endpoint the operator pointed at: a second protocol
+    /// declared in `apis` on the SAME host is covered because it is the
+    /// same name, and one on a different host keeps resolving normally
+    /// rather than being silently redirected onto the private link.
+    ///
+    /// `None` for a base the gateway cannot parse as a URL, for one whose
+    /// authority is an address literal, and for a key with no base at all:
+    /// none of them has a name to resolve, so the connection is left
+    /// exactly as it was.
+    fn base_hostname(&self) -> Option<String> {
+        let base = self.api_base.as_deref()?.trim();
+        match url::Url::parse(base).ok()?.host()? {
+            url::Host::Domain(domain) => Some(domain.to_string()),
+            url::Host::Ipv4(_) | url::Host::Ipv6(_) => None,
+        }
     }
 }
 
@@ -531,6 +646,143 @@ mod tests {
         assert_eq!(p.display_name, "x");
     }
 
+    // ---- `resolve_addresses` ----
+
+    fn pk(json: serde_json::Value) -> ProviderKey {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn a_key_with_no_overrides_dispatches_on_the_shared_pool() {
+        let key = pk(serde_json::json!({
+            "display_name": "plain",
+            "api_key": "sk-x",
+            "api_base": "https://api.example.com/v1",
+            "tls": {},
+        }));
+        assert_eq!(key.upstream_connection(), None);
+    }
+
+    #[test]
+    fn resolve_addresses_override_the_api_base_hostname() {
+        let key = pk(serde_json::json!({
+            "display_name": "private-link",
+            "api_key": "sk-x",
+            "api_base": "https://vendor.example.com:8443/v1",
+            "resolve_addresses": ["10.1.2.3"],
+        }));
+        let conn = key.upstream_connection().expect("an override is set");
+        assert_eq!(conn.tls, None);
+        assert_eq!(
+            conn.resolve,
+            vec![(
+                "vendor.example.com".to_string(),
+                vec!["10.1.2.3".parse::<IpAddr>().unwrap()]
+            )]
+        );
+    }
+
+    /// Order is the operator's, and it is the order the connector tries.
+    /// Sorting or deduplicating here would quietly change which address a
+    /// request lands on first.
+    #[test]
+    fn several_addresses_keep_the_order_they_were_written_in() {
+        let key = pk(serde_json::json!({
+            "display_name": "multi-az",
+            "api_key": "sk-x",
+            "api_base": "https://vendor.example.com/v1",
+            "resolve_addresses": ["10.0.3.9", "10.0.1.4", "2001:db8::7"],
+        }));
+        let (host, addrs) = key.upstream_connection().unwrap().resolve.remove(0);
+        assert_eq!(host, "vendor.example.com");
+        assert_eq!(
+            addrs,
+            ["10.0.3.9", "10.0.1.4", "2001:db8::7"]
+                .map(|a| a.parse::<IpAddr>().unwrap())
+                .to_vec()
+        );
+    }
+
+    /// The override follows the NAME, so a second protocol declared on
+    /// the same host is covered by the same entry — and one on a
+    /// different host is deliberately not, rather than being silently
+    /// redirected onto the private link.
+    #[test]
+    fn resolve_addresses_are_scoped_to_the_api_base_hostname() {
+        let key = pk(serde_json::json!({
+            "display_name": "two-surfaces",
+            "api_key": "sk-x",
+            "api_base": "https://vendor.example.com/v1",
+            "apis": {
+                "messages": {"base": "https://elsewhere.example.net/v1"},
+                "responses": {"base": "https://vendor.example.com/openai"},
+            },
+            "resolve_addresses": ["2001:db8::5"],
+        }));
+        let addr: IpAddr = "2001:db8::5".parse().unwrap();
+        assert_eq!(
+            key.upstream_connection().unwrap().resolve,
+            vec![("vendor.example.com".to_string(), vec![addr])]
+        );
+    }
+
+    /// Nothing to resolve: an address literal in the base URL is already
+    /// the connection target, a key with no base has no hostname at all,
+    /// and an empty list asks for nothing. All three leave the connection
+    /// exactly as it was.
+    #[test]
+    fn resolve_addresses_are_inert_without_a_hostname_to_override() {
+        for (base, addrs) in [
+            (None, serde_json::json!(["10.1.2.3"])),
+            (Some("https://10.0.0.7/v1"), serde_json::json!(["10.1.2.3"])),
+            (
+                Some("https://[2001:db8::1]/v1"),
+                serde_json::json!(["10.1.2.3"]),
+            ),
+            (Some("https://vendor.example.com/v1"), serde_json::json!([])),
+        ] {
+            let mut doc = serde_json::json!({
+                "display_name": "no-hostname",
+                "api_key": "sk-x",
+                "resolve_addresses": addrs,
+            });
+            if let Some(base) = base {
+                doc["api_base"] = serde_json::json!(base);
+            }
+            assert_eq!(pk(doc).upstream_connection(), None, "base {base:?}");
+        }
+    }
+
+    /// The two overrides are independent, and a key setting both must get
+    /// one client carrying both — not one of the two.
+    #[test]
+    fn tls_and_resolve_addresses_travel_together() {
+        let key = pk(serde_json::json!({
+            "display_name": "both",
+            "api_key": "sk-x",
+            "api_base": "https://vendor.example.com/v1",
+            "resolve_addresses": ["10.1.2.3"],
+            "tls": {"verify": false},
+        }));
+        let conn = key.upstream_connection().expect("an override is set");
+        assert_eq!(conn.tls.map(|t| t.verify), Some(false));
+        assert_eq!(conn.resolve.len(), 1);
+    }
+
+    /// A value that is not an address fails the row rather than being
+    /// ignored: the operator asked for a specific connection target, and
+    /// dialling the DNS one instead would be a silent downgrade.
+    #[test]
+    fn a_non_address_entry_is_rejected() {
+        let err = serde_json::from_value::<ProviderKey>(serde_json::json!({
+            "display_name": "bad",
+            "api_key": "sk-x",
+            "resolve_addresses": ["10.1.2.3", "vendor.example.com"],
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid IP address"), "{err}");
+    }
+
     // ---- `secret` → `api_key` rename ----
 
     #[test]
@@ -703,6 +955,7 @@ mod tests {
             response: None,
             strip_headers: default_strip_headers(),
             tls: None,
+            resolve_addresses: None,
             runtime_id: String::new(),
         };
         let s = serde_json::to_string(&original).unwrap();

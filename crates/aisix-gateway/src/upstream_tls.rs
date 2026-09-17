@@ -23,7 +23,7 @@
 use std::sync::{Arc, OnceLock};
 
 use aisix_core::config::OutboundTlsConfig;
-use aisix_core::models::provider_key::ProviderKeyTls;
+use aisix_core::models::provider_key::UpstreamConnection;
 
 /// PEM material and verification policy shared by every outbound client.
 ///
@@ -194,21 +194,22 @@ pub fn reqwest_material() -> &'static ReqwestTlsMaterial {
 
 // ─── per-ProviderKey overrides ───────────────────────────────────────
 
-/// Clients built for a `ProviderKey.tls` override, keyed by the override
-/// itself so every key with the same settings shares one connection
-/// pool.
+/// Clients built for a Provider Key's connection overrides, keyed by the
+/// overrides themselves so every key configured the same way shares one
+/// connection pool.
 ///
-/// A client is the unit reqwest attaches trust to, so an override cannot
-/// be applied per request — it needs its own client, and therefore its
-/// own pool. Building one per dispatch would pay a TLS handshake on
-/// every call, which is precisely what the shared pool exists to avoid;
-/// the cache keeps it to one per distinct override.
+/// A client is the unit reqwest attaches trust and name resolution to, so
+/// an override cannot be applied per request — it needs its own client,
+/// and therefore its own pool. Building one per dispatch would pay a TLS
+/// handshake on every call, which is precisely what the shared pool
+/// exists to avoid; the cache keeps it to one per distinct override.
 ///
-/// Unbounded on purpose. The key space is the set of distinct TLS
-/// settings across the Provider Keys an operator has configured — a
+/// Unbounded on purpose. The key space is the set of distinct override
+/// combinations across the Provider Keys an operator has configured — a
 /// handful in the deployments this exists for, and each entry is one
 /// idle connection pool.
-static PK_CLIENTS: OnceLock<dashmap::DashMap<ProviderKeyTls, reqwest::Client>> = OnceLock::new();
+static PK_CLIENTS: OnceLock<dashmap::DashMap<UpstreamConnection, reqwest::Client>> =
+    OnceLock::new();
 
 // ─── per-worker pools ────────────────────────────────────────────────
 
@@ -270,16 +271,17 @@ fn worker_client() -> Option<reqwest::Client> {
 /// is the overwhelmingly common case and the one that must keep sharing
 /// the bridge's pool.
 ///
-/// A malformed `ca_cert` falls back to `shared` with a logged error
-/// rather than to a client that trusts less than the operator asked
-/// for — the request then fails against the private endpoint, which is
-/// the same visible outcome as not having configured anything, and is
-/// preferable to quietly proceeding.
+/// A malformed `ca_cert` falls back with a logged error rather than to a
+/// client that trusts less than the operator asked for — the request then
+/// fails against the private endpoint, which is the same visible outcome
+/// as not having configured anything, and is preferable to quietly
+/// proceeding. What it falls back TO depends on whether the key also
+/// names addresses: see the error arms below.
 pub fn client_for_provider_key(
     shared: &reqwest::Client,
-    tls: Option<&ProviderKeyTls>,
+    conn: Option<&UpstreamConnection>,
 ) -> reqwest::Client {
-    let Some(tls) = tls.filter(|t| !t.is_noop()) else {
+    let Some(conn) = conn.filter(|c| !c.is_noop()) else {
         // On a thread-per-core worker, dispatch on that worker's own
         // pool: the upstream connection is then read by the same runtime
         // that is waiting for the response, instead of waking a thread
@@ -288,12 +290,12 @@ pub fn client_for_provider_key(
         return worker_client().unwrap_or_else(|| shared.clone());
     };
     let cache = PK_CLIENTS.get_or_init(dashmap::DashMap::new);
-    if let Some(existing) = cache.get(tls) {
+    if let Some(existing) = cache.get(conn) {
         return existing.clone();
     }
-    match build_provider_key_client(tls) {
-        Ok(client) => cache.entry(tls.clone()).or_insert(client).clone(),
-        Err(e) => {
+    match build_provider_key_client(conn) {
+        Ok(client) => cache.entry(conn.clone()).or_insert(client).clone(),
+        Err(e) if conn.resolve.is_empty() => {
             tracing::error!(
                 error = %e,
                 "provider_key.tls could not be applied; falling back to the \
@@ -301,27 +303,74 @@ pub fn client_for_provider_key(
             );
             shared.clone()
         }
+        Err(e) => {
+            // With an address override configured, the shared client is
+            // NOT a safe fallback: it resolves the hostname through DNS,
+            // so a key whose trust material failed to load would carry
+            // its credential to whatever public DNS answers instead of to
+            // the private endpoint the operator named — reaching a
+            // different server, and succeeding while doing it.
+            //
+            // Keep the resolution and drop only the part that failed. The
+            // request then reaches the configured address and fails its
+            // certificate check there, which is the same visible outcome
+            // as not having configured any trust material.
+            tracing::error!(
+                error = %e,
+                "provider_key.tls could not be applied; dispatching to \
+                 resolve_addresses on the deployment's trust settings, \
+                 where this endpoint is expected to fail verification"
+            );
+            let resolution_only = UpstreamConnection {
+                tls: None,
+                resolve: conn.resolve.clone(),
+            };
+            // `resolve_to_addrs` cannot fail, so the only way this second
+            // build fails is a TLS backend that would not initialise —
+            // which `shared` could not have been built over either.
+            build_provider_key_client(&resolution_only)
+                .map(|client| cache.entry(resolution_only).or_insert(client).clone())
+                .unwrap_or_else(|_| shared.clone())
+        }
     }
 }
 
-fn build_provider_key_client(tls: &ProviderKeyTls) -> Result<reqwest::Client, String> {
+fn build_provider_key_client(conn: &UpstreamConnection) -> Result<reqwest::Client, String> {
     // Layer the key's override ON TOP of the deployment settings rather
     // than replacing them: a deployment CA and a per-key CA are both
     // trust roots, and a client presenting the deployment's mTLS
     // identity must keep presenting it.
     let mut builder = crate::upstream_http::client_builder();
-    if let Some(pem) = tls.ca_cert.as_ref().filter(|p| !p.trim().is_empty()) {
-        let roots = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
-            .map_err(|e| format!("provider_key.tls.ca_cert: {e}"))?;
-        if roots.is_empty() {
-            return Err("provider_key.tls.ca_cert contains no certificate".into());
+    if let Some(tls) = conn.tls.as_ref() {
+        if let Some(pem) = tls.ca_cert.as_ref().filter(|p| !p.trim().is_empty()) {
+            let roots = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
+                .map_err(|e| format!("provider_key.tls.ca_cert: {e}"))?;
+            if roots.is_empty() {
+                return Err("provider_key.tls.ca_cert contains no certificate".into());
+            }
+            for root in roots {
+                builder = builder.add_root_certificate(root);
+            }
         }
-        for root in roots {
-            builder = builder.add_root_certificate(root);
+        if !tls.verify {
+            builder = builder.danger_accept_invalid_certs(true);
         }
     }
-    if !tls.verify {
-        builder = builder.danger_accept_invalid_certs(true);
+    for (host, addrs) in &conn.resolve {
+        // Port 0: reqwest keeps the port from the request URL and takes
+        // only the address from here. The hostname stays the one the URL
+        // names, so `Host`, `:authority`, the TLS server name and the
+        // certificate check are all unaffected — this replaces name
+        // resolution and nothing else.
+        //
+        // The whole list goes in at once, in the operator's order, so the
+        // connector walks it the way it walks a resolver's answer and
+        // moves to the next address when one will not connect.
+        let socket_addrs: Vec<std::net::SocketAddr> = addrs
+            .iter()
+            .map(|addr| std::net::SocketAddr::new(*addr, 0))
+            .collect();
+        builder = builder.resolve_to_addrs(host, &socket_addrs);
     }
     builder.build().map_err(|e| e.to_string())
 }
@@ -572,6 +621,7 @@ mod danger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aisix_core::models::provider_key::ProviderKeyTls;
 
     fn ca_pem() -> Vec<u8> {
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -743,10 +793,29 @@ mod tests {
     /// client (and therefore its own connection pool)?" is asserted
     /// through the cache: an entry exists exactly when a dedicated client
     /// was built.
-    fn cached(tls: &ProviderKeyTls) -> bool {
+    fn cached(conn: &UpstreamConnection) -> bool {
         PK_CLIENTS
             .get()
-            .is_some_and(|cache| cache.contains_key(tls))
+            .is_some_and(|cache| cache.contains_key(conn))
+    }
+
+    /// A key carrying only `tls`, in the shape the dispatch sites derive.
+    fn tls_conn(tls: ProviderKeyTls) -> UpstreamConnection {
+        UpstreamConnection {
+            tls: Some(tls),
+            resolve: Vec::new(),
+        }
+    }
+
+    /// A key carrying only `resolve_addresses`, for one hostname.
+    fn resolve_conn(host: &str, addrs: &[&str]) -> UpstreamConnection {
+        UpstreamConnection {
+            tls: None,
+            resolve: vec![(
+                host.to_string(),
+                addrs.iter().map(|a| a.parse().unwrap()).collect(),
+            )],
+        }
     }
 
     /// `tls: {}` — every field left at its default — is not an override,
@@ -771,10 +840,63 @@ mod tests {
     /// dispatching on the bridge's own client, so nothing is cached.
     #[test]
     fn a_key_without_an_override_builds_no_dedicated_client() {
-        let noop = ProviderKeyTls::default();
+        let noop = tls_conn(ProviderKeyTls::default());
         let _ = client_for_provider_key(&shared_client(), None);
+        // Passed a profile that configures nothing — the shape a caller
+        // assembling `UpstreamConnection` by hand can produce — this must
+        // still land on the shared pool rather than build a client and
+        // split it.
         let _ = client_for_provider_key(&shared_client(), Some(&noop));
         assert!(!cached(&noop));
+    }
+
+    /// `resolve_addresses` is an override in its own right: a key that
+    /// sets it while leaving TLS at the deployment defaults still needs
+    /// its own client, because reqwest attaches name resolution to the
+    /// client and not to the request.
+    #[test]
+    fn resolve_addresses_alone_build_a_dedicated_client() {
+        let key: aisix_core::models::ProviderKey = serde_json::from_value(serde_json::json!({
+            "display_name": "pk-alone",
+            "api_key": "sk-x",
+            "api_base": "https://vendor-alone.invalid/v1",
+            "resolve_addresses": ["192.0.2.10", "192.0.2.11"],
+        }))
+        .unwrap();
+        let conn = key.upstream_connection().expect("an override is set");
+        assert_eq!(conn.tls, None);
+        assert_eq!(
+            conn.resolve,
+            resolve_conn("vendor-alone.invalid", &["192.0.2.10", "192.0.2.11"]).resolve
+        );
+        let _ = client_for_provider_key(&shared_client(), Some(&conn));
+        assert!(cached(&conn));
+    }
+
+    /// Two keys pointing the same hostname at different addresses must not
+    /// share a client: the resolution lives on the client, so one pool
+    /// could only ever dial one of the two.
+    #[test]
+    fn different_addresses_for_one_hostname_get_different_clients() {
+        let first = resolve_conn("vendor-split.invalid", &["192.0.2.21"]);
+        let second = resolve_conn("vendor-split.invalid", &["192.0.2.22"]);
+        assert_ne!(first, second);
+        let _ = client_for_provider_key(&shared_client(), Some(&first));
+        let _ = client_for_provider_key(&shared_client(), Some(&second));
+        assert!(cached(&first));
+        assert!(cached(&second));
+        let for_this_host = PK_CLIENTS
+            .get()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e.key()
+                    .resolve
+                    .iter()
+                    .any(|(h, _)| h == "vendor-split.invalid")
+            })
+            .count();
+        assert_eq!(for_this_host, 2);
     }
 
     /// Two keys configured identically land on one client, so a
@@ -786,9 +908,9 @@ mod tests {
             ca_cert: Some(String::from_utf8(ca_pem()).unwrap()),
             verify: true,
         };
-        assert!(!cached(&tls));
-        let _ = client_for_provider_key(&shared_client(), Some(&tls));
-        let _ = client_for_provider_key(&shared_client(), Some(&tls.clone()));
+        assert!(!cached(&tls_conn(tls.clone())));
+        let _ = client_for_provider_key(&shared_client(), Some(&tls_conn(tls.clone())));
+        let _ = client_for_provider_key(&shared_client(), Some(&tls_conn(tls.clone())));
 
         // Counted per-CA rather than over the whole map: the tests in
         // this module share the static and run concurrently, so a total
@@ -798,7 +920,7 @@ mod tests {
             .get()
             .unwrap()
             .iter()
-            .filter(|e| e.key().ca_cert == tls.ca_cert)
+            .filter(|e| e.key().tls.as_ref().map(|t| &t.ca_cert) == Some(&tls.ca_cert))
             .count();
         assert_eq!(
             for_this_ca, 1,
@@ -816,8 +938,33 @@ mod tests {
             ca_cert: Some("-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----\n".into()),
             verify: true,
         };
-        let _ = client_for_provider_key(&shared_client(), Some(&tls));
-        assert!(!cached(&tls));
+        let _ = client_for_provider_key(&shared_client(), Some(&tls_conn(tls.clone())));
+        assert!(!cached(&tls_conn(tls)));
+    }
+
+    /// The same failure, on a key that also names addresses, must NOT
+    /// land on the shared client: that one resolves the hostname through
+    /// DNS, so the key's credential would go to whatever public DNS
+    /// answers rather than to the private endpoint — and would very
+    /// likely get there. The resolution survives; only the trust material
+    /// that failed to load is dropped.
+    #[test]
+    fn a_malformed_ca_cert_beside_an_address_override_keeps_the_addresses() {
+        let tls = ProviderKeyTls {
+            ca_cert: Some("-----BEGIN CERTIFICATE-----\nbad\n-----END CERTIFICATE-----\n".into()),
+            verify: true,
+        };
+        let addresses = resolve_conn("vendor-failclosed.invalid", &["192.0.2.31"]);
+        let conn = UpstreamConnection {
+            tls: Some(tls),
+            resolve: addresses.resolve.clone(),
+        };
+        let _ = client_for_provider_key(&shared_client(), Some(&conn));
+        assert!(!cached(&conn), "the unbuildable profile must not be cached");
+        assert!(
+            cached(&addresses),
+            "the request must still be dispatched to the configured addresses"
+        );
     }
 
     /// `verify: false` alone is a real override — no CA, but a different
@@ -828,7 +975,7 @@ mod tests {
             ca_cert: None,
             verify: false,
         };
-        let _ = client_for_provider_key(&shared_client(), Some(&tls));
-        assert!(cached(&tls));
+        let _ = client_for_provider_key(&shared_client(), Some(&tls_conn(tls.clone())));
+        assert!(cached(&tls_conn(tls)));
     }
 }

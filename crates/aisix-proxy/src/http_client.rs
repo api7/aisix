@@ -6,7 +6,7 @@
 //! same source the provider bridges use — this client talks to the same
 //! upstreams, so it must expire pooled connections on the same schedule.
 
-use aisix_core::models::provider_key::ProviderKeyTls;
+use aisix_core::models::provider_key::UpstreamConnection;
 use reqwest::Client;
 use std::sync::OnceLock;
 
@@ -22,17 +22,19 @@ pub fn client() -> &'static Client {
 
 /// The client for a call dispatched on behalf of one Provider Key.
 ///
-/// Returns a clone of the shared client whenever the key sets no `tls`
-/// override, which is every key that does not name a private CA — so the
-/// ordinary path keeps sharing one connection pool.
+/// Returns a clone of the shared client whenever the key sets no
+/// connection override, which is every key that names neither a private
+/// CA nor a resolution address — so the ordinary path keeps sharing one
+/// connection pool.
 ///
 /// Every passthrough surface goes through here rather than [`client`]:
-/// a key configured with a private CA has to reach its endpoint on
-/// `/v1/messages`, `/v1/responses`, `/v1/audio/*`, `/v1/videos/*`, the
-/// jobs surface and the raw tunnel, not only on the endpoints that run
-/// through a provider bridge.
-pub fn client_for(tls: Option<&ProviderKeyTls>) -> Client {
-    aisix_gateway::upstream_tls::client_for_provider_key(client(), tls)
+/// a key configured with a private CA, or with an upstream reachable only
+/// at a fixed address, has to reach its endpoint on `/v1/messages`,
+/// `/v1/responses`, `/v1/audio/*`, `/v1/videos/*`, the jobs surface and
+/// the raw tunnel, not only on the endpoints that run through a provider
+/// bridge.
+pub fn client_for(conn: Option<&UpstreamConnection>) -> Client {
+    aisix_gateway::upstream_tls::client_for_provider_key(client(), conn)
 }
 
 #[cfg(test)]
@@ -41,8 +43,9 @@ mod tests {
     /// `/v1/responses`, `count_tokens`, rerank, audio, videos, the jobs
     /// surface, the raw tunnel — and a new one added on [`client`]
     /// instead of [`client_for`] fails in exactly one way: the Provider
-    /// Key's private CA is ignored on that endpoint only, while every
-    /// other endpoint for the same key keeps working.
+    /// Key's private CA and resolution address are ignored on that
+    /// endpoint only, while every other endpoint for the same key keeps
+    /// working.
     ///
     /// (#471 and #715 are the same lesson twice: a per-request mechanism
     /// wired into one member of this family and silently missing from the
@@ -74,8 +77,9 @@ mod tests {
         }
         assert!(
             offenders.is_empty(),
-            "these dispatch on the shared client, so `provider_key.tls` is \
-             ignored on that endpoint; use `http_client::client_for(pk.tls.as_ref())`:\n{}",
+            "these dispatch on the shared client, so the Provider Key's \
+             connection overrides are ignored on that endpoint; use \
+             `http_client::client_for(pk.upstream_connection().as_ref())`:\n{}",
             offenders.join("\n"),
         );
     }

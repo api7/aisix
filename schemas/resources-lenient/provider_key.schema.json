@@ -320,6 +320,19 @@
       ],
       "description": "Per-key request-shape overrides applied by supported provider paths before dispatch to the upstream provider."
     },
+    "resolve_addresses": {
+      "description": "IP addresses the gateway connects to for this key's `api_base` host, instead of resolving that host through DNS. Each entry is an IPv4 or IPv6 address literal, without a port and without brackets.\n\nUse this when the upstream is reached over a private link that has no DNS entry, while the provider still requires its own hostname in the request. Only the connection target changes: the `Host` header, the HTTP/2 `:authority`, the TLS server name and the certificate check all keep using the hostname from `api_base`, and the port and scheme keep coming from `api_base` too.\n\nSeveral addresses are tried in the order given, as a resolver's answer would be: the next one is attempted when a connection cannot be established, which is how a private link that terminates on one address per availability zone stays reachable when one is down.\n\nScoped to the `api_base` hostname and nothing else. An `apis` entry that serves a second protocol from the same host is reached over the same link, because it is the same hostname; one that names a different host is resolved normally. A key with no `api_base`, or whose `api_base` is already an address literal, has no hostname to override and is dispatched unchanged.\n\nHonoured on every surface that dispatches through the Provider Key's own client: chat completions, completions, embeddings, images, audio, `/v1/messages` (and `count_tokens`), `/v1/responses`, rerank, videos, the files/batches/fine-tuning surface and `/passthrough/*`. Not honoured for Amazon Bedrock or `/v1/realtime`, which connect on their own transports — the same two that `tls` does not reach.\n\nNot applicable when the gateway reaches its upstreams through a forward proxy (`HTTPS_PROXY` / `ALL_PROXY` in the gateway's environment): the proxy is given the hostname and resolves it itself, so nothing here is consulted.",
+      "items": {
+        "format": "ip",
+        "pattern": "^[0-9A-Fa-f:.]+$",
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": [
+        "array",
+        "null"
+      ]
+    },
     "response": {
       "anyOf": [
         {

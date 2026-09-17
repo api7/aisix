@@ -637,8 +637,10 @@ async fn dispatch(
 
     // ----- outbound request -----
 
-    let tls = pk_entry.as_ref().and_then(|pk| pk.value.tls.as_ref());
-    let http_client = crate::http_client::client_for(tls);
+    let conn = pk_entry
+        .as_ref()
+        .and_then(|pk| pk.value.upstream_connection());
+    let http_client = crate::http_client::client_for(conn.as_ref());
 
     // Strip set: protocol metadata always; per-mode credential handling.
     let mut strip: std::collections::HashSet<String> =
