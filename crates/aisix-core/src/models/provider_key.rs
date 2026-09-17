@@ -103,7 +103,7 @@ pub struct ProviderKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<ProviderKeyTls>,
 
-    /// IP address the gateway connects to for this key's base URL host,
+    /// IP address the gateway connects to for this key's `api_base` host,
     /// instead of resolving that host through DNS. Accepts an IPv4 or
     /// IPv6 address literal, without a port and without brackets.
     ///
@@ -111,13 +111,28 @@ pub struct ProviderKey {
     /// no DNS entry, while the provider still requires its own hostname in
     /// the request. Only the connection target changes: the `Host` header,
     /// the HTTP/2 `:authority`, the TLS server name and the certificate
-    /// check all keep using the hostname from the base URL, and the port
-    /// and scheme keep coming from the base URL too.
+    /// check all keep using the hostname from `api_base`, and the port and
+    /// scheme keep coming from `api_base` too.
     ///
-    /// Applies to the hosts this key names itself — `api_base`, and any
-    /// `apis` entry that declares its own `base`. A key that configures no
-    /// base URL, or whose base URL is already an address literal, has no
-    /// hostname to override and is dispatched unchanged.
+    /// Scoped to the `api_base` hostname and nothing else. An `apis` entry
+    /// that serves a second protocol from the same host is reached over
+    /// the same link, because it is the same hostname; one that names a
+    /// different host is resolved normally. A key with no `api_base`, or
+    /// whose `api_base` is already an address literal, has no hostname to
+    /// override and is dispatched unchanged.
+    ///
+    /// Honoured on every surface that dispatches through the Provider
+    /// Key's own client: chat completions, completions, embeddings,
+    /// images, audio, `/v1/messages` (and `count_tokens`), `/v1/responses`,
+    /// rerank, videos, the files/batches/fine-tuning surface and
+    /// `/passthrough/*`. Not honoured for Amazon Bedrock or `/v1/realtime`,
+    /// which connect on their own transports — the same two that
+    /// `tls` does not reach.
+    ///
+    /// Not applicable when the gateway reaches its upstreams through a
+    /// forward proxy (`HTTPS_PROXY` / `ALL_PROXY` in the gateway's
+    /// environment): the proxy is given the hostname and resolves it
+    /// itself, so nothing here is consulted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolve_address: Option<IpAddr>,
 
@@ -277,19 +292,31 @@ pub struct UpstreamConnection {
     pub resolve: Vec<(String, IpAddr)>,
 }
 
+impl UpstreamConnection {
+    /// Whether this leaves the connection exactly as the deployment-wide
+    /// settings would build it, so the shared pool can be reused.
+    ///
+    /// [`ProviderKey::upstream_connection`] already answers `None` in that
+    /// case, but the fields are public and the constructor is not the only
+    /// way to reach [`client_for_provider_key`]: a value that configures
+    /// nothing must not split the connection pool, and must not lose the
+    /// per-worker pool it would otherwise dispatch on.
+    ///
+    /// [`client_for_provider_key`]: https://docs.rs/aisix-gateway
+    pub fn is_noop(&self) -> bool {
+        self.resolve.is_empty() && self.tls.as_ref().is_none_or(ProviderKeyTls::is_noop)
+    }
+}
+
 impl ProviderKey {
     /// The overrides this key's upstream connections are made with, or
     /// `None` when it configures none — the overwhelmingly common case,
     /// and the one that must keep sharing the gateway's connection pool.
     pub fn upstream_connection(&self) -> Option<UpstreamConnection> {
         let tls = self.tls.clone().filter(|t| !t.is_noop());
-        let resolve: Vec<(String, IpAddr)> = match self.resolve_address {
-            Some(addr) => self
-                .configured_hosts()
-                .into_iter()
-                .map(|host| (host, addr))
-                .collect(),
-            None => Vec::new(),
+        let resolve: Vec<(String, IpAddr)> = match (self.resolve_address, self.base_hostname()) {
+            (Some(addr), Some(host)) => vec![(host, addr)],
+            _ => Vec::new(),
         };
         if tls.is_none() && resolve.is_empty() {
             return None;
@@ -297,43 +324,24 @@ impl ProviderKey {
         Some(UpstreamConnection { tls, resolve })
     }
 
-    /// The hostnames this key's own configuration names: `api_base`, plus
-    /// each `apis` entry that declares a base of its own. Deduplicated,
-    /// declaration order preserved.
+    /// The hostname `api_base` dials, if it names one.
     ///
-    /// A base that is already an address literal yields nothing — there is
-    /// no name to resolve, so a resolution override has nothing to act on.
-    fn configured_hosts(&self) -> Vec<String> {
-        let surface_bases = self
-            .apis
-            .iter()
-            .flat_map(|apis| [apis.responses.as_ref(), apis.messages.as_ref()])
-            .flatten()
-            .filter_map(|entry| entry.base.as_deref());
-        let mut hosts = Vec::new();
-        for base in std::iter::once(self.api_base.as_deref())
-            .flatten()
-            .chain(surface_bases)
-        {
-            if let Some(host) = base_hostname(base) {
-                if !hosts.contains(&host) {
-                    hosts.push(host);
-                }
-            }
+    /// Deliberately narrow. Resolving only what `api_base` names keeps the
+    /// override to the endpoint the operator pointed at: a second protocol
+    /// declared in `apis` on the SAME host is covered because it is the
+    /// same name, and one on a different host keeps resolving normally
+    /// rather than being silently redirected onto the private link.
+    ///
+    /// `None` for a base the gateway cannot parse as a URL, for one whose
+    /// authority is an address literal, and for a key with no base at all:
+    /// none of them has a name to resolve, so the connection is left
+    /// exactly as it was.
+    fn base_hostname(&self) -> Option<String> {
+        let base = self.api_base.as_deref()?.trim();
+        match url::Url::parse(base).ok()?.host()? {
+            url::Host::Domain(domain) => Some(domain.to_string()),
+            url::Host::Ipv4(_) | url::Host::Ipv6(_) => None,
         }
-        hosts
-    }
-}
-
-/// The registrable hostname a base URL dials, if it names one.
-///
-/// `None` for a base the gateway cannot parse as a URL, and for one whose
-/// authority is an address literal: both are handled by leaving the
-/// connection alone rather than by guessing.
-fn base_hostname(base: &str) -> Option<String> {
-    match url::Url::parse(base.trim()).ok()?.host()? {
-        url::Host::Domain(domain) => Some(domain.to_string()),
-        url::Host::Ipv4(_) | url::Host::Ipv6(_) => None,
     }
 }
 
@@ -664,28 +672,26 @@ mod tests {
         );
     }
 
-    /// The `apis` map can put a second protocol on a base of its own, and
-    /// a key reached over a private link reaches that one over the same
-    /// link. Each distinct hostname is registered once.
+    /// The override follows the NAME, so a second protocol declared on
+    /// the same host is covered by the same entry — and one on a
+    /// different host is deliberately not, rather than being silently
+    /// redirected onto the private link.
     #[test]
-    fn resolve_address_covers_every_base_the_key_declares() {
+    fn resolve_address_is_scoped_to_the_api_base_hostname() {
         let key = pk(serde_json::json!({
             "display_name": "two-surfaces",
             "api_key": "sk-x",
             "api_base": "https://vendor.example.com/v1",
             "apis": {
-                "messages": {"base": "https://anthropic.vendor.example.com/v1"},
-                "responses": {"base": "https://vendor.example.com/v1"},
+                "messages": {"base": "https://elsewhere.example.net/v1"},
+                "responses": {"base": "https://vendor.example.com/openai"},
             },
             "resolve_address": "2001:db8::5",
         }));
         let addr: IpAddr = "2001:db8::5".parse().unwrap();
         assert_eq!(
             key.upstream_connection().unwrap().resolve,
-            vec![
-                ("vendor.example.com".to_string(), addr),
-                ("anthropic.vendor.example.com".to_string(), addr),
-            ]
+            vec![("vendor.example.com".to_string(), addr)]
         );
     }
 

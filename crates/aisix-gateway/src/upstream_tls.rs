@@ -280,7 +280,7 @@ pub fn client_for_provider_key(
     shared: &reqwest::Client,
     conn: Option<&UpstreamConnection>,
 ) -> reqwest::Client {
-    let Some(conn) = conn else {
+    let Some(conn) = conn.filter(|c| !c.is_noop()) else {
         // On a thread-per-core worker, dispatch on that worker's own
         // pool: the upstream connection is then read by the same runtime
         // that is waiting for the response, instead of waking a thread
@@ -799,8 +799,14 @@ mod tests {
     /// dispatching on the bridge's own client, so nothing is cached.
     #[test]
     fn a_key_without_an_override_builds_no_dedicated_client() {
+        let noop = tls_conn(ProviderKeyTls::default());
         let _ = client_for_provider_key(&shared_client(), None);
-        assert!(!cached(&tls_conn(ProviderKeyTls::default())));
+        // Passed a profile that configures nothing — the shape a caller
+        // assembling `UpstreamConnection` by hand can produce — this must
+        // still land on the shared pool rather than build a client and
+        // split it.
+        let _ = client_for_provider_key(&shared_client(), Some(&noop));
+        assert!(!cached(&noop));
     }
 
     /// `resolve_address` is an override in its own right: a key that sets

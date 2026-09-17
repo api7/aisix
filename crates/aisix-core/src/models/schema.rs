@@ -1212,6 +1212,24 @@ pub fn provider_key_root_schema() -> Value {
         "Accepted as an alternative spelling of `api_key`. \
          Provide the credential under exactly one of the two names.",
     );
+    // `schemars` annotates `IpAddr` with `format: "ip"`, which nothing
+    // validates: `format` is an annotation in draft-07 and the compiled
+    // validators do not opt into checking it. Without a constraint the
+    // gate passes a hostname through and the row then dies at
+    // deserialization — where the whole Provider Key is skipped, taking
+    // every Model that references it with it. This charset is a superset
+    // of every address `IpAddr` parses, so it rejects nothing valid; what
+    // it catches is the mistake operators actually make, a hostname or a
+    // URL written where the address goes. The exact grammar (octet
+    // ranges, group counts) stays with the decoder.
+    schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .expect("provider_key schema has properties")
+        .get_mut("resolve_address")
+        .and_then(Value::as_object_mut)
+        .expect("provider_key schema declares resolve_address")
+        .insert("pattern".to_string(), json!("^[0-9A-Fa-f:.]+$"));
     schema
 }
 
