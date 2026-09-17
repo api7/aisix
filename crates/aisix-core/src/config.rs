@@ -2697,9 +2697,13 @@ managed:
             "not a url",
             "ftp://dpm.example.com",
         ] {
-            let err = load_with_cp_base_url(value)
-                .expect_err("{value} must not load")
-                .to_string();
+            let err = match load_with_cp_base_url(value) {
+                Ok(cfg) => panic!(
+                    "{value:?} must not load, got cp_base_url = {:?}",
+                    cfg.managed.cp_base_url
+                ),
+                Err(e) => e.to_string(),
+            };
             assert!(
                 err.contains("AISIX_MANAGED__CP_BASE_URL"),
                 "rejection for {value:?} must name the variable to fix, got: {err}"
