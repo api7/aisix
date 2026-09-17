@@ -434,15 +434,28 @@ fn normalise_cp_base_url(raw: &str) -> Result<String, BootstrapError> {
     // gateway elsewhere, as `mailto:user@example.com` does once it is
     // prefixed. The sibling `cp_etcd_endpoint` rejects `@` for the same
     // reason.
-    let authority_is_host_only = url::Url::parse(&qualified).ok().is_some_and(|u| {
-        u.host_str().is_some_and(|h| !h.is_empty())
-            && u.username().is_empty()
-            && u.password().is_none()
-    });
-    if !scheme_ok || !authority_ok || !authority_is_host_only {
+    let parsed = url::Url::parse(&qualified).ok();
+    let host_ok = parsed
+        .as_ref()
+        .and_then(|u| u.host_str().map(|h| !h.is_empty()))
+        .unwrap_or(false);
+    let has_userinfo = parsed
+        .as_ref()
+        .is_some_and(|u| !u.username().is_empty() || u.password().is_some());
+    if !scheme_ok || !authority_ok || !host_ok || has_userinfo {
+        // Every other rejection quotes what was written, because the
+        // operator has to see it to fix it. This one cannot: echoing a
+        // value whose whole problem is the credential in it would write
+        // that credential to the log this branch exists to keep it out
+        // of. The host survives, which is the part worth reading back.
+        let shown = if has_userinfo {
+            redact_userinfo(&qualified)
+        } else {
+            raw.to_string()
+        };
         return Err(BootstrapError::Config(format!(
             "managed.cp_base_url ({CP_BASE_URL_ENV}) must be an http(s) URL such as \
-             https://dpm.example.com:7944, got {raw:?}"
+             https://dpm.example.com:7944, got {shown:?}"
         )));
     }
     // Return the qualified *input* byte for byte, never
@@ -451,6 +464,23 @@ fn normalise_cp_base_url(raw: &str) -> Result<String, BootstrapError> {
     // from the same input. Trailing slash, path, query and case stay as
     // typed; the call sites own their own trailing-slash handling.
     Ok(qualified)
+}
+
+/// Replace the userinfo in `qualified` with `***`, keeping the scheme,
+/// host and everything after the authority.
+///
+/// Used only by the userinfo rejection, so the operator is told which
+/// host they pointed at without the rejection logging the credential.
+fn redact_userinfo(qualified: &str) -> String {
+    let Some((scheme, rest)) = qualified.split_once("://") else {
+        return qualified.to_string();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    match authority.rfind('@') {
+        Some(at) => format!("{scheme}://***{}{tail}", &authority[at..]),
+        None => qualified.to_string(),
+    }
 }
 
 /// Environment variable that sets `managed.cp_etcd_endpoint`.
@@ -2835,16 +2865,6 @@ managed:
             // A Windows-style separator is a `://` typo, and must not
             // be prefixed into a URL whose host is the literal "https".
             r"https:\\dpm.example.com",
-            // Credentials in the authority. dp-manager authenticates by
-            // mTLS alone, so these are never meaningful — and the
-            // heartbeat worker logs its URL, so accepting one would
-            // write a secret to INFO and to every failed beat's WARN.
-            "https://user:secret@dpm.example.com:7944",
-            "https://user@dpm.example.com:7944",
-            // Pasted from the wrong field: no `:/`, so the prefixed
-            // form parses to userinfo `mailto:user` with host
-            // `example.com`, and the gateway would quietly talk to it.
-            "mailto:user@example.com",
         ] {
             let err = match load_with_cp_base_url(value) {
                 Ok(cfg) => panic!(
@@ -2889,6 +2909,53 @@ managed:
 "#
         ));
         Config::load_from_path(Some(f.path()))
+    }
+
+    /// Credentials in the authority are rejected — dp-manager
+    /// authenticates a gateway by its mTLS client certificate alone, so
+    /// userinfo is never meaningful, and the heartbeat worker reports
+    /// its URL at INFO and repeats it in every failed beat's WARN.
+    ///
+    /// The rejection therefore has to break the rule every other
+    /// rejection follows: it quotes the host but not the credential,
+    /// because echoing the value verbatim would write the secret into
+    /// the log this branch exists to keep it out of.
+    #[test]
+    fn cp_base_url_rejects_credentials_without_echoing_them() {
+        let err = match load_with_cp_base_url("https://user:secret@dpm.example.com:7944") {
+            Ok(cfg) => panic!(
+                "a URL carrying credentials must not load, got cp_base_url = {:?}",
+                cfg.managed.cp_base_url
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("AISIX_MANAGED__CP_BASE_URL"),
+            "the rejection must name the variable to fix, got: {err}"
+        );
+        assert!(
+            err.contains("***@dpm.example.com:7944"),
+            "the rejection must still show which host was named, got: {err}"
+        );
+        assert!(
+            !err.contains("secret"),
+            "the rejection must not echo the credential, got: {err}"
+        );
+
+        // A username with no password is the same class of value.
+        let err = load_with_cp_base_url("https://user@dpm.example.com:7944")
+            .expect_err("a URL carrying a username must not load")
+            .to_string();
+        assert!(err.contains("***@dpm.example.com:7944"), "got: {err}");
+        assert!(!err.contains("user@"), "got: {err}");
+
+        // Pasted from the wrong field: no `:/`, so the prefixed form
+        // parses to userinfo `mailto:user` with host `example.com` —
+        // a gateway quietly talking to somewhere nobody chose.
+        let err = load_with_cp_base_url("mailto:user@example.com")
+            .expect_err("a mailto: address must not load")
+            .to_string();
+        assert!(err.contains("***@example.com"), "got: {err}");
     }
 
     #[test]
