@@ -2653,6 +2653,15 @@ managed:
             cfg.managed.cp_base_url.as_deref(),
             Some("https://127.0.0.1:7944")
         );
+        // A bracketed IPv6 literal survives the prefixing; an
+        // unbracketed one is ambiguous with the port separator and is
+        // rejected, the same way the etcd endpoint parser reads it.
+        let cfg = load_with_cp_base_url("[::1]:7944").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://[::1]:7944")
+        );
+        assert!(load_with_cp_base_url("::1:7944").is_err());
     }
 
     #[test]
