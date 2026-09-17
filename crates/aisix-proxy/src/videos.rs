@@ -1029,10 +1029,10 @@ struct VideoTarget {
     provider_label: String,
     base_url: String,
     secret: String,
-    /// The ProviderKey's TLS override, resolved with the target so every
-    /// round-trip on this surface (submit, poll, content fetch) dials the
-    /// endpoint under the same trust settings.
-    tls: Option<aisix_core::models::provider_key::ProviderKeyTls>,
+    /// The ProviderKey's connection overrides, resolved with the target so
+    /// every round-trip on this surface (submit, poll, content fetch)
+    /// dials the endpoint the same way.
+    conn: Option<aisix_core::models::provider_key::UpstreamConnection>,
     /// The ProviderKey's rendered `default_headers`, resolved once when the
     /// target is resolved so every round-trip on this surface (submit,
     /// poll, content fetch) sends the same set (AISIX-Cloud#1112).
@@ -1107,7 +1107,7 @@ fn resolve_video_target(
     let extra_headers = aisix_gateway::resolve_default_headers(&header_ctx);
     Ok(Ok(VideoTarget {
         pk_id: pk_entry.id.to_string(),
-        tls: pk_entry.value.tls.clone(),
+        conn: pk_entry.value.upstream_connection(),
         provider: video_provider,
         provider_label: provider.to_ascii_lowercase(),
         base_url,
@@ -1135,7 +1135,7 @@ async fn provider_call(
     body: Option<&serde_json::Value>,
     request_id: &str,
 ) -> Result<serde_json::Value, ProxyError> {
-    let client = crate::http_client::client_for(target.tls.as_ref());
+    let client = crate::http_client::client_for(target.conn.as_ref());
     let note = |e: aisix_gateway::BridgeError| {
         crate::cooldown::note_failure(
             &state.runtime_status,
@@ -1293,7 +1293,7 @@ async fn proxy_content(
     url: &str,
     request_id: &str,
 ) -> Result<Response, ProxyError> {
-    let client = crate::http_client::client_for(target.tls.as_ref());
+    let client = crate::http_client::client_for(target.conn.as_ref());
     // Same map-then-merge shape as `provider_call` — see the comment there
     // on why the gateway-owned names cannot be appended to.
     let mut headers = axum::http::HeaderMap::new();

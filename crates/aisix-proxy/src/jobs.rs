@@ -359,7 +359,8 @@ async fn send_upstream(
     body: UpstreamBody,
     request_id: &str,
 ) -> Result<(StatusCode, HeaderMap, Bytes), ProxyError> {
-    let client = crate::http_client::client_for(target.pk_entry.value.tls.as_ref());
+    let client =
+        crate::http_client::client_for(target.pk_entry.value.upstream_connection().as_ref());
     let mut builder = client.request(
         reqwest::Method::from_bytes(method.as_str().as_bytes())
             .map_err(|_| ProxyError::InvalidRequest("unsupported method".into()))?,
@@ -1898,7 +1899,7 @@ fn maybe_attribute_batch(
     let secret = target.secret.clone();
     let adapter = target.adapter;
     let api_base = target.pk_entry.value.api_base.clone();
-    let pk_tls = target.pk_entry.value.tls.clone();
+    let pk_conn = target.pk_entry.value.upstream_connection();
     let raw_batch_id = raw_batch_id.to_string();
 
     tokio::spawn(async move {
@@ -1915,7 +1916,7 @@ fn maybe_attribute_batch(
             &secret,
             adapter,
             api_base.as_deref(),
-            pk_tls.as_ref(),
+            pk_conn.as_ref(),
             &raw_batch_id,
             &output_file_id,
         )
@@ -1949,7 +1950,7 @@ async fn attribute_batch_usage(
     secret: &str,
     adapter: Adapter,
     api_base: Option<&str>,
-    tls: Option<&aisix_core::models::provider_key::ProviderKeyTls>,
+    conn: Option<&aisix_core::models::provider_key::UpstreamConnection>,
     raw_batch_id: &str,
     output_file_id: &str,
 ) -> Result<(), String> {
@@ -1976,7 +1977,7 @@ async fn attribute_batch_usage(
         }
     };
 
-    let client = crate::http_client::client_for(tls);
+    let client = crate::http_client::client_for(conn);
     let mut builder = client.get(&url).timeout(BATCH_ATTRIBUTION_TIMEOUT);
     builder = match adapter {
         Adapter::AzureOpenai => builder.header("api-key", secret),

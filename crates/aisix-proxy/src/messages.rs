@@ -1318,7 +1318,7 @@ async fn anthropic_passthrough_dispatch(
         &crate::dispatch::upstream_header_ctx(pk_value, pk_id, model, model_id, client_ctx),
     );
 
-    let client = crate::http_client::client_for(pk_value.tls.as_ref());
+    let client = crate::http_client::client_for(pk_value.upstream_connection().as_ref());
     let mut req_builder = url.post_on(&client).headers(headers).json(&body);
     // #554: non-streaming gets the E2E request timeout via reqwest's
     // request-level timeout. Streaming must NOT use it (it would cap the

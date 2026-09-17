@@ -710,7 +710,7 @@ async fn count_tokens_to_target(
         ),
     );
 
-    let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
+    let client = crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
     let mut req = url.post_on(&client).headers(headers).json(&body);
     // #554: count_tokens is non-streaming; apply the E2E request timeout.
     if let Some(d) = timeouts.request {

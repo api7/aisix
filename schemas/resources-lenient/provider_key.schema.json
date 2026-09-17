@@ -320,6 +320,14 @@
       ],
       "description": "Per-key request-shape overrides applied by supported provider paths before dispatch to the upstream provider."
     },
+    "resolve_address": {
+      "description": "IP address the gateway connects to for this key's base URL host, instead of resolving that host through DNS. Accepts an IPv4 or IPv6 address literal, without a port and without brackets.\n\nUse this when the upstream is reached over a private link that has no DNS entry, while the provider still requires its own hostname in the request. Only the connection target changes: the `Host` header, the HTTP/2 `:authority`, the TLS server name and the certificate check all keep using the hostname from the base URL, and the port and scheme keep coming from the base URL too.\n\nApplies to the hosts this key names itself — `api_base`, and any `apis` entry that declares its own `base`. A key that configures no base URL, or whose base URL is already an address literal, has no hostname to override and is dispatched unchanged.",
+      "format": "ip",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "response": {
       "anyOf": [
         {
