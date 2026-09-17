@@ -21,9 +21,11 @@
 #
 # `CP_BASE_URL` may omit the scheme — a bare `host:port` is read as
 # `https://host:port`. Set `http://` explicitly for a plaintext control
-# plane. A value that is not an http(s) URL fails the boot rather than
-# being carried into the heartbeat, telemetry and budget-check calls.
-# `CP_ETCD_ENDPOINT` is different: it is always bare `host:port`.
+# plane. Anything else fails the boot rather than being carried into the
+# heartbeat, telemetry and budget-check calls: the scheme, when written
+# out, must be exactly `http://` or `https://` in lower case, and the
+# rest must be a real host — an unreplaced `<placeholder>` is rejected
+# too. `CP_ETCD_ENDPOINT` is different: it is always bare `host:port`.
 #
 # Plus optionally `AISIX_PROXY__ADDR`, `AISIX_OBSERVABILITY__LOG_LEVEL`,
 # `AISIX_CACHE__BACKEND`, etc. — every config field is reachable via

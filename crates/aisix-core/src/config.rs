@@ -388,26 +388,39 @@ fn normalise_cp_base_url(raw: &str) -> Result<String, BootstrapError> {
     if trimmed.is_empty() {
         return Ok(trimmed.to_string());
     }
-    // A value that already names a scheme keeps it — including a
-    // misspelt one, which is then reported as the typo it is rather
-    // than silently prefixed into `https://htts://host`.
-    let qualified = if trimmed.contains("://") {
+    // A value that already attempts a scheme keeps it, so a misspelt
+    // one is reported as the typo it is rather than prefixed into
+    // `https://htts://host`. The probe is `:/`, not `://`: a
+    // single-slash `https:/host` would otherwise become
+    // `https://https:/host`, which parses to the host "https" and
+    // would have sailed through.
+    let qualified = if trimmed.contains(":/") {
         trimmed.to_string()
     } else {
         format!("https://{trimmed}")
     };
-    let parsed = url::Url::parse(&qualified).ok().filter(|u| {
-        matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty())
-    });
-    if parsed.is_none() {
+    // The scheme check is a byte comparison, not `Url::scheme()`: the
+    // url crate normalises `HTTPS://host` and accepts `https:/host`,
+    // while `derive_cp_etcd_url` strips the scheme case-sensitively —
+    // so an uppercase scheme would serve the REST calls and silently
+    // break the etcd dial, the mirror image of the bug this function
+    // exists to prevent.
+    let scheme_ok = qualified.starts_with("http://") || qualified.starts_with("https://");
+    let host_ok = url::Url::parse(&qualified)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| !h.is_empty()))
+        .unwrap_or(false);
+    if !scheme_ok || !host_ok {
         return Err(BootstrapError::Config(format!(
             "managed.cp_base_url ({CP_BASE_URL_ENV}) must be an http(s) URL such as \
              https://dpm.example.com:7944, got {raw:?}"
         )));
     }
-    // Return the qualified *input*, not `Url::to_string()`: the latter
-    // appends a root path to an origin, and the call sites own their
-    // own trailing-slash handling.
+    // Return the qualified *input* byte for byte, never
+    // `Url::to_string()`: the latter appends a root path to an origin
+    // and re-encodes, and the control plane must derive the same bytes
+    // from the same input. Trailing slash, path, query and case stay as
+    // typed; the call sites own their own trailing-slash handling.
     Ok(qualified)
 }
 
@@ -2662,6 +2675,13 @@ managed:
             Some("https://[::1]:7944")
         );
         assert!(load_with_cp_base_url("::1:7944").is_err());
+        // A path on a scheme-less value is still scheme-less: the `:/`
+        // probe must not mistake the port separator for a scheme.
+        let cfg = load_with_cp_base_url("dpm.example.com:7944/path").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://dpm.example.com:7944/path")
+        );
     }
 
     #[test]
@@ -2697,14 +2717,28 @@ managed:
 
     #[test]
     fn cp_base_url_rejects_a_value_that_is_not_an_http_url() {
-        // A misspelt scheme is reported as the typo it is rather than
-        // being prefixed into `https://htts://host`; a value that is no
-        // URL at all fails the same way. Both used to boot fine and
-        // then deny every request at runtime.
+        // Each of these used to boot fine and then deny every request
+        // at runtime. Grouped by what they get wrong:
+        //
+        // - a misspelt or non-http scheme, which must be reported as
+        //   the typo it is rather than prefixed into `https://htts://…`;
+        // - a slash count that is off, where the naive `://` probe
+        //   would have produced `https://https:/host` — a URL whose
+        //   host is "https" — and let it through;
+        // - an uppercase scheme, which the REST calls tolerate but
+        //   `derive_cp_etcd_url` strips case-sensitively, so it would
+        //   break the etcd dial instead;
+        // - the shipped placeholder left unreplaced, which can never
+        //   reach a control plane whichever way it is read;
+        // - a value that is no URL at all.
         for value in [
             "htts://dpm.example.com",
-            "not a url",
             "ftp://dpm.example.com",
+            "https:/dpm.example.com:7944",
+            "https:dpm.example.com:7944",
+            "HTTPS://dpm.example.com:7944",
+            "https://<your-dp-manager>:7944",
+            "not a url",
         ] {
             let err = match load_with_cp_base_url(value) {
                 Ok(cfg) => panic!(
