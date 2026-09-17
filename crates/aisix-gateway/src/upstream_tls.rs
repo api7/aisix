@@ -271,11 +271,12 @@ fn worker_client() -> Option<reqwest::Client> {
 /// is the overwhelmingly common case and the one that must keep sharing
 /// the bridge's pool.
 ///
-/// A malformed `ca_cert` falls back to `shared` with a logged error
-/// rather than to a client that trusts less than the operator asked
-/// for — the request then fails against the private endpoint, which is
-/// the same visible outcome as not having configured anything, and is
-/// preferable to quietly proceeding.
+/// A malformed `ca_cert` falls back with a logged error rather than to a
+/// client that trusts less than the operator asked for — the request then
+/// fails against the private endpoint, which is the same visible outcome
+/// as not having configured anything, and is preferable to quietly
+/// proceeding. What it falls back TO depends on whether the key also
+/// names addresses: see the error arms below.
 pub fn client_for_provider_key(
     shared: &reqwest::Client,
     conn: Option<&UpstreamConnection>,
@@ -294,13 +295,42 @@ pub fn client_for_provider_key(
     }
     match build_provider_key_client(conn) {
         Ok(client) => cache.entry(conn.clone()).or_insert(client).clone(),
-        Err(e) => {
+        Err(e) if conn.resolve.is_empty() => {
             tracing::error!(
                 error = %e,
-                "provider_key connection settings could not be applied; \
-                 falling back to the deployment's defaults"
+                "provider_key.tls could not be applied; falling back to the \
+                 deployment's trust settings"
             );
             shared.clone()
+        }
+        Err(e) => {
+            // With an address override configured, the shared client is
+            // NOT a safe fallback: it resolves the hostname through DNS,
+            // so a key whose trust material failed to load would carry
+            // its credential to whatever public DNS answers instead of to
+            // the private endpoint the operator named — reaching a
+            // different server, and succeeding while doing it.
+            //
+            // Keep the resolution and drop only the part that failed. The
+            // request then reaches the configured address and fails its
+            // certificate check there, which is the same visible outcome
+            // as not having configured any trust material.
+            tracing::error!(
+                error = %e,
+                "provider_key.tls could not be applied; dispatching to \
+                 resolve_addresses on the deployment's trust settings, \
+                 where this endpoint is expected to fail verification"
+            );
+            let resolution_only = UpstreamConnection {
+                tls: None,
+                resolve: conn.resolve.clone(),
+            };
+            // `resolve_to_addrs` cannot fail, so the only way this second
+            // build fails is a TLS backend that would not initialise —
+            // which `shared` could not have been built over either.
+            build_provider_key_client(&resolution_only)
+                .map(|client| cache.entry(resolution_only).or_insert(client).clone())
+                .unwrap_or_else(|_| shared.clone())
         }
     }
 }
@@ -910,6 +940,31 @@ mod tests {
         };
         let _ = client_for_provider_key(&shared_client(), Some(&tls_conn(tls.clone())));
         assert!(!cached(&tls_conn(tls)));
+    }
+
+    /// The same failure, on a key that also names addresses, must NOT
+    /// land on the shared client: that one resolves the hostname through
+    /// DNS, so the key's credential would go to whatever public DNS
+    /// answers rather than to the private endpoint — and would very
+    /// likely get there. The resolution survives; only the trust material
+    /// that failed to load is dropped.
+    #[test]
+    fn a_malformed_ca_cert_beside_an_address_override_keeps_the_addresses() {
+        let tls = ProviderKeyTls {
+            ca_cert: Some("-----BEGIN CERTIFICATE-----\nbad\n-----END CERTIFICATE-----\n".into()),
+            verify: true,
+        };
+        let addresses = resolve_conn("vendor-failclosed.invalid", &["192.0.2.31"]);
+        let conn = UpstreamConnection {
+            tls: Some(tls),
+            resolve: addresses.resolve.clone(),
+        };
+        let _ = client_for_provider_key(&shared_client(), Some(&conn));
+        assert!(!cached(&conn), "the unbuildable profile must not be cached");
+        assert!(
+            cached(&addresses),
+            "the request must still be dispatched to the configured addresses"
+        );
     }
 
     /// `verify: false` alone is a real override — no CA, but a different
