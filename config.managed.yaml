@@ -90,9 +90,9 @@ proxy:
   #   key_file:  "/etc/aisix/tls/proxy.key"
   # Several proxy listeners, each with its own optional TLS — HTTPS and
   # plaintext HTTP served at the same time. Set, this is the COMPLETE set
-  # of proxy listeners: `addr` above is then ignored and nothing binds it
-  # (it stays required, and the gateway logs one line at startup saying it
-  # is ignored), and `tls` above must be absent — a certificate that would
+  # of proxy listeners: only the addresses listed here are bound, `addr`
+  # above is ignored (it stays required, and the gateway logs one line at
+  # startup saying so), and `tls` above must be absent — a certificate that would
   # apply to no listener is a configuration error. A managed deployment
   # reaches this through the environment rather than by editing this file,
   # as one JSON array:

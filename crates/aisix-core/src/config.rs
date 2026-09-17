@@ -2184,17 +2184,38 @@ impl Config {
         // asked for.
         if !self.proxy.listeners.is_empty() && self.proxy.tls.is_some() {
             return Err(BootstrapError::Config(
-                "proxy.tls cannot be combined with proxy.listeners: proxy.tls                  configures the single listener proxy.addr describes, which                  proxy.listeners replaces — move the certificate into the                  proxy.listeners entry that should serve it"
+                "proxy.tls cannot be combined with proxy.listeners: proxy.tls \
+                 configures the single listener proxy.addr describes, which \
+                 proxy.listeners replaces — move the certificate into the \
+                 proxy.listeners entry that should serve it"
                     .into(),
             ));
         }
+        let mut bound: Vec<std::net::SocketAddr> = Vec::new();
         for (i, listener) in self.proxy.listeners.iter().enumerate() {
-            if listener.addr.parse::<std::net::SocketAddr>().is_err() {
+            let Ok(addr) = listener.addr.parse::<std::net::SocketAddr>() else {
                 return Err(BootstrapError::Config(format!(
                     "proxy.listeners[{i}].addr invalid socket address: {}",
                     listener.addr
                 )));
+            };
+            // A repeated address does NOT report itself at the bind. The
+            // thread-per-core listeners set `SO_REUSEPORT`, so two entries
+            // on one address co-bind happily and the kernel then hands
+            // each connection to whichever entry's accept loop it picks —
+            // a port that answers TLS or plaintext at random when the two
+            // entries differ in `tls`. On the shared runtime it is an
+            // `EADDRINUSE` raised after the first-configuration gate,
+            // which is exactly the arbitrarily-late failure the boot probe
+            // exists to prevent (and the probe cannot see it either: it
+            // drops each socket before binding the next).
+            if let Some(first) = bound.iter().position(|seen| *seen == addr) {
+                return Err(BootstrapError::Config(format!(
+                    "proxy.listeners[{i}].addr {addr} is already bound by \
+                     proxy.listeners[{first}] — each listener needs its own address"
+                )));
             }
+            bound.push(addr);
         }
         if let Err(bad) = self.proxy.real_ip.parse_trusted() {
             return Err(BootstrapError::Config(format!(
@@ -3677,6 +3698,30 @@ admin:
                 format!("{err}").contains("proxy.listeners[1].addr invalid socket address"),
                 "{err}",
             );
+        }
+
+        #[test]
+        fn a_repeated_address_is_rejected_naming_both_entries() {
+            // SO_REUSEPORT lets the thread-per-core listeners co-bind a
+            // repeated address, so nothing downstream of here would fail:
+            // the port would just answer whichever entry's accept loop the
+            // kernel picked, TLS or plaintext, per connection.
+            let err = config_with(
+                r#"  addr: "0.0.0.0:3000"
+  listeners:
+    - addr: "0.0.0.0:3443"
+      tls:
+        cert_file: "/c.pem"
+        key_file: "/k.pem"
+    - addr: "0.0.0.0:3443""#,
+            )
+            .expect_err("a repeated listener address must be rejected");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("proxy.listeners[1].addr 0.0.0.0:3443"),
+                "{msg}"
+            );
+            assert!(msg.contains("proxy.listeners[0]"), "{msg}");
         }
 
         #[test]

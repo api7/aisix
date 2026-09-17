@@ -65,10 +65,10 @@ proxy:
   #   key_file:  "/etc/aisix/tls/proxy.key"
   # Several proxy listeners, each with its own optional TLS — for a
   # deployment that has to answer HTTPS and plaintext HTTP at the same
-  # time. Set, this is the COMPLETE set of proxy listeners: `addr` above
-  # is then ignored and nothing binds it (it stays a required field, and
-  # the gateway logs one line at startup saying it is ignored), and
-  # `tls` above must be absent — a certificate that would apply to no
+  # time. Set, this is the COMPLETE set of proxy listeners: only the
+  # addresses listed here are bound, `addr` above is ignored (it stays a
+  # required field, and the gateway logs one line at startup saying so),
+  # and `tls` above must be absent — a certificate that would apply to no
   # listener is a configuration error, not something to drop silently.
   # Put the certificate on the entry that should serve it. Every
   # listener serves the same routes and the same configuration.

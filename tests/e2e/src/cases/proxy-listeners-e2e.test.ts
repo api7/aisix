@@ -157,6 +157,23 @@ describe("proxy.listeners e2e: HTTPS and plaintext HTTP side by side", () => {
     expect(ok).toBe(false);
   });
 
+  test("a cert that will not load names the listener entry it was written on", async (ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    // The generic name for this material is `proxy.tls`, which is the one
+    // field a listener set may NOT carry — pointing the operator at it
+    // would send them to a field the gateway rejects outright.
+    const failure = await spawnApp({
+      proxyListeners: [
+        { tls: { cert_file: "/nonexistent/aisix-e2e.crt", key_file: "/nonexistent/aisix-e2e.key" } },
+        {},
+      ],
+    }).then(
+      (app) => app.exit().then(() => "started"),
+      (err: Error) => err.message,
+    );
+    expect(failure).toContain("proxy.listeners[0].tls: failed to load");
+  }, 60_000);
+
   test("proxy.addr is reported ignored, and nothing listens on it", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
 

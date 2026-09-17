@@ -1375,9 +1375,18 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
              proxy.listeners is the complete set of proxy listeners",
         );
     }
-    let mut proxy_binds: Vec<(std::net::SocketAddr, Option<aisix_core::TlsConfig>)> = Vec::new();
-    for listener in cfg.proxy.resolved_listeners() {
-        proxy_binds.push((listener.addr.parse()?, listener.tls));
+    let shorthand = cfg.proxy.listeners.is_empty();
+    let mut proxy_binds: Vec<ListenerBind> = Vec::new();
+    for (i, listener) in cfg.proxy.resolved_listeners().into_iter().enumerate() {
+        proxy_binds.push(ListenerBind {
+            addr: listener.addr.parse()?,
+            tls: listener.tls,
+            tls_field: if shorthand {
+                "proxy.tls".to_string()
+            } else {
+                format!("proxy.listeners[{i}].tls")
+            },
+        });
     }
     let proxy_workers = cfg
         .proxy
@@ -1394,16 +1403,17 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // never, on a gateway still waiting for its first configuration. Same
     // pattern, and the same benign re-bind gap, as the metrics listener's
     // probe above.
-    for (addr, tls) in &proxy_binds {
+    for bind in &proxy_binds {
+        let addr = &bind.addr;
         std::net::TcpListener::bind(addr)
             .map_err(|e| anyhow::anyhow!("proxy listener bind {addr} failed: {e}"))?;
-        if let Some(tls) = tls.as_ref() {
-            downstream_tls_acceptor(tls, "proxy").await?;
+        if let Some(tls) = bind.tls.as_ref() {
+            downstream_tls_acceptor(tls, &bind.tls_field).await?;
         }
     }
     let proxy_addrs = proxy_binds
         .iter()
-        .map(|(addr, _)| addr.to_string())
+        .map(|bind| bind.addr.to_string())
         .collect::<Vec<_>>()
         .join(", ");
     let proxy_drain = livez_state.clone();
@@ -2162,7 +2172,11 @@ async fn serve_http(
     drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
 ) -> anyhow::Result<()> {
     serve_listeners(
-        vec![(addr, tls)],
+        vec![ListenerBind {
+            addr,
+            tls,
+            tls_field: format!("{label}.tls"),
+        }],
         router,
         idle_timeout,
         shutdown,
@@ -2171,6 +2185,14 @@ async fn serve_http(
         drain,
     )
     .await
+}
+
+/// One listener to bind: its address, its optional TLS material, and the
+/// configuration path that material was written at.
+struct ListenerBind {
+    addr: std::net::SocketAddr,
+    tls: Option<aisix_core::TlsConfig>,
+    tls_field: String,
 }
 
 /// Serve `router` on every listener in `binds`, each with its own
@@ -2183,7 +2205,7 @@ async fn serve_http(
 /// pass a single element through [`serve_http`].
 #[allow(clippy::too_many_arguments)]
 async fn serve_listeners(
-    binds: Vec<(std::net::SocketAddr, Option<aisix_core::TlsConfig>)>,
+    binds: Vec<ListenerBind>,
     router: axum::Router,
     idle_timeout: Option<Duration>,
     shutdown: ShutdownWatch,
@@ -2194,12 +2216,12 @@ async fn serve_listeners(
     // Resolved before binding so a bad cert path still fails with the
     // same error it always did, before a port is taken.
     let mut resolved = Vec::with_capacity(binds.len());
-    for (addr, tls) in binds {
-        let tls = match tls {
-            Some(tls) => Some(downstream_tls_acceptor(&tls, label).await?),
+    for bind in binds {
+        let tls = match bind.tls {
+            Some(tls) => Some(downstream_tls_acceptor(&tls, &bind.tls_field).await?),
             None => None,
         };
-        resolved.push((addr, tls));
+        resolved.push((bind.addr, tls));
     }
 
     // Thread-per-core serving is the proxy's; the admin and metrics
@@ -2233,9 +2255,9 @@ async fn serve_listeners(
 
     // Each listener runs the same accept loop the single one always did,
     // on its own task — the shape the admin listener has had all along.
-    let mut serving = Vec::with_capacity(listeners.len());
+    let mut serving = tokio::task::JoinSet::new();
     for (listener, tls) in listeners {
-        serving.push(tokio::spawn(accept_loop(
+        serving.spawn(accept_loop(
             listener,
             router.clone(),
             tls,
@@ -2243,17 +2265,39 @@ async fn serve_listeners(
             shutdown.clone(),
             label,
             drain.clone(),
-        )));
+        ));
     }
-    for handle in serving {
-        handle
-            .await
-            .map_err(|e| anyhow::anyhow!("{label} listener task join error: {e}"))??;
+    join_listeners(serving, label).await
+}
+
+/// Wait for every listener task, surfacing the FIRST failure rather than
+/// the first task in order.
+///
+/// A listener that fails on its own — a panic, or an accept loop that
+/// returns `Err` — has to bring the process down, exactly as it did when
+/// there was one. Awaiting the handles in order would hold that failure
+/// until the listener ahead of it finished, which is at shutdown: the
+/// gateway would go on answering `/livez` while one of its ports had
+/// silently stopped accepting.
+async fn join_listeners(
+    mut serving: tokio::task::JoinSet<anyhow::Result<()>>,
+    label: &'static str,
+) -> anyhow::Result<()> {
+    while let Some(joined) = serving.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(anyhow::anyhow!("{label} listener task join error: {e}")),
+        }
     }
     Ok(())
 }
 
 /// Build the downstream TLS acceptor from the configured PEM files.
+///
+/// `field` is the configuration path the material came from —
+/// `proxy.listeners[1].tls` rather than a generic `proxy.tls`, so a cert
+/// that will not load names the field the operator actually wrote.
 ///
 /// ALPN offers `h2` ahead of `http/1.1`, which is what the gateway has
 /// always advertised — a downstream that prefers HTTP/2 has to keep
@@ -2261,11 +2305,11 @@ async fn serve_listeners(
 /// negotiating h2; this is the server side, and it does offer it.)
 async fn downstream_tls_acceptor(
     tls: &aisix_core::TlsConfig,
-    label: &'static str,
+    field: &str,
 ) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
     let failed = |e: String| {
         anyhow::anyhow!(
-            "{label}.tls: failed to load cert_file={:?} / key_file={:?}: {e}",
+            "{field}: failed to load cert_file={:?} / key_file={:?}: {e}",
             tls.cert_file,
             tls.key_file,
         )
@@ -2745,7 +2789,7 @@ fn run_tpc_worker(
     rt.block_on(async move {
         // This worker's share of every configured listener, accepted
         // concurrently on its own runtime.
-        let mut serving = Vec::with_capacity(listeners.len());
+        let mut serving = tokio::task::JoinSet::new();
         for WorkerListener {
             addr,
             listener,
@@ -2760,7 +2804,7 @@ fn run_tpc_worker(
                     tracing::info!(%addr, label, worker, "aisix listening (https, thread-per-core)")
                 }
             }
-            serving.push(tokio::spawn(accept_loop(
+            serving.spawn(accept_loop(
                 listener,
                 router.clone(),
                 tls,
@@ -2768,14 +2812,9 @@ fn run_tpc_worker(
                 shutdown.clone(),
                 label,
                 drain.clone(),
-            )));
+            ));
         }
-        for handle in serving {
-            handle
-                .await
-                .map_err(|e| anyhow::anyhow!("{label} listener task join error: {e}"))??;
-        }
-        Ok(())
+        join_listeners(serving, label).await
     })
 }
 
