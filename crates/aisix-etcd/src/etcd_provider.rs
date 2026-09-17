@@ -969,6 +969,88 @@ mod tests {
         );
     }
 
+    async fn assert_supervisor_cancels_unanswered_rpc(hang_watch: bool) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+        let (reset_tx, reset_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut conn = h2::server::handshake(socket).await.unwrap();
+            let mut received_tx = Some(received_tx);
+            let mut reset_tx = Some(reset_tx);
+            let mut handlers = tokio::task::JoinSet::new();
+            while let Some(Ok((request, mut respond))) = conn.accept().await {
+                let range = request.uri().path() == "/etcdserverpb.KV/Range";
+                assert!(range || request.uri().path() == "/etcdserverpb.Watch/Watch");
+                let response = http::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/grpc")
+                    .body(())
+                    .unwrap();
+                let mut body = respond.send_response(response, false).unwrap();
+                if hang_watch && range {
+                    // RangeResponse{header: ResponseHeader{revision: 1}},
+                    // prefixed by the uncompressed gRPC message length.
+                    body.send_data(vec![0, 0, 0, 0, 4, 0x0a, 2, 0x18, 1].into(), false)
+                        .unwrap();
+                    let mut trailers = http::HeaderMap::new();
+                    trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+                    body.send_trailers(trailers).unwrap();
+                } else {
+                    received_tx.take().unwrap().send(()).unwrap();
+                    let reset_tx = reset_tx.take().unwrap();
+                    handlers.spawn(async move {
+                        let reset = futures::future::poll_fn(|cx| body.poll_reset(cx)).await;
+                        let _ = reset_tx.send(reset);
+                        drop(request);
+                    });
+                }
+            }
+            handlers.abort_all();
+        });
+        let provider = Arc::new(
+            EtcdConfigProvider::connect(&[endpoint], "/aisix", None, None, None)
+                .await
+                .unwrap(),
+        );
+        let supervisor = Arc::new(crate::Supervisor::new(provider, "/aisix"));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let mut run = tokio::spawn(supervisor.clone().run(cancel_rx));
+        tokio::time::timeout(Duration::from_secs(5), received_rx)
+            .await
+            .expect("the intended RPC must reach the real HTTP/2 server")
+            .unwrap();
+        assert_eq!(supervisor.config_status().is_ready(), hang_watch);
+
+        cancel_tx.send(true).unwrap();
+        let stopped = tokio::time::timeout(Duration::from_secs(2), &mut run).await;
+        if stopped.is_err() {
+            run.abort();
+            server.abort();
+        }
+        stopped
+            .expect("shutdown must cancel an unanswered RPC without a request timeout")
+            .unwrap();
+        let reset = tokio::time::timeout(Duration::from_secs(2), reset_rx)
+            .await
+            .expect("cancellation must reach the remote RPC")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reset, h2::Reason::CANCEL);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn supervisor_shutdown_cancels_an_unanswered_initial_range() {
+        assert_supervisor_cancels_unanswered_rpc(false).await;
+    }
+
+    #[tokio::test]
+    async fn supervisor_shutdown_cancels_an_unconfirmed_watch_create() {
+        assert_supervisor_cancels_unanswered_rpc(true).await;
+    }
+
     #[test]
     fn expiry_reports_the_call_and_the_key_that_bounded_it() {
         // An expiry has to reach the operator as a diagnosable failure,
