@@ -954,6 +954,7 @@ mod tests {
             request_id: Default::default(),
             url_rewrites: Vec::new(),
             tls: None,
+            listeners: Vec::new(),
             thread_per_core: None,
             workers: None,
         }

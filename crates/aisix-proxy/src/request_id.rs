@@ -374,6 +374,7 @@ mod tests {
                 addr: "127.0.0.1:0".into(),
                 request_body_limit_bytes: 1_048_576,
                 tls: None,
+                listeners: Vec::new(),
                 real_ip: Default::default(),
                 request_id: RequestIdConfig {
                     accept_headers: accept_headers.iter().map(|s| (*s).to_owned()).collect(),

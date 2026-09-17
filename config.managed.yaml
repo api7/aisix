@@ -84,6 +84,25 @@ proxy:
   # 0 = no request-body cap (the default); set a value to bound
   # per-request memory.
   # request_body_limit_bytes: 0
+  # TLS on the single listener `addr` describes.
+  # tls:
+  #   cert_file: "/etc/aisix/tls/proxy.crt"
+  #   key_file:  "/etc/aisix/tls/proxy.key"
+  # Several proxy listeners, each with its own optional TLS — HTTPS and
+  # plaintext HTTP served at the same time. Set, this is the COMPLETE set
+  # of proxy listeners: only the addresses listed here are bound, `addr`
+  # above is ignored (it stays required, and the gateway logs one line at
+  # startup saying so), and `tls` above must be absent — a certificate that would
+  # apply to no listener is a configuration error. A managed deployment
+  # reaches this through the environment rather than by editing this file,
+  # as one JSON array:
+  # AISIX_PROXY__LISTENERS='[{"addr":"0.0.0.0:3443","tls":{"cert_file":"/etc/aisix/tls/proxy.crt","key_file":"/etc/aisix/tls/proxy.key"}},{"addr":"0.0.0.0:3000"}]'
+  # listeners:
+  #   - addr: "0.0.0.0:3443"
+  #     tls:
+  #       cert_file: "/etc/aisix/tls/proxy.crt"
+  #       key_file:  "/etc/aisix/tls/proxy.key"
+  #   - addr: "0.0.0.0:3000"
   # Serving topology; on for Linux by default. A managed deployment
   # reaches these through the environment rather than by editing this
   # file: AISIX_PROXY__THREAD_PER_CORE, AISIX_PROXY__WORKERS.

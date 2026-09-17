@@ -649,6 +649,11 @@ impl EtcdConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
+    /// The single proxy listener's address — the shorthand form, and the
+    /// only one until `listeners` was added. Required either way: the
+    /// shipped chart injects `AISIX_PROXY__ADDR` unconditionally, so a
+    /// deployment that lists its listeners explicitly still carries it.
+    /// It is then ignored, and nothing binds it.
     pub addr: String,
     /// Cap on inbound request bodies across the whole proxy surface
     /// (JSON, multipart, passthrough, MCP, A2A). `0` — the default —
@@ -660,8 +665,28 @@ pub struct ProxyConfig {
     /// the caller's error envelope.
     #[serde(default = "ProxyConfig::default_body_limit")]
     pub request_body_limit_bytes: usize,
+    /// TLS for the listener `addr` binds. Part of the shorthand form, so
+    /// it cannot be combined with a non-empty `listeners` — a certificate
+    /// that would apply to nothing is a configuration error rather than
+    /// something to drop silently.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+    /// The complete set of proxy listeners, for a deployment that needs
+    /// more than one — serving HTTPS and plaintext HTTP side by side, say
+    /// (AISIX-Cloud#1662). Empty, the default, means the single listener
+    /// described by `addr` + `tls`.
+    ///
+    /// Non-empty, it replaces that listener entirely: `addr` is not bound
+    /// and `tls` must be absent. Every listener serves the same router and
+    /// the same application state; TLS, ALPN and the drain are per
+    /// listener.
+    ///
+    /// Env-only deployments (the chart injects config purely through
+    /// `AISIX_*` vars, which cannot express a structured list) set the
+    /// whole set as one JSON array:
+    /// `AISIX_PROXY__LISTENERS='[{"addr":"0.0.0.0:3443","tls":{"cert_file":"/c.pem","key_file":"/k.pem"}},{"addr":"0.0.0.0:3000"}]'`.
+    #[serde(default, deserialize_with = "deserialize_proxy_listeners")]
+    pub listeners: Vec<ProxyListener>,
     /// Real-client-IP resolution from forwarded headers (#492). Default
     /// trusts nothing, so the logged source IP is always the immediate
     /// TCP peer. Configure `trusted_proxies` when the gateway sits behind
@@ -722,6 +747,20 @@ pub struct ProxyConfig {
 impl ProxyConfig {
     const fn default_body_limit() -> usize {
         0
+    }
+
+    /// The listeners the proxy actually binds, resolving the shorthand
+    /// form. One function so the bind path, the validation and the tests
+    /// cannot disagree about which listeners a configuration describes.
+    pub fn resolved_listeners(&self) -> Vec<ProxyListener> {
+        if self.listeners.is_empty() {
+            vec![ProxyListener {
+                addr: self.addr.clone(),
+                tls: self.tls.clone(),
+            }]
+        } else {
+            self.listeners.clone()
+        }
     }
 
     /// Whether the proxy serves from thread-per-core workers, resolving
@@ -813,6 +852,13 @@ where
     D: serde::Deserializer<'de>,
 {
     deserialize_seq_or_json_string(deserializer, "url_rewrites")
+}
+
+fn deserialize_proxy_listeners<'de, D>(deserializer: D) -> Result<Vec<ProxyListener>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_seq_or_json_string(deserializer, "listeners")
 }
 
 fn deserialize_client_type_rules<'de, D>(deserializer: D) -> Result<Vec<ClientTypeRule>, D::Error>
@@ -1080,6 +1126,18 @@ impl Default for AdminConfig {
 pub struct TlsConfig {
     pub cert_file: String,
     pub key_file: String,
+}
+
+/// One entry of [`ProxyConfig::listeners`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyListener {
+    /// Socket address this listener binds, e.g. `0.0.0.0:3000`.
+    pub addr: String,
+    /// Serve TLS on this listener. Absent, it serves plaintext HTTP —
+    /// which is what lets one gateway answer both schemes.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2118,6 +2176,46 @@ impl Config {
                 "proxy.addr invalid socket address: {}",
                 self.proxy.addr
             )));
+        }
+        // `proxy.tls` belongs to the listener `proxy.addr` describes, and
+        // that listener is not bound once `proxy.listeners` names the set.
+        // Accepting both would leave a configured certificate serving
+        // nothing, with no way to tell from the outside that TLS had been
+        // asked for.
+        if !self.proxy.listeners.is_empty() && self.proxy.tls.is_some() {
+            return Err(BootstrapError::Config(
+                "proxy.tls cannot be combined with proxy.listeners: proxy.tls \
+                 configures the single listener proxy.addr describes, which \
+                 proxy.listeners replaces — move the certificate into the \
+                 proxy.listeners entry that should serve it"
+                    .into(),
+            ));
+        }
+        let mut bound: Vec<std::net::SocketAddr> = Vec::new();
+        for (i, listener) in self.proxy.listeners.iter().enumerate() {
+            let Ok(addr) = listener.addr.parse::<std::net::SocketAddr>() else {
+                return Err(BootstrapError::Config(format!(
+                    "proxy.listeners[{i}].addr invalid socket address: {}",
+                    listener.addr
+                )));
+            };
+            // A repeated address does NOT report itself at the bind. The
+            // thread-per-core listeners set `SO_REUSEPORT`, so two entries
+            // on one address co-bind happily and the kernel then hands
+            // each connection to whichever entry's accept loop it picks —
+            // a port that answers TLS or plaintext at random when the two
+            // entries differ in `tls`. On the shared runtime it is an
+            // `EADDRINUSE` raised after the first-configuration gate,
+            // which is exactly the arbitrarily-late failure the boot probe
+            // exists to prevent (and the probe cannot see it either: it
+            // drops each socket before binding the next).
+            if let Some(first) = bound.iter().position(|seen| *seen == addr) {
+                return Err(BootstrapError::Config(format!(
+                    "proxy.listeners[{i}].addr {addr} is already bound by \
+                     proxy.listeners[{first}] — each listener needs its own address"
+                )));
+            }
+            bound.push(addr);
         }
         if let Err(bad) = self.proxy.real_ip.parse_trusted() {
             return Err(BootstrapError::Config(format!(
@@ -3407,7 +3505,7 @@ admin:
         // registration. `proxy.real_ip.trusted_proxies` was registered
         // nowhere and shipped unreachable behind exactly that gap.
         const CHILD_MARKER: &str = "TEST_ENV_SEQUENCE_FIELDS_CHILD";
-        const ENV: [(&str, &str); 9] = [
+        const ENV: [(&str, &str); 10] = [
             ("AISIX_ETCD__ENDPOINTS", "http://127.0.0.1:2379"),
             ("AISIX_ADMIN__ADMIN_KEYS", "k1,k2"),
             ("AISIX_PROXY__ADDR", "0.0.0.0:3000"),
@@ -3423,6 +3521,10 @@ admin:
             (
                 "AISIX_PROXY__URL_REWRITES",
                 r#"[{"name":"c","hosts":["gw.example.com"],"match":"^/a$","rewrite":"/b"}]"#,
+            ),
+            (
+                "AISIX_PROXY__LISTENERS",
+                r#"[{"addr":"0.0.0.0:3443","tls":{"cert_file":"/c.pem","key_file":"/k.pem"}},{"addr":"0.0.0.0:3000"}]"#,
             ),
             (
                 "AISIX_OBSERVABILITY__METRICS__CLIENT_TYPE_RULES",
@@ -3473,6 +3575,17 @@ admin:
             vec!["x-aisix-request-id".to_string(), "x-request-id".to_string()],
         );
         assert_eq!(cfg.proxy.url_rewrites.len(), 1);
+        assert_eq!(cfg.proxy.listeners.len(), 2);
+        assert_eq!(cfg.proxy.listeners[0].addr, "0.0.0.0:3443");
+        assert_eq!(
+            cfg.proxy.listeners[0]
+                .tls
+                .as_ref()
+                .map(|tls| tls.cert_file.as_str()),
+            Some("/c.pem"),
+        );
+        assert_eq!(cfg.proxy.listeners[1].addr, "0.0.0.0:3000");
+        assert!(cfg.proxy.listeners[1].tls.is_none());
         assert_eq!(cfg.observability.metrics.client_type_rules.len(), 1);
         assert_eq!(
             cfg.observability.metrics.client_type_rules[0].client,
@@ -3490,6 +3603,138 @@ admin:
             cfg.admin.admin_keys,
             vec!["k1".to_string(), "k2".to_string()]
         );
+    }
+
+    /// `proxy.listeners` and the `addr` + `tls` shorthand describe the
+    /// same thing, so exactly one of them is in force.
+    mod proxy_listeners {
+        use super::*;
+
+        fn config_with(proxy_body: &str) -> Result<Config, BootstrapError> {
+            let f = write_yaml(&format!(
+                r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+{proxy_body}
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#
+            ));
+            Config::load_from_path(Some(f.path()))
+        }
+
+        #[test]
+        fn shorthand_resolves_to_one_listener_carrying_proxy_tls() {
+            let cfg = config_with(
+                r#"  addr: "0.0.0.0:3000"
+  tls:
+    cert_file: "/c.pem"
+    key_file: "/k.pem""#,
+            )
+            .expect("shorthand config loads");
+            assert!(cfg.proxy.listeners.is_empty());
+            let resolved = cfg.proxy.resolved_listeners();
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(resolved[0].addr, "0.0.0.0:3000");
+            assert_eq!(
+                resolved[0].tls.as_ref().map(|tls| tls.cert_file.as_str()),
+                Some("/c.pem"),
+            );
+        }
+
+        #[test]
+        fn listeners_replace_the_shorthand_listener_entirely() {
+            let cfg = config_with(
+                r#"  addr: "0.0.0.0:3000"
+  listeners:
+    - addr: "0.0.0.0:3443"
+      tls:
+        cert_file: "/c.pem"
+        key_file: "/k.pem"
+    - addr: "0.0.0.0:3080""#,
+            )
+            .expect("listener set loads");
+            let resolved = cfg.proxy.resolved_listeners();
+            assert_eq!(resolved.len(), 2);
+            // `proxy.addr` is not among them: it is not bound.
+            assert!(resolved.iter().all(|l| l.addr != "0.0.0.0:3000"));
+            assert_eq!(resolved[0].addr, "0.0.0.0:3443");
+            assert!(resolved[0].tls.is_some());
+            assert_eq!(resolved[1].addr, "0.0.0.0:3080");
+            assert!(resolved[1].tls.is_none());
+        }
+
+        #[test]
+        fn proxy_tls_with_a_listener_set_is_a_config_error() {
+            // Silently dropping it would serve plaintext on every port
+            // while the operator believes a certificate is in force.
+            let err = config_with(
+                r#"  addr: "0.0.0.0:3000"
+  tls:
+    cert_file: "/c.pem"
+    key_file: "/k.pem"
+  listeners:
+    - addr: "0.0.0.0:3443""#,
+            )
+            .expect_err("proxy.tls + proxy.listeners must be rejected");
+            let msg = format!("{err}");
+            assert!(msg.contains("proxy.tls"), "{msg}");
+            assert!(msg.contains("proxy.listeners"), "{msg}");
+        }
+
+        #[test]
+        fn an_entry_address_is_validated_and_the_message_names_its_index() {
+            let err = config_with(
+                r#"  addr: "0.0.0.0:3000"
+  listeners:
+    - addr: "0.0.0.0:3443"
+    - addr: "not-an-address""#,
+            )
+            .expect_err("an unparseable listener address must be rejected");
+            assert!(
+                format!("{err}").contains("proxy.listeners[1].addr invalid socket address"),
+                "{err}",
+            );
+        }
+
+        #[test]
+        fn a_repeated_address_is_rejected_naming_both_entries() {
+            // SO_REUSEPORT lets the thread-per-core listeners co-bind a
+            // repeated address, so nothing downstream of here would fail:
+            // the port would just answer whichever entry's accept loop the
+            // kernel picked, TLS or plaintext, per connection.
+            let err = config_with(
+                r#"  addr: "0.0.0.0:3000"
+  listeners:
+    - addr: "0.0.0.0:3443"
+      tls:
+        cert_file: "/c.pem"
+        key_file: "/k.pem"
+    - addr: "0.0.0.0:3443""#,
+            )
+            .expect_err("a repeated listener address must be rejected");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("proxy.listeners[1].addr 0.0.0.0:3443"),
+                "{msg}"
+            );
+            assert!(msg.contains("proxy.listeners[0]"), "{msg}");
+        }
+
+        #[test]
+        fn an_empty_listener_set_keeps_the_shorthand() {
+            let cfg = config_with(
+                r#"  addr: "0.0.0.0:3000"
+  listeners: []"#,
+            )
+            .expect("an empty list is the shorthand");
+            let resolved = cfg.proxy.resolved_listeners();
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(resolved[0].addr, "0.0.0.0:3000");
+        }
     }
 
     #[test]

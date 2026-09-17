@@ -63,6 +63,23 @@ proxy:
   # tls:
   #   cert_file: "/etc/aisix/tls/proxy.crt"
   #   key_file:  "/etc/aisix/tls/proxy.key"
+  # Several proxy listeners, each with its own optional TLS — for a
+  # deployment that has to answer HTTPS and plaintext HTTP at the same
+  # time. Set, this is the COMPLETE set of proxy listeners: only the
+  # addresses listed here are bound, `addr` above is ignored (it stays a
+  # required field, and the gateway logs one line at startup saying so),
+  # and `tls` above must be absent — a certificate that would apply to no
+  # listener is a configuration error, not something to drop silently.
+  # Put the certificate on the entry that should serve it. Every
+  # listener serves the same routes and the same configuration.
+  # Env-only deployments set the whole set as one JSON array:
+  # AISIX_PROXY__LISTENERS='[{"addr":"0.0.0.0:3443","tls":{"cert_file":"/etc/aisix/tls/proxy.crt","key_file":"/etc/aisix/tls/proxy.key"}},{"addr":"0.0.0.0:3000"}]'
+  # listeners:
+  #   - addr: "0.0.0.0:3443"
+  #     tls:
+  #       cert_file: "/etc/aisix/tls/proxy.crt"
+  #       key_file:  "/etc/aisix/tls/proxy.key"
+  #   - addr: "0.0.0.0:3000"
   # Real-client-IP resolution for usage logs (#492). nginx
   # set_real_ip_from + real_ip_recursive parity. Default trusts nothing
   # and logs the immediate TCP peer; configure trusted_proxies when the

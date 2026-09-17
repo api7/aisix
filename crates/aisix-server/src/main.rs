@@ -1365,27 +1365,57 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
 
     // Step 9: bind + serve the proxy, once a configuration has been
     // applied. Admin is handled above.
-    let proxy_addr: std::net::SocketAddr = cfg.proxy.addr.parse()?;
-    let proxy_tls = cfg.proxy.tls.clone();
+    // `proxy.listeners`, when set, IS the listener set; `proxy.addr` +
+    // `proxy.tls` are the one-listener shorthand. Resolved in one place in
+    // aisix-core so the bind path and the validation cannot disagree.
+    if !cfg.proxy.listeners.is_empty() {
+        tracing::info!(
+            addr = %cfg.proxy.addr,
+            "proxy.addr is ignored because proxy.listeners is set — \
+             proxy.listeners is the complete set of proxy listeners",
+        );
+    }
+    let shorthand = cfg.proxy.listeners.is_empty();
+    let mut proxy_binds: Vec<ListenerBind> = Vec::new();
+    for (i, listener) in cfg.proxy.resolved_listeners().into_iter().enumerate() {
+        proxy_binds.push(ListenerBind {
+            addr: listener.addr.parse()?,
+            tls: listener.tls,
+            tls_field: if shorthand {
+                "proxy.tls".to_string()
+            } else {
+                format!("proxy.listeners[{i}].tls")
+            },
+        });
+    }
     let proxy_workers = cfg
         .proxy
         .thread_per_core_enabled()
         .then(|| cfg.proxy.worker_threads());
-    // Only the proxy listener's connections are counted for the drain: it is
+    // Only the proxy listeners' connections are counted for the drain: it is
     // about client traffic, and folding the platform's probes into the number
     // would report a connection nobody is waiting on.
     // The gate can defer the real bind indefinitely, so the two failures that
-    // used to surface AT the bind are probed here instead: an address that is
-    // unusable, and certificate material that cannot be loaded. Without this a
-    // typo'd `proxy.tls` path or an occupied port stops being a boot failure
-    // and becomes an exit at an arbitrary later moment — or never, on a
-    // gateway still waiting for its first configuration. Same pattern, and the
-    // same benign re-bind gap, as the metrics listener's probe above.
-    std::net::TcpListener::bind(proxy_addr)
-        .map_err(|e| anyhow::anyhow!("proxy listener bind {proxy_addr} failed: {e}"))?;
-    if let Some(tls) = proxy_tls.as_ref() {
-        downstream_tls_acceptor(tls, "proxy").await?;
+    // used to surface AT the bind are probed here instead — per listener: an
+    // address that is unusable, and certificate material that cannot be
+    // loaded. Without this a typo'd cert path or an occupied port stops being
+    // a boot failure and becomes an exit at an arbitrary later moment — or
+    // never, on a gateway still waiting for its first configuration. Same
+    // pattern, and the same benign re-bind gap, as the metrics listener's
+    // probe above.
+    for bind in &proxy_binds {
+        let addr = &bind.addr;
+        std::net::TcpListener::bind(addr)
+            .map_err(|e| anyhow::anyhow!("proxy listener bind {addr} failed: {e}"))?;
+        if let Some(tls) = bind.tls.as_ref() {
+            downstream_tls_acceptor(tls, &bind.tls_field).await?;
+        }
     }
+    let proxy_addrs = proxy_binds
+        .iter()
+        .map(|bind| bind.addr.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     let proxy_drain = livez_state.clone();
     let gate_status = config_status.clone();
     let mut gate_cancel = cancel_rx.clone();
@@ -1396,13 +1426,19 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // thread-per-core `SO_REUSEPORT` path. Left lazy so the shutdown
     // coordinator below is spawned before the wait begins.
     let proxy_serve = async move {
-        if !await_first_config(&gate_status, &mut gate_cancel, &mut gate_retire, proxy_addr).await {
+        if !await_first_config(
+            &gate_status,
+            &mut gate_cancel,
+            &mut gate_retire,
+            &proxy_addrs,
+        )
+        .await
+        {
             return Ok(());
         }
-        serve_http(
-            proxy_addr,
+        serve_listeners(
+            proxy_binds,
             proxy_router,
-            proxy_tls,
             downstream_idle_timeout,
             shutdown,
             "proxy",
@@ -2054,7 +2090,7 @@ async fn await_first_config(
     config_status: &ConfigStatus,
     cancel: &mut watch::Receiver<bool>,
     retire: &mut watch::Receiver<bool>,
-    proxy_addr: std::net::SocketAddr,
+    proxy_addr: &str,
 ) -> bool {
     if config_status.is_ready() {
         return true;
@@ -2135,20 +2171,65 @@ async fn serve_http(
     workers: Option<usize>,
     drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
 ) -> anyhow::Result<()> {
+    serve_listeners(
+        vec![ListenerBind {
+            addr,
+            tls,
+            tls_field: format!("{label}.tls"),
+        }],
+        router,
+        idle_timeout,
+        shutdown,
+        label,
+        workers,
+        drain,
+    )
+    .await
+}
+
+/// One listener to bind: its address, its optional TLS material, and the
+/// configuration path that material was written at.
+struct ListenerBind {
+    addr: std::net::SocketAddr,
+    tls: Option<aisix_core::TlsConfig>,
+    tls_field: String,
+}
+
+/// Serve `router` on every listener in `binds`, each with its own
+/// optional TLS, until the drain ends.
+///
+/// One router and one application state across the set, so which port a
+/// request arrived on changes nothing but the scheme — that is what lets
+/// a deployment answer HTTPS and plaintext HTTP at the same time
+/// (`proxy.listeners`, AISIX-Cloud#1662). The admin and metrics surfaces
+/// pass a single element through [`serve_http`].
+#[allow(clippy::too_many_arguments)]
+async fn serve_listeners(
+    binds: Vec<ListenerBind>,
+    router: axum::Router,
+    idle_timeout: Option<Duration>,
+    shutdown: ShutdownWatch,
+    label: &'static str,
+    workers: Option<usize>,
+    drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
+) -> anyhow::Result<()> {
     // Resolved before binding so a bad cert path still fails with the
     // same error it always did, before a port is taken.
-    let tls = match tls {
-        Some(tls) => Some(downstream_tls_acceptor(&tls, label).await?),
-        None => None,
-    };
+    let mut resolved = Vec::with_capacity(binds.len());
+    for bind in binds {
+        let tls = match bind.tls {
+            Some(tls) => Some(downstream_tls_acceptor(&tls, &bind.tls_field).await?),
+            None => None,
+        };
+        resolved.push((bind.addr, tls));
+    }
 
     // Thread-per-core serving is the proxy's; the admin and metrics
     // surfaces are control traffic and keep their single listener.
     if let Some(workers) = workers {
         return serve_http_tpc(
-            addr,
+            resolved,
             router,
-            tls,
             idle_timeout,
             shutdown,
             label,
@@ -2158,16 +2239,65 @@ async fn serve_http(
         .await;
     }
 
-    let listener = std::net::TcpListener::bind(addr)
-        .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?;
-    match tls {
-        None => tracing::info!(%addr, label, "aisix listening (http)"),
-        Some(_) => tracing::info!(%addr, label, "aisix listening (https)"),
+    // Bound before any of them starts accepting, so a bind failure on the
+    // second listener still aborts startup rather than leaving the gateway
+    // serving on fewer ports than it reported.
+    let mut listeners = Vec::with_capacity(resolved.len());
+    for (addr, tls) in resolved {
+        let listener = std::net::TcpListener::bind(addr)
+            .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?;
+        match tls {
+            None => tracing::info!(%addr, label, "aisix listening (http)"),
+            Some(_) => tracing::info!(%addr, label, "aisix listening (https)"),
+        }
+        listeners.push((listener, tls));
     }
-    accept_loop(listener, router, tls, idle_timeout, shutdown, label, drain).await
+
+    // Each listener runs the same accept loop the single one always did,
+    // on its own task — the shape the admin listener has had all along.
+    let mut serving = tokio::task::JoinSet::new();
+    for (listener, tls) in listeners {
+        serving.spawn(accept_loop(
+            listener,
+            router.clone(),
+            tls,
+            idle_timeout,
+            shutdown.clone(),
+            label,
+            drain.clone(),
+        ));
+    }
+    join_listeners(serving, label).await
+}
+
+/// Wait for every listener task, surfacing the FIRST failure rather than
+/// the first task in order.
+///
+/// A listener that fails on its own — a panic, or an accept loop that
+/// returns `Err` — has to bring the process down, exactly as it did when
+/// there was one. Awaiting the handles in order would hold that failure
+/// until the listener ahead of it finished, which is at shutdown: the
+/// gateway would go on answering `/livez` while one of its ports had
+/// silently stopped accepting.
+async fn join_listeners(
+    mut serving: tokio::task::JoinSet<anyhow::Result<()>>,
+    label: &'static str,
+) -> anyhow::Result<()> {
+    while let Some(joined) = serving.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(anyhow::anyhow!("{label} listener task join error: {e}")),
+        }
+    }
+    Ok(())
 }
 
 /// Build the downstream TLS acceptor from the configured PEM files.
+///
+/// `field` is the configuration path the material came from —
+/// `proxy.listeners[1].tls` rather than a generic `proxy.tls`, so a cert
+/// that will not load names the field the operator actually wrote.
 ///
 /// ALPN offers `h2` ahead of `http/1.1`, which is what the gateway has
 /// always advertised — a downstream that prefers HTTP/2 has to keep
@@ -2175,11 +2305,11 @@ async fn serve_http(
 /// negotiating h2; this is the server side, and it does offer it.)
 async fn downstream_tls_acceptor(
     tls: &aisix_core::TlsConfig,
-    label: &'static str,
+    field: &str,
 ) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
     let failed = |e: String| {
         anyhow::anyhow!(
-            "{label}.tls: failed to load cert_file={:?} / key_file={:?}: {e}",
+            "{field}: failed to load cert_file={:?} / key_file={:?}: {e}",
             tls.cert_file,
             tls.key_file,
         )
@@ -2509,9 +2639,8 @@ async fn serve_connection<I, S>(
 /// throughput setting rather than a latency one.
 #[allow(clippy::too_many_arguments)]
 async fn serve_http_tpc(
-    addr: std::net::SocketAddr,
+    binds: Vec<(std::net::SocketAddr, Option<tokio_rustls::TlsAcceptor>)>,
     router: axum::Router,
-    tls: Option<tokio_rustls::TlsAcceptor>,
     idle_timeout: Option<Duration>,
     shutdown: ShutdownWatch,
     label: &'static str,
@@ -2525,28 +2654,40 @@ async fn serve_http_tpc(
     // sockets below deliberately give up, since they must co-bind with
     // each other. Without this a second gateway would start silently
     // and split traffic with the first.
-    drop(
-        std::net::TcpListener::bind(addr)
-            .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?,
-    );
+    for (addr, _) in &binds {
+        drop(
+            std::net::TcpListener::bind(addr)
+                .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?,
+        );
+    }
 
     // Every listener is bound before any worker spawns, so a bind
     // failure — fd exhaustion on the last socket included — aborts
     // startup before a single connection is accepted, exactly as the
-    // single listener does.
-    let mut listeners = Vec::with_capacity(workers);
+    // single listener does. A worker gets one socket per configured
+    // address, so the worker count is the thread count whatever the
+    // listener set is, and the kernel still spreads each address's
+    // connections across the workers.
+    let mut per_worker: Vec<Vec<WorkerListener>> = Vec::with_capacity(workers);
     for _ in 0..workers {
-        let listener = bind_reuseport_listener(addr)
-            .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?;
-        listeners.push(listener);
+        let mut mine = Vec::with_capacity(binds.len());
+        for (addr, tls) in &binds {
+            let listener = bind_reuseport_listener(*addr)
+                .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?;
+            mine.push(WorkerListener {
+                addr: *addr,
+                listener,
+                tls: tls.clone(),
+            });
+        }
+        per_worker.push(mine);
     }
 
     // One slot per worker so no worker blocks reporting its exit.
     let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel::<anyhow::Result<()>>(workers);
-    for (worker, listener) in listeners.into_iter().enumerate() {
+    for (worker, listeners) in per_worker.into_iter().enumerate() {
         let router = router.clone();
         let shutdown = shutdown.clone();
-        let tls = tls.clone();
         let exit_tx = exit_tx.clone();
         // Every worker raises and lowers the same process-wide count, so
         // the drain heartbeat reports the listener as a whole rather than
@@ -2563,10 +2704,8 @@ async fn serve_http_tpc(
                     outcome: None,
                 };
                 exit.outcome = Some(run_tpc_worker(
-                    addr,
-                    listener,
+                    listeners,
                     router,
-                    tls,
                     idle_timeout,
                     shutdown,
                     label,
@@ -2632,10 +2771,8 @@ impl Drop for WorkerExit {
 /// listener, its own upstream connection pool.
 #[allow(clippy::too_many_arguments)]
 fn run_tpc_worker(
-    addr: std::net::SocketAddr,
-    listener: std::net::TcpListener,
+    listeners: Vec<WorkerListener>,
     router: axum::Router,
-    tls: Option<tokio_rustls::TlsAcceptor>,
     idle_timeout: Option<Duration>,
     shutdown: ShutdownWatch,
     label: &'static str,
@@ -2650,16 +2787,42 @@ fn run_tpc_worker(
     // it. Marked inside the worker because the marker is per thread.
     aisix_gateway::upstream_tls::mark_worker_thread();
     rt.block_on(async move {
-        match tls {
-            None => {
-                tracing::info!(%addr, label, worker, "aisix listening (http, thread-per-core)")
+        // This worker's share of every configured listener, accepted
+        // concurrently on its own runtime.
+        let mut serving = tokio::task::JoinSet::new();
+        for WorkerListener {
+            addr,
+            listener,
+            tls,
+        } in listeners
+        {
+            match tls {
+                None => {
+                    tracing::info!(%addr, label, worker, "aisix listening (http, thread-per-core)")
+                }
+                Some(_) => {
+                    tracing::info!(%addr, label, worker, "aisix listening (https, thread-per-core)")
+                }
             }
-            Some(_) => {
-                tracing::info!(%addr, label, worker, "aisix listening (https, thread-per-core)")
-            }
+            serving.spawn(accept_loop(
+                listener,
+                router.clone(),
+                tls,
+                idle_timeout,
+                shutdown.clone(),
+                label,
+                drain.clone(),
+            ));
         }
-        accept_loop(listener, router, tls, idle_timeout, shutdown, label, drain).await
+        join_listeners(serving, label).await
     })
+}
+
+/// One thread-per-core worker's share of one configured listener.
+struct WorkerListener {
+    addr: std::net::SocketAddr,
+    listener: std::net::TcpListener,
+    tls: Option<tokio_rustls::TlsAcceptor>,
 }
 
 /// A listener that shares `addr` with the other workers' listeners.
