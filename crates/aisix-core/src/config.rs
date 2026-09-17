@@ -443,15 +443,20 @@ fn normalise_cp_base_url(raw: &str) -> Result<String, BootstrapError> {
         .as_ref()
         .is_some_and(|u| !u.username().is_empty() || u.password().is_some());
     if !scheme_ok || !authority_ok || !host_ok || has_userinfo {
-        // Every other rejection quotes what was written, because the
-        // operator has to see it to fix it. This one cannot: echoing a
-        // value whose whole problem is the credential in it would write
-        // that credential to the log this branch exists to keep it out
-        // of. The host survives, which is the part worth reading back.
-        let shown = if has_userinfo {
-            redact_userinfo(&qualified)
-        } else {
+        // What to quote is decided from the INPUT, never from the parse
+        // result: `https://user:secret@dpm.example.com:abc` fails on its
+        // port, so a parse-derived answer says "no userinfo here" and
+        // echoes the secret — from the branch that exists to keep it out
+        // of the log. `redact_userinfo` hands back its input untouched
+        // when the authority carries no `@`, so comparing the two covers
+        // every rejection branch at once. A value without credentials is
+        // still quoted byte for byte: the operator has to see what they
+        // wrote to fix it.
+        let redacted = redact_userinfo(&qualified);
+        let shown = if redacted == qualified {
             raw.to_string()
+        } else {
+            redacted
         };
         return Err(BootstrapError::Config(format!(
             "managed.cp_base_url ({CP_BASE_URL_ENV}) must be an http(s) URL such as \
@@ -528,15 +533,16 @@ fn normalise_cp_etcd_endpoint(raw: &str) -> Result<String, BootstrapError> {
             .and_then(|u| u.host_str().map(|h| !h.is_empty()))
             .unwrap_or(false);
     if !is_bare_authority {
-        // Same reasoning as the `cp_base_url` userinfo branch: an
-        // endpoint pasted from a URL that carried credentials must not
-        // have them read back into the startup log. Every other
-        // rejection here quotes the value byte for byte, because the
-        // operator needs to see what they wrote.
-        let shown = if bare.contains('@') {
-            redact_userinfo(trimmed)
-        } else {
+        // Same reasoning, and the same input-derived test, as the
+        // `cp_base_url` branch above: an endpoint pasted from a URL that
+        // carried credentials must not have them read back into the
+        // startup log, in any rejection branch. Everything without
+        // credentials is still quoted byte for byte.
+        let redacted = redact_userinfo(trimmed);
+        let shown = if redacted == trimmed {
             raw.to_string()
+        } else {
+            redacted
         };
         return Err(BootstrapError::Config(format!(
             "managed.cp_etcd_endpoint ({CP_ETCD_ENDPOINT_ENV}) must be a bare host:port \
@@ -2956,6 +2962,16 @@ managed:
             "the rejection must not echo the credential, got: {err}"
         );
 
+        // The credential must not survive a rejection that fires
+        // BEFORE the userinfo check: this one fails on its port, so a
+        // parse-derived answer would report no userinfo and echo the
+        // value whole.
+        let err = load_with_cp_base_url("https://user:secret@dpm.example.com:abc")
+            .expect_err("a URL with an invalid port must not load")
+            .to_string();
+        assert!(err.contains("***@dpm.example.com:abc"), "got: {err}");
+        assert!(!err.contains("secret"), "got: {err}");
+
         // A username with no password is the same class of value.
         let err = load_with_cp_base_url("https://user@dpm.example.com:7944")
             .expect_err("a URL carrying a username must not load")
@@ -3020,6 +3036,14 @@ managed:
             .expect_err("a bare authority carrying credentials must not load")
             .to_string();
         assert!(err.contains("***@etcd.example.com:7943"), "got: {err}");
+        assert!(!err.contains("secret"), "got: {err}");
+
+        // And it must survive a rejection reached on a different
+        // ground — here the port, which fails the parse first.
+        let err = load_with_cp_etcd_endpoint("https://user:secret@etcd.example.com:abc")
+            .expect_err("an endpoint with an invalid port must not load")
+            .to_string();
+        assert!(err.contains("***@etcd.example.com:abc"), "got: {err}");
         assert!(!err.contains("secret"), "got: {err}");
     }
 
