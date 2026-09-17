@@ -1222,13 +1222,24 @@ pub fn provider_key_root_schema() -> Value {
     // it catches is the mistake operators actually make, a hostname or a
     // URL written where the address goes. The exact grammar (octet
     // ranges, group counts) stays with the decoder.
-    schema
+    //
+    // `minItems` because an empty list is a written override that
+    // overrides nothing — the field is omitted to mean "resolve normally".
+    // Duplicates are deliberately allowed: a repeated address costs one
+    // wasted connect attempt and nothing else, and leaving it out is one
+    // fewer rule for the control plane to mirror exactly.
+    let resolve_addresses = schema
         .get_mut("properties")
         .and_then(Value::as_object_mut)
         .expect("provider_key schema has properties")
-        .get_mut("resolve_address")
+        .get_mut("resolve_addresses")
         .and_then(Value::as_object_mut)
-        .expect("provider_key schema declares resolve_address")
+        .expect("provider_key schema declares resolve_addresses");
+    resolve_addresses.insert("minItems".to_string(), json!(1));
+    resolve_addresses
+        .get_mut("items")
+        .and_then(Value::as_object_mut)
+        .expect("resolve_addresses declares its item schema")
         .insert("pattern".to_string(), json!("^[0-9A-Fa-f:.]+$"));
     schema
 }

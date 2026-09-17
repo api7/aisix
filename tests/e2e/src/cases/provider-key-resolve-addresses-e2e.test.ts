@@ -15,19 +15,19 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: `provider_key.resolve_address` (AISIX-Cloud#1661).
+// E2E: `provider_key.resolve_addresses` (AISIX-Cloud#1661).
 //
 // An upstream reached over a private link that has no DNS entry, while the
 // vendor still 404s anything that does not carry its own hostname. The key
-// names the vendor's hostname in `api_base` and the link's address in
-// `resolve_address`: the gateway dials the address and sends the hostname.
+// names the vendor's hostname in `api_base` and the link's addresses in
+// `resolve_addresses`: the gateway dials one and sends the hostname.
 //
 // Every base URL below names `vendor-1661.invalid`, a name that cannot
 // resolve (RFC 2606 reserves `.invalid`), so nothing here can pass by
 // accident — reaching the mock at all proves the override was applied, and
 // the key without it is the mutation that must fail.
 
-const CALLER_PLAINTEXT = "sk-resolve-address-e2e";
+const CALLER_PLAINTEXT = "sk-resolve-addresses-e2e";
 const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
@@ -40,6 +40,15 @@ const MODEL_HTTP = "resolve-http";
 const MODEL_UNRESOLVED = "resolve-absent";
 const MODEL_EMBEDDINGS = "resolve-embeddings";
 const MODEL_HTTPS = "resolve-https";
+const MODEL_FAILOVER = "resolve-failover";
+
+/**
+ * A loopback address nothing in this spec binds. The mocks listen on
+ * `127.0.0.1` only, so a connection to this address on the same port is
+ * refused immediately — which is what makes it a usable first entry for
+ * the ordering case.
+ */
+const DEAD_LOOPBACK = "127.0.0.2";
 
 const CHAT_REPLY = {
   id: "cmpl-resolve-address",
@@ -119,11 +128,12 @@ function hostHeaderFor(upstream: OpenAiUpstream): string {
   return new URL(upstream.baseUrl).host.replace(LOOPBACK, VENDOR_HOST);
 }
 
-describe("provider_key.resolve_address (AISIX-Cloud#1661)", () => {
+describe("provider_key.resolve_addresses (AISIX-Cloud#1661)", () => {
   let app: SpawnedApp | undefined;
   let chatUpstream: OpenAiUpstream | undefined;
   let embeddingsUpstream: OpenAiUpstream | undefined;
   let tlsUpstream: OpenAiUpstream | undefined;
+  let failoverUpstream: OpenAiUpstream | undefined;
   let etcdReachable = false;
   let haveOpenssl = false;
 
@@ -143,6 +153,7 @@ describe("provider_key.resolve_address (AISIX-Cloud#1661)", () => {
       nonStreamBody: CHAT_REPLY,
       tls: { key: tls.key, cert: tls.cert },
     });
+    failoverUpstream = await startOpenAiUpstream({ nonStreamBody: CHAT_REPLY });
 
     app = await spawnApp();
     const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
@@ -152,7 +163,7 @@ describe("provider_key.resolve_address (AISIX-Cloud#1661)", () => {
         MODEL_HTTP,
         {
           api_base: asVendorUrl(chatUpstream.baseUrl),
-          resolve_address: LOOPBACK,
+          resolve_addresses: [LOOPBACK],
         },
       ],
       // The mutation: same endpoint, same hostname, no override.
@@ -161,17 +172,25 @@ describe("provider_key.resolve_address (AISIX-Cloud#1661)", () => {
         MODEL_EMBEDDINGS,
         {
           api_base: asVendorUrl(embeddingsUpstream.baseUrl),
-          resolve_address: LOOPBACK,
+          resolve_addresses: [LOOPBACK],
         },
       ],
       [
         MODEL_HTTPS,
         {
           api_base: asVendorUrl(tlsUpstream.baseUrl),
-          resolve_address: LOOPBACK,
+          resolve_addresses: [LOOPBACK],
           // `verify` left at its default, so the handshake is checked
           // against the name in the URL.
           tls: { ca_cert: tls.caPem },
+        },
+      ],
+      [
+        MODEL_FAILOVER,
+        {
+          api_base: asVendorUrl(failoverUpstream.baseUrl),
+          // First entry refuses, second serves.
+          resolve_addresses: [DEAD_LOOPBACK, LOOPBACK],
         },
       ],
     ];
@@ -196,6 +215,7 @@ describe("provider_key.resolve_address (AISIX-Cloud#1661)", () => {
         MODEL_UNRESOLVED,
         MODEL_EMBEDDINGS,
         MODEL_HTTPS,
+        MODEL_FAILOVER,
       ],
     });
     const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
@@ -207,6 +227,7 @@ describe("provider_key.resolve_address (AISIX-Cloud#1661)", () => {
     await chatUpstream?.close();
     await embeddingsUpstream?.close();
     await tlsUpstream?.close();
+    await failoverUpstream?.close();
   });
 
   async function post(
@@ -253,7 +274,8 @@ describe("provider_key.resolve_address (AISIX-Cloud#1661)", () => {
       return;
     }
     // The mutation check for the test above: identical in every respect
-    // except `resolve_address`, and it must not reach the upstream at all.
+    // except `resolve_addresses`, and it must not reach the upstream at
+    // all.
     const before = chatUpstream!.receivedRequests.length;
     const { status } = await chat(MODEL_UNRESOLVED);
     expect(status).not.toBe(200);
@@ -273,6 +295,25 @@ describe("provider_key.resolve_address (AISIX-Cloud#1661)", () => {
     expect(JSON.parse(body).data[0].embedding).toEqual(EMBEDDING_VECTOR);
     const seen = embeddingsUpstream!.receivedRequests.at(-1)!;
     expect(seen.headers.host).toBe(hostHeaderFor(embeddingsUpstream!));
+  });
+
+  test("a second address is tried when the first refuses", async (ctx) => {
+    if (!etcdReachable || !haveOpenssl) {
+      ctx.skip();
+      return;
+    }
+    // The list is an answer a resolver could have given, so the connector
+    // walks it: the first address refuses the connection and the request
+    // still lands on the second. A single-address field could not express
+    // this, and an implementation that only ever dialled the first entry
+    // would fail here.
+    const { status, body } = await chat(MODEL_FAILOVER);
+    expect(status).toBe(200);
+    expect(JSON.parse(body).choices[0].message.content).toBe(
+      "reached over the private link",
+    );
+    const seen = failoverUpstream!.receivedRequests.at(-1)!;
+    expect(seen.headers.host).toBe(hostHeaderFor(failoverUpstream!));
   });
 
   test("TLS is verified against the hostname, not the address", async (ctx) => {

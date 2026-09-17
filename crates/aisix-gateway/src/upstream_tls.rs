@@ -326,13 +326,21 @@ fn build_provider_key_client(conn: &UpstreamConnection) -> Result<reqwest::Clien
             builder = builder.danger_accept_invalid_certs(true);
         }
     }
-    for (host, addr) in &conn.resolve {
+    for (host, addrs) in &conn.resolve {
         // Port 0: reqwest keeps the port from the request URL and takes
         // only the address from here. The hostname stays the one the URL
         // names, so `Host`, `:authority`, the TLS server name and the
         // certificate check are all unaffected — this replaces name
         // resolution and nothing else.
-        builder = builder.resolve(host, std::net::SocketAddr::new(*addr, 0));
+        //
+        // The whole list goes in at once, in the operator's order, so the
+        // connector walks it the way it walks a resolver's answer and
+        // moves to the next address when one will not connect.
+        let socket_addrs: Vec<std::net::SocketAddr> = addrs
+            .iter()
+            .map(|addr| std::net::SocketAddr::new(*addr, 0))
+            .collect();
+        builder = builder.resolve_to_addrs(host, &socket_addrs);
     }
     builder.build().map_err(|e| e.to_string())
 }
@@ -769,11 +777,14 @@ mod tests {
         }
     }
 
-    /// A key carrying only `resolve_address`, for one hostname.
-    fn resolve_conn(host: &str, addr: &str) -> UpstreamConnection {
+    /// A key carrying only `resolve_addresses`, for one hostname.
+    fn resolve_conn(host: &str, addrs: &[&str]) -> UpstreamConnection {
         UpstreamConnection {
             tls: None,
-            resolve: vec![(host.to_string(), addr.parse().unwrap())],
+            resolve: vec![(
+                host.to_string(),
+                addrs.iter().map(|a| a.parse().unwrap()).collect(),
+            )],
         }
     }
 
@@ -809,27 +820,24 @@ mod tests {
         assert!(!cached(&noop));
     }
 
-    /// `resolve_address` is an override in its own right: a key that sets
-    /// it while leaving TLS at the deployment defaults still needs its own
-    /// client, because reqwest attaches name resolution to the client and
-    /// not to the request.
+    /// `resolve_addresses` is an override in its own right: a key that
+    /// sets it while leaving TLS at the deployment defaults still needs
+    /// its own client, because reqwest attaches name resolution to the
+    /// client and not to the request.
     #[test]
-    fn a_resolve_address_alone_builds_a_dedicated_client() {
+    fn resolve_addresses_alone_build_a_dedicated_client() {
         let key: aisix_core::models::ProviderKey = serde_json::from_value(serde_json::json!({
             "display_name": "pk-alone",
             "api_key": "sk-x",
             "api_base": "https://vendor-alone.invalid/v1",
-            "resolve_address": "192.0.2.10",
+            "resolve_addresses": ["192.0.2.10", "192.0.2.11"],
         }))
         .unwrap();
         let conn = key.upstream_connection().expect("an override is set");
         assert_eq!(conn.tls, None);
         assert_eq!(
             conn.resolve,
-            vec![(
-                "vendor-alone.invalid".to_string(),
-                "192.0.2.10".parse().unwrap()
-            )]
+            resolve_conn("vendor-alone.invalid", &["192.0.2.10", "192.0.2.11"]).resolve
         );
         let _ = client_for_provider_key(&shared_client(), Some(&conn));
         assert!(cached(&conn));
@@ -840,8 +848,8 @@ mod tests {
     /// could only ever dial one of the two.
     #[test]
     fn different_addresses_for_one_hostname_get_different_clients() {
-        let first = resolve_conn("vendor-split.invalid", "192.0.2.21");
-        let second = resolve_conn("vendor-split.invalid", "192.0.2.22");
+        let first = resolve_conn("vendor-split.invalid", &["192.0.2.21"]);
+        let second = resolve_conn("vendor-split.invalid", &["192.0.2.22"]);
         assert_ne!(first, second);
         let _ = client_for_provider_key(&shared_client(), Some(&first));
         let _ = client_for_provider_key(&shared_client(), Some(&second));
