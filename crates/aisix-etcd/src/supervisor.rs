@@ -34,7 +34,9 @@ use tokio::task::JoinHandle;
 
 use crate::backoff::ExpBackoff;
 use crate::key::{PrefixScope, PrefixSet, WatchedPrefix};
-use crate::loader::{self, BuildStats, PartialCompatEntry, PartialCompatRow, RejectedEntry};
+use crate::loader::{
+    self, BuildStats, PartialCompatEntry, PartialCompatRow, RejectedEntry, RejectionKind,
+};
 use crate::provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
 use crate::snapshot_cache::{encode_entry, encode_stale, SnapshotCache};
 use std::sync::atomic::AtomicBool;
@@ -148,6 +150,19 @@ pub struct WatchStatusSnapshot {
 /// CP is unreachable for a while we don't want to leak unbounded
 /// memory. Newest rejection wins on overflow (drops the oldest).
 const MAX_RETAINED_REJECTIONS: usize = 256;
+
+/// Maximum unknown-kind rows the supervisor retains, counted against its
+/// own budget rather than [`MAX_RETAINED_REJECTIONS`] (#1207) — the same
+/// reasoning as [`MAX_RETAINED_PARTIAL_ROWS`] below.
+///
+/// An unknown kind is forward compatibility: a newer control plane can
+/// project a kind this build predates for every model in the environment,
+/// which is hundreds of rows arriving at once. Sharing one budget lets that
+/// volume evict the rejections an operator can actually fix — silently,
+/// because those rows then reach neither `/status/config` nor the heartbeat,
+/// and since #1207 the unknown kinds left behind no longer flip
+/// `last_reload_successful` to show that something was dropped.
+const MAX_RETAINED_UNKNOWN_KINDS: usize = 256;
 
 /// Maximum partially-compatible rows the supervisor retains, in its own
 /// buffer so YELLOW volume can never evict RED entries from the rejection
@@ -338,10 +353,13 @@ pub struct Supervisor<P: ConfigProvider> {
     config_status: ConfigStatus,
 
     /// Most recent loader rejections, capped at
-    /// [`MAX_RETAINED_REJECTIONS`]. Read by the heartbeat path so the
+    /// [`MAX_RETAINED_REJECTIONS`] — with unknown-kind rows counted
+    /// against [`MAX_RETAINED_UNKNOWN_KINDS`] instead, so neither class
+    /// can evict the other (#1207). Read by the heartbeat path so the
     /// CP can surface "your DP rejected these resources" in the
     /// dashboard. Newest at the back; on overflow the oldest entries
-    /// are dropped — see issue #115. The buffer is replaced (not
+    /// of the overflowing class are dropped — see issue #115. The
+    /// buffer is replaced (not
     /// appended-to) on every load_once / apply_resync because those
     /// re-process the full entry set; apply_put / apply_delete append
     /// per-event because they only see one row.
@@ -636,10 +654,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// resync paths (load_once / apply_resync) which re-process every
     /// entry — old per-key rejections are no longer accurate.
     fn set_rejections(&self, mut new: Vec<RejectedEntry>) {
-        if new.len() > MAX_RETAINED_REJECTIONS {
-            // Keep the *newest* entries; tail of the vec is freshest.
-            new.drain(..new.len() - MAX_RETAINED_REJECTIONS);
-        }
+        trim_rejections_per_class(&mut new);
         *self.rejections.lock().unwrap() = new;
     }
 
@@ -649,8 +664,22 @@ impl<P: ConfigProvider> Supervisor<P> {
     fn push_rejection(&self, r: RejectedEntry) {
         let mut guard = self.rejections.lock().unwrap();
         guard.retain(|existing| existing.key != r.key);
-        if guard.len() >= MAX_RETAINED_REJECTIONS {
-            guard.remove(0);
+        // Per-class budget: a burst of unknown-kind puts from a newer
+        // control plane must not push out a rejection an operator can fix.
+        let forward_compat = is_unknown_kind(&r);
+        let cap = rejection_cap(forward_compat);
+        if guard
+            .iter()
+            .filter(|e| is_unknown_kind(e) == forward_compat)
+            .count()
+            >= cap
+        {
+            if let Some(oldest) = guard
+                .iter()
+                .position(|e| is_unknown_kind(e) == forward_compat)
+            {
+                guard.remove(oldest);
+            }
         }
         guard.push(r);
     }
@@ -1180,7 +1209,8 @@ impl<P: ConfigProvider> Supervisor<P> {
                 self.push_rejection(r);
             }
             // A rejected watch event still changes the reported state
-            // (rejected[] gains this entry; last_reload flips unsuccessful),
+            // (rejected[] gains this entry — or unknown_kinds[] for a kind
+            // this build does not know, which leaves last_reload alone),
             // and its bytes are now part of the observed state on disk.
             dirty.status = true;
             dirty.cache = true;
@@ -2257,6 +2287,53 @@ fn remove_from_snapshot(snap: &AisixSnapshot, kind: &str, id: &str) {
         }
         _ => {}
     }
+}
+
+/// Whether a retained rejection is forward compatibility (a `kind`
+/// segment this build does not know) rather than a problem an operator
+/// can act on. The two classes get independent retention budgets (#1207).
+fn is_unknown_kind(r: &RejectedEntry) -> bool {
+    r.kind == RejectionKind::UnknownKind
+}
+
+fn rejection_cap(forward_compat: bool) -> usize {
+    if forward_compat {
+        MAX_RETAINED_UNKNOWN_KINDS
+    } else {
+        MAX_RETAINED_REJECTIONS
+    }
+}
+
+/// Trim a freshly rebuilt rejection list to the newest
+/// [`MAX_RETAINED_REJECTIONS`] real rejections and the newest
+/// [`MAX_RETAINED_UNKNOWN_KINDS`] unknown-kind rows, counted separately
+/// and preserving order within each class.
+///
+/// Counted separately because the loader returns rows in ascending key
+/// order, so trimming one shared budget from the front drops whichever
+/// kinds sort earliest — `api_keys`, `guardrails`, `models` — which is
+/// exactly the set an operator needs to see.
+fn trim_rejections_per_class(entries: &mut Vec<RejectedEntry>) {
+    if entries.len() <= MAX_RETAINED_REJECTIONS.min(MAX_RETAINED_UNKNOWN_KINDS) {
+        return;
+    }
+    let mut kept = [0usize; 2];
+    let mut keep = vec![false; entries.len()];
+    // Newest-first, so the survivors of each class are its freshest rows
+    // however the two are interleaved.
+    for (i, e) in entries.iter().enumerate().rev() {
+        let class = usize::from(is_unknown_kind(e));
+        if kept[class] < rejection_cap(class == 1) {
+            kept[class] += 1;
+            keep[i] = true;
+        }
+    }
+    let mut i = 0;
+    entries.retain(|_| {
+        let k = keep[i];
+        i += 1;
+        k
+    });
 }
 
 /// Whether the snapshot holds an entry for `(kind, id)`. An unknown
@@ -4627,6 +4704,70 @@ mod tests {
         assert_eq!(rejections.len(), 2);
         assert_eq!(rejections[0].kind, loader::RejectionKind::SchemaFailed);
         assert_eq!(rejections[1].kind, loader::RejectionKind::NonJson);
+    }
+
+    // #1207. The two classes have independent retention budgets *here*, at
+    // the layer that actually truncates: a newer control plane projecting a
+    // kind this build predates writes one row per model, so a shared budget
+    // would drop the rejections an operator can fix — and drop them
+    // silently, since the unknown kinds left behind no longer flip
+    // `last_reload_successful`. Both truncation paths are covered: the
+    // resync rebuild (ascending key order, so the front is what a shared
+    // budget discards) and the per-event watch append.
+    #[tokio::test]
+    async fn unknown_kind_volume_does_not_evict_a_real_rejection_on_resync() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+
+        let mut entries = vec![entry("/aisix/models/m-bad", BAD_PROVIDER_MODEL, 1)];
+        for i in 0..MAX_RETAINED_UNKNOWN_KINDS + 50 {
+            entries.push(entry(
+                &format!("/aisix/quota_pools/q-{i:04}"),
+                b"{}",
+                2 + i as i64,
+            ));
+        }
+        sup.apply_resync(&entries);
+
+        let retained = sup.recent_rejections();
+        assert!(
+            retained
+                .iter()
+                .any(|r| r.key == "/aisix/models/m-bad" && r.kind == RejectionKind::SchemaFailed),
+            "the real rejection must survive unknown-kind volume; retained {} rows",
+            retained.len(),
+        );
+        assert_eq!(
+            retained
+                .iter()
+                .filter(|r| r.kind == RejectionKind::UnknownKind)
+                .count(),
+            MAX_RETAINED_UNKNOWN_KINDS,
+            "unknown kinds are bounded by their own budget",
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_kind_volume_does_not_evict_a_real_rejection_on_watch_puts() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+
+        assert!(!sup.apply_put(&entry("/aisix/models/m-bad", BAD_PROVIDER_MODEL, 1)));
+        for i in 0..MAX_RETAINED_UNKNOWN_KINDS + 50 {
+            sup.apply_put(&entry(
+                &format!("/aisix/quota_pools/q-{i:04}"),
+                b"{}",
+                2 + i as i64,
+            ));
+        }
+
+        let retained = sup.recent_rejections();
+        assert!(
+            retained.iter().any(|r| r.key == "/aisix/models/m-bad"),
+            "a burst of unknown-kind puts must not push out the real rejection; \
+             retained {} rows",
+            retained.len(),
+        );
     }
 
     #[tokio::test]

@@ -1950,7 +1950,10 @@ mod tests {
 
     // One new resource kind can be one row per model in the environment, so
     // the two detail sets get independent budgets: forward-compatible volume
-    // must never evict the rejection an operator can actually fix.
+    // must never evict the rejection an operator can actually fix. This
+    // covers the budget at THIS layer; the etcd supervisor's own retention
+    // buffer, which truncates before a load observation is ever built, is
+    // split the same way and tested there (`MAX_RETAINED_UNKNOWN_KINDS`).
     #[test]
     fn unknown_kind_volume_does_not_evict_a_real_rejection() {
         let cs = ConfigStatus::new(SourceKind::Etcd);
