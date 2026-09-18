@@ -275,10 +275,12 @@ describe("config forward-compat: unknown fields from a newer control plane", () 
 // - the boot full load and an incremental watch event classify identically.
 describe("config forward-compat: a resource kind from a newer control plane", () => {
   const FUTURE_KIND = "quota_pools";
+  // Written once in beforeAll and never reassigned, so no case can read it
+  // undefined and the deletion case cannot target a key that never existed.
+  const futureRowId = randomUUID();
   let app: SpawnedApp | undefined;
   let etcd: EtcdClient | undefined;
   let etcdReachable = false;
-  let futureRowId: string;
 
   beforeAll(async () => {
     etcd = new EtcdClient();
@@ -298,6 +300,12 @@ describe("config forward-compat: a resource kind from a newer control plane", ()
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
+    // A live watch event on a running gateway, as a newer control plane
+    // projecting a kind this build predates would deliver it.
+    await etcd.put(
+      `${app.etcdPrefix}/${FUTURE_KIND}/${futureRowId}`,
+      JSON.stringify({ display_name: "next release's resource", limit: 10 }),
+    );
   });
 
   afterAll(async () => {
@@ -309,12 +317,6 @@ describe("config forward-compat: a resource kind from a newer control plane", ()
       ctx.skip();
       return;
     }
-
-    futureRowId = randomUUID();
-    await etcd.put(
-      `${app.etcdPrefix}/${FUTURE_KIND}/${futureRowId}`,
-      JSON.stringify({ display_name: "next release's resource", limit: 10 }),
-    );
 
     let cfg: StatusConfig | undefined;
     await waitConfigPropagation(async () => {
@@ -353,46 +355,51 @@ describe("config forward-compat: a resource kind from a newer control plane", ()
     // An unknown routing strategy has no lenient fallback: the row rejects,
     // and THAT is what a failed reload means.
     const badId = randomUUID();
-    await etcd.put(
-      `${app.etcdPrefix}/models/${badId}`,
-      JSON.stringify({
-        display_name: "fk-router",
-        routing: {
-          strategy: "strategy-from-the-future",
-          targets: [{ model: "fk-model" }],
-        },
-      }),
-    );
-
     let cfg: StatusConfig | undefined;
-    await waitConfigPropagation(async () => {
-      cfg = await getStatusConfig(app!);
-      return cfg.rejected.some((r) => r.resource_id === badId);
-    });
-    expect(cfg!.state).toBe("degraded");
-    expect(cfg!.last_reload!.successful).toBe(false);
-    // The classes never mix: the unknown kind is still reported, apart.
-    expect(cfg!.unknown_kinds.some((r) => r.resource_id === futureRowId)).toBe(true);
-    expect(cfg!.rejected.some((r) => r.resource_id === futureRowId)).toBe(false);
+    try {
+      await etcd.put(
+        `${app.etcdPrefix}/models/${badId}`,
+        JSON.stringify({
+          display_name: "fk-router",
+          routing: {
+            strategy: "strategy-from-the-future",
+            targets: [{ model: "fk-model" }],
+          },
+        }),
+      );
 
-    let text = await scrape(app);
-    expect(gauge(text, "aisix_config_last_reload_successful")).toBe(0);
-    expect(gauge(text, "aisix_config_rejected_resources", 'kind="models"')).toBe(1);
-    expect(
-      gauge(text, "aisix_config_unknown_kind_resources", `kind="${FUTURE_KIND}"`),
-    ).toBe(1);
+      await waitConfigPropagation(async () => {
+        cfg = await getStatusConfig(app!);
+        return cfg.rejected.some((r) => r.resource_id === badId);
+      });
+      expect(cfg!.state).toBe("degraded");
+      expect(cfg!.last_reload!.successful).toBe(false);
+      // The classes never mix: the unknown kind is still reported, apart.
+      expect(cfg!.unknown_kinds.some((r) => r.resource_id === futureRowId)).toBe(
+        true,
+      );
+      expect(cfg!.rejected.some((r) => r.resource_id === futureRowId)).toBe(false);
+
+      const text = await scrape(app);
+      expect(gauge(text, "aisix_config_last_reload_successful")).toBe(0);
+      expect(gauge(text, "aisix_config_rejected_resources", 'kind="models"')).toBe(1);
+      expect(
+        gauge(text, "aisix_config_unknown_kind_resources", `kind="${FUTURE_KIND}"`),
+      ).toBe(1);
+    } finally {
+      await etcd.delete(`${app.etcdPrefix}/models/${badId}`);
+    }
 
     // Fixing the real problem restores the gauge even though the unknown
     // kind is still there — the discriminating step: before the fix the
     // unknown-kind row alone held this at 0 until the gateway was upgraded.
-    await etcd.delete(`${app.etcdPrefix}/models/${badId}`);
     await waitConfigPropagation(async () => {
       cfg = await getStatusConfig(app!);
       return cfg.rejected.length === 0;
     });
     expect(cfg!.last_reload!.successful).toBe(true);
     expect(cfg!.state).toBe("synced");
-    text = await scrape(app);
+    const text = await scrape(app);
     expect(gauge(text, "aisix_config_last_reload_successful")).toBe(1);
   });
 
@@ -439,14 +446,18 @@ describe("config forward-compat: a resource kind from a newer control plane", ()
       return;
     }
 
+    // Precondition, not decoration: without it an empty `unknown_kinds[]`
+    // would satisfy the wait below even if the row had never been written.
+    let cfg = await getStatusConfig(app);
+    expect(cfg.unknown_kinds.some((r) => r.resource_id === futureRowId)).toBe(true);
+
     await etcd.delete(`${app.etcdPrefix}/${FUTURE_KIND}/${futureRowId}`);
-    let cfg: StatusConfig | undefined;
     await waitConfigPropagation(async () => {
       cfg = await getStatusConfig(app!);
       return cfg.unknown_kinds.length === 0;
     });
-    expect(cfg!.state).toBe("synced");
-    expect(cfg!.last_reload!.successful).toBe(true);
+    expect(cfg.state).toBe("synced");
+    expect(cfg.last_reload!.successful).toBe(true);
 
     // Zero, not a lingering stale count and not NaN: the series counts rows
     // in a state, so 0 is the true reading and `sum()` keeps working.

@@ -166,7 +166,10 @@ pub struct RejectedResource {
     /// Resource id; empty when unparseable.
     pub resource_id: String,
     /// Snake-case failure kind: `bad_key | non_json | schema_failed |
-    /// parse_failed | unknown_kind` for etcd; a file classification otherwise.
+    /// parse_failed` for etcd; a file classification otherwise. `unknown_kind`
+    /// is deliberately absent — those rows are reported in
+    /// [`ConfigStatusView::unknown_kinds`] instead, and reach the control
+    /// plane through [`ConfigRejectionSnapshot`], which does carry them.
     pub last_error_kind: String,
     /// Human-readable error message. Schema-validation messages are
     /// credential-masked at the schema layer (instance values redacted before
