@@ -147,6 +147,7 @@ async fn run(
             }
             _ = ticker.tick() => {
                 if !buffer.is_empty() {
+                    fill_ready_batch(&mut buffer, &mut rx);
                     flush(&client, &cfg, &mut buffer).await;
                 }
             }
@@ -164,6 +165,18 @@ async fn run(
                     return;
                 }
             }
+        }
+    }
+}
+
+fn fill_ready_batch(
+    buffer: &mut Vec<UsageEvent>,
+    rx: &mut tokio::sync::mpsc::Receiver<UsageEvent>,
+) {
+    while buffer.len() < MAX_BATCH {
+        match rx.try_recv() {
+            Ok(event) => buffer.push(event),
+            Err(_) => break,
         }
     }
 }
@@ -427,5 +440,198 @@ mod tests {
             extra_ca_pem: None,
         };
         build_client(&mtls).expect("build_client must tolerate PEM without trailing newline");
+    }
+    type RecordedBatches = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+    async fn recording_server(first_status: u16) -> (MockServer, RecordedBatches) {
+        let server = MockServer::start().await;
+        let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&batches);
+        Mock::given(method("POST"))
+            .and(path("/dp/telemetry"))
+            .respond_with(move |request: &wiremock::Request| {
+                assert!(request.headers.get("authorization").is_none());
+                let mut batches = recorded.lock().unwrap();
+                batches.push(serde_json::from_slice(&request.body).unwrap());
+                ResponseTemplate::new(if batches.len() == 1 {
+                    first_status
+                } else {
+                    200
+                })
+            })
+            .mount(&server)
+            .await;
+        (server, batches)
+    }
+
+    fn ordered_events(count: usize) -> Vec<UsageEvent> {
+        (0..count)
+            .map(|i| {
+                // Distinct attempts may share a request ID; none may be deduplicated.
+                let mut event = sample_event(&format!("request-{}", i / 3));
+                event.model_id = format!("model-{}", i % 7);
+                event.provider_kind = format!("provider-{}", i % 3);
+                event.user_id = format!("user-{i}");
+                event.prompt_tokens = i as u32;
+                event.completion_tokens = (i * 2) as u32;
+                event
+            })
+            .collect()
+    }
+
+    async fn poll_sender(
+        mut sender: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+    ) -> std::task::Poll<()> {
+        std::future::poll_fn(|cx| std::task::Poll::Ready(sender.as_mut().poll(cx))).await
+    }
+
+    async fn finish_sender(mut sender: std::pin::Pin<&mut impl std::future::Future<Output = ()>>) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while poll_sender(sender.as_mut()).await.is_pending() {
+            assert!(std::time::Instant::now() < deadline, "sender did not exit");
+            // Keep the paused runtime runnable while real HTTP I/O completes.
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn assert_recorded_events(batches: &RecordedBatches, expected: &[UsageEvent]) -> Vec<usize> {
+        let batches = batches.lock().unwrap();
+        let actual: Vec<_> = batches
+            .iter()
+            .flat_map(|batch| batch["events"].as_array().unwrap().iter().cloned())
+            .collect();
+        assert_eq!(
+            serde_json::json!(actual),
+            serde_json::to_value(expected).unwrap()
+        );
+        batches
+            .iter()
+            .map(|batch| batch["events"].as_array().unwrap().len())
+            .collect()
+    }
+
+    async fn run_interval_with_backlog(first_status: u16) {
+        let (server, batches) = recording_server(first_status).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = TelemetryConfig::new(
+            format!("{}/dp/telemetry", server.uri()),
+            write_test_bundle(dir.path()),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let expected = ordered_events(QUEUE_CAPACITY + 2);
+        let mut events = ordered_events(QUEUE_CAPACITY + 2).into_iter();
+        tokio::time::pause();
+        let mut sender = Box::pin(run(cfg, rx, &mut cancel_rx));
+        // Consume the initial empty tick before staging a partial batch.
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        for event in events.by_ref().take(2) {
+            tx.try_send(event).unwrap();
+        }
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        assert_eq!(tx.capacity(), QUEUE_CAPACITY);
+        assert!(batches.lock().unwrap().is_empty());
+        for event in events {
+            tx.try_send(event).unwrap();
+        }
+        assert_eq!(tx.capacity(), 0);
+        tokio::time::advance(FLUSH_INTERVAL).await;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while batches.lock().unwrap().is_empty() {
+            assert!(poll_sender(sender.as_mut()).await.is_pending());
+            assert!(std::time::Instant::now() < deadline, "no telemetry POST");
+            tokio::task::yield_now().await;
+        }
+        // Both recv and the tick are ready: this must hold whichever wins.
+        assert_eq!(
+            batches.lock().unwrap()[0]["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            MAX_BATCH
+        );
+        drop(tx);
+        finish_sender(sender.as_mut()).await;
+        let sizes = assert_recorded_events(&batches, &expected);
+        assert_eq!(sizes, [vec![MAX_BATCH; 10], vec![26]].concat());
+    }
+
+    #[tokio::test]
+    async fn interval_fills_ready_backlog_without_reordering_events() {
+        run_interval_with_backlog(200).await;
+    }
+
+    #[tokio::test]
+    async fn failed_interval_batch_is_not_retried_or_carried_into_next_batch() {
+        run_interval_with_backlog(500).await;
+    }
+
+    #[tokio::test]
+    async fn interval_flushes_partial_batch_without_waiting_for_more_events() {
+        let (server, batches) = recording_server(200).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = TelemetryConfig::new(
+            format!("{}/dp/telemetry", server.uri()),
+            write_test_bundle(dir.path()),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let mut sender = Box::pin(run(cfg, rx, &mut cancel_rx));
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        for event in ordered_events(2) {
+            tx.try_send(event).unwrap();
+        }
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        assert_eq!(tx.capacity(), QUEUE_CAPACITY);
+        tokio::time::advance(FLUSH_INTERVAL - Duration::from_millis(1)).await;
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        assert!(batches.lock().unwrap().is_empty());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while batches.lock().unwrap().is_empty() {
+            assert!(poll_sender(sender.as_mut()).await.is_pending());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "partial batch was not flushed"
+            );
+            tokio::task::yield_now().await;
+        }
+        drop(tx);
+        finish_sender(sender.as_mut()).await;
+        assert_eq!(
+            assert_recorded_events(&batches, &ordered_events(2)),
+            vec![2]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_drains_buffer_and_ready_queue_without_losing_attempts() {
+        let (server, batches) = recording_server(200).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = TelemetryConfig::new(
+            format!("{}/dp/telemetry", server.uri()),
+            write_test_bundle(dir.path()),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let mut sender = Box::pin(run(cfg, rx, &mut cancel_rx));
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        let mut events = ordered_events(250).into_iter();
+        for event in events.by_ref().take(2) {
+            tx.try_send(event).unwrap();
+        }
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        assert_eq!(tx.capacity(), QUEUE_CAPACITY);
+        for event in events {
+            tx.try_send(event).unwrap();
+        }
+        cancel_tx.send(true).unwrap();
+        // Keep tx alive: completion must come from cancellation, not channel closure.
+        finish_sender(sender.as_mut()).await;
+        assert_recorded_events(&batches, &ordered_events(250));
+        assert!(tx.is_closed());
     }
 }
