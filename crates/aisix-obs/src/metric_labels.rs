@@ -323,6 +323,11 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
         &["kind"],
         required = &["kind"]
     ),
+    metric!(
+        M_CONFIG_UNKNOWN_KIND_RESOURCES,
+        &["kind"],
+        required = &["kind"]
+    ),
     metric!(M_CONFIG_OBSERVED_REVISION, &[]),
     metric!(M_CONFIG_APPLIED_REVISION, &[]),
     metric!(M_CONFIG_HASH_INFO, &["hash"], required = &["hash"]),

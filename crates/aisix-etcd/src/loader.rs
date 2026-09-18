@@ -244,6 +244,21 @@ pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnaps
         // the environment's tables: the global prefix is written by a
         // different authority, and every other kind is environment-scoped
         // by definition.
+        //
+        // This reports `UnknownKind`, which since #1207 the status handle
+        // treats as forward compatibility: the row lands in `unknown_kinds[]`
+        // and does NOT flip `aisix_config_last_reload_successful`, even when
+        // the kind is one this build knows perfectly well and is merely
+        // misplaced. Deliberate, and the divergence it creates is bounded:
+        // the control plane's own filter only suppresses a kind no released
+        // gateway reads (`dpfloor.UnreadByEveryRelease`), so a misplaced
+        // KNOWN kind is still stored and shown red on the environment
+        // overview — an operator learns about it there, from the plane that
+        // wrote it. Splitting the two apart here would need a new rejection
+        // reason on the heartbeat wire, whose vocabulary the control plane
+        // pins in a closed enum, and only the control plane writes this
+        // prefix (today: `pricing` alone), so the case needs a projection
+        // bug or a hand-written key to occur at all.
         if parsed.scope == PrefixScope::Global && parsed.kind != "pricing" {
             tracing::warn!(
                 key = %raw.key,
