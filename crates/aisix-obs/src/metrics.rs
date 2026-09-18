@@ -416,6 +416,15 @@ pub const M_CONFIG_LAST_RELOAD_SUCCESS_TIMESTAMP: &str =
 pub const M_CONFIG_RELOADS_TOTAL: &str = "aisix_config_reloads_total";
 pub const M_CONFIG_RELOAD_FAILURES_TOTAL: &str = "aisix_config_reload_failures_total";
 pub const M_CONFIG_REJECTED_RESOURCES: &str = "aisix_config_rejected_resources";
+/// Rows per kind whose `kind` segment this gateway version does not know —
+/// forward compatibility, not a load failure, so they are counted here
+/// instead of in [`M_CONFIG_REJECTED_RESOURCES`] and leave
+/// [`M_CONFIG_LAST_RELOAD_SUCCESSFUL`] at `1` (issue #1207). Non-zero means
+/// the control plane writing to this data plane projects a resource kind
+/// this build was released before; serving and later configuration updates
+/// are unaffected, and upgrading the gateway clears it. Disjoint from
+/// [`M_CONFIG_REJECTED_RESOURCES`]: a row is counted by exactly one.
+pub const M_CONFIG_UNKNOWN_KIND_RESOURCES: &str = "aisix_config_unknown_kind_resources";
 /// Served resources per kind carrying fields this gateway version does not
 /// know (loaded with those fields ignored — partially compatible, #871).
 /// Non-zero means this data plane and the control plane writing to it are
@@ -695,6 +704,7 @@ pub enum LiveGaugeSeries<'a> {
 struct ConfigLabelState {
     last_hash: Option<String>,
     last_rejected_kinds: std::collections::HashSet<String>,
+    last_unknown_kinds: std::collections::HashSet<String>,
     last_partial_kinds: std::collections::HashSet<String>,
     last_stale_kinds: std::collections::HashSet<String>,
 }
@@ -1193,8 +1203,9 @@ impl Metrics {
     ///
     /// Etcd-only series (`observed_revision`, `applied_revision`,
     /// `source_connected`) are emitted only in etcd mode. Label churn on the
-    /// info/rejected gauges (`hash_info`, `rejected_resources`) zeroes the
-    /// prior label set so the exposition never carries two live samples.
+    /// info/rejected gauges (`hash_info`, `rejected_resources`,
+    /// `unknown_kind_resources`) zeroes the prior label set so the exposition
+    /// never carries two live samples.
     ///
     /// Deliberately NOT routed through the per-worker handle cache: this
     /// runs once per scrape (not per request), and the zeroing discipline
@@ -1266,6 +1277,24 @@ impl Metrics {
                     .set(*count as f64);
             }
             labels.last_rejected_kinds = view.rejected_by_kind.keys().cloned().collect();
+
+            // Unknown-kind gauge per kind, same zeroing discipline. Zero and
+            // not NaN: unlike the retirable request-path gauges, this one
+            // counts rows currently in a state, so "no rows of this kind are
+            // unknown to me" is the true reading of 0 — and it keeps a
+            // `sum()` over the family, which is what an operator alerts on,
+            // from going NaN.
+            for kind in &labels.last_unknown_kinds {
+                if !view.unknown_kind_by_kind.contains_key(kind) {
+                    metrics::gauge!(M_CONFIG_UNKNOWN_KIND_RESOURCES, "kind" => kind.clone())
+                        .set(0.0);
+                }
+            }
+            for (kind, count) in &view.unknown_kind_by_kind {
+                metrics::gauge!(M_CONFIG_UNKNOWN_KIND_RESOURCES, "kind" => kind.clone())
+                    .set(*count as f64);
+            }
+            labels.last_unknown_kinds = view.unknown_kind_by_kind.keys().cloned().collect();
 
             // Partially-compatible gauge per kind, same zeroing discipline.
             // Per-field detail deliberately stays off the labels (field paths
@@ -6258,6 +6287,7 @@ mod tests {
             reloads_total: 3,
             reload_failures: std::collections::BTreeMap::new(),
             rejected_by_kind: std::collections::BTreeMap::new(),
+            unknown_kind_by_kind: std::collections::BTreeMap::new(),
             partially_compatible_by_kind: std::collections::BTreeMap::new(),
             stale_served_by_kind: std::collections::BTreeMap::new(),
             observed_revision: Some(42),
@@ -6277,6 +6307,7 @@ mod tests {
         view.partially_compatible_by_kind
             .insert("api_keys".to_string(), 3);
         view.stale_served_by_kind.insert("models".to_string(), 1);
+        view.unknown_kind_by_kind.insert("pricing".to_string(), 2);
         m.sync_config_status(&view);
         let out = m.render();
 
@@ -6294,6 +6325,9 @@ mod tests {
         )));
         assert!(out.contains(&format!(
             "{M_CONFIG_STALE_SERVED_RESOURCES}{{kind=\"models\"}} 1"
+        )));
+        assert!(out.contains(&format!(
+            "{M_CONFIG_UNKNOWN_KIND_RESOURCES}{{kind=\"pricing\"}} 2"
         )));
         assert!(out.contains(&format!("{M_CONFIG_OBSERVED_REVISION} 42")));
         assert!(out.contains(&format!("{M_CONFIG_APPLIED_REVISION} 42")));
@@ -6326,6 +6360,7 @@ mod tests {
             .partially_compatible_by_kind
             .insert("api_keys".to_string(), 1);
         first.stale_served_by_kind.insert("models".to_string(), 1);
+        first.unknown_kind_by_kind.insert("pricing".to_string(), 1);
         m.sync_config_status(&first);
 
         // The applied config changes and the models rejection clears.
@@ -6349,6 +6384,11 @@ mod tests {
         // And for the stale-served gauge (#871).
         assert!(out.contains(&format!(
             "{M_CONFIG_STALE_SERVED_RESOURCES}{{kind=\"models\"}} 0"
+        )));
+        // And for the unknown-kind gauge (#1207) — zero, not NaN: it counts
+        // rows in a state, so 0 is the true reading once they are gone.
+        assert!(out.contains(&format!(
+            "{M_CONFIG_UNKNOWN_KIND_RESOURCES}{{kind=\"pricing\"}} 0"
         )));
     }
 

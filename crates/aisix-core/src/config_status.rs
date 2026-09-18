@@ -37,7 +37,8 @@
 //!   last-known-good bytes for keys serving stale (#871, see
 //!   `serving_stale_since` on `rejected[]`), and nothing for a rejected key
 //!   with no last good. When everything is accepted the two hashes are
-//!   equal; a rejection makes them diverge, with `rejected[]` as the
+//!   equal; a rejection makes them diverge, with `rejected[]` (or, for a
+//!   `kind` segment this build does not know, `unknown_kinds[]`) as the
 //!   authoritative per-resource explanation. A row rejected later by a
 //!   runtime builder is removed from the reported count and derives a stable
 //!   effective hash from that loader hash plus the sorted rejected identities;
@@ -58,6 +59,27 @@ use tokio::sync::watch;
 /// and heartbeat reporting. Aggregate counts and the runtime identity digest
 /// still cover every rejection.
 pub const MAX_CONFIG_REJECTIONS: usize = 256;
+
+/// Maximum unknown-kind details retained, in its own budget so a newer
+/// control plane's forward-compatible volume can never evict a real
+/// rejection from [`MAX_CONFIG_REJECTIONS`] — a single new resource kind
+/// can account for one row per model in the environment.
+pub const MAX_CONFIG_UNKNOWN_KINDS: usize = 256;
+
+/// The loader's `RejectionKind::UnknownKind` rendered snake_case: the key
+/// named a `kind` segment this build does not know.
+///
+/// This is forward compatibility, not a load failure. Under the supported
+/// upgrade order the control plane upgrades first, and a new resource kind
+/// is a free change — every gateway in the field then reports the key as an
+/// unknown kind until it is upgraded, while serving, readiness and later
+/// configuration updates are unaffected. Such rows are therefore reported
+/// apart from real rejections: `unknown_kinds[]` rather than `rejected[]`,
+/// their own gauge rather than `aisix_config_rejected_resources`, and they
+/// never flip `last_reload.successful` (issue #1207). What does NOT change
+/// is the heartbeat: [`ConfigStatus::rejection_snapshots`] keeps reporting
+/// them to the control plane, which filters them by this same reason.
+const UNKNOWN_KIND_ERROR_KIND: &str = "unknown_kind";
 
 const MAX_REJECTION_ERROR_CHARS: usize = 256;
 
@@ -80,7 +102,8 @@ impl SourceKind {
 #[serde(rename_all = "snake_case")]
 pub enum ConfigState {
     /// Applied config matches the latest observed snapshot and nothing was
-    /// rejected.
+    /// rejected. Rows of a kind this build does not know are reported in
+    /// `unknown_kinds[]` and do not disturb this state (issue #1207).
     Synced,
     /// Applied config is serving, but the latest snapshot carried entries the
     /// gateway rejected.
@@ -165,6 +188,28 @@ pub struct RejectedResource {
     /// with `serving_stale_since`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serving_stale_age_seconds: Option<u64>,
+}
+
+/// One resource whose `kind` segment this build does not know, as reported
+/// on the wire under `unknown_kinds[]`. Not a rejection: nothing an operator
+/// can fix, and nothing that means the last reload failed — see
+/// [`UNKNOWN_KIND_ERROR_KIND`].
+///
+/// Deliberately narrower than [`RejectedResource`]: `last_error_kind` is
+/// implied by the field, and `serving_stale_since` can never apply because a
+/// kind this build does not know has never had a value that served.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnknownKindResource {
+    /// Plural resource kind as written in the key (`pricing`, …).
+    pub resource_kind: String,
+    /// Resource id; empty when the key was unparseable.
+    pub resource_id: String,
+    /// Human-readable explanation from the load path.
+    pub last_error: String,
+    /// RFC3339 UTC timestamp the row was first observed this boot.
+    pub first_seen_at: String,
+    /// RFC3339 UTC timestamp the row was most recently observed.
+    pub last_seen_at: String,
 }
 
 /// One rejected entry handed to [`ConfigStatus`] by a load path. `identity`
@@ -320,6 +365,13 @@ struct ConfigStatusInner {
     rejected: BTreeMap<String, RetainedRejection>,
     rejected_counts: BTreeMap<String, usize>,
 
+    // Rows whose `kind` segment this build does not know, kept apart from
+    // the rejections above on both budget and classification
+    // (UNKNOWN_KIND_ERROR_KIND). Same identity keying, same replace-wholesale
+    // lifecycle as `rejected`.
+    unknown_kind: BTreeMap<String, RetainedRejection>,
+    unknown_kind_counts: BTreeMap<String, usize>,
+
     // Rows accepted by the loader but rejected by a runtime builder. Kept
     // separate because `record_load` replaces only the loader's observation;
     // a watch event unrelated to the broken row must not clear its signal.
@@ -372,6 +424,8 @@ impl ConfigStatus {
                 last_failure: None,
                 rejected: BTreeMap::new(),
                 rejected_counts: BTreeMap::new(),
+                unknown_kind: BTreeMap::new(),
+                unknown_kind_counts: BTreeMap::new(),
                 build_rejected: BTreeMap::new(),
                 build_rejected_counts: BTreeMap::new(),
                 build_rejected_identity_hash: None,
@@ -413,14 +467,28 @@ impl ConfigStatus {
 
         // Keep aggregate state for every rejection while retaining only a
         // bounded detail set for unauthenticated status and heartbeat output.
+        // Unknown kinds are split out first: they are forward compatibility,
+        // so they contribute to neither the rejection counts, the reload
+        // reasons, nor the sticky failure (see UNKNOWN_KIND_ERROR_KIND).
         let mut all_rejected = BTreeMap::new();
+        let mut all_unknown_kind = BTreeMap::new();
         for rejection in obs.rejected {
-            all_rejected.insert(rejection.identity.clone(), rejection);
+            if rejection.last_error_kind == UNKNOWN_KIND_ERROR_KIND {
+                all_unknown_kind.insert(rejection.identity.clone(), rejection);
+            } else {
+                all_rejected.insert(rejection.identity.clone(), rejection);
+            }
         }
         let mut rejected_counts = BTreeMap::new();
         for rejection in all_rejected.values() {
             *rejected_counts
                 .entry(rejection.resource_kind.clone())
+                .or_insert(0) += 1;
+        }
+        let mut unknown_kind_counts = BTreeMap::new();
+        for row in all_unknown_kind.values() {
+            *unknown_kind_counts
+                .entry(row.resource_kind.clone())
                 .or_insert(0) += 1;
         }
         let reload_reasons: BTreeMap<&'static str, ()> = all_rejected
@@ -457,6 +525,29 @@ impl ConfigStatus {
         }
         inner.rejected = merged;
         inner.rejected_counts = rejected_counts;
+
+        let mut merged_unknown: BTreeMap<String, RetainedRejection> = BTreeMap::new();
+        for (identity, r) in all_unknown_kind.into_iter().take(MAX_CONFIG_UNKNOWN_KINDS) {
+            let first_seen_at = inner
+                .unknown_kind
+                .get(&identity)
+                .map(|prev| prev.first_seen_at)
+                .unwrap_or(r.seen_at);
+            merged_unknown.insert(
+                identity,
+                RetainedRejection {
+                    resource_kind: r.resource_kind,
+                    resource_id: r.resource_id,
+                    last_error_kind: r.last_error_kind,
+                    last_error: bounded_rejection_error(r.last_error),
+                    first_seen_at,
+                    last_seen_at: r.seen_at,
+                    serving_stale_since: r.serving_stale_since,
+                },
+            );
+        }
+        inner.unknown_kind = merged_unknown;
+        inner.unknown_kind_counts = unknown_kind_counts;
         inner.partially_compatible = obs.partially_compatible;
         inner.partially_compatible_rows_by_kind = obs.partially_compatible_rows_by_kind;
         inner.stale_served_rows_by_kind = obs.stale_served_rows_by_kind;
@@ -630,11 +721,18 @@ impl ConfigStatus {
     }
 
     /// Current loader + runtime-builder rejections for heartbeat reporting.
+    ///
+    /// Unknown kinds are included, with their `unknown_kind` reason intact:
+    /// the control plane is the one party that can tell "a kind no released
+    /// gateway reads yet" from "a kind this gateway alone is too old for",
+    /// and it filters them by that reason. Reporting them apart on the local
+    /// status surface (issue #1207) does not change what it receives.
     pub fn rejection_snapshots(&self) -> Vec<ConfigRejectionSnapshot> {
         let inner = self.inner.lock().unwrap();
         let mut out: Vec<_> = inner
             .rejected
             .iter()
+            .chain(inner.unknown_kind.iter())
             .chain(inner.build_rejected.iter())
             .map(|(key, r)| ConfigRejectionSnapshot {
                 key: key.clone(),
@@ -767,6 +865,20 @@ impl ConfigStatusInner {
         rejected.sort_by(|a, b| {
             (&a.resource_kind, &a.resource_id).cmp(&(&b.resource_kind, &b.resource_id))
         });
+        let mut unknown_kinds: Vec<UnknownKindResource> = self
+            .unknown_kind
+            .values()
+            .map(|r| UnknownKindResource {
+                resource_kind: r.resource_kind.clone(),
+                resource_id: r.resource_id.clone(),
+                last_error: r.last_error.clone(),
+                first_seen_at: rfc3339(r.first_seen_at),
+                last_seen_at: rfc3339(r.last_seen_at),
+            })
+            .collect();
+        unknown_kinds.sort_by(|a, b| {
+            (&a.resource_kind, &a.resource_id).cmp(&(&b.resource_kind, &b.resource_id))
+        });
         let mut partially_compatible = self.partially_compatible.clone();
         partially_compatible
             .sort_by(|a, b| (&a.resource_kind, &a.field).cmp(&(&b.resource_kind, &b.field)));
@@ -777,6 +889,7 @@ impl ConfigStatusInner {
             last_reload,
             last_failure,
             rejected,
+            unknown_kinds,
             partially_compatible,
         }
     }
@@ -794,6 +907,7 @@ impl ConfigStatusInner {
             reloads_total: self.reloads_total,
             reload_failures: self.reload_failures.iter().map(|(k, v)| (*k, *v)).collect(),
             rejected_by_kind,
+            unknown_kind_by_kind: self.unknown_kind_counts.clone(),
             partially_compatible_by_kind: self.partially_compatible_rows_by_kind.clone(),
             stale_served_by_kind: self.stale_served_rows_by_kind.clone(),
             observed_revision: if etcd { self.observed_revision } else { None },
@@ -816,6 +930,14 @@ pub struct ConfigStatusView {
     /// `null` when no failure has occurred this boot.
     pub last_failure: Option<FailureView>,
     pub rejected: Vec<RejectedResource>,
+    /// Resources whose `kind` segment this build does not know, sorted.
+    /// Forward compatibility rather than failure, so these rows are absent
+    /// from `rejected[]`, leave `state` and `last_reload.successful` alone,
+    /// and are counted by `aisix_config_unknown_kind_resources` instead of
+    /// `aisix_config_rejected_resources` (issue #1207). They are not served,
+    /// so they are the other reason `applied.config_hash` can differ from
+    /// `source.source_hash`.
+    pub unknown_kinds: Vec<UnknownKindResource>,
     /// Resources served with unknown fields ignored, aggregated per
     /// (kind, field) and sorted. Empty when every served document matched
     /// its schema exactly. The companion to `applied.config_hash`: the
@@ -871,6 +993,9 @@ pub struct ConfigMetricsView {
     pub reloads_total: u64,
     pub reload_failures: BTreeMap<&'static str, u64>,
     pub rejected_by_kind: BTreeMap<String, usize>,
+    /// Rows per kind whose `kind` segment this build does not know
+    /// (issue #1207). Disjoint from `rejected_by_kind`.
+    pub unknown_kind_by_kind: BTreeMap<String, usize>,
     /// Served resources per kind carrying at least one ignored field.
     pub partially_compatible_by_kind: BTreeMap<String, usize>,
     /// Served resources per kind running on their last known good value
@@ -1674,6 +1799,225 @@ mod tests {
         assert_eq!(m.rejected_by_kind.get("provider_keys"), Some(&1));
     }
 
+    // Issue #1207. A resource of a kind this build does not know is forward
+    // compatibility, not a load failure: the control plane upgrades first and
+    // a new resource kind is a free change, so every gateway in the field
+    // reports the key until it is upgraded while serving is unaffected.
+    #[test]
+    fn an_unknown_kind_alone_keeps_the_reload_successful() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        cs.record_load(LoadObservation {
+            source_hash: "src".into(),
+            observed_revision: Some(9),
+            applied: Some(applied("applied", &[("models", 1)])),
+            rejected: vec![incoming(
+                "/aisix/global/pricing/p-1",
+                "pricing",
+                "p-1",
+                "unknown_kind",
+                "unknown kind \"pricing\"",
+            )],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: true,
+            wholly_rejected: false,
+        });
+
+        let v = cs.view();
+        assert_eq!(v.state, ConfigState::Synced);
+        assert!(v.rejected.is_empty(), "{:?}", v.rejected);
+        assert_eq!(v.unknown_kinds.len(), 1);
+        assert_eq!(v.unknown_kinds[0].resource_kind, "pricing");
+        assert_eq!(v.unknown_kinds[0].resource_id, "p-1");
+        assert!(
+            v.last_reload.as_ref().unwrap().successful,
+            "an unknown kind must not report the last reload as failed",
+        );
+        assert!(v.last_failure.is_none(), "{:?}", v.last_failure);
+
+        let m = cs.metrics();
+        assert!(m.last_reload_successful);
+        assert!(m.rejected_by_kind.is_empty(), "{:?}", m.rejected_by_kind);
+        assert_eq!(m.unknown_kind_by_kind.get("pricing"), Some(&1));
+        assert!(m.reload_failures.is_empty(), "{:?}", m.reload_failures);
+        assert!(m.last_reload_success_ts.is_some());
+    }
+
+    // The other half of the same rule: a genuine rejection in the same
+    // reload still fails it, and the two classes never mix in either view.
+    #[test]
+    fn a_real_rejection_beside_an_unknown_kind_still_fails_the_reload() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        cs.record_load(LoadObservation {
+            source_hash: "src".into(),
+            observed_revision: Some(9),
+            applied: Some(applied("applied", &[("models", 1)])),
+            rejected: vec![
+                incoming(
+                    "/aisix/env/pricing/p-1",
+                    "pricing",
+                    "p-1",
+                    "unknown_kind",
+                    "unknown kind \"pricing\"",
+                ),
+                incoming(
+                    "/aisix/env/models/bad",
+                    "models",
+                    "bad",
+                    "schema_failed",
+                    "schema validation failed at `/display_name`",
+                ),
+            ],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: true,
+            wholly_rejected: false,
+        });
+
+        let v = cs.view();
+        assert_eq!(v.state, ConfigState::Degraded);
+        assert_eq!(v.rejected.len(), 1);
+        assert_eq!(v.rejected[0].resource_kind, "models");
+        assert_eq!(v.unknown_kinds.len(), 1);
+        assert!(!v.last_reload.as_ref().unwrap().successful);
+        assert_eq!(
+            v.last_failure.as_ref().map(|f| f.last_error_kind.as_str()),
+            Some("schema_failed"),
+            "the sticky failure must name the real rejection, not the unknown kind",
+        );
+
+        let m = cs.metrics();
+        assert!(!m.last_reload_successful);
+        assert_eq!(m.rejected_by_kind.get("models"), Some(&1));
+        assert!(!m.rejected_by_kind.contains_key("pricing"));
+        assert_eq!(m.unknown_kind_by_kind.get("pricing"), Some(&1));
+        assert_eq!(m.reload_failures.get("validate"), Some(&1));
+    }
+
+    // The control plane is the only party that can tell "a kind no released
+    // gateway reads yet" from "a kind this gateway alone is too old for", and
+    // it filters on the `unknown_kind` reason. Splitting the local views must
+    // not change what it receives.
+    #[test]
+    fn unknown_kinds_still_reach_the_heartbeat_with_their_reason() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        cs.record_load(LoadObservation {
+            source_hash: "src".into(),
+            observed_revision: Some(9),
+            applied: Some(applied("applied", &[("models", 1)])),
+            rejected: vec![
+                incoming(
+                    "/aisix/global/pricing/p-1",
+                    "pricing",
+                    "p-1",
+                    "unknown_kind",
+                    "unknown kind \"pricing\"",
+                ),
+                incoming(
+                    "/aisix/env/models/bad",
+                    "models",
+                    "bad",
+                    "schema_failed",
+                    "boom",
+                ),
+            ],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: true,
+            wholly_rejected: false,
+        });
+
+        let beat = cs.rejection_snapshots();
+        let reported: BTreeMap<&str, &str> = beat
+            .iter()
+            .map(|r| (r.key.as_str(), r.kind.as_str()))
+            .collect();
+        assert_eq!(
+            reported.get("/aisix/global/pricing/p-1"),
+            Some(&"unknown_kind"),
+        );
+        assert_eq!(
+            reported.get("/aisix/env/models/bad"),
+            Some(&"schema_failed")
+        );
+    }
+
+    // One new resource kind can be one row per model in the environment, so
+    // the two detail sets get independent budgets: forward-compatible volume
+    // must never evict the rejection an operator can actually fix.
+    #[test]
+    fn unknown_kind_volume_does_not_evict_a_real_rejection() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        let mut rejected: Vec<IncomingRejection> = (0..MAX_CONFIG_UNKNOWN_KINDS + 50)
+            .map(|i| {
+                incoming(
+                    &format!("/aisix/global/pricing/p-{i:04}"),
+                    "pricing",
+                    &format!("p-{i:04}"),
+                    "unknown_kind",
+                    "unknown kind \"pricing\"",
+                )
+            })
+            .collect();
+        rejected.push(incoming(
+            "/aisix/env/models/zzz-bad",
+            "models",
+            "zzz-bad",
+            "schema_failed",
+            "boom",
+        ));
+        cs.record_load(LoadObservation {
+            source_hash: "src".into(),
+            observed_revision: Some(9),
+            applied: Some(applied("applied", &[("models", 1)])),
+            rejected,
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: true,
+            wholly_rejected: false,
+        });
+
+        let v = cs.view();
+        assert_eq!(
+            v.rejected.len(),
+            1,
+            "the real rejection must survive unknown-kind volume",
+        );
+        assert_eq!(v.rejected[0].resource_id, "zzz-bad");
+        assert_eq!(v.unknown_kinds.len(), MAX_CONFIG_UNKNOWN_KINDS);
+        // Counts cover every row, bounded detail or not.
+        let m = cs.metrics();
+        assert_eq!(
+            m.unknown_kind_by_kind.get("pricing"),
+            Some(&(MAX_CONFIG_UNKNOWN_KINDS + 50)),
+        );
+    }
+
+    #[test]
+    fn unknown_kinds_clear_when_the_rows_go_away() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        cs.record_load(LoadObservation {
+            rejected: vec![incoming(
+                "/aisix/global/pricing/p-1",
+                "pricing",
+                "p-1",
+                "unknown_kind",
+                "unknown kind \"pricing\"",
+            )],
+            ..clean_load()
+        });
+        assert_eq!(cs.view().unknown_kinds.len(), 1);
+        cs.record_load(clean_load());
+        let v = cs.view();
+        assert!(v.unknown_kinds.is_empty());
+        assert_eq!(v.state, ConfigState::Synced);
+        assert!(cs.metrics().unknown_kind_by_kind.is_empty());
+    }
+
     #[test]
     fn fetch_failure_marks_disconnected_and_counts_fetch_reason() {
         let cs = ConfigStatus::new(SourceKind::Etcd);
@@ -1742,10 +2086,6 @@ mod tests {
         );
         assert_eq!(
             ReloadReason::from_error_kind("bad_key"),
-            ReloadReason::Validate
-        );
-        assert_eq!(
-            ReloadReason::from_error_kind("unknown_kind"),
             ReloadReason::Validate
         );
     }

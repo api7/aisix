@@ -39,7 +39,7 @@ pub use config::{
 pub use config_status::{
     hash_bytes, hash_entries, AppliedSnapshot, ConfigMetricsView, ConfigRejectionSnapshot,
     ConfigState, ConfigStatus, ConfigStatusView, IncomingRejection, LoadObservation,
-    RejectedResource, SourceKind,
+    RejectedResource, SourceKind, UnknownKindResource,
 };
 pub use error::{
     AdminError, AdminErrorEnvelope, BootstrapError, ProxyError, ProxyErrorEnvelope, RateLimitScope,
