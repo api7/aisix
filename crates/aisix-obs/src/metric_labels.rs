@@ -12,12 +12,11 @@ use metrics::{
     Counter, CounterFn, Gauge, Histogram, Key, KeyName, Label, Metadata, Recorder, SharedString,
     Unit,
 };
-use serde::Serialize;
 
 use crate::metrics::*;
 use crate::prometheus::Recorder as PrometheusRecorder;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct MetricVariable {
     pub name: &'static str,
     pub description: &'static str,
@@ -77,7 +76,7 @@ pub static METRIC_VARIABLES: &[MetricVariable] = &[
     variable!("hash", "The hash of the applied gateway resource configuration."),
 ];
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct MetricDefinition {
     pub name: &'static str,
     pub default_labels: &'static [&'static str],
