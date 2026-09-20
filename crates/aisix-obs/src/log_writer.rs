@@ -18,11 +18,13 @@
 //! once in a warning; a gap in the log that the log itself does not
 //! account for would be worse than the gap.
 //!
-//! Two things deliberately stay synchronous. A panic still reaches stderr
-//! directly, because the default panic hook writes there itself rather
-//! than through the subscriber — nothing here may change that. And
-//! [`flush`] is called on the way out of `main`, so a graceful shutdown
-//! empties the queue before the process goes.
+//! Two things deliberately stay synchronous. A panic still goes straight
+//! to stderr, because the default panic hook writes there itself rather
+//! than through the subscriber — nothing here may change that, though it
+//! is worth knowing that a panic raised while the sink is stuck queues
+//! behind the same descriptor lock the writer thread holds, exactly as it
+//! did before any of this. And `shutdown` is called on the way out of
+//! `main`, so a graceful exit empties the queue before the process goes.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -59,8 +61,14 @@ const IDLE_POLL: Duration = Duration::from_millis(100);
 
 struct Shared {
     queue: ArrayQueue<Vec<u8>>,
-    /// Events dropped and not yet accounted for by the writer thread.
-    dropped: AtomicU64,
+    /// Events dropped and not yet named in a warning.
+    unwarned: AtomicU64,
+    /// Whether the writer is between taking work and finishing it. An
+    /// empty queue is NOT an emptied one: the line the writer is parked
+    /// inside `write` with has already been popped, so a drain that only
+    /// looked at the queue would call a stuck sink drained and then join
+    /// a thread that never returns.
+    writing: AtomicBool,
     /// Set once, on the way out, to wake and retire the writer thread.
     stopping: AtomicBool,
     /// Guards nothing; paired with `wake` so the writer can sleep.
@@ -71,12 +79,26 @@ struct Shared {
 impl Shared {
     fn push(&self, line: Vec<u8>) {
         if self.queue.push(line).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            // Counted here rather than by the writer thread, because the
+            // writer is parked inside the stuck sink for exactly as long
+            // as the drops are happening — folding them in from there
+            // would publish zero for the whole window the metric exists
+            // to describe.
+            DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            self.unwarned.fetch_add(1, Ordering::Relaxed);
             return;
         }
         // Cheap when nobody is parked, which is the case whenever the
-        // sink is keeping up.
+        // sink is keeping up. A notification that lands in the window
+        // between the writer's emptiness check and its park is lost, and
+        // costs that line up to `IDLE_POLL`; closing it would need the
+        // producer to take a lock, which is the thing this must not do.
         self.wake.notify_one();
+    }
+
+    /// Nothing queued and nothing in flight.
+    fn drained(&self) -> bool {
+        self.queue.is_empty() && !self.writing.load(Ordering::Acquire)
     }
 }
 
@@ -142,7 +164,8 @@ impl LogWriter {
     ) -> (LogQueue, LogWriter) {
         let shared = Arc::new(Shared {
             queue: ArrayQueue::new(capacity),
-            dropped: AtomicU64::new(0),
+            unwarned: AtomicU64::new(0),
+            writing: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             idle: Mutex::new(()),
             wake: Condvar::new(),
@@ -156,6 +179,9 @@ impl LogWriter {
                 // is holding memory.
                 let mut unreported = 0_u64;
                 loop {
+                    // Raised before the pop, so the flag is never false
+                    // with a line already taken off the queue.
+                    worker.writing.store(true, Ordering::Release);
                     let mut wrote = false;
                     while let Some(line) = worker.queue.pop() {
                         let _ = sink.write_all(&line);
@@ -164,11 +190,8 @@ impl LogWriter {
                     if wrote {
                         let _ = sink.flush();
                     }
-                    let seen = worker.dropped.swap(0, Ordering::Relaxed);
-                    if seen > 0 {
-                        DROPPED_TOTAL.fetch_add(seen, Ordering::Relaxed);
-                        unreported += seen;
-                    }
+                    worker.writing.store(false, Ordering::Release);
+                    unreported += worker.unwarned.swap(0, Ordering::Relaxed);
                     // Only once the sink has caught up, so a sustained
                     // stall does not spend the queue on its own report.
                     if unreported > 0 && worker.queue.is_empty() {
@@ -206,14 +229,16 @@ impl LogWriter {
     /// keeps working afterwards.
     pub(crate) fn flush(&self, deadline: Duration) -> bool {
         let until = Instant::now() + deadline;
-        while Instant::now() < until {
-            if self.shared.queue.is_empty() {
+        loop {
+            if self.shared.drained() {
                 return true;
+            }
+            if Instant::now() >= until {
+                return false;
             }
             self.shared.wake.notify_one();
             std::thread::sleep(Duration::from_millis(2));
         }
-        self.shared.queue.is_empty()
     }
 
     /// Drain and retire the writer thread. Later events are discarded.
@@ -241,7 +266,7 @@ impl LogWriter {
 
     #[cfg(test)]
     fn dropped(&self) -> u64 {
-        self.shared.dropped.load(Ordering::Relaxed)
+        self.shared.unwarned.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -367,18 +392,29 @@ mod tests {
 
     /// The scenario this module exists for must not become a process
     /// that will not exit.
+    ///
+    /// One line into a queue with room for 64 is the case that matters:
+    /// the writer pops it and parks inside the sink, so the QUEUE is
+    /// empty while the line is still unwritten. A drain that only asked
+    /// the queue would call that drained and then join forever.
     #[test]
     fn shutdown_gives_up_on_a_sink_that_never_drains() {
         let sink = BlockedSink::new();
         let (queue, writer) = LogWriter::start(sink.clone(), 64);
-        for n in 0..10 {
-            let mut w = queue.make_writer();
-            w.write_all(&line(n)).expect("accepted");
+        let mut w = queue.make_writer();
+        w.write_all(&line(0)).expect("accepted");
+        drop(w);
+        // Let the writer take it off the queue and park in the sink.
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until && writer.queued() > 0 {
+            std::thread::sleep(Duration::from_millis(2));
         }
+        assert_eq!(writer.queued(), 0, "the writer has taken the line");
+
         let started = Instant::now();
         assert!(
             !writer.shutdown(Duration::from_millis(200)),
-            "an undrained queue must be reported as such",
+            "a line still inside the sink is not a drained queue",
         );
         assert!(
             started.elapsed() < Duration::from_secs(2),

@@ -155,6 +155,15 @@ enum CliCommand {
 /// taking a core back from the workers.
 const CONTROL_RUNTIME_THREADS: usize = 2;
 
+/// How long the exit waits for the log queue to reach its sink.
+///
+/// Its own constant rather than `shutdown.min_drain_secs`: that knob
+/// sizes the CONNECTION drain against a load balancer's detection
+/// latency, `0` is a legal and used value for it (the e2e harness sets
+/// exactly that), and a zero-length flush would drop the shutdown log
+/// every time.
+const LOG_FLUSH_DEADLINE: Duration = Duration::from_secs(5);
+
 fn main() -> anyhow::Result<()> {
     // Install the process-level rustls CryptoProvider before anything
     // else touches TLS. rustls 0.23 dropped implicit provider selection
@@ -244,13 +253,11 @@ async fn async_main(cfg: Config) -> anyhow::Result<()> {
 
     // Around `run`, not inside it: every `?` in there would otherwise
     // exit with the shutdown path's log lines still queued, and this is
-    // the last point at which anything can still be written. `eprintln!`
-    // for the failure, because by then the queue has no reader left.
-    let drain = Duration::from_secs(cfg.shutdown.min_drain_secs);
+    // the last point at which anything can still be written. The result
+    // is discarded on purpose — see `shutdown_logging`, there is nowhere
+    // left to report a sink that is not taking bytes.
     let outcome = run(cfg).await;
-    if !aisix_obs::shutdown_logging(drain) {
-        eprintln!("aisix: log sink did not drain before exit; queued log lines were lost");
-    }
+    let _ = aisix_obs::shutdown_logging(LOG_FLUSH_DEADLINE);
     outcome
 }
 

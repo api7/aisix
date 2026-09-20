@@ -119,11 +119,17 @@ pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
         .with_ansi(std::io::stderr().is_terminal())
         .with_writer(queue);
 
-    tracing_subscriber::registry()
+    if tracing_subscriber::registry()
         .with(filter)
         .with(fmt_layer)
         .try_init()
-        .map_err(|_| ObsError::AlreadyInitialised)?;
+        .is_err()
+    {
+        // Nothing was logged yet, so this drains instantly. Without it the
+        // writer thread and its queue outlive the failed call.
+        writer.shutdown(Duration::from_secs(1));
+        return Err(ObsError::AlreadyInitialised);
+    }
     let _ = LOG_WRITER.set(writer);
 
     tracing::info!(
@@ -139,11 +145,18 @@ static LOG_WRITER: OnceLock<log_writer::LogWriter> = OnceLock::new();
 
 /// Drain the log queue and retire the writer thread.
 ///
-/// Called on the way out of `main`, after the drain: whatever the gateway
-/// logged while shutting down is the part an operator reads to find out
-/// why, and the process exiting would otherwise discard it. Returns
-/// whether the queue emptied within `deadline`. A no-op when
-/// [`init_tracing`] was never called.
+/// Called on the way out of `main`: whatever the gateway logged while
+/// shutting down is the part an operator reads to find out why, and the
+/// process exiting would otherwise discard it. Returns whether the queue
+/// emptied within `deadline`. A no-op when [`init_tracing`] was never
+/// called.
+///
+/// A `false` here cannot be reported anywhere. It means the log sink is
+/// not accepting bytes, so `eprintln!` would block on the same descriptor
+/// — and on the very lock the abandoned writer thread is holding inside
+/// its own `write`. The loss shows up as `aisix_log_lines_dropped_total`
+/// and as a log that stops before the shutdown lines; the exit stays
+/// prompt, which is the property worth keeping.
 pub fn shutdown_logging(deadline: Duration) -> bool {
     LOG_WRITER
         .get()
