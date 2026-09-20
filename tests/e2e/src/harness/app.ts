@@ -206,6 +206,18 @@ export interface SpawnedApp {
    * instead of sleeping.
    */
   output(): string;
+  /**
+   * Stop reading the binary's stdout/stderr, leaving its log pipe to
+   * fill exactly as a container runtime's log shim does while kubelet
+   * rotates and compresses the container log. Everything written after
+   * this is invisible to `output()` until `releaseLogSink()`.
+   *
+   * For asserting that a stalled log consumer does not stall the
+   * gateway. Nothing else should need it.
+   */
+  holdLogSink(): void;
+  /** Resume draining after `holdLogSink()`. */
+  releaseLogSink(): void;
   signal(signal: NodeJS.Signals): void;
   /**
    * Resolves when the process exits on its own — no signal is sent, no
@@ -463,12 +475,11 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
 
   let stderrBuf = "";
-  child.stderr?.on("data", (c: Buffer) => {
+  const drain = (c: Buffer) => {
     stderrBuf += c.toString("utf8");
-  });
-  child.stdout?.on("data", (c: Buffer) => {
-    stderrBuf += c.toString("utf8");
-  });
+  };
+  child.stderr?.on("data", drain);
+  child.stdout?.on("data", drain);
   let exitErr: string | undefined;
   // Reject the readiness wait the moment the binary exits non-zero, so
   // an intentional boot failure (e.g. a malformed resources file)
@@ -558,6 +569,20 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     resourcesPath,
     output() {
       return stderrBuf;
+    },
+    holdLogSink() {
+      // `pause()` alone is not enough: a `data` listener puts the stream
+      // in flowing mode and keeps reading the fd.
+      child.stderr?.off("data", drain);
+      child.stdout?.off("data", drain);
+      child.stderr?.pause();
+      child.stdout?.pause();
+    },
+    releaseLogSink() {
+      child.stderr?.on("data", drain);
+      child.stdout?.on("data", drain);
+      child.stderr?.resume();
+      child.stdout?.resume();
     },
     signal(signal: NodeJS.Signals) {
       if (child.exitCode === null) child.kill(signal);
