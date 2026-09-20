@@ -287,18 +287,18 @@ impl Guard {
         let Some(conn) = lock(&guard.prober).clone() else {
             return;
         };
-        if !guard.breaker.claim_prober() {
+        let Some(claim) = guard.breaker.claim_prober() else {
             return;
-        }
+        };
         let guard = Arc::clone(guard);
-        tokio::spawn(async move { probe_until_closed(guard, conn).await });
+        tokio::spawn(async move { probe_until_closed(guard, conn, claim).await });
     }
 }
 
 /// Re-test Redis once per window until the breaker closes. Runs detached,
 /// off the request path; exactly one of these exists per open breaker
 /// ([`Breaker::claim_prober`]).
-async fn probe_until_closed(guard: Arc<Guard>, conn: ConnKind) {
+async fn probe_until_closed(guard: Arc<Guard>, conn: ConnKind, claim: u64) {
     // What one probe can cost at worst. Not the command budget for a
     // sentinel, where a probe may re-walk the sentinels to re-resolve the
     // master first — and `timeout_secs` has no upper bound, so a deadline
@@ -309,14 +309,17 @@ async fn probe_until_closed(guard: Arc<Guard>, conn: ConnKind) {
         _ => guard.timeout,
     };
     loop {
-        if !guard.breaker.hold_off(guard.breaker.window + probe_budget) {
+        if !guard
+            .breaker
+            .hold_off(claim, guard.breaker.window + probe_budget)
+        {
             return;
         }
         tokio::time::sleep(guard.breaker.window).await;
         let seen = guard.breaker.generation();
         match probe_ping(&conn, guard.timeout).await {
             Ok(()) => {
-                if guard.breaker.close_from_prober(seen) {
+                if guard.breaker.close_from_prober(claim, seen) {
                     tracing::info!(
                         target: "aisix::redis",
                         "redis answered the cool-off probe; commands resume"
@@ -403,9 +406,18 @@ struct Breaker {
 struct BreakerState {
     open_until: Option<Instant>,
     generation: u64,
-    /// A background prober is in charge of closing this breaker. While it
-    /// is, no caller is admitted, whatever the window says.
-    probing: bool,
+    /// The prober in charge of closing this breaker, if any. An id rather
+    /// than a flag, because the claim can change hands: a prober whose
+    /// deadline lapsed has it taken back by the caller that got through,
+    /// and the failure of THAT caller starts a replacement. The original
+    /// must not then renew the replacement's window or close the breaker
+    /// on evidence the replacement never asked for — with a flag, both
+    /// would read as "a prober is in charge" and both probers would run
+    /// on one connection.
+    prober: Option<u64>,
+    /// Ids handed out so far, so a returning prober cannot match a
+    /// claim it no longer owns.
+    claims: u64,
 }
 
 impl Breaker {
@@ -469,7 +481,7 @@ impl Breaker {
             // window alone used to do; releasing the claim also lets the
             // next failure start a fresh prober.
             Some(_) => {
-                st.probing = false;
+                st.prober = None;
                 st.open_until = Some(Instant::now() + self.window);
                 Some(st.generation)
             }
@@ -485,9 +497,14 @@ impl Breaker {
     /// Take charge of probing, if nothing else already has. True means the
     /// caller must start the prober task; it stays true until that task
     /// closes the breaker.
-    fn claim_prober(&self) -> bool {
+    fn claim_prober(&self) -> Option<u64> {
         let mut st = self.lock();
-        !std::mem::replace(&mut st.probing, true)
+        if st.prober.is_some() {
+            return None;
+        }
+        st.claims += 1;
+        st.prober = Some(st.claims);
+        st.prober
     }
 
     fn generation(&self) -> u64 {
@@ -501,9 +518,9 @@ impl Breaker {
     /// breaker closed — and the task must end rather than probe on;
     /// otherwise a second prober started meanwhile would double up, and
     /// the two would serialize on the same connection.
-    fn hold_off(&self, for_: Duration) -> bool {
+    fn hold_off(&self, claim: u64, for_: Duration) -> bool {
         let mut st = self.lock();
-        if !st.probing {
+        if st.prober != Some(claim) {
             return false;
         }
         st.open_until = Some(Instant::now() + for_);
@@ -513,13 +530,13 @@ impl Breaker {
     /// Close the breaker on the prober's evidence and release the
     /// prober's claim. False when a failure newer than `seen` re-opened
     /// it, which leaves the claim in place — the prober keeps going.
-    fn close_from_prober(&self, seen: u64) -> bool {
+    fn close_from_prober(&self, claim: u64, seen: u64) -> bool {
         let mut st = self.lock();
-        if st.generation != seen {
+        if st.prober != Some(claim) || st.generation != seen {
             return false;
         }
         st.open_until = None;
-        st.probing = false;
+        st.prober = None;
         true
     }
 
@@ -1225,17 +1242,19 @@ mod guard_tests {
     }
 
     /// A prober whose deadline lapsed has its claim taken back by the
-    /// caller that got through. It must find that out and stop: probing
-    /// on would put two probers on one connection, each renewing the
-    /// other's deadline, and on a sentinel they would serialize on the
-    /// same discovery lock and get slower the longer the outage ran.
+    /// caller that got through, and the failure of THAT caller starts a
+    /// replacement. The original must find out and stop: renewing the
+    /// replacement's window would put two probers on one connection —
+    /// each keeping the other alive, and on a sentinel serializing on the
+    /// same discovery lock, so probes get slower the longer the outage
+    /// runs. A flag cannot tell the two apart; the claim is an id.
     #[tokio::test]
-    async fn a_prober_whose_claim_was_taken_back_stops() {
+    async fn a_replacement_prober_takes_the_claim_from_the_first() {
         let g = guard(80, 40);
         Guard::run(&g, async { Err::<(), _>(dropped_connection()) })
             .await
             .expect_err("the failure opens the breaker");
-        assert!(g.breaker.claim_prober(), "stand in for the prober task");
+        let first = g.breaker.claim_prober().expect("stands in for the task");
 
         // Nothing renews the deadline, so the caller after it is admitted
         // as the fallback probe and takes the claim back.
@@ -1243,10 +1262,23 @@ mod guard_tests {
         Guard::run(&g, async { Err::<(), _>(dropped_connection()) })
             .await
             .expect_err("the fallback probe reaches Redis and fails");
+        let second = g
+            .breaker
+            .claim_prober()
+            .expect("the claim is free for a replacement");
+        assert_ne!(first, second);
 
         assert!(
-            !g.breaker.hold_off(Duration::from_secs(1)),
-            "the prober must find its claim gone rather than carry on"
+            !g.breaker.hold_off(first, Duration::from_secs(1)),
+            "the first prober must not renew the replacement's window"
+        );
+        assert!(
+            !g.breaker.close_from_prober(first, g.breaker.generation()),
+            "nor close the breaker on evidence the replacement never asked for"
+        );
+        assert!(
+            g.breaker.hold_off(second, Duration::from_secs(1)),
+            "the prober that owns the claim still can"
         );
     }
 
@@ -1496,7 +1528,7 @@ mod probe_tests {
         // Claim the probe before the outage, so the failure below finds
         // the claim taken and starts no task: what is left behind when a
         // prober goes away mid-flight.
-        assert!(policy.0.breaker.claim_prober());
+        assert!(policy.0.breaker.claim_prober().is_some());
 
         fake.blackhole();
         command(&conn)

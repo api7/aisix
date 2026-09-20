@@ -296,17 +296,17 @@ impl SinkPipeline {
                     Some(record) => {
                         buffer.push(record);
                         if buffer.len() >= self.cfg.max_batch {
-                            self.flush(&mut buffer, &mut shutdown).await;
+                            self.flush(&mut buffer, None, &mut shutdown).await;
                         }
                     }
                     None => {
-                        self.flush(&mut buffer, &mut shutdown).await;
+                        self.drain(&mut buffer, &mut shutdown).await;
                         tracing::info!(sink = %self.sink.name(), "sink pipeline: channel closed, exiting");
                         return;
                     }
                 },
                 _ = ticker.tick() => {
-                    self.flush(&mut buffer, &mut shutdown).await;
+                    self.flush(&mut buffer, None, &mut shutdown).await;
                 }
                 _ = cancel.changed() => {
                     if *cancel.borrow() {
@@ -333,6 +333,12 @@ impl SinkPipeline {
         buffer: &mut Vec<Arc<SinkRecord>>,
         shutdown: &mut watch::Receiver<bool>,
     ) {
+        // ONE deadline for the whole drain, not one per batch: batches go
+        // out sequentially, so a per-batch budget multiplies by however
+        // many the queue holds — 8192 records at 100 a batch is 82 of
+        // them, and a receiver failing transiently would hold shutdown
+        // for minutes.
+        let deadline = Instant::now() + DRAIN_RETRY_BUDGET;
         loop {
             while buffer.len() < self.cfg.max_batch {
                 match self.rx.try_recv() {
@@ -343,13 +349,30 @@ impl SinkPipeline {
             if buffer.is_empty() {
                 return;
             }
-            self.flush(buffer, shutdown).await;
+            if Instant::now() >= deadline {
+                // Attempting costs a request timeout apiece and the
+                // deadline is already spent. Account what is left rather
+                // than let it vanish unaccounted.
+                let mut lost = buffer.len();
+                buffer.clear();
+                while self.rx.try_recv().is_ok() {
+                    lost += 1;
+                }
+                self.record_drop(lost, "shutdown drain deadline reached", "worker_stopped");
+                return;
+            }
+            self.flush(buffer, Some(deadline), shutdown).await;
         }
     }
 
     /// Take the buffer and deliver it as one batch (with retry). No-op when
     /// empty.
-    async fn flush(&self, buffer: &mut Vec<Arc<SinkRecord>>, shutdown: &mut watch::Receiver<bool>) {
+    async fn flush(
+        &self,
+        buffer: &mut Vec<Arc<SinkRecord>>,
+        deadline: Option<Instant>,
+        shutdown: &mut watch::Receiver<bool>,
+    ) {
         if buffer.is_empty() {
             return;
         }
@@ -357,7 +380,7 @@ impl SinkPipeline {
         buffer.reserve(self.cfg.max_batch);
         let count = records.len();
         let batch = EventBatch::new(records);
-        self.deliver(&batch, count, shutdown).await;
+        self.deliver(&batch, count, deadline, shutdown).await;
     }
 
     /// Deliver one batch, retrying transient failures until the retry
@@ -376,6 +399,7 @@ impl SinkPipeline {
         &self,
         batch: &EventBatch,
         count: usize,
+        deadline: Option<Instant>,
         shutdown: &mut watch::Receiver<bool>,
     ) {
         let marker = IdempotencyMarker::None;
@@ -397,9 +421,15 @@ impl SinkPipeline {
                     if let Some(m) = &self.metrics {
                         m.record_otlp_fanout_failure(self.sink.name());
                     }
-                    let draining = *shutdown.borrow();
-                    if let Some(delay) = self.next_delay(&err, attempt, started.elapsed(), draining)
-                    {
+                    // The drain's deadline is shared by every batch it
+                    // still has to send, so a batch that is not the first
+                    // may find little or none of it left.
+                    let deadline = deadline.or_else(|| {
+                        shutdown
+                            .borrow()
+                            .then(|| Instant::now() + DRAIN_RETRY_BUDGET)
+                    });
+                    if let Some(delay) = self.next_delay(&err, attempt, started, deadline) {
                         attempt += 1;
                         self.stats.add_retries(1);
                         tracing::warn!(
@@ -407,7 +437,7 @@ impl SinkPipeline {
                             attempt,
                             delay_ms = delay.as_millis() as u64,
                             retry_after = err.retry_after().is_some(),
-                            draining,
+                            draining = deadline.is_some(),
                             error = %detail,
                             "sink delivery failed; retrying",
                         );
@@ -415,7 +445,7 @@ impl SinkPipeline {
                         // it out is what keeps the drain bounded: the budget
                         // shrinks the moment it arrives, and a backoff that
                         // is now tens of seconds long is not sat out.
-                        sleep_or_shutdown(delay, draining, shutdown).await;
+                        sleep_or_shutdown(delay, deadline.is_some(), shutdown).await;
                         continue;
                     }
                     let reason = if err.is_transient() {
@@ -439,25 +469,29 @@ impl SinkPipeline {
     /// and by whatever is left of the budget, so the last attempt lands on
     /// the budget boundary rather than past it.
     ///
-    /// While draining, the budget is [`DRAIN_RETRY_BUDGET`] instead: a
-    /// shutdown must not be held for the minutes the running budget is
-    /// worth, and a batch that has already spent longer than that stops
-    /// at once.
+    /// A drain passes its `deadline`, and that deadline belongs to the
+    /// WHOLE drain rather than to this batch: a shutdown must not be held
+    /// for the minutes the running budget is worth, nor for one drain
+    /// budget per batch — batches go out sequentially, and a full queue
+    /// is dozens of them.
     fn next_delay(
         &self,
         err: &SinkError,
         attempt: u32,
-        elapsed: Duration,
-        draining: bool,
+        started: Instant,
+        deadline: Option<Instant>,
     ) -> Option<Duration> {
         if !err.is_transient() {
             return None;
         }
-        let budget = match draining {
-            true => self.cfg.retry_budget.min(DRAIN_RETRY_BUDGET),
-            false => self.cfg.retry_budget,
-        };
-        let remaining = budget.checked_sub(elapsed).filter(|left| !left.is_zero())?;
+        let now = Instant::now();
+        let mut remaining = self.cfg.retry_budget.checked_sub(now - started)?;
+        if let Some(deadline) = deadline {
+            remaining = remaining.min(deadline.saturating_duration_since(now));
+        }
+        if remaining.is_zero() {
+            return None;
+        }
         let delay = match err.retry_after() {
             // Floored as well as capped: `Retry-After: 0` is a legal
             // answer, and honouring it literally would re-attempt with no
@@ -979,6 +1013,39 @@ mod tests {
             "attempts stay bounded by the floor: {}",
             sink.attempts()
         );
+    }
+
+    /// The drain budget belongs to the drain, not to each of its batches.
+    /// They go out sequentially, so a per-batch budget multiplies by how
+    /// many the queue holds — a full one is dozens — and a receiver
+    /// failing transiently would hold shutdown for minutes.
+    #[tokio::test]
+    async fn the_whole_shutdown_drain_shares_one_deadline() {
+        const QUEUED: usize = 250;
+        tokio::time::pause();
+        let sink = FakeSink::new(Mode::AlwaysTransient);
+        // 25 batches.
+        let c = PipelineConfig {
+            max_batch: 10,
+            ..PipelineConfig::default()
+        };
+        let (handle, worker) = SinkPipeline::new(sink.clone(), c);
+        for i in 0..QUEUED {
+            assert!(handle.try_enqueue(rec(i as u32)));
+        }
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        cancel_tx.send(true).unwrap();
+        let started = tokio::time::Instant::now();
+        worker.run(cancel_rx).await;
+
+        assert!(
+            started.elapsed() <= DRAIN_RETRY_BUDGET + TICK,
+            "the whole drain, not each batch: {:?}",
+            started.elapsed()
+        );
+        // And nothing vanishes unaccounted: what the deadline cut short
+        // is counted as lost, not silently forgotten.
+        assert_eq!(handle.stats().dropped, QUEUED as u64);
     }
 
     /// The budget is minutes now, so a shutdown that waited on it would
