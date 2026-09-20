@@ -17,12 +17,15 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, watch};
+// The retry budget is measured on the same clock the backoff sleeps on, so
+// a paused-clock test drives the whole ladder rather than only its sleeps.
+use tokio::time::Instant;
 
 use super::{EventBatch, IdempotencyMarker, ObservabilitySink, SinkError, SinkRecord};
 use crate::metrics::Metrics;
 
 /// Tuning for a [`SinkPipeline`]. Defaults mirror the telemetry worker
-/// (100-record batches, 5s flush, 1024-deep queue) plus a bounded retry.
+/// (100-record batches, 5s flush) plus a time-budgeted retry.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
     /// Bound on the producer→worker queue. When full, `try_enqueue` drops
@@ -32,24 +35,37 @@ pub struct PipelineConfig {
     pub max_batch: usize,
     /// Flush whatever is buffered at least this often.
     pub flush_interval: Duration,
-    /// Max retry attempts for a [`SinkError::Transient`] batch before it is
-    /// dropped (counted). `0` = no retry.
-    pub max_retries: u32,
+    /// How long a [`SinkError::is_transient`] batch keeps being retried,
+    /// measured from its FIRST attempt. When the budget is spent the batch
+    /// is dropped (counted as `retries_exhausted`). `0` = no retry.
+    ///
+    /// A budget rather than an attempt count because what a receiver
+    /// outage has is a duration, not a number of tries: at 200ms doubling
+    /// to 5s, four attempts gave up 3.0s in, so a one-minute 503 window
+    /// lost every batch that started inside it — measured, 19 batches and
+    /// 824 records. Attempts are the wrong unit to express "survive an
+    /// outage of length X" in, and tuning the count to reach X makes the
+    /// early retries pointlessly dense.
+    pub retry_budget: Duration,
     /// First retry delay; doubles each attempt up to `max_backoff`.
     pub base_backoff: Duration,
-    /// Ceiling on the exponential backoff delay.
+    /// Ceiling on the backoff delay, and on a `Retry-After` the sink asks
+    /// for.
     pub max_backoff: Duration,
 }
 
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
-            queue_capacity: 1024,
+            // Deep enough to hold what arrives while one batch is being
+            // retried: the retry budget is minutes now, and this queue is
+            // what stands between that and losing the newest records.
+            queue_capacity: 8192,
             max_batch: 100,
             flush_interval: Duration::from_secs(5),
-            max_retries: 4,
+            retry_budget: Duration::from_secs(300),
             base_backoff: Duration::from_millis(200),
-            max_backoff: Duration::from_secs(5),
+            max_backoff: Duration::from_secs(30),
         }
     }
 }
@@ -257,12 +273,16 @@ impl SinkPipeline {
         let mut ticker = tokio::time::interval(self.cfg.flush_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut buffer: Vec<Arc<SinkRecord>> = Vec::with_capacity(self.cfg.max_batch);
+        // The retry loop watches the same signal, through its own handle:
+        // `cancel` is borrowed by the select below for as long as each
+        // iteration lasts, including the arm bodies.
+        let mut shutdown = cancel.clone();
 
         tracing::info!(
             sink = %self.sink.name(),
             max_batch = self.cfg.max_batch,
             flush_interval_secs = self.cfg.flush_interval.as_secs(),
-            max_retries = self.cfg.max_retries,
+            retry_budget_secs = self.cfg.retry_budget.as_secs(),
             "sink pipeline started",
         );
 
@@ -272,24 +292,24 @@ impl SinkPipeline {
                     Some(record) => {
                         buffer.push(record);
                         if buffer.len() >= self.cfg.max_batch {
-                            self.flush(&mut buffer).await;
+                            self.flush(&mut buffer, &mut shutdown).await;
                         }
                     }
                     None => {
-                        self.flush(&mut buffer).await;
+                        self.flush(&mut buffer, &mut shutdown).await;
                         tracing::info!(sink = %self.sink.name(), "sink pipeline: channel closed, exiting");
                         return;
                     }
                 },
                 _ = ticker.tick() => {
-                    self.flush(&mut buffer).await;
+                    self.flush(&mut buffer, &mut shutdown).await;
                 }
                 _ = cancel.changed() => {
                     if *cancel.borrow() {
                         while let Ok(record) = self.rx.try_recv() {
                             buffer.push(record);
                         }
-                        self.flush(&mut buffer).await;
+                        self.flush(&mut buffer, &mut shutdown).await;
                         tracing::info!(sink = %self.sink.name(), "sink pipeline shutting down");
                         return;
                     }
@@ -300,7 +320,7 @@ impl SinkPipeline {
 
     /// Take the buffer and deliver it as one batch (with retry). No-op when
     /// empty.
-    async fn flush(&self, buffer: &mut Vec<Arc<SinkRecord>>) {
+    async fn flush(&self, buffer: &mut Vec<Arc<SinkRecord>>, shutdown: &mut watch::Receiver<bool>) {
         if buffer.is_empty() {
             return;
         }
@@ -308,15 +328,29 @@ impl SinkPipeline {
         buffer.reserve(self.cfg.max_batch);
         let count = records.len();
         let batch = EventBatch::new(records);
-        self.deliver(&batch, count).await;
+        self.deliver(&batch, count, shutdown).await;
     }
 
-    /// Deliver one batch, retrying transient failures with exponential
-    /// backoff. At-least-once: a retried batch may re-send already-accepted
-    /// records (the marker is `None` for the at-least-once sinks this phase
-    /// serves; offset-token sinks set their own marker later).
-    async fn deliver(&self, batch: &EventBatch, count: usize) {
+    /// Deliver one batch, retrying transient failures until the retry
+    /// budget measured from the first attempt is spent. At-least-once: a
+    /// retried batch may re-send already-accepted records (the marker is
+    /// `None` for the at-least-once sinks this phase serves; offset-token
+    /// sinks set their own marker later).
+    ///
+    /// The batches behind this one wait: one batch is in flight per sink,
+    /// so a receiver that is down for minutes now holds the queue for
+    /// minutes, and what overflows is dropped as `queue_full` — newest
+    /// first, which is deliberate. Losing the newest records to a full
+    /// queue is the same loss as losing the oldest to an exhausted retry,
+    /// only bounded by a queue the operator can see filling.
+    async fn deliver(
+        &self,
+        batch: &EventBatch,
+        count: usize,
+        shutdown: &mut watch::Receiver<bool>,
+    ) {
         let marker = IdempotencyMarker::None;
+        let started = Instant::now();
         let mut attempt: u32 = 0;
         loop {
             match self.sink.append_batch(batch, &marker).await {
@@ -334,40 +368,115 @@ impl SinkPipeline {
                     if let Some(m) = &self.metrics {
                         m.record_otlp_fanout_failure(self.sink.name());
                     }
-                    if err.is_transient() && attempt < self.cfg.max_retries {
+                    let draining = *shutdown.borrow();
+                    if let Some(delay) = self.next_delay(&err, attempt, started.elapsed(), draining)
+                    {
                         attempt += 1;
                         self.stats.add_retries(1);
-                        let delay = backoff(self.cfg.base_backoff, self.cfg.max_backoff, attempt);
                         tracing::warn!(
                             sink = %self.sink.name(),
                             attempt,
                             delay_ms = delay.as_millis() as u64,
+                            retry_after = err.retry_after().is_some(),
+                            draining,
                             error = %detail,
                             "sink delivery failed; retrying",
                         );
-                        tokio::time::sleep(delay).await;
+                        // Waking on the shutdown signal rather than sleeping
+                        // it out is what keeps the drain bounded: the budget
+                        // shrinks the moment it arrives, and a backoff that
+                        // is now tens of seconds long is not sat out.
+                        sleep_or_shutdown(delay, shutdown).await;
                         continue;
                     }
-                    self.stats.record_batch_failed();
-                    self.stats.add_dropped(count as u64);
-                    if let Some(m) = &self.metrics {
-                        let reason = if err.is_transient() {
-                            "retries_exhausted"
-                        } else {
-                            "permanent_error"
-                        };
-                        m.record_otlp_fanout_drop(self.sink.name(), reason, count as u64);
-                    }
-                    self.stats.set_error(detail.clone());
-                    tracing::warn!(
-                        sink = %self.sink.name(),
-                        dropped = count,
-                        transient = err.is_transient(),
-                        error = %detail,
-                        "sink delivery dropped after retries",
-                    );
+                    let reason = if err.is_transient() {
+                        "retries_exhausted"
+                    } else {
+                        "permanent_error"
+                    };
+                    self.record_drop(count, &detail, reason);
                     return;
                 }
+            }
+        }
+    }
+
+    /// How long to wait before re-attempting, or `None` when this batch is
+    /// done: its budget is spent, or the failure is permanent.
+    ///
+    /// A `Retry-After` the sink asked for wins over the backoff ladder —
+    /// retrying sooner than a throttling receiver asked for is what turns
+    /// a throttle into a longer one — but it is capped by `max_backoff`
+    /// and by whatever is left of the budget, so the last attempt lands on
+    /// the budget boundary rather than past it.
+    ///
+    /// While draining, the budget is [`DRAIN_RETRY_BUDGET`] instead: a
+    /// shutdown must not be held for the minutes the running budget is
+    /// worth, and a batch that has already spent longer than that stops
+    /// at once.
+    fn next_delay(
+        &self,
+        err: &SinkError,
+        attempt: u32,
+        elapsed: Duration,
+        draining: bool,
+    ) -> Option<Duration> {
+        if !err.is_transient() {
+            return None;
+        }
+        let budget = match draining {
+            true => self.cfg.retry_budget.min(DRAIN_RETRY_BUDGET),
+            false => self.cfg.retry_budget,
+        };
+        let remaining = budget.checked_sub(elapsed).filter(|left| !left.is_zero())?;
+        let delay = match err.retry_after() {
+            Some(asked) => asked.min(self.cfg.max_backoff),
+            None => backoff(self.cfg.base_backoff, self.cfg.max_backoff, attempt + 1),
+        };
+        Some(delay.min(remaining))
+    }
+
+    fn record_drop(&self, count: usize, detail: &str, reason: &str) {
+        self.stats.record_batch_failed();
+        self.stats.add_dropped(count as u64);
+        if let Some(m) = &self.metrics {
+            m.record_otlp_fanout_drop(self.sink.name(), reason, count as u64);
+        }
+        self.stats.set_error(detail.to_string());
+        tracing::warn!(
+            sink = %self.sink.name(),
+            dropped = count,
+            reason,
+            error = %detail,
+            "sink delivery dropped",
+        );
+    }
+}
+
+/// What one batch may still spend on retries once shutdown is signalled.
+/// It is what the drain could already spend before the budget became
+/// minutes — four retries of a ladder that doubled 200ms to a 5s cap — so
+/// shutdown is no slower than it was.
+const DRAIN_RETRY_BUDGET: Duration = Duration::from_secs(3);
+
+/// Wait out a backoff, returning early when shutdown is signalled so the
+/// caller re-decides under the drain budget.
+async fn sleep_or_shutdown(delay: Duration, shutdown: &mut watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        // Already draining, so this delay was computed under the drain
+        // budget and there is nothing left to cut short. Returning here
+        // instead would re-attempt with no wait at all, and spin against
+        // the failing sink for as long as the budget allowed.
+        tokio::time::sleep(delay).await;
+        return;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => {}
+        changed = shutdown.changed() => {
+            // A closed channel will never signal again, so returning on it
+            // would spin the retry loop through every backoff at once.
+            if changed.is_err() {
+                tokio::time::sleep(delay).await;
             }
         }
     }
@@ -391,7 +500,7 @@ fn masked(err: &SinkError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{backoff, PipelineConfig, SinkPipeline};
+    use super::{backoff, PipelineConfig, SinkPipeline, DRAIN_RETRY_BUDGET};
     use crate::sink::{
         BatchUnit, EventBatch, IdempotencyMarker, IdempotencyScheme, ObservabilitySink,
         OrderingScope, SinkAck, SinkCapabilities, SinkError, SinkHealth, SinkRecord, SinkResult,
@@ -408,15 +517,21 @@ mod tests {
         /// Fail with a transient error this many times, then succeed.
         TransientThenOk(AtomicU32),
         AlwaysTransient,
+        /// Always throttled, asking for this delay each time.
+        AlwaysThrottled(Duration),
+        /// Throttled once, asking for this delay, then succeed.
+        ThrottledThenOk(Duration, AtomicU32),
         Permanent,
         /// Permanent failure carrying a caller-chosen detail string.
         PermanentDetail(String),
     }
 
-    /// A configurable sink that records the batch sizes it was handed.
+    /// A configurable sink that records the batch sizes it was handed, and
+    /// when each delivery attempt arrived.
     struct FakeSink {
         mode: Mode,
         batch_sizes: Mutex<Vec<usize>>,
+        attempts: Mutex<Vec<tokio::time::Instant>>,
     }
 
     impl FakeSink {
@@ -424,10 +539,22 @@ mod tests {
             Arc::new(Self {
                 mode,
                 batch_sizes: Mutex::new(Vec::new()),
+                attempts: Mutex::new(Vec::new()),
             })
         }
         fn delivered(&self) -> usize {
             self.batch_sizes.lock().iter().sum()
+        }
+        fn attempts(&self) -> usize {
+            self.attempts.lock().len()
+        }
+        /// Gaps between consecutive delivery attempts.
+        fn gaps(&self) -> Vec<Duration> {
+            self.attempts
+                .lock()
+                .windows(2)
+                .map(|w| w[1] - w[0])
+                .collect()
         }
     }
 
@@ -453,6 +580,7 @@ mod tests {
             batch: &EventBatch,
             _marker: &IdempotencyMarker,
         ) -> SinkResult {
+            self.attempts.lock().push(tokio::time::Instant::now());
             match &self.mode {
                 Mode::Ok => {
                     self.batch_sizes.lock().push(batch.len());
@@ -474,6 +602,25 @@ mod tests {
                     }
                 }
                 Mode::AlwaysTransient => Err(SinkError::Transient("always failing".into())),
+                Mode::AlwaysThrottled(retry_after) => Err(SinkError::Throttled {
+                    retry_after: *retry_after,
+                    detail: "slow down".into(),
+                }),
+                Mode::ThrottledThenOk(retry_after, remaining) => {
+                    if remaining.load(Ordering::Relaxed) > 0 {
+                        remaining.fetch_sub(1, Ordering::Relaxed);
+                        Err(SinkError::Throttled {
+                            retry_after: *retry_after,
+                            detail: "slow down".into(),
+                        })
+                    } else {
+                        self.batch_sizes.lock().push(batch.len());
+                        Ok(SinkAck {
+                            accepted: batch.len(),
+                            ..SinkAck::default()
+                        })
+                    }
+                }
                 Mode::Permanent => Err(SinkError::Permanent("bad credentials".into())),
                 Mode::PermanentDetail(detail) => Err(SinkError::Permanent(detail.clone())),
             }
@@ -498,11 +645,15 @@ mod tests {
             queue_capacity: 1024,
             max_batch: 100,
             flush_interval: Duration::from_secs(60),
-            max_retries: 4,
+            retry_budget: Duration::from_millis(50),
             base_backoff: Duration::from_millis(1),
             max_backoff: Duration::from_millis(5),
         }
     }
+
+    /// Slack for assertions on the paused clock: a wakeup lands on the
+    /// timer tick at or just after its deadline, never before it.
+    const TICK: Duration = Duration::from_millis(50);
 
     async fn wait_for(f: impl Fn() -> bool, within: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + within;
@@ -575,7 +726,8 @@ mod tests {
     async fn drops_with_metric_after_exhausting_retries() {
         let sink = FakeSink::new(Mode::AlwaysTransient);
         let mut c = cfg();
-        c.max_retries = 2;
+        // Two 1ms retries fit; the third attempt finds the budget spent.
+        c.retry_budget = Duration::from_millis(2);
         let (handle, worker) = SinkPipeline::new(sink.clone(), c);
         assert!(handle.try_enqueue(rec(0)));
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -584,7 +736,7 @@ mod tests {
         jh.await.unwrap();
 
         let s = handle.stats();
-        assert_eq!(s.retries, 2, "retried up to the cap");
+        assert!(s.retries >= 1, "the batch was retried before being dropped");
         assert_eq!(s.dropped, 1, "record dropped and counted");
         assert_eq!(s.failed_batches, 1);
         assert_eq!(s.sent, 0);
@@ -613,6 +765,147 @@ mod tests {
         assert_eq!(s.retries, 0, "permanent errors are not retried");
         assert_eq!(s.dropped, 1);
         assert_eq!(s.sent, 0);
+    }
+
+    /// Drive a running pipeline holding one batch, with time paused so the
+    /// retry ladder plays out instantly. The batch flushes on the count
+    /// ceiling rather than on cancellation, because cancelling is what
+    /// shortens the budget.
+    ///
+    /// Returns the virtual time the batch's whole delivery took. Stepping
+    /// a second at a time is what advances the paused clock: auto-advance
+    /// jumps to the earliest pending timer, and without a timer of our own
+    /// the runtime is not idle while the worker sleeps.
+    async fn one_batch_under_paused_time(sink: Arc<FakeSink>, cfg: PipelineConfig) -> Duration {
+        tokio::time::pause();
+        let mut cfg = cfg;
+        cfg.max_batch = 1;
+        let (handle, worker) = SinkPipeline::new(sink.clone(), cfg);
+        assert!(handle.try_enqueue(rec(0)));
+        // Closing the channel lets the worker exit once the batch is done.
+        drop(handle);
+        let started = tokio::time::Instant::now();
+        let (_keep_alive, cancel_rx) = watch::channel(false);
+        let worker = tokio::spawn(worker.run(cancel_rx));
+        let mut stepped = Duration::ZERO;
+        while !worker.is_finished() {
+            assert!(
+                stepped < Duration::from_secs(3_600),
+                "the batch must reach an outcome"
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            stepped += Duration::from_secs(1);
+        }
+        worker.await.unwrap();
+        started.elapsed()
+    }
+
+    /// The defect: four attempts over a 3.0s ladder meant a receiver
+    /// outage longer than three seconds lost every batch that started
+    /// inside it — a 60s window of 503s dropped 19 batches / 824 records,
+    /// each 3.0s after its first attempt. Retrying is budgeted in time
+    /// now, so a batch survives an outage of any length up to the budget.
+    #[tokio::test]
+    async fn a_transient_receiver_is_retried_for_the_whole_budget() {
+        let sink = FakeSink::new(Mode::AlwaysTransient);
+        let elapsed = one_batch_under_paused_time(sink.clone(), PipelineConfig::default()).await;
+
+        let budget = PipelineConfig::default().retry_budget;
+        assert!(
+            elapsed >= budget && elapsed < budget + Duration::from_secs(5),
+            "the batch is given up on at the budget, not before or after: {elapsed:?}"
+        );
+        // The ladder tops out at `max_backoff`, so the attempts are spread
+        // across the budget rather than crowded into its first seconds.
+        assert!(
+            sink.attempts() > 10,
+            "attempts across the budget: {}",
+            sink.attempts()
+        );
+        assert!(
+            sink.gaps()
+                .iter()
+                .all(|g| *g <= PipelineConfig::default().max_backoff + TICK),
+            "no gap may exceed max_backoff: {:?}",
+            sink.gaps()
+        );
+        assert_eq!(sink.delivered(), 0, "nothing was ever accepted");
+    }
+
+    /// A receiver that says how long to wait is telling us something our
+    /// own ladder cannot know. Retrying sooner is what turns a throttle
+    /// into a longer one.
+    #[tokio::test]
+    async fn a_retry_after_sets_the_next_attempt() {
+        let sink = FakeSink::new(Mode::ThrottledThenOk(
+            Duration::from_secs(10),
+            AtomicU32::new(1),
+        ));
+        one_batch_under_paused_time(sink.clone(), PipelineConfig::default()).await;
+
+        assert_eq!(sink.delivered(), 1, "delivered on the second attempt");
+        let [gap] = sink.gaps()[..] else {
+            panic!("one retry: {:?}", sink.gaps())
+        };
+        // Not the 200ms first rung of the backoff ladder. The upper bound
+        // is the clock's step, not slack in the mechanism.
+        assert!(
+            gap >= Duration::from_secs(10) && gap < Duration::from_secs(12),
+            "the wait is what the receiver asked for: {gap:?}",
+        );
+    }
+
+    /// …but it does not get to park the queue behind it for as long as it
+    /// likes: an hour of `Retry-After` is one batch holding a pipeline for
+    /// an hour, and everything behind it dropping as `queue_full`.
+    #[tokio::test]
+    async fn a_retry_after_is_capped_at_the_backoff_ceiling() {
+        let sink = FakeSink::new(Mode::AlwaysThrottled(Duration::from_secs(3_600)));
+        let cfg = PipelineConfig {
+            retry_budget: Duration::from_secs(120),
+            ..PipelineConfig::default()
+        };
+        one_batch_under_paused_time(sink.clone(), cfg).await;
+
+        assert!(
+            sink.gaps()
+                .iter()
+                .all(|g| *g <= PipelineConfig::default().max_backoff + TICK),
+            "capped at max_backoff: {:?}",
+            sink.gaps()
+        );
+        assert!(
+            sink.attempts() >= 4,
+            "a capped wait still gets several attempts inside the budget: {}",
+            sink.attempts()
+        );
+    }
+
+    /// The budget is minutes now, so a shutdown that waited on it would
+    /// hold the process for minutes. It waits no longer than the old
+    /// ladder could already take.
+    #[tokio::test]
+    async fn shutdown_does_not_wait_out_the_retry_budget() {
+        tokio::time::pause();
+        let sink = FakeSink::new(Mode::AlwaysTransient);
+        let (handle, worker) = SinkPipeline::new(sink.clone(), PipelineConfig::default());
+        assert!(handle.try_enqueue(rec(0)));
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        let jh = tokio::spawn(worker.run(cancel_rx));
+        cancel_tx.send(true).unwrap();
+        jh.await.unwrap();
+
+        assert!(
+            started.elapsed() <= DRAIN_RETRY_BUDGET + TICK,
+            "the drain must not sit out the running retry budget: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            handle.stats().dropped,
+            1,
+            "the batch is accounted, not lost silently"
+        );
     }
 
     #[tokio::test]

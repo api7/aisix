@@ -48,3 +48,7 @@ lz4_flex.workspace = true
 [dev-dependencies]
 wiremock.workspace = true
 futures.workspace = true
+# `test-util` plays the delivery retry ladder out on a paused clock: the
+# budget is minutes of wall time and the cases assert where each attempt
+# lands in it.
+tokio = { workspace = true, features = ["test-util"] }

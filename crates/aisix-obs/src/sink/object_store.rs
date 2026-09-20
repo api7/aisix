@@ -18,6 +18,7 @@
 //! markers and org/env partitioning are tracked as follow-ups.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use object_store::path::Path as ObjectPath;
@@ -186,6 +187,23 @@ pub enum ObjectStoreCredentials {
     },
 }
 
+/// The one sink family whose client retries underneath the pipeline: the
+/// `object_store` builders default to a ladder of their own that runs for
+/// three minutes before the error is ever returned. Left alone, one
+/// pipeline attempt could outlast most of the pipeline's whole retry
+/// budget, so the two ladders would compound into a single slow one.
+///
+/// Bound it to the pipeline's own backoff ceiling instead: an attempt that
+/// cannot get through in 30s hands the failure back, and the pipeline —
+/// which is the only layer that knows about the queue behind it, the drop
+/// accounting, and shutdown — decides what happens next.
+fn export_retry_config() -> object_store::RetryConfig {
+    object_store::RetryConfig {
+        retry_timeout: Duration::from_secs(30),
+        ..Default::default()
+    }
+}
+
 /// HTTP client options carrying the deployment's `upstream` settings, so
 /// the exporters reach an object store on the same trust and connection
 /// settings the provider bridges use — an on-prem MinIO or internal
@@ -279,6 +297,7 @@ pub fn build_object_store(
         ) => {
             let mut b = object_store::aws::AmazonS3Builder::new()
                 .with_client_options(upstream_client_options())
+                .with_retry(export_retry_config())
                 .with_bucket_name(bucket)
                 .with_access_key_id(access_key_id)
                 .with_secret_access_key(secret_access_key);
@@ -315,6 +334,7 @@ pub fn build_object_store(
             // `endpoint` config is intentionally not applied for GCS.
             let b = object_store::gcp::GoogleCloudStorageBuilder::new()
                 .with_client_options(upstream_client_options())
+                .with_retry(export_retry_config())
                 .with_bucket_name(bucket)
                 .with_service_account_key(service_account_key);
             let store = b
@@ -331,6 +351,7 @@ pub fn build_object_store(
         ) => {
             let mut b = object_store::azure::MicrosoftAzureBuilder::new()
                 .with_client_options(upstream_client_options())
+                .with_retry(export_retry_config())
                 .with_container_name(bucket)
                 .with_account(account)
                 .with_access_key(access_key);
@@ -387,6 +408,7 @@ pub fn build_object_store_ambient(
             }
             let mut b = object_store::aws::AmazonS3Builder::from_env()
                 .with_client_options(upstream_client_options())
+                .with_retry(export_retry_config())
                 .with_bucket_name(bucket);
             if let Some(r) = region {
                 b = b.with_region(r);
@@ -401,6 +423,7 @@ pub fn build_object_store_ambient(
             // Default Credentials (GKE Workload Identity / GCE metadata).
             let store = object_store::gcp::GoogleCloudStorageBuilder::new()
                 .with_client_options(upstream_client_options())
+                .with_retry(export_retry_config())
                 .with_bucket_name(bucket)
                 .build()
                 .map_err(|e| {
@@ -811,6 +834,19 @@ mod tests {
             production.matches("with_client_options(").count(),
             chains,
             "no builder chain may pass client options from anywhere else",
+        );
+        // Left off, a chain keeps the crate's own three-minute retry
+        // ladder underneath the pipeline's, and one pipeline attempt can
+        // outlast most of the pipeline's whole budget.
+        assert_eq!(
+            production.matches("with_retry(export_retry_config())").count(),
+            chains,
+            "every builder chain must bound its own retry to `export_retry_config()`",
+        );
+        assert_eq!(
+            production.matches("with_retry(").count(),
+            chains,
+            "no builder chain may set a retry policy from anywhere else",
         );
     }
 
@@ -1284,7 +1320,8 @@ mod tests {
                 "failed to lookup address information: Name or service not known",
             ))),
         };
-        let (SinkError::Transient(detail) | SinkError::Permanent(detail)) = map_object_store_err(e);
+        let err = map_object_store_err(e);
+        let detail = err.to_string();
         assert!(
             detail.contains("failed to lookup address information"),
             "detail must surface the underlying cause, got: {detail}"

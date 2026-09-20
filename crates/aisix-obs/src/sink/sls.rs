@@ -197,6 +197,7 @@ impl ObservabilitySink for AliyunSlsSink {
             });
         }
 
+        let retry_after = super::retry_after_of(status, resp.headers());
         let body = resp.text().await.unwrap_or_default();
         let (error_code, detail) = parse_sls_error(status, &body);
         // 5xx / 408 / 429 are always worth retrying; SLS also signals back-
@@ -207,7 +208,13 @@ impl ObservabilitySink for AliyunSlsSink {
             || status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || is_transient_error_code(&error_code)
         {
-            Err(SinkError::Transient(detail))
+            Err(match retry_after {
+                Some(retry_after) => SinkError::Throttled {
+                    retry_after,
+                    detail,
+                },
+                None => SinkError::Transient(detail),
+            })
         } else {
             Err(SinkError::Permanent(detail))
         }
