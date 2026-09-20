@@ -3722,16 +3722,23 @@ mod tests {
         );
     }
 
-    /// Zero has to render, or "no drops" is indistinguishable from "the
-    /// gateway is too old to report drops".
+    /// The series has to be published on every scrape, or "no drops" is
+    /// indistinguishable from "the gateway is too old to report drops".
+    ///
+    /// Asserted against the live total rather than a literal `0`: the
+    /// writer's own tests share this process and drop events into the
+    /// same counter, and what this pins is that the series exists.
     #[test]
-    fn the_dropped_log_line_total_renders_even_when_nothing_was_dropped() {
+    fn the_dropped_log_line_total_is_published_on_every_scrape() {
         let m = Metrics::new(false);
         m.sync_log_status();
+        let expected = format!(
+            "{M_LOG_LINES_DROPPED_TOTAL} {}",
+            crate::log_writer::dropped_total()
+        );
         assert!(
-            m.render()
-                .contains(&format!("{M_LOG_LINES_DROPPED_TOTAL} 0")),
-            "a healthy gateway must publish the series at zero, got: {}",
+            m.render().contains(&expected),
+            "a scrape must publish {expected:?}, got: {}",
             m.render(),
         );
     }
