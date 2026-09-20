@@ -42,12 +42,24 @@ const MAX_BATCH: usize = 100;
 /// /usage and /logs within ~5s end-to-end.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// In-memory bound on the proxy → worker channel. At 1024 events,
-/// 5s flush, 100 batch ceiling, the proxy can sustain a sustained
-/// 200 req/s burst without dropping. Beyond that `try_emit` warns
-/// and the event is dropped — telemetry must not back-pressure the
-/// request hot path.
-const QUEUE_CAPACITY: usize = 1024;
+/// In-memory bound on the proxy → worker channel. Beyond it `try_emit`
+/// warns and the event is dropped (`sink_full`) — telemetry must not
+/// back-pressure the request hot path.
+///
+/// Sized for the control plane being SLOW rather than for the steady
+/// rate: one POST is in flight at a time, so while cp-api takes seconds
+/// per batch the queue is the only thing holding the traffic that
+/// arrives meanwhile, and a batch this worker drops is gone for good
+/// (there is no retry). A stability round measured 1.1–1.8s per batch
+/// for 8s at 173 req/s — ~1.4k events behind a queue that held 1024, so
+/// 793 were dropped. At 16384 the same stall is absorbed whole, and the
+/// queue only overflows once a sustained arrival rate outruns delivery
+/// for minutes rather than seconds.
+///
+/// Cost is bounded by occupancy, not by the bound: the channel allocates
+/// in small blocks as events are pushed, so a queue that never fills
+/// never holds the memory for one that did.
+const QUEUE_CAPACITY: usize = 16_384;
 
 /// Path the telemetry worker POSTs to, under `managed.cp_base_url`.
 /// Derived from the heartbeat URL by swapping the suffix, so the two
@@ -510,6 +522,12 @@ mod tests {
             .collect()
     }
 
+    /// Channel bound for the backlog cases below. They are about what the
+    /// worker does with a queue it has filled, not about how deep the real
+    /// one is, so they size their own channel rather than staging
+    /// [`QUEUE_CAPACITY`] events to fill it.
+    const BACKLOG_QUEUE: usize = 1024;
+
     async fn run_interval_with_backlog(first_status: u16) {
         let (server, batches) = recording_server(first_status).await;
         let dir = tempfile::tempdir().unwrap();
@@ -517,10 +535,10 @@ mod tests {
             format!("{}/dp/telemetry", server.uri()),
             write_test_bundle(dir.path()),
         );
-        let (tx, rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
+        let (tx, rx) = tokio::sync::mpsc::channel(BACKLOG_QUEUE);
         let (_cancel_tx, mut cancel_rx) = watch::channel(false);
-        let expected = ordered_events(QUEUE_CAPACITY + 2);
-        let mut events = ordered_events(QUEUE_CAPACITY + 2).into_iter();
+        let expected = ordered_events(BACKLOG_QUEUE + 2);
+        let mut events = ordered_events(BACKLOG_QUEUE + 2).into_iter();
         tokio::time::pause();
         let mut sender = Box::pin(run(cfg, rx, &mut cancel_rx));
         // Consume the initial empty tick before staging a partial batch.
@@ -529,7 +547,7 @@ mod tests {
             tx.try_send(event).unwrap();
         }
         assert!(poll_sender(sender.as_mut()).await.is_pending());
-        assert_eq!(tx.capacity(), QUEUE_CAPACITY);
+        assert_eq!(tx.capacity(), BACKLOG_QUEUE);
         assert!(batches.lock().unwrap().is_empty());
         for event in events {
             tx.try_send(event).unwrap();
@@ -633,5 +651,40 @@ mod tests {
         finish_sender(sender.as_mut()).await;
         assert_recorded_events(&batches, &ordered_events(250));
         assert!(tx.is_closed());
+    }
+
+    /// A batch this worker gives up on is gone — there is no retry — so the
+    /// queue is the whole defence against a control plane that has gone
+    /// slow. One POST is in flight at a time, and everything the proxy
+    /// emits meanwhile has to fit.
+    ///
+    /// The burst is staged before the worker is ever polled, which is
+    /// exactly what it looks like from the queue while the worker is
+    /// blocked on one slow POST — and it makes the case deterministic
+    /// instead of racing a delay. 1400 is what a stability round measured
+    /// behind an 8s control-plane stall at 173 req/s; the queue that held
+    /// 1024 dropped 793 of them.
+    #[tokio::test]
+    async fn a_burst_arriving_while_one_post_is_in_flight_is_not_dropped() {
+        const BURST: usize = 1_400;
+
+        let (server, batches) = recording_server(200).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = TelemetryConfig::new(
+            format!("{}/dp/telemetry", server.uri()),
+            write_test_bundle(dir.path()),
+        );
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (sink, worker) = spawn(cfg, cancel_rx);
+
+        let expected = ordered_events(BURST);
+        for event in expected.clone() {
+            sink.try_emit("test", event, aisix_obs::UsageEventLabels::default());
+        }
+        // Only now can the worker run: it drains the queue and exits.
+        drop(sink);
+        worker.await.unwrap();
+
+        assert_recorded_events(&batches, &expected);
     }
 }
