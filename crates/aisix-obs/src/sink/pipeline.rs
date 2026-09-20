@@ -60,6 +60,10 @@ impl Default for PipelineConfig {
             // Deep enough to hold what arrives while one batch is being
             // retried: the retry budget is minutes now, and this queue is
             // what stands between that and losing the newest records.
+            // It is also what a stalled exporter now holds in memory,
+            // which is not free on the one path where records are not
+            // shared between exporters: a full-capture exporter owns its
+            // records, prompt and completion included.
             queue_capacity: 8192,
             max_batch: 100,
             flush_interval: Duration::from_secs(5),

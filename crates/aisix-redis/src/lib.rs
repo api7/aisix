@@ -63,6 +63,14 @@
 //!   is one request per window paying it for nothing. The recovery
 //!   latency is unchanged — the breaker still closes within one window of
 //!   Redis coming back — it is simply no longer billed to a caller.
+//!   What a PING proves is narrower than what the old probe proved,
+//!   because the old probe was a real command: a server that answers
+//!   PING while the operations this subsystem actually runs keep timing
+//!   out (a loaded vector search, a partly-down cluster) closes the
+//!   breaker, and the commands behind it each pay one budget until the
+//!   first failure re-opens it. That is one window's worth of concurrent
+//!   commands rather than one command — bounded, and the alternative is
+//!   billing a caller for detection on every window of every outage.
 //!
 //! The breaker belongs to a **subsystem**, not to a connection — see
 //! [`FailurePolicy`]. A subsystem may hold several connections (the cache
