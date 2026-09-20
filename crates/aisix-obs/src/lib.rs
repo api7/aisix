@@ -14,6 +14,7 @@
 #![deny(rust_2018_idioms)]
 
 pub mod access_log;
+mod log_writer;
 pub mod metric_labels;
 pub mod metrics;
 pub mod otlp_http_sink;
@@ -24,11 +25,14 @@ pub mod trace;
 pub mod usage;
 
 use std::io::IsTerminal as _;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use aisix_core::ObservabilityConfig;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 pub use access_log::{AccessLog, CacheAccessLog, McpAccessLog};
+pub use log_writer::M_LOG_LINES_DROPPED;
 pub use metrics::{
     client_type_from_user_agent, A2aCallOutcome, A2aLabels, BudgetGauges, BudgetLabels,
     CancelledLabels, ClientTypeClassifier, DeploymentLabels, DeploymentState, GaugeFamily,
@@ -99,6 +103,10 @@ fn build_filter(cfg: &ObservabilityConfig) -> Result<EnvFilter, ObsError> {
 pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
     let filter = build_filter(cfg)?;
 
+    // Events go through a bounded queue and one writer thread, so a log
+    // consumer that stops reading costs log lines instead of request
+    // latency — see `log_writer`.
+    //
     // Colorize only for a human at a terminal. When stderr is a pipe or a
     // file — every real deployment, where logs go to a container runtime and
     // on to a log store — the escapes land BETWEEN a field's name and its
@@ -106,16 +114,18 @@ pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
     // structured fields are only searchable by bare value
     // (AISIX-Cloud#1060). tracing-subscriber's `ansi` default feature is on
     // and it does not probe the writer itself.
+    let (queue, writer) = log_writer::LogWriter::start(std::io::stderr(), log_writer::CAPACITY);
     let fmt_layer = fmt::layer()
         .with_target(true)
         .with_ansi(std::io::stderr().is_terminal())
-        .with_writer(std::io::stderr);
+        .with_writer(queue);
 
     tracing_subscriber::registry()
         .with(filter)
         .with(fmt_layer)
         .try_init()
         .map_err(|_| ObsError::AlreadyInitialised)?;
+    let _ = LOG_WRITER.set(writer);
 
     tracing::info!(
         service = %cfg.service_name,
@@ -123,6 +133,22 @@ pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
         "tracing initialised",
     );
     Ok(())
+}
+
+/// The process-wide writer thread, once [`init_tracing`] has installed one.
+static LOG_WRITER: OnceLock<log_writer::LogWriter> = OnceLock::new();
+
+/// Drain the log queue and retire the writer thread.
+///
+/// Called on the way out of `main`, after the drain: whatever the gateway
+/// logged while shutting down is the part an operator reads to find out
+/// why, and the process exiting would otherwise discard it. Returns
+/// whether the queue emptied within `deadline`. A no-op when
+/// [`init_tracing`] was never called.
+pub fn shutdown_logging(deadline: Duration) -> bool {
+    LOG_WRITER
+        .get()
+        .is_none_or(|writer| writer.shutdown(deadline))
 }
 
 #[cfg(test)]

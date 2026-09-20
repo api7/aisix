@@ -19,6 +19,8 @@ serde_json.workspace = true
 serde_ignored.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# `aisix_config_apply_*` — the apply pipeline is where an apply is timed.
+metrics.workspace = true
 base64.workspace = true
 chrono.workspace = true
 ring.workspace = true
@@ -40,3 +42,6 @@ tokio = { workspace = true, features = ["test-util"] }
 # connecting" line is the whole of what a hanging boot dial produces, so
 # it is asserted on directly rather than through its effects.
 tracing-subscriber.workspace = true
+# Snapshots the `aisix_config_apply_*` series an apply emits, without a
+# process-global recorder.
+metrics-util = { workspace = true, features = ["debugging"] }

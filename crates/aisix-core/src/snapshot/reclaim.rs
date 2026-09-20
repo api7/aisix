@@ -25,6 +25,10 @@ impl<S: Send + Sync> Retired for Option<Arc<S>> {
 type Snapshot = Box<dyn Retired>;
 
 fn run(receiver: mpsc::Receiver<Snapshot>) {
+    // Freeing a retired snapshot walks every table in it, and the 10 ms
+    // poll below runs for as long as any reader still holds one — both
+    // proportional to the configuration, neither urgent.
+    crate::sched::demote_current_thread();
     let mut pending: Vec<Snapshot> = Vec::new();
     loop {
         let next = if pending.is_empty() {

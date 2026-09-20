@@ -24,10 +24,16 @@ impl Scrape {
                 // The producer outlives any one HTTP request. A cancelled
                 // client must not start duplicate renders or discard samples.
                 tokio::spawn(async move {
-                    let result = tokio::task::spawn_blocking(render)
-                        .await
-                        .map(Bytes::from)
-                        .map_err(|error| format!("metrics render task failed: {error}"));
+                    // Rendering walks every series in the registry and
+                    // formats them — at this deployment's cardinality,
+                    // hundreds of megabytes of text on a core a request
+                    // worker also wants. It is a scrape: late is fine.
+                    let result = tokio::task::spawn_blocking(|| {
+                        aisix_core::run_demoted("metrics-render", render)
+                    })
+                    .await
+                    .map(Bytes::from)
+                    .map_err(|error| format!("metrics render task failed: {error}"));
                     let mut current = current.lock().expect("in-flight scrape");
                     *current = None;
                     let _ = sender.send(Some(result));

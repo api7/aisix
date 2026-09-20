@@ -1488,6 +1488,15 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     let _ = metrics_upkeep_task.await;
     let _ = background_check_task.await;
     tracing::info!("aisix shut down cleanly");
+    // Last, because everything above still logs: events are queued for a
+    // writer thread now, and the process exiting would drop whatever the
+    // shutdown path just recorded. Bounded by the same drain window the
+    // connections got.
+    if !aisix_obs::shutdown_logging(Duration::from_secs(cfg.shutdown.min_drain_secs)) {
+        // Only reachable with the sink still stuck, so this line is
+        // itself unlikely to land. It costs nothing to try.
+        tracing::warn!("log queue did not drain before exit");
+    }
     Ok(())
 }
 

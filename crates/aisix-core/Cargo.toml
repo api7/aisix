@@ -24,6 +24,7 @@ schemars = { workspace = true, features = ["chrono"] }
 chrono.workspace = true
 chrono-tz.workspace = true
 once_cell.workspace = true
+rustix.workspace = true
 # ApiKey::hash_bearer (prd-09a §9A.7B.4) is the canonical SHA-256 the
 # proxy uses to compare an incoming Authorization: Bearer <plaintext>
 # against the snapshot's `key_hash` column.

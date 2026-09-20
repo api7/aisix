@@ -410,6 +410,12 @@ pub const M_A2A_TASK_STATE_TOTAL: &str = "aisix_a2a_task_state_total";
 // Reflected from [`aisix_core::ConfigMetricsView`] at scrape time via
 // [`Metrics::sync_config_status`]. Standard Prometheus config-reload naming so
 // the series read the same as the control plane exposes.
+//
+// Two more `aisix_config_*` series are NOT declared here, because they are
+// not reflected from a view — `aisix_config_apply_duration_seconds` and
+// `aisix_config_apply_batch_events` are recorded by the apply itself, in
+// `aisix_etcd::supervisor`, which is the only place that knows what one
+// cost. This list is not the whole `aisix_config_*` family.
 pub const M_CONFIG_LAST_RELOAD_SUCCESSFUL: &str = "aisix_config_last_reload_successful";
 pub const M_CONFIG_LAST_RELOAD_SUCCESS_TIMESTAMP: &str =
     "aisix_config_last_reload_success_timestamp_seconds";
