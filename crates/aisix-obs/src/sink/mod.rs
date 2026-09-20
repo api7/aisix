@@ -96,7 +96,7 @@ impl SinkError {
 /// `Display` on a transport error usually names only the outermost layer
 /// ("error sending request", "Error performing PUT <url>") while the
 /// actionable cause — a DNS failure, a TLS verification error — sits levels
-/// deeper. The nightly objstore smoke burned five weeks on a detail that
+/// deeper. The scheduled objstore smoke burned five weeks on a detail that
 /// ended at the request URL before anyone saw the underlying
 /// "failed to lookup address information". Layers whose text the outer
 /// message already embeds are skipped, so wrappers that interpolate their
@@ -264,7 +264,7 @@ mod tests {
     fn error_chain_appends_hidden_sources() {
         // The wrapper's Display names only itself — the shape reqwest and
         // object_store's retry error have, which is what buried the DNS
-        // cause of the nightly objstore failure.
+        // cause of the scheduled objstore failure.
         let e = Layered {
             text: "error sending request",
             source: Some(Box::new(Layered {
