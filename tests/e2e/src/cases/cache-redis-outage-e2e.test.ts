@@ -382,6 +382,50 @@ describe("an upstream slower than the old cool-off still costs one budget", () =
   }, 60_000);
 });
 
+// The cool-off ends on its own, and what used to happen then was that the
+// next request in was elected to re-test Redis — paying the full budget to
+// discover what the request before it already knew, once per window for as
+// long as the outage lasted. A background probe does that now, so the
+// request after the window costs nothing while Redis is still down.
+//
+// This one waits out the real 30s window rather than a shortened one: the
+// constant is the thing under test.
+describe("the request after the cool-off does not re-test Redis", () => {
+  let f: Fixture | undefined;
+  let ready = false;
+
+  beforeAll(async () => {
+    ready = await vectorRedisReady();
+    if (ready) f = await bringUp("window");
+  });
+  afterAll(async () => {
+    await tearDown(f);
+  });
+
+  test("a request arriving after the window expires is not delayed", async (ctx) => {
+    if (!ready || !f) {
+      ctx.skip();
+      return;
+    }
+
+    const warm = await timeChat(f.app.proxyUrl, EXACT_MODEL, "window warm");
+    expect(warm.status).toBe(200);
+
+    f.relay.blackhole();
+
+    const first = await timeChat(f.app.proxyUrl, EXACT_MODEL, "window cold");
+    expect(first.status).toBe(200);
+    expect(first.ms).toBeGreaterThanOrEqual(TIMEOUT_SECS * 1000);
+
+    // Past the 30s cool-off, with Redis still black-holed.
+    await new Promise((r) => setTimeout(r, 33_000));
+
+    const after = await timeChat(f.app.proxyUrl, EXACT_MODEL, "window after");
+    expect(after.status).toBe(200);
+    expect(after.ms).toBeLessThan(1_000);
+  }, 120_000);
+});
+
 describe("an exact-only policy still pays one budget", () => {
   let f: Fixture | undefined;
   let ready = false;
