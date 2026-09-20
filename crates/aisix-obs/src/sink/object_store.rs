@@ -1262,7 +1262,7 @@ mod tests {
     fn mapped_detail_carries_the_error_source_chain() {
         // A Generic transport error's Display stops at the outer layer
         // ("Error performing PUT <url>"); the connect/DNS cause lives in
-        // `source()`. The nightly real-cloud smoke failed for five weeks
+        // `source()`. The scheduled real-cloud smoke failed for five weeks
         // with a detail that never named the cause — the mapped detail
         // must include the chain.
         #[derive(Debug)]

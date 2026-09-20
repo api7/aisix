@@ -9,8 +9,8 @@
 # S3 auth or (for GCS) the real PUT path that fake-gcs-server can't round-trip.
 #
 # Gated: never runs on a normal push. Triggered manually (workflow_dispatch),
-# nightly (schedule), or on a same-repo PR labeled `objstore real cloud`. Each
-# provider's test self-skips (logged) when its secrets are absent, so an
+# on the schedule below, or on a same-repo PR labeled `objstore real cloud`.
+# Each provider's test self-skips (logged) when its secrets are absent, so an
 # unconfigured run is a green no-op.
 #
 # ── Required repository secrets ──
@@ -46,7 +46,9 @@ name: objstore-real-cloud
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 0 * * *" # 00:30 UTC (08:30 Asia/Shanghai)
+    # 00:30 UTC (08:30 Asia/Shanghai) on days 3, 6, ..., 30 of each month.
+    # Month boundaries can lengthen the interval to four or five days.
+    - cron: "30 0 3-30/3 * *"
   pull_request:
     types: [labeled, synchronize, reopened]
     branches: [main]
