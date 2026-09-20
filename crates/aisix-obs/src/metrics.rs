@@ -448,6 +448,12 @@ pub const M_CONFIG_SOURCE_CONNECTED: &str = "aisix_config_source_connected";
 /// [`Metrics::record_config_apply`] rather than reflected from a view:
 /// only the apply knows what one cost, and a gauge read at scrape time
 /// would miss every apply between two scrapes.
+///
+/// Renders as a Prometheus SUMMARY, not a histogram — no buckets are
+/// configured for it, same as every other distribution here bar the
+/// three SLO series. So it carries per-instance quantiles over a rolling
+/// window and no `_bucket` series: `histogram_quantile()` against it
+/// returns nothing, and quantiles do not aggregate across gateways.
 pub const M_CONFIG_APPLY_DURATION_SECONDS: &str = "aisix_config_apply_duration_seconds";
 /// How much change that apply carried: watch events for
 /// `trigger="watch"`, rows in the snapshot for `trigger="full"`. Paired
