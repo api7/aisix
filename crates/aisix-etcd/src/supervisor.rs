@@ -401,6 +401,10 @@ pub struct Supervisor<P: ConfigProvider> {
     // drops finished handles as it pushes, so a long-lived gateway does
     // not accumulate one per apply.
     pending_writes: Mutex<Vec<JoinHandle<()>>>,
+
+    /// Where the cost of each apply goes. `None` in tests and embedders
+    /// that never wired one — see [`ApplyObserver`].
+    apply_observer: Option<Arc<ApplyObserver>>,
 }
 
 /// One watched prefix and the provider that reads it.
@@ -509,7 +513,18 @@ impl<P: ConfigProvider> Supervisor<P> {
             partial_compat: Mutex::new(HashMap::new()),
             stale_serving: Mutex::new(HashMap::new()),
             pending_writes: Mutex::new(Vec::new()),
+            apply_observer: None,
         }
+    }
+
+    /// Report the cost of every apply to `observer`.
+    pub fn with_apply_observer(mut self, observer: Arc<ApplyObserver>) -> Self {
+        self.apply_observer = Some(observer);
+        self
+    }
+
+    fn apply_observer(&self) -> Option<&ApplyObserver> {
+        self.apply_observer.as_deref()
     }
 
     /// Cheap clonable handle to the supervisor's freshness state.
@@ -882,7 +897,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     pub async fn load_once(&self) -> Result<BuildStats, ProviderError> {
         let load = self.load_all_prefixes().await?;
         let revision = load.applied_revision();
-        let (stats, _) = config_work("full", load.entries.len(), || {
+        let (stats, _) = config_work(self.apply_observer(), "full", load.entries.len(), || {
             let stats = self.apply_resync_at(&load.entries, Some(revision));
             // Preserve the range read's consistent-as-of revision.
             self.record_read_revision(revision);
@@ -1675,7 +1690,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         // every prefix has been read, so readiness means every prefix's
         // initial load completed and no request can observe the
         // environment loaded and the catalog not.
-        config_work("full", load.entries.len(), || {
+        config_work(self.apply_observer(), "full", load.entries.len(), || {
             self.apply_resync_at(&load.entries, Some(revision));
             self.record_read_revision(revision);
         });
@@ -1746,7 +1761,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                 }
                 Some(Watched::Event(Err(err))) => return Err(SupervisorError::Provider(err)),
                 Some(Watched::Event(Ok(WatchEvent::Resync { entries, revision }))) => {
-                    config_work("full", entries.len(), || {
+                    config_work(self.apply_observer(), "full", entries.len(), || {
                         self.apply_resync_at(&entries, Some(revision));
                         // The resync header remains the consistent-as-of point.
                         self.record_read_revision(revision);
@@ -1846,7 +1861,9 @@ impl<P: ConfigProvider> Supervisor<P> {
                         })
                         .collect();
                     let (_, elapsed) =
-                        config_work("watch", staged.len(), || self.apply_events(&staged));
+                        config_work(self.apply_observer(), "watch", staged.len(), || {
+                            self.apply_events(&staged)
+                        });
                     apply_timing.record(elapsed);
                 }
             }
@@ -1854,18 +1871,18 @@ impl<P: ConfigProvider> Supervisor<P> {
     }
 }
 
-/// `aisix_config_apply_duration_seconds{trigger}` — wall time of one
-/// configuration apply: parse, snapshot clone, hash, cache flush, publish.
+/// Notified after every configuration apply with what it cost.
 ///
-/// Emitted here rather than in `aisix-obs` with the rest of the
-/// `aisix_config_*` family, because this is where an apply is timed.
-pub const M_CONFIG_APPLY_DURATION: &str = "aisix_config_apply_duration_seconds";
-
-/// `aisix_config_apply_batch_events{trigger}` — how much change that apply
-/// carried: watch events for `trigger="watch"`, rows in the snapshot for
-/// `trigger="full"`. Paired with the duration, this is what separates "the
-/// control plane wrote a lot" from "one small write costs this much".
-pub const M_CONFIG_APPLY_BATCH_EVENTS: &str = "aisix_config_apply_batch_events";
+/// A callback rather than a `metrics::histogram!` here, because this
+/// crate has no recorder: `aisix-obs` keeps its registry in `Metrics` and
+/// reaches it with `metrics::with_local_recorder`, so a macro call from
+/// an apply thread would record into nothing at all. The server wires
+/// this to `Metrics::record_config_apply`.
+///
+/// Arguments: the trigger (`watch` for a coalesced watch batch, `full`
+/// for a (re)load of every prefix), how many events or rows it carried,
+/// and how long it took.
+pub type ApplyObserver = dyn Fn(&'static str, usize, Duration) + Send + Sync;
 
 /// One configuration apply: off the async worker, at background priority,
 /// measured.
@@ -1881,11 +1898,13 @@ pub const M_CONFIG_APPLY_BATCH_EVENTS: &str = "aisix_config_apply_batch_events";
 ///   `/livez` and `/readyz` listener, so the demotion cannot go on the
 ///   runtime's own worker threads — it has to be a thread per apply.
 /// - the timing feeds both the coalescing window (an expensive apply
-///   earns a longer quiet period) and the two series above.
+///   earns a longer quiet period) and, through `observer`, the
+///   `aisix_config_apply_*` series.
 ///
 /// `trigger` distinguishes an incremental watch batch from a full (re)load
 /// of every prefix; `events` is what that number counts for each.
 fn config_work<T: Send>(
+    observer: Option<&ApplyObserver>,
     trigger: &'static str,
     events: usize,
     work: impl FnOnce() -> T + Send,
@@ -1908,9 +1927,9 @@ fn config_work<T: Send>(
         _ => demoted(),
     };
     let elapsed = started.elapsed();
-    metrics::histogram!(M_CONFIG_APPLY_DURATION, "trigger" => trigger)
-        .record(elapsed.as_secs_f64());
-    metrics::histogram!(M_CONFIG_APPLY_BATCH_EVENTS, "trigger" => trigger).record(events as f64);
+    if let Some(observer) = observer {
+        observer(trigger, events, elapsed);
+    }
     tracing::debug!(
         trigger,
         events,
@@ -3897,61 +3916,28 @@ mod tests {
     /// proportional to the whole configuration rather than to the change,
     /// and until now it was measured (`ApplyTiming`) and then thrown away.
     #[test]
-    fn an_apply_records_its_duration_and_how_much_change_it_carried() {
-        let recorder = metrics_util::debugging::DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let answer = metrics::with_local_recorder(&recorder, || {
-            let (value, elapsed) = config_work("watch", 7, || {
-                std::thread::sleep(Duration::from_millis(5));
-                "applied"
-            });
-            assert!(elapsed >= Duration::from_millis(5));
-            value
+    fn an_apply_reports_its_duration_and_how_much_change_it_carried() {
+        type Reported = Vec<(&'static str, usize, Duration)>;
+        let seen: Arc<Mutex<Reported>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let observer: Arc<ApplyObserver> = Arc::new(move |trigger, events, elapsed| {
+            recorded.lock().unwrap().push((trigger, events, elapsed));
         });
-        assert_eq!(answer, "applied");
+        let (value, elapsed) = config_work(Some(observer.as_ref()), "watch", 7, || {
+            std::thread::sleep(Duration::from_millis(5));
+            "applied"
+        });
+        assert_eq!(value, "applied");
+        assert!(elapsed >= Duration::from_millis(5));
 
-        let mut seen = Vec::new();
-        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
-            let key = key.key().clone();
-            let labels: Vec<_> = key
-                .labels()
-                .map(|l| (l.key().to_owned(), l.value().to_owned()))
-                .collect();
-            seen.push((key.name().to_owned(), labels, value));
-        }
-        let find = |name: &str| {
-            seen.iter()
-                .find(|(n, _, _)| n == name)
-                .unwrap_or_else(|| panic!("{name} was not recorded; got {seen:?}"))
-        };
-        for name in [M_CONFIG_APPLY_DURATION, M_CONFIG_APPLY_BATCH_EVENTS] {
-            let (_, labels, _) = find(name);
-            assert_eq!(
-                labels,
-                &[("trigger".to_owned(), "watch".to_owned())],
-                "{name} must say which kind of apply it measured",
-            );
-        }
-        let metrics_util::debugging::DebugValue::Histogram(events) =
-            &find(M_CONFIG_APPLY_BATCH_EVENTS).2
-        else {
-            panic!("batch size must be a histogram");
-        };
-        assert_eq!(
-            events.iter().map(|v| v.into_inner()).collect::<Vec<_>>(),
-            vec![7.0],
-            "the batch size is the event count handed to the apply",
-        );
-        let metrics_util::debugging::DebugValue::Histogram(seconds) =
-            &find(M_CONFIG_APPLY_DURATION).2
-        else {
-            panic!("duration must be a histogram");
-        };
-        assert_eq!(seconds.len(), 1);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "one apply reports once");
+        assert_eq!(seen[0].0, "watch", "the trigger says which kind of apply");
+        assert_eq!(seen[0].1, 7, "the batch size is the event count applied");
         assert!(
-            seconds[0].into_inner() >= 0.005,
-            "the recorded duration must cover the work, got {:?}",
-            seconds[0],
+            seen[0].2 >= Duration::from_millis(5),
+            "the reported duration must cover the work, got {:?}",
+            seen[0].2,
         );
     }
 
@@ -3962,7 +3948,7 @@ mod tests {
         let completed = Arc::new(AtomicBool::new(false));
         let done = completed.clone();
         let apply = tokio::spawn(async move {
-            config_work("watch", 1, move || {
+            config_work(None, "watch", 1, move || {
                 entered_tx.send(()).unwrap();
                 release_rx
                     .recv_timeout(Duration::from_secs(5))

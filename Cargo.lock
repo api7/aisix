@@ -136,8 +136,6 @@ dependencies = [
  "h2",
  "hex",
  "http 1.4.0",
- "metrics",
- "metrics-util",
  "ring",
  "serde",
  "serde_ignored",
@@ -3040,9 +3038,7 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "hashbrown 0.15.5",
- "indexmap 2.14.0",
  "metrics",
- "ordered-float",
  "quanta",
  "rand 0.9.4",
  "rand_xoshiro",
@@ -3329,15 +3325,6 @@ name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
-
-[[package]]
-name = "ordered-float"
-version = "4.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bb71e1b3fa6ca1c61f383464aaf2bb0e2f8e772a1f01d486832464de363b951"
-dependencies = [
- "num-traits",
-]
 
 [[package]]
 name = "outref"

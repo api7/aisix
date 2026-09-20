@@ -242,7 +242,16 @@ async fn async_main(cfg: Config) -> anyhow::Result<()> {
     aisix_gateway::upstream_http::init(upstream_http_config(&cfg.upstream)?)
         .map_err(|e| anyhow::anyhow!("upstream TLS init failed: {e}"))?;
 
-    run(cfg).await
+    // Around `run`, not inside it: every `?` in there would otherwise
+    // exit with the shutdown path's log lines still queued, and this is
+    // the last point at which anything can still be written. `eprintln!`
+    // for the failure, because by then the queue has no reader left.
+    let drain = Duration::from_secs(cfg.shutdown.min_drain_secs);
+    let outcome = run(cfg).await;
+    if !aisix_obs::shutdown_logging(drain) {
+        eprintln!("aisix: log sink did not drain before exit; queued log lines were lost");
+    }
+    outcome
 }
 
 /// `aisix validate --resources <file>`: run the identical file-source
@@ -702,6 +711,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // file (`resources_file` in config) or etcd + watch supervisor.
     // Config validation already guaranteed exactly one is selected.
     let file_source_path = cfg.resources_file.clone().map(PathBuf::from);
+    // The supervisor is built before `Metrics` is — and an apply reports
+    // its cost by calling into `Metrics`, which owns the recorder. The
+    // slot closes that gap: applies before the registry exists (the boot
+    // load) report into nothing, every later one lands.
+    let metrics_slot: Arc<std::sync::OnceLock<Arc<Metrics>>> = Arc::new(std::sync::OnceLock::new());
     let (snapshot_handle, supervisor, watch_task, admin_client, config_status) =
         if let Some(path) = &file_source_path {
             // FILE MODE: load once at boot, fail fast with the aggregated
@@ -808,13 +822,21 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 Some(path) => SnapshotCache::new(path),
                 None => SnapshotCache::disabled(),
             };
-            let supervisor = Arc::new(Supervisor::with_sources(
-                vec![
-                    (WatchedPrefix::environment(etcd_prefix), provider),
-                    (WatchedPrefix::global(global_prefix), global_provider),
-                ],
-                snapshot_cache,
-            ));
+            let observed = Arc::clone(&metrics_slot);
+            let supervisor = Arc::new(
+                Supervisor::with_sources(
+                    vec![
+                        (WatchedPrefix::environment(etcd_prefix), provider),
+                        (WatchedPrefix::global(global_prefix), global_provider),
+                    ],
+                    snapshot_cache,
+                )
+                .with_apply_observer(Arc::new(move |trigger, events, elapsed| {
+                    if let Some(metrics) = observed.get() {
+                        metrics.record_config_apply(trigger, events, elapsed);
+                    }
+                })),
+            );
             // Seed the snapshot from disk before the etcd cycle starts so the
             // proxy is ready to serve from cached config the moment the watch
             // task takes its first iteration.
@@ -884,6 +906,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         )
         .map_err(|e| anyhow::anyhow!(e))?,
     );
+    let _ = metrics_slot.set(metrics.clone());
     // Built before the stores below because each Redis-backed store takes
     // the handle: their failures are fail-open by design, so the counter
     // is the only place the degradation shows (#1060).
@@ -1488,15 +1511,6 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     let _ = metrics_upkeep_task.await;
     let _ = background_check_task.await;
     tracing::info!("aisix shut down cleanly");
-    // Last, because everything above still logs: events are queued for a
-    // writer thread now, and the process exiting would drop whatever the
-    // shutdown path just recorded. Bounded by the same drain window the
-    // connections got.
-    if !aisix_obs::shutdown_logging(Duration::from_secs(cfg.shutdown.min_drain_secs)) {
-        // Only reachable with the sink still stuck, so this line is
-        // itself unlikely to land. It costs nothing to try.
-        tracing::warn!("log queue did not drain before exit");
-    }
     Ok(())
 }
 

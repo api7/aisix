@@ -32,10 +32,18 @@ use std::time::{Duration, Instant};
 use crossbeam_queue::ArrayQueue;
 use tracing_subscriber::fmt::MakeWriter;
 
-/// `aisix_log_lines_dropped_total` — log events discarded because the
-/// sink was not draining fast enough. Any value above zero means the log
-/// is incomplete for that window; the rate is how badly.
-pub const M_LOG_LINES_DROPPED: &str = "aisix_log_lines_dropped_total";
+/// Every event this process has ever dropped.
+///
+/// Read at scrape time rather than pushed: the writer thread starts in
+/// `init_tracing`, long before `Metrics` exists, and this crate keeps no
+/// global recorder for it to write to. `Metrics::sync_log_status` turns
+/// it into `aisix_log_lines_dropped_total`.
+static DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// How many log events have been dropped since the process started.
+pub(crate) fn dropped_total() -> u64 {
+    DROPPED_TOTAL.load(Ordering::Relaxed)
+}
 
 /// Queue depth, in events.
 ///
@@ -158,7 +166,7 @@ impl LogWriter {
                     }
                     let seen = worker.dropped.swap(0, Ordering::Relaxed);
                     if seen > 0 {
-                        metrics::counter!(M_LOG_LINES_DROPPED).increment(seen);
+                        DROPPED_TOTAL.fetch_add(seen, Ordering::Relaxed);
                         unreported += seen;
                     }
                     // Only once the sink has caught up, so a sustained
@@ -209,14 +217,26 @@ impl LogWriter {
     }
 
     /// Drain and retire the writer thread. Later events are discarded.
+    ///
+    /// The join is conditional on the drain having finished, and that is
+    /// the whole point: the writer only checks the stop flag after
+    /// emptying the queue, so a sink that is still refusing to accept
+    /// bytes leaves it parked in `write` forever. Joining unconditionally
+    /// would hang the process exactly in the scenario this module exists
+    /// for, waiting for a consumer that has already stopped consuming.
+    /// Abandoning the thread costs the queued lines, which a stuck sink
+    /// was never going to take anyway.
     pub(crate) fn shutdown(&self, deadline: Duration) -> bool {
         let drained = self.flush(deadline);
         self.shared.stopping.store(true, Ordering::Release);
         self.shared.wake.notify_one();
+        if !drained {
+            return false;
+        }
         if let Some(thread) = self.thread.lock().expect("log writer handle").take() {
             let _ = thread.join();
         }
-        drained
+        true
     }
 
     #[cfg(test)]
@@ -343,6 +363,29 @@ mod tests {
         for n in [0, 250, 499] {
             assert!(text.contains(&format!("line-{n}\n")), "missing line-{n}");
         }
+    }
+
+    /// The scenario this module exists for must not become a process
+    /// that will not exit.
+    #[test]
+    fn shutdown_gives_up_on_a_sink_that_never_drains() {
+        let sink = BlockedSink::new();
+        let (queue, writer) = LogWriter::start(sink.clone(), 64);
+        for n in 0..10 {
+            let mut w = queue.make_writer();
+            w.write_all(&line(n)).expect("accepted");
+        }
+        let started = Instant::now();
+        assert!(
+            !writer.shutdown(Duration::from_millis(200)),
+            "an undrained queue must be reported as such",
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown must not wait on a sink that is not consuming, took {:?}",
+            started.elapsed(),
+        );
+        sink.release();
     }
 
     #[test]

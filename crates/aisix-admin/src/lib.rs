@@ -245,8 +245,9 @@ pub fn metrics_router(
 }
 
 /// Prometheus scrape handler. Reflects the live config load-observability
-/// state into the recorder (so the `aisix_config_*` series are current) then
-/// renders. Unauthenticated by design — restrict access at the network layer.
+/// state and the log writer's drop total into the recorder (so the
+/// `aisix_config_*` series and `aisix_log_lines_dropped_total` are current)
+/// then renders. Unauthenticated by design — restrict access at the network layer.
 /// Emits `text/plain; version=0.0.4`.
 async fn metrics_handler(
     axum::extract::State(state): axum::extract::State<MetricsState>,
@@ -257,6 +258,7 @@ async fn metrics_handler(
     state
         .metrics
         .sync_config_status(&state.config_status.metrics());
+    state.metrics.sync_log_status();
     let rendered = match state.metrics.render_async().await {
         Ok(rendered) => rendered,
         Err(error) => {

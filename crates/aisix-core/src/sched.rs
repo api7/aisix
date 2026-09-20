@@ -10,10 +10,14 @@
 //! core between them, so a burst of configuration writes is paid for in
 //! request latency.
 //!
-//! None of it is latency-sensitive: a config apply that takes 400 ms
-//! instead of 250 ms is invisible, while the 150 ms it stole is not. So it
-//! runs at the lowest priority the scheduler offers and yields the core
-//! whenever a request worker is runnable.
+//! None of it is latency-sensitive — an apply that lands a little later
+//! is invisible, while the core it took from a request worker is not —
+//! so it runs at the lowest priority the scheduler offers and yields the
+//! core whenever a request worker is runnable. The cost is real and not
+//! small: CFS weights nice 19 at 15 against nice 0's 1024, so on a
+//! saturated core this work gets what is left rather than a share. That
+//! is the intended trade, and it is why the list below is only work
+//! nothing waits on.
 //!
 //! What must NOT be demoted: the request workers themselves, and the
 //! listener serving `/livez` and `/readyz` — a liveness probe that loses
@@ -52,6 +56,26 @@ pub fn demote_current_thread() {
 #[cfg(target_os = "linux")]
 const LOWEST_PRIORITY: i32 = 19;
 
+// Test seam for the spawn-refused path, which no test can provoke for
+// real without exhausting the whole test process' thread budget.
+// Thread-local, so the test that sets it cannot divert a `run_demoted`
+// running in parallel on another test thread.
+#[cfg(test)]
+thread_local! {
+    static BLOCK_SPAWNING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn spawning_is_blocked() -> bool {
+    #[cfg(test)]
+    {
+        BLOCK_SPAWNING.with(|blocked| blocked.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// Run `work` on a dedicated demoted thread and return what it produced.
 ///
 /// A scoped thread, so `work` may borrow — which is what lets an apply
@@ -65,17 +89,46 @@ const LOWEST_PRIORITY: i32 = 19;
 /// A panic inside `work` is re-raised on the calling thread, so a caller
 /// that used to see one still does.
 pub fn run_demoted<T: Send>(name: &'static str, work: impl FnOnce() -> T + Send) -> T {
+    // A thread the kernel refuses (EAGAIN under a pids cgroup limit) must
+    // not become a failed apply: the caller is the configuration watch
+    // loop, its panic is swallowed by the task it runs in, and the
+    // gateway would serve its last snapshot forever with `/readyz` still
+    // green. Lower priority is an optimization and may not take the
+    // work with it when it cannot be had.
+    let pending = std::sync::Mutex::new(Some(work));
+    let done = std::sync::Mutex::new(None);
     std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .name(name.to_owned())
-            .spawn_scoped(scope, || {
-                demote_current_thread();
-                work()
-            })
-            .expect("spawn a background-priority thread")
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-    })
+        let spawned = if spawning_is_blocked() {
+            None
+        } else {
+            std::thread::Builder::new()
+                .name(name.to_owned())
+                .spawn_scoped(scope, || {
+                    demote_current_thread();
+                    let work = pending
+                        .lock()
+                        .expect("background work")
+                        .take()
+                        .expect("background work runs once");
+                    let value = work();
+                    *done.lock().expect("background work product") = Some(value);
+                })
+                .ok()
+        };
+        // No handle means the closure never ran, so `pending` still holds
+        // the work and the caller runs it below.
+        if let Some(handle) = spawned {
+            handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        }
+    });
+    if let Some(work) = pending.into_inner().expect("background work") {
+        return work();
+    }
+    done.into_inner()
+        .expect("background work product")
+        .expect("a joined background thread produced its value")
 }
 
 #[cfg(test)]
@@ -105,6 +158,22 @@ mod tests {
     #[should_panic(expected = "work panicked")]
     fn run_demoted_re_raises_a_panic_on_the_caller() {
         run_demoted("test-demoted-panic", || panic!("work panicked"));
+    }
+
+    /// The caller is the configuration watch loop; a thread the kernel
+    /// refuses must cost priority, not the apply.
+    #[test]
+    fn work_still_runs_when_no_thread_can_be_spawned() {
+        let caller = std::thread::current().id();
+        BLOCK_SPAWNING.with(|blocked| blocked.set(true));
+        let (value, ran_on) =
+            run_demoted("test-demoted-nospawn", || (7, std::thread::current().id()));
+        BLOCK_SPAWNING.with(|blocked| blocked.set(false));
+        assert_eq!(value, 7, "the work must still produce its value");
+        assert_eq!(
+            ran_on, caller,
+            "and it must fall back to the caller's thread"
+        );
     }
 
     #[cfg(target_os = "linux")]
