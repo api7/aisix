@@ -165,12 +165,18 @@ async fn run(
             }
             _ = cancel.changed() => {
                 if *cancel.borrow() {
-                    // Final drain — try to grab whatever is still in
-                    // the channel without blocking, then post it.
-                    while let Ok(ev) = rx.try_recv() {
-                        buffer.push(ev);
-                    }
-                    if !buffer.is_empty() {
+                    // Final drain — post whatever is still queued, in
+                    // batches of at most MAX_BATCH. This is the one path
+                    // that can meet a FULL queue (every other flush
+                    // happens at or below the ceiling), and one POST of
+                    // everything queued is exactly what the ceiling
+                    // exists to prevent: cp-api rejects an oversized body
+                    // and the whole backlog is gone, unretried.
+                    loop {
+                        fill_ready_batch(&mut buffer, &mut rx);
+                        if buffer.is_empty() {
+                            break;
+                        }
                         flush(&client, &cfg, &mut buffer).await;
                     }
                     tracing::info!("telemetry sender shutting down");
@@ -476,6 +482,31 @@ mod tests {
         (server, batches)
     }
 
+    /// [`recording_server`] that holds its FIRST response for `held`,
+    /// leaving the worker inside one flush while a test stages what
+    /// arrives behind it. The body is recorded before the wait, so the
+    /// test can tell "in flight" from "not sent yet".
+    async fn recording_server_holding_first(held: Duration) -> (MockServer, RecordedBatches) {
+        let server = MockServer::start().await;
+        let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&batches);
+        Mock::given(method("POST"))
+            .and(path("/dp/telemetry"))
+            .respond_with(move |request: &wiremock::Request| {
+                let mut batches = recorded.lock().unwrap();
+                batches.push(serde_json::from_slice(&request.body).unwrap());
+                let response = ResponseTemplate::new(200);
+                if batches.len() == 1 {
+                    response.set_delay(held)
+                } else {
+                    response
+                }
+            })
+            .mount(&server)
+            .await;
+        (server, batches)
+    }
+
     fn ordered_events(count: usize) -> Vec<UsageEvent> {
         (0..count)
             .map(|i| {
@@ -653,22 +684,58 @@ mod tests {
         assert!(tx.is_closed());
     }
 
+    /// The shutdown drain is the one flush that can meet a FULL queue —
+    /// every other one happens at or below MAX_BATCH — and one POST of
+    /// everything queued is what the ceiling exists to prevent: cp-api
+    /// rejects an oversized body, and a rejected batch is not retried, so
+    /// the whole backlog would go at once.
+    #[tokio::test]
+    async fn cancellation_posts_the_backlog_in_batches_not_in_one_body() {
+        const QUEUED: usize = MAX_BATCH * 3 + 7;
+
+        let (server, batches) = recording_server(200).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = TelemetryConfig::new(
+            format!("{}/dp/telemetry", server.uri()),
+            write_test_bundle(dir.path()),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(QUEUED);
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let mut sender = Box::pin(run(cfg, rx, &mut cancel_rx));
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        for event in ordered_events(QUEUED) {
+            tx.try_send(event).unwrap();
+        }
+        cancel_tx.send(true).unwrap();
+        finish_sender(sender.as_mut()).await;
+
+        let sizes = assert_recorded_events(&batches, &ordered_events(QUEUED));
+        assert!(
+            sizes.iter().all(|n| *n <= MAX_BATCH),
+            "no POST may carry more than the batch ceiling: {sizes:?}"
+        );
+    }
+
     /// A batch this worker gives up on is gone — there is no retry — so the
     /// queue is the whole defence against a control plane that has gone
     /// slow. One POST is in flight at a time, and everything the proxy
     /// emits meanwhile has to fit.
     ///
-    /// The burst is staged before the worker is ever polled, which is
-    /// exactly what it looks like from the queue while the worker is
-    /// blocked on one slow POST — and it makes the case deterministic
-    /// instead of racing a delay. 1400 is what a stability round measured
-    /// behind an 8s control-plane stall at 173 req/s; the queue that held
-    /// 1024 dropped 793 of them.
+    /// 1550 events is the shape a stability round measured behind an 8s
+    /// control-plane stall at 173 req/s: the queue that held 1024 dropped
+    /// 793 of them.
     #[tokio::test]
     async fn a_burst_arriving_while_one_post_is_in_flight_is_not_dropped() {
+        // Staged first, to get the worker into a POST. The mock records a
+        // request before it answers, so seeing the batch means the flush
+        // is in flight rather than finished.
+        const OPENING: usize = 150;
         const BURST: usize = 1_400;
+        // Outlasts the staging below, which is a few microseconds of
+        // non-blocking sends.
+        const HELD: Duration = Duration::from_secs(5);
 
-        let (server, batches) = recording_server(200).await;
+        let (server, batches) = recording_server_holding_first(HELD).await;
         let dir = tempfile::tempdir().unwrap();
         let cfg = TelemetryConfig::new(
             format!("{}/dp/telemetry", server.uri()),
@@ -677,11 +744,22 @@ mod tests {
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let (sink, worker) = spawn(cfg, cancel_rx);
 
-        let expected = ordered_events(BURST);
-        for event in expected.clone() {
+        let expected = ordered_events(OPENING + BURST);
+        let mut events = expected.clone().into_iter();
+        for event in events.by_ref().take(OPENING) {
             sink.try_emit("test", event, aisix_obs::UsageEventLabels::default());
         }
-        // Only now can the worker run: it drains the queue and exits.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while batches.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "no telemetry POST");
+            tokio::task::yield_now().await;
+        }
+
+        // The control plane is now holding that POST, so nothing is being
+        // drained while the rest of the burst arrives.
+        for event in events {
+            sink.try_emit("test", event, aisix_obs::UsageEventLabels::default());
+        }
         drop(sink);
         worker.await.unwrap();
 

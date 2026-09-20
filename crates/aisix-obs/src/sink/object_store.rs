@@ -839,7 +839,9 @@ mod tests {
         // ladder underneath the pipeline's, and one pipeline attempt can
         // outlast most of the pipeline's whole budget.
         assert_eq!(
-            production.matches("with_retry(export_retry_config())").count(),
+            production
+                .matches("with_retry(export_retry_config())")
+                .count(),
             chains,
             "every builder chain must bound its own retry to `export_retry_config()`",
         );

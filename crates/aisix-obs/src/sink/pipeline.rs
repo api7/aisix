@@ -306,15 +306,40 @@ impl SinkPipeline {
                 }
                 _ = cancel.changed() => {
                     if *cancel.borrow() {
-                        while let Ok(record) = self.rx.try_recv() {
-                            buffer.push(record);
-                        }
-                        self.flush(&mut buffer, &mut shutdown).await;
+                        self.drain(&mut buffer, &mut shutdown).await;
                         tracing::info!(sink = %self.sink.name(), "sink pipeline shutting down");
                         return;
                     }
                 }
             }
+        }
+    }
+
+    /// Deliver everything queued, in batches of at most `max_batch`.
+    ///
+    /// The batch ceiling matters most here, because this is the one path
+    /// that can meet a full queue: every other flush happens at or below
+    /// the ceiling, while a shutdown can find thousands of records behind
+    /// a receiver that has been failing for minutes. Handing all of them
+    /// over as one batch is how a drain exceeds a receiver's payload
+    /// limit, and a 413 is a PERMANENT error — the whole backlog would be
+    /// dropped on its first attempt rather than delivered in pieces.
+    async fn drain(
+        &mut self,
+        buffer: &mut Vec<Arc<SinkRecord>>,
+        shutdown: &mut watch::Receiver<bool>,
+    ) {
+        loop {
+            while buffer.len() < self.cfg.max_batch {
+                match self.rx.try_recv() {
+                    Ok(record) => buffer.push(record),
+                    Err(_) => break,
+                }
+            }
+            if buffer.is_empty() {
+                return;
+            }
+            self.flush(buffer, shutdown).await;
         }
     }
 
@@ -386,7 +411,7 @@ impl SinkPipeline {
                         // it out is what keeps the drain bounded: the budget
                         // shrinks the moment it arrives, and a backoff that
                         // is now tens of seconds long is not sat out.
-                        sleep_or_shutdown(delay, shutdown).await;
+                        sleep_or_shutdown(delay, draining, shutdown).await;
                         continue;
                     }
                     let reason = if err.is_transient() {
@@ -430,7 +455,12 @@ impl SinkPipeline {
         };
         let remaining = budget.checked_sub(elapsed).filter(|left| !left.is_zero())?;
         let delay = match err.retry_after() {
-            Some(asked) => asked.min(self.cfg.max_backoff),
+            // Floored as well as capped: `Retry-After: 0` is a legal
+            // answer, and honouring it literally would re-attempt with no
+            // wait at all — for the whole budget, at full rate, against a
+            // receiver that has just said it is overloaded. The backoff
+            // ladder cannot produce a zero delay, so only this path can.
+            Some(asked) => asked.clamp(self.cfg.base_backoff, self.cfg.max_backoff),
             None => backoff(self.cfg.base_backoff, self.cfg.max_backoff, attempt + 1),
         };
         Some(delay.min(remaining))
@@ -461,12 +491,16 @@ const DRAIN_RETRY_BUDGET: Duration = Duration::from_secs(3);
 
 /// Wait out a backoff, returning early when shutdown is signalled so the
 /// caller re-decides under the drain budget.
-async fn sleep_or_shutdown(delay: Duration, shutdown: &mut watch::Receiver<bool>) {
-    if *shutdown.borrow() {
-        // Already draining, so this delay was computed under the drain
-        // budget and there is nothing left to cut short. Returning here
-        // instead would re-attempt with no wait at all, and spin against
-        // the failing sink for as long as the budget allowed.
+/// `draining` is the caller's own read of the signal, not a fresh one:
+/// re-reading it here can see a flip that happened after `delay` was
+/// computed, and then sleep out a delay sized for the running budget —
+/// up to `max_backoff` — with no way to cut it short.
+async fn sleep_or_shutdown(delay: Duration, draining: bool, shutdown: &mut watch::Receiver<bool>) {
+    if draining {
+        // The delay is already bounded by the drain budget, so there is
+        // nothing left to cut short. Returning here instead would
+        // re-attempt with no wait at all, and spin against the failing
+        // sink for as long as the budget allowed.
         tokio::time::sleep(delay).await;
         return;
     }
@@ -877,6 +911,68 @@ mod tests {
         assert!(
             sink.attempts() >= 4,
             "a capped wait still gets several attempts inside the budget: {}",
+            sink.attempts()
+        );
+    }
+
+    /// The shutdown drain is the one flush that can meet a FULL queue —
+    /// every other one happens at or below the ceiling, while a drain can
+    /// find thousands of records behind a receiver that has been failing
+    /// for minutes. Handing all of them over as one batch is how a drain
+    /// exceeds a receiver's payload limit, and a 413 is PERMANENT: the
+    /// whole backlog would be dropped on its first attempt.
+    #[tokio::test]
+    async fn the_shutdown_drain_keeps_to_the_batch_ceiling() {
+        const QUEUED: usize = 250;
+        let sink = FakeSink::new(Mode::Ok);
+        let mut c = cfg();
+        c.max_batch = 10;
+        let (handle, worker) = SinkPipeline::new(sink.clone(), c);
+        for i in 0..QUEUED {
+            assert!(handle.try_enqueue(rec(i as u32)));
+        }
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        cancel_tx.send(true).unwrap();
+        worker.run(cancel_rx).await;
+
+        let sizes = sink.batch_sizes.lock().clone();
+        assert!(
+            sizes.iter().all(|n| *n <= 10),
+            "no batch may exceed the ceiling: {sizes:?}"
+        );
+        assert_eq!(
+            sizes.iter().sum::<usize>(),
+            QUEUED,
+            "and the whole backlog still goes: {sizes:?}"
+        );
+    }
+
+    /// `Retry-After: 0` is a legal answer, and the one delay the backoff
+    /// ladder can never produce. Taken literally it re-attempts with no
+    /// wait for the whole budget — full rate against a receiver that just
+    /// said it was overloaded.
+    #[tokio::test]
+    async fn a_zero_retry_after_does_not_become_a_spin() {
+        let sink = FakeSink::new(Mode::AlwaysThrottled(Duration::ZERO));
+        let cfg = PipelineConfig {
+            retry_budget: Duration::from_secs(10),
+            ..PipelineConfig::default()
+        };
+        one_batch_under_paused_time(sink.clone(), cfg).await;
+
+        let base = PipelineConfig::default().base_backoff;
+        let gaps = sink.gaps();
+        // All but the last: the final wait is trimmed to what is left of
+        // the budget, so that one attempt lands on the boundary.
+        assert!(
+            gaps[..gaps.len() - 1].iter().all(|g| *g >= base),
+            "every wait must be at least the base backoff: {gaps:?}"
+        );
+        // 10s of budget at >=200ms a try; the ladder would be ~50 at the
+        // floor, and unbounded without it.
+        assert!(
+            sink.attempts() <= 51,
+            "attempts stay bounded by the floor: {}",
             sink.attempts()
         );
     }

@@ -294,6 +294,10 @@ async fn probe_until_closed(guard: Arc<Guard>, conn: ConnKind) {
     loop {
         tokio::time::sleep(guard.breaker.time_to_probe()).await;
         let seen = guard.breaker.generation();
+        // Says "still here" before a PING that may take the whole command
+        // budget: the deadline is what tells a live prober from one that
+        // ended without closing the breaker (see `Breaker::admit`).
+        guard.breaker.rearm();
         match probe_ping(&conn, guard.timeout).await {
             Ok(()) => {
                 if guard.breaker.close_from_prober(seen) {
@@ -433,9 +437,18 @@ impl Breaker {
         let mut st = self.lock();
         match st.open_until {
             None => Some(st.generation),
-            Some(_) if st.probing => None,
-            Some(until) if Instant::now() < until => None,
+            // A prober keeps its deadline in the future for as long as it
+            // is alive ([`Breaker::rearm`], called before each PING as
+            // well as after a failed one). One that is a whole further
+            // window past it has stopped without closing the breaker —
+            // its task was dropped, or the runtime is gone — and its
+            // claim must not latch the subsystem open for the rest of the
+            // process. Fall through to the no-prober behaviour, which
+            // self-heals exactly as the window alone used to.
+            Some(until) if st.probing && Instant::now() < until + self.window => None,
+            Some(until) if !st.probing && Instant::now() < until => None,
             Some(_) => {
+                st.probing = false;
                 st.open_until = Some(Instant::now() + self.window);
                 Some(st.generation)
             }
@@ -468,8 +481,9 @@ impl Breaker {
             .unwrap_or_default()
     }
 
-    /// Hold commands off for another window after a probe found Redis
-    /// still unreachable.
+    /// Hold commands off for another window — after a probe found Redis
+    /// still unreachable, and before each probe, which is also what marks
+    /// the prober alive.
     fn rearm(&self) {
         self.lock().open_until = Some(Instant::now() + self.window);
     }
@@ -1188,6 +1202,42 @@ mod guard_tests {
         );
     }
 
+    /// The prober is the only thing that closes the breaker, so a prober
+    /// that ends without closing it — its task dropped, the runtime gone
+    /// — would short-circuit the subsystem for the rest of the process.
+    /// The window alone used to guarantee recovery; taking the probe off
+    /// the request path must not take that guarantee with it.
+    #[tokio::test]
+    async fn a_prober_that_never_finishes_does_not_latch_the_breaker_open() {
+        let g = guard(80, 60);
+        Guard::run(&g, async { Err::<(), _>(dropped_connection()) })
+            .await
+            .expect_err("the failure opens the breaker");
+        // Claim the probe and then never probe: what is left behind when
+        // the task goes away mid-flight.
+        assert!(g.breaker.claim_prober(), "nothing else has claimed it");
+
+        // One window is not enough — a live prober is allowed to be
+        // inside a PING that spends the whole command budget.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            g.breaker.is_open(),
+            "a prober still within its deadline keeps commands off"
+        );
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let started = Instant::now();
+        Guard::run(&g, async { Ok::<_, redis::RedisError>(1) })
+            .await
+            .expect("a command is admitted again rather than short-circuiting forever");
+        assert!(
+            started.elapsed() < Duration::from_millis(80),
+            "the command ran rather than waiting: {:?}",
+            started.elapsed()
+        );
+        assert!(!g.breaker.is_open(), "and its success closed the breaker");
+    }
+
     /// A reply from a live Redis — a script error, `WRONGTYPE`, an ACL
     /// refusal — is not an outage. Tripping on it would short-circuit
     /// the whole cool-off of healthy traffic every time one command is
@@ -1398,9 +1448,12 @@ mod probe_tests {
             "the first failure pays the budget: {elapsed:?}"
         );
 
-        // Long enough for the window to expire twice over, so the prober
-        // has been round the loop and re-armed it.
-        tokio::time::sleep(WINDOW * 3).await;
+        // Long enough for the prober to wake, spend the whole budget on a
+        // PING that is never answered, and re-arm the window behind it.
+        // Waiting only for the window to expire would prove less: the
+        // command would still short-circuit, but on the prober being in
+        // flight rather than on the window it re-armed.
+        tokio::time::sleep(WINDOW + BUDGET + WINDOW).await;
 
         let (outcome, elapsed) = command(&conn).await;
         let err = outcome.expect_err("Redis is still down");
