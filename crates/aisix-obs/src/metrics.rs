@@ -1228,11 +1228,15 @@ impl Metrics {
         self.inner.handle.render()
     }
 
-    /// Render outside the async runtime, sharing work and bytes between
-    /// overlapping scrapes. A later scrape always starts a fresh snapshot.
-    pub async fn render_async(&self) -> Result<bytes::Bytes, String> {
+    /// Render outside the async runtime, into the response as it is
+    /// produced. The receiver yields the body in bounded pieces and ends
+    /// when the exposition does.
+    pub fn render_stream(&self) -> tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>
+    {
         let metrics = self.clone();
-        self.inner.scrape.render(move || metrics.render()).await
+        self.inner
+            .scrape
+            .stream(move |emit| metrics.inner.handle.render_chunks(emit))
     }
 
     /// Drain pending histogram samples into their distributions.
