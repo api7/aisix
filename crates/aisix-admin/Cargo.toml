@@ -14,6 +14,8 @@ aisix-etcd = { path = "../aisix-etcd" }
 aisix-proxy = { path = "../aisix-proxy" }
 tokio.workspace = true
 axum.workspace = true
+bytes.workspace = true
+futures.workspace = true
 tower.workspace = true
 http.workspace = true
 serde.workspace = true

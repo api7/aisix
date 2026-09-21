@@ -139,6 +139,13 @@ pub fn client_builder() -> reqwest::ClientBuilder {
     let cfg = config();
     let mut b = reqwest::Client::builder()
         .user_agent(format!("aisix/{}", aisix_core::BUILD_VERSION))
+        // Every client in the process resolves through the one cache, so
+        // a burst of new connections to a host costs one lookup however
+        // many clients it is spread over — including the per-ProviderKey
+        // and per-guardrail ones rebuilt on each configuration snapshot.
+        // Per-name overrides (`resolve_to_addrs`, the private-link
+        // address pin) still apply on top and never reach it.
+        .dns_resolver(crate::dns_cache::shared())
         .pool_idle_timeout(cfg.pool_idle_timeout)
         .tcp_keepalive(cfg.tcp_keepalive);
     if let Some(d) = cfg.connect_timeout {

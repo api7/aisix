@@ -52,7 +52,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use ring::digest::{Context, SHA256};
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::watch;
 
 /// Maximum number of source + runtime rejection details retained for status
@@ -266,11 +267,154 @@ pub struct PartialCompatResource {
     pub count: usize,
 }
 
+/// A configuration digest, computed the first time something reports it.
+///
+/// Hashing is proportional to the whole configuration, not to the change
+/// that triggered the apply, so a gateway under a stream of small writes
+/// spends most of an apply re-digesting rows nothing touched — 44% of the
+/// apply thread's CPU at 53k api_keys and 14 writes a second. Nothing on
+/// the request path reads a digest: it reaches `GET /status/config`, the
+/// `aisix_config_hash_info` series and the heartbeat, all of which run at
+/// their own cadence and are happy to pay for it there. So an apply hands
+/// over the *means* to compute the digest and the identity of the bytes it
+/// would cover, and the first reader after that apply computes it once.
+///
+/// `version` identifies those bytes: two values with the same `version`
+/// digest the same input, which is what lets [`ConfigStatus`] decide
+/// whether the applied configuration changed without resolving either
+/// side. It is NOT a digest and never reaches the wire.
+///
+/// Resolution runs on a background-priority thread ([`crate::run_demoted`])
+/// because it is the same whole-configuration work an apply was demoted
+/// for; a caller inside an async runtime must therefore reach it from a
+/// blocking context.
+#[derive(Clone)]
+pub struct LazyHash {
+    version: u64,
+    inner: Arc<LazyHashInner>,
+}
+
+struct LazyHashInner {
+    compute: Box<dyn Fn() -> String + Send + Sync>,
+    value: OnceLock<String>,
+}
+
+impl LazyHash {
+    /// A digest that will be computed by `compute` on first report.
+    ///
+    /// `version` must change whenever the bytes `compute` would digest
+    /// change. The converse is owed only as far as the producer can give
+    /// it without digesting them: `apply_seq` keys on this, so a version
+    /// that moves where the digest would not costs an extra advance,
+    /// while one that fails to move loses an apply entirely.
+    pub fn deferred(version: u64, compute: impl Fn() -> String + Send + Sync + 'static) -> Self {
+        Self {
+            version,
+            inner: Arc::new(LazyHashInner {
+                compute: Box::new(compute),
+                value: OnceLock::new(),
+            }),
+        }
+    }
+
+    /// The same digest under a different identity.
+    ///
+    /// Two surfaces can report one digest and still disagree about when
+    /// it counts as having changed — the observed configuration and the
+    /// served one are the same bytes until something is rejected. This
+    /// shares the value, so reporting both costs one computation.
+    pub fn rekeyed(&self, version: u64) -> Self {
+        Self {
+            version,
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// A digest already in hand — the file source, where hashing is one
+    /// pass over bytes already read, and tests.
+    pub fn ready(value: impl Into<String>) -> Self {
+        let value = value.into();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        value.hash(&mut hasher);
+        let version = hasher.finish();
+        let cell = OnceLock::new();
+        let _ = cell.set(value);
+        Self {
+            version,
+            inner: Arc::new(LazyHashInner {
+                compute: Box::new(|| unreachable!("a ready digest is never computed")),
+                value: cell,
+            }),
+        }
+    }
+
+    /// Identity of the bytes this digest covers.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// The digest, computed once per [`LazyHash`] and shared by every
+    /// later reader of the same one.
+    pub fn get(&self) -> String {
+        if let Some(value) = self.inner.value.get() {
+            return value.clone();
+        }
+        self.inner
+            .value
+            .get_or_init(|| crate::run_demoted("config-hash", || (self.inner.compute)()))
+            .clone()
+    }
+}
+
+/// The applied digest as the status handle holds it: the served-bytes
+/// digest, plus the identities of rows a runtime builder rejected folded
+/// over it.
+///
+/// It exists so a reader can take it out from under the status lock and
+/// resolve it outside: `/readyz`, every configuration apply and the
+/// heartbeat take that lock, and the digest underneath is computed on a
+/// background-priority thread that a saturated core may keep waiting.
+#[derive(Debug, Clone)]
+struct EffectiveHash {
+    base: LazyHash,
+    runtime_rejections: Option<String>,
+}
+
+impl EffectiveHash {
+    fn get(&self) -> String {
+        let base = self.base.get();
+        let Some(identity_hash) = self.runtime_rejections.as_ref() else {
+            return base;
+        };
+        let mut hasher = Context::new(&SHA256);
+        hasher.update(b"aisix-runtime-filtered-v1\0");
+        hasher.update(base.as_bytes());
+        hasher.update(&[0u8]);
+        hasher.update(identity_hash.as_bytes());
+        hex(hasher.finish().as_ref())
+    }
+}
+
+impl<T: Into<String>> From<T> for LazyHash {
+    fn from(value: T) -> Self {
+        Self::ready(value)
+    }
+}
+
+impl std::fmt::Debug for LazyHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyHash")
+            .field("version", &self.version)
+            .field("resolved", &self.inner.value.get())
+            .finish()
+    }
+}
+
 /// The result of a snapshot the gateway actually applied (served).
 #[derive(Debug, Clone)]
 pub struct AppliedSnapshot {
     /// Hash of the accepted (served) entry set.
-    pub config_hash: String,
+    pub config_hash: LazyHash,
     /// etcd revision the applied snapshot reflects; `None` in file mode.
     pub revision: Option<i64>,
     /// Per-kind counts of served resources.
@@ -281,7 +425,7 @@ pub struct AppliedSnapshot {
 #[derive(Debug, Clone)]
 pub struct LoadObservation {
     /// Hash of the full raw snapshot observed from the source.
-    pub source_hash: String,
+    pub source_hash: LazyHash,
     /// etcd revision the observed snapshot reflects; `None` in file mode.
     pub observed_revision: Option<i64>,
     /// The applied snapshot, when this load produced/kept a served snapshot.
@@ -342,12 +486,12 @@ struct ConfigStatusInner {
     // Observed (latest raw snapshot seen from the source).
     connected: bool,
     observed_revision: Option<i64>,
-    source_hash: Option<String>,
+    source_hash: Option<LazyHash>,
     observed_at: Option<DateTime<Utc>>,
 
     // Applied (last snapshot actually served).
     ever_applied: bool,
-    config_hash: Option<String>,
+    config_hash: Option<LazyHash>,
     applied_revision: Option<i64>,
     applied_at: Option<DateTime<Utc>>,
     apply_seq: u64,
@@ -447,7 +591,7 @@ impl ConfigStatus {
     pub fn record_load(&self, obs: LoadObservation) {
         let now = Utc::now();
         let mut inner = self.inner.lock().unwrap();
-        let previous_effective_hash = inner.effective_config_hash();
+        let previous_effective_version = inner.effective_config_version();
         let was_applied = inner.ever_applied;
 
         inner.connected = true;
@@ -556,7 +700,7 @@ impl ConfigStatus {
         inner.stale_served_rows_by_kind = obs.stale_served_rows_by_kind;
 
         if inner.ever_applied
-            && (!was_applied || previous_effective_hash != inner.effective_config_hash())
+            && (!was_applied || previous_effective_version != inner.effective_config_version())
         {
             inner.apply_seq += 1;
             inner.applied_at = Some(now);
@@ -598,7 +742,7 @@ impl ConfigStatus {
     pub fn record_build_rejections(&self, rejected: Vec<IncomingRejection>) {
         let now = Utc::now();
         let mut inner = self.inner.lock().unwrap();
-        let previous_effective_hash = inner.effective_config_hash();
+        let previous_effective_version = inner.effective_config_version();
         let mut all_rejected = BTreeMap::new();
         for rejection in rejected {
             all_rejected.insert(rejection.identity.clone(), rejection);
@@ -643,7 +787,7 @@ impl ConfigStatus {
         inner.build_rejected = merged;
         inner.build_rejected_counts = counts;
         inner.build_rejected_identity_hash = identity_hash;
-        if inner.ever_applied && previous_effective_hash != inner.effective_config_hash() {
+        if inner.ever_applied && previous_effective_version != inner.effective_config_version() {
             inner.apply_seq += 1;
             inner.applied_at = Some(now);
         }
@@ -720,7 +864,8 @@ impl ConfigStatus {
     /// per-node config-verification field — without building the full
     /// [`Self::view`] / [`Self::metrics`] snapshot.
     pub fn applied_config_hash(&self) -> Option<String> {
-        self.inner.lock().unwrap().effective_config_hash()
+        let hash = self.inner.lock().unwrap().effective_hash();
+        hash.map(|hash| hash.get())
     }
 
     /// Current loader + runtime-builder rejections for heartbeat reporting.
@@ -752,13 +897,24 @@ impl ConfigStatus {
     }
 
     /// Point-in-time JSON view for `GET /status/config`.
+    ///
+    /// The two digests are resolved after the status lock is released, so
+    /// they are the ones the rest of the view was built from unless an
+    /// apply landed while they were being computed.
     pub fn view(&self) -> ConfigStatusView {
-        self.inner.lock().unwrap().view()
+        let (mut view, source, applied) = self.inner.lock().unwrap().view();
+        view.source.source_hash = source.map(|hash| hash.get());
+        if let Some(rendered) = view.applied.as_mut() {
+            rendered.config_hash = applied.map(|hash| hash.get()).unwrap_or_default();
+        }
+        view
     }
 
     /// Point-in-time numeric view for the `aisix_config_*` Prometheus series.
     pub fn metrics(&self) -> ConfigMetricsView {
-        self.inner.lock().unwrap().metrics()
+        let (mut metrics, applied) = self.inner.lock().unwrap().metrics();
+        metrics.config_hash = applied.map(|hash| hash.get());
+        metrics
     }
 }
 
@@ -767,17 +923,35 @@ impl ConfigStatusInner {
         !self.rejected_counts.is_empty() || !self.build_rejected_counts.is_empty()
     }
 
-    fn effective_config_hash(&self) -> Option<String> {
-        let base = self.config_hash.as_ref()?;
+    /// Identity of the applied configuration, without digesting it.
+    ///
+    /// Two observations with the same value cover the same bytes, which
+    /// is all `apply_seq` / `applied_at` need to decide whether the
+    /// applied configuration moved. Whether it is exact is the
+    /// producer's to say: the etcd source's is exact while everything
+    /// loads, and conservative once something is rejected — a write that
+    /// lands as a rejection counts as an apply even though what serves
+    /// did not change, because knowing otherwise means digesting the
+    /// served bytes, which is the cost this exists to defer.
+    fn effective_config_version(&self) -> Option<u64> {
+        let base = self.config_hash.as_ref()?.version();
         let Some(identity_hash) = self.build_rejected_identity_hash.as_ref() else {
-            return Some(base.clone());
+            return Some(base);
         };
-        let mut hasher = Context::new(&SHA256);
-        hasher.update(b"aisix-runtime-filtered-v1\0");
-        hasher.update(base.as_bytes());
-        hasher.update(&[0u8]);
-        hasher.update(identity_hash.as_bytes());
-        Some(hex(hasher.finish().as_ref()))
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        base.hash(&mut hasher);
+        identity_hash.hash(&mut hasher);
+        Some(hasher.finish())
+    }
+
+    /// The reported applied digest, still unresolved. Resolving it walks
+    /// the whole observed configuration, so it is deliberately handed out
+    /// rather than computed here — see [`EffectiveHash`].
+    fn effective_hash(&self) -> Option<EffectiveHash> {
+        Some(EffectiveHash {
+            base: self.config_hash.clone()?,
+            runtime_rejections: self.build_rejected_identity_hash.clone(),
+        })
     }
 
     fn effective_resource_counts(&self) -> BTreeMap<String, usize> {
@@ -816,19 +990,21 @@ impl ConfigStatusInner {
         }
     }
 
-    fn view(&self) -> ConfigStatusView {
+    /// The view, minus the two digests: those come back unresolved so the
+    /// caller can compute them with the status lock released.
+    fn view(&self) -> (ConfigStatusView, Option<LazyHash>, Option<EffectiveHash>) {
         let etcd = self.source_kind.is_etcd();
         let source = SourceView {
             source_type: self.source_kind,
             connected: etcd.then_some(self.connected),
             observed_revision: if etcd { self.observed_revision } else { None },
-            source_hash: self.source_hash.clone(),
+            source_hash: None,
             observed_at: self.observed_at.map(rfc3339),
         };
         let applied = if self.ever_applied {
             Some(AppliedView {
                 applied_revision: if etcd { self.applied_revision } else { None },
-                config_hash: self.effective_config_hash().unwrap_or_default(),
+                config_hash: String::new(),
                 apply_seq: self.apply_seq,
                 applied_at: self.applied_at.map(rfc3339).unwrap_or_default(),
                 resource_counts: self.effective_resource_counts(),
@@ -885,25 +1061,30 @@ impl ConfigStatusInner {
         let mut partially_compatible = self.partially_compatible.clone();
         partially_compatible
             .sort_by(|a, b| (&a.resource_kind, &a.field).cmp(&(&b.resource_kind, &b.field)));
-        ConfigStatusView {
-            state: self.derive_state(),
-            source,
-            applied,
-            last_reload,
-            last_failure,
-            rejected,
-            unknown_kinds,
-            partially_compatible,
-        }
+        (
+            ConfigStatusView {
+                state: self.derive_state(),
+                source,
+                applied,
+                last_reload,
+                last_failure,
+                rejected,
+                unknown_kinds,
+                partially_compatible,
+            },
+            self.source_hash.clone(),
+            self.effective_hash(),
+        )
     }
 
-    fn metrics(&self) -> ConfigMetricsView {
+    /// As [`Self::view`]: the applied digest comes back unresolved.
+    fn metrics(&self) -> (ConfigMetricsView, Option<EffectiveHash>) {
         let etcd = self.source_kind.is_etcd();
         let mut rejected_by_kind = self.rejected_counts.clone();
         for (kind, count) in &self.build_rejected_counts {
             *rejected_by_kind.entry(kind.clone()).or_insert(0) += count;
         }
-        ConfigMetricsView {
+        let metrics = ConfigMetricsView {
             source_kind: self.source_kind,
             last_reload_successful: self.last_reload_successful,
             last_reload_success_ts: self.last_reload_success_at.map(|t| t.timestamp()),
@@ -915,9 +1096,10 @@ impl ConfigStatusInner {
             stale_served_by_kind: self.stale_served_rows_by_kind.clone(),
             observed_revision: if etcd { self.observed_revision } else { None },
             applied_revision: if etcd { self.applied_revision } else { None },
-            config_hash: self.effective_config_hash(),
+            config_hash: None,
             connected: etcd.then_some(self.connected),
-        }
+        };
+        (metrics, self.effective_hash())
     }
 }
 
@@ -1163,7 +1345,7 @@ mod tests {
 
     fn applied(hash: &str, counts: &[(&str, usize)]) -> AppliedSnapshot {
         AppliedSnapshot {
-            config_hash: hash.to_string(),
+            config_hash: hash.into(),
             revision: Some(7),
             resource_counts: counts.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
         }
