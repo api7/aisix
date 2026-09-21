@@ -797,6 +797,13 @@ fn is_zero_f64(n: &f64) -> bool {
 /// - dropped (reason=sink_full): worker overloaded
 /// - dropped (reason=sink_closed): worker shut down
 /// - dropped (reason=sink_disabled): no sink wired (legacy / dev mode)
+///
+/// The sender worker adds two more reasons to the SAME counter for events
+/// it accepted here and then could not deliver to the control plane —
+/// `send_failed` and `retry_budget_exhausted` (see aisix-server's
+/// `telemetry` module). They carry only the member pair off the event, so
+/// "delivered" reads as "reached the control plane" in aggregate, and the
+/// per-model slice of the invariant covers the queue side only.
 #[derive(Debug, Clone)]
 pub struct UsageSink {
     tx: Option<tokio::sync::mpsc::Sender<UsageEvent>>,
