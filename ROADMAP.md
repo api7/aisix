@@ -17,7 +17,7 @@ The **Surface** column shows where a capability lands: **Gateway** is the AISIX 
 | Capability | What's planned | Surface |
 | --- | --- | --- |
 | Enterprise SSO | Single sign-on through SAML and generic OIDC, beyond today's social logins. | Cloud |
-| Service accounts | Login-less, first-class principals for automated callers. | Cloud |
+| Service accounts | Non-human, team-scoped principals that own caller keys without being modeled as organization members, on top of today's login-less members. | Cloud |
 
 ## Next
 
@@ -33,7 +33,7 @@ The **Surface** column shows where a capability lands: **Gateway** is the AISIX 
 | Capability | What's planned | Surface |
 | --- | --- | --- |
 | External secret management | Manage provider and API credentials through external KMS and secret stores such as Vault. | Gateway · Cloud |
-| Expanded observability export | OTLP export for metrics and logs, and alerting integrations such as Slack and PagerDuty. | Gateway · Cloud |
+| Expanded observability export | OTLP export for metrics and logs, alerting integrations beyond today's webhook and Slack budget alerts (such as PagerDuty), and first-party data-warehouse sinks on top of today's object-storage staging. | Gateway · Cloud |
 | Metered usage billing | Usage-based billing in addition to subscription plans. | Cloud |
 | SDKs and agent-framework integrations | First-party SDKs and integrations with common agent frameworks. | Gateway · Cloud |
 
