@@ -890,13 +890,6 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             }
         }
     });
-    let (usage_sink, telemetry_task) = match telemetry_cfg {
-        Some(cfg) => {
-            let (sink, handle) = telemetry::spawn(cfg, cancel_rx.clone());
-            (sink, Some(handle))
-        }
-        None => (aisix_obs::UsageSink::disabled(), None),
-    };
 
     // Steps 7-8: build Hub, shared components, then routers.
     let hub = Arc::new(build_hub());
@@ -918,6 +911,17 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!(e))?,
     );
     let _ = metrics_slot.set(metrics.clone());
+    // Spawned here rather than beside the heartbeat worker above because it
+    // needs `Metrics`: a usage batch it gives up on is counted against
+    // `aisix_usage_event_drops_total`, the same counter the queue's own
+    // drops land on.
+    let (usage_sink, telemetry_task) = match telemetry_cfg {
+        Some(cfg) => {
+            let (sink, handle) = telemetry::spawn(cfg, (*metrics).clone(), cancel_rx.clone());
+            (sink, Some(handle))
+        }
+        None => (aisix_obs::UsageSink::disabled(), None),
+    };
     // Built before the stores below because each Redis-backed store takes
     // the handle: their failures are fail-open by design, so the counter
     // is the only place the degradation shows (#1060).

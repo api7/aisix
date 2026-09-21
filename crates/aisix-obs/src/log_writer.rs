@@ -336,6 +336,22 @@ mod tests {
         format!("line-{n}\n").into_bytes()
     }
 
+    /// `DROPPED_TOTAL` is process-global — it is read at scrape time, long
+    /// after any single writer is gone — so a test that reads it and a test
+    /// that drops into it cannot run at the same time: the reader counts
+    /// the other one's drops as its own. Every test that touches the
+    /// counter takes this first.
+    static OWNS_THE_DROP_COUNTER: Mutex<()> = Mutex::new(());
+
+    fn owning_the_drop_counter() -> std::sync::MutexGuard<'static, ()> {
+        // A poisoned lock means some earlier test panicked while holding
+        // it; the counter is still usable, and hiding that failure behind
+        // a second one helps nobody.
+        OWNS_THE_DROP_COUNTER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn a_blocked_sink_does_not_block_the_emitting_thread() {
         let sink = BlockedSink::new();
@@ -358,6 +374,7 @@ mod tests {
 
     #[test]
     fn events_past_the_bound_are_dropped_and_counted() {
+        let _counter = owning_the_drop_counter();
         let sink = BlockedSink::new();
         let (queue, writer) = LogWriter::start(sink.clone(), 8);
         for n in 0..40 {
@@ -405,6 +422,7 @@ mod tests {
     /// no consumer left, so it has to be counted rather than queued.
     #[test]
     fn events_arriving_after_shutdown_are_counted_not_silently_queued() {
+        let _counter = owning_the_drop_counter();
         let sink = BlockedSink::new();
         sink.release();
         let (queue, writer) = LogWriter::start(sink.clone(), 64);

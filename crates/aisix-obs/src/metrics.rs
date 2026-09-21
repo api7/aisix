@@ -2465,10 +2465,13 @@ impl Metrics {
         );
     }
 
-    /// Count a usage event that never made it into the queue. Carries the
+    /// Count a usage event that never made it into the queue, or that the
+    /// sender worker could not deliver to the control plane. Carries the
     /// same attribution as the emit counter (AISIX-Cloud#1317): a dropped
     /// event is a hole in the usage record, and the operator's question is
-    /// whose data is missing, which `reason` alone cannot answer.
+    /// whose data is missing, which `reason` alone cannot answer. (The
+    /// sender-side reasons can only supply the member pair — see
+    /// [`crate::UsageSink`].)
     ///
     /// "The same attribution" means every dimension [`UsageEventLabels`]
     /// supplies, `upstream_protocol` included (AISIX-Cloud#1403) — the
