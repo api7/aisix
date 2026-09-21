@@ -636,6 +636,68 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// The scrape body is produced in pieces as the exposition is
+    /// rendered, so at real cardinality it reaches the client as many
+    /// chunks rather than one. A registry small enough to fit in one
+    /// piece never exercises that, and every other case here is: this
+    /// one drives enough series that the handover happens repeatedly,
+    /// through the real router and response body, and requires what
+    /// arrives to be the exposition and nothing less.
+    #[tokio::test]
+    async fn a_large_registry_survives_the_trip_through_the_response() {
+        use aisix_obs::{Metrics, RequestOutcome};
+        use std::time::Duration;
+
+        let metrics = Arc::new(Metrics::new(false));
+        for i in 0..20_000 {
+            metrics.record_request(
+                "openai",
+                &format!("model-{i:05}"),
+                200,
+                RequestOutcome::Success,
+                Duration::from_millis(10),
+            );
+        }
+        let app = metrics_router(
+            Arc::clone(&metrics),
+            aisix_core::ConfigStatus::new(aisix_core::SourceKind::Etcd),
+            &PrometheusConfig {
+                enabled: true,
+                path: "/metrics".into(),
+                addr: "0.0.0.0:9090".into(),
+            },
+            empty_models_status(),
+        );
+
+        let resp = run(
+            app,
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 512 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.len() > 1024 * 1024,
+            "the fixture must be larger than one piece to test the handover \
+             ({} bytes)",
+            body.len(),
+        );
+        // Nothing lost at a boundary: the first series, the last one, and
+        // the count of them.
+        assert!(body.contains("model=\"model-00000\""));
+        assert!(body.contains("model=\"model-19999\""));
+        assert_eq!(
+            body.matches("aisix_requests_total{").count(),
+            20_000,
+            "every series must arrive",
+        );
+        assert!(body.ends_with('\n'));
+    }
+
     #[tokio::test]
     async fn metrics_router_honors_custom_path() {
         use aisix_obs::Metrics;

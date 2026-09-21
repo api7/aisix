@@ -259,7 +259,10 @@ impl BudgetClient {
         // the same queue, and each record is looked at once in its life,
         // so an insert costs a constant number of entries however large
         // the cache is.
-        let mut evicting = self.cache.len() >= CACHE_CAPACITY;
+        // Refreshing a key already in the cache takes no new room, so it
+        // must not cost another key its decision.
+        let mut evicting =
+            self.cache.len() >= CACHE_CAPACITY && !self.cache.contains_key(api_key_id);
         while let Some((recorded, key)) = expiry.front() {
             #[cfg(test)]
             self.inspected.fetch_add(1, Ordering::Relaxed);
@@ -277,6 +280,22 @@ impl BudgetClient {
             let (_, oldest) = expiry.pop_front().expect("a front that was just read");
             self.cache.remove(&oldest);
             evicting = false;
+        }
+        // The walk above only reaches records behind a current one when
+        // it is evicting, so a key that is cached and never fetched
+        // again pins the front while every refresh behind it leaves a
+        // superseded record. Compact when they outnumber what the cache
+        // can hold: at most once per `CACHE_CAPACITY` inserts, which
+        // keeps the cost per insert constant and the queue bounded.
+        if expiry.len() >= 2 * CACHE_CAPACITY {
+            #[cfg(test)]
+            self.inspected
+                .fetch_add(expiry.len() as u64, Ordering::Relaxed);
+            expiry.retain(|(recorded, key)| {
+                self.cache
+                    .get(key)
+                    .is_some_and(|entry| entry.seq == *recorded)
+            });
         }
         expiry.push_back((seq, api_key_id.to_string()));
         self.cache.insert(
@@ -720,6 +739,47 @@ managed:
                 .get(&format!("key-{:06}", CACHE_CAPACITY - 1))
                 .is_some(),
             "and the newest survivors are not",
+        );
+
+        // A refresh of a key already cached takes no new room, so it
+        // must not cost an unrelated key its decision.
+        let cached = client.cache.len();
+        client.insert("fresh-000000", decision(false));
+        assert_eq!(client.cache.len(), cached);
+        assert_eq!(
+            client.cache.get("fresh-000001").map(|e| e.decision.allowed),
+            Some(true),
+            "refreshing one key must not evict another",
+        );
+    }
+
+    /// Most deployments never fill the cache, so nothing ever evicts —
+    /// and a key that is cached and never fetched again then sits at the
+    /// front of the expiry order forever. Every refresh of every other
+    /// key leaves a superseded record behind it, so the records have to
+    /// be bounded by something other than eviction.
+    #[test]
+    fn refreshing_keys_below_capacity_does_not_accumulate_records() {
+        let client = BudgetClient::disabled();
+        // One key that is never seen again, pinning the front.
+        client.insert("pinned", decision(true));
+        for round in 0..20_000 {
+            client.insert(&format!("busy-{}", round % 50), decision(true));
+        }
+        assert!(client.cache.len() < CACHE_CAPACITY, "the cache never fills");
+        let records = client.expiry.lock().unwrap().len();
+        assert!(
+            records <= 2 * CACHE_CAPACITY,
+            "expiry records must stay bounded: {records} for {} cached keys",
+            client.cache.len(),
+        );
+        assert!(
+            client.cache.get("pinned").is_some(),
+            "and compaction must not drop a key that is still cached",
+        );
+        assert_eq!(
+            client.cache.get("busy-7").map(|e| e.decision.allowed),
+            Some(true),
         );
     }
 

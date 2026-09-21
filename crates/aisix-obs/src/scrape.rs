@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, Semaphore};
@@ -9,6 +10,26 @@ use tokio::sync::{mpsc, Semaphore};
 /// a queue: a scrape's peak memory is this many pieces, whatever the
 /// exposition's size.
 const PIECES_IN_FLIGHT: usize = 1;
+
+/// How long one piece may wait for the response to take it.
+///
+/// A reader can stop reading without closing — a zero window, a wedged
+/// sidecar, a half-open socket — and nothing below this notices: the
+/// listener's only timeout covers the gap BETWEEN requests, not a
+/// response being written. Without a bound the render parks forever
+/// holding the gate below, and every later scrape is answered with a
+/// `200` whose body never arrives. A reader this slow has lost its own
+/// scrape either way; what must not be lost is everyone else's.
+#[cfg(not(test))]
+const PIECE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Shortened so a case can drive a reader that stops without waiting one
+/// out; what the case pins is the abandonment, not the number.
+#[cfg(test)]
+const PIECE_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// How long to leave a full channel before looking again. Small against
+/// [`PIECE_TIMEOUT`], and only ever reached when the reader is behind.
+const PIECE_RETRY: Duration = Duration::from_millis(10);
 
 pub(crate) struct Scrape {
     /// One render at a time. Walking and formatting every series is the
@@ -53,19 +74,58 @@ impl Scrape {
             let Ok(_permit) = gate.acquire_owned().await else {
                 return;
             };
-            let rendered = tokio::task::spawn_blocking(move || {
-                aisix_core::run_demoted("metrics-render", || {
-                    render(&mut |piece| sender.blocking_send(Ok(Bytes::from(piece))).is_ok())
+            let failed = {
+                let sender = sender.clone();
+                tokio::task::spawn_blocking(move || {
+                    aisix_core::run_demoted("metrics-render", || {
+                        render(&mut |piece| hand_over(&sender, Bytes::from(piece)))
+                    })
                 })
-            })
-            .await;
-            if let Err(error) = rendered {
-                // The response headers are long gone by now, so this can
-                // only truncate the body. Say so where it is visible.
+                .await
+            };
+            if let Err(error) = failed {
                 tracing::error!(%error, "metrics render task failed");
+                // The headers left long ago, so the only way left to say
+                // the exposition is incomplete is to end the body
+                // abnormally. Ending it cleanly would hand the scraper a
+                // truncated exposition as a successful scrape, and every
+                // series past the failure would read as gone rather than
+                // unknown.
+                let _ = sender
+                    .send(Err(std::io::Error::other("metrics render failed")))
+                    .await;
             }
         });
         receiver
+    }
+}
+
+/// Give one piece to the response, waiting for it to take the previous
+/// one. `false` means stop rendering: the response is gone, or it has
+/// stopped taking pieces for longer than any live scrape would.
+///
+/// A plain blocking send would be simpler and is what a render wants —
+/// but it waits on the reader without limit, and this render holds a
+/// process-wide gate while it does.
+fn hand_over(sender: &mpsc::Sender<Result<Bytes, std::io::Error>>, piece: Bytes) -> bool {
+    let deadline = std::time::Instant::now() + PIECE_TIMEOUT;
+    let mut piece = Ok(piece);
+    loop {
+        match sender.try_send(piece) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            Err(mpsc::error::TrySendError::Full(unsent)) => {
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        "a metrics scrape stopped reading; abandoning its render so later \
+                         scrapes are not blocked behind it",
+                    );
+                    return false;
+                }
+                piece = unsent;
+                std::thread::sleep(PIECE_RETRY);
+            }
+        }
     }
 }
 
@@ -124,6 +184,60 @@ mod tests {
         assert!(
             rendered.load(Ordering::SeqCst) < 64,
             "the abandoned render must stop, not run to completion",
+        );
+    }
+
+    /// A reader that stops reading WITHOUT closing — a zero window, a
+    /// wedged sidecar — used to be indistinguishable from a slow one,
+    /// and the render waits on it while holding the only gate. It must
+    /// give up so the next scrape can run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_that_stops_without_closing_does_not_hold_the_gate() {
+        let scrape = Scrape::default();
+        let stalled = scrape.stream(|emit| {
+            for _ in 0..64 {
+                if !emit("series 1\n".to_owned()) {
+                    return;
+                }
+            }
+        });
+
+        // Held, never read from: the channel fills and stays full.
+        let second = scrape.stream(|emit| {
+            assert!(emit("series 2\n".to_owned()));
+        });
+        let body = tokio::time::timeout(Duration::from_secs(10), collect(second))
+            .await
+            .expect("the second scrape must not wait on the first reader");
+        assert_eq!(body, "series 2\n");
+        drop(stalled);
+    }
+
+    /// A render that dies has already had its headers sent, so the only
+    /// way left to say the exposition is incomplete is to end the body
+    /// abnormally. Ending it cleanly would pass a truncated exposition
+    /// off as a whole one.
+    #[tokio::test]
+    async fn a_failed_render_ends_the_body_with_an_error() {
+        let scrape = Scrape::default();
+        let mut body = scrape.stream(|emit| {
+            assert!(emit("partial\n".to_owned()));
+            panic!("render died");
+        });
+        assert_eq!(body.recv().await.unwrap().unwrap(), "partial\n");
+        assert!(
+            body.recv().await.expect("a piece, not the end").is_err(),
+            "the body must end abnormally, not cleanly",
+        );
+        assert!(body.recv().await.is_none());
+
+        // And the gate is free for the next one.
+        assert_eq!(
+            collect(scrape.stream(|emit| {
+                assert!(emit("recovered\n".to_owned()));
+            }))
+            .await,
+            "recovered\n",
         );
     }
 

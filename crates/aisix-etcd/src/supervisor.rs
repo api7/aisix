@@ -23,9 +23,7 @@ use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::AisixSnapshot;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use ring::digest::{Context, SHA256};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
@@ -251,33 +249,19 @@ impl StateEntry {
     }
 }
 
-// Checkpoints contain the digest state AFTER each group of records. Any
-// insertion, replacement or deletion invalidates the checkpoint at its key
-// and all later checkpoints. Keep the map and its cache under the same lock.
-const HASH_CHECKPOINT_RECORDS: usize = 64;
-
 #[derive(Default)]
 struct ObservedState {
     entries: BTreeMap<String, StateEntry>,
-    checkpoints: Vec<(String, Context)>,
-    digest: Option<String>,
-    /// Identity of `entries`, advanced by every change to them. Lets a
-    /// reader decide whether the observed configuration moved without
-    /// digesting it — see [`aisix_core::LazyHash`].
+    /// Identity of `entries`: advanced by every change to them, and by
+    /// nothing else. Lets a reader decide whether the observed
+    /// configuration moved without digesting it — see
+    /// [`aisix_core::LazyHash`]. It must never restart, so the entry map
+    /// is reconciled in place rather than replaced.
     version: u64,
-    #[cfg(test)]
-    last_hashed_records: usize,
-    /// How many times the observed digest was actually computed — the
-    /// thing an apply must not do.
-    #[cfg(test)]
-    hash_calls: usize,
 }
 
 impl ObservedState {
-    fn invalidate(&mut self, key: &str) {
-        let keep = self.checkpoints.partition_point(|(k, _)| k.as_str() < key);
-        self.checkpoints.truncate(keep);
-        self.digest = None;
+    fn invalidate(&mut self) {
         self.version = self.version.wrapping_add(1);
     }
 
@@ -288,7 +272,7 @@ impl ObservedState {
             .get(&row.entry.key)
             .is_none_or(|old| old.record != row.record)
         {
-            self.invalidate(&row.entry.key);
+            self.invalidate();
         }
         self.entries.insert(row.entry.key.clone(), row);
     }
@@ -296,40 +280,29 @@ impl ObservedState {
     fn remove(&mut self, key: &str) -> Option<StateEntry> {
         let removed = self.entries.remove(key);
         if removed.is_some() {
-            self.invalidate(key);
+            self.invalidate();
         }
         removed
     }
 
-    fn source_hash(&mut self) -> String {
-        #[cfg(test)]
-        {
-            self.last_hashed_records = 0;
-        }
-        if let Some(digest) = &self.digest {
-            return digest.clone();
-        }
-        #[cfg(test)]
-        {
-            self.hash_calls += 1;
-        }
-        let (start, mut hash) = match self.checkpoints.last() {
-            Some((key, hash)) => (Excluded(key.clone()), hash.clone()),
-            None => (Unbounded, Context::new(&SHA256)),
-        };
-        for (index, (key, row)) in self.entries.range((start, Unbounded)).enumerate() {
-            hash.update(&row.record);
-            #[cfg(test)]
-            {
-                self.last_hashed_records += 1;
-            }
-            if (index + 1) % HASH_CHECKPOINT_RECORDS == 0 {
-                self.checkpoints.push((key.clone(), hash.clone()));
-            }
-        }
-        let digest = hex::encode(hash.finish());
-        self.digest = Some(digest.clone());
-        digest
+    /// The bytes the observed digest covers, in key order — taken at
+    /// apply time so the digest computed from it later describes the
+    /// state that was applied, not whatever the map has since become.
+    /// Each record is already computed and shared, so this is a list of
+    /// pointers, not a copy of the configuration.
+    fn records(&self) -> Vec<Arc<[u8]>> {
+        self.entries
+            .values()
+            .map(|row| row.record.clone())
+            .collect()
+    }
+
+    /// As [`Self::records`], keyed — what the served-set filter needs.
+    fn records_by_key(&self) -> Vec<(String, Arc<[u8]>)> {
+        self.entries
+            .iter()
+            .map(|(key, row)| (key.clone(), row.record.clone()))
+            .collect()
     }
 }
 
@@ -349,10 +322,11 @@ pub struct Supervisor<P: ConfigProvider> {
     // Cached records and SHA-256 prefixes share the authoritative entry
     // map's lock, so status publication cannot reuse a prefix invalidated
     // by a concurrent Put/Delete/resync. Disk snapshot encoding is lazy.
-    /// `Arc` because the digests over it are computed on demand, by
-    /// whoever first reports one after an apply, long after the apply
-    /// that handed out the closure has returned.
-    state: Arc<Mutex<ObservedState>>,
+    state: Mutex<ObservedState>,
+    /// How many times the observed digest was actually computed — the
+    /// thing an apply must not do.
+    #[cfg(test)]
+    hashed: Arc<std::sync::atomic::AtomicUsize>,
     revision: Mutex<i64>,
     cache: SnapshotCache,
 
@@ -520,7 +494,9 @@ impl<P: ConfigProvider> Supervisor<P> {
             sources,
             prefixes,
             handle: SnapshotHandle::new(AisixSnapshot::new()),
-            state: Arc::new(Mutex::new(ObservedState::default())),
+            state: Mutex::new(ObservedState::default()),
+            #[cfg(test)]
+            hashed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             revision: Mutex::new(0),
             cache,
             status: WatchStatus::new(),
@@ -578,14 +554,23 @@ impl<P: ConfigProvider> Supervisor<P> {
             // Every observed write, including a rejected one, contributes
             // to the source hash. Unchanged prefixes keep their SHA state.
             //
-            // Neither digest is computed here. Both are proportional to
-            // the whole configuration rather than to this apply, and an
-            // apply is not what reports them — see [`LazyHash`].
+            // Not computed here: the digest is proportional to the whole
+            // configuration rather than to this apply, and an apply is
+            // not what reports it — see [`LazyHash`]. What IS taken here
+            // is the list of records it covers, so the digest a reader
+            // gets later describes this apply and not a batch that
+            // landed while it was reading.
             source_hash = {
-                let state = Arc::clone(&self.state);
-                LazyHash::deferred(version, move || state.lock().unwrap().source_hash())
+                let records = state.records();
+                #[cfg(test)]
+                let hashed = Arc::clone(&self.hashed);
+                LazyHash::deferred(version, move || {
+                    #[cfg(test)]
+                    hashed.fetch_add(1, Ordering::Relaxed);
+                    hash_records(&records)
+                })
             };
-            let rejected_keys: HashSet<String> = rejections.iter().map(|r| r.key.clone()).collect();
+            let rejected_keys: HashSet<&str> = rejections.iter().map(|r| r.key.as_str()).collect();
             // config_hash covers the bytes each key ACTUALLY serves: the
             // observed etcd bytes for accepted keys, the pinned last-known-
             // good bytes for stale-serving keys (#871), and nothing for a
@@ -601,12 +586,17 @@ impl<P: ConfigProvider> Supervisor<P> {
             config_hash = if rejected_keys.is_empty() && stale.is_empty() {
                 source_hash.clone()
             } else {
-                let state = Arc::clone(&self.state);
+                let records = state.records_by_key();
                 let stale = stale.clone();
+                #[cfg(test)]
+                let hashed = Arc::clone(&self.hashed);
+                let rejected_keys: HashSet<String> =
+                    rejected_keys.iter().map(|key| (*key).to_owned()).collect();
                 LazyHash::deferred(served_version(version, &rejected_keys, &stale), move || {
-                    let state = state.lock().unwrap();
+                    #[cfg(test)]
+                    hashed.fetch_add(1, Ordering::Relaxed);
                     let keys: HashSet<&str> = rejected_keys.iter().map(String::as_str).collect();
-                    hash_records(served_records(&state.entries, &keys, &stale))
+                    hash_records(served_records(&records, &keys, &stale))
                 })
             };
             rejected = rejections
@@ -1520,10 +1510,24 @@ impl<P: ConfigProvider> Supervisor<P> {
 
         self.handle.store(snap);
 
-        // Replace the cache-tracking map wholesale and flush.
+        // Reconcile the cache-tracking map against this entry set, and
+        // flush. Reconciled rather than replaced: the map's `version` is
+        // what tells a reader whether the observed configuration moved,
+        // and a fresh map would restart it — so a resync that changed
+        // nothing would read as a change, and two different states could
+        // share a version.
         {
             let mut state = self.state.lock().unwrap();
-            *state = ObservedState::default();
+            let incoming: HashSet<&str> = entries.iter().map(|e| e.key.as_str()).collect();
+            let departed: Vec<String> = state
+                .entries
+                .keys()
+                .filter(|key| !incoming.contains(key.as_str()))
+                .cloned()
+                .collect();
+            for key in departed {
+                state.remove(&key);
+            }
             for e in entries {
                 state.insert(e.clone());
             }
@@ -2175,21 +2179,16 @@ fn stamp_max(slot: &mut Option<i64>, revision: i64) {
     });
 }
 
-/// The digest records for the bytes each key ACTUALLY serves, in the
-/// ascending-key order `hash_records` is defined over: the observed etcd
-/// bytes for an accepted key, the pinned last-known-good bytes for a
-/// stale-serving one (#871), and nothing for a key rejected with no last
-/// good. `state` is already sorted, so the pinned records are merged into
-/// the walk rather than sorted with it.
-/// Identity of what [`served_records`] would produce, without walking the
-/// entry map: the observed state's own version plus the filter applied to
-/// it. Only reached when something is rejected or serving stale — the
-/// clean case shares the source digest's identity outright.
+/// Identity of what [`served_records`] would produce, without walking
+/// the entry map: the observed state's own version plus the filter
+/// applied to it. Only reached when something is rejected or serving
+/// stale — the clean case shares the observed digest's identity outright.
 ///
-/// Conservative in one direction, like the identity it feeds: a change to
-/// a key that is rejected, and so serves nothing, still advances the
-/// observed state's version and therefore this. It never misses a change
-/// to what is served.
+/// Conservative in one direction: a change to a key that is rejected,
+/// and so serves nothing, advances the observed state's version and
+/// therefore this, where comparing the digests would not have. It never
+/// misses a change to what is served, which is the direction that would
+/// lose an apply.
 fn served_version(
     observed: u64,
     rejected_keys: &HashSet<String>,
@@ -2210,8 +2209,14 @@ fn served_version(
     hasher.finish()
 }
 
+/// The digest records for the bytes each key ACTUALLY serves, in the
+/// ascending-key order `hash_records` is defined over: the observed etcd
+/// bytes for an accepted key, the pinned last-known-good bytes for a
+/// stale-serving one (#871), and nothing for a key rejected with no last
+/// good. `state` is already sorted, so the pinned records are merged into
+/// the walk rather than sorted with it.
 fn served_records(
-    state: &BTreeMap<String, StateEntry>,
+    state: &[(String, Arc<[u8]>)],
     rejected_keys: &HashSet<&str>,
     stale: &HashMap<String, StaleServing>,
 ) -> Vec<Arc<[u8]>> {
@@ -2226,7 +2231,7 @@ fn served_records(
 
     let mut out: Vec<Arc<[u8]>> = Vec::with_capacity(state.len() + pinned.len());
     let mut next_pinned = 0usize;
-    for (key, entry) in state {
+    for (key, record) in state {
         // A pinned key etcd no longer reports still serves — emit it in
         // its own place in the ordering rather than at the end.
         while next_pinned < pinned.len() && pinned[next_pinned].0 < key.as_str() {
@@ -2241,7 +2246,7 @@ fn served_records(
         if rejected_keys.contains(key.as_str()) {
             continue;
         }
-        out.push(entry.record.clone());
+        out.push(record.clone());
     }
     for (_, record) in &pinned[next_pinned..] {
         out.push(record.clone());
@@ -2615,6 +2620,15 @@ mod tests {
         "provider_key_id": "11111111-1111-1111-1111-111111111111"
     }"#;
 
+    /// A second valid model, so a resync can replace an entry set with a
+    /// different one of the same size.
+    const VALID_MODEL_ALT: &[u8] = br#"{
+        "display_name": "my-gpt4-alt",
+        "provider": "openai",
+        "model_name": "gpt-4o-mini",
+        "provider_key_id": "11111111-1111-1111-1111-111111111111"
+    }"#;
+
     fn assert_observed_hash(state: &mut ObservedState) {
         let expected = aisix_core::config_status::hash_entries(
             state
@@ -2622,12 +2636,16 @@ mod tests {
                 .iter()
                 .map(|(key, row)| (key.as_str(), row.entry.value.as_slice())),
         );
-        assert_eq!(state.source_hash(), expected);
-        assert!(state.checkpoints.len() <= state.entries.len() / HASH_CHECKPOINT_RECORDS);
+        assert_eq!(hash_records(state.records()), expected);
     }
 
+    /// `version` is what a reader compares to decide whether the
+    /// observed configuration moved, and what `apply_seq` is built on,
+    /// so it has to track the records and nothing else: a write that
+    /// lands the same canonical bytes is not a change, and neither is a
+    /// delete of a key that was not there.
     #[test]
-    fn observed_hash_reuses_unchanged_prefix_and_identical_records() {
+    fn the_observed_version_moves_exactly_when_the_records_do() {
         let mut state = ObservedState::default();
         for i in 0..256 {
             state.insert(entry(
@@ -2637,24 +2655,31 @@ mod tests {
             ));
         }
         assert_observed_hash(&mut state);
-        assert_eq!(state.last_hashed_records, 256);
+        assert_eq!(state.version, 256, "every new key is a change");
+
+        let before = state.version;
+        let digest = hash_records(state.records());
         state.insert(entry("/aisix/models/0240", br#"{"a":2,"b":2}"#, 2));
+        assert_ne!(state.version, before);
+        assert_ne!(hash_records(state.records()), digest);
         assert_observed_hash(&mut state);
-        assert!(
-            state.last_hashed_records < 128,
-            "a late change must skip the unchanged prefix"
-        );
-        let digest = state.source_hash();
+
+        let changed = state.version;
+        let digest = hash_records(state.records());
         state.insert(entry("/aisix/models/0240", br#"{ "b": 2, "a": 2 }"#, 3));
-        assert_eq!(state.source_hash(), digest);
         assert_eq!(
-            state.last_hashed_records, 0,
-            "canonical-equivalent updates do not hash again"
+            state.version, changed,
+            "canonical-equivalent bytes are not a change",
         );
+        assert_eq!(hash_records(state.records()), digest);
         assert_eq!(state.entries["/aisix/models/0240"].entry.revision, 3);
+
         assert!(state.remove("/aisix/models/missing").is_none());
-        assert_observed_hash(&mut state);
-        assert_eq!(state.last_hashed_records, 0);
+        assert_eq!(
+            state.version, changed,
+            "deleting what was never there is not a change",
+        );
+        assert_eq!(hash_records(state.records()), digest);
     }
 
     #[test]
@@ -2706,7 +2731,7 @@ mod tests {
             state.remove(&key);
             assert_observed_hash(&mut state);
         }
-        assert!(state.checkpoints.is_empty());
+        assert!(state.entries.is_empty());
     }
 
     /// Digesting is proportional to the whole configuration rather than
@@ -2723,7 +2748,7 @@ mod tests {
             sup.apply_resync_at(&rows, Some(i + 1));
         }
         assert_eq!(
-            sup.state.lock().unwrap().hash_calls,
+            sup.hashed.load(Ordering::Relaxed),
             0,
             "an apply nothing is reading must not digest the configuration",
         );
@@ -2736,14 +2761,14 @@ mod tests {
         assert_eq!(view.source.source_hash.as_deref(), Some(expected.as_str()));
         assert_eq!(view.applied.unwrap().config_hash, expected);
         assert_eq!(
-            sup.state.lock().unwrap().hash_calls,
+            sup.hashed.load(Ordering::Relaxed),
             1,
             "reporting both digests over one unrejected state costs one pass",
         );
 
         sup.config_status().view();
         assert_eq!(
-            sup.state.lock().unwrap().hash_calls,
+            sup.hashed.load(Ordering::Relaxed),
             1,
             "a second report of the same state reuses the first result",
         );
@@ -2756,10 +2781,6 @@ mod tests {
             .map(|i| entry(&format!("/aisix/models/{i:04}"), VALID_MODEL, 1))
             .collect();
         sup.apply_resync_at(&rows, Some(1));
-        // Checkpoints are a by-product of digesting the observed state,
-        // which an apply no longer does — reporting the digest does.
-        sup.config_status().view();
-        assert!(!sup.state.lock().unwrap().checkpoints.is_empty());
         rows.remove(240);
         rows[200].value = b"invalid JSON".to_vec();
         rows.push(entry("/aisix/models/0256", VALID_MODEL, 2));
@@ -2774,7 +2795,76 @@ mod tests {
         assert_observed_hash(&mut sup.state.lock().unwrap());
         sup.apply_resync_at(&[], Some(3));
         assert_observed_hash(&mut sup.state.lock().unwrap());
-        assert!(sup.state.lock().unwrap().checkpoints.is_empty());
+        assert!(sup.state.lock().unwrap().entries.is_empty());
+    }
+
+    /// What the apply counter does when a row is rejected, which the
+    /// digests alone used to decide.
+    ///
+    /// The identity a reader compares is the observed state's, not the
+    /// served bytes' — knowing the served bytes means digesting them,
+    /// which is the whole cost this defers. So a write that lands as a
+    /// rejection counts as an apply even though nothing it serves
+    /// changed. It is one advance per such write, never a missed one,
+    /// and what serves is unaffected: the digest, the counts and the
+    /// rejection report all still describe the last known good.
+    #[tokio::test]
+    async fn a_rejected_write_advances_the_apply_counter_without_changing_what_serves() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+        assert!(sup.apply_put(&entry("/aisix/models/m-1", VALID_MODEL, 1)));
+        let good = sup.config_status().view().applied.unwrap();
+
+        sup.apply_resync(&[entry("/aisix/models/m-1", BAD_PROVIDER_MODEL, 2)]);
+        let rejected = sup.config_status().view().applied.unwrap();
+        assert_eq!(
+            rejected.config_hash, good.config_hash,
+            "the served bytes, and so the digest, are the last known good",
+        );
+        assert_eq!(rejected.apply_seq, good.apply_seq + 1);
+
+        // And a second rewrite of the same broken row, while it stays
+        // rejected, does not advance it again: the observed state is the
+        // only thing that moved, and it moved into the same shape.
+        sup.apply_resync(&[entry("/aisix/models/m-1", BAD_PROVIDER_MODEL, 3)]);
+        let again = sup.config_status().view().applied.unwrap();
+        assert_eq!(again.config_hash, good.config_hash);
+        assert_eq!(again.apply_seq, rejected.apply_seq);
+    }
+
+    /// A resync reconciles the entry map rather than replacing it, so
+    /// the version it reports keeps moving forward and keeps standing
+    /// still when nothing changed. Replacing the map restarts the
+    /// counter, and two different configurations then share a version —
+    /// which is `apply_seq` silently not advancing.
+    #[test]
+    fn a_resync_neither_restarts_nor_inflates_the_observed_version() {
+        let sup = Supervisor::new(Arc::new(FakeProvider::new(vec![], 0)), "/aisix");
+        let rows: Vec<_> = (0..8)
+            .map(|i| entry(&format!("/aisix/models/{i:04}"), VALID_MODEL, 1))
+            .collect();
+        sup.apply_resync_at(&rows, Some(1));
+        let seeded = sup.config_status().view().applied.unwrap();
+        let version = sup.state.lock().unwrap().version;
+
+        // The same entry set again: nothing moved.
+        sup.apply_resync_at(&rows, Some(2));
+        assert_eq!(sup.state.lock().unwrap().version, version);
+        let repeated = sup.config_status().view().applied.unwrap();
+        assert_eq!(repeated.config_hash, seeded.config_hash);
+        assert_eq!(repeated.apply_seq, seeded.apply_seq);
+
+        // A different entry set of the SAME size, which a restarting
+        // counter would land on the same version as the first.
+        let replaced: Vec<_> = (0..8)
+            .map(|i| entry(&format!("/aisix/models/{i:04}"), VALID_MODEL_ALT, 2))
+            .collect();
+        sup.apply_resync_at(&replaced, Some(3));
+        assert_ne!(sup.state.lock().unwrap().version, version);
+        let after = sup.config_status().view().applied.unwrap();
+        assert_ne!(after.config_hash, seeded.config_hash);
+        assert_eq!(after.apply_seq, seeded.apply_seq + 1);
     }
 
     fn entry(key: &str, v: &[u8], rev: i64) -> RawEntry {

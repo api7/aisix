@@ -301,7 +301,10 @@ impl LazyHash {
     /// A digest that will be computed by `compute` on first report.
     ///
     /// `version` must change whenever the bytes `compute` would digest
-    /// change, and must not change otherwise.
+    /// change. The converse is owed only as far as the producer can give
+    /// it without digesting them: `apply_seq` keys on this, so a version
+    /// that moves where the digest would not costs an extra advance,
+    /// while one that fails to move loses an apply entirely.
     pub fn deferred(version: u64, compute: impl Fn() -> String + Send + Sync + 'static) -> Self {
         Self(Arc::new(LazyHashInner {
             version,
@@ -903,13 +906,14 @@ impl ConfigStatusInner {
 
     /// Identity of the applied configuration, without digesting it.
     ///
-    /// Two observations with the same value cover the same served bytes,
-    /// which is all `apply_seq` / `applied_at` need to decide whether the
-    /// applied configuration moved. It is a *conservative* stand-in for
-    /// comparing the digests: it can differ where the digest would not —
-    /// the observed bytes of a row that is rejected, and so serves
-    /// nothing, still advance the source's identity — so a rewrite of a
-    /// broken row now counts as an apply. It never misses a real change.
+    /// Two observations with the same value cover the same bytes, which
+    /// is all `apply_seq` / `applied_at` need to decide whether the
+    /// applied configuration moved. Whether it is exact is the
+    /// producer's to say: the etcd source's is exact while everything
+    /// loads, and conservative once something is rejected — a write that
+    /// lands as a rejection counts as an apply even though what serves
+    /// did not change, because knowing otherwise means digesting the
+    /// served bytes, which is the cost this exists to defer.
     fn effective_config_version(&self) -> Option<u64> {
         let base = self.config_hash.as_ref()?.version();
         let Some(identity_hash) = self.build_rejected_identity_hash.as_ref() else {

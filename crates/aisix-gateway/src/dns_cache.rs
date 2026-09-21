@@ -78,9 +78,6 @@ enum Claim {
     Ready(Answer),
     /// A lookup is running — this caller's or someone else's.
     Wait(watch::Receiver<Option<Answer>>),
-    /// The cache is full of names still in their window; resolve without
-    /// remembering rather than evict one in use.
-    Unremembered,
 }
 
 impl DnsCache {
@@ -90,7 +87,6 @@ impl DnsCache {
         let mut waiting = match self.claim(host) {
             Claim::Ready(answer) => return answer,
             Claim::Wait(waiting) => waiting,
-            Claim::Unremembered => return resolve(host.to_owned()).await,
         };
         loop {
             if let Some(answer) = waiting.borrow_and_update().clone() {
@@ -119,23 +115,27 @@ impl DnsCache {
         }
         // Inserting a name is the only thing that grows the map, so it is
         // where names whose window has passed are dropped.
+        let mut remember = true;
         if names.len() >= MAX_NAMES && !names.contains_key(host) {
             names.retain(|_, entry| match entry {
                 Entry::Settled { until, .. } => *until > now,
                 Entry::Running(_) => true,
             });
-            if names.len() >= MAX_NAMES {
-                return Claim::Unremembered;
-            }
+            // Still full of names in their window. This one is looked up
+            // and then forgotten rather than evicting one in use — but it
+            // is still looked up ONCE however many callers want it, which
+            // is what collapses a burst. The map therefore holds at most
+            // this bound plus the names being resolved right now.
+            remember = names.len() < MAX_NAMES;
         }
         let (sender, receiver) = watch::channel(None);
         names.insert(host.to_owned(), Entry::Running(receiver.clone()));
-        self.settle(host.to_owned(), sender);
+        self.settle(host.to_owned(), sender, remember);
         Claim::Wait(receiver)
     }
 
     /// Run the lookup for a claimed name and publish it to its waiters.
-    fn settle(&self, host: String, sender: watch::Sender<Option<Answer>>) {
+    fn settle(&self, host: String, sender: watch::Sender<Option<Answer>>, remember: bool) {
         let names = Arc::clone(&self.names);
         tokio::spawn(async move {
             let answer = resolve(host.clone()).await;
@@ -145,13 +145,19 @@ impl DnsCache {
                 } else {
                     FAILURE_TTL
                 };
-            names.lock().expect("dns cache").insert(
-                host,
-                Entry::Settled {
-                    answer: answer.clone(),
-                    until,
-                },
-            );
+            let mut names = names.lock().expect("dns cache");
+            if remember {
+                names.insert(
+                    host,
+                    Entry::Settled {
+                        answer: answer.clone(),
+                        until,
+                    },
+                );
+            } else {
+                names.remove(&host);
+            }
+            drop(names);
             // After the map, so a waiter this wakes cannot look the name
             // up again and find it still running.
             let _ = sender.send(Some(answer));

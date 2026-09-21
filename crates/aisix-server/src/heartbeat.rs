@@ -491,9 +491,15 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
     // so the first heartbeat after an apply walks the whole
     // configuration on a background-priority thread.
     let config_hash = match cfg.config_hash_fetcher.clone() {
-        Some(fetcher) => tokio::task::spawn_blocking(move || fetcher())
-            .await
-            .unwrap_or_default(),
+        Some(fetcher) => match tokio::task::spawn_blocking(move || fetcher()).await {
+            Ok(hash) => hash,
+            Err(error) => {
+                // Silently omitting it would repeat every cycle with
+                // nothing to read.
+                tracing::error!(%error, "reading the applied config hash failed");
+                None
+            }
+        },
         None => None,
     }
     // Defensive clamp — the hash is 64 hex chars, but the CP column
