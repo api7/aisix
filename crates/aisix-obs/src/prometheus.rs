@@ -206,6 +206,53 @@ impl DistributionSeries {
     }
 }
 
+/// Exposition text accumulated until it is worth handing to the response.
+///
+/// A warmed scrape at this deployment's cardinality is hundreds of
+/// megabytes, and a body built in one piece is that much memory faulted
+/// in, zeroed and given back to the kernel on every scrape. Handing it
+/// over in pieces makes a scrape's peak cost this buffer rather than the
+/// exposition's size, and the concatenation of the pieces is the same
+/// text either way — the boundaries fall between whole series.
+struct Chunks<'a> {
+    buffer: String,
+    emit: &'a mut dyn FnMut(String) -> bool,
+    /// Cleared once the response is gone and there is nothing to render
+    /// for any more.
+    wanted: bool,
+}
+
+/// Target size of one handed-over piece. Large enough that the handover
+/// is noise next to formatting the series in it, small enough that a
+/// scrape's peak is a constant rather than a function of cardinality.
+const CHUNK_BYTES: usize = 256 * 1024;
+
+impl Chunks<'_> {
+    fn new(emit: &mut dyn FnMut(String) -> bool) -> Chunks<'_> {
+        Chunks {
+            buffer: String::with_capacity(CHUNK_BYTES),
+            emit,
+            wanted: true,
+        }
+    }
+
+    /// Hand over what has accumulated if it has reached a full piece.
+    /// Called between series, never inside one.
+    fn hand_over_if_full(&mut self) {
+        if self.buffer.len() >= CHUNK_BYTES {
+            self.hand_over();
+        }
+    }
+
+    fn hand_over(&mut self) {
+        if self.buffer.is_empty() {
+            return;
+        }
+        let piece = std::mem::replace(&mut self.buffer, String::with_capacity(CHUNK_BYTES));
+        self.wanted &= (self.emit)(piece);
+    }
+}
+
 struct Storage {
     distributions: DistributionBuilder,
     // Counter, gauge and histogram membership invalidate independently.
@@ -251,7 +298,6 @@ struct Series {
 pub(crate) struct Recorder {
     registry: Registry<Key, Storage>,
     descriptions: Mutex<HashMap<String, SharedString>>,
-    previous_render_bytes: AtomicUsize,
     generation: Arc<[AtomicUsize; 3]>,
     series: Mutex<Option<([usize; 3], Arc<Series>)>>,
 }
@@ -265,7 +311,6 @@ impl Recorder {
                 generation: generation.clone(),
             }),
             descriptions: Mutex::new(HashMap::new()),
-            previous_render_bytes: AtomicUsize::new(0),
             generation,
             series: Mutex::new(None),
         }
@@ -331,59 +376,87 @@ impl Recorder {
         }
     }
 
-    pub(crate) fn render(&self) -> String {
+    /// Render the exposition, handing it over in bounded pieces.
+    ///
+    /// `emit` receives the pieces in order and returns `false` once the
+    /// response is gone, which stops the walk. Whatever it received is
+    /// still a correct prefix: a distribution renders by draining its
+    /// pending samples into its own accumulator, so a walk that stops
+    /// early has recorded them rather than discarded them.
+    pub(crate) fn render_chunks(&self, emit: &mut dyn FnMut(String) -> bool) {
         let descriptions = self
             .descriptions
             .lock()
             .expect("metric descriptions")
             .clone();
-        // A warmed high-cardinality scrape can be hundreds of MiB. Leave
-        // room for growing counters without copying that buffer on every scrape.
-        let previous_bytes = self.previous_render_bytes.load(Ordering::Relaxed);
-        let mut output = String::with_capacity(previous_bytes.saturating_add(previous_bytes / 8));
+        let mut chunks = Chunks::new(emit);
         let series = self.series();
         let mut previous = "";
         for value in series.counters.iter() {
             write_header(
-                &mut output,
+                &mut chunks.buffer,
                 &descriptions,
                 &mut previous,
                 &value.labels.name,
                 "counter",
             );
-            value
-                .labels
-                .write(&mut output, None, None, value.value.load(Ordering::Acquire));
+            value.labels.write(
+                &mut chunks.buffer,
+                None,
+                None,
+                value.value.load(Ordering::Acquire),
+            );
+            chunks.hand_over_if_full();
+            if !chunks.wanted {
+                return;
+            }
         }
         previous = "";
         for value in series.gauges.iter() {
             write_header(
-                &mut output,
+                &mut chunks.buffer,
                 &descriptions,
                 &mut previous,
                 &value.labels.name,
                 "gauge",
             );
             value.labels.write(
-                &mut output,
+                &mut chunks.buffer,
                 None,
                 None,
                 f64::from_bits(value.value.load(Ordering::Acquire)),
             );
+            chunks.hand_over_if_full();
+            if !chunks.wanted {
+                return;
+            }
         }
         previous = "";
         for value in series.distributions.iter() {
             write_header(
-                &mut output,
+                &mut chunks.buffer,
                 &descriptions,
                 &mut previous,
                 &value.labels.name,
                 value.kind,
             );
-            value.render(&mut output);
+            value.render(&mut chunks.buffer);
+            chunks.hand_over_if_full();
+            if !chunks.wanted {
+                return;
+            }
         }
-        self.previous_render_bytes
-            .store(output.len(), Ordering::Relaxed);
+        chunks.hand_over();
+    }
+
+    /// The whole exposition as one string — what a caller that is not a
+    /// response body wants.
+    pub(crate) fn render(&self) -> String {
+        let mut output = String::new();
+        self.render_chunks(&mut |piece| {
+            output.push_str(&piece);
+            true
+        });
         output
     }
 
@@ -462,6 +535,85 @@ mod tests {
             .collect::<Vec<_>>();
         lines.sort_unstable();
         lines
+    }
+
+    /// A registry big enough that a body built in one piece is what this
+    /// deployment cannot afford. What must hold: the pieces concatenate
+    /// to the exposition, none of them is bigger than the target
+    /// whatever the cardinality, and each ends on a line — so a reader
+    /// that stops early has whole series rather than half of one.
+    #[test]
+    fn a_large_registry_is_handed_over_in_bounded_pieces() {
+        let recorder = Recorder::new(distributions());
+        let metadata = Metadata::new("test", metrics::Level::INFO, None);
+        for i in 0..20_000 {
+            recorder
+                .register_counter(
+                    &Key::from_parts(
+                        "requests",
+                        vec![
+                            metrics::Label::new("model", format!("model-{i:05}")),
+                            metrics::Label::new("environment", "a-label-value-of-some-length"),
+                        ],
+                    ),
+                    &metadata,
+                )
+                .increment(i as u64);
+        }
+
+        let mut pieces = Vec::new();
+        recorder.render_chunks(&mut |piece| {
+            pieces.push(piece);
+            true
+        });
+        assert_eq!(pieces.concat(), recorder.render());
+        let whole = pieces.iter().map(String::len).sum::<usize>();
+        assert!(
+            whole > CHUNK_BYTES * 4,
+            "the fixture must be large enough to test the bound ({whole} bytes)",
+        );
+        assert!(
+            pieces.len() > 4,
+            "a large registry is handed over in pieces"
+        );
+        let largest = pieces.iter().map(String::len).max().unwrap_or(0);
+        assert!(
+            largest < CHUNK_BYTES * 2,
+            "a piece must stay bounded whatever the cardinality ({largest} bytes)",
+        );
+        for piece in &pieces {
+            assert!(piece.ends_with('\n'), "pieces break between series");
+        }
+    }
+
+    /// A reader that goes away stops the walk, and what it got is a
+    /// prefix of the exposition rather than a rearrangement of it.
+    #[test]
+    fn a_reader_that_stops_gets_a_prefix_and_ends_the_walk() {
+        let recorder = Recorder::new(distributions());
+        let metadata = Metadata::new("test", metrics::Level::INFO, None);
+        for i in 0..20_000 {
+            recorder
+                .register_counter(
+                    &Key::from_parts(
+                        "requests",
+                        vec![metrics::Label::new("model", format!("model-{i:05}"))],
+                    ),
+                    &metadata,
+                )
+                .increment(1);
+        }
+        let whole = recorder.render();
+        let mut taken = String::new();
+        let mut offered = 0;
+        recorder.render_chunks(&mut |piece| {
+            offered += 1;
+            taken.push_str(&piece);
+            false
+        });
+        assert_eq!(offered, 1, "the walk stops at the first refusal");
+        assert!(!taken.is_empty());
+        assert!(whole.starts_with(&taken));
     }
 
     #[test]

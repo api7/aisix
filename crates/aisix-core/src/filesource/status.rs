@@ -11,7 +11,7 @@ use std::path::Path;
 use chrono::Utc;
 
 use crate::config_status::{
-    hash_bytes, AppliedSnapshot, ConfigStatus, IncomingRejection, LoadObservation,
+    hash_bytes, AppliedSnapshot, ConfigStatus, IncomingRejection, LazyHash, LoadObservation,
 };
 use crate::AisixSnapshot;
 
@@ -46,7 +46,7 @@ pub fn load_resources_file_tracked(
         }
     };
 
-    let source_hash = hash_bytes(contents.as_bytes());
+    let source_hash = LazyHash::ready(hash_bytes(contents.as_bytes()));
     let result = load_from_str(&contents, &label, revision, &|name| {
         std::env::var(name).ok()
     });

@@ -70,6 +70,11 @@ fn shared_http_client() -> rmcp_reqwest::Client {
         .get_or_init(|| {
             let cfg = aisix_gateway::upstream_http::config();
             let mut b = rmcp_reqwest::Client::builder()
+                // rmcp pins its own reqwest major, so this client cannot
+                // be built from `client_builder()` — but it resolves
+                // through the same process-wide cache, via that crate
+                // version's own resolver trait.
+                .dns_resolver(std::sync::Arc::new(CachedResolver))
                 .pool_idle_timeout(cfg.pool_idle_timeout)
                 .tcp_keepalive(cfg.tcp_keepalive);
             if let Some(d) = cfg.connect_timeout {
@@ -116,6 +121,22 @@ fn shared_http_client() -> rmcp_reqwest::Client {
             b.build().unwrap_or_else(|_| rmcp_reqwest::Client::new())
         })
         .clone()
+}
+
+/// The workspace DNS cache, behind rmcp's reqwest major's resolver trait.
+struct CachedResolver;
+
+impl rmcp_reqwest::dns::Resolve for CachedResolver {
+    fn resolve(&self, name: rmcp_reqwest::dns::Name) -> rmcp_reqwest::dns::Resolving {
+        let cache = aisix_gateway::dns_cache::shared();
+        Box::pin(async move {
+            let addrs = cache.lookup(name.as_str()).await?;
+            Ok(
+                Box::new(addrs.iter().copied().collect::<Vec<_>>().into_iter())
+                    as rmcp_reqwest::dns::Addrs,
+            )
+        })
+    }
 }
 
 /// Header carrying the gateway-held key for `api_key` upstream auth.

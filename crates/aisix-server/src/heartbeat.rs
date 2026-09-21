@@ -486,13 +486,25 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
         .as_ref()
         .map(|fetcher| fetcher())
         .unwrap_or(0);
-    let config_hash = cfg
-        .config_hash_fetcher
-        .as_ref()
-        .and_then(|fetcher| fetcher())
-        // Defensive clamp — the hash is 64 hex chars, but the CP column
-        // caps at 128 so never send more.
-        .map(|h| h.chars().take(CONFIG_HASH_MAX_CHARS).collect::<String>());
+    // Off the runtime's own threads: the configuration status computes
+    // this digest when something reports it rather than on every apply,
+    // so the first heartbeat after an apply walks the whole
+    // configuration on a background-priority thread.
+    let config_hash = match cfg.config_hash_fetcher.clone() {
+        Some(fetcher) => match tokio::task::spawn_blocking(move || fetcher()).await {
+            Ok(hash) => hash,
+            Err(error) => {
+                // Silently omitting it would repeat every cycle with
+                // nothing to read.
+                tracing::error!(%error, "reading the applied config hash failed");
+                None
+            }
+        },
+        None => None,
+    }
+    // Defensive clamp — the hash is 64 hex chars, but the CP column
+    // caps at 128 so never send more.
+    .map(|h| h.chars().take(CONFIG_HASH_MAX_CHARS).collect::<String>());
     let mut exporter_health: Vec<ExporterHealthWire> = cfg
         .exporter_health_fetcher
         .as_ref()
