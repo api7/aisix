@@ -30,6 +30,7 @@
 pub mod bridge;
 pub mod chat;
 pub mod credential;
+pub mod dns_cache;
 pub mod hub;
 pub mod sse;
 pub mod structured_output;
