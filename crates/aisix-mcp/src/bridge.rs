@@ -131,8 +131,10 @@ impl rmcp_reqwest::dns::Resolve for CachedResolver {
         let cache = aisix_gateway::dns_cache::shared();
         Box::pin(async move {
             let addrs = cache.lookup(name.as_str()).await?;
-            Ok(Box::new(addrs.iter().copied().collect::<Vec<_>>().into_iter())
-                as rmcp_reqwest::dns::Addrs)
+            Ok(
+                Box::new(addrs.iter().copied().collect::<Vec<_>>().into_iter())
+                    as rmcp_reqwest::dns::Addrs,
+            )
         })
     }
 }

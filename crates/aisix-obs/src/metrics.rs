@@ -1231,8 +1231,9 @@ impl Metrics {
     /// Render outside the async runtime, into the response as it is
     /// produced. The receiver yields the body in bounded pieces and ends
     /// when the exposition does.
-    pub fn render_stream(&self) -> tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>
-    {
+    pub fn render_stream(
+        &self,
+    ) -> tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>> {
         let metrics = self.clone();
         self.inner
             .scrape

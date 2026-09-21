@@ -585,8 +585,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                 let state = Arc::clone(&self.state);
                 LazyHash::deferred(version, move || state.lock().unwrap().source_hash())
             };
-            let rejected_keys: HashSet<String> =
-                rejections.iter().map(|r| r.key.clone()).collect();
+            let rejected_keys: HashSet<String> = rejections.iter().map(|r| r.key.clone()).collect();
             // config_hash covers the bytes each key ACTUALLY serves: the
             // observed etcd bytes for accepted keys, the pinned last-known-
             // good bytes for stale-serving keys (#871), and nothing for a
@@ -604,15 +603,11 @@ impl<P: ConfigProvider> Supervisor<P> {
             } else {
                 let state = Arc::clone(&self.state);
                 let stale = stale.clone();
-                LazyHash::deferred(
-                    served_version(version, &rejected_keys, &stale),
-                    move || {
-                        let state = state.lock().unwrap();
-                        let keys: HashSet<&str> =
-                            rejected_keys.iter().map(String::as_str).collect();
-                        hash_records(served_records(&state.entries, &keys, &stale))
-                    },
-                )
+                LazyHash::deferred(served_version(version, &rejected_keys, &stale), move || {
+                    let state = state.lock().unwrap();
+                    let keys: HashSet<&str> = rejected_keys.iter().map(String::as_str).collect();
+                    hash_records(served_records(&state.entries, &keys, &stale))
+                })
             };
             rejected = rejections
                 .iter()

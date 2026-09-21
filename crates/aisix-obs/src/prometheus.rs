@@ -572,7 +572,10 @@ mod tests {
             whole > CHUNK_BYTES * 4,
             "the fixture must be large enough to test the bound ({whole} bytes)",
         );
-        assert!(pieces.len() > 4, "a large registry is handed over in pieces");
+        assert!(
+            pieces.len() > 4,
+            "a large registry is handed over in pieces"
+        );
         let largest = pieces.iter().map(String::len).max().unwrap_or(0);
         assert!(
             largest < CHUNK_BYTES * 2,

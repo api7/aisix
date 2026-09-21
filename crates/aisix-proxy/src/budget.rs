@@ -715,7 +715,10 @@ managed:
             "the oldest entry is the one evicted",
         );
         assert!(
-            client.cache.get(&format!("key-{:06}", CACHE_CAPACITY - 1)).is_some(),
+            client
+                .cache
+                .get(&format!("key-{:06}", CACHE_CAPACITY - 1))
+                .is_some(),
             "and the newest survivors are not",
         );
     }
