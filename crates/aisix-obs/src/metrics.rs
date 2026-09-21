@@ -443,6 +443,26 @@ pub const M_CONFIG_OBSERVED_REVISION: &str = "aisix_config_observed_revision";
 pub const M_CONFIG_APPLIED_REVISION: &str = "aisix_config_applied_revision";
 pub const M_CONFIG_HASH_INFO: &str = "aisix_config_hash_info";
 pub const M_CONFIG_SOURCE_CONNECTED: &str = "aisix_config_source_connected";
+/// Wall time of one configuration apply — parse, snapshot clone, hash,
+/// cache flush, publish. Pushed by the supervisor through
+/// [`Metrics::record_config_apply`] rather than reflected from a view:
+/// only the apply knows what one cost, and a gauge read at scrape time
+/// would miss every apply between two scrapes.
+///
+/// Renders as a Prometheus SUMMARY, not a histogram — no buckets are
+/// configured for it, same as every other distribution here bar the
+/// three SLO series. So it carries per-instance quantiles over a rolling
+/// window and no `_bucket` series: `histogram_quantile()` against it
+/// returns nothing, and quantiles do not aggregate across gateways.
+pub const M_CONFIG_APPLY_DURATION_SECONDS: &str = "aisix_config_apply_duration_seconds";
+/// How much change that apply carried: watch events for
+/// `trigger="watch"`, rows in the snapshot for `trigger="full"`. Paired
+/// with the duration, this is what separates "the control plane wrote a
+/// lot" from "one small write costs this much".
+pub const M_CONFIG_APPLY_BATCH_EVENTS: &str = "aisix_config_apply_batch_events";
+/// Log events discarded because the log sink was not draining fast
+/// enough. Above zero means the log is incomplete for that window.
+pub const M_LOG_LINES_DROPPED_TOTAL: &str = "aisix_log_lines_dropped_total";
 
 /// Default bucket edges for [`M_REQUEST_E2E_LATENCY_SECONDS`], spanning the
 /// full client-perceived range: a millisecond-scale rejection or cache hit
@@ -1004,6 +1024,33 @@ impl Metrics {
                 retirable: Mutex::new(HashMap::new()),
             }),
         })
+    }
+
+    /// Record what one configuration apply cost.
+    ///
+    /// `trigger` is `watch` for a coalesced watch batch and `full` for a
+    /// (re)load of every prefix; `events` counts watch events for the
+    /// first and snapshot rows for the second.
+    pub fn record_config_apply(&self, trigger: &'static str, events: usize, elapsed: Duration) {
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::histogram!(M_CONFIG_APPLY_DURATION_SECONDS, "trigger" => trigger)
+                .record(elapsed.as_secs_f64());
+            metrics::histogram!(M_CONFIG_APPLY_BATCH_EVENTS, "trigger" => trigger)
+                .record(events as f64);
+        });
+    }
+
+    /// Reflect the log writer's drop total into the recorder.
+    ///
+    /// Pulled at scrape time, like [`Self::sync_config_status`]: the
+    /// writer thread predates this struct and has no recorder of its own.
+    /// Always emitted, so the series reads `0` on a healthy gateway
+    /// rather than being absent.
+    pub fn sync_log_status(&self) {
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::counter!(M_LOG_LINES_DROPPED_TOTAL)
+                .absolute(crate::log_writer::dropped_total());
+        });
     }
 
     /// Remember one label set of a retirable gauge family.
@@ -3656,6 +3703,49 @@ mod tests {
         assert_eq!(
             RequestOutcome::from_status(502),
             RequestOutcome::UpstreamError
+        );
+    }
+
+    /// Both halves of the apply pair have to reach the registry — a
+    /// `metrics::histogram!` called anywhere outside `with_local_recorder`
+    /// records into nothing, which is the failure this pins.
+    #[test]
+    fn a_recorded_config_apply_renders_both_series_with_its_trigger() {
+        let m = Metrics::new(false);
+        m.record_config_apply("watch", 7, Duration::from_millis(12));
+        let rendered = m.render();
+        for name in [M_CONFIG_APPLY_DURATION_SECONDS, M_CONFIG_APPLY_BATCH_EVENTS] {
+            assert!(
+                rendered.contains(&format!("{name}_count{{trigger=\"watch\"}} 1")),
+                "{name} must render one observation labelled by trigger, got: {rendered}",
+            );
+        }
+        assert!(
+            rendered.contains(&format!(
+                "{M_CONFIG_APPLY_BATCH_EVENTS}_sum{{trigger=\"watch\"}} 7"
+            )),
+            "the batch size is the event count, got: {rendered}",
+        );
+    }
+
+    /// The series has to be published on every scrape, or "no drops" is
+    /// indistinguishable from "the gateway is too old to report drops".
+    ///
+    /// Asserted against the live total rather than a literal `0`: the
+    /// writer's own tests share this process and drop events into the
+    /// same counter, and what this pins is that the series exists.
+    #[test]
+    fn the_dropped_log_line_total_is_published_on_every_scrape() {
+        let m = Metrics::new(false);
+        m.sync_log_status();
+        let expected = format!(
+            "{M_LOG_LINES_DROPPED_TOTAL} {}",
+            crate::log_writer::dropped_total()
+        );
+        assert!(
+            m.render().contains(&expected),
+            "a scrape must publish {expected:?}, got: {}",
+            m.render(),
         );
     }
 

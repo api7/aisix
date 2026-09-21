@@ -25,6 +25,7 @@ pub mod header_template;
 pub mod host;
 pub mod models;
 pub mod resource;
+pub mod sched;
 pub mod similarity;
 pub mod snapshot;
 pub mod version;
@@ -67,6 +68,7 @@ pub use models::{
     DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use resource::{Resource, ResourceEntry};
+pub use sched::{demote_current_thread, run_demoted};
 pub use similarity::{best_similarity, best_similarity_by, cosine_similarity};
 pub use snapshot::{ResourceTable, SnapshotHandle};
 pub use version::BUILD_VERSION;

@@ -155,6 +155,15 @@ enum CliCommand {
 /// taking a core back from the workers.
 const CONTROL_RUNTIME_THREADS: usize = 2;
 
+/// How long the exit waits for the log queue to reach its sink.
+///
+/// Its own constant rather than `shutdown.min_drain_secs`: that knob
+/// sizes the CONNECTION drain against a load balancer's detection
+/// latency, `0` is a legal and used value for it (the e2e harness sets
+/// exactly that), and a zero-length flush would drop the shutdown log
+/// every time.
+const LOG_FLUSH_DEADLINE: Duration = Duration::from_secs(5);
+
 fn main() -> anyhow::Result<()> {
     // Install the process-level rustls CryptoProvider before anything
     // else touches TLS. rustls 0.23 dropped implicit provider selection
@@ -237,12 +246,23 @@ async fn async_main(cfg: Config) -> anyhow::Result<()> {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     let _ = enable_jemalloc_background_thread();
 
-    // Before any bridge builds its `reqwest::Client` — the connection
-    // pools are constructed once and can't be reconfigured afterwards.
-    aisix_gateway::upstream_http::init(upstream_http_config(&cfg.upstream)?)
-        .map_err(|e| anyhow::anyhow!("upstream TLS init failed: {e}"))?;
-
-    run(cfg).await
+    // Everything from here on is inside the drained scope, because
+    // everything from here on can log and then fail: `?` would otherwise
+    // return with those lines still queued for a writer thread nobody is
+    // going to flush, and a boot that fails is precisely when the log is
+    // the only thing an operator has. The flush result is discarded on
+    // purpose — see `shutdown_logging`, there is nowhere left to report a
+    // sink that is not taking bytes.
+    let outcome = async {
+        // Before any bridge builds its `reqwest::Client` — the connection
+        // pools are constructed once and can't be reconfigured afterwards.
+        aisix_gateway::upstream_http::init(upstream_http_config(&cfg.upstream)?)
+            .map_err(|e| anyhow::anyhow!("upstream TLS init failed: {e}"))?;
+        run(cfg).await
+    }
+    .await;
+    let _ = aisix_obs::shutdown_logging(LOG_FLUSH_DEADLINE);
+    outcome
 }
 
 /// `aisix validate --resources <file>`: run the identical file-source
@@ -702,6 +722,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // file (`resources_file` in config) or etcd + watch supervisor.
     // Config validation already guaranteed exactly one is selected.
     let file_source_path = cfg.resources_file.clone().map(PathBuf::from);
+    // The supervisor is built before `Metrics` is — and an apply reports
+    // its cost by calling into `Metrics`, which owns the recorder. The
+    // slot closes that gap: applies before the registry exists (the boot
+    // load) report into nothing, every later one lands.
+    let metrics_slot: Arc<std::sync::OnceLock<Arc<Metrics>>> = Arc::new(std::sync::OnceLock::new());
     let (snapshot_handle, supervisor, watch_task, admin_client, config_status) =
         if let Some(path) = &file_source_path {
             // FILE MODE: load once at boot, fail fast with the aggregated
@@ -808,13 +833,21 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 Some(path) => SnapshotCache::new(path),
                 None => SnapshotCache::disabled(),
             };
-            let supervisor = Arc::new(Supervisor::with_sources(
-                vec![
-                    (WatchedPrefix::environment(etcd_prefix), provider),
-                    (WatchedPrefix::global(global_prefix), global_provider),
-                ],
-                snapshot_cache,
-            ));
+            let observed = Arc::clone(&metrics_slot);
+            let supervisor = Arc::new(
+                Supervisor::with_sources(
+                    vec![
+                        (WatchedPrefix::environment(etcd_prefix), provider),
+                        (WatchedPrefix::global(global_prefix), global_provider),
+                    ],
+                    snapshot_cache,
+                )
+                .with_apply_observer(Arc::new(move |trigger, events, elapsed| {
+                    if let Some(metrics) = observed.get() {
+                        metrics.record_config_apply(trigger, events, elapsed);
+                    }
+                })),
+            );
             // Seed the snapshot from disk before the etcd cycle starts so the
             // proxy is ready to serve from cached config the moment the watch
             // task takes its first iteration.
@@ -884,6 +917,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         )
         .map_err(|e| anyhow::anyhow!(e))?,
     );
+    let _ = metrics_slot.set(metrics.clone());
     // Built before the stores below because each Redis-backed store takes
     // the handle: their failures are fail-open by design, so the counter
     // is the only place the degradation shows (#1060).

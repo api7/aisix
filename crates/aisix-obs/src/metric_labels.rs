@@ -33,6 +33,7 @@ macro_rules! variable {
 
 pub static METRIC_VARIABLES: &[MetricVariable] = &[
     variable!("env_id", "The gateway's AISIX Cloud environment ID; unknown when not connected to AISIX Cloud. Available on every metric."),
+    variable!("trigger", "What caused a configuration apply: watch for a coalesced batch of watch events, full for a (re)load of every prefix."),
     variable!("endpoint", "The matched route template, without caller-supplied path parameters."),
     variable!("inbound_protocol", "The protocol used by the caller, derived from the matched endpoint."),
     variable!("upstream_protocol", "The wire protocol of the selected provider credential; unknown before upstream selection or for non-LLM traffic."),
@@ -331,6 +332,17 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
     metric!(M_CONFIG_APPLIED_REVISION, &[]),
     metric!(M_CONFIG_HASH_INFO, &["hash"], required = &["hash"]),
     metric!(M_CONFIG_SOURCE_CONNECTED, &[]),
+    metric!(
+        M_CONFIG_APPLY_DURATION_SECONDS,
+        &["trigger"],
+        required = &["trigger"]
+    ),
+    metric!(
+        M_CONFIG_APPLY_BATCH_EVENTS,
+        &["trigger"],
+        required = &["trigger"]
+    ),
+    metric!(M_LOG_LINES_DROPPED_TOTAL, &[]),
 ];
 
 #[derive(Debug)]

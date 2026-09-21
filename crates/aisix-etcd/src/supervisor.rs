@@ -401,6 +401,10 @@ pub struct Supervisor<P: ConfigProvider> {
     // drops finished handles as it pushes, so a long-lived gateway does
     // not accumulate one per apply.
     pending_writes: Mutex<Vec<JoinHandle<()>>>,
+
+    /// Where the cost of each apply goes. `None` in tests and embedders
+    /// that never wired one — see [`ApplyObserver`].
+    apply_observer: Option<Arc<ApplyObserver>>,
 }
 
 /// One watched prefix and the provider that reads it.
@@ -509,7 +513,18 @@ impl<P: ConfigProvider> Supervisor<P> {
             partial_compat: Mutex::new(HashMap::new()),
             stale_serving: Mutex::new(HashMap::new()),
             pending_writes: Mutex::new(Vec::new()),
+            apply_observer: None,
         }
+    }
+
+    /// Report the cost of every apply to `observer`.
+    pub fn with_apply_observer(mut self, observer: Arc<ApplyObserver>) -> Self {
+        self.apply_observer = Some(observer);
+        self
+    }
+
+    fn apply_observer(&self) -> Option<&ApplyObserver> {
+        self.apply_observer.as_deref()
     }
 
     /// Cheap clonable handle to the supervisor's freshness state.
@@ -882,7 +897,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     pub async fn load_once(&self) -> Result<BuildStats, ProviderError> {
         let load = self.load_all_prefixes().await?;
         let revision = load.applied_revision();
-        let stats = config_work(|| {
+        let (stats, _) = config_work(self.apply_observer(), "full", load.entries.len(), || {
             let stats = self.apply_resync_at(&load.entries, Some(revision));
             // Preserve the range read's consistent-as-of revision.
             self.record_read_revision(revision);
@@ -1675,7 +1690,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         // every prefix has been read, so readiness means every prefix's
         // initial load completed and no request can observe the
         // environment loaded and the catalog not.
-        config_work(|| {
+        config_work(self.apply_observer(), "full", load.entries.len(), || {
             self.apply_resync_at(&load.entries, Some(revision));
             self.record_read_revision(revision);
         });
@@ -1746,7 +1761,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                 }
                 Some(Watched::Event(Err(err))) => return Err(SupervisorError::Provider(err)),
                 Some(Watched::Event(Ok(WatchEvent::Resync { entries, revision }))) => {
-                    config_work(|| {
+                    config_work(self.apply_observer(), "full", entries.len(), || {
                         self.apply_resync_at(&entries, Some(revision));
                         // The resync header remains the consistent-as-of point.
                         self.record_read_revision(revision);
@@ -1845,24 +1860,83 @@ impl<P: ConfigProvider> Supervisor<P> {
                             }
                         })
                         .collect();
-                    let started = std::time::Instant::now();
-                    config_work(|| self.apply_events(&staged));
-                    apply_timing.record(started.elapsed());
+                    let (_, elapsed) =
+                        config_work(self.apply_observer(), "watch", staged.len(), || {
+                            self.apply_events(&staged)
+                        });
+                    apply_timing.record(elapsed);
                 }
             }
         }
     }
 }
 
-// Keep synchronous parsing, snapshot cloning and hashing from occupying an
-// async worker. The apply still completes before the next watch item or cancel
-// is handled; a detached blocking task could publish after the loop exits.
-fn config_work<T>(work: impl FnOnce() -> T) -> T {
-    match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
-        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+/// Notified after every configuration apply with what it cost.
+///
+/// A callback rather than a `metrics::histogram!` here, because this
+/// crate has no recorder: `aisix-obs` keeps its registry in `Metrics` and
+/// reaches it with `metrics::with_local_recorder`, so a macro call from
+/// an apply thread would record into nothing at all. The server wires
+/// this to `Metrics::record_config_apply`.
+///
+/// Arguments: the trigger (`watch` for a coalesced watch batch, `full`
+/// for a (re)load of every prefix), how many events or rows it carried,
+/// and how long it took.
+pub type ApplyObserver = dyn Fn(&'static str, usize, Duration) + Send + Sync;
+
+/// One configuration apply: off the async worker, at background priority,
+/// measured.
+///
+/// Three things, in order of why they are here:
+///
+/// - `block_in_place` keeps synchronous parsing, snapshot cloning and
+///   hashing from occupying an async worker. The apply still completes
+///   before the next watch item or cancel is handled; a detached blocking
+///   task could publish after the loop exits.
+/// - [`run_demoted`] puts the work itself on a thread the scheduler
+///   deprioritises. The supervisor shares the control runtime with the
+///   `/livez` and `/readyz` listener, so the demotion cannot go on the
+///   runtime's own worker threads — it has to be a thread per apply.
+/// - the timing feeds both the coalescing window (an expensive apply
+///   earns a longer quiet period) and, through `observer`, the
+///   `aisix_config_apply_*` series.
+///
+/// `trigger` distinguishes an incremental watch batch from a full (re)load
+/// of every prefix; `events` is what that number counts for each.
+fn config_work<T: Send>(
+    observer: Option<&ApplyObserver>,
+    trigger: &'static str,
+    events: usize,
+    work: impl FnOnce() -> T + Send,
+) -> (T, Duration) {
+    let started = std::time::Instant::now();
+    let handle = tokio::runtime::Handle::try_current();
+    // The apply thread has to be inside the runtime context, not merely
+    // started from it: `Self::flush_cache` spawns the snapshot-cache
+    // write through `Handle::try_current`, and a bare `std::thread` would
+    // silently skip it — the cache would stop being written at all.
+    let demoted = || {
+        aisix_core::run_demoted("config-apply", || {
+            let _guard = handle.as_ref().ok().map(|handle| handle.enter());
+            work()
+        })
+    };
+    let value = match handle.as_ref().map(|handle| handle.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(demoted),
         // Current-thread embedders retain the synchronous behavior.
-        _ => work(),
+        _ => demoted(),
+    };
+    let elapsed = started.elapsed();
+    if let Some(observer) = observer {
+        observer(trigger, events, elapsed);
     }
+    tracing::debug!(
+        trigger,
+        events,
+        duration_ms = elapsed.as_millis() as u64,
+        "configuration apply finished",
+    );
+    (value, elapsed)
 }
 
 /// One pass of [`Supervisor::load_all_prefixes`]: the union of every
@@ -3838,6 +3912,35 @@ mod tests {
         );
     }
 
+    /// The apply is the only thing in the gateway whose cost is
+    /// proportional to the whole configuration rather than to the change,
+    /// and until now it was measured (`ApplyTiming`) and then thrown away.
+    #[test]
+    fn an_apply_reports_its_duration_and_how_much_change_it_carried() {
+        type Reported = Vec<(&'static str, usize, Duration)>;
+        let seen: Arc<Mutex<Reported>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let observer: Arc<ApplyObserver> = Arc::new(move |trigger, events, elapsed| {
+            recorded.lock().unwrap().push((trigger, events, elapsed));
+        });
+        let (value, elapsed) = config_work(Some(observer.as_ref()), "watch", 7, || {
+            std::thread::sleep(Duration::from_millis(5));
+            "applied"
+        });
+        assert_eq!(value, "applied");
+        assert!(elapsed >= Duration::from_millis(5));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "one apply reports once");
+        assert_eq!(seen[0].0, "watch", "the trigger says which kind of apply");
+        assert_eq!(seen[0].1, 7, "the batch size is the event count applied");
+        assert!(
+            seen[0].2 >= Duration::from_millis(5),
+            "the reported duration must cover the work, got {:?}",
+            seen[0].2,
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn config_work_releases_the_worker_but_finishes_before_cancellation() {
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -3845,7 +3948,7 @@ mod tests {
         let completed = Arc::new(AtomicBool::new(false));
         let done = completed.clone();
         let apply = tokio::spawn(async move {
-            config_work(|| {
+            config_work(None, "watch", 1, move || {
                 entered_tx.send(()).unwrap();
                 release_rx
                     .recv_timeout(Duration::from_secs(5))
