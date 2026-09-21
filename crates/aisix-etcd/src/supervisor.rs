@@ -2899,13 +2899,14 @@ mod tests {
         let again = sup.config_status().view().applied.unwrap();
         assert_eq!(again.apply_seq, seeded.apply_seq);
 
-        // 2. Repairing it puts the row back as it was, so the served
-        //    bytes return to the seeded ones — and THAT is a change,
-        //    because they had been the pinned last known good under a
-        //    different observed state.
+        // 2. Repairing it: the row goes back to the bytes that were
+        //    already serving as its pinned last known good, so accepting
+        //    them again changes nothing a client can see either.
         sup.apply_resync(&[entry("/aisix/models/m-1", VALID_MODEL, 4)]);
         let repaired = sup.config_status().view().applied.unwrap();
         assert_eq!(repaired.config_hash, seeded.config_hash);
+        assert_eq!(repaired.apply_seq, seeded.apply_seq);
+        assert_eq!(repaired.applied_at, seeded.applied_at);
 
         // 3. A put carrying the bytes that already serve, under a new
         //    revision: observed nothing, served nothing.

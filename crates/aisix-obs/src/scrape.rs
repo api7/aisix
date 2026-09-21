@@ -62,7 +62,9 @@ impl Scrape {
         &self,
         render: impl FnOnce(&mut dyn FnMut(String) -> bool) + Send + 'static,
     ) -> mpsc::Receiver<Result<Bytes, std::io::Error>> {
-        let (sender, receiver) = mpsc::channel(PIECES_IN_FLIGHT);
+        // One slot beyond the pieces in flight, held in reserve below so
+        // a render that dies can always say so.
+        let (sender, receiver) = mpsc::channel(PIECES_IN_FLIGHT + 1);
         let gate = Arc::clone(&self.gate);
         // Taken here, where there is a runtime to take it from: the
         // render runs on a thread of its own and needs it to wait for
@@ -76,6 +78,13 @@ impl Scrape {
             let Ok(_permit) = gate.acquire_owned().await else {
                 return;
             };
+            // Taken before the render can fill the channel. Saying the
+            // exposition is incomplete must not itself have to wait for
+            // a reader — that is the wait this task holds the gate
+            // through, and a reader can stop without closing.
+            let Ok(terminal) = sender.clone().reserve_owned().await else {
+                return;
+            };
             let failed = {
                 let sender = sender.clone();
                 tokio::task::spawn_blocking(move || {
@@ -85,17 +94,18 @@ impl Scrape {
                 })
                 .await
             };
-            if let Err(error) = failed {
-                tracing::error!(%error, "metrics render task failed");
-                // The headers left long ago, so the only way left to say
-                // the exposition is incomplete is to end the body
-                // abnormally. Ending it cleanly would hand the scraper a
-                // truncated exposition as a successful scrape, and every
-                // series past the failure would read as gone rather than
-                // unknown.
-                let _ = sender
-                    .send(Err(std::io::Error::other("metrics render failed")))
-                    .await;
+            match failed {
+                Ok(()) => drop(terminal),
+                Err(error) => {
+                    tracing::error!(%error, "metrics render task failed");
+                    // The headers left long ago, so the only way left to
+                    // say the exposition is incomplete is to end the body
+                    // abnormally. Ending it cleanly would hand the
+                    // scraper a truncated exposition as a successful
+                    // scrape, and every series past the failure would
+                    // read as gone rather than unknown.
+                    terminal.send(Err(std::io::Error::other("metrics render failed")));
+                }
             }
         });
         receiver
@@ -290,6 +300,33 @@ mod tests {
             .await,
             "recovered\n",
         );
+    }
+
+    /// Saying the exposition is incomplete must not have to wait for a
+    /// reader either. A render that dies with the channel already full,
+    /// against a receiver that is open but not being read, would
+    /// otherwise wait there holding the gate — the same way the pieces
+    /// themselves used to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_render_that_dies_on_a_full_channel_still_frees_the_gate() {
+        let scrape = Scrape::default();
+        // Fills every slot, then dies. The receiver below is held and
+        // never read from.
+        let stalled = scrape.stream(|emit| {
+            for _ in 0..PIECES_IN_FLIGHT {
+                assert!(emit("queued\n".to_owned()));
+            }
+            panic!("render died with the channel full");
+        });
+
+        let second = scrape.stream(|emit| {
+            assert!(emit("the next scrape\n".to_owned()));
+        });
+        let body = tokio::time::timeout(Duration::from_secs(10), collect(second))
+            .await
+            .expect("the gate must not be held by the dead render");
+        assert_eq!(body, "the next scrape\n");
+        drop(stalled);
     }
 
     /// Two overlapping scrapes each get their own exposition, and the
