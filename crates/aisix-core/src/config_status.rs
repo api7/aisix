@@ -289,10 +289,12 @@ pub struct PartialCompatResource {
 /// for; a caller inside an async runtime must therefore reach it from a
 /// blocking context.
 #[derive(Clone)]
-pub struct LazyHash(Arc<LazyHashInner>);
+pub struct LazyHash {
+    version: u64,
+    inner: Arc<LazyHashInner>,
+}
 
 struct LazyHashInner {
-    version: u64,
     compute: Box<dyn Fn() -> String + Send + Sync>,
     value: OnceLock<String>,
 }
@@ -306,11 +308,26 @@ impl LazyHash {
     /// that moves where the digest would not costs an extra advance,
     /// while one that fails to move loses an apply entirely.
     pub fn deferred(version: u64, compute: impl Fn() -> String + Send + Sync + 'static) -> Self {
-        Self(Arc::new(LazyHashInner {
+        Self {
             version,
-            compute: Box::new(compute),
-            value: OnceLock::new(),
-        }))
+            inner: Arc::new(LazyHashInner {
+                compute: Box::new(compute),
+                value: OnceLock::new(),
+            }),
+        }
+    }
+
+    /// The same digest under a different identity.
+    ///
+    /// Two surfaces can report one digest and still disagree about when
+    /// it counts as having changed — the observed configuration and the
+    /// served one are the same bytes until something is rejected. This
+    /// shares the value, so reporting both costs one computation.
+    pub fn rekeyed(&self, version: u64) -> Self {
+        Self {
+            version,
+            inner: Arc::clone(&self.inner),
+        }
     }
 
     /// A digest already in hand — the file source, where hashing is one
@@ -322,27 +339,29 @@ impl LazyHash {
         let version = hasher.finish();
         let cell = OnceLock::new();
         let _ = cell.set(value);
-        Self(Arc::new(LazyHashInner {
+        Self {
             version,
-            compute: Box::new(|| unreachable!("a ready digest is never computed")),
-            value: cell,
-        }))
+            inner: Arc::new(LazyHashInner {
+                compute: Box::new(|| unreachable!("a ready digest is never computed")),
+                value: cell,
+            }),
+        }
     }
 
     /// Identity of the bytes this digest covers.
     pub fn version(&self) -> u64 {
-        self.0.version
+        self.version
     }
 
     /// The digest, computed once per [`LazyHash`] and shared by every
     /// later reader of the same one.
     pub fn get(&self) -> String {
-        if let Some(value) = self.0.value.get() {
+        if let Some(value) = self.inner.value.get() {
             return value.clone();
         }
-        self.0
+        self.inner
             .value
-            .get_or_init(|| crate::run_demoted("config-hash", || (self.0.compute)()))
+            .get_or_init(|| crate::run_demoted("config-hash", || (self.inner.compute)()))
             .clone()
     }
 }
@@ -385,8 +404,8 @@ impl<T: Into<String>> From<T> for LazyHash {
 impl std::fmt::Debug for LazyHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LazyHash")
-            .field("version", &self.0.version)
-            .field("resolved", &self.0.value.get())
+            .field("version", &self.version)
+            .field("resolved", &self.inner.value.get())
             .finish()
     }
 }

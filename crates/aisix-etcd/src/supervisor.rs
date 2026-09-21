@@ -229,6 +229,13 @@ struct StateEntry {
     /// function of `(key, value)`, so it is valid for exactly as long as
     /// this map holds these bytes.
     record: Arc<[u8]>,
+    /// What this key contributed to the SERVED set at the last status
+    /// publication: its own record when accepted, the pinned
+    /// last-known-good record while it serves stale, and nothing while
+    /// it is rejected with no last good. Compared against what it would
+    /// contribute now to decide whether an apply changed anything a
+    /// client can see.
+    served: Option<Arc<[u8]>>,
     cache_record: OnceLock<Arc<[u8]>>,
 }
 
@@ -238,6 +245,7 @@ impl StateEntry {
         Self {
             entry,
             record,
+            served: None,
             cache_record: OnceLock::new(),
         }
     }
@@ -253,36 +261,110 @@ impl StateEntry {
 struct ObservedState {
     entries: BTreeMap<String, StateEntry>,
     /// Identity of `entries`: advanced by every change to them, and by
-    /// nothing else. Lets a reader decide whether the observed
+    /// nothing else. Lets a reader decide whether the OBSERVED
     /// configuration moved without digesting it — see
     /// [`aisix_core::LazyHash`]. It must never restart, so the entry map
     /// is reconciled in place rather than replaced.
     version: u64,
+    /// The same, for what the gateway actually SERVES. The two differ
+    /// exactly when something is rejected: a write that fails to load
+    /// moves `version` and leaves this alone, because the last known
+    /// good keeps serving. `apply_seq` is built on this one, which is
+    /// why it may not advance on unchanged content.
+    served_version: u64,
+    /// Keys whose record changed since the last publication, against
+    /// what each of them served at it. The only keys whose served bytes
+    /// can have moved — so deciding costs the size of the change, not of
+    /// the configuration. A removed key keeps its last served record
+    /// here, so a delete and a re-put of identical bytes inside one
+    /// batch reads as no change at all.
+    pending: HashMap<String, Option<Arc<[u8]>>>,
+    /// Keys that were rejected or serving stale at the last publication.
+    /// A key can leave that set without being written to — the rejection
+    /// buffer is capped — and its served bytes change when it does.
+    filtered: HashSet<String>,
 }
 
 impl ObservedState {
-    fn invalidate(&mut self) {
-        self.version = self.version.wrapping_add(1);
+    /// Remember what `key` served before this change, once per key per
+    /// publication: the FIRST value wins, so several changes to one key
+    /// inside a batch are still compared against what it served before
+    /// the batch.
+    fn remember_served(&mut self, key: &str, served: Option<Arc<[u8]>>) {
+        if !self.pending.contains_key(key) {
+            self.pending.insert(key.to_owned(), served);
+        }
     }
 
     fn insert(&mut self, entry: RawEntry) {
-        let row = StateEntry::new(entry);
-        if self
-            .entries
-            .get(&row.entry.key)
-            .is_none_or(|old| old.record != row.record)
-        {
-            self.invalidate();
+        let mut row = StateEntry::new(entry);
+        let key = row.entry.key.clone();
+        match self.entries.get(&key) {
+            // The same canonical bytes under a new revision: nothing
+            // observed changed, so neither identity moves and the
+            // recorded served value carries over.
+            Some(old) if old.record == row.record => {
+                row.served = old.served.clone();
+            }
+            old => {
+                let served = old.and_then(|old| old.served.clone());
+                self.remember_served(&key, served);
+                self.version = self.version.wrapping_add(1);
+            }
         }
-        self.entries.insert(row.entry.key.clone(), row);
+        self.entries.insert(key, row);
     }
 
     fn remove(&mut self, key: &str) -> Option<StateEntry> {
         let removed = self.entries.remove(key);
-        if removed.is_some() {
-            self.invalidate();
+        if let Some(row) = &removed {
+            self.remember_served(key, row.served.clone());
+            self.version = self.version.wrapping_add(1);
         }
         removed
+    }
+
+    /// Settle what each changed key serves now, and say whether any of
+    /// it moved. Called once per publication, with the rejections and
+    /// stale pins that publication reports.
+    fn publish_served(
+        &mut self,
+        rejected: &HashSet<&str>,
+        stale: &HashMap<String, StaleServing>,
+    ) -> u64 {
+        let filtered: HashSet<String> = rejected
+            .iter()
+            .map(|key| (*key).to_owned())
+            .chain(stale.keys().cloned())
+            .collect();
+        // A key whose rejected/stale status moved serves different bytes
+        // even if nothing wrote to it.
+        let candidates: Vec<String> = self
+            .pending
+            .keys()
+            .cloned()
+            .chain(self.filtered.symmetric_difference(&filtered).cloned())
+            .collect();
+        let mut moved = false;
+        for key in candidates {
+            let now = served_record(&key, &self.entries, rejected, stale);
+            let before = match self.pending.get(&key) {
+                Some(before) => before.clone(),
+                None => self.entries.get(&key).and_then(|row| row.served.clone()),
+            };
+            if now != before {
+                moved = true;
+            }
+            if let Some(row) = self.entries.get_mut(&key) {
+                row.served = now;
+            }
+        }
+        self.pending.clear();
+        self.filtered = filtered;
+        if moved {
+            self.served_version = self.served_version.wrapping_add(1);
+        }
+        self.served_version
     }
 
     /// The bytes the observed digest covers, in key order — taken at
@@ -304,6 +386,23 @@ impl ObservedState {
             .map(|(key, row)| (key.clone(), row.record.clone()))
             .collect()
     }
+}
+
+/// What one key contributes to the served set right now. The same three
+/// rules [`served_records`] walks, for a single key.
+fn served_record(
+    key: &str,
+    entries: &BTreeMap<String, StateEntry>,
+    rejected: &HashSet<&str>,
+    stale: &HashMap<String, StaleServing>,
+) -> Option<Arc<[u8]>> {
+    if let Some(pinned) = stale.get(key) {
+        return Some(hash_record(&pinned.entry.key, &pinned.entry.value).into());
+    }
+    if rejected.contains(key) {
+        return None;
+    }
+    entries.get(key).map(|row| row.record.clone())
 }
 
 /// One supervisor instance. Consumers call [`Supervisor::run`] once and
@@ -548,7 +647,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         let config_hash;
         let rejected: Vec<IncomingRejection>;
         {
-            let state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap();
             let rejections = self.rejections.lock().unwrap();
             let version = state.version;
             // Every observed write, including a rejected one, contributes
@@ -571,6 +670,12 @@ impl<P: ConfigProvider> Supervisor<P> {
                 })
             };
             let rejected_keys: HashSet<&str> = rejections.iter().map(|r| r.key.as_str()).collect();
+            // Settle what each changed key serves, and take the identity
+            // of the served set from it. `apply_seq` keys on this, and
+            // must not advance on unchanged content: an apply whose
+            // writes were all rejected, or whose puts carry the bytes
+            // that already serve, moves nothing a client can see.
+            let served = state.publish_served(&rejected_keys, &stale);
             // config_hash covers the bytes each key ACTUALLY serves: the
             // observed etcd bytes for accepted keys, the pinned last-known-
             // good bytes for stale-serving keys (#871), and nothing for a
@@ -582,9 +687,10 @@ impl<P: ConfigProvider> Supervisor<P> {
             // With nothing rejected and nothing pinned the filter admits
             // every key and the chain adds none, so the two digests are
             // over the identical record sequence — the overwhelmingly
-            // common case, and the same deferred digest to share.
+            // common case. Same value, computed once, under the two
+            // identities the two surfaces report changes by.
             config_hash = if rejected_keys.is_empty() && stale.is_empty() {
-                source_hash.clone()
+                source_hash.rekeyed(served)
             } else {
                 let records = state.records_by_key();
                 let stale = stale.clone();
@@ -592,7 +698,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                 let hashed = Arc::clone(&self.hashed);
                 let rejected_keys: HashSet<String> =
                     rejected_keys.iter().map(|key| (*key).to_owned()).collect();
-                LazyHash::deferred(served_version(version, &rejected_keys, &stale), move || {
+                LazyHash::deferred(served, move || {
                     #[cfg(test)]
                     hashed.fetch_add(1, Ordering::Relaxed);
                     let keys: HashSet<&str> = rejected_keys.iter().map(String::as_str).collect();
@@ -2179,36 +2285,6 @@ fn stamp_max(slot: &mut Option<i64>, revision: i64) {
     });
 }
 
-/// Identity of what [`served_records`] would produce, without walking
-/// the entry map: the observed state's own version plus the filter
-/// applied to it. Only reached when something is rejected or serving
-/// stale — the clean case shares the observed digest's identity outright.
-///
-/// Conservative in one direction: a change to a key that is rejected,
-/// and so serves nothing, advances the observed state's version and
-/// therefore this, where comparing the digests would not have. It never
-/// misses a change to what is served, which is the direction that would
-/// lose an apply.
-fn served_version(
-    observed: u64,
-    rejected_keys: &HashSet<String>,
-    stale: &HashMap<String, StaleServing>,
-) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    observed.hash(&mut hasher);
-    let mut rejected: Vec<&str> = rejected_keys.iter().map(String::as_str).collect();
-    rejected.sort_unstable();
-    rejected.hash(&mut hasher);
-    let mut pinned: Vec<(&str, &[u8])> = stale
-        .values()
-        .map(|s| (s.entry.key.as_str(), s.entry.value.as_slice()))
-        .collect();
-    pinned.sort_unstable_by_key(|(key, _)| *key);
-    pinned.hash(&mut hasher);
-    hasher.finish()
-}
-
 /// The digest records for the bytes each key ACTUALLY serves, in the
 /// ascending-key order `hash_records` is defined over: the observed etcd
 /// bytes for an accepted key, the pinned last-known-good bytes for a
@@ -2798,41 +2874,82 @@ mod tests {
         assert!(sup.state.lock().unwrap().entries.is_empty());
     }
 
-    /// What the apply counter does when a row is rejected, which the
-    /// digests alone used to decide.
-    ///
-    /// The identity a reader compares is the observed state's, not the
-    /// served bytes' — knowing the served bytes means digesting them,
-    /// which is the whole cost this defers. So a write that lands as a
-    /// rejection counts as an apply even though nothing it serves
-    /// changed. It is one advance per such write, never a missed one,
-    /// and what serves is unaffected: the digest, the counts and the
-    /// rejection report all still describe the last known good.
+    /// The apply counter tracks what the gateway SERVES, which is what
+    /// the published reference promises: "unchanged content does not
+    /// advance it". Three ways content can look like it changed without
+    /// having changed, and none of them may advance it.
     #[tokio::test]
-    async fn a_rejected_write_advances_the_apply_counter_without_changing_what_serves() {
+    async fn the_apply_counter_advances_only_when_what_serves_changes() {
         let provider = Arc::new(FakeProvider::new(vec![], 0));
         let sup = Supervisor::new(provider, "/aisix");
         sup.load_once().await.unwrap();
         assert!(sup.apply_put(&entry("/aisix/models/m-1", VALID_MODEL, 1)));
-        let good = sup.config_status().view().applied.unwrap();
+        let seeded = sup.config_status().view().applied.unwrap();
 
+        // 1. A write that lands as a rejection: the last known good keeps
+        //    serving, so nothing a client can see moved.
         sup.apply_resync(&[entry("/aisix/models/m-1", BAD_PROVIDER_MODEL, 2)]);
-        let rejected = sup.config_status().view().applied.unwrap();
-        assert_eq!(
-            rejected.config_hash, good.config_hash,
-            "the served bytes, and so the digest, are the last known good",
-        );
-        assert_eq!(rejected.apply_seq, good.apply_seq + 1);
+        let broken = sup.config_status().view().applied.unwrap();
+        assert_eq!(broken.config_hash, seeded.config_hash);
+        assert_eq!(broken.apply_seq, seeded.apply_seq);
+        assert_eq!(broken.applied_at, seeded.applied_at);
 
-        // And a second rewrite of the same broken row, while it stays
-        // rejected, does not advance it again: the observed state is the
-        // only thing that moved, and it moved into the same shape.
-        sup.apply_resync(&[entry("/aisix/models/m-1", BAD_PROVIDER_MODEL, 3)]);
+        // ...and rewriting the broken row, still rejected, still nothing.
+        sup.apply_resync(&[entry("/aisix/models/m-1", b"also not a model", 3)]);
         let again = sup.config_status().view().applied.unwrap();
-        assert_eq!(again.config_hash, good.config_hash);
-        assert_eq!(again.apply_seq, rejected.apply_seq);
+        assert_eq!(again.apply_seq, seeded.apply_seq);
+
+        // 2. Repairing it puts the row back as it was, so the served
+        //    bytes return to the seeded ones — and THAT is a change,
+        //    because they had been the pinned last known good under a
+        //    different observed state.
+        sup.apply_resync(&[entry("/aisix/models/m-1", VALID_MODEL, 4)]);
+        let repaired = sup.config_status().view().applied.unwrap();
+        assert_eq!(repaired.config_hash, seeded.config_hash);
+
+        // 3. A put carrying the bytes that already serve, under a new
+        //    revision: observed nothing, served nothing.
+        let settled = sup.config_status().view().applied.unwrap();
+        sup.apply_put(&entry("/aisix/models/m-1", VALID_MODEL, 5));
+        let identical = sup.config_status().view().applied.unwrap();
+        assert_eq!(identical.apply_seq, settled.apply_seq);
+        assert_eq!(identical.applied_at, settled.applied_at);
+
+        // And a real change advances it exactly once.
+        assert!(sup.apply_put(&entry("/aisix/models/m-2", VALID_MODEL_ALT, 6)));
+        let added = sup.config_status().view().applied.unwrap();
+        assert_eq!(added.apply_seq, settled.apply_seq + 1);
+        assert_ne!(added.config_hash, settled.config_hash);
     }
 
+    /// A key can stop serving, or start again, without anything writing
+    /// to it: the rejection buffer is capped, so which keys it names can
+    /// change on its own. Deciding only from the keys an apply touched
+    /// would miss that — and missing it loses an apply, the direction
+    /// that matters.
+    #[test]
+    fn a_key_whose_rejection_status_moves_on_its_own_still_counts() {
+        let mut state = ObservedState::default();
+        state.insert(entry("/aisix/models/0001", VALID_MODEL, 1));
+        state.insert(entry("/aisix/models/0002", VALID_MODEL_ALT, 1));
+        let stale = HashMap::new();
+        let settled = state.publish_served(&HashSet::new(), &stale);
+        assert_eq!(
+            state.publish_served(&HashSet::new(), &stale),
+            settled,
+            "publishing the same state twice is not a change",
+        );
+
+        let rejected: HashSet<&str> = ["/aisix/models/0001"].into_iter().collect();
+        let dropped = state.publish_served(&rejected, &stale);
+        assert_ne!(dropped, settled, "a key that stops serving is a change");
+        assert_eq!(state.publish_served(&rejected, &stale), dropped);
+
+        let restored = state.publish_served(&HashSet::new(), &stale);
+        assert_ne!(restored, dropped, "and one that starts again is too");
+    }
+
+    /// A resync reconciles the entry map rather than replacing it, so
     /// A resync reconciles the entry map rather than replacing it, so
     /// the version it reports keeps moving forward and keeps standing
     /// still when nothing changed. Replacing the map restarts the
