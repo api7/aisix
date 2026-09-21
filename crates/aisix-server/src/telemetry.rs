@@ -13,12 +13,15 @@
 //!   POST carries [`USAGE_BATCH_ID_HEADER`], the control plane records
 //!   that id in the same transaction as the usage rows, and it answers
 //!   every response from that handler with [`USAGE_BATCH_DEDUP_HEADER`].
-//!   A failure whose response lacks that header is dropped, exactly as
-//!   every failure was before. There is still no persistent disk queue:
-//!   a batch that cannot be delivered inside [`RETRY_BUDGET`] is dropped.
-//!   The `received_at` column on the cp-api side records when CP saw the
-//!   row, so dashboards distinguish "DP never sent" from "DP sent but CP
-//!   rejected" via log correlation.
+//!   A failure whose response lacks that header — or carries it with an
+//!   undefined value — is dropped, exactly as every failure was before.
+//!   There is still no persistent disk queue: a batch is given up on once
+//!   its OLDEST event is [`RETRY_BUDGET`] old (which can be before its
+//!   first attempt, since the sender is single in-flight), or once the
+//!   control plane has answered and refused it [`MAX_ANSWERED_FAILURES`]
+//!   times in a row. The `received_at` column on the cp-api side records
+//!   when CP saw the row, so dashboards distinguish "DP never sent" from
+//!   "DP sent but CP rejected" via log correlation.
 //!
 //! mTLS: the sender presents the same on-disk bundle the heartbeat
 //! worker uses. cp-api derives `env_id` and `dp_id` from the peer
@@ -75,9 +78,18 @@ const QUEUE_CAPACITY: usize = 16_384;
 const USAGE_BATCH_ID_HEADER: &str = "X-Aisix-Usage-Batch-Id";
 
 /// Response header the control plane sets on EVERY response its telemetry
-/// handler produces — success and failure alike. Its presence is the only
-/// evidence this sender has that a re-send cannot double-count.
+/// handler produces — success and failure alike. It is the only evidence
+/// this sender has that a re-send cannot double-count.
 const USAGE_BATCH_DEDUP_HEADER: &str = "X-Aisix-Usage-Batch-Dedup";
+
+/// The one value [`USAGE_BATCH_DEDUP_HEADER`] is defined to carry.
+///
+/// Matched exactly rather than by presence: the header is a capability
+/// assertion, and the protocol pins its value, so anything else is a
+/// control plane this sender does not understand — including a future one
+/// that uses the value to say something narrower. Reading such a header as
+/// "de-duplication is on" is the one mistake that bills twice.
+const USAGE_BATCH_DEDUP_ENABLED: &str = "1";
 
 /// First wait before a batch is re-sent; doubles per attempt up to
 /// [`RETRY_MAX_BACKOFF`].
@@ -86,18 +98,42 @@ const RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Ceiling on the wait between re-sends.
 const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-/// How long a batch may be re-sent, measured from its FIRST attempt.
+/// How long a batch may be re-sent, measured from its OLDEST event's
+/// `occurred_at` — NOT from its first attempt.
 ///
 /// Bounded by billing, not by patience: cp-api's `usagepush` seals each
 /// UTC hour's billing counters at `hour start + settleDelay + 1h`
 /// (`settleDelay` is 1 hour today), and an event whose `occurred_at` falls
-/// at the end of an hour is already near `hour start + 1h` on its first
-/// attempt. A budget equal to `settleDelay` would therefore leave zero
+/// at the end of an hour is already near `hour start + 1h` when it is
+/// emitted. A budget equal to `settleDelay` would therefore leave zero
 /// margin: the rows land, and the hour they belong to has already been
-/// billed without them. 30 minutes keeps 30 minutes of margin. Change
-/// either side only together with the other's comment — the control-plane
-/// half is in `internal/cpapi/usagepush` and prd-09 §9.6.6.
+/// billed without them. 30 minutes of event age keeps 30 minutes of margin.
+///
+/// Measuring from the first ATTEMPT would only hold that margin for the
+/// batch at the head of the queue: this sender is single in-flight, so a
+/// batch waiting behind one that burned the whole budget is already half an
+/// hour old before its own first attempt, and its own budget would carry it
+/// past the seal. A batch that is already past the budget when it reaches
+/// the head is therefore dropped WITHOUT an attempt. Change either side
+/// only together with the other's comment — the control-plane half is in
+/// `internal/cpapi/usagepush` and prd-09 §9.6.6.
 const RETRY_BUDGET: Duration = Duration::from_secs(30 * 60);
+
+/// Consecutive failures that CARRIED A RESPONSE before a batch is given up
+/// on, whatever the budget has left.
+///
+/// The control plane classifies a permanently unacceptable batch as a
+/// non-retryable 4xx, which this sender already drops at once. This is the
+/// safety net for the case that classification misses: a control plane
+/// answering `5xx` for a batch it can never accept would otherwise hold the
+/// single in-flight channel for the whole budget, and the queue behind it —
+/// every event the gateway records meanwhile — overflows long before that,
+/// which is a far larger loss than the batch itself.
+///
+/// A failure with NO response does not count against this cap: that is the
+/// control-plane outage this feature exists for, and it is bounded by the
+/// budget instead.
+const MAX_ANSWERED_FAILURES: usize = 8;
 
 /// `aisix_usage_event_drops_total{reason}` for a batch given up on without
 /// ever being re-sent: the control plane answered without
@@ -105,10 +141,12 @@ const RETRY_BUDGET: Duration = Duration::from_secs(30 * 60);
 /// failure was not retryable, or the gateway is shutting down.
 const DROP_SEND_FAILED: &str = "send_failed";
 
-/// `aisix_usage_event_drops_total{reason}` for a batch re-sent until
-/// [`RETRY_BUDGET`] ran out. Distinct from [`DROP_SEND_FAILED`] because it
-/// says the control plane was unreachable for half an hour, not that the
-/// batch was refused.
+/// `aisix_usage_event_drops_total{reason}` for a batch that ran out of room
+/// to keep trying: its events aged past [`RETRY_BUDGET`] (with or without
+/// an attempt ever being made), or it was answered and refused
+/// [`MAX_ANSWERED_FAILURES`] times in a row. Distinct from
+/// [`DROP_SEND_FAILED`], which says the very first failure could not be
+/// re-sent at all.
 const DROP_RETRY_BUDGET_EXHAUSTED: &str = "retry_budget_exhausted";
 
 /// Path the telemetry worker POSTs to, under `managed.cp_base_url`.
@@ -356,9 +394,25 @@ async fn deliver(
 ) {
     let batch_id = Uuid::new_v4();
     let count = events.len();
-    let deadline = Instant::now() + RETRY_BUDGET;
+    let budget = remaining_budget(events);
+    if budget.is_zero() {
+        // Already past the billing window the budget protects — see
+        // `RETRY_BUDGET`. Sending it would land rows in an hour that has been
+        // billed without them, so it is given up on unattempted.
+        drop_batch(
+            metrics,
+            DROP_RETRY_BUDGET_EXHAUSTED,
+            events,
+            batch_id,
+            0,
+            None,
+        );
+        return;
+    }
+    let deadline = Instant::now() + budget;
     let mut backoff = RETRY_INITIAL_BACKOFF;
     let mut attempts = 0usize;
+    let mut answered_failures = 0usize;
     let mut resending = false;
     // Flipped when shutdown interrupts a backoff: the batch in hand gets one
     // final attempt, and then this worker stops holding the drain open.
@@ -384,6 +438,9 @@ async fn deliver(
             Attempt::Failed(failure) => failure,
         };
 
+        if matches!(failure, SendFailure::Response { .. }) {
+            answered_failures += 1;
+        }
         let may_resend = state.may_resend(&failure);
         if !may_resend || last_attempt {
             drop_batch(
@@ -392,20 +449,20 @@ async fn deliver(
                 events,
                 batch_id,
                 attempts,
-                &failure,
+                Some(&failure),
             );
             return;
         }
 
         let now = Instant::now();
-        if now >= deadline {
+        if answered_failures >= MAX_ANSWERED_FAILURES || now >= deadline {
             drop_batch(
                 metrics,
                 DROP_RETRY_BUDGET_EXHAUSTED,
                 events,
                 batch_id,
                 attempts,
-                &failure,
+                Some(&failure),
             );
             return;
         }
@@ -442,6 +499,32 @@ async fn deliver(
     }
 }
 
+/// What is left of [`RETRY_BUDGET`] for this batch, measured from its OLDEST
+/// event rather than from now: the sender is single in-flight, so a batch
+/// that waited behind a long re-send is already old when it first goes out,
+/// and the budget exists to keep its rows inside the control plane's billing
+/// window rather than to cap how long this worker tries. `Duration::ZERO`
+/// means the batch is already past it.
+///
+/// An event whose `occurred_at` does not parse cannot be aged, so it does not
+/// shorten anything — what to do with a malformed timestamp is the control
+/// plane's call, by its own rules.
+fn remaining_budget(events: &[UsageEvent]) -> Duration {
+    let now = chrono::Utc::now();
+    let Some(oldest) = events
+        .iter()
+        .filter_map(|event| chrono::DateTime::parse_from_rfc3339(&event.occurred_at).ok())
+        .map(|at| at.with_timezone(&chrono::Utc))
+        .min()
+    else {
+        return RETRY_BUDGET;
+    };
+    // `to_std` fails on a negative span — an event stamped in the future,
+    // which ages nothing.
+    let age = (now - oldest).to_std().unwrap_or_default();
+    RETRY_BUDGET.saturating_sub(age)
+}
+
 /// Give up on a batch: count every event it carried against the existing
 /// drop counter under `reason`, and log the one line that closes the retry
 /// the `re-sending` line opened.
@@ -458,7 +541,7 @@ fn drop_batch(
     events: &[UsageEvent],
     batch_id: Uuid,
     attempts: usize,
-    failure: &SendFailure,
+    failure: Option<&SendFailure>,
 ) {
     for event in events {
         metrics.record_usage_event_drop(
@@ -470,12 +553,18 @@ fn drop_batch(
             },
         );
     }
+    let error = match failure {
+        Some(failure) => failure.to_string(),
+        // `attempts = 0` beside it: there is no failure to name, because
+        // nothing was sent.
+        None => "older than the retry budget; not attempted".to_string(),
+    };
     tracing::warn!(
         %batch_id,
         count = events.len(),
         attempts,
         reason,
-        error = %failure,
+        error,
         // Wording held verbatim from before re-sending existed: the
         // control-plane e2e log scans allowlist this line by its exact text
         // (`e2e/cases/dp_harness_test.go`, `dashboard/tests/e2e/dp-harness.ts`),
@@ -567,7 +656,10 @@ async fn send(
     };
 
     // Read off THIS response, never remembered: see `SenderState::may_resend`.
-    let dedup = resp.headers().contains_key(USAGE_BATCH_DEDUP_HEADER);
+    let dedup = resp
+        .headers()
+        .get(USAGE_BATCH_DEDUP_HEADER)
+        .is_some_and(|value| value.as_bytes() == USAGE_BATCH_DEDUP_ENABLED.as_bytes());
     let status = resp.status();
     if status.is_success() {
         return Attempt::Delivered { dedup };
@@ -675,10 +767,27 @@ mod tests {
         }
     }
 
+    /// One timestamp for the whole test binary, so two calls building the
+    /// "expected" and the "staged" copy of a batch produce byte-identical
+    /// events. Fresh rather than fixed, because a batch is now aged by its
+    /// oldest `occurred_at` and a hardcoded past date would put every test
+    /// event past [`RETRY_BUDGET`].
+    fn now_rfc3339() -> &'static str {
+        static NOW: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        NOW.get_or_init(|| chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+    }
+
+    /// An `occurred_at` `age` in the past — a batch that waited behind a
+    /// long re-send.
+    fn aged_rfc3339(age: Duration) -> String {
+        (chrono::Utc::now() - chrono::Duration::from_std(age).unwrap())
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
     fn sample_event(id: &str) -> UsageEvent {
         UsageEvent {
             request_id: id.into(),
-            occurred_at: "2026-04-29T12:00:00Z".into(),
+            occurred_at: now_rfc3339().to_string(),
             model_id: "mod-uuid".into(),
             api_key_id: "ak-uuid".into(),
             prompt_tokens: 10,
@@ -905,13 +1014,6 @@ mod tests {
         (server, batches)
     }
 
-    /// A response shaped like the control plane's: the handler sets the
-    /// de-duplication header on EVERY response it produces, whatever the
-    /// status.
-    fn dedup_response(status: u16) -> ResponseTemplate {
-        ResponseTemplate::new(status).insert_header(USAGE_BATCH_DEDUP_HEADER, "1")
-    }
-
     /// One recorded POST: the batch id it carried and its body.
     type RecordedPosts = Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>;
 
@@ -921,7 +1023,8 @@ mod tests {
     #[derive(Debug, Clone, Copy)]
     struct Answer {
         status: u16,
-        dedup: bool,
+        /// `None` sends no header at all; `Some(v)` sends it with value `v`.
+        dedup: Option<&'static str>,
         /// `true` answers so late that the sender gives up waiting — the
         /// failure a control-plane outage actually produces, with NO
         /// response to read a capability off. Deterministic where killing
@@ -935,7 +1038,17 @@ mod tests {
     fn dedups(status: u16) -> Answer {
         Answer {
             status,
-            dedup: true,
+            dedup: Some(USAGE_BATCH_DEDUP_ENABLED),
+            stalled: false,
+        }
+    }
+
+    /// Answers with the header set to something the protocol does not
+    /// define — a control plane this sender must not read as capable.
+    fn dedup_value(status: u16, value: &'static str) -> Answer {
+        Answer {
+            status,
+            dedup: Some(value),
             stalled: false,
         }
     }
@@ -945,7 +1058,7 @@ mod tests {
     fn no_dedup(status: u16) -> Answer {
         Answer {
             status,
-            dedup: false,
+            dedup: None,
             stalled: false,
         }
     }
@@ -954,7 +1067,7 @@ mod tests {
     fn stalls() -> Answer {
         Answer {
             status: 200,
-            dedup: true,
+            dedup: Some(USAGE_BATCH_DEDUP_ENABLED),
             stalled: true,
         }
     }
@@ -991,10 +1104,10 @@ mod tests {
                 let answer = *script
                     .get(posts.len() - 1)
                     .unwrap_or_else(|| script.last().unwrap());
-                let response = if answer.dedup {
-                    dedup_response(answer.status)
-                } else {
-                    ResponseTemplate::new(answer.status)
+                let response = match answer.dedup {
+                    Some(value) => ResponseTemplate::new(answer.status)
+                        .insert_header(USAGE_BATCH_DEDUP_HEADER, value),
+                    None => ResponseTemplate::new(answer.status),
                 };
                 if answer.stalled {
                     response.set_delay(BEYOND_THE_REQUEST_TIMEOUT)
@@ -1074,6 +1187,18 @@ mod tests {
                 event.user_id = format!("user-{i}");
                 event.prompt_tokens = i as u32;
                 event.completion_tokens = (i * 2) as u32;
+                event
+            })
+            .collect()
+    }
+
+    /// [`ordered_events`], stamped `age` in the past.
+    fn aged_events(count: usize, age: Duration) -> Vec<UsageEvent> {
+        let occurred_at = aged_rfc3339(age);
+        ordered_events(count)
+            .into_iter()
+            .map(|mut event| {
+                event.occurred_at = occurred_at.clone();
                 event
             })
             .collect()
@@ -1411,6 +1536,34 @@ mod tests {
         assert_eq!(drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED), 0);
     }
 
+    /// The header is a capability assertion with one defined value. A
+    /// response that carries it with anything else is a control plane this
+    /// sender does not understand, and re-sending to it could bill twice —
+    /// so it is treated exactly like a response that carries no header.
+    #[tokio::test]
+    async fn a_dedup_header_with_an_unknown_value_does_not_allow_a_re_send() {
+        let (server, posts) = scripted_server(vec![dedup_value(503, "0")]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let (mut sender, tx) = staged_sender(cfg, metrics.clone(), &mut cancel_rx, 2).await;
+
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || drops_with_reason(&metrics, DROP_SEND_FAILED) == 2,
+            "the batch was not dropped",
+        )
+        .await;
+        drop(tx);
+        finish_sender(sender.as_mut()).await;
+
+        assert_eq!(posts.lock().unwrap().len(), 1, "it must not be re-sent");
+        assert_eq!(drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED), 0);
+    }
+
     /// A `400` is the control plane refusing THIS batch — a malformed body,
     /// a batch id it will not accept. Re-sending it changes nothing, so it
     /// is dropped on the first answer even though de-duplication is on.
@@ -1691,6 +1844,136 @@ mod tests {
                 "whose usage was lost must stay answerable, missing {member}: {dropped:?}",
             );
         }
+    }
+
+    /// The safety net for a control plane that answers `5xx` for a batch it
+    /// can never accept: without a cap the single in-flight channel is held
+    /// for the whole budget, and the queue behind it — every event the
+    /// gateway records meanwhile — overflows long before that.
+    #[tokio::test]
+    async fn a_batch_answered_and_refused_eight_times_is_given_up_on() {
+        let (server, posts) = scripted_server(vec![dedups(503)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let (mut sender, tx) = staged_sender(cfg, metrics.clone(), &mut cancel_rx, 2).await;
+
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED) == 2,
+            "the refused batch was re-sent past the cap",
+        )
+        .await;
+        assert_identical_resends(&posts, MAX_ANSWERED_FAILURES);
+
+        // …and the channel is free for what queued up behind it.
+        for event in ordered_events(2) {
+            tx.try_send(event).unwrap();
+        }
+        tokio::time::advance(FLUSH_INTERVAL).await;
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || posts.lock().unwrap().len() > MAX_ANSWERED_FAILURES,
+            "the next batch never got its turn",
+        )
+        .await;
+        let posts = posts.lock().unwrap();
+        assert_ne!(
+            posts[MAX_ANSWERED_FAILURES].0, posts[0].0,
+            "the batch after a give-up is a new batch, with its own id",
+        );
+    }
+
+    /// The cap counts answered failures only. A control plane that has
+    /// stopped answering is the outage this feature exists for, and it is
+    /// bounded by the budget instead — so attempts that time out neither
+    /// consume the cap nor are stopped by it.
+    #[tokio::test]
+    async fn failures_with_no_response_do_not_consume_the_cap() {
+        // Alternating: every second attempt is answered, the rest stall past
+        // the request timeout.
+        let script: Vec<Answer> = (0..40)
+            .map(|i| if i % 2 == 0 { dedups(503) } else { stalls() })
+            .collect();
+        let (server, posts) = scripted_server(script).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let (mut sender, tx) = staged_sender(cfg, metrics.clone(), &mut cancel_rx, 2).await;
+
+        // Small steps throughout: the answered attempts are real exchanges,
+        // and a clock that outran one would turn it into a no-response
+        // failure — the very distinction this test is about.
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED) == 2,
+            "the batch was never given up on",
+        )
+        .await;
+        drop(tx);
+
+        // Answered attempts are the odd ones, so the eighth of them is the
+        // fifteenth attempt — the stalls in between cost nothing.
+        assert_identical_resends(&posts, MAX_ANSWERED_FAILURES * 2 - 1);
+    }
+
+    /// The budget is measured from the batch's OLDEST event, not from its
+    /// first attempt: the sender is single in-flight, so a batch that waited
+    /// behind a long re-send is already old when its turn comes, and sending
+    /// it would land rows in an hour the control plane has already billed.
+    /// A younger batch behind it is unaffected.
+    #[tokio::test]
+    async fn a_batch_older_than_the_budget_is_dropped_without_an_attempt() {
+        let (server, posts) = scripted_server(vec![dedups(200)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let (tx, rx) = tokio::sync::mpsc::channel(BACKLOG_QUEUE);
+        tokio::time::pause();
+        let mut sender = Box::pin(run(cfg, metrics.clone(), rx, &mut cancel_rx));
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+
+        for event in aged_events(2, RETRY_BUDGET + Duration::from_secs(60)) {
+            tx.try_send(event).unwrap();
+        }
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        tokio::time::advance(FLUSH_INTERVAL).await;
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED) == 2,
+            "the stale batch was not dropped",
+        )
+        .await;
+        assert!(
+            posts.lock().unwrap().is_empty(),
+            "a batch past the billing window must not be sent at all",
+        );
+
+        // The batch behind it is fresh, and goes out normally.
+        for event in ordered_events(2) {
+            tx.try_send(event).unwrap();
+        }
+        tokio::time::advance(FLUSH_INTERVAL).await;
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || !posts.lock().unwrap().is_empty(),
+            "the fresh batch behind it never went out",
+        )
+        .await;
+        drop(tx);
+        finish_sender(sender.as_mut()).await;
+        assert_eq!(posts.lock().unwrap().len(), 1);
+        assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 0);
     }
 
     /// Shutdown gets one last attempt at the batch in hand and then stops —
