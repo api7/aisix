@@ -99,7 +99,6 @@ export OPENAI_API_KEY="YOUR_PROVIDER_KEY"
 export CALLER_API_KEY="YOUR_CALLER_KEY"
 
 docker run -d --name aisix \
-  --platform linux/amd64 \
   -v "$(pwd)/config.yaml:/etc/aisix/config.yaml:ro" \
   -v "$(pwd)/resources.yaml:/etc/aisix/resources.yaml:ro" \
   -e OPENAI_API_KEY -e CALLER_API_KEY \
