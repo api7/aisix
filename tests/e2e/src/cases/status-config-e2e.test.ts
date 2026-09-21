@@ -181,6 +181,112 @@ describe("status/config: etcd watch source", () => {
     expect(text).toMatch(/aisix_config_hash_info\{hash="[0-9a-f]{64}"\} 1/);
   });
 
+  // The gateway computes the configuration digests when something reports
+  // them, not on every apply, so what a reader gets back is produced after
+  // the fact from the state the gateway holds. Two failures that shape
+  // allows and nothing else here would catch: a digest that never moves
+  // once it has been computed, and one that moves while the configuration
+  // sits still. Both surfaces have to agree with each other throughout —
+  // `/status/config` builds its answer in the handler, the scrape streams
+  // its copy out of the recorder.
+  test("the reported digest moves only when the configuration does", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    await waitConfigPropagation(async () => (await getStatusConfig(app!)).state === "synced");
+
+    const before = await getStatusConfig(app);
+    expect(configHashValue(await scrape(app))).toBe(before.applied!.config_hash);
+
+    // Nothing changed: reading again re-reports the same digest rather
+    // than a fresh computation over drifting state.
+    const settled = await getStatusConfig(app);
+    expect(settled.applied!.config_hash).toBe(before.applied!.config_hash);
+    expect(settled.source.source_hash).toBe(before.source.source_hash);
+    expect(configHashValue(await scrape(app))).toBe(before.applied!.config_hash);
+
+    // One more resource, and both surfaces must move together.
+    const extra = await seed.createApiKey({
+      key_hash: createHash("sha256").update(randomUUID()).digest("hex"),
+      allowed_models: ["status-model"],
+    });
+    let after: StatusConfig | undefined;
+    await waitConfigPropagation(async () => {
+      after = await getStatusConfig(app!);
+      return after.applied?.resource_counts.api_keys === 2;
+    });
+    expect(after!.applied!.config_hash).not.toBe(before.applied!.config_hash);
+    expect(after!.source.source_hash).not.toBe(before.source.source_hash);
+    expect(after!.applied!.config_hash).toBe(after!.source.source_hash);
+    expect(configHashValue(await scrape(app))).toBe(after!.applied!.config_hash);
+
+    // Take it away again: the digest is over what the gateway holds, so
+    // the same configuration has to digest to the same value however many
+    // applies and reports happened in between.
+    await seed.delete("api_keys", extra.id);
+    let restored: StatusConfig | undefined;
+    await waitConfigPropagation(async () => {
+      restored = await getStatusConfig(app!);
+      return restored.applied?.resource_counts.api_keys === 1;
+    });
+    expect(restored!.source.source_hash).toBe(before.source.source_hash);
+    expect(restored!.applied!.config_hash).toBe(before.applied!.config_hash);
+    expect(configHashValue(await scrape(app))).toBe(before.applied!.config_hash);
+  });
+
+  // The exposition is streamed out in pieces as it is rendered rather than
+  // built whole, so a scrape's completeness is now a property of the
+  // transport. A body cut between pieces still parses line by line — what
+  // gives it away is a family whose header arrives without its samples, or
+  // twice.
+  test("a streamed scrape arrives whole and well-formed", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    await waitConfigPropagation(async () => (await getStatusConfig(app!)).state === "synced");
+
+    const res = await fetch(`${app.metricsUrl}/metrics`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/plain; version=0.0.4");
+    const text = await res.text();
+
+    expect(text.endsWith("\n")).toBe(true);
+    const headers = new Map<string, number>();
+    const samples = new Set<string>();
+    for (const line of text.split("\n")) {
+      if (line === "") continue;
+      const typed = line.match(/^# TYPE (\S+) \S+$/);
+      if (typed) {
+        headers.set(typed[1], (headers.get(typed[1]) ?? 0) + 1);
+        continue;
+      }
+      if (line.startsWith("#")) continue;
+      expect(line).toMatch(/^[a-zA-Z_:][a-zA-Z0-9_:]*(\{.*\})? \S+$/);
+      samples.add(line.slice(0, line.indexOf(" ")).replace(/\{.*$/, ""));
+    }
+    expect(headers.size).toBeGreaterThan(0);
+    for (const [family, count] of headers) {
+      expect(count, `${family} declared ${count} times`).toBe(1);
+      const declared = [...samples].some(
+        (name) => name === family || name.startsWith(`${family}_`),
+      );
+      expect(declared, `${family} declared with no samples`).toBe(true);
+    }
+    // Two scrapes back to back describe the same families: the renderer
+    // walks a catalog, and a piece lost between them would show up here
+    // as a family present in one and missing from the other.
+    const again = await scrape(app);
+    const families = (body: string) =>
+      body
+        .split("\n")
+        .filter((line) => line.startsWith("# TYPE "))
+        .map((line) => line.split(" ")[2])
+        .sort();
+    expect(families(again)).toEqual(families(text));
+  });
+
   test("a bad doc alongside good ones degrades without dropping the good config", async (ctx) => {
     if (!etcdReachable || !app || !upstream) {
       ctx.skip();
