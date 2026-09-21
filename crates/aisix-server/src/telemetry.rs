@@ -1031,10 +1031,11 @@ mod tests {
     /// one-second backoff is crossed in a hundred.
     const STEP_WHILE_SERVING: Duration = Duration::from_millis(10);
 
-    /// Virtual-time step for a phase whose control plane is GONE: every
-    /// attempt is refused on connect, so nothing is ever in flight long
-    /// enough for a jump to time it out, and a 30-minute budget is 1800
-    /// cheap iterations.
+    /// Virtual-time step for a phase whose control plane never answers in
+    /// time. Each attempt ends at the client's own request timeout, which is
+    /// measured on this same paused clock, so advancing in seconds is what
+    /// ENDS an attempt rather than something that could cut one short — and
+    /// a 30-minute budget is 1800 cheap iterations.
     const STEP_WHILE_UNREACHABLE: Duration = Duration::from_secs(1);
 
     /// Poll the worker while virtual time moves forward in `step`s, until
@@ -1599,6 +1600,97 @@ mod tests {
             posts.iter().all(|post| (&post.0, &post.1) == first),
             "the batch in hand must keep going unchanged: {posts:?}",
         );
+    }
+
+    /// The budget and the backoff schedule are normative in the cross-plane
+    /// protocol — the control plane's `settleDelay` is chosen against this
+    /// number — so their values are pinned literally. Every other test here
+    /// compares the sender against itself and stays green if these move.
+    #[test]
+    fn the_retry_schedule_is_the_one_the_control_plane_was_sized_against() {
+        assert_eq!(RETRY_BUDGET, Duration::from_secs(30 * 60));
+        assert_eq!(RETRY_INITIAL_BACKOFF, Duration::from_secs(1));
+        assert_eq!(RETRY_MAX_BACKOFF, Duration::from_secs(30));
+    }
+
+    /// A status is re-sent only when the control plane could take the same
+    /// batch later. Everything else is it refusing this batch, which no
+    /// number of re-sends changes.
+    #[test]
+    fn only_a_temporary_refusal_is_re_sent() {
+        use reqwest::StatusCode;
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            assert!(is_retryable(status), "{status} must be re-sent");
+        }
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::CONFLICT,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            assert!(!is_retryable(status), "{status} is a refusal of THIS batch");
+        }
+    }
+
+    /// What the sender-side drop samples can and cannot attribute. The
+    /// member pair comes off the event, exactly as the queue's own drops
+    /// take it; the model and provider-key dimensions are the emitting
+    /// handler's label set, which the queue does not carry, so they read
+    /// `unknown`. Documentation quotes this, so it is pinned rather than
+    /// described.
+    #[tokio::test]
+    async fn a_sender_side_drop_names_the_member_and_nothing_else() {
+        let (server, _posts) = scripted_server(vec![dedups(400)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let (mut sender, tx) = staged_sender(cfg, metrics.clone(), &mut cancel_rx, 2).await;
+
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || drops_with_reason(&metrics, DROP_SEND_FAILED) == 2,
+            "the refused batch was not dropped",
+        )
+        .await;
+        drop(tx);
+
+        let rendered = metrics.render();
+        let dropped: Vec<&str> = rendered
+            .lines()
+            .filter(|line| {
+                line.starts_with("aisix_usage_event_drops_total{")
+                    && line.contains("reason=\"send_failed\"")
+            })
+            .collect();
+        // `ordered_events` gives each event its own member.
+        assert_eq!(dropped.len(), 2, "one series per member: {dropped:?}");
+        for line in &dropped {
+            assert!(
+                line.contains("model=\"unknown\"") && line.contains("provider_key_id=\"unknown\""),
+                "the queue carries events, not the handler's labels: {line}",
+            );
+        }
+        for member in ["user-0", "user-1"] {
+            assert!(
+                dropped
+                    .iter()
+                    .any(|line| line.contains(&format!("user_id=\"{member}\""))),
+                "whose usage was lost must stay answerable, missing {member}: {dropped:?}",
+            );
+        }
     }
 
     /// Shutdown gets one last attempt at the batch in hand and then stops —
