@@ -416,7 +416,7 @@ async fn deliver(
                 count,
                 error = %failure,
                 budget_secs = RETRY_BUDGET.as_secs(),
-                "telemetry batch failed; re-sending it (the control plane de-duplicates by batch id)",
+                "telemetry batch failed; re-sending (the control plane de-duplicates by batch id)",
             );
         }
 
@@ -444,7 +444,7 @@ async fn deliver(
 
 /// Give up on a batch: count every event it carried against the existing
 /// drop counter under `reason`, and log the one line that closes the retry
-/// the `re-sending it` line opened.
+/// the `re-sending` line opened.
 ///
 /// Attribution is thinner here than at the queue: `UsageSink::try_emit`
 /// takes the model and ProviderKey dimensions from the emitting handler's
@@ -476,7 +476,12 @@ fn drop_batch(
         attempts,
         reason,
         error = %failure,
-        "telemetry batch dropped (events lost)",
+        // Wording held verbatim from before re-sending existed: the
+        // control-plane e2e log scans allowlist this line by its exact text
+        // (`e2e/cases/dp_harness_test.go`, `dashboard/tests/e2e/dp-harness.ts`),
+        // and an offline window is expected to produce it. The two lines that
+        // bracket a re-send are new text and need allowlisting there.
+        "telemetry batch failed (events dropped)",
     );
 }
 
