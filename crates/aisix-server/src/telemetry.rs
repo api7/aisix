@@ -191,7 +191,13 @@ pub fn spawn(
     mut cancel: watch::Receiver<bool>,
 ) -> (UsageSink, tokio::task::JoinHandle<()>) {
     let (tx, rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
-    let sink = UsageSink::new(tx);
+    // Attached here as well as at the wiring point: this function holds the
+    // handle, so a caller cannot end up with a sink whose queue drops are
+    // invisible while the worker's are counted. (The wiring point still
+    // attaches it, because the no-control-plane branch builds a
+    // `UsageSink::disabled()` that never comes through here and still has
+    // `sink_disabled` to report.)
+    let sink = UsageSink::new(tx).with_metrics(metrics.clone());
     let handle = tokio::spawn(async move {
         run(cfg, metrics, rx, &mut cancel).await;
     });
