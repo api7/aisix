@@ -16,8 +16,8 @@
 //! read path reading a fully-formed `Arc<Snapshot>` the whole time.
 
 use aisix_core::config_status::{
-    hash_record, hash_records, AppliedSnapshot, ConfigStatus, IncomingRejection, LoadObservation,
-    PartialCompatResource, SourceKind,
+    hash_record, hash_records, AppliedSnapshot, ConfigStatus, IncomingRejection, LazyHash,
+    LoadObservation, PartialCompatResource, SourceKind,
 };
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::AisixSnapshot;
@@ -261,8 +261,16 @@ struct ObservedState {
     entries: BTreeMap<String, StateEntry>,
     checkpoints: Vec<(String, Context)>,
     digest: Option<String>,
+    /// Identity of `entries`, advanced by every change to them. Lets a
+    /// reader decide whether the observed configuration moved without
+    /// digesting it — see [`aisix_core::LazyHash`].
+    version: u64,
     #[cfg(test)]
     last_hashed_records: usize,
+    /// How many times the observed digest was actually computed — the
+    /// thing an apply must not do.
+    #[cfg(test)]
+    hash_calls: usize,
 }
 
 impl ObservedState {
@@ -270,6 +278,7 @@ impl ObservedState {
         let keep = self.checkpoints.partition_point(|(k, _)| k.as_str() < key);
         self.checkpoints.truncate(keep);
         self.digest = None;
+        self.version = self.version.wrapping_add(1);
     }
 
     fn insert(&mut self, entry: RawEntry) {
@@ -299,6 +308,10 @@ impl ObservedState {
         }
         if let Some(digest) = &self.digest {
             return digest.clone();
+        }
+        #[cfg(test)]
+        {
+            self.hash_calls += 1;
         }
         let (start, mut hash) = match self.checkpoints.last() {
             Some((key, hash)) => (Excluded(key.clone()), hash.clone()),
@@ -336,7 +349,10 @@ pub struct Supervisor<P: ConfigProvider> {
     // Cached records and SHA-256 prefixes share the authoritative entry
     // map's lock, so status publication cannot reuse a prefix invalidated
     // by a concurrent Put/Delete/resync. Disk snapshot encoding is lazy.
-    state: Mutex<ObservedState>,
+    /// `Arc` because the digests over it are computed on demand, by
+    /// whoever first reports one after an apply, long after the apply
+    /// that handed out the closure has returned.
+    state: Arc<Mutex<ObservedState>>,
     revision: Mutex<i64>,
     cache: SnapshotCache,
 
@@ -504,7 +520,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             sources,
             prefixes,
             handle: SnapshotHandle::new(AisixSnapshot::new()),
-            state: Mutex::new(ObservedState::default()),
+            state: Arc::new(Mutex::new(ObservedState::default())),
             revision: Mutex::new(0),
             cache,
             status: WatchStatus::new(),
@@ -556,12 +572,21 @@ impl<P: ConfigProvider> Supervisor<P> {
         let config_hash;
         let rejected: Vec<IncomingRejection>;
         {
-            let mut state = self.state.lock().unwrap();
+            let state = self.state.lock().unwrap();
             let rejections = self.rejections.lock().unwrap();
+            let version = state.version;
             // Every observed write, including a rejected one, contributes
             // to the source hash. Unchanged prefixes keep their SHA state.
-            source_hash = state.source_hash();
-            let rejected_keys: HashSet<&str> = rejections.iter().map(|r| r.key.as_str()).collect();
+            //
+            // Neither digest is computed here. Both are proportional to
+            // the whole configuration rather than to this apply, and an
+            // apply is not what reports them — see [`LazyHash`].
+            source_hash = {
+                let state = Arc::clone(&self.state);
+                LazyHash::deferred(version, move || state.lock().unwrap().source_hash())
+            };
+            let rejected_keys: HashSet<String> =
+                rejections.iter().map(|r| r.key.clone()).collect();
             // config_hash covers the bytes each key ACTUALLY serves: the
             // observed etcd bytes for accepted keys, the pinned last-known-
             // good bytes for stale-serving keys (#871), and nothing for a
@@ -573,11 +598,21 @@ impl<P: ConfigProvider> Supervisor<P> {
             // With nothing rejected and nothing pinned the filter admits
             // every key and the chain adds none, so the two digests are
             // over the identical record sequence — the overwhelmingly
-            // common case, and one full SHA-256 pass to skip.
+            // common case, and the same deferred digest to share.
             config_hash = if rejected_keys.is_empty() && stale.is_empty() {
                 source_hash.clone()
             } else {
-                hash_records(served_records(&state.entries, &rejected_keys, &stale))
+                let state = Arc::clone(&self.state);
+                let stale = stale.clone();
+                LazyHash::deferred(
+                    served_version(version, &rejected_keys, &stale),
+                    move || {
+                        let state = state.lock().unwrap();
+                        let keys: HashSet<&str> =
+                            rejected_keys.iter().map(String::as_str).collect();
+                        hash_records(served_records(&state.entries, &keys, &stale))
+                    },
+                )
             };
             rejected = rejections
                 .iter()
@@ -2151,6 +2186,35 @@ fn stamp_max(slot: &mut Option<i64>, revision: i64) {
 /// stale-serving one (#871), and nothing for a key rejected with no last
 /// good. `state` is already sorted, so the pinned records are merged into
 /// the walk rather than sorted with it.
+/// Identity of what [`served_records`] would produce, without walking the
+/// entry map: the observed state's own version plus the filter applied to
+/// it. Only reached when something is rejected or serving stale — the
+/// clean case shares the source digest's identity outright.
+///
+/// Conservative in one direction, like the identity it feeds: a change to
+/// a key that is rejected, and so serves nothing, still advances the
+/// observed state's version and therefore this. It never misses a change
+/// to what is served.
+fn served_version(
+    observed: u64,
+    rejected_keys: &HashSet<String>,
+    stale: &HashMap<String, StaleServing>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    observed.hash(&mut hasher);
+    let mut rejected: Vec<&str> = rejected_keys.iter().map(String::as_str).collect();
+    rejected.sort_unstable();
+    rejected.hash(&mut hasher);
+    let mut pinned: Vec<(&str, &[u8])> = stale
+        .values()
+        .map(|s| (s.entry.key.as_str(), s.entry.value.as_slice()))
+        .collect();
+    pinned.sort_unstable_by_key(|(key, _)| *key);
+    pinned.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn served_records(
     state: &BTreeMap<String, StateEntry>,
     rejected_keys: &HashSet<&str>,
@@ -2650,6 +2714,46 @@ mod tests {
         assert!(state.checkpoints.is_empty());
     }
 
+    /// Digesting is proportional to the whole configuration rather than
+    /// to the write that triggered the apply, and an apply is not what
+    /// reports the digest. So a run of applies with nothing reading must
+    /// cost no hashing at all, and the first report after them exactly
+    /// one pass — whose result is what the eager implementation produced.
+    #[test]
+    fn applies_do_not_hash_until_something_reports_the_digest() {
+        let sup = Supervisor::new(Arc::new(FakeProvider::new(vec![], 0)), "/aisix");
+        let mut rows = Vec::new();
+        for i in 0..16 {
+            rows.push(entry(&format!("/aisix/models/{i:04}"), VALID_MODEL, i + 1));
+            sup.apply_resync_at(&rows, Some(i + 1));
+        }
+        assert_eq!(
+            sup.state.lock().unwrap().hash_calls,
+            0,
+            "an apply nothing is reading must not digest the configuration",
+        );
+
+        let expected = aisix_core::config_status::hash_entries(
+            rows.iter()
+                .map(|row| (row.key.as_str(), row.value.as_slice())),
+        );
+        let view = sup.config_status().view();
+        assert_eq!(view.source.source_hash.as_deref(), Some(expected.as_str()));
+        assert_eq!(view.applied.unwrap().config_hash, expected);
+        assert_eq!(
+            sup.state.lock().unwrap().hash_calls,
+            1,
+            "reporting both digests over one unrejected state costs one pass",
+        );
+
+        sup.config_status().view();
+        assert_eq!(
+            sup.state.lock().unwrap().hash_calls,
+            1,
+            "a second report of the same state reuses the first result",
+        );
+    }
+
     #[test]
     fn observed_hash_is_rebuilt_on_full_resync() {
         let sup = Supervisor::new(Arc::new(FakeProvider::new(vec![], 0)), "/aisix");
@@ -2657,6 +2761,9 @@ mod tests {
             .map(|i| entry(&format!("/aisix/models/{i:04}"), VALID_MODEL, 1))
             .collect();
         sup.apply_resync_at(&rows, Some(1));
+        // Checkpoints are a by-product of digesting the observed state,
+        // which an apply no longer does — reporting the digest does.
+        sup.config_status().view();
         assert!(!sup.state.lock().unwrap().checkpoints.is_empty());
         rows.remove(240);
         rows[200].value = b"invalid JSON".to_vec();
