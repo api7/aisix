@@ -31,6 +31,8 @@ pub use pipeline::{PipelineConfig, SinkHandle, SinkPipeline, SinkStatsSnapshot};
 pub use record::{CapturedContent, EventBatch, SinkContent, SinkRecord, SCHEMA_VERSION};
 pub use sls::{resolve_sls_credential, AliyunSlsSink};
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 
 /// Health snapshot a sink reports for the circuit-breaker and the dashboard.
@@ -77,6 +79,16 @@ pub enum SinkError {
     /// throttle/429).
     #[error("transient sink error: {0}")]
     Transient(String),
+    /// Transient, and the sink said how long to wait: a `Retry-After` on a
+    /// 429 or a 503. Retrying sooner than asked is what turns a throttle
+    /// into a longer one, so the pipeline waits the stated delay instead
+    /// of its own backoff (bounded by `max_backoff` — a sink asking for
+    /// an hour does not get to stall the queue behind it that long).
+    #[error("transient sink error (retry after {retry_after:?}): {detail}")]
+    Throttled {
+        retry_after: Duration,
+        detail: String,
+    },
     /// Permanent for this batch — retrying it unchanged will fail again
     /// (auth/403, malformed payload, oversize). The pipeline stops hammering
     /// and surfaces a masked health error instead.
@@ -87,8 +99,43 @@ pub enum SinkError {
 impl SinkError {
     /// Whether the pipeline should retry this batch with backoff.
     pub fn is_transient(&self) -> bool {
-        matches!(self, SinkError::Transient(_))
+        matches!(self, SinkError::Transient(_) | SinkError::Throttled { .. })
     }
+
+    /// The delay the sink itself asked for, if it did.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            SinkError::Throttled { retry_after, .. } => Some(*retry_after),
+            _ => None,
+        }
+    }
+}
+
+/// The `Retry-After` on a throttled or overloaded response, as the HTTP
+/// spec allows it: delta-seconds, or an HTTP date to wait until.
+///
+/// Read only for 429 and 503, the two statuses where it means "come back
+/// later" rather than something about the resource. A value that is
+/// absent, unparseable or already in the past yields `None`, leaving the
+/// pipeline on its own backoff.
+pub(crate) fn retry_after_of(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<Duration> {
+    if status != reqwest::StatusCode::TOO_MANY_REQUESTS
+        && status != reqwest::StatusCode::SERVICE_UNAVAILABLE
+    {
+        return None;
+    }
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    if let Ok(secs) = raw.trim().parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let until = chrono::DateTime::parse_from_rfc2822(raw.trim()).ok()?;
+    (until.timestamp() - chrono::Utc::now().timestamp())
+        .try_into()
+        .ok()
+        .map(Duration::from_secs)
 }
 
 /// Render an error together with its full `source()` chain.
@@ -230,6 +277,69 @@ mod tests {
     fn sink_error_transience_drives_retry() {
         assert!(SinkError::Transient("429".into()).is_transient());
         assert!(!SinkError::Permanent("403".into()).is_transient());
+        // A throttle is a transient failure that came with instructions.
+        let throttled = SinkError::Throttled {
+            retry_after: Duration::from_secs(7),
+            detail: "429".into(),
+        };
+        assert!(throttled.is_transient());
+        assert_eq!(throttled.retry_after(), Some(Duration::from_secs(7)));
+        assert_eq!(SinkError::Transient("429".into()).retry_after(), None);
+    }
+
+    /// `Retry-After` is what a throttling receiver knows and our backoff
+    /// ladder does not. Read it in both forms the spec allows, and only
+    /// where it means "come back later".
+    #[test]
+    fn retry_after_is_read_on_throttle_and_overload_only() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        use reqwest::StatusCode;
+
+        let with = |raw: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(RETRY_AFTER, HeaderValue::from_str(raw).unwrap());
+            h
+        };
+
+        assert_eq!(
+            retry_after_of(StatusCode::TOO_MANY_REQUESTS, &with("30")),
+            Some(Duration::from_secs(30)),
+            "delta-seconds",
+        );
+        let date = chrono::Utc::now() + chrono::Duration::seconds(45);
+        let parsed = retry_after_of(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &with(&date.format("%a, %d %b %Y %H:%M:%S GMT").to_string()),
+        )
+        .expect("an HTTP date is a legal Retry-After");
+        assert!(
+            parsed >= Duration::from_secs(43) && parsed <= Duration::from_secs(45),
+            "an HTTP date resolves to the wait it implies: {parsed:?}",
+        );
+
+        // A date already past means "now", never a negative wait.
+        let past = chrono::Utc::now() - chrono::Duration::seconds(60);
+        assert_eq!(
+            retry_after_of(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &with(&past.format("%a, %d %b %Y %H:%M:%S GMT").to_string()),
+            ),
+            None,
+        );
+        assert_eq!(
+            retry_after_of(StatusCode::TOO_MANY_REQUESTS, &with("whenever")),
+            None,
+            "an unparseable value leaves the pipeline on its own backoff",
+        );
+        assert_eq!(
+            retry_after_of(StatusCode::INTERNAL_SERVER_ERROR, &with("30")),
+            None,
+            "on other statuses the header is not this instruction",
+        );
+        assert_eq!(
+            retry_after_of(StatusCode::TOO_MANY_REQUESTS, &HeaderMap::new()),
+            None,
+        );
     }
 
     #[test]

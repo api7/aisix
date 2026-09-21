@@ -587,6 +587,7 @@ impl ObservabilitySink for OtlpSink {
                         ..SinkAck::default()
                     });
                 }
+                let retry_after = crate::sink::retry_after_of(status, resp.headers());
                 let text = resp.text().await.unwrap_or_default();
                 let detail = format!(
                     "HTTP {}: {}",
@@ -599,7 +600,13 @@ impl ObservabilitySink for OtlpSink {
                     || status == reqwest::StatusCode::REQUEST_TIMEOUT
                     || status == reqwest::StatusCode::TOO_MANY_REQUESTS
                 {
-                    Err(SinkError::Transient(detail))
+                    Err(match retry_after {
+                        Some(retry_after) => SinkError::Throttled {
+                            retry_after,
+                            detail,
+                        },
+                        None => SinkError::Transient(detail),
+                    })
                 } else {
                     Err(SinkError::Permanent(detail))
                 }

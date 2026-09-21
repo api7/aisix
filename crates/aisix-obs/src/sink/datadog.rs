@@ -172,13 +172,20 @@ impl ObservabilitySink for DatadogSink {
             });
         }
 
+        let retry_after = super::retry_after_of(status, resp.headers());
         let body = resp.text().await.unwrap_or_default();
         let detail = parse_datadog_error(status, &body);
         // 429 (rate limit) and 5xx (502/503/504, transient server faults) are
         // worth retrying; other 4xx (400 malformed / 401/403 auth / 413 too
         // large) are config/auth/payload errors that fail identically on retry.
         if is_transient_status(status) {
-            Err(SinkError::Transient(detail))
+            Err(match retry_after {
+                Some(retry_after) => SinkError::Throttled {
+                    retry_after,
+                    detail,
+                },
+                None => SinkError::Transient(detail),
+            })
         } else {
             Err(SinkError::Permanent(detail))
         }

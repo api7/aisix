@@ -37,6 +37,14 @@ export interface MockOtlpOptions {
    * the sink's delivery retry re-sends byte-identical spans.
    */
   failFirst?: number;
+  /**
+   * Status to answer those first N POSTs with. 503 (the default) is a
+   * transient refusal the sink retries; a 4xx such as 400 is permanent, so
+   * the batch is dropped on its first attempt rather than after the
+   * pipeline's retry budget — which is minutes, and not something a test
+   * can wait out.
+   */
+  failStatus?: number;
 }
 
 export interface MockOtlp {
@@ -73,7 +81,11 @@ export async function startMockOtlp(
 ): Promise<MockOtlp> {
   const spans: CapturedSpan[] = [];
   const parseFailures: string[] = [];
-  const state = { posts: 0, failuresLeft: options.failFirst ?? 0 };
+  const state = {
+    posts: 0,
+    failuresLeft: options.failFirst ?? 0,
+    failStatus: options.failStatus ?? 503,
+  };
   const server: Server = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -130,7 +142,7 @@ export async function startMockOtlp(
       }
       if (state.failuresLeft > 0) {
         state.failuresLeft -= 1;
-        res.writeHead(503, { "content-type": "application/json" });
+        res.writeHead(state.failStatus, { "content-type": "application/json" });
         res.end("{}");
         return;
       }
