@@ -6,10 +6,12 @@ use tokio::sync::{mpsc, Semaphore};
 
 /// Rendered pieces in flight between the renderer and the response.
 ///
-/// One. The renderer is what should wait when the response is slow, not
-/// a queue: a scrape's peak memory is this many pieces, whatever the
-/// exposition's size.
-const PIECES_IN_FLIGHT: usize = 1;
+/// Two, so the renderer can be formatting the next piece while the
+/// socket drains the previous one. One made them strictly alternate,
+/// which costs the whole render the socket's latency once per piece. A
+/// scrape's peak memory is still this many pieces plus the one being
+/// filled, whatever the exposition's size.
+const PIECES_IN_FLIGHT: usize = 2;
 
 /// How long one piece may wait for the response to take it.
 ///
@@ -26,10 +28,6 @@ const PIECE_TIMEOUT: Duration = Duration::from_secs(30);
 /// out; what the case pins is the abandonment, not the number.
 #[cfg(test)]
 const PIECE_TIMEOUT: Duration = Duration::from_millis(200);
-
-/// How long to leave a full channel before looking again. Small against
-/// [`PIECE_TIMEOUT`], and only ever reached when the reader is behind.
-const PIECE_RETRY: Duration = Duration::from_millis(10);
 
 pub(crate) struct Scrape {
     /// One render at a time. Walking and formatting every series is the
@@ -66,6 +64,10 @@ impl Scrape {
     ) -> mpsc::Receiver<Result<Bytes, std::io::Error>> {
         let (sender, receiver) = mpsc::channel(PIECES_IN_FLIGHT);
         let gate = Arc::clone(&self.gate);
+        // Taken here, where there is a runtime to take it from: the
+        // render runs on a thread of its own and needs it to wait for
+        // the response without polling for capacity.
+        let runtime = tokio::runtime::Handle::current();
         // The producer outlives the handler that started it, so a
         // cancelled client releases the gate through the sink below
         // rather than by abandoning a permit.
@@ -78,7 +80,7 @@ impl Scrape {
                 let sender = sender.clone();
                 tokio::task::spawn_blocking(move || {
                     aisix_core::run_demoted("metrics-render", || {
-                        render(&mut |piece| hand_over(&sender, Bytes::from(piece)))
+                        render(&mut |piece| hand_over(&runtime, &sender, Bytes::from(piece)))
                     })
                 })
                 .await
@@ -100,31 +102,35 @@ impl Scrape {
     }
 }
 
-/// Give one piece to the response, waiting for it to take the previous
+/// Give one piece to the response, waiting for it to take an earlier
 /// one. `false` means stop rendering: the response is gone, or it has
 /// stopped taking pieces for longer than any live scrape would.
 ///
-/// A plain blocking send would be simpler and is what a render wants —
-/// but it waits on the reader without limit, and this render holds a
-/// process-wide gate while it does.
-fn hand_over(sender: &mpsc::Sender<Result<Bytes, std::io::Error>>, piece: Bytes) -> bool {
-    let deadline = std::time::Instant::now() + PIECE_TIMEOUT;
-    let mut piece = Ok(piece);
-    loop {
-        match sender.try_send(piece) {
-            Ok(()) => return true,
-            Err(mpsc::error::TrySendError::Closed(_)) => return false,
-            Err(mpsc::error::TrySendError::Full(unsent)) => {
-                if std::time::Instant::now() >= deadline {
-                    tracing::warn!(
-                        "a metrics scrape stopped reading; abandoning its render so later \
-                         scrapes are not blocked behind it",
-                    );
-                    return false;
-                }
-                piece = unsent;
-                std::thread::sleep(PIECE_RETRY);
-            }
+/// The wait is a real wait, not a poll. Looking again on a timer costs
+/// every full channel the whole interval even when the response drained
+/// it immediately, and at this exposition's size that is thousands of
+/// intervals — measured at 13.6x the time per byte against a reader
+/// that was never actually behind.
+fn hand_over(
+    runtime: &tokio::runtime::Handle,
+    sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
+    piece: Bytes,
+) -> bool {
+    // The timeout is built INSIDE the block, where the runtime context
+    // exists: a timer registers when it is created, not when it is
+    // awaited.
+    match runtime
+        .block_on(async { tokio::time::timeout(PIECE_TIMEOUT, sender.send(Ok(piece))).await })
+    {
+        Ok(Ok(())) => true,
+        // The response is gone; there is nothing left to render for.
+        Ok(Err(_)) => false,
+        Err(_) => {
+            tracing::warn!(
+                "a metrics scrape stopped reading; abandoning its render so later \
+                 scrapes are not blocked behind it",
+            );
+            false
         }
     }
 }
@@ -153,6 +159,51 @@ mod tests {
             }
         });
         assert_eq!(collect(body).await, "first\nsecond\nthird\n");
+    }
+
+    /// The handover must WAIT for the response, not look again on a
+    /// timer.
+    ///
+    /// A reader that is keeping up never fills the channel, so it cannot
+    /// tell the two apart — what does is a reader that is merely
+    /// *slower* than the renderer, which is every real one: the socket
+    /// drains 256 KiB more slowly than the recorder formats it. A poll
+    /// then costs each piece its whole interval instead of the reader's
+    /// actual latency, and an exposition this size is thousands of
+    /// pieces. The first version of this shipped a 10 ms retry and took
+    /// 13.6x as long per byte on a warm registry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_only_costs_the_render_its_own_latency() {
+        const PIECES: usize = 1200;
+        /// Well under the retry interval this replaced, so the interval
+        /// rather than this is what a poll would spend.
+        const READER_LATENCY: Duration = Duration::from_millis(1);
+
+        let scrape = Scrape::default();
+        let mut body = scrape.stream(|emit| {
+            for _ in 0..PIECES {
+                assert!(emit("a series line\n".to_owned()));
+            }
+        });
+        let started = std::time::Instant::now();
+        let mut taken = 0;
+        while let Some(piece) = body.recv().await {
+            piece.expect("a piece, not an error");
+            taken += 1;
+            tokio::time::sleep(READER_LATENCY).await;
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(taken, PIECES);
+        // Against the reader's OWN cost rather than a wall-clock number,
+        // so a slow machine moves both sides together. Measured here:
+        // ~2.1x the floor waiting on the reader, ~5x polling for it.
+        let floor = READER_LATENCY * PIECES as u32;
+        assert!(
+            elapsed < floor * 3,
+            "handing over {PIECES} pieces to a reader that takes each in \
+             {READER_LATENCY:?} took {elapsed:?}, against a floor of {floor:?} — \
+             the renderer is waiting on something other than the reader",
+        );
     }
 
     /// A reader that goes away must stop the render rather than let it
