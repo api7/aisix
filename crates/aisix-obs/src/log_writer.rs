@@ -78,6 +78,17 @@ struct Shared {
 
 impl Shared {
     fn push(&self, line: Vec<u8>) {
+        // The writer retires as soon as it finds the queue empty with the
+        // flag set, so an event enqueued after that point would sit there
+        // with no consumer and no accounting. Counting it as dropped is
+        // honest and cheap; SEALING the queue would mean the producer
+        // taking a lock, which is the one thing this must never do. The
+        // window left is between this load and the writer's exit, inside
+        // a process that is already on its way out.
+        if self.stopping.load(Ordering::Acquire) {
+            DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         if self.queue.push(line).is_err() {
             // Counted here rather than by the writer thread, because the
             // writer is parked inside the stuck sink for exactly as long
@@ -388,6 +399,26 @@ mod tests {
         for n in [0, 250, 499] {
             assert!(text.contains(&format!("line-{n}\n")), "missing line-{n}");
         }
+    }
+
+    /// An event that arrives after the writer has been told to stop has
+    /// no consumer left, so it has to be counted rather than queued.
+    #[test]
+    fn events_arriving_after_shutdown_are_counted_not_silently_queued() {
+        let sink = BlockedSink::new();
+        sink.release();
+        let (queue, writer) = LogWriter::start(sink.clone(), 64);
+        assert!(writer.shutdown(Duration::from_secs(5)), "queue drains");
+        let before = dropped_total();
+        let mut w = queue.make_writer();
+        w.write_all(&line(0)).expect("accepted");
+        drop(w);
+        assert_eq!(
+            dropped_total(),
+            before + 1,
+            "a late event must land in the drop total, not in the queue",
+        );
+        assert_eq!(writer.queued(), 0, "and not in the queue either");
     }
 
     /// The scenario this module exists for must not become a process

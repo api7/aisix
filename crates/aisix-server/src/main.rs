@@ -246,17 +246,21 @@ async fn async_main(cfg: Config) -> anyhow::Result<()> {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     let _ = enable_jemalloc_background_thread();
 
-    // Before any bridge builds its `reqwest::Client` — the connection
-    // pools are constructed once and can't be reconfigured afterwards.
-    aisix_gateway::upstream_http::init(upstream_http_config(&cfg.upstream)?)
-        .map_err(|e| anyhow::anyhow!("upstream TLS init failed: {e}"))?;
-
-    // Around `run`, not inside it: every `?` in there would otherwise
-    // exit with the shutdown path's log lines still queued, and this is
-    // the last point at which anything can still be written. The result
-    // is discarded on purpose — see `shutdown_logging`, there is nowhere
-    // left to report a sink that is not taking bytes.
-    let outcome = run(cfg).await;
+    // Everything from here on is inside the drained scope, because
+    // everything from here on can log and then fail: `?` would otherwise
+    // return with those lines still queued for a writer thread nobody is
+    // going to flush, and a boot that fails is precisely when the log is
+    // the only thing an operator has. The flush result is discarded on
+    // purpose — see `shutdown_logging`, there is nowhere left to report a
+    // sink that is not taking bytes.
+    let outcome = async {
+        // Before any bridge builds its `reqwest::Client` — the connection
+        // pools are constructed once and can't be reconfigured afterwards.
+        aisix_gateway::upstream_http::init(upstream_http_config(&cfg.upstream)?)
+            .map_err(|e| anyhow::anyhow!("upstream TLS init failed: {e}"))?;
+        run(cfg).await
+    }
+    .await;
     let _ = aisix_obs::shutdown_logging(LOG_FLUSH_DEADLINE);
     outcome
 }
