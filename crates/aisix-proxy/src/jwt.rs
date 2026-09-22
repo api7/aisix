@@ -975,16 +975,19 @@ fn bound_claim_matches(actual: &serde_json::Value, expect: &BoundClaimExpect) ->
 /// refuse to try is a token this gateway rejects for no reason the
 /// operator can see.
 ///
-/// [`JWKS_MAX_BYTES`] bounds how large that set may be, NOT what one
+/// Being uncapped is a decision, not an oversight (user ruling,
+/// 2026-09-22), and the cost was measured before it was taken.
+/// [`JWKS_MAX_BYTES`] bounds how large the set may be, NOT what one
 /// request spends walking it, and the conversion is steep: 512 KB holds
 /// ~3100 P-384 JWKs, and verifying against all of them is ~640 ms of
-/// synchronous work on the worker thread serving the request. Whether
-/// the walk happens at all is the caller's choice — a token carrying a
-/// `kid` takes the single-key path above. So the cost is bounded by
-/// what the configured `jwks_uri` publishes, which is the identity
-/// provider's choice and not the caller's; a set of that size is a
-/// misconfigured or hostile endpoint, not a real IdP (they publish one
-/// to three keys).
+/// synchronous work on the worker thread serving the request (~3100
+/// P-256: 215 ms; ~1400 RSA-2048: 28 ms). Whether the walk happens at
+/// all is the caller's choice — a token carrying a `kid` takes the
+/// single-key path above. What the walk COSTS is not: it is bounded by
+/// what the configured `jwks_uri` publishes, and a set of that size is
+/// a misconfigured or hostile endpoint rather than a real IdP, which
+/// publishes one to three keys. That exposure is accepted; do not
+/// reintroduce a cap without reopening the decision.
 fn candidate_keys(jwks: &JwkSet, kid: Option<&str>, alg: Algorithm) -> Vec<DecodingKey> {
     match kid {
         Some(kid) => jwks
@@ -993,6 +996,8 @@ fn candidate_keys(jwks: &JwkSet, kid: Option<&str>, alg: Algorithm) -> Vec<Decod
             .and_then(|jwk| DecodingKey::from_jwk(jwk).ok())
             .into_iter()
             .collect(),
+        // Deliberately unbounded — see the accepted-exposure paragraph
+        // above before adding a `.take()` here.
         None => jwks
             .keys
             .iter()
