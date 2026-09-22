@@ -1173,23 +1173,22 @@ mod tests {
     /// step is the caller's because it is a trade: it has to cross a backoff
     /// in a reasonable number of iterations without racing the request
     /// timeout of an exchange that is on the wire right now.
-    /// Step the sender's virtual clock until `done`, or fail with `what`.
     ///
-    /// **A condition that reads `posts` and a condition that reads a
-    /// metric are not interchangeable.** `posts` is pushed by the
-    /// wiremock responder, which runs on wiremock's own runtime in REAL
-    /// time; the sender's request timeout runs on the clock this
-    /// advances, in instant steps. So for an attempt the server never
-    /// answers, the sender can count the failure before wiremock has
-    /// dispatched the request to the responder at all — and an assertion
-    /// on `posts` placed AFTER a wait on the metric then reads a count
-    /// that has not caught up yet. Whatever such an assertion needs from
-    /// `posts` belongs in this condition, not after it; the wall-clock
-    /// deadline below keeps that from hanging.
+    /// **The step also decides whether an attempt gets DELIVERED.**
+    /// `posts` is pushed by the wiremock responder, on wiremock's own
+    /// runtime, in real time; the client's 10s request timeout runs on
+    /// the clock this advances, in instant steps. At one second a step an
+    /// attempt gets ten polls to cross a real socket — microseconds of
+    /// wall clock — before its own timeout cancels it, and a cancelled
+    /// request is never recorded at all. At ten milliseconds it gets a
+    /// thousand. So a phase that has to end with the server having
+    /// RECEIVED an attempt belongs on the small step, whatever the
+    /// condition is written in terms of; reaching it on the big step and
+    /// then reading `posts` is the shape that flakes.
     ///
-    /// An attempt the server ANSWERS carries no such race: the response
-    /// cannot exist unless the responder ran, and the responder records
-    /// the post before it replies.
+    /// An attempt the server ANSWERS carries no such race in either
+    /// direction: the response cannot exist unless the responder ran, and
+    /// the responder records the post before it replies.
     async fn drive_until<F: std::future::Future<Output = ()> + ?Sized>(
         mut sender: std::pin::Pin<&mut F>,
         step: Duration,
@@ -1650,13 +1649,14 @@ mod tests {
             "the failed batch was never re-sent",
         )
         .await;
-        // From here every attempt stalls past the request timeout. The
-        // first of them still goes out on the SMALL step: it has to reach
-        // wiremock, which records it in real time, and at a second a step
-        // an attempt gets ten polls to cross a real socket before its own
-        // 10s timeout — measured on this paused clock — cuts it off. This
-        // wait is what pins "a stalling batch is re-sent at all"; the
-        // count assertion below can then only add the upper bound.
+        // Attempt 2 stalled, and the wait above has already delivered it.
+        // This one takes the re-send AFTER it — attempt 3 — which is what
+        // says a batch that met no response goes again. It stays on the
+        // SMALL step because that delivery is what is being waited for:
+        // at a second a step an attempt gets ten polls to cross a real
+        // socket before its own 10s timeout cancels it, and a cancelled
+        // request is never recorded. This wait replaces the `attempts > 2`
+        // assertion that used to sit below it.
         drive_until(
             sender.as_mut(),
             STEP_WHILE_SERVING,
@@ -1682,12 +1682,18 @@ mod tests {
         // One lock per statement: `assert_identical_resends` takes the lock
         // itself, and a guard still alive from an argument expression would
         // deadlock against it.
-        // `attempts > 2` is no longer asserted here: the wait above is
-        // what establishes it, and repeating it after the fact would be a
-        // check that cannot fail. What is still worth saying is that
-        // every one of them carried the same batch.
-        let attempts = posts.lock().unwrap().len();
-        assert_identical_resends(&posts, attempts);
+        // `attempts > 2` is not asserted here: the wait above establishes
+        // it, and repeating it after the fact would be a check that
+        // cannot fail. What is worth saying is that every attempt carried
+        // the same batch — and that is asserted under ONE lock, because a
+        // count read in one statement and re-checked in the next can
+        // disagree with itself if a late recording lands in between.
+        let posts = posts.lock().unwrap();
+        let first = (&posts[0].0, &posts[0].1);
+        assert!(
+            posts.iter().all(|post| (&post.0, &post.1) == first),
+            "a re-send repeats the SAME batch id and the SAME events: {posts:?}",
+        );
         assert_eq!(
             drops_with_reason(&metrics, DROP_SEND_FAILED),
             0,
@@ -1969,14 +1975,20 @@ mod tests {
         drive_until(
             sender.as_mut(),
             STEP_WHILE_SERVING,
-            || {
-                drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED) == 2
-                    // The stalled attempts in between are recorded on
-                    // wiremock's clock, and the exact count below
-                    // includes them — see `drive_until`.
-                    && posts.lock().unwrap().len() >= MAX_ANSWERED_FAILURES * 2 - 1
-            },
+            || drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED) == 2,
             "the batch was never given up on",
+        )
+        .await;
+        // The stalled attempts in between are recorded on wiremock's
+        // clock, and the exact count below includes them. Its own wait,
+        // not a conjunct of the one above: folded together, a recording
+        // that never arrives would spend the wall-clock deadline and then
+        // report that the batch was never given up on — which it was.
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || posts.lock().unwrap().len() >= MAX_ANSWERED_FAILURES * 2 - 1,
+            "a stalled attempt was never recorded",
         )
         .await;
         drop(tx);
