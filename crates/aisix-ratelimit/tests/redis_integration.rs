@@ -628,6 +628,14 @@ impl RedisCutoff {
     fn blackhole(&self) {
         self.hole.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+
+    /// Forward again. Connections opened from now on work; the ones the
+    /// blackhole swallowed mid-handshake were abandoned by the client
+    /// when its own budget expired, which is what a Redis coming back up
+    /// looks like from the caller's end.
+    fn heal(&self) {
+        self.hole.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 fn counter_value(rendered: &str, operation: &str) -> f64 {
@@ -767,4 +775,237 @@ async fn a_silent_redis_fails_open_within_the_command_budget() {
         second < Duration::from_millis(500),
         "the command behind a failure must short-circuit, took {second:?}",
     );
+}
+
+/// A store whose connection never landed must BE the store an outage
+/// produces — every operation failing open to the per-replica counters —
+/// and it must take the shared backend over on its own once Redis
+/// answers.
+///
+/// `connect_or_attach_later` is the only production constructor
+/// (`RedisStore::connect` is now test-only), and the e2e that covers the
+/// boot exercises `acquire` and `commit` alone. The other three
+/// operations reach the same empty slot and are what a `Drop`, a
+/// post-stream token add and the `x-ratelimit-*` headers run through.
+#[tokio::test]
+async fn a_store_that_never_connected_fails_open_and_attaches_later() {
+    let Some(url) = redis_url() else { return };
+    let relay = RedisCutoff::start(&url).await;
+    // Silent from the first SYN: the store's own connect is what meets it.
+    relay.blackhole();
+
+    let mut cfg = single(&relay.url());
+    cfg.timeout_secs = 1;
+    let key = unique_key("boot-degraded");
+    // rpm=1 is what the fallback must refuse on; the concurrency cap is
+    // deliberately ABOVE the two requests below, or the concurrency gate
+    // would refuse the second one first and the rpm window would never
+    // be the thing under test.
+    let limits = RateLimit {
+        rpm: Some(1),
+        concurrency: Some(2),
+        ..Default::default()
+    };
+
+    let metrics = Metrics::new(false);
+    let started = std::time::Instant::now();
+    let (store, unreachable) = RedisStore::connect_or_attach_later(&cfg)
+        .await
+        .expect("an unreachable Redis is a diagnostic, not a fatal config error");
+    let elapsed = started.elapsed();
+    let store = store.with_metrics(metrics.clone());
+
+    // The whole point: it returned, on the configured budget, with the
+    // failure as a diagnostic rather than as an error to propagate.
+    assert!(
+        unreachable.is_some(),
+        "an unreachable Redis must be reported"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "connect_or_attach_later spent {elapsed:?}, not the configured 1s budget"
+    );
+
+    // Fails OPEN, and the fallback still ENFORCES: the second request in
+    // the same minute is refused by the local window, not admitted.
+    store
+        .acquire(&key, &limits, "boot-1")
+        .await
+        .expect("the local fallback admits the first request");
+    let refused = store
+        .acquire(&key, &limits, "boot-2")
+        .await
+        .expect_err("the local fallback still enforces rpm=1");
+    assert!(matches!(
+        refused,
+        aisix_ratelimit::RateLimitError::Requests { .. }
+    ));
+
+    // The remaining three operations run against the same empty slot.
+    // `peek` reports the local window rather than nothing at all.
+    let status = store
+        .peek(&key, &limits)
+        .await
+        .expect("peek falls back to the local window");
+    assert_eq!(status.rpm_limit, Some(1));
+    assert_eq!(status.rpm_used, 1);
+    store.add_tokens(&key, 7);
+    store.release(&key, "boot-1");
+
+    // The degradation is counted, which is the only signal it produces
+    // while no log level is raised.
+    assert!(
+        counter_value(&metrics.render(), "ratelimit_acquire") > 0.0,
+        "a degraded acquire must be counted"
+    );
+
+    // Redis comes up. The background task attaches it with no restart.
+    relay.heal();
+    let peer = RedisStore::connect(&single(&relay.url()))
+        .await
+        .expect("a healed Redis connects");
+    wait_for_attach(&store, &peer).await;
+
+    // Discriminating: a SECOND store, connected normally to the same
+    // Redis, is already over rpm=1 because of the request the first one
+    // just made. While the first store was counting locally this could
+    // not hold — the peer's window would be its own and empty.
+    let shared_key = unique_key("boot-attached");
+    store
+        .acquire(&shared_key, &limits, "attached-1")
+        .await
+        .expect("the attached store admits the first request");
+    peer.acquire(&shared_key, &limits, "peer-1")
+        .await
+        .expect_err("the attached store wrote to the SHARED counter, not to its local one");
+}
+
+/// Block until `store` has attached its shared backend, judged by an
+/// effect only the shared backend can produce: a token add that `peer` —
+/// a second store connected normally to the same Redis — can read back.
+///
+/// Not `peek`, and not a successful `acquire`: both of those answer from
+/// the local fallback too, so a gate built on either falls through
+/// immediately and leaves whatever follows it asserting against a store
+/// that may still be degraded. (Both gates here were written that way
+/// first; a mutation check caught it.)
+async fn wait_for_attach(store: &RedisStore, peer: &RedisStore) {
+    let probe = unique_key("attach-probe");
+    let limits = RateLimit {
+        tpm: Some(1_000_000),
+        ..Default::default()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        store.add_tokens(&probe, 1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if peer
+            .peek(&probe, &limits)
+            .await
+            .is_some_and(|s| s.tpm_used > 0)
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the shared backend never attached"
+        );
+    }
+}
+
+/// A reservation taken on the local fallback and committed after the
+/// shared backend attached must give its local concurrency slot back.
+///
+/// `LocalStore` has no ttl on `in_flight`, so a slot left behind is left
+/// behind for the life of the process: the local baseline for that bucket
+/// is permanently raised, and a LATER Redis outage then refuses traffic
+/// on a path whose entire contract is to fail open. The boot-degraded
+/// state makes this reachable on every cold start that precedes its
+/// Redis, where before it needed the exact instant a breaker closed.
+#[tokio::test]
+async fn a_commit_after_the_backend_attaches_returns_the_local_slot() {
+    let Some(url) = redis_url() else { return };
+    let relay = RedisCutoff::start(&url).await;
+    relay.blackhole();
+
+    let mut cfg = single(&relay.url());
+    cfg.timeout_secs = 1;
+    let key = unique_key("boot-handover");
+    // concurrency=1 and nothing else, so the only thing that can refuse
+    // the probe at the end is a leaked slot.
+    let limits = RateLimit {
+        concurrency: Some(1),
+        ..Default::default()
+    };
+
+    let (store, unreachable) = RedisStore::connect_or_attach_later(&cfg)
+        .await
+        .expect("an unreachable Redis is a diagnostic, not a fatal config error");
+    assert!(unreachable.is_some());
+
+    // Slot taken locally, while there is no connection.
+    store
+        .acquire(&key, &limits, "handover-1")
+        .await
+        .expect("the local fallback admits it");
+
+    relay.heal();
+    let peer = RedisStore::connect(&single(&relay.url()))
+        .await
+        .expect("a healed Redis connects");
+    wait_for_attach(&store, &peer).await;
+
+    // Committed against the shared backend, which never held the member.
+    store.commit(&key, 0, "handover-1").await;
+
+    // Now force the store back onto the local counters and check the slot
+    // came back. Without the release in `commit` this refuses.
+    relay.blackhole();
+    store
+        .acquire(&key, &limits, "handover-2")
+        .await
+        .expect("the local concurrency slot was returned on commit");
+}
+
+/// A config the driver can never use must still end the boot.
+///
+/// Everything else on this path is now retried forever in the
+/// background, and a typo does not come good on a retry: a gateway that
+/// starts healthy and is quietly never going to enforce a shared limit
+/// is strictly worse than the boot failure it replaced.
+#[tokio::test]
+async fn a_config_the_driver_cannot_use_is_still_fatal() {
+    let cfg = RedisConnConfig {
+        mode: RedisMode::Single,
+        url: Some("not-a-redis-url".into()),
+        ..Default::default()
+    };
+    let err = RedisStore::connect_or_attach_later(&cfg)
+        .await
+        .expect_err("a malformed url must not be degraded around");
+    assert!(aisix_redis::is_permanent_config_error(&err), "{err:?}");
+}
+
+/// A credential the server ANSWERED and refused is permanent too.
+///
+/// It is not the unreachable case the background retry exists for — the
+/// server is right there — and no amount of waiting turns a wrong
+/// password into a right one. Same judgement the etcd side already
+/// makes on a refused credential.
+#[test]
+fn a_refused_credential_is_permanent_too() {
+    let refused = redis::RedisError::from((
+        redis::ErrorKind::AuthenticationFailed,
+        "WRONGPASS invalid username-password pair",
+    ));
+    assert!(aisix_redis::is_permanent_config_error(&refused));
+
+    // …while an unreachable server is not, or a Redis that is merely
+    // late would stop the boot it is supposed to be ridden out.
+    let unreachable = redis::RedisError::from((
+        redis::ErrorKind::IoError,
+        "redis connect timed out",
+        "no connection within 5s".to_string(),
+    ));
+    assert!(!aisix_redis::is_permanent_config_error(&unreachable));
 }

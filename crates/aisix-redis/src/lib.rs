@@ -72,6 +72,12 @@
 //!   commands rather than one command — bounded, and the alternative is
 //!   billing a caller for detection on every window of every outage.
 //!
+//! The same reasoning applies to the connection a subsystem opens at
+//! **boot**, which nothing else bounds: [`connect_bounded`] spends at
+//! most one budget there, because the driver's own retry schedule for
+//! the initial connect is measured in minutes and boot holds the
+//! listeners closed while it runs.
+//!
 //! The breaker belongs to a **subsystem**, not to a connection — see
 //! [`FailurePolicy`]. A subsystem may hold several connections (the cache
 //! holds two: exact-KV and vector search) and one request touches all of
@@ -107,6 +113,63 @@ use tokio::sync::Mutex;
 /// is what a 5s window did, since the non-streaming completions this
 /// cache stores routinely take longer than that.
 pub const BREAKER_WINDOW: Duration = Duration::from_secs(30);
+
+/// A [`RedisConn`] that may not exist yet, shared by every operation of
+/// one subsystem.
+///
+/// A Redis that is unreachable when the gateway starts must not keep it
+/// from binding its listeners, so a subsystem carries on with the slot
+/// empty and a background task fills it in when Redis answers. An empty
+/// slot is the state a mid-flight outage already puts the subsystem in —
+/// every operation gets a connectivity error and runs its existing
+/// fail-open branch — which is why no consumer needs a branch of its own
+/// for it.
+///
+/// `ArcSwapOption` rather than a lock around the value: cloning a
+/// `RedisConn` out per operation is a deep clone of the driver's
+/// connection info (host, username, password), and [`RedisConn::acquire`]
+/// already makes one of those internally.
+#[derive(Clone)]
+pub struct ConnSlot(Arc<arc_swap::ArcSwapOption<RedisConn>>);
+
+impl ConnSlot {
+    pub fn filled(conn: RedisConn) -> Self {
+        Self(Arc::new(arc_swap::ArcSwapOption::from_pointee(conn)))
+    }
+
+    pub fn empty() -> Self {
+        Self(Arc::new(arc_swap::ArcSwapOption::empty()))
+    }
+
+    pub fn attach(&self, conn: RedisConn) {
+        self.0.store(Some(Arc::new(conn)));
+    }
+
+    /// Whether a connection has landed, so a retry loop does not re-dial
+    /// a slot it already filled.
+    pub fn is_attached(&self) -> bool {
+        self.get().is_some()
+    }
+
+    fn get(&self) -> Option<Arc<RedisConn>> {
+        self.0.load_full()
+    }
+
+    /// A live handle, or the error that makes the caller fail open.
+    pub async fn acquire(&self) -> RedisResult<RedisConnHandle> {
+        match self.get() {
+            Some(conn) => conn.acquire().await,
+            None => Err(not_connected_error()),
+        }
+    }
+
+    /// [`RedisConn::note_error`] on the connection if there is one.
+    pub async fn note_error(&self) {
+        if let Some(conn) = self.get() {
+            conn.note_error().await;
+        }
+    }
+}
 
 /// A long-lived Redis client handle. Cheap to [`Clone`] (every variant is
 /// `Arc`-backed). Build one with [`connect`].
@@ -564,6 +627,67 @@ fn breaker_open_error() -> redis::RedisError {
     ))
 }
 
+/// The error an operation gets while its subsystem holds no connection
+/// yet — the state [`connect_bounded`] leaves behind when Redis is
+/// unreachable at startup and the subsystem chose to carry on without
+/// it. `IoError` for the same reason as [`breaker_open_error`]: every
+/// consumer already classifies a connectivity failure as the cue to run
+/// its fail-open branch, and this is one.
+pub fn not_connected_error() -> redis::RedisError {
+    redis::RedisError::from((
+        redis::ErrorKind::IoError,
+        "redis is not connected yet",
+        "the backend was unreachable at startup; a background task keeps trying and \
+         commands run on the local fallback until it attaches"
+            .to_string(),
+    ))
+}
+
+/// True when a connect error can never come good on a retry: the
+/// operator wrote something the driver cannot use at all — a malformed
+/// `url`, TLS material that will not read or parse — or a credential the
+/// server answered and refused.
+///
+/// It matters because everything else here is now retried forever in the
+/// background. Retrying a typo turns a boot that said exactly what was
+/// wrong into a gateway that comes up healthy and is quietly never going
+/// to enforce a shared limit or cache anything, which is strictly worse
+/// than the failure it replaced. A refused credential is the same
+/// judgement the etcd side already makes: no amount of waiting turns a
+/// wrong password into a right one, and a server that ANSWERED is not
+/// the unreachable case the retry exists for.
+///
+/// It only classifies what the driver reports as such. A refusal the
+/// budget cut short arrives as a timeout instead, and is retried — which
+/// is the safe direction for a misclassification, since the alternative
+/// is refusing to start over a slow handshake.
+pub fn is_permanent_config_error(e: &redis::RedisError) -> bool {
+    matches!(
+        e.kind(),
+        redis::ErrorKind::InvalidClientConfig | redis::ErrorKind::AuthenticationFailed
+    )
+}
+
+/// The error a connect that outran its whole budget returns.
+///
+/// Separate from [`timed_out_error`] because the budget it spent is a
+/// MULTIPLE of the field the operator set, and a message that named
+/// `redis.timeout_secs (20s)` would send someone grepping their config
+/// for a 20 that is not in it. Name the product and the field it came
+/// from, both.
+fn connect_timed_out_error(budget: Duration, per_attempt: Duration) -> redis::RedisError {
+    redis::RedisError::from((
+        redis::ErrorKind::IoError,
+        "redis connect timed out",
+        format!(
+            "no connection within {}s (redis.timeout_secs = {}s, once per configured \
+             endpoint the connect walks plus one)",
+            budget.as_secs(),
+            per_attempt.as_secs()
+        ),
+    ))
+}
+
 fn timed_out_error(budget: Duration) -> redis::RedisError {
     redis::RedisError::from((
         redis::ErrorKind::IoError,
@@ -690,6 +814,147 @@ pub async fn connect(cfg: &RedisConnConfig) -> RedisResult<RedisConn> {
     connect_with(cfg, &FailurePolicy::new(cfg)).await
 }
 
+/// [`connect_with`], bounded in aggregate by the subsystem's command
+/// budget (`redis.timeout_secs`) rather than only per attempt.
+///
+/// `connect_with` sets the budget natively on the driver, which bounds
+/// each connection ATTEMPT — but not the call, because the single-node
+/// connection manager retries the initial connect on the driver's own
+/// schedule before it reports a failure. That schedule is not derived
+/// from anything the operator configured and it runs to minutes: a boot
+/// against a black-holed Redis measured **eight minutes** on `redis`
+/// 0.27 at `timeout_secs: 2`, with no log line and no error until the
+/// last attempt gave up. Boot awaits this connection before it binds a
+/// listener, so the gateway answered nothing at all for that whole
+/// stretch. The budget the operator set is what a boot may spend on it.
+///
+/// Reconnects after a successful start are NOT bounded here — they run
+/// inside the driver on that same schedule, behind the breaker and the
+/// per-command budget, so they cost a caller nothing.
+pub async fn connect_bounded(
+    cfg: &RedisConnConfig,
+    policy: &FailurePolicy,
+) -> RedisResult<RedisConn> {
+    let per_attempt = policy.0.timeout;
+    let budget = discovery_budget(configured_endpoints(cfg), per_attempt);
+    match tokio::time::timeout(budget, connect_with(cfg, policy)).await {
+        Ok(r) => r,
+        Err(_) => Err(connect_timed_out_error(budget, per_attempt)),
+    }
+}
+
+/// How many endpoints a connect may have to pay for before it lands.
+fn configured_endpoints(cfg: &RedisConnConfig) -> usize {
+    // Trimmed-empty entries are what `validate` tolerates and what
+    // `connect_with` then filters out, so they are never dialled and must
+    // not each buy a budget the walk will not spend.
+    let live = |urls: &[String]| urls.iter().filter(|u| !u.trim().is_empty()).count();
+    match cfg.mode {
+        RedisMode::Single => 0,
+        RedisMode::Cluster => live(&cfg.nodes),
+        RedisMode::Sentinel => live(&cfg.sentinels),
+    }
+}
+
+/// What a whole connect may spend, which is NOT one command budget in
+/// every topology: one per endpoint it may have to pay for, plus one for
+/// the connection it ends in.
+///
+/// `sentinel` discovery walks its sentinel list serially. `cluster`
+/// dials its seeds concurrently, but then walks the resulting connection
+/// map serially for `CLUSTER SLOTS` and again to dial the slot map's
+/// nodes — so either way a list whose front entries are unreachable is
+/// what spends the budgets, and that is the normal case those topologies
+/// exist for. One budget for the whole call would fail a connect that is
+/// working exactly as designed, in the one deployment shape built to
+/// survive a dead node.
+///
+/// For `cluster` this is an approximation rather than a strict ceiling:
+/// the slot map can name more nodes than the seed list does. Reaching it
+/// needs several of them black-holed at once, by which point the cluster
+/// itself is already broken.
+///
+/// One expression, used by both the outer bound in [`connect_bounded`]
+/// and sentinel's own discovery bound inside [`connect_with`], so the
+/// two cannot drift. They are equal, and the outer one starts marginally
+/// earlier (before the TLS material is read), so the outer is the one
+/// that reports — with the same budget in its message.
+fn discovery_budget(endpoints: usize, per_attempt: Duration) -> Duration {
+    let budgets = u32::try_from(endpoints)
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    per_attempt.saturating_mul(budgets)
+}
+
+/// The backend's address with the scheme, any userinfo and any path
+/// stripped, so a diagnostic can name WHICH Redis is unreachable. The
+/// configured URL itself must never be logged — it carries the password
+/// in `redis://user:pass@host` form.
+pub fn endpoint_label(cfg: &RedisConnConfig) -> String {
+    /// What a label says when the text it was given is not a URL whose
+    /// host can be identified. Never echo the input: the thing that makes
+    /// it unparseable is usually an unescaped character in the password.
+    const UNPARSEABLE: &str = "<unparseable redis endpoint>";
+
+    fn host(url: &str) -> &str {
+        let rest = url.split_once("://").map_or(url, |(_, r)| r);
+        // Authority first: an `@` can appear after the host too (in a
+        // path or a query), and only the one inside the authority is
+        // userinfo.
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        // Then the LAST `@` of the authority, so a password containing
+        // one cannot leave a fragment of itself in front of the host.
+        let candidate = authority.rsplit_once('@').map_or(authority, |(_, r)| r);
+        // And finally a shape check, because the two steps above trust
+        // the input to be well formed and a password is exactly what is
+        // most likely to make it not be. `redis://user:pw/x@host:6379`
+        // has authority `user:pw` by RFC 3986 — the `@` is in the path —
+        // so slicing alone would print the password. Emitting only text
+        // that looks like `host[:port]` makes that impossible whatever
+        // the input.
+        if is_host_port(candidate) {
+            candidate
+        } else {
+            UNPARSEABLE
+        }
+    }
+
+    /// `host`, `host:port`, or `[v6]:port` — nothing else.
+    fn is_host_port(s: &str) -> bool {
+        let (host, port) = match s.rsplit_once(':') {
+            Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => (h, Some(p)),
+            _ => (s, None),
+        };
+        let host = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+            // An IPv6 literal: hex groups and separators only.
+            Some(v6) => {
+                return !v6.is_empty()
+                    && v6
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+                    && port.is_none_or(|p| p.len() <= 5);
+            }
+            None => host,
+        };
+        !host.is_empty()
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
+    }
+    fn hosts(urls: &[String]) -> String {
+        urls.iter().map(|u| host(u)).collect::<Vec<_>>().join(",")
+    }
+    match cfg.mode {
+        RedisMode::Single => host(cfg.url.as_deref().unwrap_or_default()).to_string(),
+        RedisMode::Cluster => hosts(&cfg.nodes),
+        RedisMode::Sentinel => format!(
+            "master {} via {}",
+            cfg.master_name.as_deref().unwrap_or_default(),
+            hosts(&cfg.sentinels)
+        ),
+    }
+}
+
 /// [`connect`] against an existing [`FailurePolicy`].
 ///
 /// Every connection a subsystem opens from the same `redis:` block must
@@ -763,7 +1028,7 @@ pub async fn connect_with(cfg: &RedisConnConfig, policy: &FailurePolicy) -> Redi
                 .filter(|s| !s.is_empty())
                 .map(|s| insecure_url(s, cfg))
                 .collect();
-            let sentinels_len = sentinels.len().max(1) as u32;
+            let sentinels_len = sentinels.len().max(1);
             let master_name = cfg.master_name.clone().unwrap_or_default();
             // The master/data node may need its own auth and TLS; the
             // sentinels themselves carry theirs in `sentinels` URLs. Derive
@@ -824,13 +1089,13 @@ pub async fn connect_with(cfg: &RedisConnConfig, policy: &FailurePolicy) -> Redi
             // connect attempts inside it — so the whole exchange gets an
             // outer budget too, or an unreachable sentinel stalls the
             // boot attempt indefinitely.
-            let discovery_timeout = timeout * (sentinels_len + 1);
+            let discovery_timeout = discovery_budget(sentinels_len, timeout);
             let conn = tokio::time::timeout(
                 discovery_timeout,
                 client.get_async_connection_with_config(&conn_config(timeout)),
             )
             .await
-            .map_err(|_| timed_out_error(discovery_timeout))??;
+            .map_err(|_| connect_timed_out_error(discovery_timeout, timeout))??;
             tracing::info!(
                 target: "aisix::redis",
                 mode = "sentinel",
@@ -1591,5 +1856,163 @@ mod probe_tests {
         let (outcome, elapsed) = command(&conn).await;
         outcome.expect("Redis is back, so the command goes through");
         assert!(elapsed < BUDGET, "{elapsed:?}");
+    }
+}
+
+#[cfg(test)]
+mod boot_connect_tests {
+    use super::*;
+
+    fn single(url: &str) -> RedisConnConfig {
+        RedisConnConfig {
+            mode: RedisMode::Single,
+            url: Some(url.to_string()),
+            ..Default::default()
+        }
+    }
+
+    // The label goes into a boot WARN, so what it must never carry is the
+    // password — which is exactly what the shipped way of supplying one
+    // (`AISIX_RATELIMIT__REDIS__URL=redis://user:pass@host`) puts in the
+    // URL this is derived from.
+    #[test]
+    fn strips_scheme_userinfo_and_path() {
+        assert_eq!(
+            endpoint_label(&single("redis://10.0.0.1:6379")),
+            "10.0.0.1:6379"
+        );
+        assert_eq!(
+            endpoint_label(&single("rediss://user:p%40ss@10.0.0.1:6379/2")),
+            "10.0.0.1:6379"
+        );
+        // A password containing '@' must not leave its tail in front of
+        // the host, which is what splitting on the FIRST '@' would do.
+        assert_eq!(
+            endpoint_label(&single("redis://user:p@ss@10.0.0.1:6379")),
+            "10.0.0.1:6379"
+        );
+        assert_eq!(
+            endpoint_label(&single("redis://10.0.0.1:6379/#insecure")),
+            "10.0.0.1:6379"
+        );
+    }
+
+    // A one-budget bound would cut sentinel and cluster discovery short
+    // in exactly the deployment those modes exist for — the one with a
+    // dead node at the front of the list.
+    #[test]
+    fn the_connect_budget_pays_for_every_endpoint_the_walk_may_touch() {
+        let per_attempt = Duration::from_secs(5);
+        let budget =
+            |cfg: &RedisConnConfig| discovery_budget(configured_endpoints(cfg), per_attempt);
+
+        assert_eq!(budget(&single("redis://10.0.0.1:6379")), per_attempt);
+
+        let cluster = RedisConnConfig {
+            mode: RedisMode::Cluster,
+            nodes: vec!["redis://a:6379".into(), "redis://b:6379".into()],
+            ..Default::default()
+        };
+        assert_eq!(budget(&cluster), per_attempt * 3);
+
+        let sentinel = RedisConnConfig {
+            mode: RedisMode::Sentinel,
+            master_name: Some("mymaster".into()),
+            sentinels: vec![
+                "redis://s1:26379".into(),
+                "redis://s2:26379".into(),
+                "redis://s3:26379".into(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(budget(&sentinel), per_attempt * 4);
+    }
+
+    // The message is the only place an operator meets the aggregate, and
+    // the product is not a number they can find in their config — so it
+    // has to name the field it was derived from as well. Pinned because
+    // an e2e asserts on this text to prove the CONFIGURED budget, not
+    // the default, is what a boot spent.
+    #[test]
+    fn a_connect_timeout_names_both_the_aggregate_and_the_field() {
+        let err = connect_timed_out_error(Duration::from_secs(20), Duration::from_secs(5));
+        let msg = format!("{err}");
+        assert!(msg.contains("no connection within 20s"), "{msg}");
+        assert!(msg.contains("redis.timeout_secs = 5s"), "{msg}");
+    }
+
+    // The label goes into a log line, and the thing most likely to make
+    // a redis URL unparseable is an unescaped character in the password.
+    // So the rule is not "slice carefully" — it is "emit nothing that is
+    // not shaped like a host", whatever the input.
+    #[test]
+    fn a_url_it_cannot_read_yields_no_text_from_the_url() {
+        // RFC 3986 puts the authority at `user:secret` here — the `@` is
+        // inside the path — so slicing alone prints the password.
+        assert_eq!(
+            endpoint_label(&single("redis://user:secret/extra@redis.internal:6379")),
+            "<unparseable redis endpoint>"
+        );
+        assert_eq!(
+            endpoint_label(&single("redis://user:secret?x@redis.internal:6379")),
+            "<unparseable redis endpoint>"
+        );
+        assert_eq!(
+            endpoint_label(&single("redis://user:secret#x@redis.internal:6379")),
+            "<unparseable redis endpoint>"
+        );
+        assert_eq!(endpoint_label(&single("")), "<unparseable redis endpoint>");
+        // A port that is not a number is not a port, so the whole thing
+        // fails the shape check rather than being printed as a host.
+        assert_eq!(
+            endpoint_label(&single("redis://host:not-a-port")),
+            "<unparseable redis endpoint>"
+        );
+    }
+
+    #[test]
+    fn an_ipv6_literal_survives_the_shape_check() {
+        assert_eq!(
+            endpoint_label(&single("redis://[2001:db8::1]:6379")),
+            "[2001:db8::1]:6379"
+        );
+        assert_eq!(
+            endpoint_label(&single("redis://user:pw@[::1]:6379")),
+            "[::1]:6379"
+        );
+    }
+
+    // An entry `validate` tolerates and `connect_with` then filters out
+    // must not buy a budget the walk will never spend.
+    #[test]
+    fn a_blank_endpoint_buys_no_budget() {
+        let per_attempt = Duration::from_secs(5);
+        let cluster = RedisConnConfig {
+            mode: RedisMode::Cluster,
+            nodes: vec!["redis://a:6379".into(), "  ".into(), String::new()],
+            ..Default::default()
+        };
+        assert_eq!(
+            discovery_budget(configured_endpoints(&cluster), per_attempt),
+            per_attempt * 2
+        );
+    }
+
+    #[test]
+    fn names_every_topology() {
+        let cluster = RedisConnConfig {
+            mode: RedisMode::Cluster,
+            nodes: vec!["redis://a:6379".into(), "redis://admin:pw@b:6380".into()],
+            ..Default::default()
+        };
+        assert_eq!(endpoint_label(&cluster), "a:6379,b:6380");
+
+        let sentinel = RedisConnConfig {
+            mode: RedisMode::Sentinel,
+            master_name: Some("mymaster".into()),
+            sentinels: vec!["redis://s1:26379".into()],
+            ..Default::default()
+        };
+        assert_eq!(endpoint_label(&sentinel), "master mymaster via s1:26379");
     }
 }

@@ -11,5 +11,6 @@ description = "aisix: shared Redis connection layer (single / cluster / sentinel
 [dependencies]
 aisix-core = { path = "../aisix-core" }
 redis.workspace = true
+arc-swap.workspace = true
 tokio.workspace = true
 tracing.workspace = true

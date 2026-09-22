@@ -46,14 +46,23 @@
 #   AISIX_RATELIMIT__REDIS__URL=redis://<host>:6379
 #   AISIX_RATELIMIT__REDIS__TIMEOUT_SECS=5   # optional; this is the default
 #
-# `timeout_secs` bounds one Redis round trip and one connection attempt.
-# The limiter fails open to per-replica counting when Redis errors, but an
-# unreachable Redis produces no error at all until something times out, so
-# without the bound a rate-limited request waits on TCP retransmission for
-# minutes. Lower it for a Redis on the same node; it must be >= 1. After a
-# failure the limiter short-circuits for 30 seconds and then lets one
-# request probe, so an outage costs this budget once per 30 seconds rather
-# than once per request.
+# `timeout_secs` bounds one Redis round trip, and the connection the
+# gateway makes at startup (in `cluster`/`sentinel` mode the startup
+# connection gets this budget once per configured endpoint the discovery
+# walks, plus one). The limiter fails open to per-replica counting when
+# Redis errors, but an unreachable Redis produces no error at all until
+# something times out, so without the bound a rate-limited request waits
+# on TCP retransmission for minutes. Lower it for a Redis on the same
+# node; it must be >= 1. After a failure the limiter short-circuits for
+# 30 seconds and then lets one request probe, so an outage costs this
+# budget once per 30 seconds rather than once per request.
+#
+# A Redis that is unreachable when the gateway STARTS does not stop it:
+# the listeners bind, the limiter counts per replica (so cluster-wide
+# limits are not enforced) and one WARN names the backend. The shared
+# backend is attached in the background as soon as Redis answers — which
+# is the node-reboot case, where Redis comes up after the gateway. The
+# gateway never silently falls back to the `memory` backend.
 #
 # Subsequent boots re-use the mTLS bundle written under
 # `managed.mtls_dir`.
@@ -63,20 +72,29 @@ etcd:
   endpoints:
     - "https://placeholder-overridden-at-register:2379"
   prefix: "/aisix"
-  # Both timeouts are unset by default, and unset means unbounded; `0`
-  # means unbounded as well — the same reading a model's `timeout: 0`
-  # gets. (A model's `stream_timeout: 0` instead falls back to the next
-  # level of a resolution chain these flat startup keys do not have.)
-  # `dial_timeout_ms` bounds the whole dial — the TCP connect, the TLS
-  # handshake above it and the authentication exchange when `user` is
-  # set — and an expired dial is retried, not fatal;
-  # `request_timeout_ms` bounds a
-  # single request/response call (the configuration range read, creating
-  # the watch, the admin reads) but never the established watch stream. A
-  # `request_timeout_ms` the range read cannot finish inside makes the
-  # gateway retry it forever without ever serving traffic, so leave it
-  # unset unless a slow etcd must fail fast.
-  # dial_timeout_ms: 5000
+  # `0` means unbounded on either key — the same reading a model's
+  # `timeout: 0` gets. (A model's `stream_timeout: 0` instead falls back
+  # to the next level of a resolution chain these flat startup keys do
+  # not have.)
+  # `dial_timeout_ms` bounds a dial — the TCP connect, the TLS handshake
+  # above it and the authentication exchange when `user` is set — and an
+  # expired dial is retried, not fatal. The whole dial gets it once per
+  # configured endpoint (`dial_timeout_ms x max(1, endpoints)`), as
+  # headroom for a cluster with unreachable members. The window in which
+  # no listener is bound is `dial_timeout_ms x endpoints x 2`, because
+  # boot dials two providers one after the other. It defaults to 5000,
+  # because boot awaits the dial before binding any listener: a control
+  # plane that accepts the connection and then answers nothing would
+  # otherwise hold the proxy and metrics ports closed indefinitely, with
+  # the snapshot cache unread behind it. Set `0` for the old unbounded
+  # behaviour.
+  # `request_timeout_ms` is unset by default, and unset means unbounded.
+  # It bounds a single request/response call (the configuration range
+  # read, creating the watch, the admin reads) but never the established
+  # watch stream. A `request_timeout_ms` the range read cannot finish
+  # inside makes the gateway retry it forever without ever serving
+  # traffic, so leave it unset unless a slow etcd must fail fast.
+  # dial_timeout_ms: 5000   # this is the default; 0 = unbounded
   # request_timeout_ms: 5000
 
 proxy:

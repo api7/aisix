@@ -102,7 +102,7 @@ pub use error::{ErrorEnvelope, ProxyError};
 pub use health::{
     HealthTracker, LivezState, ModelRuntimeStatusTracker, RuntimeStatus, RuntimeStatusSnapshot,
 };
-pub use state::{CacheBackends, ProxyState};
+pub use state::{CacheBackends, ProxyState, SemanticRedisCell};
 
 use aisix_obs::{AccessLog, CancelledLabels};
 use axum::extract::State;

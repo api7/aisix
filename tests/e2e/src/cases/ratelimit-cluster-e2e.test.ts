@@ -229,16 +229,24 @@ describe("rate limit is NOT shared with backend=memory (per-replica, the #798 bu
  * forwarding it: Redis is reachable and refusing, so the gateway learns
  * of the failure immediately.
  *
+ * `blackholed: true` starts it that way, for the case where the gateway
+ * meets the silence during its own boot rather than mid-traffic; `heal()`
+ * ends it.
+ *
  * `blackhole()` keeps the socket open and never forwards or answers
  * anything, which is what a stopped container, a downed host or a
  * partitioned network looks like from the client end. Nothing arrives and
  * nothing is refused, so without a command budget the gateway waits on TCP
  * retransmission — for minutes.
  */
-async function startRedisCutoff(upstreamUrl: string): Promise<{
+async function startRedisCutoff(
+  upstreamUrl: string,
+  opts: { blackholed?: boolean } = {},
+): Promise<{
   url: string;
   cut(): void;
   blackhole(): void;
+  heal(): void;
   close(): Promise<void>;
 }> {
   const m = /^redis:\/\/(?:[^@/]*@)?([^:/]+)(?::(\d+))?/.exec(upstreamUrl);
@@ -246,7 +254,7 @@ async function startRedisCutoff(upstreamUrl: string): Promise<{
   const host = m[1];
   const port = m[2] ? Number(m[2]) : 6379;
   let cut = false;
-  let hole = false;
+  let hole = opts.blackholed ?? false;
   const live = new Set<Socket>();
   const server: Server = createServer((client) => {
     live.add(client);
@@ -283,6 +291,15 @@ async function startRedisCutoff(upstreamUrl: string): Promise<{
     },
     blackhole: () => {
       hole = true;
+    },
+    // Forwarding resumes for connections opened from now on. Sockets that
+    // were already swallowed mid-handshake stay broken — the client
+    // abandoned them when its own budget expired, which is what a Redis
+    // coming back up looks like from the gateway's end.
+    heal: () => {
+      hole = false;
+      for (const s of live) s.destroy();
+      live.clear();
     },
     close: () =>
       new Promise<void>((r) => {
@@ -479,5 +496,153 @@ describe("an unreachable Redis degrades the limiter instead of hanging the reque
     expect(second.status).toBe(200);
     await second.body?.cancel();
     expect(secondMs).toBeLessThan(1000);
+  });
+});
+
+
+// A Redis that is already unreachable when the gateway STARTS is the same
+// silence the describe above covers, met one step earlier — and it used to
+// cost the whole gateway rather than the limiter.
+//
+// The startup connect is awaited before any listener is bound, and
+// `timeout_secs` bounded only one attempt of it: the driver retries the
+// initial connect on a schedule of its own, which against a black-holed
+// address ran for eight minutes (measured, at `timeout_secs: 2`) before
+// reporting `timed out`. For that whole stretch there was no listener, no
+// `/livez`, no `/metrics`, no error line and no exit — a managed gateway
+// whose node rebooted ahead of its Redis looked hung rather than degraded.
+//
+// Three properties, and each is worthless without the others: the gateway
+// serves inside the budget it was given; the limiter still ENFORCES while
+// it is degraded (per replica, which is the documented fail-open state, not
+// "no limits"); and the shared backend takes over by itself once Redis
+// answers, so the degradation is temporary rather than a silent demotion
+// to the `memory` backend for the process's whole life.
+describe("a Redis unreachable at startup degrades the limiter, not the boot", () => {
+  let appA: SpawnedApp | undefined;
+  let appB: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let relay: Awaited<ReturnType<typeof startRedisCutoff>> | undefined;
+  let infraReady = false;
+  let bootMs = 0;
+  const prefix = `/aisix-e2e-rl-bootblackhole-${randomUUID()}`;
+  const model = "rl-redis-boot";
+  // Deliberately not the 5s default: the WARN below names the budget that
+  // was actually spent, so a gateway that ignored the per-block field
+  // would report `5s` there and fail that assertion.
+  const TIMEOUT_SECS = 2;
+
+  beforeAll(async () => {
+    infraReady = (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
+    if (!infraReady) return;
+
+    upstream = await startOpenAiUpstream();
+    // Silent from the first SYN onwards: the gateway's own connect meets it.
+    // A refused connection is a different, fast path and does not reproduce
+    // this at all.
+    relay = await startRedisCutoff(REDIS_URL, { blackholed: true });
+    const startedAt = Date.now();
+    appA = await spawnApp({
+      // `info`, so the background attach announces itself in `output()` —
+      // the gate the takeover assertion waits on.
+      logLevel: "info",
+      extra: {
+        etcd: sharedEtcd(prefix),
+        ratelimit: {
+          backend: "redis",
+          redis: { url: relay.url, timeout_secs: TIMEOUT_SECS },
+        },
+      },
+    });
+    bootMs = Date.now() - startedAt;
+    await seed(prefix, upstream.baseUrl, model);
+    await waitModelLive(appA.proxyUrl, model);
+  });
+
+  afterAll(async () => {
+    await appA?.exit();
+    await appB?.exit();
+    await upstream?.close();
+    await relay?.close();
+    if (infraReady) await new EtcdClient().deletePrefix(prefix);
+  });
+
+  test("it binds inside the budget, limits per replica, then takes the shared backend over", async (ctx) => {
+    if (!infraReady || !appA || !relay || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    // 1. It served at all, which `spawnApp` is what enforces: it gates on
+    //    `/livez` plus the metrics listener inside its own 10s readiness
+    //    budget, so a gateway that awaits the driver's retry schedule
+    //    never reaches this line. No UPPER bound on `bootMs` is asserted:
+    //    one at or above that readiness budget could not fail, and one
+    //    below it would be asserting how long an etcd dial and a first
+    //    config apply take on a machine shared with three other forks.
+    expect(appA.output()).toContain("aisix listening");
+
+    // 2. One WARN names the backend, WHICH Redis, and the budget it
+    //    spent — with no credentials, because a redis URL carries the
+    //    password. The budget is the discriminator for "on the
+    //    operator's budget rather than the driver's schedule": it is the
+    //    per-block `timeout_secs`, not the 5s default, and not a
+    //    multi-minute ladder.
+    const warn = appA
+      .output()
+      .split("\n")
+      .find((l) => l.includes("shared rate-limit backend unreachable at startup"));
+    expect(warn).toBeDefined();
+    expect(warn).toContain(new URL(relay.url).host);
+    expect(warn).toContain(`redis.timeout_secs = ${TIMEOUT_SECS}s`);
+    expect(warn).not.toContain("redis://");
+    //    The LOWER bound does hold, and fails if the connect never
+    //    reached the network at all: a boot that binds without spending
+    //    the budget has not been through the path under test.
+    expect(bootMs).toBeGreaterThanOrEqual(TIMEOUT_SECS * 1000);
+
+    // 3. The limiter still refuses: the seeded key is RPM=1, and a degraded
+    //    limiter that had stopped counting would serve both of these.
+    await awaitWindowHeadroom();
+    const first = await chatRequest(appA.proxyUrl, model);
+    expect(first.status).toBe(200);
+    await first.body?.cancel();
+    const second = await chatRequest(appA.proxyUrl, model);
+    expect(second.status).toBe(429);
+    await second.body?.cancel();
+
+    // 4. Redis comes up. A second replica joins on the same etcd namespace
+    //    and the same Redis — it connects normally, so it reads whatever
+    //    counter replica A is writing to. That is the discriminator: while
+    //    A counts locally, B's window is its own and B serves; once A has
+    //    attached the shared backend, A's request is B's counter too.
+    relay.heal();
+    appB = await spawnApp({
+      extra: {
+        etcd: sharedEtcd(prefix),
+        ratelimit: {
+          backend: "redis",
+          redis: { url: relay.url, timeout_secs: TIMEOUT_SECS },
+        },
+      },
+    });
+    await waitModelLive(appB.proxyUrl, model);
+
+    const attachDeadline = Date.now() + 20_000;
+    while (
+      !appA.output().includes("shared rate-limit backend attached") &&
+      Date.now() < attachDeadline
+    ) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    expect(appA.output()).toContain("shared rate-limit backend attached");
+
+    await awaitWindowHeadroom();
+    const onA = await chatRequest(appA.proxyUrl, model);
+    expect(onA.status).toBe(200);
+    await onA.body?.cancel();
+    const onB = await chatRequest(appB.proxyUrl, model);
+    expect(onB.status).toBe(429);
+    await onB.body?.cancel();
   });
 });

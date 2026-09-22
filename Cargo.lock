@@ -442,6 +442,7 @@ name = "aisix-redis"
 version = "0.3.0"
 dependencies = [
  "aisix-core",
+ "arc-swap",
  "redis",
  "tokio",
  "tracing",
@@ -465,6 +466,7 @@ dependencies = [
  "aisix-provider-vertex",
  "aisix-proxy",
  "aisix-ratelimit",
+ "aisix-redis",
  "anyhow",
  "axum 0.7.9",
  "chrono",
