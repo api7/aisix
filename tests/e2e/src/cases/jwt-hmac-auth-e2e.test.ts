@@ -48,8 +48,9 @@ import {
 //   5. `iss` binds: a token naming a JWKS provider is refused there and
 //      is NOT retried against a shared-secret provider that would have
 //      accepted it.
-//   6. Trial order: with two issuer-less providers, a token that
-//      verifies only against the second is accepted.
+//   6. Trial order, and no bound on it: with nine issuer-less
+//      providers, a token that verifies only against the ninth is
+//      accepted.
 //   7. A provider row that could not verify anything is rejected at
 //      load, and the valid rows keep serving.
 //   8. The secret reaches neither `/status/config` nor the process log.
@@ -70,6 +71,11 @@ const SECRET_FIRST = "first-provider-shared-secret-000001";
 const SECRET_SECOND = "second-provider-shared-secret-00002";
 const SECRET_PINNED = "pinned-provider-shared-secret-00003";
 const SECRET_UNKNOWN = "not-configured-anywhere-secret-00004";
+
+// Issuer-less providers seeded between `hmac-first` and `hmac-second`,
+// holding secrets nothing signs with. They make `hmac-second` the ninth
+// trial candidate, past the eight the trial list used to stop at.
+const ISSUERLESS_PADDING = 7;
 
 const PINNED_ISSUER = "https://pinned.hmac.test";
 const PINNED_AUDIENCE = "aisix-pinned";
@@ -165,12 +171,21 @@ describe("jwt auth e2e: shared-secret (HMAC) trust providers", () => {
       provider_key_id: pk.id,
     });
 
-    // Two issuer-less shared-secret providers. Trial order is by name,
-    // so `hmac-first` is tried before `hmac-second`.
+    // Issuer-less shared-secret providers. Trial order is by name, so
+    // `hmac-first` is tried first, then the seven padding providers,
+    // and `hmac-second` — the ninth — last. The padding is what makes
+    // the trial list longer than any fixed bound: a token only
+    // `hmac-second` can verify proves every candidate is tried.
     await seed.createOidcProvider({
       name: "hmac-first",
       hmac_secret: SECRET_FIRST,
     });
+    for (let i = 1; i <= ISSUERLESS_PADDING; i++) {
+      await seed.createOidcProvider({
+        name: `hmac-pad-${String(i).padStart(2, "0")}`,
+        hmac_secret: `padding-provider-shared-secret-${String(i).padStart(5, "0")}`,
+      });
+    }
     await seed.createOidcProvider({
       name: "hmac-second",
       hmac_secret: SECRET_SECOND,
@@ -376,12 +391,14 @@ describe("jwt auth e2e: shared-secret (HMAC) trust providers", () => {
     expect(await errorCode(res)).toBe("jwt_invalid");
   });
 
-  test("a token verifying only against the second issuer-less provider is accepted", async (ctx) => {
+  test("a token verifying only against the ninth issuer-less provider is accepted", async (ctx) => {
     if (skipUnlessUp(ctx)) return;
 
-    // `hmac-first` is tried first and fails on the signature; the trial
-    // continues, and `hmac-second`'s own key binding is what the
-    // request runs as.
+    // `hmac-first` and the seven padding providers are tried first and
+    // fail on the signature; the trial continues to `hmac-second`, the
+    // ninth candidate, and its own key binding is what the request runs
+    // as. The trial list is not truncated, so a provider past the ninth
+    // would authenticate too.
     const res = await chat(app!, signHs(SECRET_SECOND, hmacClaims({ sub: "agent-second" })));
     expect(res.status, await res.clone().text()).toBe(200);
 
