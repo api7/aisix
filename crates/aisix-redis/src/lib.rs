@@ -1040,7 +1040,7 @@ async fn settings_refusal(
     // healthy boot, and against an unreachable backend a share of the
     // budget, which would make an outage take longer to report than it
     // does today.
-    if !settings_the_server_can_reject(cfg) {
+    if !probe_is_worth_asking(cfg) {
         return Ok(false);
     }
     let probed = match cfg.mode {
@@ -1086,6 +1086,26 @@ async fn settings_refusal(
         Probe::Answered => Ok(true),
         Probe::Silent => Ok(false),
     }
+}
+
+/// Whether the question is worth asking at all.
+///
+/// Two reasons it is. The obvious one is that something is configured
+/// that the server could reject. The other is `cluster` and `sentinel`,
+/// where it is worth asking even when NOTHING is configured: a
+/// `requirepass` backend addressed with no credential answers `NOAUTH`,
+/// and both drivers bury that behind a failure of their own — an empty
+/// initial connection map for cluster, a master that failed its `ROLE`
+/// check for sentinel — so the gateway would report a live server as
+/// unreachable. `single` needs no such exception: its connection opens,
+/// and [`prove`] on that connection gets the `NOAUTH` directly.
+///
+/// Asking costs nothing a boot can feel. The probe runs alongside the
+/// connect rather than before it, so it spends wall clock the connect
+/// was spending anyway, and against a black-holed backend both meet the
+/// same deadline.
+fn probe_is_worth_asking(cfg: &RedisConnConfig) -> bool {
+    cfg.mode != RedisMode::Single || settings_the_server_can_reject(cfg)
 }
 
 /// Whether anything is configured that the data node itself can reject —
@@ -1169,7 +1189,12 @@ async fn probe(
         // promises the refusal, not always the setting.
         Err(e) => return Probe::Refused(e),
     };
-    match prove_with(&mut conn, proof_command(cfg.mode), timeout).await {
+    // `PING`, whatever the mode. The fan-out that makes it wrong on a
+    // cluster belongs to the cluster CONNECTION, and this one is a plain
+    // single-node connection to one seed — where the keyed read used on
+    // the real connection would instead come back `MOVED` from any node
+    // that does not own that slot, and prove nothing.
+    match prove_with(&mut conn, redis::cmd("PING"), timeout).await {
         Ok(()) => Probe::Answered,
         Err(e) if classify_connect_failure(&e) == ConnectFailure::Refused => Probe::Refused(e),
         Err(_) => Probe::Silent,
@@ -1309,7 +1334,7 @@ pub async fn connect_bounded(
     // degraded for it. Run together they share the wall clock instead:
     // a healthy connect gets the whole budget, and a black-holed one
     // still reports on the same deadline, because both time out on it.
-    let probe = settings_the_server_can_reject(cfg).then(|| {
+    let probe = probe_is_worth_asking(cfg).then(|| {
         let (cfg, timeout) = (cfg.clone(), per_attempt);
         tokio::spawn(async move {
             let tls = load_tls(&cfg).ok().flatten();
@@ -1950,6 +1975,32 @@ mod boot_check_tests {
         assert_eq!(with_db(RedisMode::Single), 7);
         assert_eq!(with_db(RedisMode::Sentinel), 7);
         assert_eq!(with_db(RedisMode::Cluster), 0);
+    }
+
+    /// `cluster` and `sentinel` ask even when nothing is configured,
+    /// because their drivers bury a `NOAUTH` behind a failure of their
+    /// own — measured against a live `requirepass` topology, both
+    /// reported `Unreachable` without this, for a server that was
+    /// answering. `single` does not need the exception: its connection
+    /// opens and `prove` gets the `NOAUTH` on it directly.
+    #[test]
+    fn cluster_and_sentinel_ask_even_with_nothing_configured() {
+        let plain = |mode| RedisConnConfig {
+            url: Some("redis://127.0.0.1:6379".into()),
+            nodes: vec!["redis://127.0.0.1:6379".into()],
+            sentinels: vec!["redis://127.0.0.1:26379".into()],
+            master_name: Some("mymaster".into()),
+            ..cfg(mode)
+        };
+        assert!(probe_is_worth_asking(&plain(RedisMode::Cluster)));
+        assert!(probe_is_worth_asking(&plain(RedisMode::Sentinel)));
+        // …and single stays gated, which is what keeps a plain
+        // deployment from opening a connection it does not need.
+        assert!(!probe_is_worth_asking(&plain(RedisMode::Single)));
+        assert!(probe_is_worth_asking(&RedisConnConfig {
+            password: Some("pw".into()),
+            ..plain(RedisMode::Single)
+        }));
     }
 
     /// The gate that keeps a plain deployment from paying for a question
