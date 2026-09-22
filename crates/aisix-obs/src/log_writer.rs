@@ -201,10 +201,23 @@ impl LogWriter {
                     if wrote {
                         let _ = sink.flush();
                     }
-                    worker.writing.store(false, Ordering::Release);
                     unreported += worker.unwarned.swap(0, Ordering::Relaxed);
                     // Only once the sink has caught up, so a sustained
                     // stall does not spend the queue on its own report.
+                    //
+                    // `writing` stays raised across this: an owed summary
+                    // is work in flight exactly as a popped line is. Were
+                    // it lowered first, a concurrent `shutdown` could see
+                    // a drained sink in the gap, set `stopping`, and then
+                    // `push` would discard the very line that accounts
+                    // for the gap.
+                    //
+                    // The `continue` below skips the stop check, so this
+                    // loop terminates only because `push` never feeds
+                    // `unwarned` once `stopping` is set: the counter
+                    // freezes there, one more report drains it, and the
+                    // pass after that returns. Teaching that branch to
+                    // count into `unwarned` would spin here forever.
                     if unreported > 0 && worker.queue.is_empty() {
                         tracing::warn!(
                             dropped = unreported,
@@ -213,6 +226,7 @@ impl LogWriter {
                         unreported = 0;
                         continue;
                     }
+                    worker.writing.store(false, Ordering::Release);
                     if worker.stopping.load(Ordering::Acquire) && worker.queue.is_empty() {
                         return;
                     }
