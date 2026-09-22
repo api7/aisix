@@ -442,7 +442,9 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
       const barrierId = barrier.headers.get("x-aisix-request-id") ?? "";
       await waitForLogLine(
         app,
-        (l) => l.includes(`request_id="${barrierId}"`),
+        (l) =>
+          l.includes("proxy request completed") &&
+          l.includes(`request_id="${barrierId}"`),
         `the access-log line for the barrier request ${barrierId}`,
       );
       const lines = app
