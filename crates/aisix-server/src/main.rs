@@ -943,6 +943,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 backend = "redis",
                 "connecting shared rate-limit backend"
             );
+            aisix_redis::warn_on_credential_shadowing(redis_cfg);
             // A Redis that is unreachable HERE does not stop the boot: the
             // listeners must bind whether or not the shared counters are
             // reachable, and the store degrades to per-replica counting
@@ -1040,6 +1041,9 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // both blocks on one unreachable server the limiter degraded
     // correctly and then the cache killed the process anyway.
     let exact_slot = aisix_redis::ConnSlot::empty();
+    if let Some(redis_cfg) = cache_redis.as_ref() {
+        aisix_redis::warn_on_credential_shadowing(redis_cfg.0);
+    }
     let redis_cache: Option<Arc<dyn Cache>> = cache_redis.as_ref().map(|_| {
         Arc::new(
             aisix_cache::RedisCache::with_slot(exact_slot.clone())
@@ -1812,13 +1816,29 @@ fn spawn_cache_attach(
                 }
                 Err(e) if last_reminder.elapsed() >= CACHE_DEGRADED_REMINDER => {
                     last_reminder = std::time::Instant::now();
-                    tracing::warn!(
-                        target: "aisix::cache",
-                        %endpoint,
-                        error = %e,
-                        "cache backend still unreachable; every backend=redis cache \
-                         policy is being served as a miss"
-                    );
+                    // Same distinction the boot makes, for a Redis that was
+                    // down when the gateway started and came back wanting a
+                    // password it does not have. Still retried — a serving
+                    // gateway must not die — but not called unreachable.
+                    if aisix_redis::is_permanent_config_error(&e) {
+                        tracing::warn!(
+                            target: "aisix::cache",
+                            %endpoint,
+                            error = %e,
+                            "the cache backend answered and REFUSED the configured \
+                             connection settings; every backend=redis cache policy will \
+                             be served as a miss until the configuration is corrected \
+                             and the gateway restarted"
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: "aisix::cache",
+                            %endpoint,
+                            error = %e,
+                            "cache backend still unreachable; every backend=redis cache \
+                             policy is being served as a miss"
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::debug!(

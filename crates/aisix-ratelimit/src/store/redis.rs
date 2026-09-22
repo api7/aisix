@@ -422,13 +422,32 @@ fn spawn_attach(
                 Err(e) => {
                     if last_reminder.elapsed() >= DEGRADED_REMINDER {
                         last_reminder = std::time::Instant::now();
-                        tracing::warn!(
-                            target: "aisix::ratelimit",
-                            %endpoint,
-                            error = %e,
-                            "shared rate-limit backend still unreachable; cluster-wide \
-                             rate limits are NOT enforced and counting stays per-replica"
-                        );
+                        // The boot refuses to start on a refusal, but this
+                        // loop is reached by a Redis that was DOWN at boot
+                        // and came back up wanting a password the gateway
+                        // does not have. Retrying is still right — the
+                        // gateway is serving and must not die — but calling
+                        // it unreachable would send the operator to the
+                        // network for a server that is answering.
+                        if aisix_redis::is_permanent_config_error(&e) {
+                            tracing::warn!(
+                                target: "aisix::ratelimit",
+                                %endpoint,
+                                error = %e,
+                                "the shared rate-limit backend answered and REFUSED the \
+                                 configured connection settings; cluster-wide rate limits \
+                                 are NOT enforced and will not be until the configuration \
+                                 is corrected and the gateway restarted"
+                            );
+                        } else {
+                            tracing::warn!(
+                                target: "aisix::ratelimit",
+                                %endpoint,
+                                error = %e,
+                                "shared rate-limit backend still unreachable; cluster-wide \
+                                 rate limits are NOT enforced and counting stays per-replica"
+                            );
+                        }
                     } else {
                         tracing::debug!(
                             target: "aisix::ratelimit",

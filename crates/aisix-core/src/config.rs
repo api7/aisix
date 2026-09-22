@@ -1518,7 +1518,9 @@ pub struct RedisConnConfig {
     pub password: Option<String>,
     /// Database index for the data node (default 0). Overrides the one
     /// the URL's path carries. Not applicable to `cluster` (Redis
-    /// Cluster only has DB 0).
+    /// Cluster only has DB 0), where it is not sent at all. A value the
+    /// server does not have ends the boot rather than degrading: the
+    /// server answered, and `SELECT 42` will not start working.
     pub database: Option<i64>,
     /// Trust settings for a `rediss://` connection. Independent of
     /// `upstream.tls` because the cache/rate-limit backend sits inside
