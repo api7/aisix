@@ -17,7 +17,7 @@ use std::time::Duration;
 use aisix_core::RedisConnConfig;
 use aisix_gateway::ChatResponse;
 use aisix_obs::metrics::Metrics;
-use aisix_redis::RedisConn;
+use aisix_redis::ConnSlot;
 use async_trait::async_trait;
 use redis::AsyncCommands;
 
@@ -32,7 +32,7 @@ pub const DEFAULT_PREFIX: &str = "aisix:cache";
 
 #[derive(Clone)]
 pub struct RedisCache {
-    conn: RedisConn,
+    conn: ConnSlot,
     ttl_secs: u64,
     prefix: String,
     /// Prometheus handle for `aisix_redis_failures_total`. A failed read
@@ -75,12 +75,23 @@ impl RedisCache {
         let conn = aisix_redis::connect_bounded(cfg, policy)
             .await
             .map_err(|e| CacheError::Backend(format!("redis connect: {e}")))?;
-        Ok(Self {
+        Ok(Self::with_slot(ConnSlot::filled(conn)))
+    }
+
+    /// Build the cache around a connection slot the caller owns.
+    ///
+    /// The slot may be EMPTY: a Redis that is unreachable when the
+    /// gateway starts must not keep it from binding its listeners, and
+    /// every operation below already fails open to a miss when it cannot
+    /// get a connection — which is exactly what an empty slot gives it.
+    /// The caller attaches the connection when Redis answers.
+    pub fn with_slot(conn: ConnSlot) -> Self {
+        Self {
             conn,
             ttl_secs: DEFAULT_TTL.as_secs(),
             prefix: DEFAULT_PREFIX.into(),
             metrics: None,
-        })
+        }
     }
 
     /// Count Redis operation failures on `metrics` (#1060).

@@ -170,26 +170,74 @@ describe("etcd credentials: unreachable is waited out, refused is not", () => {
     expect(metrics.status).toBe(200);
   }, 120_000);
 
-  test("an unbounded dial that hangs says so instead of going silent", async (ctx) => {
+  test("an omitted dial timeout is bounded by the shipped default", async (ctx) => {
     if (!etcdReachable) {
       ctx.skip();
       return;
     }
-    // The same silent endpoint as the spec above, but with
-    // `dial_timeout_ms` left unset — the shipped default, and the only
-    // configuration in which the dial has no bound at all. The gateway
-    // is then stuck inside `Client::connect` before any listener binds,
-    // and it used to write NOTHING: an operator saw a process with no
-    // port, no log line and nothing to grep for. The bound is unchanged
-    // — what is asserted is that the wait is audible.
+    // The same silent endpoint as the spec above, with `dial_timeout_ms`
+    // left unset. Boot awaits this dial before it binds ANY listener, so
+    // an endpoint that accepts the connection and then answers nothing
+    // used to hold `:3000` and `:9090` closed for as long as it stayed
+    // quiet — and the snapshot cache that exists for exactly that outage
+    // sits unread behind the same await. The key now defaults to 5000 ms,
+    // so an operator who wrote nothing gets a gateway that comes up.
+    //
+    // The boot pays the budget once PER PROVIDER — the environment prefix
+    // and the shared pricing catalog are dialled one after the other — so
+    // the port opens after roughly two of them, not one. That is why this
+    // waits itself instead of letting `spawnAuthenticated` gate on
+    // readiness: the harness budget is 10s, which is exactly where two
+    // default budgets land.
+    const prefix = `/aisix-e2e-etcd-auth-default-${randomUUID()}`;
+    const relay = await startEtcdRelay();
+    relays.push(relay);
+    await relay.hold();
+
+    const app = await spawnAuthenticated(relay.endpoint, prefix, {}, false);
+    const metricsPort = Number(new URL(app.metricsUrl).port);
+    const deadline = Date.now() + 30_000;
+    let bound = false;
+    while (!bound && Date.now() < deadline) {
+      bound = await tcpAccepts(metricsPort);
+      if (!bound) await sleep(200);
+    }
+    // The whole point: with no `dial_timeout_ms` written anywhere, the
+    // port comes up. Unbounded, it never did.
+    expect(bound).toBe(true);
+
+    // And the bound that let it through is the dial's — not a refusal,
+    // not the read bound.
+    expect(app.output()).toContain(DEFERRED_LINE);
+    expect(app.output()).toContain("etcd.dial_timeout_ms");
+    // Not silently given up on: the supervisor keeps dialling behind the
+    // open port.
+    expect(await waitForOutput(app, BACKOFF_LINE, 30_000, 2)).toBeGreaterThanOrEqual(2);
+
+    const metrics = await fetch(`${app.metricsUrl}/metrics`);
+    expect(metrics.status).toBe(200);
+  }, 120_000);
+
+  test("dial_timeout_ms: 0 still waits forever, and says so while it does", async (ctx) => {
+    if (!etcdReachable) {
+      ctx.skip();
+      return;
+    }
+    // Unbounded is now something an operator asks for rather than
+    // something they get by omission, and asking for it must still work:
+    // a deployment behind a slow authenticating proxy chose this. The
+    // gateway is then stuck inside `Client::connect` before any listener
+    // binds, and it used to write NOTHING while it was — an operator saw
+    // a process with no port, no log line and nothing to grep for. What
+    // is asserted is that the wait is audible.
     const prefix = `/aisix-e2e-etcd-auth-hang-${randomUUID()}`;
     const relay = await startEtcdRelay();
     relays.push(relay);
     await relay.hold();
 
-    // Nothing to wait for: the proxy, admin and metrics listeners are
-    // all still unopened, which is the defect.
-    const app = await spawnAuthenticated(relay.endpoint, prefix, {}, false);
+    // Nothing to wait for: the proxy, admin and metrics listeners are all
+    // still unopened, which is what `0` buys.
+    const app = await spawnAuthenticated(relay.endpoint, prefix, { dial_timeout_ms: 0 }, false);
     // Two lines, not one: a single line is also what a one-off warning
     // would produce. The repetition is what tells an operator the
     // gateway is still waiting rather than having given up.

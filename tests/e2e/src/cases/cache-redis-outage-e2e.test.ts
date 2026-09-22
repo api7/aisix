@@ -78,16 +78,20 @@ async function redisVectorSupport(url: string): Promise<boolean | null> {
 /** A TCP relay in front of Redis that the test can black-hole: after
  *  `blackhole()` the sockets stay open and nothing is forwarded or
  *  answered, ever. */
-async function startRedisBlackhole(upstreamUrl: string): Promise<{
+async function startRedisBlackhole(
+  upstreamUrl: string,
+  opts: { blackholed?: boolean } = {},
+): Promise<{
   url: string;
   blackhole(): void;
+  heal(): void;
   close(): Promise<void>;
 }> {
   const m = /^redis:\/\/(?:[^@/]*@)?([^:/]+)(?::(\d+))?/.exec(upstreamUrl);
   if (!m) throw new Error(`unparseable redis url: ${upstreamUrl}`);
   const host = m[1];
   const port = m[2] ? Number(m[2]) : 6379;
-  let hole = false;
+  let hole = opts.blackholed ?? false;
   const live = new Set<Socket>();
   const server: Server = createServer((client) => {
     live.add(client);
@@ -119,6 +123,14 @@ async function startRedisBlackhole(upstreamUrl: string): Promise<{
     url: `redis://127.0.0.1:${addr.port}`,
     blackhole: () => {
       hole = true;
+    },
+    // Forwarding resumes for connections opened from now on; the sockets
+    // swallowed mid-handshake are dropped, which is what a Redis coming
+    // back up looks like from the client end.
+    heal: () => {
+      hole = false;
+      for (const s of live) s.destroy();
+      live.clear();
     },
     close: () =>
       new Promise<void>((resolve, reject) => {
@@ -454,4 +466,123 @@ describe("an exact-only policy still pays one budget", () => {
     expect(degraded.ms).toBeGreaterThanOrEqual(TIMEOUT_SECS * 1000);
     expect(degraded.ms).toBeLessThan(ONE_BUDGET_MS);
   }, 60_000);
+});
+
+
+// A cache Redis that is already unreachable when the gateway STARTS used
+// to end the boot. Neither half of that was right.
+//
+// The connect ran on the driver's own retry schedule rather than on
+// `timeout_secs`, so the process sat before any listener bind for about
+// eight minutes with no log line, and only then exited. And exiting at
+// all was the odd one out: every cache operation already fails open to a
+// miss, and a RUNNING gateway rides out an unbounded cache-Redis outage
+// that way — only boot was fatal.
+//
+// The deployment that makes it concrete is the one `config.example.yaml`
+// recommends: `ratelimit.redis` pointing at the same Redis as
+// `cache.redis`. With both blocks on one unreachable server the limiter
+// degraded correctly and the cache then killed the process anyway, so the
+// gateway served nothing at all — which is the shape this whole release
+// is fixing.
+describe("a cache Redis unreachable at startup degrades the cache, not the boot", () => {
+  let app: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let embed: Awaited<ReturnType<typeof startEmbeddingMock>> | undefined;
+  let relay: Awaited<ReturnType<typeof startRedisBlackhole>> | undefined;
+  let ready = false;
+  const prefix = `/aisix-e2e-cache-boot-${randomUUID()}`;
+
+  beforeAll(async () => {
+    ready = await vectorRedisReady();
+    if (!ready) return;
+
+    upstream = await startOpenAiUpstream();
+    embed = await startEmbeddingMock();
+    // Silent from the first SYN: the gateway's own boot connect is what
+    // meets it. A refused connection is a different, fast path.
+    relay = await startRedisBlackhole(REDIS_URL, { blackholed: true });
+    app = await spawnApp({
+      // `info`, so the background attach announces itself in `output()`.
+      logLevel: "info",
+      extra: {
+        etcd: { endpoints: [ETCD_ENDPOINT], prefix },
+        cache: {
+          backend: "redis",
+          redis: { url: relay.url, timeout_secs: TIMEOUT_SECS },
+        },
+        // The shared-Redis deployment, pointed at the same dead relay.
+        ratelimit: {
+          backend: "redis",
+          redis: { url: relay.url, timeout_secs: TIMEOUT_SECS },
+        },
+      },
+    });
+    await seed(prefix, embed.baseUrl, upstream.baseUrl);
+    const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(
+      async () => (await probe.listModels()).status === 200,
+    );
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+    await embed?.close();
+    await relay?.close();
+    if (ready) await new EtcdClient().deletePrefix(prefix);
+  });
+
+  test("it serves with every backend=redis policy a miss, then starts caching", async (ctx) => {
+    if (!ready || !app || !relay || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    // 1. It serves at all. Reaching this line already means the listeners
+    //    bound — `spawnApp` gates on `/livez` plus the metrics listener
+    //    within its own readiness budget, which is what fails on a
+    //    gateway that exits instead.
+    const first = await timeChat(app.proxyUrl, EXACT_MODEL, "boot degraded one");
+    expect(first.status).toBe(200);
+
+    // 2. One WARN names the backend and WHICH Redis, with no credentials.
+    const warn = app
+      .output()
+      .split("\n")
+      .find((l) => l.includes("cache backend unreachable at startup"));
+    expect(warn).toBeDefined();
+    expect(warn).toContain(new URL(relay.url).host);
+    expect(warn).not.toContain("redis://");
+
+    // 3. Every backend=redis policy is a miss while degraded, so the same
+    //    prompt reaches the upstream twice. This is what says "serving
+    //    uncached" rather than "serving from some other cache".
+    const before = upstream.receivedRequests.length;
+    await timeChat(app.proxyUrl, EXACT_MODEL, "boot degraded two");
+    await timeChat(app.proxyUrl, EXACT_MODEL, "boot degraded two");
+    expect(upstream.receivedRequests.length - before).toBe(2);
+
+    // 4. Redis comes up and the cache attaches itself — the degradation
+    //    is temporary, not a silent demotion for the life of the process.
+    relay.heal();
+    const deadline = Date.now() + 30_000;
+    while (
+      !app.output().includes("cache backend attached") &&
+      Date.now() < deadline
+    ) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    expect(app.output()).toContain("cache backend attached");
+
+    // …and it really caches now: the second identical prompt does not
+    //    reach the upstream. A store that had attached in name only would
+    //    still forward it.
+    const warm = upstream.receivedRequests.length;
+    const miss = await timeChat(app.proxyUrl, EXACT_MODEL, "boot attached one");
+    expect(miss.status).toBe(200);
+    const hit = await timeChat(app.proxyUrl, EXACT_MODEL, "boot attached one");
+    expect(hit.status).toBe(200);
+    expect(upstream.receivedRequests.length - warm).toBe(1);
+  }, 150_000);
 });

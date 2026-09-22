@@ -41,8 +41,7 @@ use std::sync::Arc;
 
 use aisix_core::{RateLimit, RedisConnConfig};
 use aisix_obs::metrics::Metrics;
-use aisix_redis::{FailurePolicy, RedisConn, RedisConnHandle};
-use arc_swap::ArcSwapOption;
+use aisix_redis::{ConnSlot, FailurePolicy};
 use async_trait::async_trait;
 use redis::Script;
 
@@ -209,55 +208,6 @@ redis.call('ZREMRANGEBYSCORE', prefix .. ':conc', 0, now - conc_ttl)
 local inflight = redis.call('ZCARD', prefix .. ':conc')
 return {rpm, tpm, inflight, 60 - (now % 60)}
 "#;
-
-/// The connection the store runs its commands on, held in a slot rather
-/// than inline because it may not exist yet.
-///
-/// A Redis that is unreachable when the gateway starts must not keep it
-/// from binding its listeners, so boot carries on with the slot empty and
-/// a background task fills it in when Redis answers.
-/// An empty slot is the state a mid-flight outage already puts this store
-/// in — every operation gets a connectivity error and runs on the
-/// per-replica fallback — which is why it needs no branch of its own
-/// anywhere below.
-#[derive(Clone)]
-struct ConnSlot(Arc<ArcSwapOption<RedisConn>>);
-
-impl ConnSlot {
-    fn filled(conn: RedisConn) -> Self {
-        Self(Arc::new(ArcSwapOption::from_pointee(conn)))
-    }
-
-    fn empty() -> Self {
-        Self(Arc::new(ArcSwapOption::empty()))
-    }
-
-    fn attach(&self, conn: RedisConn) {
-        self.0.store(Some(Arc::new(conn)));
-    }
-
-    /// `ArcSwapOption` rather than a lock around the value: cloning a
-    /// `RedisConn` out on every operation is a deep clone of the
-    /// driver's connection info (host, username, password), and
-    /// `RedisConn::acquire` already makes one of those internally.
-    fn get(&self) -> Option<Arc<RedisConn>> {
-        self.0.load_full()
-    }
-
-    /// A live handle, or the error that makes the caller fail open.
-    async fn acquire(&self) -> Result<RedisConnHandle, redis::RedisError> {
-        match self.get() {
-            Some(conn) => conn.acquire().await,
-            None => Err(aisix_redis::not_connected_error()),
-        }
-    }
-
-    async fn note_error(&self) {
-        if let Some(conn) = self.get() {
-            conn.note_error().await;
-        }
-    }
-}
 
 pub struct RedisStore {
     conn: ConnSlot,

@@ -427,7 +427,6 @@ dependencies = [
  "aisix-core",
  "aisix-obs",
  "aisix-redis",
- "arc-swap",
  "async-trait",
  "dashmap",
  "parking_lot",
@@ -443,6 +442,7 @@ name = "aisix-redis"
 version = "0.3.0"
 dependencies = [
  "aisix-core",
+ "arc-swap",
  "redis",
  "tokio",
  "tracing",

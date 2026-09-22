@@ -72,20 +72,25 @@ etcd:
   endpoints:
     - "https://placeholder-overridden-at-register:2379"
   prefix: "/aisix"
-  # Both timeouts are unset by default, and unset means unbounded; `0`
-  # means unbounded as well — the same reading a model's `timeout: 0`
-  # gets. (A model's `stream_timeout: 0` instead falls back to the next
-  # level of a resolution chain these flat startup keys do not have.)
+  # `0` means unbounded on either key — the same reading a model's
+  # `timeout: 0` gets. (A model's `stream_timeout: 0` instead falls back
+  # to the next level of a resolution chain these flat startup keys do
+  # not have.)
   # `dial_timeout_ms` bounds the whole dial — the TCP connect, the TLS
   # handshake above it and the authentication exchange when `user` is
-  # set — and an expired dial is retried, not fatal;
-  # `request_timeout_ms` bounds a
-  # single request/response call (the configuration range read, creating
-  # the watch, the admin reads) but never the established watch stream. A
-  # `request_timeout_ms` the range read cannot finish inside makes the
-  # gateway retry it forever without ever serving traffic, so leave it
-  # unset unless a slow etcd must fail fast.
-  # dial_timeout_ms: 5000
+  # set — and an expired dial is retried, not fatal. It defaults to 5000,
+  # because boot awaits the dial before binding any listener: a control
+  # plane that accepts the connection and then answers nothing would
+  # otherwise hold the proxy and metrics ports closed indefinitely, with
+  # the snapshot cache unread behind it. Set `0` for the old unbounded
+  # behaviour.
+  # `request_timeout_ms` is unset by default, and unset means unbounded.
+  # It bounds a single request/response call (the configuration range
+  # read, creating the watch, the admin reads) but never the established
+  # watch stream. A `request_timeout_ms` the range read cannot finish
+  # inside makes the gateway retry it forever without ever serving
+  # traffic, so leave it unset unless a slow etcd must fail fast.
+  # dial_timeout_ms: 5000   # this is the default; 0 = unbounded
   # request_timeout_ms: 5000
 
 proxy:

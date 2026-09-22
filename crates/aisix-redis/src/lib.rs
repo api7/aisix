@@ -114,6 +114,57 @@ use tokio::sync::Mutex;
 /// cache stores routinely take longer than that.
 pub const BREAKER_WINDOW: Duration = Duration::from_secs(30);
 
+/// A [`RedisConn`] that may not exist yet, shared by every operation of
+/// one subsystem.
+///
+/// A Redis that is unreachable when the gateway starts must not keep it
+/// from binding its listeners, so a subsystem carries on with the slot
+/// empty and a background task fills it in when Redis answers. An empty
+/// slot is the state a mid-flight outage already puts the subsystem in —
+/// every operation gets a connectivity error and runs its existing
+/// fail-open branch — which is why no consumer needs a branch of its own
+/// for it.
+///
+/// `ArcSwapOption` rather than a lock around the value: cloning a
+/// `RedisConn` out per operation is a deep clone of the driver's
+/// connection info (host, username, password), and [`RedisConn::acquire`]
+/// already makes one of those internally.
+#[derive(Clone)]
+pub struct ConnSlot(Arc<arc_swap::ArcSwapOption<RedisConn>>);
+
+impl ConnSlot {
+    pub fn filled(conn: RedisConn) -> Self {
+        Self(Arc::new(arc_swap::ArcSwapOption::from_pointee(conn)))
+    }
+
+    pub fn empty() -> Self {
+        Self(Arc::new(arc_swap::ArcSwapOption::empty()))
+    }
+
+    pub fn attach(&self, conn: RedisConn) {
+        self.0.store(Some(Arc::new(conn)));
+    }
+
+    fn get(&self) -> Option<Arc<RedisConn>> {
+        self.0.load_full()
+    }
+
+    /// A live handle, or the error that makes the caller fail open.
+    pub async fn acquire(&self) -> RedisResult<RedisConnHandle> {
+        match self.get() {
+            Some(conn) => conn.acquire().await,
+            None => Err(not_connected_error()),
+        }
+    }
+
+    /// [`RedisConn::note_error`] on the connection if there is one.
+    pub async fn note_error(&self) {
+        if let Some(conn) = self.get() {
+            conn.note_error().await;
+        }
+    }
+}
+
 /// A long-lived Redis client handle. Cheap to [`Clone`] (every variant is
 /// `Arc`-backed). Build one with [`connect`].
 #[derive(Clone)]

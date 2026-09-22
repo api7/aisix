@@ -125,9 +125,20 @@ pub struct EtcdConfig {
     /// read at connect time — never stored in the config struct.
     #[serde(default)]
     pub password_env: Option<String>,
-    /// Bound on dialling etcd, in milliseconds. Unset — the default —
-    /// and `0` both mean unbounded (see the note on `0` under
-    /// [`EtcdConfig::request_timeout`]), leaving it to the OS TCP stack.
+    /// Bound on dialling etcd, in milliseconds. Unset, it is
+    /// [`DEFAULT_ETCD_DIAL_TIMEOUT_MS`]; an explicit `0` means unbounded
+    /// (see the note on `0` under [`EtcdConfig::request_timeout`]),
+    /// leaving it to the OS TCP stack.
+    ///
+    /// The default is finite, unlike `request_timeout_ms`, because the
+    /// two bound different things. A range read's cost scales with the
+    /// size of the configuration set, so a default bound on it would
+    /// abort the one call whose expiry leaves the instance with nothing
+    /// to serve. A dial has no such cost, and boot awaits it before it
+    /// binds ANY listener — so an endpoint that accepts the TCP
+    /// connection and then answers nothing held `:3000` and `:9090`
+    /// closed for as long as it stayed quiet, with the snapshot cache
+    /// that exists for exactly that outage sitting unread behind it.
     ///
     /// When set it covers the whole dial: it reaches hyper's connector
     /// via `Endpoint::connect_timeout` for the TCP handshake, and the
@@ -136,7 +147,7 @@ pub struct EtcdConfig {
     /// etcd-client issues when `user` / `password_env` are set are
     /// bounded too. An expired dial reports an etcd that could not be
     /// reached, which the gateway retries rather than exits on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default = "default_etcd_dial_timeout_ms")]
     pub dial_timeout_ms: Option<u64>,
     /// Bound on a single request/response etcd call, in milliseconds.
     /// Unset — the default — and `0` both mean unbounded (see the note on
@@ -564,12 +575,23 @@ impl Default for EtcdConfig {
             env_id: String::new(),
             user: None,
             password_env: None,
-            dial_timeout_ms: None,
+            dial_timeout_ms: Some(DEFAULT_ETCD_DIAL_TIMEOUT_MS),
             request_timeout_ms: None,
             tls: None,
         }
     }
 }
+
+fn default_etcd_dial_timeout_ms() -> Option<u64> {
+    Some(DEFAULT_ETCD_DIAL_TIMEOUT_MS)
+}
+
+/// Default bound on one etcd dial. Generous enough that a healthy dial
+/// — including its TLS handshake and the `Authenticate` round trip when
+/// `user` is set — never trips it, short enough that a gateway scheduled
+/// ahead of its control plane binds its listeners and serves from the
+/// snapshot cache instead of waiting silently.
+pub const DEFAULT_ETCD_DIAL_TIMEOUT_MS: u64 = 5000;
 
 impl EtcdConfig {
     fn default_prefix() -> String {
@@ -2641,11 +2663,13 @@ admin:
     }
 
     #[test]
-    fn etcd_timeouts_default_to_unset_meaning_unbounded() {
-        // Both keys are optional and default to unbounded. A finite
-        // default would bound the configuration range read, whose cost
-        // scales with the size of the configuration set — the one call
-        // whose expiry leaves the instance with nothing to serve.
+    fn an_unset_dial_timeout_is_bounded_while_an_unset_read_timeout_is_not() {
+        // The two keys default differently, on purpose. A finite default
+        // on the range read would bound a call whose cost scales with the
+        // size of the configuration set — the one call whose expiry
+        // leaves the instance with nothing to serve. A dial has no such
+        // cost and boot awaits it before binding any listener, so it does
+        // get a default.
         let f = write_yaml(
             r#"
 etcd:
@@ -2659,9 +2683,12 @@ admin:
 "#,
         );
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
-        assert_eq!(cfg.etcd.dial_timeout_ms, None);
+        assert_eq!(cfg.etcd.dial_timeout_ms, Some(DEFAULT_ETCD_DIAL_TIMEOUT_MS));
         assert_eq!(cfg.etcd.request_timeout_ms, None);
-        assert_eq!(cfg.etcd.dial_timeout(), None);
+        assert_eq!(
+            cfg.etcd.dial_timeout(),
+            Some(Duration::from_millis(DEFAULT_ETCD_DIAL_TIMEOUT_MS))
+        );
         assert_eq!(cfg.etcd.request_timeout(), None);
     }
 
@@ -2691,11 +2718,15 @@ admin:
 
     #[test]
     fn etcd_timeouts_read_zero_as_unbounded_not_as_an_instant_abort() {
-        // `0` is the same as unset for both keys, matching what
-        // `Model::timeout: 0` already means. The alternative reading —
-        // abort immediately — bricks the gateway silently: every connect
-        // and every read expires, so the proxy listener never binds and
-        // nothing says why. The one `0` in this repo that means "fall
+        // `0` means unbounded on both keys, matching what
+        // `Model::timeout: 0` already means. On `request_timeout_ms` that
+        // is also what unset gives; on `dial_timeout_ms` it is now the
+        // only way to ask for it, and asking is the point — an operator
+        // who wants the dial left alone says `0` rather than omitting the
+        // key. The alternative reading of `0` — abort immediately —
+        // bricks the gateway silently: every connect and every read
+        // expires, so the proxy listener never binds and nothing says
+        // why. The one `0` in this repo that means "fall
         // back to the next level" is `Model::stream_timeout`, which needs
         // a resolution chain these two flat startup keys do not have.
         let f = write_yaml(

@@ -11,7 +11,6 @@ description = "aisix: fixed-window rate limiter (commit/read-only modes) + semap
 [dependencies]
 aisix-core = { path = "../aisix-core" }
 aisix-redis = { path = "../aisix-redis" }
-arc-swap.workspace = true
 aisix-obs = { path = "../aisix-obs" }
 tokio.workspace = true
 dashmap.workspace = true

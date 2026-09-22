@@ -7,17 +7,25 @@ etcd:
   prefix: "/aisix"
   # user: "aisix"
   # password_env: "AISIX_ETCD_PASSWORD"
-  # Optional bounds on etcd I/O. Both are unset by default, and unset
-  # means unbounded. `0` means unbounded as well — the same reading a
-  # model's `timeout: 0` gets. (A model's `stream_timeout: 0` is the odd
-  # one out: it falls back to the next level of a resolution chain these
-  # flat startup settings do not have.)
+  # Optional bounds on etcd I/O. `0` means unbounded on either key — the
+  # same reading a model's `timeout: 0` gets. (A model's
+  # `stream_timeout: 0` is the odd one out: it falls back to the next
+  # level of a resolution chain these flat startup settings do not have.)
   #
   # `dial_timeout_ms` bounds the whole dial: the TCP connect, the TLS
   # handshake after it, and the authentication exchange when `user` is
-  # set. An expired dial is treated as an etcd that is not reachable —
-  # the gateway keeps retrying it rather than exiting.
-  # `request_timeout_ms` bounds a single request/response call — the
+  # set. It defaults to 5000 — the two keys default differently on
+  # purpose. Boot awaits the dial before it binds ANY listener, so an
+  # endpoint that accepts the connection and then answers nothing used to
+  # hold both ports closed for as long as it stayed quiet, with the
+  # snapshot cache that exists for exactly that outage sitting unread
+  # behind it. Set `0` to ask for the old unbounded behaviour. An expired
+  # dial is treated as an etcd that is not reachable — the gateway binds,
+  # serves whatever the snapshot cache holds, and keeps retrying in the
+  # background rather than exiting.
+  #
+  # `request_timeout_ms` is unset by default, and unset means unbounded.
+  # It bounds a single request/response call — the
   # configuration range read at boot and on every reconnect, creating the
   # watch, and the admin API's reads. It deliberately does not apply to
   # the established watch stream, which is long-lived and would be torn
@@ -27,7 +35,7 @@ etcd:
   # etcd to fail fast: the range read grows with the size of your
   # configuration, and a bound it cannot finish inside makes the gateway
   # retry the same read forever without ever serving traffic.
-  # dial_timeout_ms: 5000
+  # dial_timeout_ms: 5000   # this is the default; 0 = unbounded
   # request_timeout_ms: 5000
   # Optional TLS / mTLS bundle. Required when connecting to an
   # AISIX Cloud Data Plane Manager (endpoint is https:// and the control plane issues

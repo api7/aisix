@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use aisix_core::RedisConnConfig;
 use aisix_gateway::ChatResponse;
 use aisix_obs::metrics::Metrics;
-use aisix_redis::RedisConn;
+use aisix_redis::ConnSlot;
 use async_trait::async_trait;
 use dashmap::DashMap;
 
@@ -52,7 +52,7 @@ struct EnsuredIndex {
 }
 
 pub struct RedisSemanticCache {
-    conn: RedisConn,
+    conn: ConnSlot,
     prefix: String,
     /// Per-policy memo of the index this instance has ensured, so the
     /// hot path pays one `DashMap` read instead of an `FT.CREATE`
@@ -100,12 +100,20 @@ impl RedisSemanticCache {
         let conn = aisix_redis::connect_bounded(cfg, policy)
             .await
             .map_err(|e| CacheError::Backend(format!("redis connect: {e}")))?;
-        Ok(Self {
+        Ok(Self::with_slot(ConnSlot::filled(conn)))
+    }
+
+    /// Build the store around a connection slot the caller owns; see
+    /// [`super::RedisCache::with_slot`]. An empty slot makes every
+    /// lookup an ordinary miss, which is the same thing this store does
+    /// during an outage.
+    pub fn with_slot(conn: ConnSlot) -> Self {
+        Self {
             conn,
             prefix: DEFAULT_PREFIX.into(),
             ensured: DashMap::new(),
             metrics: None,
-        })
+        }
     }
 
     /// Count Redis operation failures on `metrics` (#1060).
