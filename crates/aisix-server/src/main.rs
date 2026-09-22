@@ -955,9 +955,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 })?;
             if let Some(e) = degraded {
                 // Host and port only, never the configured URL: redis URLs
-                // carry credentials. `error` carries the server's own
-                // words when it answered, which is the only part that says
-                // WHICH setting it refused.
+                // carry credentials. `error` is as specific as the driver
+                // allows: it passes a refused `SELECT` through with the
+                // server's own text, but replaces a refused AUTH with a
+                // fixed "Password authentication failed", so the WARN can
+                // promise the refusal and not always which setting.
                 let reason = aisix_redis::failure_reason(&e);
                 let endpoint = aisix_redis::endpoint_label(redis_cfg);
                 if reason == "refused" {
@@ -1129,8 +1131,9 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             Err(e) => {
                 // Deliberately no URL: redis URLs carry credentials
                 // (redis://user:pass@host) and this error lands in logs
-                // that may ship to centralized sinks. `error` does carry
-                // the server's own words when it answered.
+                // that may ship to centralized sinks. `error` is as
+                // specific as the driver allows — see the rate-limit
+                // site above.
                 let reason = aisix_redis::failure_reason(&e);
                 let endpoint = aisix_redis::endpoint_label(redis_cfg);
                 if reason == "refused" {

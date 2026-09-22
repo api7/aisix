@@ -687,9 +687,13 @@ describe("a cache Redis that refuses the credential degrades the cache, not the 
       `*${args.length}\r\n` + args.map((a) => `$${Buffer.byteLength(a)}\r\n${a}\r\n`).join("");
     await new Promise<void>((resolve, reject) => {
       const sock = connect({ host, port }, () => sock.write(payload));
-      sock.once("data", () => {
+      sock.once("data", (buf) => {
         sock.destroy();
-        resolve();
+        // A `-ERR` reply is a failed setup, and swallowing it would make
+        // the test fail later on a missing WARN and point at the product.
+        const text = buf.toString();
+        if (text.startsWith("-")) reject(new Error(text.trim()));
+        else resolve();
       });
       sock.once("error", (e) => {
         sock.destroy();
