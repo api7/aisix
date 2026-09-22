@@ -1,6 +1,7 @@
 export { spawnApp, suiteThreadPerCore, type SpawnedApp, type AppOverrides } from "./app.js";
 export { AdminClient, waitConfigPropagation, awaitWindowHeadroom } from "./admin.js";
-export { ProxyClient } from "./proxy.js";
+export { waitForLogLine, waitForLogLines } from "./logs.js";
+export { ProxyClient, type ProxyResponse } from "./proxy.js";
 export { EtcdClient, etcdEndpoint } from "./etcd.js";
 export { startEtcdRelay, type EtcdRelay } from "./etcd-relay.js";
 export { SeedClient } from "./seed.js";

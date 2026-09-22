@@ -7,6 +7,7 @@ import {
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLine,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -226,7 +227,8 @@ describe("graceful drain e2e: an HTTP/2 downstream is retired with GOAWAY", () =
 
       session.close();
       await app.waitForExit(15_000);
-      expect(app.output()).toContain("drain complete");
+      // The exit event can precede the last of the child's log pipe.
+      await waitForLogLine(app, (l) => l.includes("drain complete"), "the drain-complete line");
     },
     60_000,
   );

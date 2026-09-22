@@ -9,6 +9,7 @@ import {
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLine,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -117,9 +118,27 @@ describe("guardrail index invalidation", () => {
       .filter((l) => REBUILT.test(l)).length;
   }
 
+  /**
+   * A chat, and the barrier that makes `rebuilds()` exact right after it.
+   *
+   * The rebuild line is written while the request resolves its
+   * guardrails, so it is queued before that request's own access-log
+   * line; the log queue and its writer thread are both FIFO, so once the
+   * access line is visible every rebuild the request caused is too. That
+   * is what lets the counts below assert "exactly N" rather than "at
+   * least N" — including the ones whose point is that NOTHING rebuilt.
+   */
   async function chat(model: string, content: string): Promise<number> {
-    return (await proxy!.chat({ model, messages: [{ role: "user", content }] }))
-      .status;
+    const { status, requestId } = await proxy!.chat({
+      model,
+      messages: [{ role: "user", content }],
+    });
+    await waitForLogLine(
+      app!,
+      (l) => l.includes("proxy request completed") && l.includes(`request_id="${requestId}"`),
+      `the access-log line for ${requestId}`,
+    );
+    return status;
   }
 
   // Gate on a caller key seeded AFTER the write under test: etcd delivers

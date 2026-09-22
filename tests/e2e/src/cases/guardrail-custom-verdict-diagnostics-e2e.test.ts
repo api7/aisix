@@ -7,6 +7,7 @@ import {
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLine,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -265,10 +266,13 @@ describe("custom guardrail e2e: a broken script is distinguishable from an enfor
     await ensureSeedLive();
 
     await expect422("cvd-unknown", "a perfectly ordinary question");
-    const log = app!.output();
-    expect(log).toContain("custom guardrail returned an unknown action");
-    expect(log).toContain("none | allow | block | mask");
-    expect(log).toContain("permit");
+    const line = await waitForLogLine(
+      app!,
+      (l) => l.includes("custom guardrail returned an unknown action"),
+      "the unknown-action diagnostic",
+    );
+    expect(line).toContain("none | allow | block | mask");
+    expect(line).toContain("permit");
   });
 
   test("the latency histogram separates the two script faults from a policy block", async (ctx) => {

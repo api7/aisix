@@ -7,6 +7,7 @@ import {
   spawnApp,
   startMcpUpstream,
   waitConfigPropagation,
+  waitForLogLine,
   type McpUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -102,24 +103,10 @@ describe("mcp request logging e2e: JSON-RPC method, tool counts, ACL warning", (
     return app!.output().split("\n").filter(pred);
   };
 
-  const waitForLine = async (
-    pred: (line: string) => boolean,
-    what: string,
-  ): Promise<string> => {
-    const deadline = Date.now() + 5_000;
-    let last = "";
-    while (Date.now() < deadline) {
-      last = app!.output();
-      const hit = last.split("\n").find(pred);
-      if (hit) return hit;
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    throw new Error(`timed out waiting for ${what}; DP output was:\n${last}`);
-  };
-
   /** The access line this key's `method` request wrote. */
   const accessLine = (token: string, method: string): Promise<string> =>
-    waitForLine(
+    waitForLogLine(
+      app!,
       (l) =>
         l.includes("proxy request completed") &&
         l.includes(`api_key_id="${keyIds[token]}"`) &&
@@ -252,7 +239,8 @@ describe("mcp request logging e2e: JSON-RPC method, tool counts, ACL warning", (
     });
     expect(res.status).toBe(400);
 
-    const line = await waitForLine(
+    const line = await waitForLogLine(
+      app!,
       (l) =>
         l.includes("proxy request completed") &&
         l.includes(`api_key_id="${keyIds[KEY_GRANTED]}"`) &&

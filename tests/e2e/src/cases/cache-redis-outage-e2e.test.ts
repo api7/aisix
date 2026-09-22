@@ -10,6 +10,7 @@ import {
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLine,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -261,7 +262,7 @@ async function timeChat(
   proxyUrl: string,
   model: string,
   prompt: string,
-): Promise<{ status: number; ms: number }> {
+): Promise<{ status: number; ms: number; requestId: string }> {
   const started = Date.now();
   const res = await fetch(`${proxyUrl}/v1/chat/completions`, {
     method: "POST",
@@ -272,7 +273,11 @@ async function timeChat(
     body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }] }),
   });
   await res.text();
-  return { status: res.status, ms: Date.now() - started };
+  return {
+    status: res.status,
+    ms: Date.now() - started,
+    requestId: res.headers.get("x-aisix-request-id") ?? "",
+  };
 }
 
 interface Fixture {
@@ -614,16 +619,24 @@ describe("a cache Redis unreachable at startup degrades the cache, not the boot"
     await timeChat(app.proxyUrl, MEMORY_MODEL, "memory policy one");
     await timeChat(app.proxyUrl, EXACT_MODEL, "boot degraded three");
     await timeChat(app.proxyUrl, MEMORY_MODEL, "memory policy two");
-    await timeChat(app.proxyUrl, EXACT_MODEL, "boot degraded four");
+    const last = await timeChat(app.proxyUrl, EXACT_MODEL, "boot degraded four");
 
-    const degradedWarns = app
-      .output()
-      .split("\n")
-      .filter(
-        (l) =>
-          l.includes("WARN") &&
-          (l.includes("cache lookup failed") || l.includes("cache write failed")),
-      ).length;
+    // Every cache warning above was queued while its own request ran, so
+    // all of them precede this one's access-log line in the log queue —
+    // which is what makes the count below an upper bound and not just a
+    // lower one. Waiting for the WARN itself would settle on the FIRST
+    // one, written six requests ago, and prove nothing about these.
+    await waitForLogLine(
+      app,
+      (l) =>
+        l.includes("proxy request completed") &&
+        l.includes(`request_id="${last.requestId}"`),
+      `the access-log line for ${last.requestId}`,
+    );
+    const degraded = (l: string) =>
+      l.includes("WARN") &&
+      (l.includes("cache lookup failed") || l.includes("cache write failed"));
+    const degradedWarns = app.output().split("\n").filter(degraded).length;
     // ONE, not one per operation: the exact-KV half is a single
     // degradation, and whichever of its read and write gets there first
     // is the one that reports it. The rest of the outage is debug.
