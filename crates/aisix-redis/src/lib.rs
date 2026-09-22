@@ -145,6 +145,12 @@ impl ConnSlot {
         self.0.store(Some(Arc::new(conn)));
     }
 
+    /// Whether a connection has landed, so a retry loop does not re-dial
+    /// a slot it already filled.
+    pub fn is_attached(&self) -> bool {
+        self.get().is_some()
+    }
+
     fn get(&self) -> Option<Arc<RedisConn>> {
         self.0.load_full()
     }

@@ -1071,7 +1071,30 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         )
         .await
         {
-            Ok(()) => {}
+            Ok(CacheAttach::Settled) => {}
+            // The exact half is up, so `backend: redis` policies are
+            // being served — but the vector-search question has not been
+            // answered, and dropping it here would mean exact-only for
+            // the life of the process on a server that may well support
+            // it. A task carries on asking.
+            Ok(CacheAttach::SemanticPending) => {
+                tracing::warn!(
+                    target: "aisix::cache",
+                    backend = "redis",
+                    endpoint = %aisix_redis::endpoint_label(redis_cfg),
+                    "cache.redis connected but the vector-search probe did not \
+                     complete; semantic matching on backend=redis policies stays \
+                     exact-only until it does, and is retried in the background"
+                );
+                spawn_cache_attach(
+                    exact_slot.clone(),
+                    semantic_cell,
+                    (*redis_cfg).clone(),
+                    policy.clone(),
+                    cfg.etcd.env_id.clone(),
+                    (*metrics).clone(),
+                );
+            }
             // A config the driver can never use is still fatal: retrying
             // a typo'd `ca_file` forever would leave the gateway healthy
             // and permanently uncached, which is worse than the boot
@@ -1613,13 +1636,30 @@ fn build_etcd_connect_options_with_extra_ca(
 /// misconfiguration stays greppable in any retained log window.
 const CACHE_DEGRADED_REMINDER: Duration = Duration::from_secs(300);
 
+/// How far [`attach_cache_backends`] got.
+///
+/// The two connections do not settle together, and the difference is
+/// what tells the retry loop whether to stop. A semantic connection that
+/// failed, or a probe that never reached an answer, leaves the question
+/// open — and giving up on it would mean exact-only for the life of the
+/// process on a server that may well do vector search.
+enum CacheAttach {
+    /// Both halves are settled: the exact connection is up, and the
+    /// vector-search question has a final answer — published, or
+    /// answered no by a server that answered.
+    Settled,
+    /// The exact connection is up; the vector-search question is still
+    /// open. Keep asking.
+    SemanticPending,
+}
+
 /// Connect the cache subsystem and publish what it got.
 ///
 /// The exact-KV connection is what the subsystem IS: failing it fails
 /// this call, and the caller decides whether that is a boot warning or a
-/// retry that has not landed yet. The vector-search half is an
-/// optimization layer on top, so it degrades on its own and never fails
-/// this call.
+/// retry that has not landed yet. The vector-search half never fails
+/// this call — it reports through [`CacheAttach`] instead, because its
+/// failure is not the subsystem's.
 ///
 /// The semantic store is BUILT here rather than handed in, because the
 /// question it answers — does this server do vector search at all — can
@@ -1631,6 +1671,9 @@ const CACHE_DEGRADED_REMINDER: Duration = Duration::from_secs(300);
 /// connection would instead charge an embedding call for every semantic
 /// lookup for the life of the process, which is why nothing is published
 /// until the probe has passed.
+///
+/// Re-entrant: the retry loop calls it again for the half that has not
+/// settled, and neither half is re-dialled once it has.
 async fn attach_cache_backends(
     exact: &aisix_redis::ConnSlot,
     semantic: Option<&aisix_proxy::SemanticRedisCell>,
@@ -1638,39 +1681,58 @@ async fn attach_cache_backends(
     policy: &aisix_cache::FailurePolicy,
     env_id: &str,
     metrics: &Metrics,
-) -> Result<(), aisix_redis::ConnectError> {
-    exact.attach(aisix_redis::connect_bounded(cfg, policy).await?);
+) -> Result<CacheAttach, aisix_redis::ConnectError> {
+    if !exact.is_attached() {
+        exact.attach(aisix_redis::connect_bounded(cfg, policy).await?);
+    }
     let Some(cell) = semantic else {
-        return Ok(());
+        return Ok(CacheAttach::Settled);
     };
     if cell.get().is_some() {
-        return Ok(());
+        return Ok(CacheAttach::Settled);
     }
     // Its own connection — same policy, so the two share one cool-off,
     // but separate so they do not serialize on one pipeline.
     let conn = match aisix_redis::connect_bounded(cfg, policy).await {
         Ok(conn) => conn,
         Err(e) => {
-            tracing::warn!(
+            // Not settled: the exact connection landing a moment earlier
+            // says the server is there, so this is a blip — a connection
+            // limit, a restart between the two dials — and the answer is
+            // still unknown rather than no.
+            tracing::debug!(
                 target: "aisix::cache",
                 error = %e,
-                "redis semantic cache connect failed; semantic matching \
-                 on backend=redis policies stays exact-only"
+                "redis semantic cache connect failed; retrying"
             );
-            return Ok(());
+            return Ok(CacheAttach::SemanticPending);
         }
     };
     let store = aisix_cache::RedisSemanticCache::from_conn(conn)
         .with_env_namespace(env_id)
         .with_metrics(metrics.clone());
-    if let Err(e) = store.probe().await {
-        tracing::warn!(
-            target: "aisix::cache",
-            error = %e,
-            "cache.redis has no vector-search support; semantic matching \
-             on backend=redis policies stays exact-only"
-        );
-        return Ok(());
+    match store.probe_outcome().await {
+        aisix_cache::ProbeOutcome::Inconclusive(e) => {
+            // The probe did not reach an answer. Recording "no vector
+            // search" on that would be recording a timeout as a server
+            // capability, for the life of the process.
+            tracing::debug!(
+                target: "aisix::cache",
+                error = %e,
+                "vector-search probe did not complete; retrying"
+            );
+            return Ok(CacheAttach::SemanticPending);
+        }
+        aisix_cache::ProbeOutcome::Unsupported(e) => {
+            tracing::warn!(
+                target: "aisix::cache",
+                error = %e,
+                "cache.redis has no vector-search support; semantic matching \
+                 on backend=redis policies stays exact-only"
+            );
+            return Ok(CacheAttach::Settled);
+        }
+        aisix_cache::ProbeOutcome::Supported => {}
     }
     match store.sweep_empty_indexes().await {
         Ok(dropped) if dropped > 0 => {
@@ -1691,21 +1753,21 @@ async fn attach_cache_backends(
         "cache.redis supports vector search; semantic matching \
          enabled for backend=redis policies"
     );
-    Ok(())
+    Ok(CacheAttach::Settled)
 }
 
-/// Keep trying the cache backend until it answers, then attach it.
+/// Keep trying the cache backend until both halves settle, then stop.
 ///
 /// Same cadence and same reasoning as the rate limiter's attach task: one
 /// attempt per configured budget, off the request path, so the
 /// node-reboot case — Redis coming up seconds after the gateway —
 /// recovers in seconds.
 ///
-/// It stops once the exact connection lands, which is also when the
-/// vector-search question has been answered one way or the other. A probe
-/// that failed for a transient reason therefore leaves semantic matching
-/// off until a restart — the same exposure the boot path has always had,
-/// since that answer has always been decided once per process.
+/// It does NOT stop as soon as the exact connection lands. The semantic
+/// half is a second connection and a capability question, and either can
+/// miss for a transient reason; giving up on the first attempt would
+/// leave every semantic policy exact-only for the life of the process on
+/// a server that does support vector search.
 fn spawn_cache_attach(
     exact: aisix_redis::ConnSlot,
     semantic: Option<Arc<aisix_proxy::SemanticRedisCell>>,
@@ -1718,6 +1780,7 @@ fn spawn_cache_attach(
         let retry = Duration::from_secs(cfg.timeout_secs.max(1));
         let endpoint = aisix_redis::endpoint_label(&cfg);
         let mut last_reminder = std::time::Instant::now();
+        let mut announced = false;
         loop {
             tokio::time::sleep(retry).await;
             match attach_cache_backends(
@@ -1730,13 +1793,22 @@ fn spawn_cache_attach(
             )
             .await
             {
-                Ok(()) => {
-                    tracing::info!(
-                        target: "aisix::cache",
-                        %endpoint,
-                        "cache backend attached; backend=redis policies are served again"
-                    );
-                    return;
+                Ok(settled) => {
+                    // Announced on the first round that gets the exact
+                    // connection up, not on every subsequent semantic
+                    // retry: that is when `backend: redis` policies start
+                    // being served again.
+                    if !announced {
+                        announced = true;
+                        tracing::info!(
+                            target: "aisix::cache",
+                            %endpoint,
+                            "cache backend attached; backend=redis policies are served again"
+                        );
+                    }
+                    if matches!(settled, CacheAttach::Settled) {
+                        return;
+                    }
                 }
                 Err(e) if last_reminder.elapsed() >= CACHE_DEGRADED_REMINDER => {
                     last_reminder = std::time::Instant::now();

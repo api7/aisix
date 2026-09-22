@@ -72,6 +72,42 @@ impl std::fmt::Debug for RedisSemanticCache {
     }
 }
 
+/// Which kind of answer a failed `FT._LIST` is.
+///
+/// An I/O error — a command timeout, a dropped connection, the
+/// connection layer's cool-off — says nothing about whether the server
+/// has the search module. Everything else is the server replying, which
+/// on this command means it does not know it.
+fn classify_probe_error(e: &redis::RedisError) -> ProbeOutcome {
+    if e.is_io_error() {
+        ProbeOutcome::Inconclusive(CacheError::Backend(format!(
+            "vector-search probe did not complete (cache.redis unreachable \
+             or too slow; this does not mean the server lacks vector search): {e}"
+        )))
+    } else {
+        ProbeOutcome::Unsupported(CacheError::Backend(format!(
+            "vector search unsupported (requires Redis 8+ or the search module): {e}"
+        )))
+    }
+}
+
+/// What a vector-search probe learned.
+///
+/// Three states rather than two because the caller turns this into a
+/// permanent decision, and "the server said no" and "the server did not
+/// answer" must not become the same decision.
+#[derive(Debug)]
+pub enum ProbeOutcome {
+    /// The server answered and speaks the vector-search family.
+    Supported,
+    /// The server answered and does not — or this connection is
+    /// configured in a way the parser cannot read. Permanent.
+    Unsupported(CacheError),
+    /// The probe never reached an answer. Says nothing about the server,
+    /// so a caller that records verdicts should ask again.
+    Inconclusive(CacheError),
+}
+
 impl RedisSemanticCache {
     /// Connect on a policy of this store's own.
     ///
@@ -138,48 +174,51 @@ impl RedisSemanticCache {
 
     /// One-shot capability probe: succeeds iff the server speaks the
     /// vector-search command family AND the connection talks RESP2.
-    /// The bootstrap calls this once and skips wiring the store when it
-    /// fails, so a plain Redis 6/7 — or a `?protocol=resp3` connection,
-    /// whose `FT.SEARCH` replies use a nested map shape this parser
-    /// does not speak — degrades semantic matching visibly at boot,
-    /// never silently at request time.
+    /// A plain Redis 6/7 — or a `?protocol=resp3` connection, whose
+    /// `FT.SEARCH` replies use a nested map shape this parser does not
+    /// speak — degrades semantic matching visibly, never silently at
+    /// request time.
+    ///
+    /// Flattens [`Self::probe_outcome`]. Use that one wherever the
+    /// answer is going to be recorded as permanent.
     pub async fn probe(&self) -> Result<(), CacheError> {
-        let mut conn = self.acquire().await?;
+        match self.probe_outcome().await {
+            ProbeOutcome::Supported => Ok(()),
+            ProbeOutcome::Unsupported(e) | ProbeOutcome::Inconclusive(e) => Err(e),
+        }
+    }
+
+    /// [`Self::probe`] with its two failures told apart.
+    ///
+    /// The caller records a PERMANENT verdict on this answer — an empty
+    /// semantic cell means exact-only for the life of the process — so a
+    /// probe that never reached an answer must not stand in for one that
+    /// did. `Result<(), CacheError>` cannot express the difference, and
+    /// it used to live only in the message text.
+    pub async fn probe_outcome(&self) -> ProbeOutcome {
+        let mut conn = match self.acquire().await {
+            Ok(conn) => conn,
+            Err(e) => return ProbeOutcome::Inconclusive(e),
+        };
         let proto: redis::Value = redis::cmd("HELLO")
             .query_async(&mut conn)
             .await
             .unwrap_or(redis::Value::Nil);
         if let redis::Value::Map(_) = proto {
-            // A map HELLO reply means the connection negotiated RESP3.
-            return Err(CacheError::Backend(
+            // A map HELLO reply means the connection negotiated RESP3 —
+            // a definite answer about how this deployment is configured,
+            // not a blip.
+            return ProbeOutcome::Unsupported(CacheError::Backend(
                 "RESP3 connections are not supported by the semantic cache \
                  (FT.SEARCH reply parsing assumes RESP2); remove \
                  protocol=resp3 from cache.redis"
                     .into(),
             ));
         }
-        redis::cmd("FT._LIST")
-            .query_async::<()>(&mut conn)
-            .await
-            .map_err(|e| {
-                // An I/O error — a command timeout, a dropped connection,
-                // the connection layer's cool-off — says nothing about
-                // whether the server has the search module. The probe runs
-                // once per process and its verdict is permanent, so a
-                // wrong attribution here is what the operator reads for
-                // the life of the pod.
-                if e.is_io_error() {
-                    CacheError::Backend(format!(
-                        "vector-search probe did not complete (cache.redis unreachable \
-                         or too slow; this does not mean the server lacks vector \
-                         search): {e}"
-                    ))
-                } else {
-                    CacheError::Backend(format!(
-                        "vector search unsupported (requires Redis 8+ or the search module): {e}"
-                    ))
-                }
-            })
+        match redis::cmd("FT._LIST").query_async::<()>(&mut conn).await {
+            Ok(()) => ProbeOutcome::Supported,
+            Err(e) => classify_probe_error(&e),
+        }
     }
 
     async fn acquire(&self) -> Result<aisix_redis::RedisConnHandle, CacheError> {
@@ -579,5 +618,41 @@ impl SemanticCacheStore for RedisSemanticCache {
             return Err(err);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod probe_classification_tests {
+    use super::*;
+
+    // The caller turns this answer into a PERMANENT decision — an empty
+    // semantic cell is exact-only for the life of the process — so a
+    // probe that never reached the server must not be filed as one that
+    // did. Collapse the two and a timeout becomes a capability verdict.
+    #[test]
+    fn a_probe_that_never_reached_an_answer_is_not_a_no() {
+        let blip = redis::RedisError::from((
+            redis::ErrorKind::IoError,
+            "redis command timed out",
+            "no reply within redis.timeout_secs (5s)".to_string(),
+        ));
+        assert!(
+            matches!(classify_probe_error(&blip), ProbeOutcome::Inconclusive(_)),
+            "an I/O failure says nothing about the search module"
+        );
+
+        // …while a server that answered has answered.
+        let answered = redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "unknown command",
+            "unknown command `FT._LIST`".to_string(),
+        ));
+        assert!(
+            matches!(
+                classify_probe_error(&answered),
+                ProbeOutcome::Unsupported(_)
+            ),
+            "a server that replied to FT._LIST with an error does not have it"
+        );
     }
 }
