@@ -11,10 +11,12 @@ import {
   ProxyClient,
   SeedClient,
   signHs,
+  scrapeMetrics,
   spawnApp,
   startMockIdp,
   startOpenAiUpstream,
   startRestUpstream,
+  sumMetric,
   waitConfigPropagation,
   type MockIdp,
   type OpenAiUpstream,
@@ -97,6 +99,23 @@ async function chat(app: SpawnedApp, token: string): Promise<Response> {
 async function errorCode(res: Response): Promise<string | undefined> {
   const body = (await res.json()) as { error?: { code?: string } };
   return body.error?.code;
+}
+
+/**
+ * Denials for one reason class so far.
+ *
+ * The caller-visible envelope collapses several denial reasons onto the
+ * same `401 jwt_invalid`, so a status assertion cannot tell WHY a token
+ * was refused — and for the algorithm guards, "refused for the right
+ * reason" is the whole contract. `aisix_auth_decisions_total` carries
+ * the reason, so a delta on it is the assertion that can actually fail.
+ */
+async function denials(app: SpawnedApp, reason: string): Promise<number> {
+  return sumMetric(await scrapeMetrics(app.metricsUrl), "aisix_auth_decisions_total", {
+    method: "jwt",
+    result: "denied",
+    reason,
+  });
 }
 
 /**
@@ -307,9 +326,15 @@ describe("jwt auth e2e: shared-secret (HMAC) trust providers", () => {
     const token = idp!.sign(
       agentClaims(PINNED_ISSUER, { aud: PINNED_AUDIENCE, sub: "agent-pinned" }),
     );
+    const before = await denials(app!, "jwt_alg_not_allowed");
     const res = await chat(app!, token);
     expect(res.status).toBe(401);
     expect(await errorCode(res)).toBe("jwt_invalid");
+    // Without the per-mode algorithm guard this is still a 401
+    // `jwt_invalid` — the library refuses the family mismatch a layer
+    // down — so the status proves nothing. The reason is what says the
+    // provider's own family gate is what stopped it.
+    expect(await denials(app!, "jwt_alg_not_allowed")).toBe(before + 1);
   });
 
   test("an HS token signed with a JWKS provider's published public key is refused", async (ctx) => {
@@ -322,9 +347,17 @@ describe("jwt auth e2e: shared-secret (HMAC) trust providers", () => {
       jwksPublicKeyPem,
       agentClaims(idp!.url, { sub: "agent-jwks" }),
     );
+    const before = await denials(app!, "jwt_alg_not_allowed");
+    const jwksFetches = idp!.jwksFetches;
     const res = await chat(app!, token);
     expect(res.status).toBe(401);
     expect(await errorCode(res)).toBe("jwt_invalid");
+    // Same trap as above: dropping the guard still 401s, because the
+    // published key declares `alg: RS256` and no candidate key survives
+    // the filter. Assert the reason, and that the key endpoint was never
+    // consulted — the guard runs before any key material is built.
+    expect(await denials(app!, "jwt_alg_not_allowed")).toBe(before + 1);
+    expect(idp!.jwksFetches).toBe(jwksFetches);
   });
 
   test("an iss naming a JWKS provider is not retried against a shared-secret provider", async (ctx) => {
@@ -357,6 +390,77 @@ describe("jwt auth e2e: shared-secret (HMAC) trust providers", () => {
     const crossed = await chat(app!, signHs(SECRET_FIRST, hmacClaims({ sub: "agent-second" })));
     expect(crossed.status).toBe(401);
     expect(await errorCode(crossed)).toBe("jwt_identity_unmapped");
+  });
+
+  test("an expired token reports jwt_expired even when another candidate sorts first", async (ctx) => {
+    if (skipUnlessUp(ctx)) return;
+
+    // `hmac-first` is tried first and fails on the SIGNATURE — it does
+    // not hold this token's key, and it would fail that way for any
+    // token, so its reason says nothing. `hmac-second` verifies the
+    // signature and finds the token expired, and that is the answer the
+    // caller needs: an SDK refreshes on `jwt_expired`, not on the
+    // generic `jwt_invalid`.
+    const res = await chat(
+      app!,
+      signHs(
+        SECRET_SECOND,
+        hmacClaims({ sub: "agent-second", exp: Math.floor(Date.now() / 1000) - 3600 }),
+      ),
+    );
+    expect(res.status).toBe(401);
+    expect(await errorCode(res)).toBe("jwt_expired");
+  });
+
+  test("an issuer two providers claim fails closed instead of reaching the trial path", async (ctx) => {
+    if (skipUnlessUp(ctx)) return;
+
+    // A duplicated issuer is a transient etcd race or a control-plane
+    // bug, and the gateway refuses to guess which policy applies. What
+    // it must NOT do is treat "ambiguous" as "nobody claims it" and fall
+    // through to the issuer-less shared-secret providers — the token
+    // below is signed with a secret `hmac-first` accepts, so a
+    // fall-through would authenticate it as that provider's identity.
+    const etcd = new EtcdClient();
+    const dupId = randomUUID();
+    const token = signHs(SECRET_FIRST, hmacClaims({ iss: PINNED_ISSUER }));
+
+    await etcd.put(
+      `${app!.etcdPrefix}/oidc_providers/${dupId}`,
+      JSON.stringify({
+        name: "hmac-pinned-duplicate",
+        issuer: PINNED_ISSUER,
+        audiences: [PINNED_AUDIENCE],
+        hmac_secret: SECRET_PINNED,
+      }),
+    );
+
+    try {
+      let status = 0;
+      await waitConfigPropagation(async () => {
+        const res = await chat(app!, token);
+        status = res.status;
+        await res.text();
+        return status === 401;
+      });
+      expect(status).toBe(401);
+    } finally {
+      await etcd.delete(`${app!.etcdPrefix}/oidc_providers/${dupId}`);
+      // Do not leave the environment ambiguous for the tests after this
+      // one: wait until the single pinned provider authenticates again.
+      await waitConfigPropagation(async () => {
+        const res = await chat(
+          app!,
+          signHs(
+            SECRET_PINNED,
+            hmacClaims({ sub: "agent-pinned", iss: PINNED_ISSUER, aud: PINNED_AUDIENCE }),
+          ),
+        );
+        const ok = res.status === 200;
+        await res.text();
+        return ok;
+      });
+    }
   });
 
   test("a shared-secret token authenticates a passthrough route too", async (ctx) => {
@@ -429,6 +533,12 @@ describe("jwt auth e2e: shared-secret (HMAC) trust providers", () => {
       expect(rej!.last_error_kind).toBe("schema_failed");
       // The reason names the rule, so an operator can act on it.
       expect(rej!.last_error.length).toBeGreaterThan(0);
+      // And it does so without echoing the secret. This is the one place
+      // a live secret really can reach an operator-facing surface: the
+      // `hmac-with-jwks-uri` row below carries SECRET_FIRST, and its
+      // rejection message rides the heartbeat to the control plane's
+      // rejected-resources view.
+      expect(rej!.last_error).not.toContain(SECRET_FIRST);
     }
 
     // The valid providers kept serving throughout.

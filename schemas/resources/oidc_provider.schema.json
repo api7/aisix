@@ -22,11 +22,10 @@
   },
   "properties": {
     "audiences": {
-      "description": "Accepted `aud` values. The token's audience (a string or an array) must contain at least one of these. Required unless `hmac_secret` is set; when a shared-secret provider omits it, the `aud` claim is ignored.",
+      "description": "Accepted `aud` values. The token's audience (a string or an array) must contain at least one of these. Required unless `hmac_secret` is set; when a shared-secret provider omits it, the `aud` claim is ignored.\n\nAn empty list means exactly what omitting the field means — it carries no `minItems`, deliberately. The runtime reads \"no accepted audiences\" off `is_empty()`, so a schema that rejected `[]` would make the two planes disagree about what an empty list means and kill the whole row over a projection that spelled \"unset\" the other way. What stays rejected is a JWKS provider with no audiences at all, which `validate_semantics` owns.",
       "items": {
         "type": "string"
       },
-      "minItems": 1,
       "type": "array"
     },
     "bound_claims": {

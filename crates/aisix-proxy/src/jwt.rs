@@ -192,16 +192,30 @@ fn unverified_issuer(token: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Which enabled provider an `iss` selects.
+///
+/// [`Ambiguous`](ProviderMatch::Ambiguous) is deliberately NOT the same
+/// answer as [`None`](ProviderMatch::None): an ambiguous issuer is one a
+/// provider DOES claim, so it must fail closed rather than fall through
+/// to the issuer-less shared-secret candidates, which would hand the
+/// request to a provider whose policy the token was never meant to be
+/// judged by.
+enum ProviderMatch {
+    /// Exactly one enabled provider claims this issuer.
+    One(Arc<ResourceEntry<OidcProvider>>),
+    /// No enabled provider claims it.
+    None,
+    /// Two or more do.
+    Ambiguous,
+}
+
 /// The enabled provider matching `iss`. Fails closed on ambiguity: if
 /// two enabled providers claim the same issuer their audience/scope/
 /// claim policies differ, so silently picking one would apply the wrong
 /// policy — the request is denied instead. The control plane enforces
 /// per-environment issuer uniqueness and the file loader rejects
 /// duplicates, so this only guards a transient etcd race or a CP bug.
-fn provider_for_issuer(
-    snapshot: &AisixSnapshot,
-    iss: &str,
-) -> Option<Arc<ResourceEntry<OidcProvider>>> {
+fn provider_for_issuer(snapshot: &AisixSnapshot, iss: &str) -> ProviderMatch {
     let (found, ambiguous) = snapshot
         .oidc_providers
         .find_unique_by(|e| e.value.enabled && e.value.issuer.as_deref() == Some(iss));
@@ -212,8 +226,12 @@ fn provider_for_issuer(
             "two enabled OIDC providers claim this issuer; failing closed — \
              their policies differ and neither can be chosen unambiguously",
         );
+        return ProviderMatch::Ambiguous;
     }
-    found
+    match found {
+        Some(entry) => ProviderMatch::One(entry),
+        None => ProviderMatch::None,
+    }
 }
 
 /// The enabled HMAC-mode providers that pin no `issuer`, in a total
@@ -226,6 +244,12 @@ fn provider_for_issuer(
 /// that mode, so one always selects by issuer — and neither is an HMAC
 /// provider that pinned an issuer: pinning one is a statement that only
 /// tokens carrying it belong to this provider.
+///
+/// Two issuer-less providers holding the SAME secret are
+/// indistinguishable by construction — nothing in the token says which
+/// one minted it — so every such token binds to whichever sorts first,
+/// and the other's `required_scopes` / `bound_claims` / key bindings
+/// never apply. Give each provider its own secret, or pin an issuer.
 fn issuerless_hmac_providers(snapshot: &AisixSnapshot) -> Vec<Arc<ResourceEntry<OidcProvider>>> {
     let mut candidates: Vec<_> = snapshot
         .oidc_providers
@@ -236,8 +260,68 @@ fn issuerless_hmac_providers(snapshot: &AisixSnapshot) -> Vec<Arc<ResourceEntry<
     candidates.sort_by(|a, b| {
         (a.value.name.as_str(), a.id.as_str()).cmp(&(b.value.name.as_str(), b.id.as_str()))
     });
-    candidates.truncate(MAX_ISSUERLESS_PROVIDERS_TRIED);
+    if candidates.len() > MAX_ISSUERLESS_PROVIDERS_TRIED {
+        // Dropping a provider silently would be an unobservable dead
+        // configuration: the row loads, `/status/config` reports it
+        // accepted, and it simply never authenticates anyone. Every
+        // other unusable shape in this resource is named at load, so
+        // name this one too — once per process, since it is a property
+        // of the configuration rather than of a request.
+        static TRUNCATED_WARN: std::sync::Once = std::sync::Once::new();
+        let dropped: Vec<&str> = candidates[MAX_ISSUERLESS_PROVIDERS_TRIED..]
+            .iter()
+            .map(|e| e.value.name.as_str())
+            .collect();
+        TRUNCATED_WARN.call_once(|| {
+            tracing::warn!(
+                target: "aisix::auth",
+                limit = MAX_ISSUERLESS_PROVIDERS_TRIED,
+                configured = candidates.len(),
+                dropped = ?dropped,
+                "more OIDC providers declare a shared secret and no issuer than a \
+                 token may be tried against; the providers listed here will never \
+                 authenticate anyone — give them an issuer so tokens select them \
+                 directly, or remove them",
+            );
+        });
+        candidates.truncate(MAX_ISSUERLESS_PROVIDERS_TRIED);
+    }
     candidates
+}
+
+/// The failure reported when no trial candidate accepted a token.
+///
+/// A candidate that does not hold the token's key fails on the
+/// SIGNATURE, and it fails that way for every token — so that reason
+/// says nothing about the token itself and must not shadow the one
+/// candidate that did verify it and then rejected a claim. Keeping the
+/// first signature-class failure only as a fallback is what stops an
+/// expired token reading as `jwt_invalid` (and an SDK's refresh branch
+/// never firing) purely because some other provider sorts first.
+#[derive(Default)]
+struct TrialFailure {
+    /// First failure from a candidate whose signature check passed.
+    claim: Option<(&'static str, ProxyError)>,
+    /// First failure of any kind, in candidate order.
+    any: Option<(&'static str, ProxyError)>,
+}
+
+impl TrialFailure {
+    fn record(&mut self, failure: (&'static str, ProxyError)) {
+        // These two are the reasons a candidate rejects a token it was
+        // never holding the key for; everything else means the signature
+        // verified and a claim did not.
+        let signature_class = matches!(failure.0, "jwt_bad_signature" | "jwt_alg_not_allowed");
+        if !signature_class && self.claim.is_none() {
+            self.claim = Some(failure);
+        } else if self.any.is_none() {
+            self.any = Some(failure);
+        }
+    }
+
+    fn into_reported(self) -> Option<(&'static str, ProxyError)> {
+        self.claim.or(self.any)
+    }
 }
 
 /// Verify a token's signature and registered claims against one
@@ -398,7 +482,11 @@ pub(crate) async fn authenticate_jwt(
     token: &str,
     ctx: crate::auth::DenialContext<'_>,
 ) -> Result<AuthenticatedKey, ProxyError> {
-    let d = Denier { state, ctx };
+    let d = Denier {
+        state,
+        ctx,
+        issuer_matched: true,
+    };
     let header = match jsonwebtoken::decode_header(token) {
         Ok(h) => h,
         Err(_) => {
@@ -424,30 +512,46 @@ pub(crate) async fn authenticate_jwt(
     // the confusion this path exists to prevent.
     let (provider, claims) = match iss
         .as_deref()
-        .and_then(|i| provider_for_issuer(snapshot, i))
+        .map_or(ProviderMatch::None, |i| provider_for_issuer(snapshot, i))
     {
-        Some(provider) => match verify_against_provider(&provider.value, token, &header).await {
-            Ok(claims) => (provider, claims),
-            Err((reason, err)) => {
-                return Err(deny(
-                    d,
-                    reason,
-                    &logged_iss,
-                    kid.as_deref(),
-                    None,
-                    None,
-                    err,
-                ))
+        ProviderMatch::One(provider) => {
+            match verify_against_provider(&provider.value, token, &header).await {
+                Ok(claims) => (provider, claims),
+                Err((reason, err)) => {
+                    return Err(deny(
+                        d,
+                        reason,
+                        &logged_iss,
+                        kid.as_deref(),
+                        None,
+                        None,
+                        err,
+                    ))
+                }
             }
-        },
-        None => {
+        }
+        // An issuer two providers claim is still an issuer that was
+        // claimed: deny it rather than let it reach the issuer-less
+        // candidates, which is where the no-fallback rule would be lost.
+        ProviderMatch::Ambiguous => {
+            return Err(deny(
+                d,
+                "jwt_untrusted_issuer",
+                &logged_iss,
+                kid.as_deref(),
+                None,
+                None,
+                ProxyError::JwtInvalid,
+            ))
+        }
+        ProviderMatch::None => {
             // No issuer, or one no provider claims. The shared-secret
             // providers that pin no issuer are the only candidates; each
             // is tried in turn and the first that verifies wins. With
             // none configured this is exactly the pre-HMAC behavior: the
             // token is denied on its issuer.
             let candidates = issuerless_hmac_providers(snapshot);
-            let mut first_failure: Option<(&'static str, ProxyError)> = None;
+            let mut failure = TrialFailure::default();
             let mut verified = None;
             for provider in candidates {
                 match verify_against_provider(&provider.value, token, &header).await {
@@ -455,24 +559,27 @@ pub(crate) async fn authenticate_jwt(
                         verified = Some((provider, claims));
                         break;
                     }
-                    Err(failure) => first_failure.get_or_insert(failure),
-                };
+                    Err(f) => failure.record(f),
+                }
             }
             match verified {
                 Some(pair) => pair,
                 None => {
-                    // The reason a single candidate rejected the token is
-                    // the useful one; with several, the first in the
-                    // deterministic order stands in. With no candidate at
-                    // all the token never reached a verifier, and the
-                    // denial names why it could not be routed to one.
-                    let (reason, err) = first_failure.unwrap_or(if iss.is_none() {
+                    // With no candidate at all the token never reached a
+                    // verifier, and the denial names why it could not be
+                    // routed to one — the pre-HMAC reasons, unchanged.
+                    let (reason, err) = failure.into_reported().unwrap_or(if iss.is_none() {
                         ("jwt_missing_issuer", ProxyError::JwtInvalid)
                     } else {
                         ("jwt_untrusted_issuer", ProxyError::JwtInvalid)
                     });
+                    // Nothing here named a configured issuer, so this is
+                    // the scanner-probe shape however specific the reason
+                    // turned out to be: an unauthenticated bearer must not
+                    // be able to drive WARN volume (the reason is still
+                    // counted on `aisix_auth_decisions_total`).
                     return Err(deny(
-                        d,
+                        d.unmatched_issuer(),
                         reason,
                         &logged_iss,
                         kid.as_deref(),
@@ -634,6 +741,15 @@ fn clip(s: &str) -> &str {
 /// signal beyond the metric, so they log at `debug`. Once a trust
 /// provider has matched, a denial names a real configured issuer and is
 /// worth a `warn`.
+///
+/// A denial from the issuer-less trial path is the same probe shape
+/// whatever reason it ended on — the token named no configured issuer,
+/// so any unauthenticated bearer reaches it — and
+/// [`Denier::unmatched_issuer`] marks it so. Without that, configuring a
+/// single issuer-less shared-secret provider would turn every forged
+/// bearer on the internet into a `warn` line and bury the real
+/// `jwt_bad_signature` signal (a trusted issuer's token failing
+/// verification) that operators alert on.
 fn deny(
     d: Denier<'_>,
     reason: &'static str,
@@ -643,13 +759,13 @@ fn deny(
     claim_mapping: Option<&str>,
     err: ProxyError,
 ) -> ProxyError {
-    let Denier { state, ctx } = d;
+    let Denier {
+        state,
+        ctx,
+        issuer_matched,
+    } = d;
     state.metrics.record_auth_decision("jwt", false, reason);
-    let pre_match = matches!(
-        reason,
-        "jwt_malformed" | "jwt_missing_issuer" | "jwt_untrusted_issuer" | "jwt_alg_not_allowed"
-    );
-    if pre_match {
+    if logs_as_probe(issuer_matched, reason) {
         tracing::debug!(
             target: "aisix::auth",
             method = "jwt",
@@ -681,12 +797,47 @@ fn deny(
     err
 }
 
+/// Whether a denial is scanner-probe shaped and so belongs at `debug`
+/// rather than `warn`.
+///
+/// Two ways to qualify. The reason is one any malformed or unaddressed
+/// bearer produces before a trust provider is picked; or no configured
+/// issuer was named at all, which is the issuer-less trial path — there,
+/// every reason is reachable by an unauthenticated caller, so none of
+/// them is worth a log line an attacker can multiply.
+///
+/// Split out of [`deny`] so it can be pinned by a test: the whole point
+/// is a level, which leaves no other trace to assert on.
+fn logs_as_probe(issuer_matched: bool, reason: &str) -> bool {
+    !issuer_matched
+        || matches!(
+            reason,
+            "jwt_malformed" | "jwt_missing_issuer" | "jwt_untrusted_issuer" | "jwt_alg_not_allowed"
+        )
+}
+
 /// `state` + the request context every JWT denial line carries, bundled so
 /// the twelve `deny` sites stay one argument wide.
 #[derive(Clone, Copy)]
 struct Denier<'a> {
     state: &'a ProxyState,
     ctx: crate::auth::DenialContext<'a>,
+    /// Whether the token's `iss` named a configured trust provider. False
+    /// only on the issuer-less trial path, where any unauthenticated
+    /// bearer can reach the verifier and so no reason is worth a `warn`.
+    /// Defaults to true so a new `deny` site keeps the louder level
+    /// unless it opts out.
+    issuer_matched: bool,
+}
+
+impl<'a> Denier<'a> {
+    /// This denial came from the issuer-less trial path.
+    fn unmatched_issuer(self) -> Self {
+        Self {
+            issuer_matched: false,
+            ..self
+        }
+    }
 }
 
 /// Verify signature + registered claims against each candidate key.
@@ -1764,20 +1915,30 @@ jyxumGxNpoIV8LlzsMsaWQ==
         mk("corp", "https://corp.test", true);
         mk("partner", "https://partner.test", true);
         mk("disabled", "https://off.test", false);
-        assert_eq!(
-            provider_for_issuer(&snapshot, "https://corp.test")
-                .unwrap()
-                .id,
-            "corp"
-        );
+        let matched = |iss: &str| match provider_for_issuer(&snapshot, iss) {
+            ProviderMatch::One(entry) => Some(entry.id.clone()),
+            _ => None,
+        };
+        assert_eq!(matched("https://corp.test").as_deref(), Some("corp"));
         // A disabled provider is not selected even on an exact issuer match.
-        assert!(provider_for_issuer(&snapshot, "https://off.test").is_none());
-        assert!(provider_for_issuer(&snapshot, "https://unknown.test").is_none());
+        assert!(matched("https://off.test").is_none());
+        assert!(matched("https://unknown.test").is_none());
+        // Neither is "nobody claims it" — that answer has to stay
+        // distinguishable from ambiguity, or the issuer-less trial path
+        // would swallow a claimed issuer.
+        assert!(matches!(
+            provider_for_issuer(&snapshot, "https://unknown.test"),
+            ProviderMatch::None
+        ));
 
         // Two ENABLED providers claiming one issuer -> fail closed, not a
-        // silent pick (their audience/scope policies differ).
+        // silent pick (their audience/scope policies differ) and not a
+        // fall-through to the issuer-less candidates either.
         mk("corp-dup", "https://corp.test", true);
-        assert!(provider_for_issuer(&snapshot, "https://corp.test").is_none());
+        assert!(matches!(
+            provider_for_issuer(&snapshot, "https://corp.test"),
+            ProviderMatch::Ambiguous
+        ));
     }
 
     #[test]
@@ -2245,9 +2406,88 @@ jyxumGxNpoIV8LlzsMsaWQ==
     }
 
     #[test]
-    fn the_trial_candidate_set_is_capped() {
+    fn a_trial_path_denial_never_raises_the_log_level() {
+        // Configuring one issuer-less shared-secret provider makes the
+        // trial path reachable by ANY forged bearer, so a reason that is
+        // worth a `warn` when a configured issuer named the provider is
+        // pure scanner noise here. Without this, one such provider turns
+        // every internet probe into a WARN line and buries the real
+        // signal operators alert on.
+        for reason in [
+            "jwt_bad_signature",
+            "jwt_expired",
+            "jwt_missing_claim",
+            "jwt_audience_mismatch",
+        ] {
+            assert!(
+                logs_as_probe(false, reason),
+                "{reason} reached through the trial path must stay at debug"
+            );
+            assert!(
+                !logs_as_probe(true, reason),
+                "{reason} against a provider the token NAMED is worth a warn"
+            );
+        }
+        // The pre-existing probe classes keep their level either way.
+        for reason in [
+            "jwt_malformed",
+            "jwt_missing_issuer",
+            "jwt_untrusted_issuer",
+            "jwt_alg_not_allowed",
+        ] {
+            assert!(logs_as_probe(true, reason));
+            assert!(logs_as_probe(false, reason));
+        }
+        // A JWKS outage against a named provider is an operator signal.
+        assert!(!logs_as_probe(true, "jwks_unavailable"));
+    }
+
+    #[test]
+    fn a_claim_failure_outranks_another_candidate_s_signature_failure() {
+        // The candidate that does not hold the key fails on the
+        // signature for EVERY token, so its reason says nothing; the one
+        // that verified and then found the token expired is the answer
+        // the caller needs (an SDK refreshes on `jwt_expired`, not on
+        // `jwt_invalid`). Order of arrival must not decide it.
+        let mut first_signature = TrialFailure::default();
+        first_signature.record(("jwt_bad_signature", ProxyError::JwtInvalid));
+        first_signature.record(("jwt_expired", ProxyError::JwtExpired));
+        assert_eq!(first_signature.into_reported().unwrap().0, "jwt_expired");
+
+        let mut first_claim = TrialFailure::default();
+        first_claim.record(("jwt_expired", ProxyError::JwtExpired));
+        first_claim.record(("jwt_bad_signature", ProxyError::JwtInvalid));
+        assert_eq!(first_claim.into_reported().unwrap().0, "jwt_expired");
+
+        // An algorithm refusal is the same "not this provider's token"
+        // class as a signature failure.
+        let mut alg_then_claim = TrialFailure::default();
+        alg_then_claim.record(("jwt_alg_not_allowed", ProxyError::JwtInvalid));
+        alg_then_claim.record(("jwt_missing_claim", ProxyError::JwtInvalid));
+        assert_eq!(
+            alg_then_claim.into_reported().unwrap().0,
+            "jwt_missing_claim"
+        );
+
+        // With nothing but signature-class failures the first one stands.
+        let mut all_signature = TrialFailure::default();
+        all_signature.record(("jwt_bad_signature", ProxyError::JwtInvalid));
+        all_signature.record(("jwt_alg_not_allowed", ProxyError::JwtInvalid));
+        assert_eq!(
+            all_signature.into_reported().unwrap().0,
+            "jwt_bad_signature"
+        );
+
+        assert!(TrialFailure::default().into_reported().is_none());
+    }
+
+    #[test]
+    fn the_trial_candidate_cap_names_what_it_drops() {
+        // A dropped provider is loaded, reported accepted, and silently
+        // unable to authenticate anyone — so the cap has to say so. The
+        // set it hands back is still the first N in name order.
         let snapshot = AisixSnapshot::new();
-        for i in 0..MAX_ISSUERLESS_PROVIDERS_TRIED + 5 {
+        for i in 0..MAX_ISSUERLESS_PROVIDERS_TRIED + 2 {
             snapshot.oidc_providers.insert(ResourceEntry::new(
                 format!("p-{i:02}"),
                 serde_json::from_value::<OidcProvider>(serde_json::json!({
@@ -2258,9 +2498,12 @@ jyxumGxNpoIV8LlzsMsaWQ==
                 1,
             ));
         }
+        let candidates = issuerless_hmac_providers(&snapshot);
+        assert_eq!(candidates.len(), MAX_ISSUERLESS_PROVIDERS_TRIED);
+        assert_eq!(candidates[0].value.name, "hmac-00");
         assert_eq!(
-            issuerless_hmac_providers(&snapshot).len(),
-            MAX_ISSUERLESS_PROVIDERS_TRIED
+            candidates[MAX_ISSUERLESS_PROVIDERS_TRIED - 1].value.name,
+            format!("hmac-{:02}", MAX_ISSUERLESS_PROVIDERS_TRIED - 1)
         );
     }
 

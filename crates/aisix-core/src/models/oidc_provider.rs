@@ -145,8 +145,15 @@ pub struct OidcProvider {
     /// array) must contain at least one of these. Required unless
     /// `hmac_secret` is set; when a shared-secret provider omits it,
     /// the `aud` claim is ignored.
+    ///
+    /// An empty list means exactly what omitting the field means — it
+    /// carries no `minItems`, deliberately. The runtime reads "no
+    /// accepted audiences" off `is_empty()`, so a schema that rejected
+    /// `[]` would make the two planes disagree about what an empty list
+    /// means and kill the whole row over a projection that spelled
+    /// "unset" the other way. What stays rejected is a JWKS provider
+    /// with no audiences at all, which `validate_semantics` owns.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(min = 1))]
     pub audiences: Vec<String>,
 
     /// JWKS endpoint URL the signing keys are fetched from. When
@@ -507,6 +514,38 @@ mod tests {
         assert!(!rendered.contains(LONG_ENOUGH), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
         assert!(!format!("{:?}", p.hmac_secret().unwrap()).contains(LONG_ENOUGH));
+    }
+
+    #[test]
+    fn an_empty_audiences_list_means_the_same_thing_on_both_schemas_and_in_the_runtime() {
+        // The runtime reads "no accepted audiences" off `is_empty()`, so
+        // `[]` has to survive validation and land as that state. A
+        // `minItems: 1` here would reject the row outright and make a
+        // control plane that spells "unset" as `[]` kill every one of
+        // this provider's requests — the row would not load at all.
+        let doc = serde_json::json!({
+            "name": "shared", "hmac_secret": LONG_ENOUGH, "audiences": [],
+        });
+        crate::models::validate_oidc_provider(&doc).expect("strict schema must accept []");
+        crate::models::validate_oidc_provider_lenient(&doc).expect("lenient schema must accept []");
+        let p: OidcProvider = serde_json::from_value(doc).unwrap();
+        assert!(p.audiences.is_empty());
+        p.validate_semantics().unwrap();
+
+        // Omitting the key lands in exactly the same state.
+        let omitted = parse(serde_json::json!({"name": "shared", "hmac_secret": LONG_ENOUGH}));
+        assert_eq!(omitted.audiences, p.audiences);
+
+        // What stays rejected is a JWKS provider with no audiences — by
+        // the semantic pass, which can tell the two modes apart, rather
+        // than by a schema keyword that cannot.
+        let jwks = serde_json::json!({"name": "corp", "issuer": "https://x", "audiences": []});
+        crate::models::validate_oidc_provider(&jwks).expect("schema accepts the shape");
+        assert!(serde_json::from_value::<OidcProvider>(jwks)
+            .unwrap()
+            .validate_semantics()
+            .unwrap_err()
+            .contains("`audiences` is required"));
     }
 
     #[test]
