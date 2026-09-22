@@ -40,6 +40,14 @@ use crate::routing::RoutingRegistry;
 /// caching for its requests (`cache_status = disabled`) — never a
 /// silent fallback to node-local memory, which would lie about the
 /// sharing semantics the operator picked.
+/// The write-once home of the `backend: redis` semantic store.
+///
+/// A `OnceLock` rather than a swap cell because that is the whole
+/// contract: the vector-search question is answered once, against the
+/// first live connection, and the answer never changes for the life of
+/// the process.
+pub type SemanticRedisCell = std::sync::OnceLock<Arc<dyn SemanticCacheStore>>;
+
 #[derive(Clone)]
 pub struct CacheBackends {
     memory: Arc<dyn Cache>,
@@ -48,11 +56,19 @@ pub struct CacheBackends {
     /// built — in-process, no config needed, zero cost until a policy
     /// with a `semantic` block matches a request.
     semantic_memory: Arc<dyn SemanticCacheStore>,
-    /// Semantic (L2) store for `backend: redis` policies. Wired by the
-    /// bootstrap only when `cache.redis` is configured, is not cluster
-    /// mode, AND the server passed the vector-search capability probe —
-    /// so its absence here IS the degradation signal.
-    semantic_redis: Option<Arc<dyn SemanticCacheStore>>,
+    /// Semantic (L2) store for `backend: redis` policies. Wired only
+    /// when `cache.redis` is configured, is not cluster mode, AND the
+    /// server passed the vector-search capability probe — so its absence
+    /// here IS the degradation signal, and a policy that asks for
+    /// semantic matching is told once and then served exact-only with no
+    /// embedding call and no Redis round trip.
+    ///
+    /// Swappable because the probe can only run against a live
+    /// connection, and `cache.redis` may be unreachable when the gateway
+    /// starts: the answer is then not "no vector search" but "not asked
+    /// yet", and the background attach fills it in when it gets there.
+    /// It is written once, by that attach, and never cleared.
+    semantic_redis: Arc<SemanticRedisCell>,
     /// Policy ids already warned about an unavailable redis backend,
     /// so the gate logs once per policy instead of once per request.
     redis_warned: Arc<DashSet<String>>,
@@ -71,7 +87,7 @@ impl CacheBackends {
             memory,
             redis,
             semantic_memory: Arc::new(MemorySemanticCache::new()),
-            semantic_redis: None,
+            semantic_redis: Arc::new(SemanticRedisCell::new()),
             redis_warned: Arc::new(DashSet::new()),
             semantic_redis_warned: Arc::new(DashSet::new()),
             semantic_resolve_warned: Arc::new(DashSet::new()),
@@ -79,10 +95,17 @@ impl CacheBackends {
     }
 
     /// Attach the shared semantic store for `backend: redis` policies.
-    /// The bootstrap calls this only after the capability probe passed.
-    pub fn with_semantic_redis(mut self, store: Arc<dyn SemanticCacheStore>) -> Self {
-        self.semantic_redis = Some(store);
+    /// Callers reach this only after the capability probe passed.
+    pub fn with_semantic_redis(self, store: Arc<dyn SemanticCacheStore>) -> Self {
+        let _ = self.semantic_redis.set(store);
         self
+    }
+
+    /// The cell [`Self::with_semantic_redis`] writes, for a bootstrap
+    /// that has to attach the store later than it builds the backends —
+    /// a `cache.redis` that was unreachable at startup.
+    pub fn semantic_redis_cell(&self) -> Arc<SemanticRedisCell> {
+        Arc::clone(&self.semantic_redis)
     }
 
     /// True the FIRST time `policy_id` reports a stable semantic config
@@ -141,7 +164,7 @@ impl CacheBackends {
         match backend {
             CacheBackend::Memory => Some(&self.semantic_memory),
             CacheBackend::Redis => {
-                let store = self.semantic_redis.as_ref();
+                let store = self.semantic_redis.get();
                 if store.is_none() && self.semantic_redis_warned.insert(policy_id.to_string()) {
                     tracing::warn!(
                         target: "aisix::cache",

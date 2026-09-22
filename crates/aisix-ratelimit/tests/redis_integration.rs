@@ -809,7 +809,9 @@ async fn a_store_that_never_connected_fails_open_and_attaches_later() {
 
     let metrics = Metrics::new(false);
     let started = std::time::Instant::now();
-    let (store, unreachable) = RedisStore::connect_or_attach_later(&cfg).await;
+    let (store, unreachable) = RedisStore::connect_or_attach_later(&cfg)
+        .await
+        .expect("an unreachable Redis is a diagnostic, not a fatal config error");
     let elapsed = started.elapsed();
     let store = store.with_metrics(metrics.clone());
 
@@ -936,7 +938,9 @@ async fn a_commit_after_the_backend_attaches_returns_the_local_slot() {
         ..Default::default()
     };
 
-    let (store, unreachable) = RedisStore::connect_or_attach_later(&cfg).await;
+    let (store, unreachable) = RedisStore::connect_or_attach_later(&cfg)
+        .await
+        .expect("an unreachable Redis is a diagnostic, not a fatal config error");
     assert!(unreachable.is_some());
 
     // Slot taken locally, while there is no connection.
@@ -961,4 +965,23 @@ async fn a_commit_after_the_backend_attaches_returns_the_local_slot() {
         .acquire(&key, &limits, "handover-2")
         .await
         .expect("the local concurrency slot was returned on commit");
+}
+
+/// A config the driver can never use must still end the boot.
+///
+/// Everything else on this path is now retried forever in the
+/// background, and a typo does not come good on a retry: a gateway that
+/// starts healthy and is quietly never going to enforce a shared limit
+/// is strictly worse than the boot failure it replaced.
+#[tokio::test]
+async fn a_config_the_driver_cannot_use_is_still_fatal() {
+    let cfg = RedisConnConfig {
+        mode: RedisMode::Single,
+        url: Some("not-a-redis-url".into()),
+        ..Default::default()
+    };
+    let err = RedisStore::connect_or_attach_later(&cfg)
+        .await
+        .expect_err("a malformed url must not be degraded around");
+    assert!(aisix_redis::is_permanent_config_error(&err), "{err:?}");
 }

@@ -290,10 +290,13 @@ cache:
   #   # connection gets this budget once per endpoint the discovery may
   #   # have to walk, plus one — so `cluster` mode with two nodes can
   #   # spend three of them, and `sentinel` mode one per sentinel plus one
-  #   # for the master. Unlike the rate limiter, a cache Redis that is
-  #   # unreachable at STARTUP is fatal: the gateway reports it and exits
-  #   # rather than serving `backend: redis` policies silently uncached.
-  #   # After a failure, commands short-circuit for 30 seconds and then
+  #   # for the master. A cache Redis that is unreachable at STARTUP does
+  #   # not stop the gateway: the listeners bind, every `backend: redis`
+  #   # policy is served as a miss, one WARN names the backend, and the
+  #   # connection is attached in the background as soon as Redis answers.
+  #   # A `url` the driver cannot parse, or TLS material that cannot be
+  #   # read, is different and still ends the boot — no amount of retrying
+  #   # fixes a typo. After a failure, commands short-circuit for 30 seconds and then
   #   # ONE request probes, so an outage costs this budget roughly once per
   #   # 30 seconds rather than once per request. Must be >= 1.
   #   #

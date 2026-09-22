@@ -266,15 +266,20 @@ impl RedisStore {
     /// Note what this does NOT do: fall back to the `memory` backend. That
     /// would be permanent, and the operator asked for cluster-wide
     /// counting.
+    ///
+    /// The outer `Err` is the one failure that is still fatal: a config
+    /// the driver can never use, which no amount of retrying fixes and
+    /// which the operator needs told loudly rather than degraded around.
     pub async fn connect_or_attach_later(
         cfg: &RedisConnConfig,
-    ) -> (Self, Option<redis::RedisError>) {
+    ) -> Result<(Self, Option<redis::RedisError>), redis::RedisError> {
         let policy = FailurePolicy::new(cfg);
         match aisix_redis::connect_bounded(cfg, &policy).await {
-            Ok(conn) => (
+            Ok(conn) => Ok((
                 Self::with_slot(ConnSlot::filled(conn), Arc::new(AtomicBool::new(false))),
                 None,
-            ),
+            )),
+            Err(e) if aisix_redis::is_permanent_config_error(&e) => Err(e),
             Err(e) => {
                 let slot = ConnSlot::empty();
                 // Already "logged": the caller WARNs this failure itself,
@@ -287,7 +292,7 @@ impl RedisStore {
                     cfg.clone(),
                     policy,
                 );
-                (Self::with_slot(slot, degraded_logged), Some(e))
+                Ok((Self::with_slot(slot, degraded_logged), Some(e)))
             }
         }
     }

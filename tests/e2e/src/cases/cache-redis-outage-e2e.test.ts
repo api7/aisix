@@ -505,6 +505,13 @@ describe("a cache Redis unreachable at startup degrades the cache, not the boot"
     app = await spawnApp({
       // `info`, so the background attach announces itself in `output()`.
       logLevel: "info",
+      // Both blocks meet the same black hole, and the limiter's connect
+      // and the cache's run one after the other — two budgets before a
+      // listener binds, against a 10s harness readiness gate. Waiting
+      // here ourselves keeps the case measuring its own subject instead
+      // of racing that gate; the assertion that it served at all is the
+      // `/livez` poll below.
+      awaitListeners: false,
       extra: {
         etcd: { endpoints: [ETCD_ENDPOINT], prefix },
         cache: {
@@ -518,6 +525,21 @@ describe("a cache Redis unreachable at startup degrades the cache, not the boot"
         },
       },
     });
+    // `awaitListeners: false` means nothing has waited yet, and the
+    // config probe below would meet a refused connection rather than a
+    // not-ready one. The bound is generous on purpose: the subject is
+    // that the boot no longer takes MINUTES, and the two budgets it does
+    // take are the gateway's business, not this case's.
+    const deadline = Date.now() + 30_000;
+    let live = false;
+    while (!live && Date.now() < deadline) {
+      live = await fetch(`${app.proxyUrl}/livez`)
+        .then((r) => r.ok)
+        .catch(() => false);
+      if (!live) await new Promise((r) => setTimeout(r, 200));
+    }
+    if (!live) throw new Error("the gateway never bound its proxy listener");
+
     await seed(prefix, embed.baseUrl, upstream.baseUrl);
     const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
     await waitConfigPropagation(
@@ -533,16 +555,17 @@ describe("a cache Redis unreachable at startup degrades the cache, not the boot"
     if (ready) await new EtcdClient().deletePrefix(prefix);
   });
 
+
   test("it serves with every backend=redis policy a miss, then starts caching", async (ctx) => {
     if (!ready || !app || !relay || !upstream) {
       ctx.skip();
       return;
     }
 
-    // 1. It serves at all. Reaching this line already means the listeners
-    //    bound — `spawnApp` gates on `/livez` plus the metrics listener
-    //    within its own readiness budget, which is what fails on a
-    //    gateway that exits instead.
+    // 1. It serves at all. On the pre-change binary the process exits
+    //    during `beforeAll` instead, so `waitConfigPropagation` never
+    //    sees a 200 and the case fails there.
+    expect(app.output()).toContain("aisix listening");
     const first = await timeChat(app.proxyUrl, EXACT_MODEL, "boot degraded one");
     expect(first.status).toBe(200);
 

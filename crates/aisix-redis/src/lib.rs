@@ -637,6 +637,19 @@ pub fn not_connected_error() -> redis::RedisError {
     ))
 }
 
+/// True when a connect error can never come good on a retry: the
+/// operator wrote something the driver cannot use at all — a malformed
+/// `url`, TLS material that will not read or parse.
+///
+/// It matters because everything else here is now retried forever in the
+/// background. Retrying a typo turns a boot that said exactly what was
+/// wrong into a gateway that comes up healthy and is quietly never going
+/// to enforce a shared limit or cache anything, which is strictly worse
+/// than the failure it replaced.
+pub fn is_permanent_config_error(e: &redis::RedisError) -> bool {
+    e.kind() == redis::ErrorKind::InvalidClientConfig
+}
+
 /// The error a connect that outran its whole budget returns.
 ///
 /// Separate from [`timed_out_error`] because the budget it spent is a
