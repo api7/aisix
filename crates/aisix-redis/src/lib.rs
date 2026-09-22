@@ -98,7 +98,7 @@ use redis::aio::{
 use redis::cluster::ClusterClient;
 use redis::cluster_async::ClusterConnection;
 use redis::sentinel::{SentinelClient, SentinelNodeConnectionInfo, SentinelServerType};
-use redis::{AsyncConnectionConfig, RedisResult};
+use redis::{AsyncConnectionConfig, IntoConnectionInfo, RedisResult};
 use tokio::sync::Mutex;
 
 /// How long commands short-circuit after a connectivity failure. Fixed,
@@ -662,10 +662,19 @@ pub fn not_connected_error() -> redis::RedisError {
 /// is the safe direction for a misclassification, since the alternative
 /// is refusing to start over a slow handshake.
 pub fn is_permanent_config_error(e: &redis::RedisError) -> bool {
-    matches!(
+    if matches!(
         e.kind(),
         redis::ErrorKind::InvalidClientConfig | redis::ErrorKind::AuthenticationFailed
-    )
+    ) {
+        return true;
+    }
+    // A refusal the server raises against the startup PING rather than
+    // against the handshake. redis-rs has no `ErrorKind` for these — they
+    // arrive as extension errors carrying the server's own code — so
+    // match the code. `NOAUTH` is what a `requirepass` server answers a
+    // connection that never authenticated at all; `WRONGPASS`/`NOPERM`
+    // are the ACL refusals. None of the three comes good on a retry.
+    matches!(e.code(), Some("NOAUTH" | "WRONGPASS" | "NOPERM"))
 }
 
 /// The error a connect that outran its whole budget returns.
@@ -762,6 +771,224 @@ fn conn_config(timeout: Duration) -> AsyncConnectionConfig {
     AsyncConnectionConfig::new()
         .set_connection_timeout(timeout)
         .set_response_timeout(timeout)
+}
+
+/// Apply the explicitly configured credentials to a connection that was
+/// built from a URL.
+///
+/// The explicit fields WIN over anything the URL carries. That is what
+/// they exist for: `password` is documented as the way to keep the
+/// secret out of the config file (`AISIX_CACHE__REDIS__PASSWORD`), and a
+/// value supplied that way is useless if a stale credential left in the
+/// URL quietly outranks it. A field the operator did not set changes
+/// nothing, so a URL-only deployment is unaffected.
+fn apply_explicit_credentials(info: &mut redis::RedisConnectionInfo, cfg: &RedisConnConfig) {
+    if let Some(username) = &cfg.username {
+        info.username = Some(username.clone());
+    }
+    if let Some(password) = &cfg.password {
+        info.password = Some(password.clone());
+    }
+    if let Some(db) = cfg.database {
+        info.db = db;
+    }
+}
+
+/// One real command on a freshly opened connection, so "connected" can
+/// never be logged for a connection the server has not authenticated.
+///
+/// Opening the connection is not proof of that. A `requirepass` server
+/// accepts the socket and refuses the *commands*, so a credential that
+/// never reached the handshake looks exactly like a healthy boot — the
+/// shape this gateway shipped in when `password` was parsed and then
+/// dropped on the floor in `single` mode: `connected`, no warning, and
+/// every counter and cache operation failing per request from then on.
+async fn ping(conn: &mut impl ConnectionLike, timeout: Duration) -> RedisResult<()> {
+    tokio::time::timeout(timeout, redis::cmd("PING").query_async::<()>(conn))
+        .await
+        .map_err(|_| timed_out_error(timeout))?
+}
+
+/// What one direct connection to a data node was able to establish.
+enum Probe {
+    /// It answered, and it ran our command.
+    Answered,
+    /// It answered, and it refused the credential. Permanent.
+    Refused(redis::RedisError),
+    /// Nothing usable came back. Not evidence of anything.
+    Silent,
+}
+
+/// Ask the data node directly whether it refuses the configured
+/// credential, and return the refusal if it does.
+///
+/// This exists because none of the three drivers will say so. Each hides
+/// it differently and all three land in the same place — the gateway
+/// concludes the backend is merely unreachable, binds its listeners and
+/// serves fail-open for the life of the process against a password that
+/// is never going to become right, while the log blames the network:
+///
+/// - `single` — the connection manager's retry ladder swallows every
+///   attempt's error but the last, and runs past the boot budget, so the
+///   caller only ever sees the budget expire.
+/// - `cluster` — a seed that refuses is dropped from the initial
+///   connection map; an empty map is an `IoError`.
+/// - `sentinel` — a master that refuses fails discovery's `ROLE` check
+///   and is skipped, so the group reads as not found.
+///
+/// A plain connection has none of that machinery, so the server's own
+/// answer is what returns. It runs a command rather than only
+/// connecting, because connecting proves nothing: a `requirepass` server
+/// accepts the socket and refuses the *commands*, which is how a
+/// `password` that never reached the handshake could look like a healthy
+/// boot and then fail every operation.
+///
+/// It reports ONLY a refusal. Every other outcome is discarded and the
+/// mode's own error stands, so this can never turn a slow or unreachable
+/// backend into a boot failure, and it can never be the thing that
+/// decides how long a boot spends.
+async fn credential_refusal(
+    cfg: &RedisConnConfig,
+    tls: &Option<redis::TlsCertificates>,
+    timeout: Duration,
+) -> Option<redis::RedisError> {
+    // Nothing the data node could refuse, so there is nothing to ask.
+    // Not an optimisation: it is what keeps a deployment that uses no
+    // password from paying for the question — one connection on a
+    // healthy boot, and against an unreachable backend a share of the
+    // budget, which would make an outage take longer to report than it
+    // does today.
+    if !credential_configured(cfg) {
+        return None;
+    }
+    match cfg.mode {
+        RedisMode::Single => match probe(cfg.url.as_deref()?, cfg, tls, timeout).await {
+            Probe::Refused(e) => Some(e),
+            _ => None,
+        },
+        RedisMode::Cluster => {
+            // Serially, stopping at the first node that answers either
+            // way: one answer settles the question for every node, since
+            // the credential is applied to all of them identically. A
+            // node that stays silent is not an answer, so the walk goes
+            // on — and if they all do, the walk is free, because they
+            // are the same sockets the connect just failed on.
+            for node in &cfg.nodes {
+                match probe(node, cfg, tls, timeout).await {
+                    Probe::Refused(e) => return Some(e),
+                    Probe::Answered => return None,
+                    Probe::Silent => continue,
+                }
+            }
+            None
+        }
+        RedisMode::Sentinel => {
+            let master = sentinel_master_address(cfg, timeout).await?;
+            match probe(&master, cfg, tls, timeout).await {
+                Probe::Refused(e) => Some(e),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Whether a credential reaches the data node at all — from the explicit
+/// fields, or from inside its own URL.
+///
+/// The Sentinel-discovered master has no URL of its own, so in that mode
+/// the fields are the only source; the `sentinels` URLs carry the
+/// sentinels' credentials, which are a different thing.
+fn credential_configured(cfg: &RedisConnConfig) -> bool {
+    if cfg.username.is_some() || cfg.password.is_some() {
+        return true;
+    }
+    let in_url = |url: &String| {
+        url.trim()
+            .into_connection_info()
+            .is_ok_and(|i| i.redis.username.is_some() || i.redis.password.is_some())
+    };
+    match cfg.mode {
+        RedisMode::Single => cfg.url.as_ref().is_some_and(in_url),
+        RedisMode::Cluster => cfg.nodes.iter().any(in_url),
+        RedisMode::Sentinel => false,
+    }
+}
+
+/// One plain, single-attempt connection to `url` with the configured
+/// credentials applied, plus one command on it.
+async fn probe(
+    url: &str,
+    cfg: &RedisConnConfig,
+    tls: &Option<redis::TlsCertificates>,
+    timeout: Duration,
+) -> Probe {
+    let url = insecure_url(url.trim(), cfg);
+    let Ok(mut info) = url.as_str().into_connection_info() else {
+        return Probe::Silent;
+    };
+    apply_explicit_credentials(&mut info.redis, cfg);
+    let client = match tls {
+        Some(certs) => redis::Client::build_with_tls(info, certs.clone()),
+        None => redis::Client::open(info),
+    };
+    let Ok(client) = client else {
+        return Probe::Silent;
+    };
+    let answered = async {
+        let mut conn = client
+            .get_multiplexed_async_connection_with_config(&conn_config(timeout))
+            .await?;
+        ping(&mut conn, timeout).await
+    }
+    .await;
+    match answered {
+        Ok(()) => Probe::Answered,
+        Err(e) if is_permanent_config_error(&e) => Probe::Refused(e),
+        Err(_) => Probe::Silent,
+    }
+}
+
+/// `host:port` of the monitored master, asked of the sentinels directly.
+///
+/// redis-rs offers no way to get the address without also connecting to
+/// it and validating it — which is the step that swallows the refusal
+/// this is trying to find. So the raw command, on the first sentinel
+/// that answers it. The sentinels carry their own credentials in their
+/// URLs, independent of the master's.
+async fn sentinel_master_address(cfg: &RedisConnConfig, timeout: Duration) -> Option<String> {
+    let master_name = cfg.master_name.as_deref()?;
+    for sentinel in &cfg.sentinels {
+        let sentinel = sentinel.trim();
+        let Ok(client) = redis::Client::open(sentinel) else {
+            continue;
+        };
+        let addr = async {
+            let mut conn = client
+                .get_multiplexed_async_connection_with_config(&conn_config(timeout))
+                .await?;
+            tokio::time::timeout(
+                timeout,
+                redis::cmd("SENTINEL")
+                    .arg("get-master-addr-by-name")
+                    .arg(master_name)
+                    .query_async::<(String, String)>(&mut conn),
+            )
+            .await
+            .map_err(|_| timed_out_error(timeout))?
+        }
+        .await;
+        if let Ok((host, port)) = addr {
+            // The master's scheme follows the sentinels', the same
+            // uniform-TLS assumption the sentinel connect itself makes.
+            let scheme = if sentinel.starts_with("rediss://") {
+                "rediss"
+            } else {
+                "redis"
+            };
+            return Some(format!("{scheme}://{host}:{port}"));
+        }
+    }
+    None
 }
 
 // Every command from every consumer — `Script::invoke_async`,
@@ -967,17 +1194,33 @@ pub async fn connect_with(cfg: &RedisConnConfig, policy: &FailurePolicy) -> Redi
     let inner = match cfg.mode {
         RedisMode::Single => {
             let url = insecure_url(cfg.url.as_deref().unwrap_or_default(), cfg);
+            let mut info = url.as_str().into_connection_info()?;
+            apply_explicit_credentials(&mut info.redis, cfg);
             let client = match &tls {
-                Some(certs) => redis::Client::build_with_tls(url.as_str(), certs.clone())?,
-                None => redis::Client::open(url.as_str())?,
+                Some(certs) => redis::Client::build_with_tls(info, certs.clone())?,
+                None => redis::Client::open(info)?,
             };
+            // Ask the server BEFORE the manager does, because after it
+            // there is nothing left to ask with: `ConnectionManager`'s
+            // initial connect runs a retry ladder built from the
+            // driver's defaults, reports only the LAST attempt's error,
+            // and outlasts the whole boot budget. A Redis that answers
+            // and refuses the credential therefore had exactly one
+            // outcome — the budget expired, the operator was told the
+            // backend had timed out, and the gateway served fail-open
+            // for the life of the process against a password that was
+            // never going to become right.
+            if let Some(refusal) = credential_refusal(cfg, &tls, timeout).await {
+                return Err(refusal);
+            }
             // Only the two timeouts are set; the retry policy stays the
             // library default, which is what the boot retry loop is tuned
             // around.
             let manager_cfg = ConnectionManagerConfig::new()
                 .set_connection_timeout(timeout)
                 .set_response_timeout(timeout);
-            let conn = ConnectionManager::new_with_config(client, manager_cfg).await?;
+            let mut conn = ConnectionManager::new_with_config(client, manager_cfg).await?;
+            ping(&mut conn, timeout).await?;
             tracing::info!(
                 target: "aisix::redis",
                 mode = "single",
@@ -1010,7 +1253,17 @@ pub async fn connect_with(cfg: &RedisConnConfig, policy: &FailurePolicy) -> Redi
                 builder = builder.certs(certs.clone());
             }
             let client = builder.build()?;
-            let conn = client.get_async_connection().await?;
+            let mut conn = match client.get_async_connection().await {
+                Ok(conn) => conn,
+                // A seed that refuses the credential is not added to the
+                // initial connection map, and an empty map is reported as
+                // `Failed to create initial connections` — the same
+                // `IoError` an unplugged cluster gets. Unlike `single`
+                // this arrives fast, with the budget barely touched, so
+                // the question can be asked after the fact.
+                Err(e) => return Err(credential_refusal(cfg, &tls, timeout).await.unwrap_or(e)),
+            };
+            ping(&mut conn, timeout).await?;
             tracing::info!(
                 target: "aisix::redis",
                 mode = "cluster",
@@ -1090,12 +1343,25 @@ pub async fn connect_with(cfg: &RedisConnConfig, policy: &FailurePolicy) -> Redi
             // outer budget too, or an unreachable sentinel stalls the
             // boot attempt indefinitely.
             let discovery_timeout = discovery_budget(sentinels_len, timeout);
-            let conn = tokio::time::timeout(
+            let discovered = tokio::time::timeout(
                 discovery_timeout,
                 client.get_async_connection_with_config(&conn_config(timeout)),
             )
             .await
-            .map_err(|_| connect_timed_out_error(discovery_timeout, timeout))??;
+            .map_err(|_| connect_timed_out_error(discovery_timeout, timeout))
+            .and_then(|r| r);
+            let mut conn = match discovered {
+                Ok(conn) => conn,
+                // Discovery validates a candidate master by running
+                // `ROLE` on it, so a master that refuses the credential
+                // fails that check and is skipped — and a correctly
+                // configured group comes back as
+                // `MasterNameNotFoundBySentinel`, which is also what a
+                // typo'd `master_name` returns. Same fast failure as
+                // cluster, same question asked afterwards.
+                Err(e) => return Err(credential_refusal(cfg, &tls, timeout).await.unwrap_or(e)),
+            };
+            ping(&mut conn, timeout).await?;
             tracing::info!(
                 target: "aisix::redis",
                 mode = "sentinel",

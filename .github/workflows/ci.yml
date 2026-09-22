@@ -147,6 +147,21 @@ jobs:
       CACHE_TEST_REDIS_CLUSTER_NODES: redis://127.0.0.1:7000,redis://127.0.0.1:7001,redis://127.0.0.1:7002
       CACHE_TEST_REDIS_SENTINELS: redis://127.0.0.1:26379
       CACHE_TEST_REDIS_MASTER: mymaster
+      # Picked up by crates/aisix-redis/tests/auth_connect.rs. A
+      # password-protected Redis of its own (6390), started by the step
+      # below: `requirepass` is server-wide, so putting it on the shared
+      # service would lock every other Redis test out of it. The URL
+      # carries NO credential — the tests supply it, in each of the ways
+      # an operator can. Same skip-if-unset / no-AISIX_-prefix rules.
+      REDIS_AUTH_TEST_URL: redis://127.0.0.1:6390
+      REDIS_AUTH_TEST_PASSWORD: aisix-ci-redis
+      # The cluster and sentinel halves of the same file, pointed at the
+      # topologies below. They need NO password, which is what makes them
+      # usable here: a credential they refuse proves the field reached
+      # the handshake, without a second authenticated topology.
+      REDIS_AUTH_TEST_CLUSTER_NODES: redis://127.0.0.1:7000,redis://127.0.0.1:7001,redis://127.0.0.1:7002
+      REDIS_AUTH_TEST_SENTINELS: redis://127.0.0.1:26379
+      REDIS_AUTH_TEST_MASTER: mymaster
       # Picked up by crates/aisix-redis/tests/sentinel_failover.rs — the
       # master+replica+sentinel(26380) topology the setup step brings up,
       # so the failover/reconnect test forces a real promotion in CI.
@@ -290,6 +305,13 @@ jobs:
           sleep 2
           docker exec redis-fo-sentinel redis-cli -p 26380 sentinel get-master-addr-by-name myfo | tr -d '\r' | tr '\n' ' ' | grep -qE '127\.0\.0\.1 +6381' \
             || { echo "::error::Failover sentinel 26380 did not resolve myfo to the master"; exit 1; }
+          # A password-protected Redis for the credential-refusal tests.
+          # Its own server because `requirepass` is server-wide.
+          docker run -d --name redis-auth --network host redis:7-alpine \
+            redis-server --port 6390 --requirepass aisix-ci-redis
+          sleep 2
+          docker exec redis-auth redis-cli -p 6390 -a aisix-ci-redis ping | grep -q PONG \
+            || { echo "::error::Authenticated Redis 6390 did not come up"; exit 1; }
       - name: unit tests with coverage
         run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov-unit.info
       - uses: actions/upload-artifact@v7

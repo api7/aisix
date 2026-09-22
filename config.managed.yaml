@@ -64,6 +64,14 @@
 # is the node-reboot case, where Redis comes up after the gateway. The
 # gateway never silently falls back to the `memory` backend.
 #
+# A Redis that ANSWERS and refuses the credential is not that case and
+# ends the boot, naming the refusal: retrying never turns a wrong
+# password into a right one, and a gateway that came up would enforce
+# nothing cluster-wide for the life of the process. The credential may
+# be embedded in the URL or given separately as
+# `AISIX_RATELIMIT__REDIS__USERNAME` / `__PASSWORD` / `__DATABASE`,
+# which override whatever the URL carries.
+#
 # Subsequent boots re-use the mTLS bundle written under
 # `managed.mtls_dir`.
 
