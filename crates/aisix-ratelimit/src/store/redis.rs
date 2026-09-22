@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use aisix_core::{RateLimit, RedisConnConfig};
 use aisix_obs::metrics::Metrics;
-use aisix_redis::RedisConn;
+use aisix_redis::{FailurePolicy, RedisConn, RedisConnHandle};
 use async_trait::async_trait;
 use redis::Script;
 
@@ -204,8 +204,53 @@ local inflight = redis.call('ZCARD', prefix .. ':conc')
 return {rpm, tpm, inflight, 60 - (now % 60)}
 "#;
 
+/// The connection the store runs its commands on, held in a slot rather
+/// than inline because it may not exist yet.
+///
+/// A Redis that is unreachable when the gateway starts must not keep it
+/// from binding its listeners, so boot carries on with the slot empty and
+/// a background task fills it in when Redis answers.
+/// An empty slot is the state a mid-flight outage already puts this store
+/// in — every operation gets a connectivity error and runs on the
+/// per-replica fallback — which is why it needs no branch of its own
+/// anywhere below.
+#[derive(Clone)]
+struct ConnSlot(Arc<parking_lot::RwLock<Option<RedisConn>>>);
+
+impl ConnSlot {
+    fn filled(conn: RedisConn) -> Self {
+        Self(Arc::new(parking_lot::RwLock::new(Some(conn))))
+    }
+
+    fn empty() -> Self {
+        Self(Arc::new(parking_lot::RwLock::new(None)))
+    }
+
+    fn attach(&self, conn: RedisConn) {
+        *self.0.write() = Some(conn);
+    }
+
+    fn get(&self) -> Option<RedisConn> {
+        self.0.read().clone()
+    }
+
+    /// A live handle, or the error that makes the caller fail open.
+    async fn acquire(&self) -> Result<RedisConnHandle, redis::RedisError> {
+        match self.get() {
+            Some(conn) => conn.acquire().await,
+            None => Err(aisix_redis::not_connected_error()),
+        }
+    }
+
+    async fn note_error(&self) {
+        if let Some(conn) = self.get() {
+            conn.note_error().await;
+        }
+    }
+}
+
 pub struct RedisStore {
-    conn: RedisConn,
+    conn: ConnSlot,
     prefix: String,
     conc_ttl: u64,
     grace: u64,
@@ -235,7 +280,42 @@ impl RedisStore {
     /// [`aisix_redis::connect`].
     pub async fn connect(cfg: &RedisConnConfig) -> Result<Self, redis::RedisError> {
         let conn = aisix_redis::connect(cfg).await?;
-        Ok(Self {
+        Ok(Self::with_slot(ConnSlot::filled(conn)))
+    }
+
+    /// Connect for the boot path: bounded by `ratelimit.redis.timeout_secs`
+    /// and never fatal.
+    ///
+    /// The gateway must bind its listeners whether or not Redis is up —
+    /// the node-reboot case has Redis coming up *after* the gateway, and
+    /// a gateway that refuses to serve until its
+    /// rate-limit counters are shareable trades an availability outage for
+    /// an accuracy one. So a connection that does not land inside the
+    /// budget leaves the store in its ordinary degraded state (per-replica
+    /// in-memory counting) and a background task attaches the shared
+    /// backend the moment Redis answers. The returned error is the boot
+    /// diagnostic, not a failure: it is `Some` exactly when the store
+    /// started degraded.
+    ///
+    /// Note what this does NOT do: fall back to the `memory` backend. That
+    /// would be permanent, and the operator asked for cluster-wide
+    /// counting.
+    pub async fn connect_or_attach_later(
+        cfg: &RedisConnConfig,
+    ) -> (Self, Option<redis::RedisError>) {
+        let policy = FailurePolicy::new(cfg);
+        match aisix_redis::connect_bounded(cfg, &policy).await {
+            Ok(conn) => (Self::with_slot(ConnSlot::filled(conn)), None),
+            Err(e) => {
+                let slot = ConnSlot::empty();
+                spawn_attach(slot.clone(), cfg.clone(), policy);
+                (Self::with_slot(slot), Some(e))
+            }
+        }
+    }
+
+    fn with_slot(conn: ConnSlot) -> Self {
+        Self {
             conn,
             prefix: DEFAULT_PREFIX.into(),
             conc_ttl: DEFAULT_CONC_TTL_SECS,
@@ -243,7 +323,7 @@ impl RedisStore {
             local: Arc::new(LocalStore::new()),
             degraded_logged: AtomicBool::new(false),
             metrics: None,
-        })
+        }
     }
 
     /// Count Redis operation failures on `metrics`. Without it the
@@ -305,6 +385,47 @@ impl RedisStore {
     fn mark_ok(&self) {
         self.degraded_logged.store(false, Ordering::Relaxed);
     }
+}
+
+/// Keep trying the shared backend until it answers, then attach it.
+///
+/// The cadence is the configured budget, not the breaker's cool-off
+/// window: the reason the request-path prober waits a whole window is
+/// that a probe against a still-dead Redis costs a caller its budget,
+/// and nothing here is billed to a caller. What it buys instead is the
+/// case this exists for — Redis coming up seconds after the gateway on a
+/// node reboot — recovering in seconds rather than half a minute.
+///
+/// One attempt per iteration: `connect_bounded` spends at most the
+/// budget, so an unreachable Redis costs one TCP connect attempt per
+/// `2 × timeout_secs` for as long as the outage lasts.
+fn spawn_attach(slot: ConnSlot, cfg: RedisConnConfig, policy: FailurePolicy) {
+    tokio::spawn(async move {
+        let retry = std::time::Duration::from_secs(cfg.timeout_secs.max(1));
+        loop {
+            tokio::time::sleep(retry).await;
+            match aisix_redis::connect_bounded(&cfg, &policy).await {
+                Ok(conn) => {
+                    slot.attach(conn);
+                    tracing::info!(
+                        target: "aisix::ratelimit",
+                        endpoint = %aisix_redis::endpoint_label(&cfg),
+                        "shared rate-limit backend attached; cluster-wide counting resumes"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "aisix::ratelimit",
+                        error = %e,
+                        retry_secs = retry.as_secs(),
+                        "shared rate-limit backend still unreachable; per-replica \
+                         counting continues"
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// Bump `aisix_redis_failures_total` for one failed rate-limit store

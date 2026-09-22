@@ -72,6 +72,12 @@
 //!   commands rather than one command — bounded, and the alternative is
 //!   billing a caller for detection on every window of every outage.
 //!
+//! The same reasoning applies to the connection a subsystem opens at
+//! **boot**, which nothing else bounds: [`connect_bounded`] spends at
+//! most one budget there, because the driver's own retry schedule for
+//! the initial connect is measured in minutes and boot holds the
+//! listeners closed while it runs.
+//!
 //! The breaker belongs to a **subsystem**, not to a connection — see
 //! [`FailurePolicy`]. A subsystem may hold several connections (the cache
 //! holds two: exact-KV and vector search) and one request touches all of
@@ -564,6 +570,22 @@ fn breaker_open_error() -> redis::RedisError {
     ))
 }
 
+/// The error an operation gets while its subsystem holds no connection
+/// yet — the state [`connect_bounded`] leaves behind when Redis is
+/// unreachable at startup and the subsystem chose to carry on without
+/// it. `IoError` for the same reason as [`breaker_open_error`]: every
+/// consumer already classifies a connectivity failure as the cue to run
+/// its fail-open branch, and this is one.
+pub fn not_connected_error() -> redis::RedisError {
+    redis::RedisError::from((
+        redis::ErrorKind::IoError,
+        "redis is not connected yet",
+        "the backend was unreachable at startup; a background task keeps trying and \
+         commands run on the local fallback until it attaches"
+            .to_string(),
+    ))
+}
+
 fn timed_out_error(budget: Duration) -> redis::RedisError {
     redis::RedisError::from((
         redis::ErrorKind::IoError,
@@ -688,6 +710,60 @@ impl ConnectionLike for RedisConnHandle {
 /// passed (the boot path validates before calling this).
 pub async fn connect(cfg: &RedisConnConfig) -> RedisResult<RedisConn> {
     connect_with(cfg, &FailurePolicy::new(cfg)).await
+}
+
+/// [`connect_with`], bounded in aggregate by the subsystem's command
+/// budget (`redis.timeout_secs`) rather than only per attempt.
+///
+/// `connect_with` sets the budget natively on the driver, which bounds
+/// each connection ATTEMPT — but not the call, because the single-node
+/// connection manager retries the initial connect on the driver's own
+/// schedule before it reports a failure. That schedule is not derived
+/// from anything the operator configured and it runs to minutes: a boot
+/// against a black-holed Redis measured **eight minutes** on `redis`
+/// 0.27 at `timeout_secs: 2`, with no log line and no error until the
+/// last attempt gave up. Boot awaits this connection before it binds a
+/// listener, so the gateway answered nothing at all for that whole
+/// stretch. The budget the operator set is what a boot may spend on it.
+///
+/// Reconnects after a successful start are NOT bounded here — they run
+/// inside the driver on that same schedule, behind the breaker and the
+/// per-command budget, so they cost a caller nothing.
+pub async fn connect_bounded(
+    cfg: &RedisConnConfig,
+    policy: &FailurePolicy,
+) -> RedisResult<RedisConn> {
+    let budget = policy.0.timeout;
+    match tokio::time::timeout(budget, connect_with(cfg, policy)).await {
+        Ok(r) => r,
+        Err(_) => Err(timed_out_error(budget)),
+    }
+}
+
+/// The backend's address with the scheme, any userinfo and any path
+/// stripped, so a diagnostic can name WHICH Redis is unreachable. The
+/// configured URL itself must never be logged — it carries the password
+/// in `redis://user:pass@host` form.
+pub fn endpoint_label(cfg: &RedisConnConfig) -> String {
+    fn host(url: &str) -> &str {
+        let rest = url.split_once("://").map_or(url, |(_, r)| r);
+        // Last `@`, so a password containing one cannot leave a fragment
+        // of itself in front of the host.
+        let rest = rest.rsplit_once('@').map_or(rest, |(_, r)| r);
+        rest.split(['/', '?', '#']).next().unwrap_or_default()
+    }
+    fn hosts(urls: &[String]) -> String {
+        urls.iter().map(|u| host(u)).collect::<Vec<_>>().join(",")
+    }
+    match cfg.mode {
+        RedisMode::Single => host(cfg.url.as_deref().unwrap_or_default()).to_string(),
+        RedisMode::Cluster => hosts(&cfg.nodes),
+        RedisMode::Sentinel => format!(
+            "master {} via {}",
+            cfg.master_name.as_deref().unwrap_or_default(),
+            hosts(&cfg.sentinels)
+        ),
+    }
 }
 
 /// [`connect`] against an existing [`FailurePolicy`].
@@ -1591,5 +1667,62 @@ mod probe_tests {
         let (outcome, elapsed) = command(&conn).await;
         outcome.expect("Redis is back, so the command goes through");
         assert!(elapsed < BUDGET, "{elapsed:?}");
+    }
+}
+
+#[cfg(test)]
+mod endpoint_label_tests {
+    use super::*;
+
+    fn single(url: &str) -> RedisConnConfig {
+        RedisConnConfig {
+            mode: RedisMode::Single,
+            url: Some(url.to_string()),
+            ..Default::default()
+        }
+    }
+
+    // The label goes into a boot WARN, so what it must never carry is the
+    // password — which is exactly what the shipped way of supplying one
+    // (`AISIX_RATELIMIT__REDIS__URL=redis://user:pass@host`) puts in the
+    // URL this is derived from.
+    #[test]
+    fn strips_scheme_userinfo_and_path() {
+        assert_eq!(
+            endpoint_label(&single("redis://10.0.0.1:6379")),
+            "10.0.0.1:6379"
+        );
+        assert_eq!(
+            endpoint_label(&single("rediss://user:p%40ss@10.0.0.1:6379/2")),
+            "10.0.0.1:6379"
+        );
+        // A password containing '@' must not leave its tail in front of
+        // the host, which is what splitting on the FIRST '@' would do.
+        assert_eq!(
+            endpoint_label(&single("redis://user:p@ss@10.0.0.1:6379")),
+            "10.0.0.1:6379"
+        );
+        assert_eq!(
+            endpoint_label(&single("redis://10.0.0.1:6379/#insecure")),
+            "10.0.0.1:6379"
+        );
+    }
+
+    #[test]
+    fn names_every_topology() {
+        let cluster = RedisConnConfig {
+            mode: RedisMode::Cluster,
+            nodes: vec!["redis://a:6379".into(), "redis://admin:pw@b:6380".into()],
+            ..Default::default()
+        };
+        assert_eq!(endpoint_label(&cluster), "a:6379,b:6380");
+
+        let sentinel = RedisConnConfig {
+            mode: RedisMode::Sentinel,
+            master_name: Some("mymaster".into()),
+            sentinels: vec!["redis://s1:26379".into()],
+            ..Default::default()
+        };
+        assert_eq!(endpoint_label(&sentinel), "master mymaster via s1:26379");
     }
 }

@@ -68,7 +68,11 @@ impl RedisCache {
         cfg: &RedisConnConfig,
         policy: &aisix_redis::FailurePolicy,
     ) -> Result<Self, CacheError> {
-        let conn = aisix_redis::connect_with(cfg, policy)
+        // `connect_bounded`, not `connect_with`: the gateway awaits this
+        // before it binds a listener, and the driver's own retry schedule
+        // for the initial connect runs for minutes against an unreachable
+        // Redis — see `aisix_redis::connect_bounded`.
+        let conn = aisix_redis::connect_bounded(cfg, policy)
             .await
             .map_err(|e| CacheError::Backend(format!("redis connect: {e}")))?;
         Ok(Self {

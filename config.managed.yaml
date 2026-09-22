@@ -46,14 +46,22 @@
 #   AISIX_RATELIMIT__REDIS__URL=redis://<host>:6379
 #   AISIX_RATELIMIT__REDIS__TIMEOUT_SECS=5   # optional; this is the default
 #
-# `timeout_secs` bounds one Redis round trip and one connection attempt.
-# The limiter fails open to per-replica counting when Redis errors, but an
-# unreachable Redis produces no error at all until something times out, so
-# without the bound a rate-limited request waits on TCP retransmission for
-# minutes. Lower it for a Redis on the same node; it must be >= 1. After a
-# failure the limiter short-circuits for 30 seconds and then lets one
-# request probe, so an outage costs this budget once per 30 seconds rather
-# than once per request.
+# `timeout_secs` bounds one Redis round trip, and the connection attempt
+# the gateway makes at startup. The limiter fails open to per-replica
+# counting when Redis errors, but an unreachable Redis produces no error
+# at all until something times out, so without the bound a rate-limited
+# request waits on TCP retransmission for minutes. Lower it for a Redis on
+# the same node; it must be >= 1. After a failure the limiter
+# short-circuits for 30 seconds and then lets one request probe, so an
+# outage costs this budget once per 30 seconds rather than once per
+# request.
+#
+# A Redis that is unreachable when the gateway STARTS does not stop it:
+# the listeners bind, the limiter counts per replica (so cluster-wide
+# limits are not enforced) and one WARN names the backend. The shared
+# backend is attached in the background as soon as Redis answers — which
+# is the node-reboot case, where Redis comes up after the gateway. The
+# gateway never silently falls back to the `memory` backend.
 #
 # Subsequent boots re-use the mTLS bundle written under
 # `managed.mtls_dir`.

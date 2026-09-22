@@ -274,14 +274,17 @@ cache:
   #   # (it is logged at startup). Use SSL_CERT_FILE or the system trust
   #   # store for that one case; `verify` does apply.
   #   #
-  #   # Seconds one Redis round trip, or one connection attempt, may take
-  #   # before it is abandoned and the request proceeds without the cache.
-  #   # A Redis that stops answering without closing the socket (host down,
-  #   # network partition, stopped container) would otherwise block the
-  #   # request for minutes instead of degrading it. After a failure,
-  #   # commands short-circuit for 30 seconds and then ONE request probes,
-  #   # so an outage costs this budget roughly once per 30 seconds rather
-  #   # than once per request. Must be >= 1.
+  #   # Seconds one Redis round trip, or the startup connection attempt,
+  #   # may take before it is abandoned and the request proceeds without
+  #   # the cache. A Redis that stops answering without closing the socket
+  #   # (host down, network partition, stopped container) would otherwise
+  #   # block the request for minutes instead of degrading it. Unlike the
+  #   # rate limiter, a cache Redis that is unreachable at STARTUP is
+  #   # fatal: the gateway reports it and exits within this budget rather
+  #   # than serving with `backend: redis` policies silently uncached.
+  #   # After a failure, commands short-circuit for 30 seconds and then
+  #   # ONE request probes, so an outage costs this budget roughly once per
+  #   # 30 seconds rather than once per request. Must be >= 1.
   #   #
   #   # The cool-off is per SUBSYSTEM, not per connection. This cache
   #   # opens two connections to this Redis — the exact-KV one and, for
@@ -306,7 +309,10 @@ cache:
 # enforces ONE global window — set this on multi-replica deployments.
 # May point at the same Redis as `cache` (keys are namespaced
 # `aisix:rl:`). On a Redis outage the limiter fails open to per-replica
-# in-memory counting (logged) so traffic keeps flowing.
+# in-memory counting (logged) so traffic keeps flowing — including when
+# Redis is already unreachable at startup, where the gateway binds its
+# listeners anyway and attaches the shared backend in the background as
+# soon as Redis answers. It never falls back to `memory` permanently.
 ratelimit:
   backend: "memory"   # memory | redis
   # redis:
@@ -317,11 +323,12 @@ ratelimit:
   #   # sentinels: ["redis://10.0.0.1:26379"]   # mode: sentinel
   #   # master_name: "mymaster"                  # mode: sentinel
   #   # tls: { ca_file: "/etc/aisix/tls/redis-ca.pem" }   # for rediss://
-  #   # Seconds one Redis round trip, or one connection attempt, may take
-  #   # before it is abandoned and the limiter falls back to per-replica
-  #   # counting. Same field and same meaning as cache.redis above; without
-  #   # it an unreachable Redis blocks every rate-limited request for
-  #   # minutes instead of degrading it. Must be >= 1.
+  #   # Seconds one Redis round trip, or the startup connection attempt,
+  #   # may take before it is abandoned and the limiter falls back to
+  #   # per-replica counting. Same field and same meaning as cache.redis
+  #   # above; without it an unreachable Redis blocks every rate-limited
+  #   # request — and the whole boot — for minutes instead of degrading.
+  #   # Must be >= 1.
   #   #
   #   # The limiter is a separate subsystem from the cache and cools off
   #   # independently, so a request that uses both can pay one budget for

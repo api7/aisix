@@ -465,6 +465,7 @@ dependencies = [
  "aisix-provider-vertex",
  "aisix-proxy",
  "aisix-ratelimit",
+ "aisix-redis",
  "anyhow",
  "axum 0.7.9",
  "chrono",

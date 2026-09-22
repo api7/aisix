@@ -26,6 +26,7 @@ aisix-provider-vertex = { path = "../aisix-provider-vertex" }
 aisix-provider-azure-openai = { path = "../aisix-provider-azure-openai" }
 aisix-provider-bedrock = { path = "../aisix-provider-bedrock" }
 aisix-ratelimit = { path = "../aisix-ratelimit" }
+aisix-redis = { path = "../aisix-redis" }
 aisix-cache = { path = "../aisix-cache", features = ["redis"] }
 tokio.workspace = true
 axum.workspace = true

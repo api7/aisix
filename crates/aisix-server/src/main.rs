@@ -943,12 +943,25 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 backend = "redis",
                 "connecting shared rate-limit backend"
             );
-            // No URL in the message: redis URLs carry credentials.
-            let store = RedisStore::connect(redis_cfg)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("redis rate-limit connect failed (ratelimit.redis): {e}")
-                })?
+            // A Redis that is unreachable HERE does not stop the boot: the
+            // listeners must bind whether or not the shared counters are
+            // reachable, and the store degrades to per-replica counting
+            // and re-attaches on its own.
+            let (store, unreachable) = RedisStore::connect_or_attach_later(redis_cfg).await;
+            if let Some(e) = unreachable {
+                // Host and port only, never the configured URL: redis URLs
+                // carry credentials.
+                tracing::warn!(
+                    target: "aisix::ratelimit",
+                    backend = "redis",
+                    endpoint = %aisix_redis::endpoint_label(redis_cfg),
+                    error = %e,
+                    "shared rate-limit backend unreachable at startup; serving with \
+                     per-replica in-memory counting (cluster limits not enforced) and \
+                     attaching the shared backend in the background"
+                );
+            }
+            let store = store
                 .with_conc_ttl(cfg.ratelimit.concurrency_ttl_secs)
                 .with_env_namespace(&cfg.etcd.env_id)
                 .with_metrics((*metrics).clone());
