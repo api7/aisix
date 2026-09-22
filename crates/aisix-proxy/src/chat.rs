@@ -1056,6 +1056,11 @@ async fn resolve_cache_hit(
         .await
     {
         Ok(Some(hit)) => {
+            // A hit is a success too: without this a semantic cache that
+            // recovered and went straight to serving hits would leave the
+            // latch set, and the NEXT outage's first failure would report
+            // at debug.
+            note_cache_ok(state, CacheHalf::Semantic);
             // Backfill TTL is capped at the matched entry's own
             // remaining lifetime: a paraphrase near expiry must not
             // grant the stored response a fresh full TTL, or repeated
@@ -1065,11 +1070,19 @@ async fn resolve_cache_hit(
                 .saturating_duration_since(std::time::Instant::now());
             let backfill_ttl = ttl.map(|t| t.min(remaining)).unwrap_or(remaining);
             if !backfill_ttl.is_zero() {
-                if let Err(err) = cache
+                // The backfill is an exact-half write, so it reports
+                // under the exact latch like the other two.
+                match cache
                     .put_with_ttl(key, hit.response.clone(), backfill_ttl)
                     .await
                 {
-                    tracing::warn!(error = %err, key = %key, "cache backfill write failed");
+                    Ok(()) => note_cache_ok(state, CacheHalf::Exact),
+                    Err(err) if note_cache_failed(state, CacheHalf::Exact) => {
+                        tracing::warn!(error = %err, key = %key, "cache backfill write failed");
+                    }
+                    Err(err) => {
+                        tracing::debug!(error = %err, key = %key, "cache backfill write failed");
+                    }
                 }
             }
             // 4-dp similarity everywhere it surfaces (header, usage
