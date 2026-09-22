@@ -992,6 +992,13 @@ async fn a_config_the_driver_cannot_use_is_still_fatal() {
 /// server is right there — and no amount of waiting turns a wrong
 /// password into a right one. Same judgement the etcd side already
 /// makes on a refused credential.
+///
+/// Synthetic errors, so this pins the CLASSIFIER and nothing else. It
+/// does not prove a real Redis refusal ever reaches it, and for a while
+/// none did — every driver reported a refusal as a connectivity failure,
+/// so the branch below was unreachable in production while this test
+/// stayed green. `crates/aisix-redis/tests/auth_connect.rs` is the one
+/// that answers that question, against a live server.
 #[test]
 fn a_refused_credential_is_permanent_too() {
     let refused = redis::RedisError::from((
