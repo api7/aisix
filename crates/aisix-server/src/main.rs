@@ -948,23 +948,41 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // listeners must bind whether or not the shared counters are
             // reachable, and the store degrades to per-replica counting
             // and re-attaches on its own.
-            let (store, unreachable) = RedisStore::connect_or_attach_later(redis_cfg)
+            let (store, degraded) = RedisStore::connect_or_attach_later(redis_cfg)
                 .await
                 .map_err(|e| {
                     anyhow::anyhow!("redis rate-limit connect failed (ratelimit.redis): {e}")
                 })?;
-            if let Some(e) = unreachable {
+            if let Some(e) = degraded {
                 // Host and port only, never the configured URL: redis URLs
-                // carry credentials.
-                tracing::warn!(
-                    target: "aisix::ratelimit",
-                    backend = "redis",
-                    endpoint = %aisix_redis::endpoint_label(redis_cfg),
-                    error = %e,
-                    "shared rate-limit backend unreachable at startup; serving with \
-                     per-replica in-memory counting (cluster limits not enforced) and \
-                     attaching the shared backend in the background"
-                );
+                // carry credentials. `error` carries the server's own
+                // words when it answered, which is the only part that says
+                // WHICH setting it refused.
+                let reason = aisix_redis::failure_reason(&e);
+                let endpoint = aisix_redis::endpoint_label(redis_cfg);
+                if reason == "refused" {
+                    tracing::warn!(
+                        target: "aisix::ratelimit",
+                        backend = "redis",
+                        %endpoint,
+                        %reason,
+                        error = %e,
+                        "shared rate-limit backend REFUSED the configured connection \
+                         settings at startup; serving with per-replica in-memory counting \
+                         (cluster limits not enforced) and retrying in the background"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "aisix::ratelimit",
+                        backend = "redis",
+                        %endpoint,
+                        %reason,
+                        error = %e,
+                        "shared rate-limit backend unreachable at startup; serving with \
+                         per-replica in-memory counting (cluster limits not enforced) and \
+                         attaching the shared backend in the background"
+                    );
+                }
             }
             let store = store
                 .with_conc_ttl(cfg.ratelimit.concurrency_ttl_secs)
@@ -1099,25 +1117,44 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                     (*metrics).clone(),
                 );
             }
-            // A config the driver can never use is still fatal: retrying
-            // a typo'd `ca_file` forever would leave the gateway healthy
-            // and permanently uncached, which is worse than the boot
-            // failure it replaced.
-            Err(e) if aisix_redis::is_permanent_config_error(&e) => {
+            // A config the process rejected by ITSELF is still fatal:
+            // retrying a typo'd `ca_file` forever would leave the gateway
+            // healthy and permanently uncached, which is worse than the
+            // boot failure it replaced. A server that answered and
+            // refused is degraded around instead — it can be corrected
+            // server-side while this gateway keeps serving.
+            Err(e) if aisix_redis::is_boot_fatal(&e) => {
                 anyhow::bail!("redis cache connect failed (cache.redis): {e}");
             }
             Err(e) => {
                 // Deliberately no URL: redis URLs carry credentials
                 // (redis://user:pass@host) and this error lands in logs
-                // that may ship to centralized sinks.
-                tracing::warn!(
-                    target: "aisix::cache",
-                    backend = "redis",
-                    endpoint = %aisix_redis::endpoint_label(redis_cfg),
-                    error = %e,
-                    "cache backend unreachable at startup; serving with backend=redis \
-                     cache policies treated as misses and attaching in the background"
-                );
+                // that may ship to centralized sinks. `error` does carry
+                // the server's own words when it answered.
+                let reason = aisix_redis::failure_reason(&e);
+                let endpoint = aisix_redis::endpoint_label(redis_cfg);
+                if reason == "refused" {
+                    tracing::warn!(
+                        target: "aisix::cache",
+                        backend = "redis",
+                        %endpoint,
+                        %reason,
+                        error = %e,
+                        "cache backend REFUSED the configured connection settings at \
+                         startup; serving with backend=redis cache policies treated as \
+                         misses and retrying in the background"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "aisix::cache",
+                        backend = "redis",
+                        %endpoint,
+                        %reason,
+                        error = %e,
+                        "cache backend unreachable at startup; serving with backend=redis \
+                         cache policies treated as misses and attaching in the background"
+                    );
+                }
                 spawn_cache_attach(
                     exact_slot.clone(),
                     semantic_cell,
@@ -1816,24 +1853,24 @@ fn spawn_cache_attach(
                 }
                 Err(e) if last_reminder.elapsed() >= CACHE_DEGRADED_REMINDER => {
                     last_reminder = std::time::Instant::now();
-                    // Same distinction the boot makes, for a Redis that was
-                    // down when the gateway started and came back wanting a
-                    // password it does not have. Still retried — a serving
-                    // gateway must not die — but not called unreachable.
-                    if aisix_redis::is_permanent_config_error(&e) {
+                    // Same `reason` the boot line carried, so the two read
+                    // as one story and one filter finds both.
+                    let reason = aisix_redis::failure_reason(&e);
+                    if reason == "refused" {
                         tracing::warn!(
                             target: "aisix::cache",
                             %endpoint,
+                            %reason,
                             error = %e,
-                            "the cache backend answered and REFUSED the configured \
-                             connection settings; every backend=redis cache policy will \
-                             be served as a miss until the configuration is corrected \
-                             and the gateway restarted"
+                            "cache backend is still REFUSING the configured connection \
+                             settings; every backend=redis cache policy is being served \
+                             as a miss"
                         );
                     } else {
                         tracing::warn!(
                             target: "aisix::cache",
                             %endpoint,
+                            %reason,
                             error = %e,
                             "cache backend still unreachable; every backend=redis cache \
                              policy is being served as a miss"

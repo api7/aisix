@@ -663,3 +663,95 @@ describe("a cache Redis unreachable at startup degrades the cache, not the boot"
     expect(upstream.receivedRequests.length - warm).toBe(1);
   }, 150_000);
 });
+
+// The cache half of the credential-refusal case. The full story — that
+// the degraded state ends by itself once the credential is corrected on
+// the server — is in `ratelimit-cluster-e2e.test.ts`, because both
+// subsystems share one connect path and one classification. What is
+// asserted here is that the cache reaches the same two conclusions
+// through its own call site: it serves, and it says the server REFUSED
+// rather than that it timed out.
+describe("a cache Redis that refuses the credential degrades the cache, not the boot", () => {
+  let app: SpawnedApp | undefined;
+  let ready = false;
+  const prefix = `/aisix-e2e-cache-refused-${randomUUID()}`;
+  const user = `aisix-e2e-cache-${randomUUID().slice(0, 8)}`;
+
+  /** One command over a fresh RESP connection, as bulk strings. */
+  async function redisCommand(args: string[]): Promise<void> {
+    const m = /^redis:\/\/(?:[^@/]*@)?([^:/]+)(?::(\d+))?/.exec(REDIS_URL);
+    if (!m) throw new Error(`not a redis url: ${REDIS_URL}`);
+    const host = m[1];
+    const port = m[2] ? Number(m[2]) : 6379;
+    const payload =
+      `*${args.length}\r\n` + args.map((a) => `$${Buffer.byteLength(a)}\r\n${a}\r\n`).join("");
+    await new Promise<void>((resolve, reject) => {
+      const sock = connect({ host, port }, () => sock.write(payload));
+      sock.once("data", () => {
+        sock.destroy();
+        resolve();
+      });
+      sock.once("error", (e) => {
+        sock.destroy();
+        reject(e);
+      });
+      sock.setTimeout(2000, () => {
+        sock.destroy();
+        reject(new Error("redis command timed out"));
+      });
+    });
+  }
+
+  beforeAll(async () => {
+    ready = await vectorRedisReady();
+    if (!ready) return;
+    // An ACL user rather than `requirepass`, which is server-wide and
+    // would lock every other file in this suite out of the same Redis.
+    await redisCommand(["ACL", "SETUSER", user, "on", ">not-the-one-configured", "~*", "+@all"]);
+    app = await spawnApp({
+      // `info`, so the listening line the first assertion reads is kept.
+      logLevel: "info",
+      extra: {
+        etcd: { endpoints: [ETCD_ENDPOINT], prefix },
+        cache: {
+          backend: "redis",
+          redis: {
+            url: REDIS_URL,
+            username: user,
+            password: "the-one-configured",
+            timeout_secs: 5,
+          },
+        },
+      },
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    if (ready) {
+      await redisCommand(["ACL", "DELUSER", user]).catch(() => {});
+      await new EtcdClient().deletePrefix(prefix);
+    }
+  });
+
+  test("it serves, and the WARN names a refusal rather than a timeout", async (ctx) => {
+    if (!ready || !app) {
+      ctx.skip();
+      return;
+    }
+    expect(app.output()).toContain("aisix listening");
+
+    const warn = app
+      .output()
+      .split("\n")
+      .find((l) => l.includes("cache backend REFUSED"));
+    expect(warn).toBeDefined();
+    expect(warn).toContain("reason=refused");
+    expect(warn).toContain(new URL(REDIS_URL).host);
+    // The server's own words: the only part that says WHICH setting.
+    expect(warn?.toLowerCase()).toContain("auth");
+    expect(warn).not.toContain("timed out");
+    expect(warn).not.toContain("unreachable");
+    expect(warn).not.toContain("redis://");
+  }, 60_000);
+});

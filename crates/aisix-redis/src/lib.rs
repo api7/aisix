@@ -643,43 +643,73 @@ pub fn not_connected_error() -> redis::RedisError {
     ))
 }
 
-/// True when a connect error can never come good on a retry: the
-/// operator wrote something the driver cannot use at all — a malformed
-/// `url`, TLS material that will not read or parse — or a credential the
-/// server answered and refused.
+/// Why a connect failed, as far as it changes what an operator should
+/// do about it.
 ///
-/// It matters because everything else here is now retried forever in the
-/// background. Retrying a typo turns a boot that said exactly what was
-/// wrong into a gateway that comes up healthy and is quietly never going
-/// to enforce a shared limit or cache anything, which is strictly worse
-/// than the failure it replaced. A refused credential is the same
-/// judgement the etcd side already makes: no amount of waiting turns a
-/// wrong password into a right one, and a server that ANSWERED is not
-/// the unreachable case the retry exists for.
-///
-/// It only classifies what the driver reports as such. A refusal the
-/// budget cut short arrives as a timeout instead, and is retried — which
-/// is the safe direction for a misclassification, since the alternative
-/// is refusing to start over a slow handshake.
-pub fn is_permanent_config_error(e: &redis::RedisError) -> bool {
-    if matches!(
-        e.kind(),
-        redis::ErrorKind::InvalidClientConfig | redis::ErrorKind::AuthenticationFailed
-    ) {
-        return true;
+/// Only [`ConnectFailure::Local`] ends a boot. The other two are served
+/// degraded — per-replica counting, cache misses — with the background
+/// re-attach still running, because both can come good without the
+/// gateway being restarted: a server comes back, or an operator fixes
+/// the credential on the server side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectFailure {
+    /// Rejected before a packet was sent: a `url` the driver cannot
+    /// parse, TLS material that will not read. Nothing about the network
+    /// or the server can change it, and there is no degraded state worth
+    /// entering — the operator has to edit the configuration and start
+    /// again.
+    Local,
+    /// The server answered, and refused what we connected with: the
+    /// credential, or a `database` it does not have. It is NOT an
+    /// outage, and saying so sends an operator to the network for a
+    /// server that replied in milliseconds — which is the whole reason
+    /// this variant exists separately from the one below.
+    Refused,
+    /// Nothing usable answered inside the budget.
+    Unreachable,
+}
+
+/// Classify a connect error.
+pub fn classify_connect_failure(e: &redis::RedisError) -> ConnectFailure {
+    // `InvalidClientConfig` is raised only by the URL parse and by
+    // reading the TLS material — both of which happen before any socket.
+    if e.kind() == redis::ErrorKind::InvalidClientConfig {
+        return ConnectFailure::Local;
     }
-    // A refusal the server raises against the startup PING rather than
-    // against the handshake. redis-rs has no `ErrorKind` for these — they
-    // arrive as extension errors carrying the server's own code — so
-    // match the code. `NOAUTH` is what a `requirepass` server answers a
-    // connection that never authenticated at all, and `WRONGPASS` is the
-    // ACL refusal; neither comes good on a retry.
+    // Everything the server can say about what we connected with. The
+    // handshake runs `AUTH` and `SELECT` and nothing else, so a
+    // `ResponseError` from it is a refused `database`; a refused
+    // credential arrives as `AuthenticationFailed` from the handshake,
+    // or as the server's own `NOAUTH`/`WRONGPASS` against the proof
+    // command when no credential was sent at all.
     //
     // Deliberately NOT `NOPERM`: that answer comes from a connection the
     // server has already authenticated and only says this user may not
-    // run this command. An ACL scoped to what a subsystem actually uses
-    // routinely excludes `PING`, and such a deployment works.
-    matches!(e.code(), Some("NOAUTH" | "WRONGPASS"))
+    // run this command — see [`prove_with`].
+    if matches!(
+        e.kind(),
+        redis::ErrorKind::AuthenticationFailed | redis::ErrorKind::ResponseError
+    ) || matches!(e.code(), Some("NOAUTH" | "WRONGPASS"))
+    {
+        return ConnectFailure::Refused;
+    }
+    ConnectFailure::Unreachable
+}
+
+/// Whether a connect failure has to end the boot.
+pub fn is_boot_fatal(e: &redis::RedisError) -> bool {
+    classify_connect_failure(e) == ConnectFailure::Local
+}
+
+/// The word every line about a degraded backend carries, so the boot's
+/// line and the periodic restatement cannot drift apart and so a
+/// `reason=` filter finds both.
+pub fn failure_reason(e: &redis::RedisError) -> &'static str {
+    match classify_connect_failure(e) {
+        ConnectFailure::Refused => "refused",
+        // A `Local` failure never reaches a degraded-state line.
+        ConnectFailure::Local | ConnectFailure::Unreachable => "unreachable",
+    }
 }
 
 /// The error a connect that outran its whole budget returns.
@@ -920,21 +950,6 @@ enum Probe {
     Silent,
 }
 
-/// The shape a refusal is reported in, whatever the server called it.
-///
-/// `InvalidClientConfig` because that is what it is — the operator wrote
-/// something this server will not accept — and because it is already the
-/// kind [`is_permanent_config_error`] treats as never coming good on a
-/// retry. The server's own words are kept as the detail, since they are
-/// the only part that says WHICH setting.
-fn settings_refused(e: redis::RedisError) -> redis::RedisError {
-    redis::RedisError::from((
-        redis::ErrorKind::InvalidClientConfig,
-        "redis refused the configured connection settings",
-        e.to_string(),
-    ))
-}
-
 /// Ask the data node directly whether it refuses the settings we would
 /// connect with, and return the refusal if it does.
 ///
@@ -1097,11 +1112,14 @@ async fn probe(
         // `IoError` and the timeouts are the unreachable case, which is
         // not ours to report. Anything else came from the server.
         Err(e) if e.kind() == redis::ErrorKind::IoError => return Probe::Silent,
-        Err(e) => return Probe::Refused(settings_refused(e)),
+        // Kept exactly as the server phrased it: it is the only part of
+        // the diagnostic that says WHICH setting was refused, and it is
+        // what the degraded-state WARN quotes.
+        Err(e) => return Probe::Refused(e),
     };
     match prove_with(&mut conn, proof_command(cfg.mode), timeout).await {
         Ok(()) => Probe::Answered,
-        Err(e) if is_permanent_config_error(&e) => Probe::Refused(settings_refused(e)),
+        Err(e) if classify_connect_failure(&e) == ConnectFailure::Refused => Probe::Refused(e),
         Err(_) => Probe::Silent,
     }
 }

@@ -308,11 +308,14 @@ cache:
   #   # not stop the gateway: the listeners bind, every `backend: redis`
   #   # policy is served as a miss, one WARN names the backend, and the
   #   # connection is attached in the background as soon as Redis answers.
-  #   # A `url` the driver cannot parse, TLS material that cannot be read,
-  #   # and settings the server ANSWERS and refuses (a rejected credential,
-  #   # a `database` it does not have) are different and still end the
-  #   # boot — no amount of retrying fixes a typo, and a server that
-  #   # replied is not the outage the retry exists for.
+  #   # Settings the server ANSWERS and refuses — a rejected credential,
+  #   # a `database` it does not have — degrade the same way, and the WARN
+  #   # says the server REFUSED rather than that it timed out. They are
+  #   # retried too: the credential may be corrected on the server, and
+  #   # the connection is then attached without restarting the gateway.
+  #   # Only configuration this process can reject by itself still ends
+  #   # the boot: a `url` the driver cannot parse, TLS material that
+  #   # cannot be read. Nothing outside the process can fix those.
   #   # After a failure, commands short-circuit for 30 seconds and then
   #   # ONE request probes, so an outage costs this budget roughly once per
   #   # 30 seconds rather than once per request. Must be >= 1.
@@ -373,10 +376,11 @@ ratelimit:
   #   # the listeners bind, counting is per-replica (so cluster-wide
   #   # limits are not enforced), one WARN names the backend, and the
   #   # shared backend is attached in the background as soon as Redis
-  #   # answers. Configuration the backend cannot use is different and
-  #   # still ends the boot — a `url` the driver cannot parse, TLS
-  #   # material that cannot be read, and settings the server answers and
-  #   # refuses (a rejected credential, a `database` it does not have).
+  #   # answers. A Redis that ANSWERS and refuses the settings degrades
+  #   # the same way, with a WARN that says REFUSED rather than timed out,
+  #   # and is retried too. Only configuration this process can reject by
+  #   # itself still ends the boot: a `url` the driver cannot parse, TLS
+  #   # material that cannot be read.
   #   #
   #   # The limiter is a separate subsystem from the cache and cools off
   #   # independently, so a request that uses both can pay one budget for

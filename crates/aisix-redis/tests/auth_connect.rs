@@ -6,15 +6,19 @@
 //! so local unit runs stay hermetic).
 //!
 //! Two properties, and they are the same property seen from both sides:
-//! a server that ANSWERS and refuses the credential must stop the boot
-//! with the refusal in the message, and a credential supplied through
-//! the `password` field must reach the handshake — because the failure
-//! that made both of these tests necessary was the gateway reporting
-//! `connected` in one case and `redis connect timed out` in the other,
-//! never once naming the password.
+//! a server that ANSWERS and refuses must be told apart from one that
+//! never answered, and a credential supplied through the `password`
+//! field must reach the handshake — because the failure that made both
+//! of these tests necessary was the gateway reporting `connected` in one
+//! case and `redis connect timed out` in the other, never once naming
+//! the password.
+//!
+//! Neither outcome ends a boot. What the classification decides is what
+//! the operator is TOLD while the gateway serves degraded, and whether
+//! the background re-attach is waiting on a network or on them.
 
 use aisix_core::{RedisConnConfig, RedisMode};
-use aisix_redis::{connect_bounded, is_permanent_config_error, FailurePolicy};
+use aisix_redis::{classify_connect_failure, connect_bounded, ConnectFailure, FailurePolicy};
 
 /// `redis://host:port`, with NO credential in it.
 fn plain_url() -> Option<String> {
@@ -62,11 +66,11 @@ async fn connect_and_use(cfg: &RedisConnConfig) -> Result<(), redis::RedisError>
         .await
 }
 
-/// The whole finding in one assertion: the server answered, so the boot
-/// must stop, and the message must name what it answered rather than a
-/// timeout that never happened.
+/// The whole finding in one assertion: the server answered, so this is a
+/// refusal rather than an outage, and the error must carry what it
+/// answered rather than a timeout that never happened.
 #[tokio::test]
-async fn a_wrong_password_in_the_url_is_a_permanent_error() {
+async fn a_wrong_password_in_the_url_reads_as_a_refusal() {
     let (Some(url), Some(_)) = (plain_url(), password()) else {
         return;
     };
@@ -74,9 +78,11 @@ async fn a_wrong_password_in_the_url_is_a_permanent_error() {
     let err = connect_and_use(&cfg)
         .await
         .expect_err("a refused credential must fail the connect");
-    assert!(
-        is_permanent_config_error(&err),
-        "a refused credential must be permanent, not retried forever: {err}"
+    assert_eq!(
+        classify_connect_failure(&err),
+        ConnectFailure::Refused,
+        "the server answered; classifying it as an outage is what produced the \
+         timeout diagnostic: {err}"
     );
     let text = err.to_string().to_lowercase();
     assert!(
@@ -108,7 +114,7 @@ async fn the_password_field_authenticates_when_the_url_carries_no_credential() {
 }
 
 #[tokio::test]
-async fn a_wrong_password_field_is_a_permanent_error() {
+async fn a_wrong_password_field_reads_as_a_refusal() {
     let (Some(url), Some(_)) = (plain_url(), password()) else {
         return;
     };
@@ -119,7 +125,11 @@ async fn a_wrong_password_field_is_a_permanent_error() {
     let err = connect_and_use(&cfg)
         .await
         .expect_err("a refused credential must fail the connect");
-    assert!(is_permanent_config_error(&err), "{err}");
+    assert_eq!(
+        classify_connect_failure(&err),
+        ConnectFailure::Refused,
+        "{err}"
+    );
 }
 
 /// Precedence, stated in the field's rustdoc and in `config.example.yaml`:
@@ -163,23 +173,28 @@ async fn the_username_field_reaches_the_handshake() {
     let err = connect_and_use(&bad)
         .await
         .expect_err("an unknown ACL user must fail the connect");
-    assert!(is_permanent_config_error(&err), "{err}");
+    assert_eq!(
+        classify_connect_failure(&err),
+        ConnectFailure::Refused,
+        "{err}"
+    );
 }
 
-/// The other half of the classification, and the one the fail-open path
-/// depends on: nothing answered, so this is NOT permanent and the
-/// background re-attach keeps trying.
+/// The other half of the classification: nothing answered, so this must
+/// not be dressed up as a refusal — the operator would go looking at a
+/// credential when the server is simply not there.
 #[tokio::test]
-async fn an_endpoint_that_does_not_answer_is_not_permanent() {
+async fn an_endpoint_that_does_not_answer_reads_as_unreachable() {
     // Port 1 on loopback: refused immediately, so this stays hermetic
     // and fast. The blackhole *timing* is pinned by the e2e cases.
     let cfg = single("redis://127.0.0.1:1");
     let err = connect_and_use(&cfg)
         .await
         .expect_err("nothing is listening there");
-    assert!(
-        !is_permanent_config_error(&err),
-        "an unreachable endpoint must keep being retried in the background: {err}"
+    assert_eq!(
+        classify_connect_failure(&err),
+        ConnectFailure::Unreachable,
+        "nothing answered, so this must not be reported as a refusal: {err}"
     );
 }
 
@@ -223,9 +238,10 @@ mod data_node_credentials {
         let err = connect_and_use(&cfg)
             .await
             .expect_err("a password the cluster refuses must fail the connect");
-        assert!(
-            is_permanent_config_error(&err),
-            "a refused cluster credential must be permanent: {err}"
+        assert_eq!(
+            classify_connect_failure(&err),
+            ConnectFailure::Refused,
+            "a refused cluster credential must read as a refusal: {err}"
         );
     }
 
@@ -245,9 +261,10 @@ mod data_node_credentials {
         let err = connect_and_use(&cfg)
             .await
             .expect_err("a password the master refuses must fail the connect");
-        assert!(
-            is_permanent_config_error(&err),
-            "a refused master credential must be permanent: {err}"
+        assert_eq!(
+            classify_connect_failure(&err),
+            ConnectFailure::Refused,
+            "a refused master credential must read as a refusal: {err}"
         );
     }
 }
@@ -304,12 +321,12 @@ mod what_the_server_rejects {
     /// A `database` the server does not have is the same class as a
     /// refused password and was hidden the same way — the connection
     /// manager's retry ladder turned the server's `SELECT` refusal into
-    /// a timeout, so the gateway degraded forever over a typo.
+    /// a timeout, so the operator was told the network was down.
     ///
     /// `single` mode is where this became reachable: `database` was
     /// ignored there until the field started being applied.
     #[tokio::test]
-    async fn a_database_the_server_does_not_have_is_permanent() {
+    async fn a_database_the_server_does_not_have_reads_as_a_refusal() {
         let (Some(url), Some(pw)) = (plain_url(), password()) else {
             return;
         };
@@ -322,7 +339,11 @@ mod what_the_server_rejects {
         let err = connect_and_use(&cfg)
             .await
             .expect_err("an out-of-range database must fail the connect");
-        assert!(is_permanent_config_error(&err), "{err}");
+        assert_eq!(
+            classify_connect_failure(&err),
+            ConnectFailure::Refused,
+            "{err}"
+        );
         assert!(
             !err.to_string().to_lowercase().contains("timed out"),
             "the server answered; calling it a timeout is what hid this: {err}"
@@ -357,7 +378,11 @@ mod what_the_server_rejects {
         let err = connect_and_use(&cfg)
             .await
             .expect_err("the URL's password must not be lent to another user");
-        assert!(is_permanent_config_error(&err), "{err}");
+        assert_eq!(
+            classify_connect_failure(&err),
+            ConnectFailure::Refused,
+            "{err}"
+        );
         // NOAUTH is the discriminator, and it is the whole point: the
         // connection authenticated as NOTHING, because a username with
         // no password is not a credential. Borrowing the URL's password
