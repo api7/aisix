@@ -527,15 +527,10 @@ describe("a Redis unreachable at startup degrades the limiter, not the boot", ()
   let bootMs = 0;
   const prefix = `/aisix-e2e-rl-bootblackhole-${randomUUID()}`;
   const model = "rl-redis-boot";
-  // Below the 5s default, so a boot that spent the default instead of the
-  // configured budget fails the bound below.
+  // Deliberately not the 5s default: the WARN below names the budget that
+  // was actually spent, so a gateway that ignored the per-block field
+  // would report `5s` there and fail that assertion.
   const TIMEOUT_SECS = 2;
-  // What the rest of a boot costs — etcd dial, first config apply, listener
-  // bind — on a machine shared with three other vitest forks. The subject is
-  // that the Redis connect no longer adds minutes to it, so this is
-  // deliberately loose; it is still two orders of magnitude under the eight
-  // minutes the unbounded retry schedule took.
-  const BOOT_OVERHEAD_MS = 8000;
 
   beforeAll(async () => {
     infraReady = (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
@@ -578,21 +573,33 @@ describe("a Redis unreachable at startup degrades the limiter, not the boot", ()
       return;
     }
 
-    // 1. It served at all. `spawnApp` gates on `/livez` plus the metrics
-    //    listener, so reaching this line already means both bound; the
-    //    bound is what says it happened on the operator's budget rather
-    //    than on the driver's schedule.
-    expect(bootMs).toBeLessThan(TIMEOUT_SECS * 1000 + BOOT_OVERHEAD_MS);
+    // 1. It served at all, which `spawnApp` is what enforces: it gates on
+    //    `/livez` plus the metrics listener inside its own 10s readiness
+    //    budget, so a gateway that awaits the driver's retry schedule
+    //    never reaches this line. No UPPER bound on `bootMs` is asserted:
+    //    one at or above that readiness budget could not fail, and one
+    //    below it would be asserting how long an etcd dial and a first
+    //    config apply take on a machine shared with three other forks.
+    expect(appA.output()).toContain("aisix listening");
 
-    // 2. One WARN names the backend and WHICH Redis, with no credentials —
-    //    a URL is not loggable here because it carries the password.
+    // 2. One WARN names the backend, WHICH Redis, and the budget it
+    //    spent — with no credentials, because a redis URL carries the
+    //    password. The budget is the discriminator for "on the
+    //    operator's budget rather than the driver's schedule": it is the
+    //    per-block `timeout_secs`, not the 5s default, and not a
+    //    multi-minute ladder.
     const warn = appA
       .output()
       .split("\n")
       .find((l) => l.includes("shared rate-limit backend unreachable at startup"));
     expect(warn).toBeDefined();
     expect(warn).toContain(new URL(relay.url).host);
+    expect(warn).toContain(`redis.timeout_secs = ${TIMEOUT_SECS}s`);
     expect(warn).not.toContain("redis://");
+    //    The LOWER bound does hold, and fails if the connect never
+    //    reached the network at all: a boot that binds without spending
+    //    the budget has not been through the path under test.
+    expect(bootMs).toBeGreaterThanOrEqual(TIMEOUT_SECS * 1000);
 
     // 3. The limiter still refuses: the seeded key is RPM=1, and a degraded
     //    limiter that had stopped counting would serve both of these.

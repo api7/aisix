@@ -1454,9 +1454,10 @@ pub struct RedisConnConfig {
     /// Only consulted for `rediss://` URLs; a plaintext `redis://`
     /// connection never negotiates TLS regardless of what is set here.
     pub tls: OutboundTlsConfig,
-    /// Seconds a single Redis round trip, and a single connection
-    /// attempt, may take before it is abandoned. Default
-    /// [`DEFAULT_REDIS_TIMEOUT_SECS`].
+    /// Seconds a single Redis round trip may take before it is
+    /// abandoned, and the budget the startup connection is given — once
+    /// per endpoint a `cluster`/`sentinel` discovery may have to walk,
+    /// plus one. Default [`DEFAULT_REDIS_TIMEOUT_SECS`].
     ///
     /// Every consumer of this connection fails **open** on a Redis error
     /// (the rate limiter falls back to per-replica counters, the caches

@@ -427,6 +427,7 @@ dependencies = [
  "aisix-core",
  "aisix-obs",
  "aisix-redis",
+ "arc-swap",
  "async-trait",
  "dashmap",
  "parking_lot",

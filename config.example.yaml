@@ -274,14 +274,17 @@ cache:
   #   # (it is logged at startup). Use SSL_CERT_FILE or the system trust
   #   # store for that one case; `verify` does apply.
   #   #
-  #   # Seconds one Redis round trip, or the startup connection attempt,
-  #   # may take before it is abandoned and the request proceeds without
-  #   # the cache. A Redis that stops answering without closing the socket
-  #   # (host down, network partition, stopped container) would otherwise
-  #   # block the request for minutes instead of degrading it. Unlike the
-  #   # rate limiter, a cache Redis that is unreachable at STARTUP is
-  #   # fatal: the gateway reports it and exits within this budget rather
-  #   # than serving with `backend: redis` policies silently uncached.
+  #   # Seconds one Redis round trip, or the startup connection, may take
+  #   # before it is abandoned and the request proceeds without the cache.
+  #   # A Redis that stops answering without closing the socket (host
+  #   # down, network partition, stopped container) would otherwise block
+  #   # the request for minutes instead of degrading it. The startup
+  #   # connection gets this budget once per endpoint the discovery may
+  #   # have to walk, plus one — so `cluster` mode with two nodes can
+  #   # spend three of them, and `sentinel` mode one per sentinel plus one
+  #   # for the master. Unlike the rate limiter, a cache Redis that is
+  #   # unreachable at STARTUP is fatal: the gateway reports it and exits
+  #   # rather than serving `backend: redis` policies silently uncached.
   #   # After a failure, commands short-circuit for 30 seconds and then
   #   # ONE request probes, so an outage costs this budget roughly once per
   #   # 30 seconds rather than once per request. Must be >= 1.
@@ -325,9 +328,10 @@ ratelimit:
   #   # tls: { ca_file: "/etc/aisix/tls/redis-ca.pem" }   # for rediss://
   #   # Seconds one Redis round trip, or the startup connection, may take
   #   # before it is abandoned and the limiter falls back to per-replica
-  #   # counting. Same field and same meaning as cache.redis
-  #   # above; without it an unreachable Redis blocks every rate-limited
-  #   # request — and the whole boot — for minutes instead of degrading.
+  #   # counting. Same field and same meaning as cache.redis above,
+  #   # including the per-endpoint multiplier on the startup connection;
+  #   # without it an unreachable Redis blocks every rate-limited request
+  #   # — and the whole boot — for minutes instead of degrading.
   #   # Must be >= 1.
   #   #
   #   # The limiter is a separate subsystem from the cache and cools off
