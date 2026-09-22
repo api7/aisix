@@ -1350,6 +1350,15 @@ pub async fn connect_bounded(
         probe.abort();
         return outcome;
     };
+    // A local error outranks anything the server said. It is the only
+    // class that still ends the boot, and the probe can be answering
+    // about a DIFFERENT endpoint — one live cluster seed refusing a
+    // credential would otherwise mask an unparsable URL on another, and
+    // the gateway would degrade over a typo it could have named.
+    if is_boot_fatal(&e) {
+        probe.abort();
+        return Err(e);
+    }
     // The connect failed, so what the server said about the settings is
     // the better answer if it said anything. It has had the same wall
     // clock the connect had, so this is a join, not a wait.

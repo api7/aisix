@@ -394,3 +394,39 @@ mod what_the_server_rejects {
         );
     }
 }
+
+/// A configuration error this process can name outranks anything a
+/// server says about a different endpoint.
+///
+/// The probe runs alongside the connect and answers about whichever
+/// endpoint replied, so on a cluster one live seed refusing a credential
+/// can be answering while another seed's URL is simply unparsable. The
+/// refusal is the less useful of the two and must not replace the one
+/// the operator can act on — and it is not merely a worse message: a
+/// refusal degrades, while the unparsable URL is the one class that
+/// still ends the boot.
+#[tokio::test]
+async fn a_malformed_seed_outranks_another_seed_refusing_the_credential() {
+    let (Some(url), Some(_)) = (plain_url(), password()) else {
+        return;
+    };
+    let cfg = RedisConnConfig {
+        mode: RedisMode::Cluster,
+        // One the driver cannot parse, and one that is live and will
+        // refuse what we send it.
+        nodes: vec!["not-a-redis-url".into(), url],
+        password: Some("definitely-not-the-password".into()),
+        timeout_secs: 3,
+        ..Default::default()
+    };
+    let policy = FailurePolicy::new(&cfg);
+    let Err(err) = connect_bounded(&cfg, &policy).await else {
+        panic!("an unparsable seed must fail the connect")
+    };
+    assert_eq!(
+        classify_connect_failure(&err),
+        ConnectFailure::Local,
+        "the unparsable URL is what the operator must be told, not the other seed's \
+         refusal — and it is the one that still ends the boot: {err}"
+    );
+}
