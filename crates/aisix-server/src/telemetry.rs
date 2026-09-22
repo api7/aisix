@@ -1155,6 +1155,14 @@ mod tests {
     /// measured on this same paused clock, so advancing in seconds is what
     /// ENDS an attempt rather than something that could cut one short — and
     /// a 30-minute budget is 1800 cheap iterations.
+    ///
+    /// It does NOT give an attempt time to be DELIVERED. Ten steps cross
+    /// the 10s timeout, so the request gets ten polls to reach a real
+    /// socket and a real wiremock thread, against a thousand at
+    /// [`STEP_WHILE_SERVING`] — and those ten pass in microseconds of
+    /// wall clock. A phase that needs the server to have RECEIVED an
+    /// attempt (anything that then reads `posts`) must reach that point
+    /// on the small step and only then switch to this one.
     const STEP_WHILE_UNREACHABLE: Duration = Duration::from_secs(1);
 
     /// Poll the worker while virtual time moves forward in `step`s, until
@@ -1165,6 +1173,30 @@ mod tests {
     /// step is the caller's because it is a trade: it has to cross a backoff
     /// in a reasonable number of iterations without racing the request
     /// timeout of an exchange that is on the wire right now.
+    ///
+    /// **The step also decides whether an attempt gets DELIVERED.**
+    /// `posts` is pushed by the wiremock responder, on wiremock's own
+    /// runtime, in real time; the client's 10s request timeout runs on
+    /// the clock this advances, in instant steps. At one second a step an
+    /// attempt gets ten polls to cross a real socket — microseconds of
+    /// wall clock — before its own timeout cancels it, and a cancelled
+    /// request is never recorded at all. At ten milliseconds it gets a
+    /// thousand. So a phase that has to end with the server having
+    /// RECEIVED an attempt belongs on the small step, whatever the
+    /// condition is written in terms of; reaching it on the big step and
+    /// then reading `posts` is the shape that flakes.
+    ///
+    /// An attempt the server ANSWERS carries no such race in either
+    /// direction: the response cannot exist unless the responder ran, and
+    /// the responder records the post before it replies.
+    ///
+    /// The small step is MARGIN, not a guarantee. One delivery measured
+    /// 14 to 21 iterations of this loop against a budget of ten at the
+    /// big step and a thousand at the small one — two orders of
+    /// magnitude, which is why one is reliable and the other is a coin
+    /// flip, but neither is an invariant. Making it one would mean
+    /// synchronising on a server-side event rather than on a poll
+    /// budget; nothing here needs that yet.
     async fn drive_until<F: std::future::Future<Output = ()> + ?Sized>(
         mut sender: std::pin::Pin<&mut F>,
         step: Duration,
@@ -1625,8 +1657,22 @@ mod tests {
             "the failed batch was never re-sent",
         )
         .await;
-        // From here every attempt stalls past the request timeout, so the
-        // clock can move in seconds.
+        // Attempt 2 stalled, and the wait above has already delivered it.
+        // This one takes the re-send AFTER it — attempt 3 — which is what
+        // says a batch that met no response goes again. It stays on the
+        // SMALL step because that delivery is what is being waited for:
+        // at a second a step an attempt gets ten polls to cross a real
+        // socket before its own 10s timeout cancels it, and a cancelled
+        // request is never recorded. This wait replaces the `attempts > 2`
+        // assertion that used to sit below it.
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || posts.lock().unwrap().len() > 2,
+            "the stalling batch was never re-sent",
+        )
+        .await;
+        // Only now may the clock move in seconds, to run the budget out.
         drive_until(
             sender.as_mut(),
             STEP_WHILE_UNREACHABLE,
@@ -1644,12 +1690,18 @@ mod tests {
         // One lock per statement: `assert_identical_resends` takes the lock
         // itself, and a guard still alive from an argument expression would
         // deadlock against it.
-        let attempts = posts.lock().unwrap().len();
+        // `attempts > 2` is not asserted here: the wait above establishes
+        // it, and repeating it after the fact would be a check that
+        // cannot fail. What is worth saying is that every attempt carried
+        // the same batch — and that is asserted under ONE lock, because a
+        // count read in one statement and re-checked in the next can
+        // disagree with itself if a late recording lands in between.
+        let posts = posts.lock().unwrap();
+        let first = (&posts[0].0, &posts[0].1);
         assert!(
-            attempts > 2,
-            "a half-hour budget is many attempts: {attempts}"
+            posts.iter().all(|post| (&post.0, &post.1) == first),
+            "a re-send repeats the SAME batch id and the SAME events: {posts:?}",
         );
-        assert_identical_resends(&posts, attempts);
         assert_eq!(
             drops_with_reason(&metrics, DROP_SEND_FAILED),
             0,
@@ -1687,6 +1739,18 @@ mod tests {
             tx.try_send(event).unwrap();
         }
         tokio::time::advance(FLUSH_INTERVAL).await;
+        // Two phases, and the order is the point. The third attempt has to
+        // REACH the server before the clock may outrun it — `posts` is
+        // recorded by wiremock in real time — so it goes out on the small
+        // step. Only once it has landed may the clock jump in seconds to
+        // blow its request timeout.
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || posts.lock().unwrap().len() >= 3,
+            "the batch that met no response was never re-sent",
+        )
+        .await;
         drive_until(
             sender.as_mut(),
             STEP_WHILE_UNREACHABLE,
@@ -1921,6 +1985,19 @@ mod tests {
             STEP_WHILE_SERVING,
             || drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED) == 2,
             "the batch was never given up on",
+        )
+        .await;
+        // The stalled attempts in between are recorded on wiremock's
+        // clock, and the exact count below includes them. Its own wait,
+        // not a conjunct of the one above: folded together, a recording
+        // that never arrives would spend the wall-clock deadline and then
+        // report that the batch was never given up on — which it was.
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || posts.lock().unwrap().len() >= MAX_ANSWERED_FAILURES * 2 - 1,
+            "the batch was given up on before its fifteenth attempt — a \
+             stalled attempt consumed the cap",
         )
         .await;
         drop(tx);
