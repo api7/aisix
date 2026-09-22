@@ -1499,14 +1499,20 @@ pub async fn connect_with(cfg: &RedisConnConfig, policy: &FailurePolicy) -> Redi
             // nodes themselves leaves nothing for the builder to fill in
             // and keeps one definition of what "the explicit fields win"
             // means.
-            let nodes: Vec<redis::ConnectionInfo> = nodes
+            // The parse error is propagated, not filtered away: it is an
+            // `InvalidClientConfig`, which is the one class that still
+            // ends the boot, and dropping it would let a typo'd seed
+            // quietly reduce discovery redundancy instead of being
+            // reported. Passing raw strings used to get this for free,
+            // because the builder parsed them itself.
+            let nodes = nodes
                 .iter()
-                .filter_map(|url| url.as_str().into_connection_info().ok())
-                .map(|mut info| {
+                .map(|url| {
+                    let mut info = url.as_str().into_connection_info()?;
                     apply_explicit_settings(&mut info.redis, cfg);
-                    info
+                    Ok(info)
                 })
-                .collect();
+                .collect::<RedisResult<Vec<_>>>()?;
             let mut builder = ClusterClient::builder(nodes)
                 .connection_timeout(timeout)
                 .response_timeout(timeout);

@@ -673,6 +673,8 @@ describe("a cache Redis unreachable at startup degrades the cache, not the boot"
 // rather than that it timed out.
 describe("a cache Redis that refuses the credential degrades the cache, not the boot", () => {
   let app: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let embed: Awaited<ReturnType<typeof startEmbeddingMock>> | undefined;
   let ready = false;
   const prefix = `/aisix-e2e-cache-refused-${randomUUID()}`;
   const user = `aisix-e2e-cache-${randomUUID().slice(0, 8)}`;
@@ -712,6 +714,8 @@ describe("a cache Redis that refuses the credential degrades the cache, not the 
     // An ACL user rather than `requirepass`, which is server-wide and
     // would lock every other file in this suite out of the same Redis.
     await redisCommand(["ACL", "SETUSER", user, "on", ">not-the-one-configured", "~*", "+@all"]);
+    upstream = await startOpenAiUpstream();
+    embed = await startEmbeddingMock();
     app = await spawnApp({
       // `info`, so the listening line the first assertion reads is kept.
       logLevel: "info",
@@ -728,22 +732,42 @@ describe("a cache Redis that refuses the credential degrades the cache, not the 
         },
       },
     });
+    await seed(prefix, embed.baseUrl, upstream.baseUrl);
+    const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(
+      async () => (await probe.listModels()).status === 200,
+    );
   });
 
   afterAll(async () => {
     await app?.exit();
+    await upstream?.close();
+    await embed?.close();
     if (ready) {
       await redisCommand(["ACL", "DELUSER", user]).catch(() => {});
       await new EtcdClient().deletePrefix(prefix);
     }
   });
 
-  test("it serves, and the WARN names a refusal rather than a timeout", async (ctx) => {
-    if (!ready || !app) {
+  test("it serves every backend=redis policy as a miss, and the WARN names a refusal rather than a timeout", async (ctx) => {
+    if (!ready || !app || !upstream) {
       ctx.skip();
       return;
     }
     expect(app.output()).toContain("aisix listening");
+
+    // The behaviour the WARN promises, not just the WARN: `EXACT_MODEL`
+    // carries a `backend: redis` policy, so with the credential refused
+    // the second of two identical requests must still reach the
+    // upstream. A cache that had somehow connected would serve it from
+    // the store and the upstream would see one request, not two.
+    const before = upstream.receivedRequests.length;
+    const prompt = `refused-credential ${randomUUID()}`;
+    for (const _ of [0, 1]) {
+      const res = await timeChat(app.proxyUrl, EXACT_MODEL, prompt);
+      expect(res.status).toBe(200);
+    }
+    expect(upstream.receivedRequests.length - before).toBe(2);
 
     const warn = app
       .output()

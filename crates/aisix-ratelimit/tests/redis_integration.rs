@@ -1091,4 +1091,14 @@ async fn a_refused_credential_corrected_on_the_server_is_adopted_without_a_resta
         .await
         .expect("the corrected credential must connect");
     wait_for_attach(&store, &peer).await;
+
+    // The Redis is shared with every other test here and outlives the
+    // run, so the user this test invented does not get to accumulate on
+    // it one password at a time.
+    let mut handle = admin.acquire().await.expect("an admin handle");
+    let _ = redis::cmd("ACL")
+        .arg("DELUSER")
+        .arg(&user)
+        .query_async::<()>(&mut handle)
+        .await;
 }
