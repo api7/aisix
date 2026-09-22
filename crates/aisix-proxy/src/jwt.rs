@@ -229,8 +229,9 @@ fn provider_for_issuer(snapshot: &AisixSnapshot, iss: &str) -> ProviderMatch {
 ///
 /// The list is not capped. How many providers a token is tried against
 /// is set by the operator, not by the caller, and one HMAC verification
-/// is microseconds — whereas dropping the tail would leave a provider
-/// that loads, reports accepted, and authenticates nobody.
+/// costs tens of microseconds at the [`MAX_JWT_BYTES`] token cap — so
+/// the trial is N times that — whereas dropping the tail would leave a
+/// provider that loads, reports accepted, and authenticates nobody.
 ///
 /// These are the only providers a token whose `iss` names nothing can
 /// reach. A JWKS-mode provider is never here — `issuer` is mandatory in
@@ -970,10 +971,20 @@ fn bound_claim_matches(actual: &serde_json::Value, expect: &BoundClaimExpect) ->
 /// otherwise every signature-use key in the set — an identity provider
 /// mid-rotation may publish two keys, and some omit `kid` entirely.
 ///
-/// The fall-through list is not capped: how many keys it holds is the
-/// identity provider's choice bounded by [`JWKS_MAX_BYTES`], not the
-/// caller's, and a key the set publishes but we refuse to try is a
-/// token this gateway rejects for no reason the operator can see.
+/// The fall-through list is not capped: a key the set publishes but we
+/// refuse to try is a token this gateway rejects for no reason the
+/// operator can see.
+///
+/// [`JWKS_MAX_BYTES`] bounds how large that set may be, NOT what one
+/// request spends walking it, and the conversion is steep: 512 KB holds
+/// ~3100 P-384 JWKs, and verifying against all of them is ~640 ms of
+/// synchronous work on the worker thread serving the request. Whether
+/// the walk happens at all is the caller's choice — a token carrying a
+/// `kid` takes the single-key path above. So the cost is bounded by
+/// what the configured `jwks_uri` publishes, which is the identity
+/// provider's choice and not the caller's; a set of that size is a
+/// misconfigured or hostile endpoint, not a real IdP (they publish one
+/// to three keys).
 fn candidate_keys(jwks: &JwkSet, kid: Option<&str>, alg: Algorithm) -> Vec<DecodingKey> {
     match kid {
         Some(kid) => jwks
