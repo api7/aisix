@@ -2486,8 +2486,13 @@ jyxumGxNpoIV8LlzsMsaWQ==
         let expected: Vec<String> = (0..COUNT).map(|i| format!("hmac-{i:02}")).collect();
         assert_eq!(names, expected);
 
-        // The trial the request path drives: first success wins, and
-        // here the only success is the twelfth candidate.
+        // A replica of the request path's trial loop, not the loop
+        // itself — what this pins is that the twelfth candidate's
+        // secret is the only one that verifies, so the assertion above
+        // is about a list whose tail matters. Reinstating a bound at
+        // the real loop would leave this green; the e2e is what covers
+        // that, by driving a ninth-candidate token through the
+        // gateway.
         let token = hs_sign(
             Algorithm::HS256,
             TEST_HMAC_SECRET,
