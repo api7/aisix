@@ -186,6 +186,10 @@ async function startEmbeddingMock(): Promise<{
 
 const SEMANTIC_MODEL = "cache-outage-semantic";
 const EXACT_MODEL = "cache-outage-exact";
+/// Served by a `backend: memory` policy — the other half of a mixed
+/// deployment, which is the shape that can re-arm the degradation latch
+/// on a backend that never fails.
+const MEMORY_MODEL = "cache-outage-memory";
 // Longer than the OLD 5s cool-off and shorter than the 30s one, so the
 // window length alone decides whether the cache write pays a second
 // budget. Non-streaming completions — the only responses this cache
@@ -215,7 +219,7 @@ async function seed(etcdRoot: string, embedBase: string, upstreamBase: string) {
     secret: "sk-mock",
     api_base: `${upstreamBase}/v1`,
   });
-  for (const model of [SEMANTIC_MODEL, EXACT_MODEL]) {
+  for (const model of [SEMANTIC_MODEL, EXACT_MODEL, MEMORY_MODEL]) {
     await seed.createModel({
       display_name: model,
       provider: "openai",
@@ -234,6 +238,16 @@ async function seed(etcdRoot: string, embedBase: string, upstreamBase: string) {
     name: "cache-outage-exact-policy",
     backend: "redis",
     applies_to: `model:${EXACT_MODEL}`,
+    ttl_seconds: 600,
+  });
+  // A memory-backed policy on its own model, so a spec can drive traffic
+  // that does NOT touch redis while redis is down. Its cache essentially
+  // cannot fail, so if its successes counted as "redis recovered" the
+  // outage would be re-reported on every alternation.
+  await seed.createCachePolicy({
+    name: "cache-outage-memory-policy",
+    backend: "memory",
+    applies_to: `model:${MEMORY_MODEL}`,
     ttl_seconds: 600,
   });
   await seed.createApiKey({
@@ -593,6 +607,15 @@ describe("a cache Redis unreachable at startup degrades the cache, not the boot"
     //    the outage lasts — burying everything else in the log. How hard
     //    and how long it is failing is `aisix_redis_failures_total`;
     //    the log line only has to say that it started.
+    // A memory-backed policy interleaved with the failing redis ones.
+    // Its cache cannot fail, so every one of these used to count as
+    // "redis recovered" and re-arm the latch — bringing the per-request
+    // flood straight back in any deployment that runs both kinds.
+    await timeChat(app.proxyUrl, MEMORY_MODEL, "memory policy one");
+    await timeChat(app.proxyUrl, EXACT_MODEL, "boot degraded three");
+    await timeChat(app.proxyUrl, MEMORY_MODEL, "memory policy two");
+    await timeChat(app.proxyUrl, EXACT_MODEL, "boot degraded four");
+
     const degradedWarns = app
       .output()
       .split("\n")
@@ -605,6 +628,17 @@ describe("a cache Redis unreachable at startup degrades the cache, not the boot"
     // degradation, and whichever of its read and write gets there first
     // is the one that reports it. The rest of the outage is debug.
     expect(degradedWarns).toBe(1);
+
+    //    A count of one proves throttling only if the requests really
+    //    reached the cache gate — one that never got there would read
+    //    one too. The counter is what says they did: it is incremented
+    //    per failed operation and is deliberately NOT throttled, so it
+    //    supplies the lower bound the log line cannot.
+    const scrape = await (await fetch(`${app.metricsUrl}/metrics`)).text();
+    const cacheGetFailures = Number(
+      /aisix_redis_failures_total\{operation="cache_get"\} (\d+)/.exec(scrape)?.[1] ?? 0,
+    );
+    expect(cacheGetFailures).toBeGreaterThanOrEqual(3);
 
     // 4. Redis comes up and the cache attaches itself — the degradation
     //    is temporary, not a silent demotion for the life of the process.

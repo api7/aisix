@@ -985,3 +985,27 @@ async fn a_config_the_driver_cannot_use_is_still_fatal() {
         .expect_err("a malformed url must not be degraded around");
     assert!(aisix_redis::is_permanent_config_error(&err), "{err:?}");
 }
+
+/// A credential the server ANSWERED and refused is permanent too.
+///
+/// It is not the unreachable case the background retry exists for — the
+/// server is right there — and no amount of waiting turns a wrong
+/// password into a right one. Same judgement the etcd side already
+/// makes on a refused credential.
+#[test]
+fn a_refused_credential_is_permanent_too() {
+    let refused = redis::RedisError::from((
+        redis::ErrorKind::AuthenticationFailed,
+        "WRONGPASS invalid username-password pair",
+    ));
+    assert!(aisix_redis::is_permanent_config_error(&refused));
+
+    // …while an unreachable server is not, or a Redis that is merely
+    // late would stop the boot it is supposed to be ridden out.
+    let unreachable = redis::RedisError::from((
+        redis::ErrorKind::IoError,
+        "redis connect timed out",
+        "no connection within 5s".to_string(),
+    ));
+    assert!(!aisix_redis::is_permanent_config_error(&unreachable));
+}

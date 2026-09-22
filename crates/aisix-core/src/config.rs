@@ -130,11 +130,12 @@ pub struct EtcdConfig {
     /// (see the note on `0` under [`EtcdConfig::request_timeout`]),
     /// leaving it to the OS TCP stack.
     ///
-    /// This is the budget for ONE connection attempt. The whole dial gets
-    /// it once per configured endpoint — `dial_timeout_ms × max(1,
-    /// endpoints)` — because the client opens one balanced channel over
-    /// all of them and a single authentication call may have to fail over
-    /// across the set. See [`EtcdConfig::dial_budget`].
+    /// The whole dial gets this budget once per configured endpoint —
+    /// `dial_timeout_ms × max(1, endpoints)`, see
+    /// [`EtcdConfig::dial_budget`] — and the value also reaches the
+    /// connector as its per-TCP-connect bound. The TLS handshake and the
+    /// `Authenticate` exchange sit outside that connector option, which
+    /// is why the whole-dial bound exists at all.
     ///
     /// The default is finite, unlike `request_timeout_ms`, because the
     /// two bound different things. A range read's cost scales with the
@@ -603,24 +604,36 @@ impl EtcdConfig {
     fn default_prefix() -> String {
         "/aisix".into()
     }
-    /// `None` when unset or `0`: the dial is unbounded.
-    ///
-    /// See [`EtcdConfig::request_timeout`] for why `0` means unbounded
-    /// here and "fall back to the next level" elsewhere in this repo.
     /// What a whole dial may spend, as opposed to one attempt of it.
     ///
-    /// `Client::connect` opens ONE balanced channel over every configured
-    /// endpoint and then makes a single `Authenticate` call across it, so
-    /// the worst case is that call failing over from endpoint to
-    /// endpoint — each one worth a budget. A single flat bound would cut
-    /// a dial that is working exactly as designed, in the one deployment
-    /// shape built to survive a dead member.
+    /// `None` only when `dial_timeout_ms` is an explicit `0` — omitting
+    /// the key gets [`DEFAULT_ETCD_DIAL_TIMEOUT_MS`]. See
+    /// [`EtcdConfig::request_timeout`] for why `0` means unbounded here
+    /// and "fall back to the next level" elsewhere in this repo.
+    ///
+    /// One budget per configured endpoint, as headroom rather than as a
+    /// claim about the client's internals. `Client::connect` opens one
+    /// balanced channel over the whole set and the driver exposes no
+    /// per-endpoint bound to set instead, so the only lever is the total
+    /// — and a total sized for one endpoint would cut a dial that has to
+    /// get past unreachable members, which is the deployment a multi-
+    /// endpoint cluster exists to survive.
     ///
     /// `× max(1, endpoints)`, with no `+1`: unlike the Redis side, where
     /// a sentinel or cluster walk ends in a connection to a node the walk
     /// merely pointed at, the channel here IS the endpoints and there is
-    /// no extra hop to pay for. Blank entries do not count — they are
-    /// tolerated by `validate` and dropped before anything is dialled.
+    /// no extra hop to pay for.
+    ///
+    /// What an operator actually sees is the window in which no listener
+    /// is bound, and boot dials TWO providers (the environment prefix and
+    /// the shared pricing catalog) one after the other — so against a
+    /// wholly unreachable cluster that window is
+    /// `dial_timeout_ms × endpoints × 2`.
+    ///
+    /// Blank entries are excluded from the count because they are not
+    /// endpoints anything can dial: `Client::connect` rejects the whole
+    /// set at URI parsing if one is present, which ends the boot. Paying
+    /// a budget for them would be paying for a dial that cannot happen.
     pub fn dial_budget(&self) -> Option<Duration> {
         let endpoints = self
             .endpoints

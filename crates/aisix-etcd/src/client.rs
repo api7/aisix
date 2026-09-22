@@ -359,9 +359,12 @@ pub struct LazyEtcdClient {
     /// bounds: the TLS handshake and the `Authenticate` round trip sit
     /// outside that option, so an endpoint that completes TCP and then
     /// goes silent would otherwise hang the dial with no bound at all.
-    /// `None` leaves it unbounded, which is what an explicit
-    /// `dial_timeout_ms: 0` asks for. Omitting the key gets
-    /// `aisix_core::DEFAULT_ETCD_DIAL_TIMEOUT_MS` instead.
+    /// The WHOLE-dial budget — `EtcdConfig::dial_budget`, which is
+    /// `dial_timeout_ms` once per configured endpoint, because one
+    /// balanced channel spans them all and a single authentication call
+    /// may fail over across the set. `None` leaves it unbounded, which
+    /// is what an explicit `dial_timeout_ms: 0` asks for; omitting the
+    /// key gets `aisix_core::DEFAULT_ETCD_DIAL_TIMEOUT_MS` per endpoint.
     dial_timeout: Option<Duration>,
     connected: Mutex<Option<Connected>>,
     /// Handed to the next connection [`LazyEtcdClient::dial`] establishes.
@@ -528,10 +531,16 @@ impl LazyEtcdClient {
                 // matters here, so this joins the retry path rather than
                 // ending the boot.
                 Err(_) => {
+                    // Not "etcd.dial_timeout_ms (15000 ms)": the value
+                    // here is the whole-dial budget, which is the
+                    // configured key once per endpoint — and an operator
+                    // grepping their config for 15000 would find nothing.
                     return Err(ConnectError::Unreachable(format!(
-                        "connect exceeded etcd.dial_timeout_ms ({} ms)",
-                        d.as_millis()
-                    )))
+                        "connect exceeded the etcd dial budget ({} ms = \
+                         etcd.dial_timeout_ms x {} endpoint(s))",
+                        d.as_millis(),
+                        self.endpoints.len().max(1),
+                    )));
                 }
             },
         };

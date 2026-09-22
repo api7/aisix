@@ -17,6 +17,7 @@
 //!    status, error type, and (for rate-limits) Retry-After.
 
 use aisix_cache::{semantic_prompt_text, Cache, CacheKey, SemanticCacheStore};
+use aisix_core::models::CacheBackend;
 use aisix_core::models::{CacheScope, SemanticCacheConfig};
 use aisix_core::{AisixSnapshot, AppliedGuardrail};
 use aisix_gateway::{BridgeError, ChatFormat, ChatResponse};
@@ -986,8 +987,14 @@ enum CacheHalf {
 /// it at WARN and the rest of the outage at debug. How hard and how long
 /// the backend is failing is `aisix_redis_failures_total{operation}`; the
 /// log line only has to say that it started.
-fn note_cache_failed(state: &ProxyState, half: CacheHalf) -> bool {
-    let Some(backends) = state.cache.as_ref() else {
+///
+/// `backend` is the matched policy's, and only `redis` participates. A
+/// memory-backed policy shares neither the connection nor the failure
+/// mode, and it essentially cannot fail — so counting its successes
+/// would re-arm the latch on every such request and bring the per-request
+/// flood straight back in a deployment that runs both kinds of policy.
+fn note_cache_failed(state: &ProxyState, backend: Option<CacheBackend>, half: CacheHalf) -> bool {
+    let (Some(CacheBackend::Redis), Some(backends)) = (backend, state.cache.as_ref()) else {
         return true;
     };
     match half {
@@ -997,8 +1004,8 @@ fn note_cache_failed(state: &ProxyState, half: CacheHalf) -> bool {
 }
 
 /// Re-arm [`note_cache_failed`], so a LATER outage is reported again.
-fn note_cache_ok(state: &ProxyState, half: CacheHalf) {
-    let Some(backends) = state.cache.as_ref() else {
+fn note_cache_ok(state: &ProxyState, backend: Option<CacheBackend>, half: CacheHalf) {
+    let (Some(CacheBackend::Redis), Some(backends)) = (backend, state.cache.as_ref()) else {
         return;
     };
     match half {
@@ -1025,17 +1032,18 @@ async fn resolve_cache_hit(
     semantic_gate: Option<&SemanticGateCtx>,
     request_id: &str,
     semantic_embedding: &mut Option<Vec<f32>>,
+    policy_backend: Option<CacheBackend>,
 ) -> Option<(ChatResponse, CacheHitLayer, Option<f32>)> {
     match cache.get(key).await {
         Ok(Some(cached)) => {
-            note_cache_ok(state, CacheHalf::Exact);
+            note_cache_ok(state, policy_backend, CacheHalf::Exact);
             return Some((cached, CacheHitLayer::Exact, None));
         }
-        Ok(None) => note_cache_ok(state, CacheHalf::Exact),
+        Ok(None) => note_cache_ok(state, policy_backend, CacheHalf::Exact),
         // Once per outage, not once per request: the count lives on
         // `aisix_redis_failures_total`, and a cache Redis can now stay
         // unreachable from boot onwards.
-        Err(err) if note_cache_failed(state, CacheHalf::Exact) => {
+        Err(err) if note_cache_failed(state, policy_backend, CacheHalf::Exact) => {
             tracing::warn!(error = %err, key = %key, "cache lookup failed");
         }
         Err(err) => {
@@ -1060,7 +1068,7 @@ async fn resolve_cache_hit(
             // recovered and went straight to serving hits would leave the
             // latch set, and the NEXT outage's first failure would report
             // at debug.
-            note_cache_ok(state, CacheHalf::Semantic);
+            note_cache_ok(state, policy_backend, CacheHalf::Semantic);
             // Backfill TTL is capped at the matched entry's own
             // remaining lifetime: a paraphrase near expiry must not
             // grant the stored response a fresh full TTL, or repeated
@@ -1076,8 +1084,8 @@ async fn resolve_cache_hit(
                     .put_with_ttl(key, hit.response.clone(), backfill_ttl)
                     .await
                 {
-                    Ok(()) => note_cache_ok(state, CacheHalf::Exact),
-                    Err(err) if note_cache_failed(state, CacheHalf::Exact) => {
+                    Ok(()) => note_cache_ok(state, policy_backend, CacheHalf::Exact),
+                    Err(err) if note_cache_failed(state, policy_backend, CacheHalf::Exact) => {
                         tracing::warn!(error = %err, key = %key, "cache backfill write failed");
                     }
                     Err(err) => {
@@ -1091,12 +1099,12 @@ async fn resolve_cache_hit(
             Some((hit.response, CacheHitLayer::Semantic, Some(similarity)))
         }
         Ok(None) => {
-            note_cache_ok(state, CacheHalf::Semantic);
+            note_cache_ok(state, policy_backend, CacheHalf::Semantic);
             *semantic_embedding = Some(vector);
             None
         }
         Err(err) => {
-            if note_cache_failed(state, CacheHalf::Semantic) {
+            if note_cache_failed(state, policy_backend, CacheHalf::Semantic) {
                 tracing::warn!(
                     target: "aisix::cache",
                     policy_name = %sem.policy_name,
@@ -2571,6 +2579,9 @@ async fn dispatch(
             .cloned(),
         _ => None,
     };
+    // Which backend's degradation the gate is reporting on. See
+    // `note_cache_failed`.
+    let policy_backend = matched_policy.as_ref().map(|entry| entry.value.backend);
     let matched_policy_ttl = policy_cache
         .as_ref()
         .and(matched_policy.as_ref())
@@ -2705,6 +2716,7 @@ async fn dispatch(
                 semantic_gate.as_ref(),
                 request_id,
                 &mut semantic_embedding,
+                policy_backend,
             )
             .await
         };
@@ -3453,8 +3465,8 @@ async fn dispatch(
         cc.no_store,
     ) {
         match cache.put_with_ttl(key, upstream.clone(), ttl).await {
-            Ok(()) => note_cache_ok(state, CacheHalf::Exact),
-            Err(err) if note_cache_failed(state, CacheHalf::Exact) => {
+            Ok(()) => note_cache_ok(state, policy_backend, CacheHalf::Exact),
+            Err(err) if note_cache_failed(state, policy_backend, CacheHalf::Exact) => {
                 tracing::warn!(error = %err, key = %key, "cache write failed");
             }
             Err(err) => tracing::debug!(error = %err, key = %key, "cache write failed"),
@@ -3488,9 +3500,9 @@ async fn dispatch(
                     // Re-armed here too, not only on the lookup: a
                     // `no-cache` request skips the lookup entirely, so
                     // the write is the only success that half sees.
-                    Ok(()) => note_cache_ok(state, CacheHalf::Semantic),
+                    Ok(()) => note_cache_ok(state, policy_backend, CacheHalf::Semantic),
                     Err(err) => {
-                        if note_cache_failed(state, CacheHalf::Semantic) {
+                        if note_cache_failed(state, policy_backend, CacheHalf::Semantic) {
                             tracing::warn!(
                                 target: "aisix::cache",
                                 policy_name = %sem.policy_name,

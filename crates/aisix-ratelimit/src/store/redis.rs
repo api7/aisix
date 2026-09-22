@@ -577,8 +577,18 @@ impl RateStore for RedisStore {
                 // number of requests in flight when the backend
                 // attached, and a LATER outage then fails CLOSED on a
                 // path whose whole contract is to fail open.
-                // Non-inserting, hence a no-op for a bucket that never
-                // acquired locally.
+                // `LocalStore::release` is non-inserting and ignores
+                // `member` — its `in_flight` is a plain counter — so
+                // this is a no-op for a bucket with no local slots at
+                // all, and otherwise gives back A slot rather than
+                // necessarily THIS member's. During a handover that can
+                // return a slot another degraded request is still
+                // holding, under-counting local in-flight by one.
+                // Accepted: it errs toward admitting traffic on a path
+                // whose contract is to fail open, `saturating_sub`
+                // bounds it, and the alternative is tracking per-member
+                // local ownership that `LocalStore` deliberately does
+                // not keep.
                 self.local.release(key, member);
             }
             Err(e) => {

@@ -12,18 +12,23 @@ etcd:
   # `stream_timeout: 0` is the odd one out: it falls back to the next
   # level of a resolution chain these flat startup settings do not have.)
   #
-  # `dial_timeout_ms` bounds one connection attempt inside a dial: the
-  # TCP connect, the TLS handshake after it, and the authentication
-  # exchange when `user` is set. The whole dial gets it once per
-  # configured endpoint — `dial_timeout_ms x max(1, endpoints)` — because
-  # the client opens ONE balanced channel over all of them and a single
-  # authentication call may have to fail over across the set, so a flat
-  # bound would cut a dial that is working exactly as designed. It
-  # defaults to 5000 — the two keys default differently on purpose. Boot awaits the dial before it binds ANY listener, so an
-  # endpoint that accepts the connection and then answers nothing used to
-  # hold both ports closed for as long as it stayed quiet, with the
-  # snapshot cache that exists for exactly that outage sitting unread
-  # behind it. Set `0` to ask for the old unbounded behaviour. An expired
+  # `dial_timeout_ms` bounds a dial: the TCP connect, the TLS handshake
+  # after it, and the authentication exchange when `user` is set. The
+  # value reaches the connector as its per-TCP-connect bound, and the
+  # whole dial — handshake and authentication included — gets it once per
+  # configured endpoint, `dial_timeout_ms x max(1, endpoints)`. The extra
+  # budget is headroom for a cluster with unreachable members, which is
+  # what a multi-endpoint list is for; the client offers no per-endpoint
+  # bound to set instead. What you plan around is the window in which no
+  # listener is bound, and boot dials two providers one after the other,
+  # so against a wholly unreachable cluster that window is
+  # `dial_timeout_ms x endpoints x 2`. It defaults to 5000 — the two keys
+  # default differently on purpose. Boot awaits the dial before it binds
+  # ANY listener, so an endpoint that accepts the connection and then
+  # answers nothing used to hold both ports closed for as long as it
+  # stayed quiet, with the snapshot cache that exists for exactly that
+  # outage sitting unread behind it. Set `0` for the old unbounded
+  # behaviour. An expired
   # dial is treated as an etcd that is not reachable — the gateway binds,
   # serves whatever the snapshot cache holds, and keeps retrying in the
   # background rather than exiting.

@@ -123,8 +123,15 @@ impl CacheBackends {
     }
 
     /// Re-arm [`Self::note_exact_failure`] after a successful operation.
+    ///
+    /// Read before write: this runs on every cache MISS, the commonest
+    /// branch there is, and an unconditional store is a cross-core line
+    /// invalidation per request under thread-per-core serving. The
+    /// healthy path only ever reads.
     pub fn note_exact_success(&self) {
-        self.exact_degraded.store(false, Ordering::Relaxed);
+        if self.exact_degraded.load(Ordering::Relaxed) {
+            self.exact_degraded.store(false, Ordering::Relaxed);
+        }
     }
 
     /// [`Self::note_exact_failure`] for the vector-search half.
@@ -132,9 +139,12 @@ impl CacheBackends {
         !self.semantic_degraded.swap(true, Ordering::Relaxed)
     }
 
-    /// Re-arm [`Self::note_semantic_failure`].
+    /// Re-arm [`Self::note_semantic_failure`]. Read before write, for
+    /// the reason on [`Self::note_exact_success`].
     pub fn note_semantic_success(&self) {
-        self.semantic_degraded.store(false, Ordering::Relaxed);
+        if self.semantic_degraded.load(Ordering::Relaxed) {
+            self.semantic_degraded.store(false, Ordering::Relaxed);
+        }
     }
 
     /// Attach the shared semantic store for `backend: redis` policies.
@@ -622,6 +632,38 @@ impl ProxyState {
 
 #[cfg(test)]
 mod tests {
+
+    // The re-arm is the only direction of this latch that can cause
+    // SILENCE — a latch stuck set means the NEXT outage reports at debug
+    // and nobody hears about it — and it has already been got wrong once
+    // (a semantic HIT did not re-arm). Without this test, deleting the
+    // re-arm leaves every other test green.
+    #[test]
+    fn a_second_outage_is_reported_again() {
+        let b = super::CacheBackends::memory_only();
+        assert!(b.note_exact_failure(), "the first failure reports");
+        assert!(!b.note_exact_failure(), "the rest of the outage is quiet");
+        b.note_exact_success();
+        assert!(b.note_exact_failure(), "a later outage must report again");
+    }
+
+    // The two halves fail and recover independently — one connection is
+    // exact-KV and the other is vector search — so neither latch may
+    // speak for the other.
+    #[test]
+    fn the_two_cache_halves_latch_independently() {
+        let b = super::CacheBackends::memory_only();
+        assert!(b.note_exact_failure());
+        assert!(
+            b.note_semantic_failure(),
+            "the exact half's outage must not silence the semantic one"
+        );
+        b.note_exact_success();
+        assert!(
+            !b.note_semantic_failure(),
+            "and recovering the exact half must not re-arm the semantic one"
+        );
+    }
     use super::ProxyState;
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ProxyConfig};

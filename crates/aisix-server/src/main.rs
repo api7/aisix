@@ -1606,11 +1606,6 @@ fn build_etcd_connect_options_with_extra_ca(
     Ok(needs_options.then_some(options))
 }
 
-/// Extract the host portion of a URL-like endpoint (`http://host:2379`,
-/// `https://host:2379`, or bare `host:2379`) for use as the TLS SNI.
-/// Per-endpoint DNS probe logged at info / warn. Not part of the
-/// connect path — purely diagnostic. See the call site in [`run`]
-/// for why this exists.
 /// How often a gateway that started without its cache backend re-states
 /// that `backend: redis` policies are being served as misses. Same
 /// reasoning, and same interval, as the rate limiter's: a Redis that is

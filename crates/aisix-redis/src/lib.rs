@@ -639,15 +639,27 @@ pub fn not_connected_error() -> redis::RedisError {
 
 /// True when a connect error can never come good on a retry: the
 /// operator wrote something the driver cannot use at all — a malformed
-/// `url`, TLS material that will not read or parse.
+/// `url`, TLS material that will not read or parse — or a credential the
+/// server answered and refused.
 ///
 /// It matters because everything else here is now retried forever in the
 /// background. Retrying a typo turns a boot that said exactly what was
 /// wrong into a gateway that comes up healthy and is quietly never going
 /// to enforce a shared limit or cache anything, which is strictly worse
-/// than the failure it replaced.
+/// than the failure it replaced. A refused credential is the same
+/// judgement the etcd side already makes: no amount of waiting turns a
+/// wrong password into a right one, and a server that ANSWERED is not
+/// the unreachable case the retry exists for.
+///
+/// It only classifies what the driver reports as such. A refusal the
+/// budget cut short arrives as a timeout instead, and is retried — which
+/// is the safe direction for a misclassification, since the alternative
+/// is refusing to start over a slow handshake.
 pub fn is_permanent_config_error(e: &redis::RedisError) -> bool {
-    e.kind() == redis::ErrorKind::InvalidClientConfig
+    matches!(
+        e.kind(),
+        redis::ErrorKind::InvalidClientConfig | redis::ErrorKind::AuthenticationFailed
+    )
 }
 
 /// The error a connect that outran its whole budget returns.
