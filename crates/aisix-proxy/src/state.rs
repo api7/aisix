@@ -75,7 +75,10 @@ pub struct CacheBackends {
     /// so the gate logs once per policy instead of once per request.
     redis_warned: Arc<DashSet<String>>,
     /// Policy ids already warned about the redis semantic layer being
-    /// unavailable (same warn-once discipline as `redis_warned`).
+    /// unavailable (same warn-once discipline as `redis_warned`). The
+    /// line has to name both reasons the cell can be empty, because
+    /// warn-once means it is never corrected: a store published by the
+    /// background attach simply stops the gate reaching this branch.
     semantic_redis_warned: Arc<DashSet<String>>,
     /// Policy ids already warned about a stable semantic config error
     /// (missing / non-embedding `embedding_model`). The per-request
@@ -224,9 +227,12 @@ impl CacheBackends {
                         policy_id = %policy_id,
                         policy_name = %policy_name,
                         "cache policy configures semantic matching on backend=redis but \
-                         the configured cache.redis has no vector-search support \
-                         (requires Redis 8+ or the search module; cluster mode is not \
-                         supported yet); requests fall back to exact matching only"
+                         no vector-search store is available: either the configured \
+                         cache.redis has no vector-search support (requires Redis 8+ or \
+                         the search module; cluster mode is not supported yet), or it \
+                         was unreachable at startup and has not been probed yet — a \
+                         background attach publishes the store if the probe then \
+                         passes. Requests fall back to exact matching only"
                     );
                 }
                 store
