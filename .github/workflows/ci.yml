@@ -309,7 +309,10 @@ jobs:
           # Its own server because `requirepass` is server-wide.
           docker run -d --name redis-auth --network host redis:7-alpine \
             redis-server --port 6390 --requirepass aisix-ci-redis
-          sleep 2
+          for _ in $(seq 30); do
+            docker exec redis-auth redis-cli -p 6390 -a aisix-ci-redis ping 2>/dev/null | grep -q PONG && break
+            sleep 1
+          done
           docker exec redis-auth redis-cli -p 6390 -a aisix-ci-redis ping | grep -q PONG \
             || { echo "::error::Authenticated Redis 6390 did not come up"; exit 1; }
       - name: unit tests with coverage

@@ -931,10 +931,19 @@ fn settings_refused(e: redis::RedisError) -> redis::RedisError {
 ///
 /// It reports ONLY a refusal. Every other outcome is discarded and the
 /// mode's own error stands, so this can never turn a slow or unreachable
-/// backend into a boot failure, and it can never be the thing that
-/// decides how long a boot spends. `Ok(true)` means the data node
-/// answered us, which is what lets the caller skip proving the same
-/// thing a second time.
+/// backend into a boot failure. `Ok(true)` means the data node answered
+/// us, which is what lets the caller skip proving the same thing a
+/// second time.
+///
+/// What it costs a boot differs by mode, and neither case lengthens one.
+/// `cluster` and `sentinel` call it only after their own connect has
+/// already failed, so it spends what is left of a budget that is already
+/// forfeit. `single` calls it BEFORE the connection manager, so against
+/// an unreachable endpoint the probe is what spends that mode's single
+/// budget and the manager never gets to attempt inside it — the boot
+/// then reports the same non-permanent connect timeout, on the same
+/// deadline, that it reported when the manager spent the budget itself,
+/// and the background re-attach follows as before.
 async fn settings_refusal(
     cfg: &RedisConnConfig,
     tls: &Option<redis::TlsCertificates>,
