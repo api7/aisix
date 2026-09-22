@@ -8,6 +8,7 @@ import {
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLine,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -147,27 +148,6 @@ async function startAliyunMock(): Promise<AliyunMock> {
       });
     },
   };
-}
-
-/**
- * Poll the DP's captured output for a line satisfying `pred`. Log delivery
- * to the harness lags the HTTP response (the child's stderr is piped), so a
- * bare read right after the request is racy.
- */
-async function waitForLogLine(
-  app: SpawnedApp,
-  pred: (line: string) => boolean,
-  what: string,
-): Promise<string> {
-  const deadline = Date.now() + 5_000;
-  let last = "";
-  while (Date.now() < deadline) {
-    last = app.output();
-    const hit = last.split("\n").find(pred);
-    if (hit) return hit;
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  throw new Error(`timed out waiting for ${what}; DP output was:\n${last}`);
 }
 
 describe("aliyun guardrail e2e: upstream RequestId is preserved and correlatable", () => {

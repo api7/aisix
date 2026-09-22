@@ -26,6 +26,21 @@ Two things the gate must not be:
   Prefer a gate that cannot throw (`ProxyClient.listModels`) over a `try/catch`
   around an SDK call.
 
+## A log line is never readable when the request that produced it returns
+
+The gateway hands every event to a bounded queue drained by a dedicated
+writer thread, so the request path never blocks on the log descriptor
+(`crates/aisix-obs/src/log_writer.rs`); the harness then drains the child's
+pipe from its own event loop. Neither hop is ordered against the HTTP
+response, so `app.output()` read straight after a request routinely does
+not contain that request's access-log line — the read passes only when the
+machine happens to be idle.
+
+Wait for it: `waitForLogLine(app, pred, what)` (and `waitForLogLines` when
+the count is what the spec asserts). Reading `output()` once is correct
+only for a line the gateway wrote before `spawnApp` resolved — a boot
+warning, a configuration rejected at startup.
+
 ## etcd is per-fork, and on CI it must be there
 
 CI runs one etcd cluster per vitest fork and hands each fork its own

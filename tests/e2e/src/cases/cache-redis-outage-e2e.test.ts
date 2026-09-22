@@ -10,6 +10,7 @@ import {
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLines,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -616,14 +617,11 @@ describe("a cache Redis unreachable at startup degrades the cache, not the boot"
     await timeChat(app.proxyUrl, MEMORY_MODEL, "memory policy two");
     await timeChat(app.proxyUrl, EXACT_MODEL, "boot degraded four");
 
-    const degradedWarns = app
-      .output()
-      .split("\n")
-      .filter(
-        (l) =>
-          l.includes("WARN") &&
-          (l.includes("cache lookup failed") || l.includes("cache write failed")),
-      ).length;
+    const degraded = (l: string) =>
+      l.includes("WARN") &&
+      (l.includes("cache lookup failed") || l.includes("cache write failed"));
+    await waitForLogLines(app, degraded, 1, "the cache-degradation warning");
+    const degradedWarns = app.output().split("\n").filter(degraded).length;
     // ONE, not one per operation: the exact-KV half is a single
     // degradation, and whichever of its read and write gets there first
     // is the one that reports it. The rest of the outage is debug.

@@ -6,6 +6,7 @@ import {
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLine,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -144,7 +145,8 @@ describe("graceful drain e2e: a live SSE stream holds the listener open", () => 
         if (done) break;
       }
       await app.waitForExit(20_000);
-      expect(app.output()).toContain("drain complete");
+      // The exit event can precede the last of the child's log pipe.
+      await waitForLogLine(app, (l) => l.includes("drain complete"), "the drain-complete line");
     },
     90_000,
   );

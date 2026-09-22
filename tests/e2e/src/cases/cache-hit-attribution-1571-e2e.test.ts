@@ -8,6 +8,7 @@ import {
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLine,
   waitForSlsLog,
   type MockSls,
   type OpenAiUpstream,
@@ -89,30 +90,18 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
   let singleModelId = "";
 
   /**
-   * Poll the DP's captured output for this request's access-log line.
-   * Delivery lags the HTTP response (the child's stderr is piped), and the
-   * per-attempt `provider call completed` line shares the request id — so
-   * the predicate pins the access log's own message too.
+   * This request's access-log line. The per-attempt `provider call
+   * completed` line shares the request id, so the predicate pins the
+   * access log's own message too.
    */
-  async function accessLine(requestId: string): Promise<string> {
-    const deadline = Date.now() + 5_000;
-    let last = "";
-    while (Date.now() < deadline) {
-      last = app!.output();
-      const hit = last
-        .split("\n")
-        .find(
-          (l) =>
-            l.includes("proxy request completed") &&
-            field(l, "request_id") === requestId,
-        );
-      if (hit) return hit;
-      await new Promise((r) => setTimeout(r, 50));
-    }
-    throw new Error(
-      `timed out waiting for the access-log line of ${requestId}; DP output was:\n${last}`,
+  const accessLine = (requestId: string): Promise<string> =>
+    waitForLogLine(
+      app!,
+      (l) =>
+        l.includes("proxy request completed") &&
+        field(l, "request_id") === requestId,
+      `the access-log line of ${requestId}`,
     );
-  }
 
   async function chat(
     model: string,

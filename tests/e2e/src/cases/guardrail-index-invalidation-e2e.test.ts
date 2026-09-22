@@ -9,6 +9,7 @@ import {
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLines,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -117,6 +118,17 @@ describe("guardrail index invalidation", () => {
       .filter((l) => REBUILT.test(l)).length;
   }
 
+  /** The rebuild count, once at least `atLeast` lines have been written. */
+  async function rebuildsAtLeast(atLeast: number): Promise<number> {
+    const hits = await waitForLogLines(
+      app!,
+      (l) => REBUILT.test(l),
+      atLeast,
+      `${atLeast} guardrail-index rebuild lines`,
+    );
+    return hits.length;
+  }
+
   async function chat(model: string, content: string): Promise<number> {
     return (await proxy!.chat({ model, messages: [{ role: "user", content }] }))
       .status;
@@ -216,8 +228,7 @@ describe("guardrail index invalidation", () => {
     expect(await chat(SCREENED_MODEL, BLOCK_MARKER)).toBe(422);
     const callsAfterWarm = guard!.calls;
     expect(callsAfterWarm).toBeGreaterThan(0);
-    const afterWarm = rebuilds();
-    expect(afterWarm).toBeGreaterThan(0);
+    const afterWarm = await rebuildsAtLeast(1);
 
     // Thirty writes to a resource kind the index does not read — the
     // shape of the bulk API-key edit in the report. Each one publishes a
@@ -260,13 +271,13 @@ describe("guardrail index invalidation", () => {
     const attachment = await seed!.attachGuardrailToModel(guardrailID, lateModelID);
     await propagated("attached");
     expect(await chat(LATE_MODEL, BLOCK_MARKER)).toBe(422);
-    expect(rebuilds()).toBe(afterWarm + 1);
+    expect(await rebuildsAtLeast(afterWarm + 1)).toBe(afterWarm + 1);
 
     // And removing it stops the enforcement.
     await seed!.delete("guardrail_attachments", attachment.id);
     await propagated("detached");
     expect(await chat(LATE_MODEL, BLOCK_MARKER)).toBe(200);
-    expect(rebuilds()).toBe(afterWarm + 2);
+    expect(await rebuildsAtLeast(afterWarm + 2)).toBe(afterWarm + 2);
     // The scope that was configured all along is untouched by either.
     expect(await chat(SCREENED_MODEL, BLOCK_MARKER)).toBe(422);
   });

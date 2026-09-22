@@ -8,6 +8,8 @@ import {
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLine,
+  waitForLogLines,
   waitForSlsLog,
   type MockSls,
   type OpenAiUpstream,
@@ -265,11 +267,11 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
       // read the `x-aisix-request-id` header.
       const requestId = row.get("request_id") ?? "";
       expect(requestId).not.toBe("");
-      const line = app
-        .output()
-        .split("\n")
-        .find((l) => l.includes(`request_id="${requestId}"`) && l.includes("status=499"));
-      expect(line, `no 499 access-log line for ${requestId} in:\n${app.output()}`).toBeTruthy();
+      const line = await waitForLogLine(
+        app,
+        (l) => l.includes(`request_id="${requestId}"`) && l.includes("status=499"),
+        `the 499 access-log line for ${requestId}`,
+      );
       expect(line).toContain(`model="${GROUP}"`);
       expect(line).toContain(`upstream_model="${UPSTREAM_MODEL}"`);
       expect(line).toContain(`provider_key_id="${providerKeyId}"`);
@@ -358,11 +360,11 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
     const requestId = res.headers.get("x-aisix-request-id") ?? "";
     expect(requestId).not.toBe("");
 
-    const line = app
-      .output()
-      .split("\n")
-      .find((l) => l.includes(`request_id="${requestId}"`) && l.includes("status=200"));
-    expect(line, `no 200 access-log line for ${requestId} in:\n${app.output()}`).toBeTruthy();
+    const line = await waitForLogLine(
+      app,
+      (l) => l.includes(`request_id="${requestId}"`) && l.includes("status=200"),
+      `the 200 access-log line for ${requestId}`,
+    );
     expect(line).toContain(`upstream_model="${FAST_UPSTREAM_MODEL}"`);
     expect(line).toContain(`provider_key_id="${fastProviderKeyId}"`);
   });
@@ -421,12 +423,12 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
       expect(row.get("error_class")).toBe("client_disconnected");
       expect(row.get("error_message")).toContain("while the response was streaming");
 
-      const lines = app
-        .output()
-        .split("\n")
-        .filter(
-          (l) => l.includes("proxy request completed") && l.includes(`request_id="${requestId}"`),
-        );
+      const lines = await waitForLogLines(
+        app,
+        (l) => l.includes("proxy request completed") && l.includes(`request_id="${requestId}"`),
+        1,
+        `the access-log line for the abandoned stream ${requestId}`,
+      );
       expect(
         lines.length,
         `one request, one line — got ${lines.length} for ${requestId}:\n${lines.join("\n")}`,

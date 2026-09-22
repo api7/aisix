@@ -7,6 +7,7 @@ import {
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLine,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -41,27 +42,6 @@ const CALLER_KEY_HASH = createHash("sha256")
 const NONSTREAM_ID = "chatcmpl-e2e-nonstream-1289";
 const STREAM_ID = "chatcmpl-e2e-stream-1289";
 const RESPONSES_ID = "resp_e2e_1289";
-
-/**
- * Poll the DP's captured output for a line satisfying `pred`. Log delivery to
- * the harness lags the HTTP response (the child's stderr is piped), so a bare
- * read right after the request is racy.
- */
-async function waitForLogLine(
-  app: SpawnedApp,
-  pred: (line: string) => boolean,
-  what: string,
-): Promise<string> {
-  const deadline = Date.now() + 5_000;
-  let last = "";
-  while (Date.now() < deadline) {
-    last = app.output();
-    const hit = last.split("\n").find(pred);
-    if (hit) return hit;
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  throw new Error(`timed out waiting for ${what}; DP output was:\n${last}`);
-}
 
 async function call(
   app: SpawnedApp,
