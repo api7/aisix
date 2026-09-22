@@ -211,6 +211,13 @@ impl LogWriter {
                     // a drained sink in the gap, set `stopping`, and then
                     // `push` would discard the very line that accounts
                     // for the gap.
+                    //
+                    // The `continue` below skips the stop check, so this
+                    // loop terminates only because `push` never feeds
+                    // `unwarned` once `stopping` is set: the counter
+                    // freezes there, one more report drains it, and the
+                    // pass after that returns. Teaching that branch to
+                    // count into `unwarned` would spin here forever.
                     if unreported > 0 && worker.queue.is_empty() {
                         tracing::warn!(
                             dropped = unreported,
