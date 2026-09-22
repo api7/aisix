@@ -29,10 +29,10 @@
 //!    verified against **that provider and no other** — a mode or
 //!    algorithm mismatch there is a denial, never a fallback.
 //! 2. Otherwise (no `iss`, or one matching nothing) the candidates are
-//!    the enabled HMAC-mode providers that declare no `issuer`, tried in
-//!    a deterministic order under [`MAX_ISSUERLESS_PROVIDERS_TRIED`];
-//!    the first whose verification succeeds wins. JWKS-mode providers
-//!    are never trial candidates — every one of them pins an issuer.
+//!    the enabled HMAC-mode providers that declare no `issuer`, every
+//!    one of them, tried in a deterministic order; the first whose
+//!    verification succeeds wins. JWKS-mode providers are never trial
+//!    candidates — every one of them pins an issuer.
 //!
 //! Design invariants:
 //!
@@ -104,10 +104,6 @@ const ALLOWED_ALGS: [Algorithm; 9] = [
     Algorithm::EdDSA,
 ];
 
-/// Cap on signature attempts for a token without a `kid` against a
-/// multi-key JWKS.
-const MAX_KEYS_TRIED: usize = 8;
-
 /// Verification algorithms accepted by an HMAC-mode provider: the
 /// shared-secret families only, mirroring [`ALLOWED_ALGS`]. The two
 /// lists are disjoint, and which one applies is decided by the selected
@@ -115,13 +111,6 @@ const MAX_KEYS_TRIED: usize = 8;
 /// algorithm confusion structurally impossible rather than merely
 /// checked.
 const HMAC_ALGS: [Algorithm; 3] = [Algorithm::HS256, Algorithm::HS384, Algorithm::HS512];
-
-/// Cap on providers tried for a token whose `iss` selects none — the
-/// issuer-less shared-secret providers, in name order. Separate from
-/// [`MAX_KEYS_TRIED`], which bounds keys within one provider's JWKS:
-/// this one bounds the HMAC verifications an unauthenticated token can
-/// drive across providers.
-const MAX_ISSUERLESS_PROVIDERS_TRIED: usize = 8;
 
 /// Upper bound on a bearer we will treat as a JWT. A real IdP token is a
 /// few KB; the cap stops a several-hundred-KB `Authorization` header from
@@ -234,10 +223,14 @@ fn provider_for_issuer(snapshot: &AisixSnapshot, iss: &str) -> ProviderMatch {
     }
 }
 
-/// The enabled HMAC-mode providers that pin no `issuer`, in a total
+/// Every enabled HMAC-mode provider that pins no `issuer`, in a total
 /// order (`name`, then id) so the same token resolves the same provider
-/// on every replica and across snapshot updates, bounded by
-/// [`MAX_ISSUERLESS_PROVIDERS_TRIED`].
+/// on every replica and across snapshot updates.
+///
+/// The list is not capped. How many providers a token is tried against
+/// is set by the operator, not by the caller, and one HMAC verification
+/// is microseconds — whereas dropping the tail would leave a provider
+/// that loads, reports accepted, and authenticates nobody.
 ///
 /// These are the only providers a token whose `iss` names nothing can
 /// reach. A JWKS-mode provider is never here — `issuer` is mandatory in
@@ -260,32 +253,6 @@ fn issuerless_hmac_providers(snapshot: &AisixSnapshot) -> Vec<Arc<ResourceEntry<
     candidates.sort_by(|a, b| {
         (a.value.name.as_str(), a.id.as_str()).cmp(&(b.value.name.as_str(), b.id.as_str()))
     });
-    if candidates.len() > MAX_ISSUERLESS_PROVIDERS_TRIED {
-        // Dropping a provider silently would be an unobservable dead
-        // configuration: the row loads, `/status/config` reports it
-        // accepted, and it simply never authenticates anyone. Every
-        // other unusable shape in this resource is named at load, so
-        // name this one too — once per process, since it is a property
-        // of the configuration rather than of a request.
-        static TRUNCATED_WARN: std::sync::Once = std::sync::Once::new();
-        let dropped: Vec<&str> = candidates[MAX_ISSUERLESS_PROVIDERS_TRIED..]
-            .iter()
-            .map(|e| e.value.name.as_str())
-            .collect();
-        TRUNCATED_WARN.call_once(|| {
-            tracing::warn!(
-                target: "aisix::auth",
-                limit = MAX_ISSUERLESS_PROVIDERS_TRIED,
-                configured = candidates.len(),
-                dropped = ?dropped,
-                "more OIDC providers declare a shared secret and no issuer than a \
-                 token may be tried against; the providers listed here will never \
-                 authenticate anyone — give them an issuer so tokens select them \
-                 directly, or remove them",
-            );
-        });
-        candidates.truncate(MAX_ISSUERLESS_PROVIDERS_TRIED);
-    }
     candidates
 }
 
@@ -1000,9 +967,13 @@ fn bound_claim_matches(actual: &serde_json::Value, expect: &BoundClaimExpect) ->
 }
 
 /// Decoding keys to try: an exact `kid` match when the token names one,
-/// otherwise every signature-use key in the set (bounded) — an identity
-/// provider mid-rotation may publish two keys, and some omit `kid`
-/// entirely.
+/// otherwise every signature-use key in the set — an identity provider
+/// mid-rotation may publish two keys, and some omit `kid` entirely.
+///
+/// The fall-through list is not capped: how many keys it holds is the
+/// identity provider's choice bounded by [`JWKS_MAX_BYTES`], not the
+/// caller's, and a key the set publishes but we refuse to try is a
+/// token this gateway rejects for no reason the operator can see.
 fn candidate_keys(jwks: &JwkSet, kid: Option<&str>, alg: Algorithm) -> Vec<DecodingKey> {
     match kid {
         Some(kid) => jwks
@@ -1016,7 +987,6 @@ fn candidate_keys(jwks: &JwkSet, kid: Option<&str>, alg: Algorithm) -> Vec<Decod
             .iter()
             .filter(|jwk| usable_for_verification(jwk, alg))
             .filter_map(|jwk| DecodingKey::from_jwk(jwk).ok())
-            .take(MAX_KEYS_TRIED)
             .collect(),
     }
 }
@@ -1594,6 +1564,11 @@ jyxumGxNpoIV8LlzsMsaWQ==
 -----END PRIVATE KEY-----";
 
     const TEST_JWKS: &str = r#"{"keys":[{"kty":"RSA","kid":"test-kid-1","use":"sig","alg":"RS256","n":"3wEW2WrhiuG0ZFC9IFnLLxshQTFVunnjXAMu1NADx_dh-Q0iJsn9VoZ73w2q3kZFxQYYh8ugY9MH8-8hO5IDzYVwdJeK_JhXd24k5JcbeXwyqryWXeO93xTpIjP_w4wetpaHV3wy8Ia9KM0ItMQpz8zMs0MfRFUdb9ScFv_ZUuEGhIIlRgxEvZodJH57M8O7B-SBcCs9gYLR0oByflspK-4Qew2NdNzsROvQVygNmyfpP9GovHUIks4HyBJGopb8v9sGaDn1WxH1qcFz7j_oqap__XPZm24zEbVBzo4AUL6osI4sdtZ4fGaHggPM_2Lr3YF10yYKBtIfiFi8kF0jsQ","e":"AQAB"}]}"#;
+
+    /// The public modulus of an unrelated RSA keypair whose private half
+    /// exists nowhere: a well-formed JWK that parses into a decoding key
+    /// and verifies nothing.
+    const DECOY_RSA_MODULUS: &str = "tWzP0LvGGpXqYBIOiKvcxbJOC25xFDGSCaPBpNr3SDhkDSZKcnb7nQ2bBq9UEHbj9Yycu--k1h6gFPi6XLGmOxW267ceBUg-v496erzx2m__rmIowT7d_jvp2LSPdYERwPxqsjKmTYVQzZq9ewDsajeRPJ1XSvU8fKD69Aj51LngffuCgcMWgumLAWRswLduhDBcHCBU-Xz5hEPmFOzz1gMWC8rZgLcv8UjYJDkg4elI8IpSxsPSzBSJb8LpE20s3Oi1h8zGwlzAha04MNZVF-RCgq1tQtmZFXL929G2gFVCciFHesjUV7gCtmE4HbPHXs9ui38_XOi_hCqq2_2rhw";
 
     fn test_provider(json: &str) -> OidcProvider {
         serde_json::from_str(json).unwrap()
@@ -2481,30 +2456,90 @@ jyxumGxNpoIV8LlzsMsaWQ==
         assert!(TrialFailure::default().into_reported().is_none());
     }
 
-    #[test]
-    fn the_trial_candidate_cap_names_what_it_drops() {
-        // A dropped provider is loaded, reported accepted, and silently
-        // unable to authenticate anyone — so the cap has to say so. The
-        // set it hands back is still the first N in name order.
+    #[tokio::test]
+    async fn every_issuerless_hmac_provider_is_tried_however_many_there_are() {
+        // No cap on the trial list: a provider past whatever the list
+        // used to be truncated to must still authenticate. Only the
+        // last of twelve holds the token's secret, so a truncated list
+        // would deny a token the configuration says is valid.
+        const COUNT: usize = 12;
         let snapshot = AisixSnapshot::new();
-        for i in 0..MAX_ISSUERLESS_PROVIDERS_TRIED + 2 {
+        for i in 0..COUNT {
+            let last = i == COUNT - 1;
             snapshot.oidc_providers.insert(ResourceEntry::new(
                 format!("p-{i:02}"),
                 serde_json::from_value::<OidcProvider>(serde_json::json!({
                     "name": format!("hmac-{i:02}"),
-                    "hmac_secret": TEST_HMAC_SECRET,
+                    "hmac_secret": if last {
+                        TEST_HMAC_SECRET.to_string()
+                    } else {
+                        format!("decoy-secret-{i:02}-0000000000000000")
+                    },
                 }))
                 .unwrap(),
                 1,
             ));
         }
+
         let candidates = issuerless_hmac_providers(&snapshot);
-        assert_eq!(candidates.len(), MAX_ISSUERLESS_PROVIDERS_TRIED);
-        assert_eq!(candidates[0].value.name, "hmac-00");
-        assert_eq!(
-            candidates[MAX_ISSUERLESS_PROVIDERS_TRIED - 1].value.name,
-            format!("hmac-{:02}", MAX_ISSUERLESS_PROVIDERS_TRIED - 1)
+        let names: Vec<&str> = candidates.iter().map(|e| e.value.name.as_str()).collect();
+        let expected: Vec<String> = (0..COUNT).map(|i| format!("hmac-{i:02}")).collect();
+        assert_eq!(names, expected);
+
+        // The trial the request path drives: first success wins, and
+        // here the only success is the twelfth candidate.
+        let token = hs_sign(
+            Algorithm::HS256,
+            TEST_HMAC_SECRET,
+            &serde_json::json!({"sub": "agent-1", "exp": future()}),
         );
+        let header = jsonwebtoken::decode_header(&token).unwrap();
+        let mut verified = None;
+        for entry in &candidates {
+            if verify_against_provider(&entry.value, &token, &header)
+                .await
+                .is_ok()
+            {
+                verified = Some(entry.value.name.clone());
+                break;
+            }
+        }
+        assert_eq!(verified.as_deref(), Some("hmac-11"));
+    }
+
+    #[test]
+    fn a_kid_less_token_is_tried_against_every_key_in_the_jwks() {
+        // No cap on the fall-through key list either: a set larger than
+        // it used to be truncated to must still verify a token signed
+        // by a key at the end of it. Nine keys that cannot verify
+        // anything precede the one that can.
+        let mut keys: Vec<serde_json::Value> = (0..9)
+            .map(|i| {
+                serde_json::json!({
+                    "kty": "RSA", "kid": format!("decoy-{i}"), "use": "sig", "alg": "RS256",
+                    "n": DECOY_RSA_MODULUS, "e": "AQAB",
+                })
+            })
+            .collect();
+        let real: serde_json::Value =
+            serde_json::from_str::<serde_json::Value>(TEST_JWKS).unwrap()["keys"][0].clone();
+        keys.push(real);
+        let jwks: JwkSet = serde_json::from_value(serde_json::json!({"keys": keys})).unwrap();
+
+        let candidates = candidate_keys(&jwks, None, Algorithm::RS256);
+        assert_eq!(candidates.len(), 10);
+
+        // Signed by the last key, and carrying no `kid` to shortcut to it.
+        let token = encode(
+            &Header::new(Algorithm::RS256),
+            &valid_claims(),
+            &encoding_key(),
+        )
+        .unwrap();
+        assert!(jsonwebtoken::decode_header(&token).unwrap().kid.is_none());
+        let claims =
+            validate_with_keys(&token, Algorithm::RS256, &base_provider(), &candidates).unwrap();
+        assert_eq!(claims["sub"], "agent-1");
     }
 
     #[test]
