@@ -586,6 +586,26 @@ describe("a cache Redis unreachable at startup degrades the cache, not the boot"
     await timeChat(app.proxyUrl, EXACT_MODEL, "boot degraded two");
     expect(upstream.receivedRequests.length - before).toBe(2);
 
+    //    …and the outage is reported ONCE, not once per request. Three
+    //    requests have now been served with a failing cache, each of
+    //    which both reads and writes, so an unthrottled gateway has
+    //    logged six lines by here and will keep doing so for as long as
+    //    the outage lasts — burying everything else in the log. How hard
+    //    and how long it is failing is `aisix_redis_failures_total`;
+    //    the log line only has to say that it started.
+    const degradedWarns = app
+      .output()
+      .split("\n")
+      .filter(
+        (l) =>
+          l.includes("WARN") &&
+          (l.includes("cache lookup failed") || l.includes("cache write failed")),
+      ).length;
+    // ONE, not one per operation: the exact-KV half is a single
+    // degradation, and whichever of its read and write gets there first
+    // is the one that reports it. The rest of the outage is debug.
+    expect(degradedWarns).toBe(1);
+
     // 4. Redis comes up and the cache attaches itself — the degradation
     //    is temporary, not a silent demotion for the life of the process.
     relay.heal();

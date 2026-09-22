@@ -786,7 +786,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                     etcd_prefix.clone(),
                     connect_options.clone(),
                     cfg.etcd.request_timeout(),
-                    cfg.etcd.dial_timeout(),
+                    cfg.etcd.dial_budget(),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
@@ -801,7 +801,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                     global_prefix.clone(),
                     connect_options.clone(),
                     cfg.etcd.request_timeout(),
-                    cfg.etcd.dial_timeout(),
+                    cfg.etcd.dial_budget(),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
@@ -822,7 +822,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                     Arc::new(aisix_etcd::LazyEtcdClient::new(
                         cfg.etcd.endpoints.clone(),
                         connect_options.clone(),
-                        cfg.etcd.dial_timeout(),
+                        cfg.etcd.dial_budget(),
                     )),
                     etcd_prefix.clone(),
                     cfg.etcd.request_timeout(),
@@ -1551,7 +1551,9 @@ fn build_etcd_connect_options_with_extra_ca(
 
     // `with_connect_timeout` bounds establishing the channel only; it is
     // not a deadline on the calls made over it (that is
-    // `etcd.request_timeout_ms`, applied per call).
+    // `etcd.request_timeout_ms`, applied per call). Per ATTEMPT, so the
+    // per-endpoint value rather than `dial_budget`, which is what bounds
+    // the whole dial one level up.
     if let Some(dial) = etcd.dial_timeout() {
         options = options.with_connect_timeout(dial);
         needs_options = true;

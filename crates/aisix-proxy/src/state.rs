@@ -14,6 +14,8 @@
 //!
 //! Cheap to clone: every field is either an `Arc` or a small Copy scalar.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use aisix_cache::{Cache, MemoryCache, MemorySemanticCache, SemanticCacheStore};
 use aisix_core::models::CacheBackend;
 use aisix_core::models::{LiveMcpServerIndex, LivePricingIndex};
@@ -79,6 +81,24 @@ pub struct CacheBackends {
     /// (missing / non-embedding `embedding_model`). The per-request
     /// metric keeps counting; only the log line is deduplicated.
     semantic_resolve_warned: Arc<DashSet<String>>,
+    /// Set while the redis cache is failing, so the gate reports an
+    /// outage once rather than once per request. Re-armed by the next
+    /// success, so a second outage is reported again.
+    ///
+    /// A cache Redis can now be unreachable from boot and stay that way
+    /// (the connection attaches in the background instead of the process
+    /// exiting), and every cached-policy request produces both a read and
+    /// a write failure — so an unthrottled line is two per request for as
+    /// long as the outage lasts, which buries every other line in the
+    /// log. How hard and how long it is failing is
+    /// `aisix_redis_failures_total{operation}`; the log says that it
+    /// started.
+    ///
+    /// Two latches, not one: the exact-KV and vector-search halves fail
+    /// and recover independently, and only one of them costs an
+    /// embedding call.
+    exact_degraded: Arc<AtomicBool>,
+    semantic_degraded: Arc<AtomicBool>,
 }
 
 impl CacheBackends {
@@ -91,7 +111,30 @@ impl CacheBackends {
             redis_warned: Arc::new(DashSet::new()),
             semantic_redis_warned: Arc::new(DashSet::new()),
             semantic_resolve_warned: Arc::new(DashSet::new()),
+            exact_degraded: Arc::new(AtomicBool::new(false)),
+            semantic_degraded: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// True the first time the exact-KV cache fails in an outage, false
+    /// for the rest of it — the caller logs only when it is true.
+    pub fn note_exact_failure(&self) -> bool {
+        !self.exact_degraded.swap(true, Ordering::Relaxed)
+    }
+
+    /// Re-arm [`Self::note_exact_failure`] after a successful operation.
+    pub fn note_exact_success(&self) {
+        self.exact_degraded.store(false, Ordering::Relaxed);
+    }
+
+    /// [`Self::note_exact_failure`] for the vector-search half.
+    pub fn note_semantic_failure(&self) -> bool {
+        !self.semantic_degraded.swap(true, Ordering::Relaxed)
+    }
+
+    /// Re-arm [`Self::note_semantic_failure`].
+    pub fn note_semantic_success(&self) {
+        self.semantic_degraded.store(false, Ordering::Relaxed);
     }
 
     /// Attach the shared semantic store for `backend: redis` policies.

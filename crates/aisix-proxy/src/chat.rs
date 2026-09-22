@@ -973,6 +973,40 @@ async fn cache_semantic_embed(
     }
 }
 
+/// Which half of the cache subsystem a degradation belongs to. They fail
+/// and recover independently, and only the semantic half costs an
+/// embedding call, so they are reported separately.
+#[derive(Clone, Copy)]
+enum CacheHalf {
+    Exact,
+    Semantic,
+}
+
+/// True when this failure is the FIRST of an outage, so the caller logs
+/// it at WARN and the rest of the outage at debug. How hard and how long
+/// the backend is failing is `aisix_redis_failures_total{operation}`; the
+/// log line only has to say that it started.
+fn note_cache_failed(state: &ProxyState, half: CacheHalf) -> bool {
+    let Some(backends) = state.cache.as_ref() else {
+        return true;
+    };
+    match half {
+        CacheHalf::Exact => backends.note_exact_failure(),
+        CacheHalf::Semantic => backends.note_semantic_failure(),
+    }
+}
+
+/// Re-arm [`note_cache_failed`], so a LATER outage is reported again.
+fn note_cache_ok(state: &ProxyState, half: CacheHalf) {
+    let Some(backends) = state.cache.as_ref() else {
+        return;
+    };
+    match half {
+        CacheHalf::Exact => backends.note_exact_success(),
+        CacheHalf::Semantic => backends.note_semantic_success(),
+    }
+}
+
 /// Read path of the cache gate: exact (L1) lookup first, then — on an
 /// exact miss, when the policy configures it — the semantic (L2)
 /// similarity lookup. A semantic hit backfills the exact layer so the
@@ -993,10 +1027,19 @@ async fn resolve_cache_hit(
     semantic_embedding: &mut Option<Vec<f32>>,
 ) -> Option<(ChatResponse, CacheHitLayer, Option<f32>)> {
     match cache.get(key).await {
-        Ok(Some(cached)) => return Some((cached, CacheHitLayer::Exact, None)),
-        Ok(None) => {}
-        Err(err) => {
+        Ok(Some(cached)) => {
+            note_cache_ok(state, CacheHalf::Exact);
+            return Some((cached, CacheHitLayer::Exact, None));
+        }
+        Ok(None) => note_cache_ok(state, CacheHalf::Exact),
+        // Once per outage, not once per request: the count lives on
+        // `aisix_redis_failures_total`, and a cache Redis can now stay
+        // unreachable from boot onwards.
+        Err(err) if note_cache_failed(state, CacheHalf::Exact) => {
             tracing::warn!(error = %err, key = %key, "cache lookup failed");
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, key = %key, "cache lookup failed");
         }
     }
     let sem = semantic_gate?;
@@ -1035,16 +1078,26 @@ async fn resolve_cache_hit(
             Some((hit.response, CacheHitLayer::Semantic, Some(similarity)))
         }
         Ok(None) => {
+            note_cache_ok(state, CacheHalf::Semantic);
             *semantic_embedding = Some(vector);
             None
         }
         Err(err) => {
-            tracing::warn!(
-                target: "aisix::cache",
-                policy_name = %sem.policy_name,
-                error = %err,
-                "semantic cache lookup failed",
-            );
+            if note_cache_failed(state, CacheHalf::Semantic) {
+                tracing::warn!(
+                    target: "aisix::cache",
+                    policy_name = %sem.policy_name,
+                    error = %err,
+                    "semantic cache lookup failed",
+                );
+            } else {
+                tracing::debug!(
+                    target: "aisix::cache",
+                    policy_name = %sem.policy_name,
+                    error = %err,
+                    "semantic cache lookup failed",
+                );
+            }
             state
                 .metrics
                 .record_cache_semantic_store_failure(&sem.policy_name, "lookup");
@@ -3386,8 +3439,12 @@ async fn dispatch(
         // `Cache-Control: no-store` suppresses both layers' writes.
         cc.no_store,
     ) {
-        if let Err(err) = cache.put_with_ttl(key, upstream.clone(), ttl).await {
-            tracing::warn!(error = %err, key = %key, "cache write failed");
+        match cache.put_with_ttl(key, upstream.clone(), ttl).await {
+            Ok(()) => note_cache_ok(state, CacheHalf::Exact),
+            Err(err) if note_cache_failed(state, CacheHalf::Exact) => {
+                tracing::warn!(error = %err, key = %key, "cache write failed");
+            }
+            Err(err) => tracing::debug!(error = %err, key = %key, "cache write failed"),
         }
         // Semantic (L2) write. Reuses the read path's embedding; when
         // the read path was bypassed (`no-cache`) compute one now so
@@ -3401,7 +3458,7 @@ async fn dispatch(
                 None => None,
             };
             if let Some(vector) = vector {
-                if let Err(err) = sem
+                match sem
                     .store
                     .store(
                         &sem.policy_id,
@@ -3415,15 +3472,30 @@ async fn dispatch(
                     )
                     .await
                 {
-                    tracing::warn!(
-                        target: "aisix::cache",
-                        policy_name = %sem.policy_name,
-                        error = %err,
-                        "semantic cache write failed",
-                    );
-                    state
-                        .metrics
-                        .record_cache_semantic_store_failure(&sem.policy_name, "store");
+                    // Re-armed here too, not only on the lookup: a
+                    // `no-cache` request skips the lookup entirely, so
+                    // the write is the only success that half sees.
+                    Ok(()) => note_cache_ok(state, CacheHalf::Semantic),
+                    Err(err) => {
+                        if note_cache_failed(state, CacheHalf::Semantic) {
+                            tracing::warn!(
+                                target: "aisix::cache",
+                                policy_name = %sem.policy_name,
+                                error = %err,
+                                "semantic cache write failed",
+                            );
+                        } else {
+                            tracing::debug!(
+                                target: "aisix::cache",
+                                policy_name = %sem.policy_name,
+                                error = %err,
+                                "semantic cache write failed",
+                            );
+                        }
+                        state
+                            .metrics
+                            .record_cache_semantic_store_failure(&sem.policy_name, "store");
+                    }
                 }
             }
         }

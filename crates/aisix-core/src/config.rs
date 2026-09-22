@@ -130,6 +130,12 @@ pub struct EtcdConfig {
     /// (see the note on `0` under [`EtcdConfig::request_timeout`]),
     /// leaving it to the OS TCP stack.
     ///
+    /// This is the budget for ONE connection attempt. The whole dial gets
+    /// it once per configured endpoint — `dial_timeout_ms × max(1,
+    /// endpoints)` — because the client opens one balanced channel over
+    /// all of them and a single authentication call may have to fail over
+    /// across the set. See [`EtcdConfig::dial_budget`].
+    ///
     /// The default is finite, unlike `request_timeout_ms`, because the
     /// two bound different things. A range read's cost scales with the
     /// size of the configuration set, so a default bound on it would
@@ -601,6 +607,34 @@ impl EtcdConfig {
     ///
     /// See [`EtcdConfig::request_timeout`] for why `0` means unbounded
     /// here and "fall back to the next level" elsewhere in this repo.
+    /// What a whole dial may spend, as opposed to one attempt of it.
+    ///
+    /// `Client::connect` opens ONE balanced channel over every configured
+    /// endpoint and then makes a single `Authenticate` call across it, so
+    /// the worst case is that call failing over from endpoint to
+    /// endpoint — each one worth a budget. A single flat bound would cut
+    /// a dial that is working exactly as designed, in the one deployment
+    /// shape built to survive a dead member.
+    ///
+    /// `× max(1, endpoints)`, with no `+1`: unlike the Redis side, where
+    /// a sentinel or cluster walk ends in a connection to a node the walk
+    /// merely pointed at, the channel here IS the endpoints and there is
+    /// no extra hop to pay for. Blank entries do not count — they are
+    /// tolerated by `validate` and dropped before anything is dialled.
+    pub fn dial_budget(&self) -> Option<Duration> {
+        let endpoints = self
+            .endpoints
+            .iter()
+            .filter(|e| !e.trim().is_empty())
+            .count()
+            .max(1);
+        self.dial_timeout()
+            .map(|per_attempt| per_attempt.saturating_mul(endpoints.try_into().unwrap_or(u32::MAX)))
+    }
+
+    /// What ONE connection attempt inside a dial may spend — the value
+    /// the operator wrote. [`Self::dial_budget`] is what the whole dial
+    /// gets.
     pub const fn dial_timeout(&self) -> Option<Duration> {
         Self::bound(self.dial_timeout_ms)
     }
@@ -2690,6 +2724,62 @@ admin:
             Some(Duration::from_millis(DEFAULT_ETCD_DIAL_TIMEOUT_MS))
         );
         assert_eq!(cfg.etcd.request_timeout(), None);
+    }
+
+    // The whole dial gets a budget per endpoint, because the client
+    // opens ONE balanced channel over all of them and a single
+    // authentication call may fail over across the set. A flat bound
+    // would cut a dial working exactly as designed on the one topology
+    // built to survive a dead member.
+    #[test]
+    fn the_dial_budget_pays_for_every_configured_endpoint() {
+        // `ms` is written out on every case: a struct literal cannot
+        // express "the key was omitted" — that is serde's job, and the
+        // load test above pins it. What is pinned here is the arithmetic
+        // built on top of whatever value arrives.
+        let cfg = |endpoints: Vec<&str>, ms: Option<u64>| EtcdConfig {
+            endpoints: endpoints.into_iter().map(String::from).collect(),
+            dial_timeout_ms: ms,
+            ..Default::default()
+        };
+        let per = DEFAULT_ETCD_DIAL_TIMEOUT_MS;
+        let dflt = Some(per);
+
+        assert_eq!(
+            cfg(vec!["http://a:2379"], dflt).dial_budget(),
+            Some(Duration::from_millis(per))
+        );
+        assert_eq!(
+            cfg(
+                vec!["http://a:2379", "http://b:2379", "http://c:2379"],
+                dflt
+            )
+            .dial_budget(),
+            Some(Duration::from_millis(per * 3))
+        );
+        // Blank entries are dropped before anything is dialled, so they
+        // must not buy a budget the dial will never spend.
+        assert_eq!(
+            cfg(vec!["http://a:2379", "  ", ""], dflt).dial_budget(),
+            Some(Duration::from_millis(per))
+        );
+        // No endpoints at all is a config `validate` rejects; the floor
+        // keeps the arithmetic from reading as "no budget".
+        assert_eq!(
+            cfg(vec![], dflt).dial_budget(),
+            Some(Duration::from_millis(per))
+        );
+        // Unbounded scales to unbounded, not to zero.
+        assert_eq!(
+            cfg(vec!["http://a:2379", "http://b:2379"], Some(0)).dial_budget(),
+            None
+        );
+        // And the per-attempt value is untouched by the count — it is
+        // what reaches the connector for one TCP connect.
+        assert_eq!(
+            cfg(vec!["http://a:2379", "http://b:2379"], Some(1500)).dial_timeout(),
+            Some(Duration::from_millis(1500))
+        );
     }
 
     #[test]
