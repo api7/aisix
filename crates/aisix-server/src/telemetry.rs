@@ -1189,6 +1189,14 @@ mod tests {
     /// An attempt the server ANSWERS carries no such race in either
     /// direction: the response cannot exist unless the responder ran, and
     /// the responder records the post before it replies.
+    ///
+    /// The small step is MARGIN, not a guarantee. One delivery measured
+    /// 14 to 21 iterations of this loop against a budget of ten at the
+    /// big step and a thousand at the small one — two orders of
+    /// magnitude, which is why one is reliable and the other is a coin
+    /// flip, but neither is an invariant. Making it one would mean
+    /// synchronising on a server-side event rather than on a poll
+    /// budget; nothing here needs that yet.
     async fn drive_until<F: std::future::Future<Output = ()> + ?Sized>(
         mut sender: std::pin::Pin<&mut F>,
         step: Duration,
@@ -1988,7 +1996,8 @@ mod tests {
             sender.as_mut(),
             STEP_WHILE_SERVING,
             || posts.lock().unwrap().len() >= MAX_ANSWERED_FAILURES * 2 - 1,
-            "a stalled attempt was never recorded",
+            "the batch was given up on before its fifteenth attempt — a \
+             stalled attempt consumed the cap",
         )
         .await;
         drop(tx);
