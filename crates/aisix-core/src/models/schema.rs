@@ -1454,6 +1454,17 @@ fn title_single_value_enum_variants(
 /// plain-but-absent `Option` representation (`false`): the control plane
 /// omits unset fields (`jwks_uri`, `bound_claims`) rather than sending an
 /// explicit `null`.
+///
+/// Only `name` is required here. Which of `issuer` / `audiences` /
+/// `jwks_uri` a provider must or must not carry depends on its
+/// verification mode — which the presence of `hmac_secret` derives — and
+/// the secret's floor is a count of UTF-8 bytes rather than of the
+/// characters `minLength` measures. Both live in
+/// [`OidcProvider::validate_semantics`], applied by the loader and the
+/// file source after parse, exactly as the rate-limit policy's tree caps
+/// are.
+///
+/// [`OidcProvider::validate_semantics`]: crate::models::OidcProvider::validate_semantics
 pub fn oidc_provider_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::OidcProvider>(false);
     // schemars does not propagate the `#[schemars(length(min = 1))]` on

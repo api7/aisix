@@ -1422,3 +1422,39 @@ fn a_ceiling_of_only_star_named_servers_blocks_once_with_the_right_advice() {
         doc.blocking
     );
 }
+
+#[test]
+fn default_export_emits_no_live_oidc_shared_secret() {
+    let snap = AisixSnapshot::new();
+    snap.oidc_providers.insert(ResourceEntry::new(
+        "op-1",
+        serde_json::from_value(json!({
+            "name": "shared-idp",
+            "hmac_secret": "hmac-super-secret-do-not-leak-32b",
+        }))
+        .unwrap(),
+        1,
+    ));
+    let doc = build_export_document(&snap, false);
+    let providers = find(&doc, "oidc_providers");
+    assert_eq!(
+        providers[0]["hmac_secret"],
+        json!("${AISIXSECRET_OIDC_PROVIDER_SHARED_IDP_HMAC_SECRET}")
+    );
+    let rendered =
+        serde_json::to_string(&doc.collections.iter().map(|(_, v)| v).collect::<Vec<_>>()).unwrap();
+    assert!(
+        !rendered.contains("hmac-super-secret-do-not-leak-32b"),
+        "{rendered}"
+    );
+    assert_eq!(doc.secret_placeholders.len(), 1);
+    assert_eq!(doc.secret_placeholders[0].kind, "oidc_providers");
+
+    // `--reveal-secrets` is the only way the real value is written out.
+    let revealed = build_export_document(&snap, true);
+    assert_eq!(
+        find(&revealed, "oidc_providers")[0]["hmac_secret"],
+        json!("hmac-super-secret-do-not-leak-32b")
+    );
+    assert!(revealed.secret_placeholders.is_empty());
+}

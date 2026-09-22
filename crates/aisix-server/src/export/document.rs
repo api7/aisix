@@ -318,8 +318,10 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
         ),
     );
 
-    // oidc_providers — identity: name; no secrets (issuer / audiences /
-    // JWKS endpoint are all public trust configuration).
+    // oidc_providers — identity: name; secret: hmac_secret. Issuer,
+    // audiences and the JWKS endpoint are public trust configuration; a
+    // shared-secret provider's `hmac_secret` is the credential every one
+    // of its callers authenticates with.
     push_kind(
         &mut collections,
         "oidc_providers",
@@ -329,7 +331,16 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             "oidc_providers",
             &mut diag,
             |_, _, _| {},
-            |_, _| {},
+            |doc, identity| {
+                let mut ctx = RedactionCtx {
+                    kind_token: "OIDC_PROVIDER",
+                    kind: "oidc_providers",
+                    identity,
+                    reveal: reveal_secrets,
+                    out: &mut placeholders,
+                };
+                redact_top_level(doc, "hmac_secret", &mut ctx);
+            },
         ),
     );
 

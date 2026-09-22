@@ -454,12 +454,20 @@ pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnaps
                 }
             }
             "oidc_providers" => {
-                if let Some(entry) = validate_and_parse::<OidcProvider>(
+                // Which fields a provider requires depends on its
+                // verification mode, which the schema cannot express
+                // (`issuer`/`audiences` for JWKS mode, no `jwks_uri` and
+                // a 32-byte floor for HMAC mode) — the semantic hook
+                // rejects such rows the same way a schema failure is
+                // rejected, so a provider that could not verify anything
+                // never enters the snapshot.
+                if let Some(entry) = validate_and_parse_with_semantics::<OidcProvider>(
                     &raw.key,
                     raw.revision,
                     parsed,
                     &value,
                     validate_oidc_provider_lenient,
+                    |p| p.validate_semantics(),
                     &mut stats,
                 ) {
                     snapshot.oidc_providers.insert(entry);
@@ -1642,5 +1650,78 @@ mod tests {
         assert_eq!(rej.key, "/aisix/rate_limit_policies/rlp-bad");
         assert_eq!(rej.kind, RejectionKind::SchemaFailed);
         assert!(rej.error.contains("does not compile"), "{}", rej.error);
+    }
+
+    #[test]
+    fn semantically_invalid_oidc_providers_are_rejected_and_the_valid_rows_still_load() {
+        // Each of the three mode rules the JSON Schema cannot express,
+        // alongside one row of each mode that is fine. A rejected
+        // provider must not enter the snapshot — one that could not
+        // verify anything would otherwise sit there claiming an issuer.
+        let secret = "shared-secret-that-is-long-enough-32";
+        let entries = vec![
+            raw(
+                "/aisix/oidc_providers/ok-jwks",
+                br#"{"name":"ok-jwks","issuer":"https://idp.test","audiences":["aisix"]}"#,
+                1,
+            ),
+            raw(
+                "/aisix/oidc_providers/ok-hmac",
+                format!(r#"{{"name":"ok-hmac","hmac_secret":"{secret}"}}"#).as_bytes(),
+                2,
+            ),
+            raw(
+                "/aisix/oidc_providers/bad-hmac-with-jwks-uri",
+                format!(
+                    r#"{{"name":"bad-1","hmac_secret":"{secret}","jwks_uri":"https://x/jwks"}}"#
+                )
+                .as_bytes(),
+                3,
+            ),
+            raw(
+                "/aisix/oidc_providers/bad-jwks-no-issuer",
+                br#"{"name":"bad-2","audiences":["aisix"]}"#,
+                4,
+            ),
+            raw(
+                "/aisix/oidc_providers/bad-jwks-no-audiences",
+                br#"{"name":"bad-3","issuer":"https://idp.test"}"#,
+                5,
+            ),
+            raw(
+                "/aisix/oidc_providers/bad-short-secret",
+                br#"{"name":"bad-4","hmac_secret":"too-short"}"#,
+                6,
+            ),
+        ];
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
+        assert_eq!(stats.accepted, 2);
+        assert_eq!(stats.schema_rejected, 4);
+        assert_eq!(snap.oidc_providers.len(), 2);
+        assert!(snap.oidc_providers.get_by_id("ok-jwks").is_some());
+        assert!(snap.oidc_providers.get_by_id("ok-hmac").is_some());
+
+        let reasons: Vec<&str> = stats.rejections.iter().map(|r| r.error.as_str()).collect();
+        for expected in [
+            "`jwks_uri` must be absent",
+            "`issuer` is required",
+            "`audiences` is required",
+            "at least 32 bytes",
+        ] {
+            assert!(
+                reasons.iter().any(|r| r.contains(expected)),
+                "no rejection mentioned {expected:?}: {reasons:?}"
+            );
+        }
+        // The rejection message is surfaced on /status/config and in the
+        // control plane's rejected-resources view; it must never carry
+        // the secret that made the row invalid.
+        assert!(
+            !reasons.iter().any(|r| r.contains("too-short")),
+            "a rejection must not echo the secret: {reasons:?}"
+        );
+        for r in &stats.rejections {
+            assert_eq!(r.kind, RejectionKind::SchemaFailed);
+        }
     }
 }

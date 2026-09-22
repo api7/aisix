@@ -21,11 +21,10 @@
   },
   "properties": {
     "audiences": {
-      "description": "Accepted `aud` values. The token's audience (a string or an array) must contain at least one of these. Every token must carry an audience claim.",
+      "description": "Accepted `aud` values. The token's audience (a string or an array) must contain at least one of these. Required unless `hmac_secret` is set; when a shared-secret provider omits it, the `aud` claim is ignored.\n\nAn empty list means exactly what omitting the field means — it carries no `minItems`, deliberately. The runtime reads \"no accepted audiences\" off `is_empty()`, so a schema that rejected `[]` would make the two planes disagree about what an empty list means and kill the whole row over a projection that spelled \"unset\" the other way. What stays rejected is a JWKS provider with no audiences at all, which `validate_semantics` owns.",
       "items": {
         "type": "string"
       },
-      "minItems": 1,
       "type": "array"
     },
     "bound_claims": {
@@ -40,6 +39,11 @@
       "description": "Whether the provider participates in JWT authentication. A disabled provider is kept but ignored. Treated as `true` when omitted.",
       "type": "boolean"
     },
+    "hmac_secret": {
+      "description": "Shared secret for HMAC-signed tokens, whose presence selects HMAC verification for this provider. Its UTF-8 bytes are the HMAC key as-is — nothing is base64-decoded or derived — and it must be at least 32 bytes long. Tokens are then accepted only under `HS256`, `HS384` or `HS512`, no signing keys are fetched, and `issuer` / `audiences` become optional. Omit it for a standard OIDC provider whose tokens are verified against a JWKS.",
+      "minLength": 1,
+      "type": "string"
+    },
     "identity_claim": {
       "default": "sub",
       "description": "Claim whose value selects the API key to act as: the request is bound to the key whose `jwt_subject` equals this claim's value. Dots traverse nested objects (e.g. `\"resource_access.account\"`). Defaults to `sub`.",
@@ -47,12 +51,12 @@
       "type": "string"
     },
     "issuer": {
-      "description": "Expected `iss` claim, compared byte-for-byte against the token's issuer. A JWT whose issuer matches no enabled provider is rejected.",
+      "description": "Expected `iss` claim, compared byte-for-byte against the token's issuer. A JWT carrying this issuer is verified against this provider and no other. Required unless `hmac_secret` is set; when a shared-secret provider omits it, the token's `iss` claim is not consulted at all.",
       "minLength": 1,
       "type": "string"
     },
     "jwks_uri": {
-      "description": "JWKS endpoint URL the signing keys are fetched from. When omitted, the endpoint is resolved once from the issuer's OIDC discovery document (`<issuer>/.well-known/openid-configuration`) and cached.",
+      "description": "JWKS endpoint URL the signing keys are fetched from. When omitted, the endpoint is resolved once from the issuer's OIDC discovery document (`<issuer>/.well-known/openid-configuration`) and cached. Must be absent when `hmac_secret` is set — a shared-secret provider fetches no keys.",
       "minLength": 1,
       "type": "string"
     },
@@ -77,8 +81,6 @@
     }
   },
   "required": [
-    "audiences",
-    "issuer",
     "name"
   ],
   "title": "OidcProvider",

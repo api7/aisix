@@ -172,7 +172,10 @@ fn full_valid_file_loads_every_kind() {
 
     // The OIDC provider loads with serde defaults filled.
     let idp = snap.oidc_providers.get_by_name("corp-keycloak").unwrap();
-    assert_eq!(idp.value.issuer, "https://sso.example.com/realms/agents");
+    assert_eq!(
+        idp.value.issuer.as_deref(),
+        Some("https://sso.example.com/realms/agents")
+    );
     assert_eq!(idp.value.identity_claim, "sub");
     assert!(idp.value.enabled);
 
@@ -1598,4 +1601,85 @@ guardrails:
         !errors.iter().any(|e| e.contains("0.75")),
         "no suggested value: {errors:?}",
     );
+}
+
+// ── HMAC (shared-secret) OIDC providers ──────────────────────────────
+
+const HMAC_PROVIDER_FILE: &str = r#"
+_format_version: "1"
+
+oidc_providers:
+  - name: shared-secret-idp
+    hmac_secret: ${AGENT_JWT_SECRET}
+    identity_claim: sub
+  - name: corp-keycloak
+    issuer: https://sso.example.com/realms/agents
+    audiences: ["aisix-gateway"]
+"#;
+
+#[test]
+fn an_hmac_provider_loads_from_the_resources_file_with_an_interpolated_secret() {
+    let env = env_of(&[("AGENT_JWT_SECRET", "shared-secret-that-is-long-enough-32")]);
+    let snap = load(HMAC_PROVIDER_FILE, &env).expect("file must load");
+    assert_eq!(snap.oidc_providers.len(), 2);
+
+    let hmac = snap
+        .oidc_providers
+        .get_by_name("shared-secret-idp")
+        .unwrap();
+    assert_eq!(
+        hmac.value.hmac_secret().unwrap().as_bytes(),
+        b"shared-secret-that-is-long-enough-32"
+    );
+    // The two optional-in-HMAC-mode fields stay unset, and the mode is
+    // derived from the secret rather than declared.
+    assert!(hmac.value.issuer.is_none());
+    assert!(hmac.value.audiences.is_empty());
+    assert!(!hmac.value.is_jwks_mode());
+
+    // A JWKS provider in the same file is unaffected.
+    let jwks = snap.oidc_providers.get_by_name("corp-keycloak").unwrap();
+    assert!(jwks.value.is_jwks_mode());
+    assert!(jwks.value.hmac_secret().is_none());
+}
+
+#[test]
+fn the_file_source_rejects_every_semantically_invalid_provider_shape() {
+    let env = env_of(&[]);
+    let secret = "shared-secret-that-is-long-enough-32";
+    for (yaml, expected) in [
+        (
+            format!("hmac_secret: {secret}\n    jwks_uri: https://x/jwks"),
+            "`jwks_uri` must be absent",
+        ),
+        ("audiences: [\"aisix\"]".to_string(), "`issuer` is required"),
+        (
+            "issuer: https://idp.test".to_string(),
+            "`audiences` is required",
+        ),
+        ("hmac_secret: too-short".to_string(), "at least 32 bytes"),
+    ] {
+        let file = format!("_format_version: \"1\"\n\noidc_providers:\n  - name: p\n    {yaml}\n");
+        let errors = errors_of(load(&file, &env));
+        assert!(
+            errors.iter().any(|e| e.contains(expected)),
+            "expected {expected:?} in {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn two_issuerless_providers_are_not_a_duplicate_issuer() {
+    // The duplicate-issuer check must not collapse providers that pin no
+    // issuer at all: a token reaches those by trial in name order, which
+    // is already a total order, so they are not ambiguous.
+    let env = env_of(&[]);
+    let secret = "shared-secret-that-is-long-enough-32";
+    let file = format!(
+        "_format_version: \"1\"\n\noidc_providers:\n  \
+         - name: a\n    hmac_secret: {secret}\n  \
+         - name: b\n    hmac_secret: {secret}\n"
+    );
+    let snap = load(&file, &env).expect("file must load");
+    assert_eq!(snap.oidc_providers.len(), 2);
 }
