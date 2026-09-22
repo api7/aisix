@@ -279,7 +279,12 @@ impl RedisStore {
                 Self::with_slot(ConnSlot::filled(conn), Arc::new(AtomicBool::new(false))),
                 None,
             )),
-            Err(e) if aisix_redis::is_permanent_config_error(&e) => Err(e),
+            // Only configuration the process rejected by itself. A
+            // server that answered and refused is degraded around like
+            // an outage: it can be corrected on the server side while
+            // this gateway keeps serving, and the re-attach below picks
+            // that up without a restart.
+            Err(e) if aisix_redis::is_boot_fatal(&e) => Err(e),
             Err(e) => {
                 let slot = ConnSlot::empty();
                 // Already "logged": the caller WARNs this failure itself,
@@ -422,13 +427,32 @@ fn spawn_attach(
                 Err(e) => {
                     if last_reminder.elapsed() >= DEGRADED_REMINDER {
                         last_reminder = std::time::Instant::now();
-                        tracing::warn!(
-                            target: "aisix::ratelimit",
-                            %endpoint,
-                            error = %e,
-                            "shared rate-limit backend still unreachable; cluster-wide \
-                             rate limits are NOT enforced and counting stays per-replica"
-                        );
+                        // Same `reason` the boot line carried, so the two
+                        // read as one story and one filter finds both. A
+                        // server that answers and refuses is not an
+                        // outage, and saying "unreachable" about it sends
+                        // the operator to the network.
+                        let reason = aisix_redis::failure_reason(&e);
+                        if reason == "refused" {
+                            tracing::warn!(
+                                target: "aisix::ratelimit",
+                                %endpoint,
+                                %reason,
+                                error = %e,
+                                "shared rate-limit backend is still REFUSING the configured \
+                                 connection settings; cluster-wide rate limits are NOT \
+                                 enforced and counting stays per-replica"
+                            );
+                        } else {
+                            tracing::warn!(
+                                target: "aisix::ratelimit",
+                                %endpoint,
+                                %reason,
+                                error = %e,
+                                "shared rate-limit backend still unreachable; cluster-wide \
+                                 rate limits are NOT enforced and counting stays per-replica"
+                            );
+                        }
                     } else {
                         tracing::debug!(
                             target: "aisix::ratelimit",

@@ -967,12 +967,14 @@ async fn a_commit_after_the_backend_attaches_returns_the_local_slot() {
         .expect("the local concurrency slot was returned on commit");
 }
 
-/// A config the driver can never use must still end the boot.
+/// A config the process rejects BY ITSELF must still end the boot.
 ///
-/// Everything else on this path is now retried forever in the
-/// background, and a typo does not come good on a retry: a gateway that
-/// starts healthy and is quietly never going to enforce a shared limit
-/// is strictly worse than the boot failure it replaced.
+/// Everything that depends on a server's answer is degraded around and
+/// retried in the background, because a server can come back and a
+/// credential can be corrected on it. A `url` the driver cannot parse
+/// can do neither: nothing outside this process will ever change it, so
+/// a gateway that started would be quietly never going to enforce a
+/// shared limit, which is strictly worse than the boot failure.
 #[tokio::test]
 async fn a_config_the_driver_cannot_use_is_still_fatal() {
     let cfg = RedisConnConfig {
@@ -983,29 +985,120 @@ async fn a_config_the_driver_cannot_use_is_still_fatal() {
     let err = RedisStore::connect_or_attach_later(&cfg)
         .await
         .expect_err("a malformed url must not be degraded around");
-    assert!(aisix_redis::is_permanent_config_error(&err), "{err:?}");
+    assert!(aisix_redis::is_boot_fatal(&err), "{err:?}");
 }
 
-/// A credential the server ANSWERED and refused is permanent too.
+/// A refused credential is NOT fatal — and it is not an outage either.
 ///
-/// It is not the unreachable case the background retry exists for — the
-/// server is right there — and no amount of waiting turns a wrong
-/// password into a right one. Same judgement the etcd side already
-/// makes on a refused credential.
+/// The server answered, so the gateway serves degraded and keeps
+/// retrying (the credential may be fixed on the server side), but the
+/// operator is told a refusal rather than sent to look at the network.
+/// Those are two separate claims and this pins both.
+///
+/// Synthetic errors, so this pins the CLASSIFIER and nothing else. It
+/// does not prove a real Redis refusal ever reaches it, and for a while
+/// none did — every driver reported a refusal as a connectivity failure,
+/// so the refused branch was unreachable in production while a test like
+/// this stayed green. `crates/aisix-redis/tests/auth_connect.rs` is what
+/// answers that question, against a live server.
 #[test]
-fn a_refused_credential_is_permanent_too() {
+fn a_refused_credential_is_told_apart_from_an_outage() {
     let refused = redis::RedisError::from((
         redis::ErrorKind::AuthenticationFailed,
         "WRONGPASS invalid username-password pair",
     ));
-    assert!(aisix_redis::is_permanent_config_error(&refused));
+    assert!(!aisix_redis::is_boot_fatal(&refused));
+    assert_eq!(aisix_redis::failure_reason(&refused), "refused");
 
-    // …while an unreachable server is not, or a Redis that is merely
-    // late would stop the boot it is supposed to be ridden out.
     let unreachable = redis::RedisError::from((
         redis::ErrorKind::IoError,
         "redis connect timed out",
         "no connection within 5s".to_string(),
     ));
-    assert!(!aisix_redis::is_permanent_config_error(&unreachable));
+    assert!(!aisix_redis::is_boot_fatal(&unreachable));
+    assert_eq!(aisix_redis::failure_reason(&unreachable), "unreachable");
+}
+
+/// The whole point of degrading rather than exiting: the credential is
+/// corrected ON THE SERVER, and the running gateway picks it up.
+///
+/// An ACL user rather than `requirepass`, because `requirepass` is
+/// server-wide and every other test in this file shares the server. The
+/// user is created with one password, the store is configured with
+/// another — so the first connect is refused, exactly as a typo'd
+/// `AISIX_RATELIMIT__REDIS__PASSWORD` would be — and then the user's
+/// password is changed to the configured one with the gateway still
+/// running.
+#[tokio::test]
+async fn a_refused_credential_corrected_on_the_server_is_adopted_without_a_restart() {
+    let Some(url) = redis_url() else { return };
+    let user = format!("aisix-heal-{}", unique_key("u").replace(':', "-"));
+    let wanted = "the-password-the-gateway-holds";
+
+    let admin = aisix_redis::connect(&single(&url))
+        .await
+        .expect("the admin connection must come up");
+    let set_user = |password: &str| {
+        let (user, password) = (user.clone(), password.to_string());
+        let admin = &admin;
+        async move {
+            let mut handle = admin.acquire().await.expect("an admin handle");
+            redis::cmd("ACL")
+                .arg("SETUSER")
+                .arg(&user)
+                .arg("on")
+                .arg(format!(">{password}"))
+                .arg("~*")
+                .arg("+@all")
+                .query_async::<()>(&mut handle)
+                .await
+                .expect("the ACL user must be settable");
+        }
+    };
+    set_user("not-the-password-the-gateway-holds").await;
+
+    let cfg = RedisConnConfig {
+        username: Some(user.clone()),
+        password: Some(wanted.into()),
+        ..single(&url)
+    };
+    let (store, degraded) = RedisStore::connect_or_attach_later(&cfg)
+        .await
+        .expect("a refused credential must NOT end the boot");
+    let degraded = degraded.expect("a refused credential must degrade, not connect");
+    assert_eq!(
+        aisix_redis::failure_reason(&degraded),
+        "refused",
+        "the operator must be told the server refused, not that it is unreachable: {degraded}"
+    );
+
+    // Still enforcing, per replica: a degraded limiter that had stopped
+    // counting would serve both of these.
+    let key = unique_key("heal");
+    let limits = RateLimit {
+        rpm: Some(1),
+        ..Default::default()
+    };
+    assert!(store.acquire(&key, &limits, "heal-1").await.is_ok());
+    assert!(
+        store.acquire(&key, &limits, "heal-2").await.is_err(),
+        "per-replica enforcement must hold while the shared backend is refused"
+    );
+
+    // The operator fixes it on the server. Nothing restarts.
+    set_user(wanted).await;
+    let peer = RedisStore::connect(&cfg)
+        .await
+        .expect("the corrected credential must connect");
+    wait_for_attach(&store, &peer).await;
+
+    // The Redis is shared with every other test here and outlives the
+    // run, so the user this test invented does not get to accumulate on
+    // it one password at a time.
+    let mut handle = admin.acquire().await.expect("an admin handle");
+    let _ = redis::cmd("ACL")
+        .arg("DELUSER")
+        .arg(&user)
+        .query_async::<()>(&mut handle)
+        .await;
 }

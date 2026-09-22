@@ -56,6 +56,40 @@ async function redisPing(url: string): Promise<boolean> {
   });
 }
 
+/**
+ * One command over a fresh RESP connection, as an array of bulk strings.
+ *
+ * Only used to manage an ACL user: the refusal case needs a credential
+ * the server rejects and then accepts, and `requirepass` is server-wide
+ * while every other file in this suite shares the same Redis. An ACL
+ * user is scoped to itself and named per run.
+ */
+async function redisCommand(url: string, args: string[]): Promise<string> {
+  const m = /^redis:\/\/(?:[^@/]*@)?([^:/]+)(?::(\d+))?/.exec(url);
+  if (!m) throw new Error(`not a redis url: ${url}`);
+  const host = m[1];
+  const port = m[2] ? Number(m[2]) : 6379;
+  const payload =
+    `*${args.length}\r\n` + args.map((a) => `$${Buffer.byteLength(a)}\r\n${a}\r\n`).join("");
+  return new Promise((resolve, reject) => {
+    const sock = connect({ host, port }, () => sock.write(payload));
+    sock.once("data", (buf) => {
+      sock.destroy();
+      const text = buf.toString();
+      if (text.startsWith("-")) reject(new Error(text.trim()));
+      else resolve(text);
+    });
+    sock.once("error", (e) => {
+      sock.destroy();
+      reject(e);
+    });
+    sock.setTimeout(2000, () => {
+      sock.destroy();
+      reject(new Error("redis command timed out"));
+    });
+  });
+}
+
 /** A shared etcd block so two replicas read ONE config namespace — the
  *  ApiKey then has a single entry id across both, which is the rate-limit
  *  bucket key. (`spawnApp` otherwise gives each app a unique prefix.) */
@@ -645,4 +679,163 @@ describe("a Redis unreachable at startup degrades the limiter, not the boot", ()
     expect(onB.status).toBe(429);
     await onB.body?.cancel();
   });
+});
+
+// E2E: a shared Redis that ANSWERS and refuses the credential.
+//
+// It is neither of the two states the gateway used to have. It is not an
+// outage — the server replied in milliseconds — and it is not a config
+// the process can reject by itself, because the credential can be
+// corrected on the SERVER while this gateway keeps running. So the
+// gateway degrades exactly as it does for an outage, and the difference
+// is entirely in what the operator is told.
+//
+// Release QA against 1.4.0-rc.2 found the gateway reporting a five-second
+// timeout against a Redis that had answered in 0.26s, never once naming
+// the credential. None of the three drivers reports the refusal on its
+// own: the single-node connection manager retries its initial connect
+// past the boot budget and reports only the last attempt's error, a
+// cluster seed that refuses is dropped from the initial connection map,
+// and sentinel discovery skips a master that fails its `ROLE` check.
+//
+// The Redis here needs no password, so a configured ACL user is the
+// lever: created with one password while the gateway holds another, it
+// is refused; changed to the one the gateway holds, it is accepted. That
+// second half is why this must not be a boot failure — a restart would
+// not be needed and must not be required.
+describe("a Redis that refuses the credential degrades the limiter, not the boot", () => {
+  let app: SpawnedApp | undefined;
+  let peer: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let infraReady = false;
+  const prefix = `/aisix-e2e-rl-refused-${randomUUID()}`;
+  const model = "rl-redis-refused";
+  const user = `aisix-e2e-${randomUUID().slice(0, 8)}`;
+  const held = "the-password-the-gateway-holds";
+  const TIMEOUT_SECS = 5;
+
+  beforeAll(async () => {
+    infraReady = (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
+    if (!infraReady) return;
+
+    // The user exists and works — for a password the gateway does not have.
+    await redisCommand(REDIS_URL, [
+      "ACL",
+      "SETUSER",
+      user,
+      "on",
+      `>not-${held}`,
+      "~*",
+      "+@all",
+    ]);
+    upstream = await startOpenAiUpstream();
+    app = await spawnApp({
+      // `info`, so the background attach announces itself in `output()`.
+      logLevel: "info",
+      extra: {
+        etcd: sharedEtcd(prefix),
+        ratelimit: {
+          backend: "redis",
+          redis: {
+            url: REDIS_URL,
+            // Supplied as the FIELDS, which is the documented way to keep
+            // the secret out of the config file — and which in `single`
+            // mode reached nothing at all until this release.
+            username: user,
+            password: held,
+            timeout_secs: TIMEOUT_SECS,
+          },
+        },
+      },
+    });
+    await seed(prefix, upstream.baseUrl, model);
+    await waitModelLive(app.proxyUrl, model);
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await peer?.exit();
+    await upstream?.close();
+    if (infraReady) {
+      await redisCommand(REDIS_URL, ["ACL", "DELUSER", user]).catch(() => {});
+      await new EtcdClient().deletePrefix(prefix);
+    }
+  });
+
+  test("it serves, says the server REFUSED, limits per replica, then adopts the corrected credential", async (ctx) => {
+    if (!infraReady || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    // 1. It served at all. `spawnApp` already gated on `/livez` plus the
+    //    metrics listener, so reaching this line is most of the claim.
+    expect(app.output()).toContain("aisix listening");
+
+    // 2. One WARN, and it is about a REFUSAL. The two words it must not
+    //    contain are the whole finding: before this the operator was told
+    //    the backend had timed out, against a server that answered in a
+    //    quarter of a second, and went looking at the network.
+    const warn = app
+      .output()
+      .split("\n")
+      .find((l) => l.includes("shared rate-limit backend REFUSED"));
+    expect(warn).toBeDefined();
+    expect(warn).toContain("reason=refused");
+    expect(warn).toContain(new URL(REDIS_URL).host);
+    //    The server's own words, which are the only part that says WHICH
+    //    setting it refused.
+    expect(warn?.toLowerCase()).toContain("auth");
+    expect(warn).not.toContain("timed out");
+    expect(warn).not.toContain("unreachable");
+    //    And never the URL, which carries the credential.
+    expect(warn).not.toContain("redis://");
+
+    // 3. It still refuses: the seeded key is RPM=1, and a degraded
+    //    limiter that had stopped counting would serve both of these.
+    await awaitWindowHeadroom();
+    const first = await chatRequest(app.proxyUrl, model);
+    expect(first.status).toBe(200);
+    await first.body?.cancel();
+    const second = await chatRequest(app.proxyUrl, model);
+    expect(second.status).toBe(429);
+    await second.body?.cancel();
+
+    // 4. The operator fixes the credential ON THE SERVER. Nothing
+    //    restarts — which is the reason a refusal must not end a boot.
+    await redisCommand(REDIS_URL, ["ACL", "SETUSER", user, "on", `>${held}`, "~*", "+@all"]);
+    const attachDeadline = Date.now() + 30_000;
+    while (
+      !app.output().includes("shared rate-limit backend attached") &&
+      Date.now() < attachDeadline
+    ) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    expect(app.output()).toContain("shared rate-limit backend attached");
+
+    // 5. And the counter really is shared now: a second replica on the
+    //    same etcd namespace and the same Redis sees this one's window.
+    peer = await spawnApp({
+      extra: {
+        etcd: sharedEtcd(prefix),
+        ratelimit: {
+          backend: "redis",
+          redis: {
+            url: REDIS_URL,
+            username: user,
+            password: held,
+            timeout_secs: TIMEOUT_SECS,
+          },
+        },
+      },
+    });
+    await waitModelLive(peer.proxyUrl, model);
+    await awaitWindowHeadroom();
+    const onA = await chatRequest(app.proxyUrl, model);
+    expect(onA.status).toBe(200);
+    await onA.body?.cancel();
+    const onB = await chatRequest(peer.proxyUrl, model);
+    expect(onB.status).toBe(429);
+    await onB.body?.cancel();
+  }, 180_000);
 });
