@@ -1155,6 +1155,14 @@ mod tests {
     /// measured on this same paused clock, so advancing in seconds is what
     /// ENDS an attempt rather than something that could cut one short — and
     /// a 30-minute budget is 1800 cheap iterations.
+    ///
+    /// It does NOT give an attempt time to be DELIVERED. Ten steps cross
+    /// the 10s timeout, so the request gets ten polls to reach a real
+    /// socket and a real wiremock thread, against a thousand at
+    /// [`STEP_WHILE_SERVING`] — and those ten pass in microseconds of
+    /// wall clock. A phase that needs the server to have RECEIVED an
+    /// attempt (anything that then reads `posts`) must reach that point
+    /// on the small step and only then switch to this one.
     const STEP_WHILE_UNREACHABLE: Duration = Duration::from_secs(1);
 
     /// Poll the worker while virtual time moves forward in `step`s, until
@@ -1165,6 +1173,23 @@ mod tests {
     /// step is the caller's because it is a trade: it has to cross a backoff
     /// in a reasonable number of iterations without racing the request
     /// timeout of an exchange that is on the wire right now.
+    /// Step the sender's virtual clock until `done`, or fail with `what`.
+    ///
+    /// **A condition that reads `posts` and a condition that reads a
+    /// metric are not interchangeable.** `posts` is pushed by the
+    /// wiremock responder, which runs on wiremock's own runtime in REAL
+    /// time; the sender's request timeout runs on the clock this
+    /// advances, in instant steps. So for an attempt the server never
+    /// answers, the sender can count the failure before wiremock has
+    /// dispatched the request to the responder at all — and an assertion
+    /// on `posts` placed AFTER a wait on the metric then reads a count
+    /// that has not caught up yet. Whatever such an assertion needs from
+    /// `posts` belongs in this condition, not after it; the wall-clock
+    /// deadline below keeps that from hanging.
+    ///
+    /// An attempt the server ANSWERS carries no such race: the response
+    /// cannot exist unless the responder ran, and the responder records
+    /// the post before it replies.
     async fn drive_until<F: std::future::Future<Output = ()> + ?Sized>(
         mut sender: std::pin::Pin<&mut F>,
         step: Duration,
@@ -1625,8 +1650,21 @@ mod tests {
             "the failed batch was never re-sent",
         )
         .await;
-        // From here every attempt stalls past the request timeout, so the
-        // clock can move in seconds.
+        // From here every attempt stalls past the request timeout. The
+        // first of them still goes out on the SMALL step: it has to reach
+        // wiremock, which records it in real time, and at a second a step
+        // an attempt gets ten polls to cross a real socket before its own
+        // 10s timeout — measured on this paused clock — cuts it off. This
+        // wait is what pins "a stalling batch is re-sent at all"; the
+        // count assertion below can then only add the upper bound.
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || posts.lock().unwrap().len() > 2,
+            "the stalling batch was never re-sent",
+        )
+        .await;
+        // Only now may the clock move in seconds, to run the budget out.
         drive_until(
             sender.as_mut(),
             STEP_WHILE_UNREACHABLE,
@@ -1644,11 +1682,11 @@ mod tests {
         // One lock per statement: `assert_identical_resends` takes the lock
         // itself, and a guard still alive from an argument expression would
         // deadlock against it.
+        // `attempts > 2` is no longer asserted here: the wait above is
+        // what establishes it, and repeating it after the fact would be a
+        // check that cannot fail. What is still worth saying is that
+        // every one of them carried the same batch.
         let attempts = posts.lock().unwrap().len();
-        assert!(
-            attempts > 2,
-            "a half-hour budget is many attempts: {attempts}"
-        );
         assert_identical_resends(&posts, attempts);
         assert_eq!(
             drops_with_reason(&metrics, DROP_SEND_FAILED),
@@ -1687,6 +1725,18 @@ mod tests {
             tx.try_send(event).unwrap();
         }
         tokio::time::advance(FLUSH_INTERVAL).await;
+        // Two phases, and the order is the point. The third attempt has to
+        // REACH the server before the clock may outrun it — `posts` is
+        // recorded by wiremock in real time — so it goes out on the small
+        // step. Only once it has landed may the clock jump in seconds to
+        // blow its request timeout.
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || posts.lock().unwrap().len() >= 3,
+            "the batch that met no response was never re-sent",
+        )
+        .await;
         drive_until(
             sender.as_mut(),
             STEP_WHILE_UNREACHABLE,
@@ -1919,7 +1969,13 @@ mod tests {
         drive_until(
             sender.as_mut(),
             STEP_WHILE_SERVING,
-            || drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED) == 2,
+            || {
+                drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED) == 2
+                    // The stalled attempts in between are recorded on
+                    // wiremock's clock, and the exact count below
+                    // includes them — see `drive_until`.
+                    && posts.lock().unwrap().len() >= MAX_ANSWERED_FAILURES * 2 - 1
+            },
             "the batch was never given up on",
         )
         .await;
