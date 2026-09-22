@@ -778,8 +778,17 @@ pub fn load_from_str(
                 }
             }
             "oidc_providers" => {
-                if let Some(t) = finish(&scope, &entry.doc, validate_oidc_provider, &mut errors) {
-                    oidc_providers.push((id, scope, t));
+                if let Some(t) =
+                    finish::<OidcProvider>(&scope, &entry.doc, validate_oidc_provider, &mut errors)
+                {
+                    // Mode-dependent field coupling and the shared-secret
+                    // length floor are beyond the schema — a failing
+                    // entry is a load error like any schema failure.
+                    if let Err(message) = t.validate_semantics() {
+                        errors.push(LoadError { scope, message });
+                    } else {
+                        oidc_providers.push((id, scope, t));
+                    }
                 }
             }
             "claim_mappings" => {
@@ -944,13 +953,18 @@ pub fn load_from_str(
         if !provider.enabled {
             continue;
         }
-        if let Some(first) = seen_issuers.insert(provider.issuer.as_str(), scope.as_str()) {
+        // Providers that pin no issuer (only possible in shared-secret
+        // mode) are not ambiguous with each other: a token reaches them
+        // by trial in name order, not by issuer, which is a total order.
+        let Some(issuer) = provider.issuer.as_deref() else {
+            continue;
+        };
+        if let Some(first) = seen_issuers.insert(issuer, scope.as_str()) {
             errors.push(LoadError {
                 scope: scope.clone(),
                 message: format!(
-                    "duplicate enabled OIDC issuer {:?}: already used by {first} — every \
-                     enabled provider must have a distinct issuer",
-                    provider.issuer
+                    "duplicate enabled OIDC issuer {issuer:?}: already used by {first} — every \
+                     enabled provider must have a distinct issuer"
                 ),
             });
         }
@@ -1005,7 +1019,7 @@ pub fn load_from_str(
     // credentials there would only leak (e.g. through a snapshot export).
     for (_, scope, provider) in &oidc_providers {
         for (field, url) in [
-            ("issuer", Some(&provider.issuer)),
+            ("issuer", provider.issuer.as_ref()),
             ("jwks_uri", provider.jwks_uri.as_ref()),
         ] {
             if let Some(url) = url {

@@ -1,5 +1,6 @@
 import { createServer, type Server } from "node:http";
 import {
+  createHmac,
   createPrivateKey,
   createPublicKey,
   createSign,
@@ -149,6 +150,38 @@ export async function startMockIdp(): Promise<MockIdp> {
       });
     },
   };
+}
+
+/** HMAC algorithms an `hmac_secret` provider accepts. */
+export type HsAlgorithm = "HS256" | "HS384" | "HS512";
+
+const HS_DIGEST: Record<HsAlgorithm, string> = {
+  HS256: "sha256",
+  HS384: "sha384",
+  HS512: "sha512",
+};
+
+/**
+ * Sign a JWT with an HMAC shared secret — the client half of a
+ * `hmac_secret` trust provider, where tokens are minted out of band
+ * rather than by an identity provider, so there is no server to stand up.
+ *
+ * `secret` is used as raw UTF-8 key material, exactly as the gateway
+ * reads the configured value; `header` overrides let a test present a
+ * mislabelled `alg` or an unexpected `kid`.
+ */
+export function signHs(
+  secret: string,
+  claims: Record<string, unknown>,
+  opts: { alg?: HsAlgorithm; header?: Record<string, unknown> } = {},
+): string {
+  const alg = opts.alg ?? "HS256";
+  const header = { alg, typ: "JWT", ...opts.header };
+  const signingInput = `${b64u(JSON.stringify(header))}.${b64u(
+    JSON.stringify(claims),
+  )}`;
+  const sig = createHmac(HS_DIGEST[alg], secret).update(signingInput).digest();
+  return `${signingInput}.${sig.toString("base64url")}`;
 }
 
 /** Standard claim set for a mock agent token, expiring in one hour. */

@@ -2,10 +2,8 @@
 //!
 //! When the environment has at least one enabled [`OidcProvider`], a bearer
 //! token that is a JWT is authenticated here instead of the API-key hash
-//! lookup: the token's unverified `iss` selects the trust provider, the
-//! signature is verified against the provider's JWKS (fetched and cached,
-//! with a rate-limited refresh when an unknown `kid` appears so key
-//! rotation needs no restart), the registered claims (`exp` required,
+//! lookup: a trust provider is selected, the signature is verified against
+//! that provider's key material, the registered claims (`exp` required,
 //! `aud` against the provider's accepted audiences, `nbf` when present)
 //! and the provider's `required_scopes` / `bound_claims` are enforced, and
 //! the value of the provider's `identity_claim` selects the API key whose
@@ -13,21 +11,50 @@
 //! `allowed_models`, rate limits, budget, and usage attribution all apply
 //! unchanged.
 //!
+//! A provider verifies in one of two modes, derived from the row rather
+//! than declared by it (`OidcProvider::hmac_secret`):
+//!
+//! - **JWKS mode** — asymmetric signatures verified against keys fetched
+//!   from `jwks_uri` or resolved through OIDC discovery, cached, with a
+//!   rate-limited refresh when an unknown `kid` appears so key rotation
+//!   needs no restart. `issuer` and `audiences` are mandatory.
+//! - **HMAC mode** — `HS256`/`HS384`/`HS512` verified against the
+//!   provider's shared secret. Nothing is fetched. `issuer` and
+//!   `audiences` are optional: set, each is enforced exactly as in JWKS
+//!   mode; unset, the corresponding claim is not consulted.
+//!
+//! Provider selection:
+//!
+//! 1. A token whose `iss` equals an enabled provider's `issuer` is
+//!    verified against **that provider and no other** — a mode or
+//!    algorithm mismatch there is a denial, never a fallback.
+//! 2. Otherwise (no `iss`, or one matching nothing) the candidates are
+//!    the enabled HMAC-mode providers that declare no `issuer`, tried in
+//!    a deterministic order under [`MAX_ISSUERLESS_PROVIDERS_TRIED`];
+//!    the first whose verification succeeds wins. JWKS-mode providers
+//!    are never trial candidates — every one of them pins an issuer.
+//!
 //! Design invariants:
 //!
 //! - **No fallback**: once a token is JWT-shaped and JWT auth is enabled,
 //!   a validation failure is final — it is never retried as an API key.
-//! - **Issuer allow-list**: a JWT whose `iss` matches no enabled provider
-//!   is rejected; there is no catch-all validation path.
-//! - **Default deny**: `exp`, `iss`, and `aud` must be present and valid
-//!   on every token; a missing identity claim or an unmapped identity is
-//!   a rejection, never an anonymous pass.
-//! - **Asymmetric algorithms only**: HMAC family excluded, so a JWKS can
-//!   never be confused into acting as a shared secret.
+//! - **Issuer allow-list**: a JWT whose `iss` names a trust provider is
+//!   bound to it; one that names none reaches only the issuer-less
+//!   shared-secret providers, and nothing else is a catch-all.
+//! - **Default deny**: `exp` is required on every token, as are `iss` and
+//!   `aud` wherever the selected provider pins them; a missing identity
+//!   claim or an unmapped identity is a rejection, never an anonymous
+//!   pass.
+//! - **The signature family is pinned per provider**: a JWKS-mode
+//!   provider accepts only [`ALLOWED_ALGS`] and an HMAC-mode one only
+//!   [`HMAC_ALGS`], checked against the JOSE header before any key
+//!   material is built. A public JWKS can therefore never be confused
+//!   into acting as a shared secret, and a shared secret can never be
+//!   presented as a public key.
 //! - Every decision (allow and deny, API-key and JWT path alike) is
 //!   recorded on the `aisix_auth_decisions_total` metric, and denials are
 //!   logged under `target: "aisix::auth"` with the detailed reason class —
-//!   the raw token is never logged.
+//!   neither the raw token nor a provider's shared secret is ever logged.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -81,6 +108,21 @@ const ALLOWED_ALGS: [Algorithm; 9] = [
 /// multi-key JWKS.
 const MAX_KEYS_TRIED: usize = 8;
 
+/// Verification algorithms accepted by an HMAC-mode provider: the
+/// shared-secret families only, mirroring [`ALLOWED_ALGS`]. The two
+/// lists are disjoint, and which one applies is decided by the selected
+/// provider before any key material exists — that is what makes
+/// algorithm confusion structurally impossible rather than merely
+/// checked.
+const HMAC_ALGS: [Algorithm; 3] = [Algorithm::HS256, Algorithm::HS384, Algorithm::HS512];
+
+/// Cap on providers tried for a token whose `iss` selects none — the
+/// issuer-less shared-secret providers, in name order. Separate from
+/// [`MAX_KEYS_TRIED`], which bounds keys within one provider's JWKS:
+/// this one bounds the HMAC verifications an unauthenticated token can
+/// drive across providers.
+const MAX_ISSUERLESS_PROVIDERS_TRIED: usize = 8;
+
 /// Upper bound on a bearer we will treat as a JWT. A real IdP token is a
 /// few KB; the cap stops a several-hundred-KB `Authorization` header from
 /// driving the base64/JSON work (done up to three times per request)
@@ -117,6 +159,20 @@ pub(crate) fn any_enabled_provider(snapshot: &AisixSnapshot) -> bool {
     !snapshot.oidc_providers.is_empty() && snapshot.oidc_providers.any(|e| e.value.enabled)
 }
 
+/// True when the snapshot has at least one enabled provider that
+/// verifies against a fetched key set — the gate for the OAuth
+/// protected-resource surface, which exists to name authorization
+/// servers a client can go and get a token from. A shared-secret
+/// provider has none to name: its callers are issued their tokens out
+/// of band, so it is not advertised and cannot on its own bring the
+/// discovery surface up.
+pub(crate) fn any_enabled_jwks_provider(snapshot: &AisixSnapshot) -> bool {
+    !snapshot.oidc_providers.is_empty()
+        && snapshot
+            .oidc_providers
+            .any(|e| e.value.enabled && e.value.is_jwks_mode())
+}
+
 fn b64url_json(segment: &str) -> Option<serde_json::Value> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(segment)
@@ -148,7 +204,7 @@ fn provider_for_issuer(
 ) -> Option<Arc<ResourceEntry<OidcProvider>>> {
     let (found, ambiguous) = snapshot
         .oidc_providers
-        .find_unique_by(|e| e.value.enabled && e.value.issuer == iss);
+        .find_unique_by(|e| e.value.enabled && e.value.issuer.as_deref() == Some(iss));
     if ambiguous {
         tracing::warn!(
             target: "aisix::auth",
@@ -158,6 +214,106 @@ fn provider_for_issuer(
         );
     }
     found
+}
+
+/// The enabled HMAC-mode providers that pin no `issuer`, in a total
+/// order (`name`, then id) so the same token resolves the same provider
+/// on every replica and across snapshot updates, bounded by
+/// [`MAX_ISSUERLESS_PROVIDERS_TRIED`].
+///
+/// These are the only providers a token whose `iss` names nothing can
+/// reach. A JWKS-mode provider is never here — `issuer` is mandatory in
+/// that mode, so one always selects by issuer — and neither is an HMAC
+/// provider that pinned an issuer: pinning one is a statement that only
+/// tokens carrying it belong to this provider.
+fn issuerless_hmac_providers(snapshot: &AisixSnapshot) -> Vec<Arc<ResourceEntry<OidcProvider>>> {
+    let mut candidates: Vec<_> = snapshot
+        .oidc_providers
+        .entries()
+        .into_iter()
+        .filter(|e| e.value.enabled && e.value.issuer.is_none() && e.value.hmac_secret().is_some())
+        .collect();
+    candidates.sort_by(|a, b| {
+        (a.value.name.as_str(), a.id.as_str()).cmp(&(b.value.name.as_str(), b.id.as_str()))
+    });
+    candidates.truncate(MAX_ISSUERLESS_PROVIDERS_TRIED);
+    candidates
+}
+
+/// Verify a token's signature and registered claims against one
+/// provider, in whichever mode that provider is configured for.
+///
+/// The algorithm check comes first and is per mode, so the key material
+/// built afterwards can only ever be of the family the header already
+/// named — a JWKS is never handed to an HMAC verifier, and a shared
+/// secret is never handed to an asymmetric one.
+async fn verify_against_provider(
+    prov: &OidcProvider,
+    token: &str,
+    header: &jsonwebtoken::Header,
+) -> Result<serde_json::Value, (&'static str, ProxyError)> {
+    let Some(secret) = prov.hmac_secret() else {
+        return verify_against_jwks(prov, token, header).await;
+    };
+    if !HMAC_ALGS.contains(&header.alg) {
+        return Err(("jwt_alg_not_allowed", ProxyError::JwtInvalid));
+    }
+    // One secret per provider, so no `kid` is consulted: a shared-secret
+    // provider has exactly one key and a token naming some other one is
+    // simply verified against the secret and fails on the signature.
+    let key = DecodingKey::from_secret(secret.as_bytes());
+    validate_with_keys(token, header.alg, prov, std::slice::from_ref(&key))
+}
+
+/// The JWKS-mode half of [`verify_against_provider`]: resolve the key
+/// endpoint, fetch the key set (cached, with one rate-limited refresh
+/// for an unknown `kid`), and verify against the candidate keys.
+async fn verify_against_jwks(
+    prov: &OidcProvider,
+    token: &str,
+    header: &jsonwebtoken::Header,
+) -> Result<serde_json::Value, (&'static str, ProxyError)> {
+    if !ALLOWED_ALGS.contains(&header.alg) {
+        return Err(("jwt_alg_not_allowed", ProxyError::JwtInvalid));
+    }
+    let kid = header.kid.as_deref();
+    let jwks_url = match resolve_jwks_url(prov).await {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(
+                target: "aisix::auth",
+                provider = %prov.name,
+                error = %e,
+                "cannot resolve the trust provider's JWKS endpoint",
+            );
+            return Err(("jwks_unavailable", ProxyError::JwksUnavailable));
+        }
+    };
+    let jwks = match get_jwks(&jwks_url).await {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!(
+                target: "aisix::auth",
+                provider = %prov.name,
+                error = %e,
+                "cannot fetch the trust provider's JWKS",
+            );
+            return Err(("jwks_unavailable", ProxyError::JwksUnavailable));
+        }
+    };
+
+    let mut candidates = candidate_keys(&jwks, kid, header.alg);
+    if candidates.is_empty() {
+        // Unknown (or absent-yet-unmatched) kid: the identity provider may
+        // have just rotated its keys — refetch once, rate-limited.
+        if let Some(fresh) = refresh_jwks_rate_limited(&jwks_url).await {
+            candidates = candidate_keys(&fresh, kid, header.alg);
+        }
+    }
+    if candidates.is_empty() {
+        return Err(("jwt_unknown_kid", ProxyError::JwtInvalid));
+    }
+    validate_with_keys(token, header.alg, prov, &candidates)
 }
 
 /// The API key bound to `subject` **as asserted by `provider_name`**,
@@ -258,113 +414,78 @@ pub(crate) async fn authenticate_jwt(
         }
     };
     let kid = header.kid.clone();
+    let iss = unverified_issuer(token);
+    let logged_iss = iss.clone().unwrap_or_default();
 
-    let Some(iss) = unverified_issuer(token) else {
-        return Err(deny(
-            d,
-            "jwt_missing_issuer",
-            "",
-            kid.as_deref(),
-            None,
-            None,
-            ProxyError::JwtInvalid,
-        ));
-    };
-
-    let Some(provider) = provider_for_issuer(snapshot, &iss) else {
-        return Err(deny(
-            d,
-            "jwt_untrusted_issuer",
-            &iss,
-            kid.as_deref(),
-            None,
-            None,
-            ProxyError::JwtInvalid,
-        ));
+    // ── Provider selection + signature + registered claims ───────────
+    // An `iss` that names a trust provider binds the token to it and to
+    // nothing else, whichever mode that provider is in: falling through
+    // to another provider after a mode or algorithm mismatch is exactly
+    // the confusion this path exists to prevent.
+    let (provider, claims) = match iss
+        .as_deref()
+        .and_then(|i| provider_for_issuer(snapshot, i))
+    {
+        Some(provider) => match verify_against_provider(&provider.value, token, &header).await {
+            Ok(claims) => (provider, claims),
+            Err((reason, err)) => {
+                return Err(deny(
+                    d,
+                    reason,
+                    &logged_iss,
+                    kid.as_deref(),
+                    None,
+                    None,
+                    err,
+                ))
+            }
+        },
+        None => {
+            // No issuer, or one no provider claims. The shared-secret
+            // providers that pin no issuer are the only candidates; each
+            // is tried in turn and the first that verifies wins. With
+            // none configured this is exactly the pre-HMAC behavior: the
+            // token is denied on its issuer.
+            let candidates = issuerless_hmac_providers(snapshot);
+            let mut first_failure: Option<(&'static str, ProxyError)> = None;
+            let mut verified = None;
+            for provider in candidates {
+                match verify_against_provider(&provider.value, token, &header).await {
+                    Ok(claims) => {
+                        verified = Some((provider, claims));
+                        break;
+                    }
+                    Err(failure) => first_failure.get_or_insert(failure),
+                };
+            }
+            match verified {
+                Some(pair) => pair,
+                None => {
+                    // The reason a single candidate rejected the token is
+                    // the useful one; with several, the first in the
+                    // deterministic order stands in. With no candidate at
+                    // all the token never reached a verifier, and the
+                    // denial names why it could not be routed to one.
+                    let (reason, err) = first_failure.unwrap_or(if iss.is_none() {
+                        ("jwt_missing_issuer", ProxyError::JwtInvalid)
+                    } else {
+                        ("jwt_untrusted_issuer", ProxyError::JwtInvalid)
+                    });
+                    return Err(deny(
+                        d,
+                        reason,
+                        &logged_iss,
+                        kid.as_deref(),
+                        None,
+                        None,
+                        err,
+                    ));
+                }
+            }
+        }
     };
     let prov = &provider.value;
-
-    if !ALLOWED_ALGS.contains(&header.alg) {
-        return Err(deny(
-            d,
-            "jwt_alg_not_allowed",
-            &iss,
-            kid.as_deref(),
-            None,
-            None,
-            ProxyError::JwtInvalid,
-        ));
-    }
-
-    // ── Signing keys ─────────────────────────────────────────────────
-    let jwks_url = match resolve_jwks_url(prov).await {
-        Ok(u) => u,
-        Err(e) => {
-            tracing::warn!(
-                target: "aisix::auth",
-                provider = %prov.name,
-                issuer = %prov.issuer,
-                error = %e,
-                "cannot resolve the trust provider's JWKS endpoint",
-            );
-            return Err(deny(
-                d,
-                "jwks_unavailable",
-                &iss,
-                kid.as_deref(),
-                None,
-                None,
-                ProxyError::JwksUnavailable,
-            ));
-        }
-    };
-    let jwks = match get_jwks(&jwks_url).await {
-        Ok(j) => j,
-        Err(e) => {
-            tracing::warn!(
-                target: "aisix::auth",
-                provider = %prov.name,
-                issuer = %prov.issuer,
-                error = %e,
-                "cannot fetch the trust provider's JWKS",
-            );
-            return Err(deny(
-                d,
-                "jwks_unavailable",
-                &iss,
-                kid.as_deref(),
-                None,
-                None,
-                ProxyError::JwksUnavailable,
-            ));
-        }
-    };
-
-    let mut candidates = candidate_keys(&jwks, kid.as_deref(), header.alg);
-    if candidates.is_empty() {
-        // Unknown (or absent-yet-unmatched) kid: the identity provider may
-        // have just rotated its keys — refetch once, rate-limited.
-        if let Some(fresh) = refresh_jwks_rate_limited(&jwks_url).await {
-            candidates = candidate_keys(&fresh, kid.as_deref(), header.alg);
-        }
-    }
-    if candidates.is_empty() {
-        return Err(deny(
-            d,
-            "jwt_unknown_kid",
-            &iss,
-            kid.as_deref(),
-            None,
-            None,
-            ProxyError::JwtInvalid,
-        ));
-    }
-
-    // ── Signature + registered claims ────────────────────────────────
-    let claims = match validate_with_keys(token, header.alg, prov, &candidates) {
-        Ok(c) => c,
-        Err((reason, err)) => return Err(deny(d, reason, &iss, kid.as_deref(), None, None, err)),
-    };
+    let iss = logged_iss;
 
     // ── Provider claim requirements ──────────────────────────────────
     // Scope and bound-claim failures map to distinct errors: a scope
@@ -579,12 +700,24 @@ fn validate_with_keys(
     keys: &[DecodingKey],
 ) -> Result<serde_json::Value, (&'static str, ProxyError)> {
     let mut validation = Validation::new(alg);
-    validation.set_issuer(&[&prov.issuer]);
-    validation.set_audience(&prov.audiences);
     // `aud`/`iss` are only checked when present — requiring them makes
     // absence a rejection (default deny), alongside the always-required
-    // `exp`.
-    validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+    // `exp`. A provider that pins neither (only possible in HMAC mode)
+    // must also stop `aud` being validated at all: left on with no
+    // accepted audiences, the library rejects every token that carries
+    // one, which is the opposite of ignoring the claim.
+    let mut required: Vec<&str> = vec!["exp"];
+    if let Some(issuer) = &prov.issuer {
+        validation.set_issuer(&[issuer]);
+        required.push("iss");
+    }
+    if prov.audiences.is_empty() {
+        validation.validate_aud = false;
+    } else {
+        validation.set_audience(&prov.audiences);
+        required.push("aud");
+    }
+    validation.set_required_spec_claims(&required);
     validation.leeway = prov.leeway_secs;
     validation.validate_nbf = true;
 
@@ -835,16 +968,24 @@ async fn resolve_jwks_url(prov: &OidcProvider) -> Result<String, String> {
         }
         return Ok(u.clone());
     }
+    // A JWKS-mode provider always carries an issuer — the row validator
+    // rejects one that does not — and discovery is derived entirely from
+    // it, so there is nothing to resolve without one.
+    let Some(issuer) = prov.issuer.as_deref() else {
+        return Err(
+            "a provider with no jwks_uri must declare an issuer to discover from".to_string(),
+        );
+    };
     {
         let map = read_recover(discovery_cache());
-        if let Some((url, at)) = map.get(&prov.issuer).and_then(|e| e.resolved.as_ref()) {
+        if let Some((url, at)) = map.get(issuer).and_then(|e| e.resolved.as_ref()) {
             if at.elapsed() < JWKS_TTL {
                 return Ok(url.clone());
             }
         }
     }
     let fetch_lock = write_recover(discovery_cache())
-        .entry(prov.issuer.clone())
+        .entry(issuer.to_string())
         .or_default()
         .fetch_lock
         .clone();
@@ -852,7 +993,7 @@ async fn resolve_jwks_url(prov: &OidcProvider) -> Result<String, String> {
         Ok(guard) => guard,
         Err(_) => {
             if let Some((url, _)) = read_recover(discovery_cache())
-                .get(&prov.issuer)
+                .get(issuer)
                 .and_then(|e| e.resolved.as_ref())
             {
                 return Ok(url.clone());
@@ -863,7 +1004,7 @@ async fn resolve_jwks_url(prov: &OidcProvider) -> Result<String, String> {
     let now = Instant::now();
     let (stale, attempted_recently) = {
         let map = read_recover(discovery_cache());
-        match map.get(&prov.issuer) {
+        match map.get(issuer) {
             Some(entry) => {
                 if let Some((url, at)) = &entry.resolved {
                     if now.duration_since(*at) < JWKS_TTL {
@@ -889,19 +1030,19 @@ async fn resolve_jwks_url(prov: &OidcProvider) -> Result<String, String> {
 
     let discovery_url = format!(
         "{}/.well-known/openid-configuration",
-        prov.issuer.trim_end_matches('/')
+        issuer.trim_end_matches('/')
     );
     let result = fetch_json(&discovery_url).await;
     // Only completed attempts consume the interval. Cancellation drops the
     // fetch lock so a waiting request can take over instead of failing cold.
     write_recover(discovery_cache())
-        .entry(prov.issuer.clone())
+        .entry(issuer.to_string())
         .or_default()
         .last_attempt = Some(Instant::now());
     match result {
         Ok(doc) => {
             // §4.3: the document must claim the issuer we asked about.
-            if doc.get("issuer").and_then(|v| v.as_str()) != Some(prov.issuer.as_str()) {
+            if doc.get("issuer").and_then(|v| v.as_str()) != Some(issuer) {
                 return Err(
                     "discovery document issuer does not match the configured issuer".to_string(),
                 );
@@ -914,14 +1055,14 @@ async fn resolve_jwks_url(prov: &OidcProvider) -> Result<String, String> {
             // The advertised endpoint decides where trust material comes
             // from, so it must stay on the issuer's own origin — otherwise
             // the discovery document is an open redirect into our network.
-            if !same_origin(&prov.issuer, &jwks_uri) {
+            if !same_origin(issuer, &jwks_uri) {
                 return Err("discovery jwks_uri is not on the issuer's origin".to_string());
             }
             if url_has_credentials(&jwks_uri) {
                 return Err("discovery jwks_uri must not embed credentials".to_string());
             }
             write_recover(discovery_cache())
-                .entry(prov.issuer.clone())
+                .entry(issuer.to_string())
                 .or_default()
                 .resolved = Some((jwks_uri.clone(), Instant::now()));
             Ok(jwks_uri)
@@ -931,7 +1072,7 @@ async fn resolve_jwks_url(prov: &OidcProvider) -> Result<String, String> {
             if let Some(url) = stale {
                 tracing::warn!(
                     target: "aisix::auth",
-                    issuer = %clip(&prov.issuer),
+                    issuer = %clip(issuer),
                     error = %e,
                     "OIDC discovery re-fetch failed; keeping the previously resolved JWKS URL",
                 );
@@ -1198,7 +1339,7 @@ mod tests {
     async fn cached_fetch(url: &str, discovery: bool) -> Result<(), String> {
         if discovery {
             let mut provider = base_provider();
-            provider.issuer = url.to_string();
+            provider.issuer = Some(url.to_string());
             resolve_jwks_url(&provider).await.map(|_| ())
         } else {
             get_jwks(url).await.map(|_| ())
@@ -1616,7 +1757,7 @@ jyxumGxNpoIV8LlzsMsaWQ==
         let snapshot = AisixSnapshot::new();
         let mk = |id: &str, issuer: &str, enabled: bool| {
             let mut p = base_provider();
-            p.issuer = issuer.to_string();
+            p.issuer = Some(issuer.to_string());
             p.enabled = enabled;
             snapshot.oidc_providers.insert(ResourceEntry::new(id, p, 1));
         };
@@ -1912,5 +2053,233 @@ jyxumGxNpoIV8LlzsMsaWQ==
         let one = serde_json::json!({"department": "finance", "groups": ["dev"]});
         assert!(matching_claim_mapping(&snapshot, "corp", &both).is_some());
         assert!(matching_claim_mapping(&snapshot, "corp", &one).is_none());
+    }
+
+    // ── HMAC (shared-secret) providers ───────────────────────────────
+
+    const TEST_HMAC_SECRET: &str = "shared-secret-that-is-long-enough-32";
+
+    fn hmac_provider(extra: serde_json::Value) -> OidcProvider {
+        let mut doc = serde_json::json!({
+            "name": "hmac-idp",
+            "hmac_secret": TEST_HMAC_SECRET,
+        });
+        let (serde_json::Value::Object(base), serde_json::Value::Object(more)) = (&mut doc, extra)
+        else {
+            unreachable!("both fixtures are objects")
+        };
+        base.extend(more);
+        serde_json::from_value(doc).unwrap()
+    }
+
+    fn hs_sign(alg: Algorithm, secret: &str, claims: &serde_json::Value) -> String {
+        encode(
+            &Header::new(alg),
+            claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    fn hmac_claims(extra: serde_json::Value) -> serde_json::Value {
+        let mut claims = serde_json::json!({"sub": "agent-1", "exp": future()});
+        let (serde_json::Value::Object(base), serde_json::Value::Object(more)) =
+            (&mut claims, extra)
+        else {
+            unreachable!("both fixtures are objects")
+        };
+        base.extend(more);
+        claims
+    }
+
+    async fn verify(prov: &OidcProvider, token: &str) -> Result<serde_json::Value, &'static str> {
+        let header = jsonwebtoken::decode_header(token).unwrap();
+        verify_against_provider(prov, token, &header)
+            .await
+            .map_err(|(reason, _)| reason)
+    }
+
+    #[tokio::test]
+    async fn hmac_provider_without_issuer_or_audiences_ignores_both_claims() {
+        let prov = hmac_provider(serde_json::json!({}));
+        for alg in HMAC_ALGS {
+            // Neither claim present …
+            let bare = hs_sign(alg, TEST_HMAC_SECRET, &hmac_claims(serde_json::json!({})));
+            assert_eq!(verify(&prov, &bare).await.unwrap()["sub"], "agent-1");
+            // … and both present but matching nothing the provider
+            // configured, which is what `validate_aud = false` buys: left
+            // on, the library rejects any token that carries an `aud`.
+            let noisy = hs_sign(
+                alg,
+                TEST_HMAC_SECRET,
+                &hmac_claims(serde_json::json!({"iss": "https://whoever", "aud": "whatever"})),
+            );
+            assert_eq!(verify(&prov, &noisy).await.unwrap()["sub"], "agent-1");
+        }
+    }
+
+    #[tokio::test]
+    async fn hmac_provider_enforces_the_issuer_and_audience_it_does_pin() {
+        let prov = hmac_provider(serde_json::json!({
+            "issuer": "https://hmac.test",
+            "audiences": ["aisix"],
+        }));
+        let good = hs_sign(
+            Algorithm::HS256,
+            TEST_HMAC_SECRET,
+            &hmac_claims(serde_json::json!({"iss": "https://hmac.test", "aud": "aisix"})),
+        );
+        assert!(verify(&prov, &good).await.is_ok());
+
+        let wrong_iss = hs_sign(
+            Algorithm::HS256,
+            TEST_HMAC_SECRET,
+            &hmac_claims(serde_json::json!({"iss": "https://elsewhere", "aud": "aisix"})),
+        );
+        assert_eq!(verify(&prov, &wrong_iss).await, Err("jwt_issuer_mismatch"));
+
+        let wrong_aud = hs_sign(
+            Algorithm::HS256,
+            TEST_HMAC_SECRET,
+            &hmac_claims(serde_json::json!({"iss": "https://hmac.test", "aud": "other"})),
+        );
+        assert_eq!(
+            verify(&prov, &wrong_aud).await,
+            Err("jwt_audience_mismatch")
+        );
+
+        // A pinned claim is required, not merely checked when present.
+        let no_iss = hs_sign(
+            Algorithm::HS256,
+            TEST_HMAC_SECRET,
+            &hmac_claims(serde_json::json!({"aud": "aisix"})),
+        );
+        assert_eq!(verify(&prov, &no_iss).await, Err("jwt_missing_claim"));
+    }
+
+    #[tokio::test]
+    async fn hmac_provider_rejects_the_wrong_secret_and_an_expired_token() {
+        let prov = hmac_provider(serde_json::json!({}));
+        let wrong_secret = hs_sign(
+            Algorithm::HS256,
+            "another-secret-that-is-long-enough!!",
+            &hmac_claims(serde_json::json!({})),
+        );
+        assert_eq!(verify(&prov, &wrong_secret).await, Err("jwt_bad_signature"));
+
+        let expired = hs_sign(
+            Algorithm::HS256,
+            TEST_HMAC_SECRET,
+            &serde_json::json!({"sub": "agent-1", "exp": chrono::Utc::now().timestamp() - 3600}),
+        );
+        assert_eq!(verify(&prov, &expired).await, Err("jwt_expired"));
+    }
+
+    /// Algorithm confusion, both directions. Each provider's family is
+    /// decided by the row, before any key material exists, so neither
+    /// token can reach the other mode's verifier.
+    #[tokio::test]
+    async fn the_signature_family_is_pinned_per_provider() {
+        // An asymmetric token presented to a shared-secret provider.
+        let hmac = hmac_provider(serde_json::json!({}));
+        let rs = sign(&valid_claims());
+        assert_eq!(verify(&hmac, &rs).await, Err("jwt_alg_not_allowed"));
+
+        // An HS token presented to a JWKS provider — refused on the
+        // algorithm before the key endpoint is even consulted, which is
+        // what stops the published public key being used as a secret.
+        // The endpoint is deliberately unroutable: reaching it would
+        // surface as `jwks_unavailable` instead.
+        let mut jwks = base_provider();
+        jwks.jwks_uri = Some("http://127.0.0.1:1/jwks".to_string());
+        for alg in HMAC_ALGS {
+            let hs = hs_sign(alg, TEST_HMAC_SECRET, &valid_claims());
+            assert_eq!(verify(&jwks, &hs).await, Err("jwt_alg_not_allowed"));
+        }
+    }
+
+    #[test]
+    fn only_enabled_issuerless_hmac_providers_are_trial_candidates() {
+        let snapshot = AisixSnapshot::new();
+        let add = |id: &str, doc: serde_json::Value| {
+            snapshot.oidc_providers.insert(ResourceEntry::new(
+                id,
+                serde_json::from_value::<OidcProvider>(doc).unwrap(),
+                1,
+            ));
+        };
+        add(
+            "p-b",
+            serde_json::json!({"name": "b-hmac", "hmac_secret": TEST_HMAC_SECRET}),
+        );
+        add(
+            "p-a",
+            serde_json::json!({"name": "a-hmac", "hmac_secret": TEST_HMAC_SECRET}),
+        );
+        // Pins an issuer: reachable only by `iss`, never by trial.
+        add(
+            "p-pinned",
+            serde_json::json!({
+                "name": "pinned-hmac", "issuer": "https://hmac.test",
+                "hmac_secret": TEST_HMAC_SECRET,
+            }),
+        );
+        // Disabled.
+        add(
+            "p-off",
+            serde_json::json!({
+                "name": "off-hmac", "hmac_secret": TEST_HMAC_SECRET, "enabled": false,
+            }),
+        );
+        // JWKS mode.
+        add(
+            "p-jwks",
+            serde_json::json!({
+                "name": "jwks", "issuer": "https://idp.test", "audiences": ["aisix"],
+            }),
+        );
+
+        let candidates = issuerless_hmac_providers(&snapshot);
+        let names: Vec<&str> = candidates.iter().map(|e| e.value.name.as_str()).collect();
+        assert_eq!(names, vec!["a-hmac", "b-hmac"]);
+    }
+
+    #[test]
+    fn the_trial_candidate_set_is_capped() {
+        let snapshot = AisixSnapshot::new();
+        for i in 0..MAX_ISSUERLESS_PROVIDERS_TRIED + 5 {
+            snapshot.oidc_providers.insert(ResourceEntry::new(
+                format!("p-{i:02}"),
+                serde_json::from_value::<OidcProvider>(serde_json::json!({
+                    "name": format!("hmac-{i:02}"),
+                    "hmac_secret": TEST_HMAC_SECRET,
+                }))
+                .unwrap(),
+                1,
+            ));
+        }
+        assert_eq!(
+            issuerless_hmac_providers(&snapshot).len(),
+            MAX_ISSUERLESS_PROVIDERS_TRIED
+        );
+    }
+
+    #[test]
+    fn an_enabled_hmac_provider_alone_does_not_advertise_an_authorization_server() {
+        let snapshot = AisixSnapshot::new();
+        snapshot.oidc_providers.insert(ResourceEntry::new(
+            "p-hmac",
+            hmac_provider(serde_json::json!({})),
+            1,
+        ));
+        // It still activates JWT authentication …
+        assert!(any_enabled_provider(&snapshot));
+        // … but has no authorization server to publish.
+        assert!(!any_enabled_jwks_provider(&snapshot));
+
+        snapshot
+            .oidc_providers
+            .insert(ResourceEntry::new("p-jwks", base_provider(), 1));
+        assert!(any_enabled_jwks_provider(&snapshot));
     }
 }
