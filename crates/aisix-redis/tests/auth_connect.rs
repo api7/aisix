@@ -251,3 +251,121 @@ mod data_node_credentials {
         );
     }
 }
+
+/// The boot check must not be stricter than what the gateway actually
+/// needs, and it must still catch a setting the server rejects outright.
+mod what_the_server_rejects {
+    use super::*;
+
+    /// An ACL user scoped to the commands a subsystem really runs has no
+    /// `+ping` — and it works, so it must start.
+    ///
+    /// `NOPERM` is an answer from a connection the server has already
+    /// authenticated: it knows who we are and is declining one command.
+    /// Reading it as a bad credential would refuse to start a deployment
+    /// that serves correctly.
+    #[tokio::test]
+    async fn an_acl_user_without_ping_still_boots() {
+        let (Some(url), Some(pw)) = (plain_url(), password()) else {
+            return;
+        };
+        let admin = RedisConnConfig {
+            password: Some(pw),
+            ..single(&url)
+        };
+        let policy = FailurePolicy::new(&admin);
+        let conn = connect_bounded(&admin, &policy)
+            .await
+            .expect("the admin connection must come up");
+        let mut handle = conn.acquire().await.expect("a handle");
+        redis::cmd("ACL")
+            .arg("SETUSER")
+            .arg("aisix-scoped")
+            .arg("on")
+            .arg(">scoped-pw")
+            .arg("~*")
+            .arg("+get")
+            .arg("+set")
+            .query_async::<()>(&mut handle)
+            .await
+            .expect("the scoped ACL user must be creatable");
+
+        let scoped = RedisConnConfig {
+            username: Some("aisix-scoped".into()),
+            password: Some("scoped-pw".into()),
+            ..single(&url)
+        };
+        let policy = FailurePolicy::new(&scoped);
+        connect_bounded(&scoped, &policy)
+            .await
+            .expect("a user that cannot PING but can serve must still boot");
+    }
+
+    /// A `database` the server does not have is the same class as a
+    /// refused password and was hidden the same way — the connection
+    /// manager's retry ladder turned the server's `SELECT` refusal into
+    /// a timeout, so the gateway degraded forever over a typo.
+    ///
+    /// `single` mode is where this became reachable: `database` was
+    /// ignored there until the field started being applied.
+    #[tokio::test]
+    async fn a_database_the_server_does_not_have_is_permanent() {
+        let (Some(url), Some(pw)) = (plain_url(), password()) else {
+            return;
+        };
+        let cfg = RedisConnConfig {
+            password: Some(pw.clone()),
+            // Far past the 16 a default Redis provides.
+            database: Some(9_999),
+            ..single(&url)
+        };
+        let err = connect_and_use(&cfg)
+            .await
+            .expect_err("an out-of-range database must fail the connect");
+        assert!(is_permanent_config_error(&err), "{err}");
+        assert!(
+            !err.to_string().to_lowercase().contains("timed out"),
+            "the server answered; calling it a timeout is what hid this: {err}"
+        );
+
+        // …and one the server does have still connects, so the check
+        // above is about the value rather than about the field existing.
+        let ok = RedisConnConfig {
+            password: Some(pw),
+            database: Some(3),
+            ..single(&url)
+        };
+        connect_and_use(&ok)
+            .await
+            .expect("a database the server has must connect");
+    }
+
+    /// The credential is one value, not two independent ones. Overriding
+    /// only the username used to compose a login from both sources —
+    /// the URL's password under the field's user — which is a credential
+    /// nobody configured, and whose refusal points at config that looks
+    /// right in both places.
+    #[tokio::test]
+    async fn a_half_specified_override_does_not_borrow_the_other_half() {
+        let (Some(url), Some(pw)) = (plain_url(), password()) else {
+            return;
+        };
+        let cfg = RedisConnConfig {
+            username: Some("aisix-no-such-user".into()),
+            ..single(&with_url_credential(&url, &pw))
+        };
+        let err = connect_and_use(&cfg)
+            .await
+            .expect_err("the URL's password must not be lent to another user");
+        assert!(is_permanent_config_error(&err), "{err}");
+        // NOAUTH is the discriminator, and it is the whole point: the
+        // connection authenticated as NOTHING, because a username with
+        // no password is not a credential. Borrowing the URL's password
+        // would have sent one — and been refused as a user/password pair
+        // that appears nowhere in the configuration.
+        assert!(
+            err.to_string().contains("NOAUTH"),
+            "a username with no password must send no credential at all: {err}"
+        );
+    }
+}
