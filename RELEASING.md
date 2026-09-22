@@ -1,9 +1,8 @@
 # Releasing
 
-How an AISIX AI Gateway release is cut. Order matters: downstream packaging
-(AISIX Cloud and the On-Premises package, whose artifact name is
-`aisix-self-hosted`) pins the exact gateway image version, so the gateway is
-always tagged and published **first**.
+How an AISIX AI Gateway release is cut. Order matters: the On-Premises package
+(artifact name `aisix-self-hosted`) bundles the exact gateway image version, so
+the gateway is always tagged and published **first**.
 
 ## 1. Tag
 
@@ -133,7 +132,26 @@ version for patch releases.
 
 ## 4. Downstream
 
-Only after the images are published, downstream release flows (AISIX Cloud /
-the On-Premises package named `aisix-self-hosted`) may tag the same `vX.Y.Z` —
-their packaging pulls
-`docker.io/api7/aisix:X.Y.Z` and fails if it does not exist yet.
+The On-Premises package (artifact name `aisix-self-hosted`) bundles
+`docker.io/api7/aisix:X.Y.Z` together with the AISIX Cloud images. It used to be
+triggered by the AISIX Cloud tag push and then poll Docker Hub for up to an hour
+waiting for this repository's image, which is why the same `vX.Y.Z` tag on AISIX
+Cloud had to come after ours. That wait is gone: packaging is
+`workflow_dispatch`-only and never waits, so the AISIX Cloud tag's timing no
+longer matters at all.
+
+What the gateway image gates now is the package **dispatch**. The release
+runbook runs it on the release tag, only once both repositories' `docker-image`
+runs for that tag have succeeded:
+
+```bash
+gh workflow run release-offline-package.yml --repo api7/AISIX-Cloud --ref vX.Y.Z
+```
+
+The job then fail-fast checks, in one pass, that `docker.io/api7/aisix:X.Y.Z`
+and the three `aisix-cp-*:X.Y.Z` images all exist as `linux/amd64` +
+`linux/arm64` manifest lists, and moves the `latest` / `version` / `quickstart`
+pointers only for stable tags.
+
+Nothing in this repository's tag build changes: both native legs plus the
+manifest merge, with PGO on stable tags.
