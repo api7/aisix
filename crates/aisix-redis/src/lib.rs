@@ -98,7 +98,7 @@ use redis::aio::{
 use redis::cluster::ClusterClient;
 use redis::cluster_async::ClusterConnection;
 use redis::sentinel::{SentinelClient, SentinelNodeConnectionInfo, SentinelServerType};
-use redis::{AsyncConnectionConfig, RedisResult};
+use redis::{AsyncConnectionConfig, IntoConnectionInfo, RedisResult};
 use tokio::sync::Mutex;
 
 /// How long commands short-circuit after a connectivity failure. Fixed,
@@ -643,29 +643,87 @@ pub fn not_connected_error() -> redis::RedisError {
     ))
 }
 
-/// True when a connect error can never come good on a retry: the
-/// operator wrote something the driver cannot use at all — a malformed
-/// `url`, TLS material that will not read or parse — or a credential the
-/// server answered and refused.
+/// Why a connect failed, as far as it changes what an operator should
+/// do about it.
 ///
-/// It matters because everything else here is now retried forever in the
-/// background. Retrying a typo turns a boot that said exactly what was
-/// wrong into a gateway that comes up healthy and is quietly never going
-/// to enforce a shared limit or cache anything, which is strictly worse
-/// than the failure it replaced. A refused credential is the same
-/// judgement the etcd side already makes: no amount of waiting turns a
-/// wrong password into a right one, and a server that ANSWERED is not
-/// the unreachable case the retry exists for.
-///
-/// It only classifies what the driver reports as such. A refusal the
-/// budget cut short arrives as a timeout instead, and is retried — which
-/// is the safe direction for a misclassification, since the alternative
-/// is refusing to start over a slow handshake.
-pub fn is_permanent_config_error(e: &redis::RedisError) -> bool {
-    matches!(
+/// Only [`ConnectFailure::Local`] ends a boot. The other two are served
+/// degraded — per-replica counting, cache misses — with the background
+/// re-attach still running, because both can come good without the
+/// gateway being restarted: a server comes back, or an operator fixes
+/// the credential on the server side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectFailure {
+    /// Rejected before a packet was sent: a `url` the driver cannot
+    /// parse, TLS material that will not read. Nothing about the network
+    /// or the server can change it, and there is no degraded state worth
+    /// entering — the operator has to edit the configuration and start
+    /// again.
+    Local,
+    /// The server answered, and refused what we connected with: the
+    /// credential, or a `database` it does not have. It is NOT an
+    /// outage, and saying so sends an operator to the network for a
+    /// server that replied in milliseconds — which is the whole reason
+    /// this variant exists separately from the one below.
+    Refused,
+    /// Nothing usable answered inside the budget.
+    Unreachable,
+}
+
+/// Classify a connect error.
+pub fn classify_connect_failure(e: &redis::RedisError) -> ConnectFailure {
+    // `InvalidClientConfig` is raised only by the URL parse and by
+    // reading the TLS material — both of which happen before any socket.
+    if e.kind() == redis::ErrorKind::InvalidClientConfig {
+        return ConnectFailure::Local;
+    }
+    // Everything the server can say about what we connected with. The
+    // handshake runs `AUTH` and `SELECT` and nothing else, so a
+    // `ResponseError` from it is a refused `database`; a refused
+    // credential arrives as `AuthenticationFailed` from the handshake,
+    // or as the server's own `NOAUTH`/`WRONGPASS` against the proof
+    // command when no credential was sent at all.
+    //
+    // `DENIED` is protected mode, which is a refusal the server spells
+    // out in a sentence telling the operator exactly what to change —
+    // and it arrives with no credential configured at all, so reporting
+    // it as an outage sends them to the network instead of reading it.
+    //
+    // Deliberately NOT `NOPERM`: that answer comes from a connection the
+    // server has already authenticated and only says this user may not
+    // run this command — see [`prove_with`].
+    //
+    // One conflation stays, because the driver creates it: redis-rs
+    // reports EVERY server error raised during `AUTH` as
+    // `AuthenticationFailed` with a fixed message, discarding what the
+    // server said. So a server refusing the handshake for a reason of
+    // its own — `ERR max number of clients reached` — is reported here
+    // as a refusal too. It is still not an outage, and the alternative
+    // reading (call every refused credential an outage) is the failure
+    // this whole classification exists to remove.
+    if matches!(
         e.kind(),
-        redis::ErrorKind::InvalidClientConfig | redis::ErrorKind::AuthenticationFailed
-    )
+        redis::ErrorKind::AuthenticationFailed | redis::ErrorKind::ResponseError
+    ) || matches!(e.code(), Some("NOAUTH" | "WRONGPASS" | "DENIED"))
+    {
+        return ConnectFailure::Refused;
+    }
+    ConnectFailure::Unreachable
+}
+
+/// Whether a connect failure has to end the boot.
+pub fn is_boot_fatal(e: &redis::RedisError) -> bool {
+    classify_connect_failure(e) == ConnectFailure::Local
+}
+
+/// The word every line about a degraded backend carries, so the boot's
+/// line and the periodic restatement cannot drift apart and so a
+/// `reason=` filter finds both.
+pub fn failure_reason(e: &redis::RedisError) -> &'static str {
+    match classify_connect_failure(e) {
+        ConnectFailure::Refused => "refused",
+        // A `Local` failure never reaches a degraded-state line.
+        ConnectFailure::Local | ConnectFailure::Unreachable => "unreachable",
+    }
 }
 
 /// The error a connect that outran its whole budget returns.
@@ -764,6 +822,437 @@ fn conn_config(timeout: Duration) -> AsyncConnectionConfig {
         .set_response_timeout(timeout)
 }
 
+/// Apply the explicitly configured connection settings on top of what
+/// the URL carried.
+///
+/// The explicit fields WIN. That is what they exist for: `password` is
+/// documented as the way to keep the secret out of the config file
+/// (`AISIX_CACHE__REDIS__PASSWORD`), and a value supplied that way is
+/// useless if a stale credential left in the URL quietly outranks it.
+///
+/// The credential is taken as a PAIR. Overriding the two halves
+/// independently can compose a login that exists in neither source — a
+/// URL's `alice:s3cret` plus a leftover `username: bob` would send
+/// `AUTH bob s3cret`, a credential nobody configured, and its refusal
+/// would be reported against config that looks correct in both places.
+/// So setting either half replaces both, and a half-specified override
+/// fails as itself.
+///
+/// `database` is left alone in `cluster` mode, where Redis has only DB 0
+/// and `SELECT` is rejected outright.
+fn apply_explicit_settings(info: &mut redis::RedisConnectionInfo, cfg: &RedisConnConfig) {
+    if cfg.username.is_some() || cfg.password.is_some() {
+        info.username = cfg.username.clone();
+        info.password = cfg.password.clone();
+    }
+    match cfg.mode {
+        // Redis Cluster has only DB 0 and rejects `SELECT` outright, so
+        // the index is forced to 0 rather than merely left unset: a node
+        // URL with a `/1` path is harmless to the real cluster connect
+        // (the driver overwrites it) but would make every probe fail
+        // with a server error, which now reads as a refusal — telling
+        // the operator their credential was rejected by a cluster that
+        // is simply unreachable.
+        RedisMode::Cluster => info.db = 0,
+        _ => {
+            if let Some(db) = cfg.database {
+                info.db = db;
+            }
+        }
+    }
+}
+
+/// Say so when a credential is configured in both places, since only one
+/// of them is in force.
+///
+/// Called once per `redis:` block at boot, NOT from the connect path:
+/// the background re-attach dials every `timeout_secs` for as long as an
+/// outage lasts, and the cache dials twice per round, so a connect-path
+/// warning would repeat this for hours over configuration that has not
+/// changed since the process started.
+///
+/// `password` had no effect at all in `single` mode until this release,
+/// so a stale one could sit in the config for a long time without ever
+/// being noticed — and it now outranks the URL's. Never the values, and
+/// never the URL: both carry the secret.
+pub fn warn_on_credential_shadowing(cfg: &RedisConnConfig) {
+    if cfg.username.is_none() && cfg.password.is_none() {
+        return;
+    }
+    let in_url = |url: &String| {
+        url.trim()
+            .into_connection_info()
+            .is_ok_and(|i| i.redis.username.is_some() || i.redis.password.is_some())
+    };
+    let shadowed = match cfg.mode {
+        RedisMode::Single => cfg.url.as_ref().is_some_and(in_url),
+        RedisMode::Cluster => cfg.nodes.iter().any(in_url),
+        // The sentinels' own credentials are a different credential, not
+        // a second copy of the master's, so they shadow nothing.
+        RedisMode::Sentinel => false,
+    };
+    if !shadowed {
+        return;
+    }
+    tracing::warn!(
+        target: "aisix::redis",
+        endpoint = %endpoint_label(cfg),
+        "redis credentials are configured in two places: the URL carries one and \
+         redis.username/redis.password carry another. The explicit fields are what is \
+         sent; remove the credential from the URL, or clear the fields, so the \
+         configuration says which one is in force."
+    );
+}
+
+/// One real command on the connection the subsystem will actually use,
+/// so "connected" can never be logged for a connection the server has
+/// not authenticated.
+///
+/// Opening the connection is not proof of that. A `requirepass` server
+/// accepts the socket and refuses the *commands*, so a credential that
+/// never reached the handshake looks exactly like a healthy boot — the
+/// shape this gateway shipped in when `password` was parsed and then
+/// dropped on the floor in `single` mode: `connected`, no warning, and
+/// every counter and cache operation failing per request from then on.
+///
+/// It is a diagnosis rather than a gate: it fails the connect only when
+/// the server REFUSED, because that is the one answer a working
+/// connection cannot give.
+///
+/// Anything else is let through. The connection is established at this
+/// point, every operation on it already fails open behind the breaker,
+/// and the proof is one command among the many that can fail for
+/// reasons of their own — a cluster slot mid-failover answering
+/// `CLUSTERDOWN`, a replica still `LOADING`. Failing the connect on
+/// those would start the subsystem degraded over a condition that has
+/// already passed by the time anyone reads the log.
+async fn prove(
+    conn: &mut impl ConnectionLike,
+    mode: RedisMode,
+    timeout: Duration,
+) -> RedisResult<()> {
+    match prove_with(conn, proof_command(mode), timeout).await {
+        Err(e) if classify_connect_failure(&e) == ConnectFailure::Refused => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// The command a mode's boot proof runs.
+///
+/// `PING` everywhere except `cluster`, where redis-rs routes it to ALL
+/// masters and fails it unless every one of them answers — so a cluster
+/// running with a master down, the failure that topology exists to
+/// survive, would stop connecting. A read of one key routes to that
+/// key's slot owner and nowhere else, which proves the same thing
+/// against one node. The key is never written and need not exist.
+fn proof_command(mode: RedisMode) -> redis::Cmd {
+    match mode {
+        RedisMode::Cluster => {
+            let mut cmd = redis::cmd("GET");
+            cmd.arg("aisix:{boot}:connection-proof");
+            cmd
+        }
+        _ => redis::cmd("PING"),
+    }
+}
+
+async fn prove_with(
+    conn: &mut impl ConnectionLike,
+    cmd: redis::Cmd,
+    timeout: Duration,
+) -> RedisResult<()> {
+    let answer = tokio::time::timeout(timeout, cmd.query_async::<()>(conn))
+        .await
+        .map_err(|_| timed_out_error(timeout))?;
+    match answer {
+        Err(e) if e.code() == Some("NOPERM") => {
+            tracing::debug!(
+                target: "aisix::redis",
+                "the configured Redis user is authenticated but not permitted to PING; \
+                 taking the refusal itself as proof the credential was accepted"
+            );
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+/// What one direct connection to a data node established.
+enum Probe {
+    /// It answered, on an authenticated connection.
+    Answered,
+    /// It answered, and it refused the settings we connected with.
+    Refused(redis::RedisError),
+    /// Nothing usable came back. Not evidence of anything.
+    Silent,
+}
+
+/// Ask the data node directly whether it refuses the settings we would
+/// connect with, and return the refusal if it does.
+///
+/// This exists because none of the three drivers will say so. Each hides
+/// it differently and all three land in the same place — the gateway
+/// concludes the backend is merely unreachable, binds its listeners and
+/// serves fail-open for the life of the process against configuration
+/// that is never going to start working, while the log blames the
+/// network:
+///
+/// - `single` — the connection manager's retry ladder swallows every
+///   attempt's error but the last, and runs past the boot budget, so the
+///   caller only ever sees the budget expire. This catches a refused
+///   password and equally a `database` the server does not have, which
+///   the same ladder hides the same way.
+/// - `cluster` — a seed that refuses is dropped from the initial
+///   connection map; an empty map is an `IoError`.
+/// - `sentinel` — a master that refuses fails discovery's `ROLE` check
+///   and is skipped, so the group reads as not found.
+///
+/// A plain connection has none of that machinery, so the server's own
+/// answer is what returns. It runs a command rather than only
+/// connecting, because connecting proves nothing: a `requirepass` server
+/// accepts the socket and refuses the *commands*, which is how a
+/// `password` that never reached the handshake could look like a healthy
+/// boot and then fail every operation.
+///
+/// It reports ONLY a refusal. Every other outcome is discarded and the
+/// mode's own error stands, so this can never turn a slow or unreachable
+/// backend into a boot failure. `Ok(true)` means the data node answered
+/// us, which is what lets the caller skip proving the same thing a
+/// second time.
+///
+/// What it costs a boot differs by mode, and neither case lengthens one.
+/// `cluster` and `sentinel` call it only after their own connect has
+/// already failed, so it spends what is left of a budget that is already
+/// forfeit. `single` calls it BEFORE the connection manager, so against
+/// an unreachable endpoint the probe is what spends that mode's single
+/// budget and the manager never gets to attempt inside it — the boot
+/// then reports the same non-permanent connect timeout, on the same
+/// deadline, that it reported when the manager spent the budget itself,
+/// and the background re-attach follows as before.
+async fn settings_refusal(
+    cfg: &RedisConnConfig,
+    tls: &Option<redis::TlsCertificates>,
+    timeout: Duration,
+) -> Result<bool, redis::RedisError> {
+    // Nothing configured that the server could reject, so there is
+    // nothing to ask. Not an optimisation: it is what keeps a plain
+    // deployment from paying for the question — one connection on a
+    // healthy boot, and against an unreachable backend a share of the
+    // budget, which would make an outage take longer to report than it
+    // does today.
+    if !probe_is_worth_asking(cfg) {
+        return Ok(false);
+    }
+    let probed = match cfg.mode {
+        RedisMode::Single => match cfg.url.as_deref() {
+            Some(url) => probe(url, cfg, tls, timeout).await,
+            None => Probe::Silent,
+        },
+        RedisMode::Cluster => {
+            // All seeds at once, not one after another. One answer
+            // settles the question for every node, since the settings are
+            // applied to all of them identically — but a node that stays
+            // silent is not an answer, so a serial walk pays a full
+            // budget for each dead seed before reaching a live one. With
+            // every seed black-holed that turned a 2s boot into an 8s one
+            // (measured, three seeds at `timeout_secs: 2`), which is the
+            // outage this whole path exists to keep short. Concurrently
+            // it is one budget however many seeds there are, and the
+            // dials are the same sockets the connect just failed on.
+            let mut dials = tokio::task::JoinSet::new();
+            for node in &cfg.nodes {
+                let (node, cfg, tls) = (node.clone(), cfg.clone(), tls.clone());
+                dials.spawn(async move { probe(&node, &cfg, &tls, timeout).await });
+            }
+            let mut seen = Probe::Silent;
+            while let Some(joined) = dials.join_next().await {
+                match joined {
+                    // A refusal is conclusive; keep an `Answered` in case
+                    // nothing better arrives, and let silence be silence.
+                    Ok(Probe::Refused(e)) => return Err(e),
+                    Ok(Probe::Answered) => seen = Probe::Answered,
+                    Ok(Probe::Silent) | Err(_) => {}
+                }
+            }
+            seen
+        }
+        RedisMode::Sentinel => match sentinel_master_address(cfg, tls, timeout).await {
+            Some(master) => probe(&master, cfg, tls, timeout).await,
+            None => Probe::Silent,
+        },
+    };
+    match probed {
+        Probe::Refused(e) => Err(e),
+        Probe::Answered => Ok(true),
+        Probe::Silent => Ok(false),
+    }
+}
+
+/// Whether the question is worth asking at all.
+///
+/// Two reasons it is. The obvious one is that something is configured
+/// that the server could reject. The other is `cluster` and `sentinel`,
+/// where it is worth asking even when NOTHING is configured: a
+/// `requirepass` backend addressed with no credential answers `NOAUTH`,
+/// and both drivers bury that behind a failure of their own — an empty
+/// initial connection map for cluster, a master that failed its `ROLE`
+/// check for sentinel — so the gateway would report a live server as
+/// unreachable. `single` needs no such exception: its connection opens,
+/// and [`prove`] on that connection gets the `NOAUTH` directly.
+///
+/// Asking costs nothing a boot can feel. The probe runs alongside the
+/// connect rather than before it, so it spends wall clock the connect
+/// was spending anyway, and against a black-holed backend both meet the
+/// same deadline.
+fn probe_is_worth_asking(cfg: &RedisConnConfig) -> bool {
+    cfg.mode != RedisMode::Single || settings_the_server_can_reject(cfg)
+}
+
+/// Whether anything is configured that the data node itself can reject —
+/// a credential, from the explicit fields or from inside its own URL, or
+/// a `database` it may not have.
+///
+/// The Sentinel-discovered master has no URL of its own, so in that mode
+/// the fields are the only source; the `sentinels` URLs carry the
+/// sentinels' credentials, which are a different thing. `database` is
+/// not counted for `cluster`, which never sends it.
+fn settings_the_server_can_reject(cfg: &RedisConnConfig) -> bool {
+    if cfg.username.is_some() || cfg.password.is_some() {
+        return true;
+    }
+    if cfg.mode != RedisMode::Cluster && cfg.database.is_some_and(|db| db != 0) {
+        return true;
+    }
+    let in_url = |url: &String| {
+        url.trim().into_connection_info().is_ok_and(|i| {
+            i.redis.username.is_some() || i.redis.password.is_some() || i.redis.db != 0
+        })
+    };
+    match cfg.mode {
+        RedisMode::Single => cfg.url.as_ref().is_some_and(in_url),
+        RedisMode::Cluster => cfg.nodes.iter().any(in_url),
+        RedisMode::Sentinel => false,
+    }
+}
+
+/// One plain, single-attempt connection to `url` with the configured
+/// settings applied, plus one command on it.
+///
+/// The handshake and the command are classified apart on purpose. The
+/// handshake runs only `AUTH` and `SELECT`, so a server error raised
+/// there is a refusal of the configuration by construction, whatever
+/// kind the driver gave it. A server error raised by the command after
+/// it is a refusal only when it says so.
+async fn probe(
+    url: &str,
+    cfg: &RedisConnConfig,
+    tls: &Option<redis::TlsCertificates>,
+    timeout: Duration,
+) -> Probe {
+    let url = insecure_url(url.trim(), cfg);
+    let Ok(mut info) = url.as_str().into_connection_info() else {
+        return Probe::Silent;
+    };
+    apply_explicit_settings(&mut info.redis, cfg);
+    let client = match tls {
+        Some(certs) => redis::Client::build_with_tls(info, certs.clone()),
+        None => redis::Client::open(info),
+    };
+    let Ok(client) = client else {
+        return Probe::Silent;
+    };
+    let mut conn = match client
+        .get_multiplexed_async_connection_with_config(&conn_config(timeout))
+        .await
+    {
+        Ok(conn) => conn,
+        // `IoError` and the timeouts are the unreachable case, which is
+        // not ours to report. Neither is `InvalidClientConfig`, which
+        // this connect can also raise on its own — "No address found for
+        // host" is one — and which would otherwise be handed back as a
+        // refusal and END THE BOOT, since that is the one kind that
+        // still does. The real connect raises it again on its own
+        // account if it is genuine.
+        Err(e)
+            if matches!(
+                e.kind(),
+                redis::ErrorKind::IoError | redis::ErrorKind::InvalidClientConfig
+            ) =>
+        {
+            return Probe::Silent;
+        }
+        // Kept as the driver handed it over rather than rewrapped: a
+        // refused `SELECT` still carries the server's own text, which is
+        // the only part that says WHICH setting. A refused AUTH does
+        // not — redis-rs replaces the server's message with a fixed
+        // "Password authentication failed" — so the WARN built from this
+        // promises the refusal, not always the setting.
+        Err(e) => return Probe::Refused(e),
+    };
+    // `PING`, whatever the mode. The fan-out that makes it wrong on a
+    // cluster belongs to the cluster CONNECTION, and this one is a plain
+    // single-node connection to one seed — where the keyed read used on
+    // the real connection would instead come back `MOVED` from any node
+    // that does not own that slot, and prove nothing.
+    match prove_with(&mut conn, redis::cmd("PING"), timeout).await {
+        Ok(()) => Probe::Answered,
+        Err(e) if classify_connect_failure(&e) == ConnectFailure::Refused => Probe::Refused(e),
+        Err(_) => Probe::Silent,
+    }
+}
+
+/// `host:port` of the monitored master, asked of the sentinels directly.
+///
+/// redis-rs offers no way to get the address without also connecting to
+/// it and validating it — which is the step that swallows the refusal
+/// this is trying to find. So the raw command, on the first sentinel
+/// that answers it. The sentinels carry their own credentials in their
+/// URLs, independent of the master's, and are reached exactly the way
+/// the real discovery reaches them — same `insecure_url` treatment, same
+/// trust material — or this would go silent on every TLS deployment and
+/// take the diagnostic with it.
+async fn sentinel_master_address(
+    cfg: &RedisConnConfig,
+    tls: &Option<redis::TlsCertificates>,
+    timeout: Duration,
+) -> Option<String> {
+    let master_name = cfg.master_name.as_deref()?;
+    for sentinel in &cfg.sentinels {
+        let sentinel = insecure_url(sentinel.trim(), cfg);
+        let client = match tls {
+            Some(certs) => redis::Client::build_with_tls(sentinel.as_str(), certs.clone()),
+            None => redis::Client::open(sentinel.as_str()),
+        };
+        let Ok(client) = client else { continue };
+        let addr = async {
+            let mut conn = client
+                .get_multiplexed_async_connection_with_config(&conn_config(timeout))
+                .await?;
+            tokio::time::timeout(
+                timeout,
+                redis::cmd("SENTINEL")
+                    .arg("get-master-addr-by-name")
+                    .arg(master_name)
+                    .query_async::<(String, String)>(&mut conn),
+            )
+            .await
+            .map_err(|_| timed_out_error(timeout))?
+        }
+        .await;
+        if let Ok((host, port)) = addr {
+            // The master's scheme follows the sentinels', the same
+            // uniform-TLS assumption the sentinel connect itself makes.
+            let scheme = if sentinel.starts_with("rediss://") {
+                "rediss"
+            } else {
+                "redis"
+            };
+            return Some(format!("{scheme}://{host}:{port}"));
+        }
+    }
+    None
+}
+
 // Every command from every consumer — `Script::invoke_async`,
 // `cmd().query_async`, pipelines — funnels through this impl, which is
 // why the budget and the breaker live here rather than in each store.
@@ -837,9 +1326,45 @@ pub async fn connect_bounded(
 ) -> RedisResult<RedisConn> {
     let per_attempt = policy.0.timeout;
     let budget = discovery_budget(configured_endpoints(cfg), per_attempt);
-    match tokio::time::timeout(budget, connect_with(cfg, policy)).await {
+    // Started ALONGSIDE the connect, not before it. Sequentially the two
+    // would share one budget, and in `single` mode that budget covers
+    // exactly one connection — so a healthy endpoint with a slow
+    // handshake (TLS across a WAN) would have had to complete two of
+    // them inside the time allowed for one, and would have started
+    // degraded for it. Run together they share the wall clock instead:
+    // a healthy connect gets the whole budget, and a black-holed one
+    // still reports on the same deadline, because both time out on it.
+    let probe = probe_is_worth_asking(cfg).then(|| {
+        let (cfg, timeout) = (cfg.clone(), per_attempt);
+        tokio::spawn(async move {
+            let tls = load_tls(&cfg).ok().flatten();
+            settings_refusal(&cfg, &tls, timeout).await
+        })
+    });
+    let outcome = match tokio::time::timeout(budget, connect_with(cfg, policy)).await {
         Ok(r) => r,
         Err(_) => Err(connect_timed_out_error(budget, per_attempt)),
+    };
+    let Some(probe) = probe else { return outcome };
+    let Err(e) = outcome else {
+        probe.abort();
+        return outcome;
+    };
+    // A local error outranks anything the server said. It is the only
+    // class that still ends the boot, and the probe can be answering
+    // about a DIFFERENT endpoint — one live cluster seed refusing a
+    // credential would otherwise mask an unparsable URL on another, and
+    // the gateway would degrade over a typo it could have named.
+    if is_boot_fatal(&e) {
+        probe.abort();
+        return Err(e);
+    }
+    // The connect failed, so what the server said about the settings is
+    // the better answer if it said anything. It has had the same wall
+    // clock the connect had, so this is a join, not a wait.
+    match tokio::time::timeout(per_attempt, probe).await {
+        Ok(Ok(Err(refusal))) => Err(refusal),
+        _ => Err(e),
     }
 }
 
@@ -967,9 +1492,11 @@ pub async fn connect_with(cfg: &RedisConnConfig, policy: &FailurePolicy) -> Redi
     let inner = match cfg.mode {
         RedisMode::Single => {
             let url = insecure_url(cfg.url.as_deref().unwrap_or_default(), cfg);
+            let mut info = url.as_str().into_connection_info()?;
+            apply_explicit_settings(&mut info.redis, cfg);
             let client = match &tls {
-                Some(certs) => redis::Client::build_with_tls(url.as_str(), certs.clone())?,
-                None => redis::Client::open(url.as_str())?,
+                Some(certs) => redis::Client::build_with_tls(info, certs.clone())?,
+                None => redis::Client::open(info)?,
             };
             // Only the two timeouts are set; the retry policy stays the
             // library default, which is what the boot retry loop is tuned
@@ -977,7 +1504,8 @@ pub async fn connect_with(cfg: &RedisConnConfig, policy: &FailurePolicy) -> Redi
             let manager_cfg = ConnectionManagerConfig::new()
                 .set_connection_timeout(timeout)
                 .set_response_timeout(timeout);
-            let conn = ConnectionManager::new_with_config(client, manager_cfg).await?;
+            let mut conn = ConnectionManager::new_with_config(client, manager_cfg).await?;
+            prove(&mut conn, cfg.mode, timeout).await?;
             tracing::info!(
                 target: "aisix::redis",
                 mode = "single",
@@ -994,23 +1522,49 @@ pub async fn connect_with(cfg: &RedisConnConfig, policy: &FailurePolicy) -> Redi
                 .filter(|s| !s.is_empty())
                 .map(|s| insecure_url(s, cfg))
                 .collect();
-            // ACL creds for the nodes can travel in the node URLs, or be
-            // set explicitly here (applied to every node). Cluster has no
-            // DB index, so `database` is ignored in this mode.
+            // The settings are applied to each node through the same
+            // function the other modes use, rather than through the
+            // builder's own `username`/`password`. The builder fills each
+            // of those from the first node URL INDEPENDENTLY when it is
+            // unset, so setting one there cannot clear the other: a
+            // `password` with no `username` — the documented shape — went
+            // out as `AUTH "" <password>` and was refused by every server
+            // that wanted `AUTH <password>`. Carrying the settings on the
+            // nodes themselves leaves nothing for the builder to fill in
+            // and keeps one definition of what "the explicit fields win"
+            // means.
+            // The parse error is propagated, not filtered away: it is an
+            // `InvalidClientConfig`, which is the one class that still
+            // ends the boot, and dropping it would let a typo'd seed
+            // quietly reduce discovery redundancy instead of being
+            // reported. Passing raw strings used to get this for free,
+            // because the builder parsed them itself.
+            let nodes = nodes
+                .iter()
+                .map(|url| {
+                    let mut info = url.as_str().into_connection_info()?;
+                    apply_explicit_settings(&mut info.redis, cfg);
+                    Ok(info)
+                })
+                .collect::<RedisResult<Vec<_>>>()?;
             let mut builder = ClusterClient::builder(nodes)
                 .connection_timeout(timeout)
                 .response_timeout(timeout);
-            if let Some(u) = &cfg.username {
-                builder = builder.username(u.clone());
-            }
-            if let Some(p) = &cfg.password {
-                builder = builder.password(p.clone());
-            }
             if let Some(certs) = &tls {
                 builder = builder.certs(certs.clone());
             }
             let client = builder.build()?;
-            let conn = client.get_async_connection().await?;
+            let mut conn = match client.get_async_connection().await {
+                Ok(conn) => conn,
+                // A seed that refuses the credential is not added to the
+                // initial connection map, and an empty map is reported as
+                // `Failed to create initial connections` — the same
+                // `IoError` an unplugged cluster gets. Unlike `single`
+                // this arrives fast, with the budget barely touched, so
+                // the question can be asked after the fact.
+                Err(e) => return Err(e),
+            };
+            prove(&mut conn, cfg.mode, timeout).await?;
             tracing::info!(
                 target: "aisix::redis",
                 mode = "cluster",
@@ -1090,12 +1644,25 @@ pub async fn connect_with(cfg: &RedisConnConfig, policy: &FailurePolicy) -> Redi
             // outer budget too, or an unreachable sentinel stalls the
             // boot attempt indefinitely.
             let discovery_timeout = discovery_budget(sentinels_len, timeout);
-            let conn = tokio::time::timeout(
+            let discovered = tokio::time::timeout(
                 discovery_timeout,
                 client.get_async_connection_with_config(&conn_config(timeout)),
             )
             .await
-            .map_err(|_| connect_timed_out_error(discovery_timeout, timeout))??;
+            .map_err(|_| connect_timed_out_error(discovery_timeout, timeout))
+            .and_then(|r| r);
+            let mut conn = match discovered {
+                Ok(conn) => conn,
+                // Discovery validates a candidate master by running
+                // `ROLE` on it, so a master that refuses the credential
+                // fails that check and is skipped — and a correctly
+                // configured group comes back as
+                // `MasterNameNotFoundBySentinel`, which is also what a
+                // typo'd `master_name` returns. Same fast failure as
+                // cluster, same question asked afterwards.
+                Err(e) => return Err(e),
+            };
+            prove(&mut conn, cfg.mode, timeout).await?;
             tracing::info!(
                 target: "aisix::redis",
                 mode = "sentinel",
@@ -1254,6 +1821,225 @@ mod tls_tests {
         let err = err.to_string();
         assert!(err.contains("redis.tls.ca_file"), "{err}");
         assert!(err.contains("/nonexistent/redis-ca.pem"), "{err}");
+    }
+}
+
+/// The two boot-check invariants that no live server can demonstrate:
+/// which command each mode proves itself with, and how the explicit
+/// settings compose with the ones the URL carried.
+#[cfg(test)]
+mod boot_check_tests {
+    use super::*;
+
+    fn cfg(mode: RedisMode) -> RedisConnConfig {
+        RedisConnConfig {
+            mode,
+            ..Default::default()
+        }
+    }
+
+    /// redis-rs routes `PING` to every master and fails it unless all of
+    /// them answer, so in cluster mode the proof must carry a key and go
+    /// to that key's slot owner alone. A cluster running with one master
+    /// down is the case this protects, and it is not reproducible here.
+    #[test]
+    fn cluster_proves_itself_with_a_single_slot_command() {
+        let cmd = proof_command(RedisMode::Cluster);
+        assert_eq!(
+            redis::cluster_routing::RoutingInfo::for_routable(&cmd).and_then(|r| match r {
+                redis::cluster_routing::RoutingInfo::SingleNode(_) => Some(()),
+                redis::cluster_routing::RoutingInfo::MultiNode(_) => None,
+            }),
+            Some(()),
+            "a fan-out proof fails a cluster that is merely missing one master"
+        );
+    }
+
+    #[test]
+    fn the_other_modes_prove_themselves_with_ping() {
+        for mode in [RedisMode::Single, RedisMode::Sentinel] {
+            let cmd = proof_command(mode);
+            assert_eq!(&cmd.args_iter().count(), &1, "{mode:?} takes no key");
+        }
+    }
+
+    /// Setting either half of the credential replaces both. Composing a
+    /// login from two sources produces one that exists in neither, and
+    /// its refusal then points at configuration that reads correctly in
+    /// both places.
+    #[test]
+    fn a_username_override_does_not_keep_the_urls_password() {
+        let mut info = redis::RedisConnectionInfo {
+            username: Some("alice".into()),
+            password: Some("s3cret".into()),
+            ..Default::default()
+        };
+        apply_explicit_settings(
+            &mut info,
+            &RedisConnConfig {
+                username: Some("bob".into()),
+                ..cfg(RedisMode::Single)
+            },
+        );
+        assert_eq!(info.username.as_deref(), Some("bob"));
+        assert_eq!(info.password, None, "alice's password must not follow bob");
+    }
+
+    #[test]
+    fn an_unset_credential_leaves_the_urls_alone() {
+        let mut info = redis::RedisConnectionInfo {
+            username: Some("alice".into()),
+            password: Some("s3cret".into()),
+            ..Default::default()
+        };
+        apply_explicit_settings(&mut info, &cfg(RedisMode::Single));
+        assert_eq!(info.username.as_deref(), Some("alice"));
+        assert_eq!(info.password.as_deref(), Some("s3cret"));
+    }
+
+    /// Two classifications the operator's next step depends on, and
+    /// both were got wrong by matching on `ErrorKind` alone.
+    #[test]
+    fn a_local_error_is_never_reported_as_the_servers_answer() {
+        // What a DNS lookup that resolves to nothing raises, from inside
+        // the connect — the same kind the URL parse and the TLS read
+        // use, and the only kind that still ends a boot.
+        let no_address = redis::RedisError::from((
+            redis::ErrorKind::InvalidClientConfig,
+            "No address found for host",
+        ));
+        assert!(is_boot_fatal(&no_address));
+        // …which is exactly why the probe must not hand it back as a
+        // refusal: doing so would turn a name that momentarily resolves
+        // to nothing into a gateway that refuses to start.
+        assert_eq!(classify_connect_failure(&no_address), ConnectFailure::Local);
+    }
+
+    /// Protected mode is a refusal the server spells out, and it arrives
+    /// with no credential configured at all — so nothing else in the
+    /// chain would have called it anything but an outage.
+    #[test]
+    fn protected_mode_reads_as_a_refusal() {
+        // Built by parsing the wire form, because that is the only way
+        // the error carries a `code()` — the `(kind, desc)` constructor
+        // does not, so a hand-built one would pass this test while the
+        // real reply failed it.
+        let denied = match redis::parse_redis_value(
+            b"-DENIED Redis is running in protected mode because protected mode is enabled\r\n",
+        ) {
+            Ok(redis::Value::ServerError(e)) => redis::RedisError::from(e),
+            other => panic!("expected a server error, got {other:?}"),
+        };
+        assert_eq!(denied.code(), Some("DENIED"));
+        assert_eq!(classify_connect_failure(&denied), ConnectFailure::Refused);
+        assert_eq!(failure_reason(&denied), "refused");
+        assert!(!is_boot_fatal(&denied));
+    }
+
+    /// A `password` with no `username` — the documented shape, and what
+    /// `AISIX_RATELIMIT__REDIS__PASSWORD` produces — must go out as the
+    /// legacy one-argument `AUTH`, which means the username stays
+    /// `None` rather than becoming an empty string.
+    ///
+    /// The cluster builder's own `username`/`password` setters cannot
+    /// express this: it fills each from the first node URL
+    /// independently when unset, so passing `""` to clear one sent
+    /// `AUTH "" <password>` and every `requirepass` server refused it.
+    /// Carrying the settings on the nodes themselves is what avoids
+    /// that, and this pins the value the nodes end up with.
+    #[test]
+    fn a_password_with_no_username_stays_a_one_argument_auth() {
+        for mode in [RedisMode::Single, RedisMode::Cluster, RedisMode::Sentinel] {
+            let mut info = redis::RedisConnectionInfo::default();
+            apply_explicit_settings(
+                &mut info,
+                &RedisConnConfig {
+                    password: Some("s3cret".into()),
+                    ..cfg(mode)
+                },
+            );
+            assert_eq!(info.password.as_deref(), Some("s3cret"), "{mode:?}");
+            assert_eq!(
+                info.username, None,
+                "{mode:?}: an empty username is sent as a two-argument AUTH and refused"
+            );
+        }
+    }
+
+    /// `SELECT` is rejected outright in Redis Cluster, so sending the
+    /// field would make the probe fail on every node and report nothing.
+    #[test]
+    fn database_is_not_sent_in_cluster_mode() {
+        let with_db = |mode| {
+            let mut info = redis::RedisConnectionInfo::default();
+            apply_explicit_settings(
+                &mut info,
+                &RedisConnConfig {
+                    database: Some(7),
+                    ..cfg(mode)
+                },
+            );
+            info.db
+        };
+        assert_eq!(with_db(RedisMode::Single), 7);
+        assert_eq!(with_db(RedisMode::Sentinel), 7);
+        assert_eq!(with_db(RedisMode::Cluster), 0);
+    }
+
+    /// `cluster` and `sentinel` ask even when nothing is configured,
+    /// because their drivers bury a `NOAUTH` behind a failure of their
+    /// own — measured against a live `requirepass` topology, both
+    /// reported `Unreachable` without this, for a server that was
+    /// answering. `single` does not need the exception: its connection
+    /// opens and `prove` gets the `NOAUTH` on it directly.
+    #[test]
+    fn cluster_and_sentinel_ask_even_with_nothing_configured() {
+        let plain = |mode| RedisConnConfig {
+            url: Some("redis://127.0.0.1:6379".into()),
+            nodes: vec!["redis://127.0.0.1:6379".into()],
+            sentinels: vec!["redis://127.0.0.1:26379".into()],
+            master_name: Some("mymaster".into()),
+            ..cfg(mode)
+        };
+        assert!(probe_is_worth_asking(&plain(RedisMode::Cluster)));
+        assert!(probe_is_worth_asking(&plain(RedisMode::Sentinel)));
+        // …and single stays gated, which is what keeps a plain
+        // deployment from opening a connection it does not need.
+        assert!(!probe_is_worth_asking(&plain(RedisMode::Single)));
+        assert!(probe_is_worth_asking(&RedisConnConfig {
+            password: Some("pw".into()),
+            ..plain(RedisMode::Single)
+        }));
+    }
+
+    /// The gate that keeps a plain deployment from paying for a question
+    /// whose answer is already known — and the reason the black-holed
+    /// boot still reports on the same deadline it always did.
+    #[test]
+    fn nothing_rejectable_configured_means_no_probe() {
+        let plain = RedisConnConfig {
+            url: Some("redis://127.0.0.1:6379".into()),
+            ..cfg(RedisMode::Single)
+        };
+        assert!(!settings_the_server_can_reject(&plain));
+        assert!(settings_the_server_can_reject(&RedisConnConfig {
+            password: Some("pw".into()),
+            ..plain.clone()
+        }));
+        assert!(settings_the_server_can_reject(&RedisConnConfig {
+            database: Some(3),
+            ..plain.clone()
+        }));
+        assert!(settings_the_server_can_reject(&RedisConnConfig {
+            url: Some("redis://:pw@127.0.0.1:6379".into()),
+            ..plain.clone()
+        }));
+        // DB 0 is the default the URL already means, so it is not a
+        // setting the operator asked for.
+        assert!(!settings_the_server_can_reject(&RedisConnConfig {
+            database: Some(0),
+            ..plain
+        }));
     }
 }
 

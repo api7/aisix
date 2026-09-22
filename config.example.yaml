@@ -259,9 +259,10 @@ cache:
   # exact matches only (probed and logged at boot).
   backend: "memory"   # memory | redis
   # redis:
-  #   # mode picks the topology. Credentials travel inside the URLs, as
-  #   # in single mode; a `rediss://` URL turns TLS on and the `tls` block
-  #   # below configures what it trusts.
+  #   # mode picks the topology. Credentials can travel inside the URLs,
+  #   # or be given below as `username`/`password`/`database`, which win
+  #   # over anything the URL carries; a `rediss://` URL turns TLS on and
+  #   # the `tls` block below configures what it trusts.
   #   mode: "single"   # single | cluster | sentinel
   #   # mode: single  → one endpoint:
   #   url: "redis://127.0.0.1:6379"
@@ -269,14 +270,18 @@ cache:
   #   # nodes: ["redis://10.0.0.1:6379", "redis://10.0.0.2:6379"]
   #   # mode: sentinel → sentinel node URLs + the monitored master name.
   #   # Sentinel auth goes in the sentinels URLs; username/password/database
-  #   # below authenticate the data node (master) Sentinel discovers — it
-  #   # has no URL of its own. Supply `password` via the matching env var
-  #   # (AISIX_CACHE__REDIS__PASSWORD) to keep it out of this file.
+  #   # below authenticate the data node — the cluster nodes, or the master
+  #   # Sentinel discovers, which has no URL of its own. Supply `password`
+  #   # via the matching env var (AISIX_CACHE__REDIS__PASSWORD) to keep it
+  #   # out of this file.
   #   # sentinels: ["redis://10.0.0.1:26379", "redis://10.0.0.2:26379"]
   #   # master_name: "mymaster"
-  #   # username: "default"      # Redis ACL user (cluster nodes / sentinel master)
+  #   # Applied in every mode, and they OVERRIDE a credential embedded in
+  #   # the URL — a value injected through the environment is no use if a
+  #   # stale one left in `url` outranks it.
+  #   # username: "default"      # Redis ACL user for the data node
   #   # password: "s3cret"
-  #   # database: 0              # DB index for the sentinel master (not used by cluster)
+  #   # database: 0              # DB index (single / sentinel; Redis Cluster has only DB 0)
   #   # Trust settings for a `rediss://` URL, ignored on plaintext
   #   # `redis://`. Separate from `upstream.tls` because an in-cluster
   #   # Redis is normally issued by a different authority than the model
@@ -303,9 +308,15 @@ cache:
   #   # not stop the gateway: the listeners bind, every `backend: redis`
   #   # policy is served as a miss, one WARN names the backend, and the
   #   # connection is attached in the background as soon as Redis answers.
-  #   # A `url` the driver cannot parse, or TLS material that cannot be
-  #   # read, is different and still ends the boot — no amount of retrying
-  #   # fixes a typo. After a failure, commands short-circuit for 30 seconds and then
+  #   # Settings the server ANSWERS and refuses — a rejected credential,
+  #   # a `database` it does not have — degrade the same way, and the WARN
+  #   # says the server REFUSED rather than that it timed out. They are
+  #   # retried too: the credential may be corrected on the server, and
+  #   # the connection is then attached without restarting the gateway.
+  #   # Only configuration this process can reject by itself still ends
+  #   # the boot: a `url` the driver cannot parse, TLS material that
+  #   # cannot be read. Nothing outside the process can fix those.
+  #   # After a failure, commands short-circuit for 30 seconds and then
   #   # ONE request probes, so an outage costs this budget roughly once per
   #   # 30 seconds rather than once per request. Must be >= 1.
   #   #
@@ -346,6 +357,13 @@ ratelimit:
   #   # sentinels: ["redis://10.0.0.1:26379"]   # mode: sentinel
   #   # master_name: "mymaster"                  # mode: sentinel
   #   # tls: { ca_file: "/etc/aisix/tls/redis-ca.pem" }   # for rediss://
+  #   # Data-node credentials, as in cache.redis above: applied in every
+  #   # mode, and they override a credential embedded in the URL. Supply
+  #   # `password` via AISIX_RATELIMIT__REDIS__PASSWORD to keep it out of
+  #   # this file.
+  #   # username: "default"
+  #   # password: "s3cret"
+  #   # database: 0              # single / sentinel; Redis Cluster has only DB 0
   #   # Seconds one Redis round trip, or the startup connection, may take
   #   # before it is abandoned and the limiter falls back to per-replica
   #   # counting. Same field and same meaning as cache.redis above,
@@ -353,6 +371,16 @@ ratelimit:
   #   # without it an unreachable Redis blocks every rate-limited request
   #   # — and the whole boot — for minutes instead of degrading.
   #   # Must be >= 1.
+  #   #
+  #   # A Redis that is unreachable at STARTUP does not stop the gateway:
+  #   # the listeners bind, counting is per-replica (so cluster-wide
+  #   # limits are not enforced), one WARN names the backend, and the
+  #   # shared backend is attached in the background as soon as Redis
+  #   # answers. A Redis that ANSWERS and refuses the settings degrades
+  #   # the same way, with a WARN that says REFUSED rather than timed out,
+  #   # and is retried too. Only configuration this process can reject by
+  #   # itself still ends the boot: a `url` the driver cannot parse, TLS
+  #   # material that cannot be read.
   #   #
   #   # The limiter is a separate subsystem from the cache and cools off
   #   # independently, so a request that uses both can pay one budget for
