@@ -1,6 +1,22 @@
 import type { SpawnedApp } from "./app.js";
 
 /**
+ * The COMPLETE lines of the gateway's captured output.
+ *
+ * `output()` concatenates the raw chunks the child's pipe delivered, with
+ * no line framing, so its tail is routinely half a line — and a predicate
+ * anchored on a field the formatter writes early will match that prefix
+ * and hand the spec a line whose later fields are simply missing. Every
+ * log line ends in a newline, so anything after the last one is a
+ * fragment and is dropped until the rest of it arrives.
+ */
+function completeLines(app: SpawnedApp): string[] {
+  const lines = app.output().split("\n");
+  lines.pop();
+  return lines;
+}
+
+/**
  * Poll the gateway's captured output for a line satisfying `pred`.
  *
  * **A log line is never readable at the moment the request that produced
@@ -27,15 +43,15 @@ export async function waitForLogLine(
   timeoutMs = 5_000,
 ): Promise<string> {
   const deadline = Date.now() + timeoutMs;
-  let last = "";
   for (;;) {
-    last = app.output();
-    const hit = last.split("\n").find(pred);
+    const hit = completeLines(app).find(pred);
     if (hit) return hit;
     if (Date.now() >= deadline) break;
     await new Promise((r) => setTimeout(r, 50));
   }
-  throw new Error(`timed out waiting for ${what}; gateway output was:\n${last}`);
+  throw new Error(
+    `timed out waiting for ${what}; gateway output was:\n${app.output()}`,
+  );
 }
 
 /**
@@ -50,15 +66,13 @@ export async function waitForLogLines(
   timeoutMs = 5_000,
 ): Promise<string[]> {
   const deadline = Date.now() + timeoutMs;
-  let last = "";
   for (;;) {
-    last = app.output();
-    const hits = last.split("\n").filter(pred);
+    const hits = completeLines(app).filter(pred);
     if (hits.length >= count) return hits;
     if (Date.now() >= deadline) break;
     await new Promise((r) => setTimeout(r, 50));
   }
   throw new Error(
-    `timed out waiting for ${count} × ${what}; gateway output was:\n${last}`,
+    `timed out waiting for ${count} × ${what}; gateway output was:\n${app.output()}`,
   );
 }

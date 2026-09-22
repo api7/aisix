@@ -9,6 +9,7 @@ import {
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLine,
   waitForLogLines,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -292,18 +293,13 @@ describe("an enabled cooldown records the exclusion it causes", () => {
     // judged against — so an operator can tell "the status was not in
     // the list" from "the list never reached the gateway". Before this
     // change only /v1/chat/completions wrote such a line at all.
-    // Written for request 1, before the exclusion line above — the log
-    // queue is FIFO, so waiting for that one covers this one.
-    const failures = app
-      .output()
-      .split("\n")
-      .filter((l) => l.includes("routing target attempt failed"));
-    expect(
-      failures.length,
-      `no attempt-failure line in gateway output:\n${app.output()}`,
-    ).toBeGreaterThan(0);
-    expect(failures[0]!).toContain("excl-primary");
-    expect(failures[0]!).toContain("fallback_on_statuses=[418]");
+    const failure = await waitForLogLine(
+      app,
+      (l) => l.includes("routing target attempt failed"),
+      "the attempt-failure line",
+    );
+    expect(failure).toContain("excl-primary");
+    expect(failure).toContain("fallback_on_statuses=[418]");
   });
 });
 

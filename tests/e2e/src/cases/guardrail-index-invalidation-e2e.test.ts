@@ -9,7 +9,7 @@ import {
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
-  waitForLogLines,
+  waitForLogLine,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -118,20 +118,27 @@ describe("guardrail index invalidation", () => {
       .filter((l) => REBUILT.test(l)).length;
   }
 
-  /** The rebuild count, once at least `atLeast` lines have been written. */
-  async function rebuildsAtLeast(atLeast: number): Promise<number> {
-    const hits = await waitForLogLines(
-      app!,
-      (l) => REBUILT.test(l),
-      atLeast,
-      `${atLeast} guardrail-index rebuild lines`,
-    );
-    return hits.length;
-  }
-
+  /**
+   * A chat, and the barrier that makes `rebuilds()` exact right after it.
+   *
+   * The rebuild line is written while the request resolves its
+   * guardrails, so it is queued before that request's own access-log
+   * line; the log queue and its writer thread are both FIFO, so once the
+   * access line is visible every rebuild the request caused is too. That
+   * is what lets the counts below assert "exactly N" rather than "at
+   * least N" — including the ones whose point is that NOTHING rebuilt.
+   */
   async function chat(model: string, content: string): Promise<number> {
-    return (await proxy!.chat({ model, messages: [{ role: "user", content }] }))
-      .status;
+    const { status, requestId } = await proxy!.chat({
+      model,
+      messages: [{ role: "user", content }],
+    });
+    await waitForLogLine(
+      app!,
+      (l) => l.includes("proxy request completed") && l.includes(`request_id="${requestId}"`),
+      `the access-log line for ${requestId}`,
+    );
+    return status;
   }
 
   // Gate on a caller key seeded AFTER the write under test: etcd delivers
@@ -228,7 +235,8 @@ describe("guardrail index invalidation", () => {
     expect(await chat(SCREENED_MODEL, BLOCK_MARKER)).toBe(422);
     const callsAfterWarm = guard!.calls;
     expect(callsAfterWarm).toBeGreaterThan(0);
-    const afterWarm = await rebuildsAtLeast(1);
+    const afterWarm = rebuilds();
+    expect(afterWarm).toBeGreaterThan(0);
 
     // Thirty writes to a resource kind the index does not read — the
     // shape of the bulk API-key edit in the report. Each one publishes a
@@ -271,13 +279,13 @@ describe("guardrail index invalidation", () => {
     const attachment = await seed!.attachGuardrailToModel(guardrailID, lateModelID);
     await propagated("attached");
     expect(await chat(LATE_MODEL, BLOCK_MARKER)).toBe(422);
-    expect(await rebuildsAtLeast(afterWarm + 1)).toBe(afterWarm + 1);
+    expect(rebuilds()).toBe(afterWarm + 1);
 
     // And removing it stops the enforcement.
     await seed!.delete("guardrail_attachments", attachment.id);
     await propagated("detached");
     expect(await chat(LATE_MODEL, BLOCK_MARKER)).toBe(200);
-    expect(await rebuildsAtLeast(afterWarm + 2)).toBe(afterWarm + 2);
+    expect(rebuilds()).toBe(afterWarm + 2);
     // The scope that was configured all along is untouched by either.
     expect(await chat(SCREENED_MODEL, BLOCK_MARKER)).toBe(422);
   });
