@@ -396,9 +396,9 @@ impl RedisStore {
 /// case this exists for — Redis coming up seconds after the gateway on a
 /// node reboot — recovering in seconds rather than half a minute.
 ///
-/// One attempt per iteration: `connect_bounded` spends at most the
-/// budget, so an unreachable Redis costs one TCP connect attempt per
-/// `2 × timeout_secs` for as long as the outage lasts.
+/// One attempt per iteration, and `connect_bounded` bounds each one, so
+/// an unreachable Redis costs one connect attempt per sleep-plus-budget
+/// for as long as the outage lasts.
 fn spawn_attach(slot: ConnSlot, cfg: RedisConnConfig, policy: FailurePolicy) {
     tokio::spawn(async move {
         let retry = std::time::Duration::from_secs(cfg.timeout_secs.max(1));

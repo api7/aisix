@@ -323,9 +323,9 @@ ratelimit:
   #   # sentinels: ["redis://10.0.0.1:26379"]   # mode: sentinel
   #   # master_name: "mymaster"                  # mode: sentinel
   #   # tls: { ca_file: "/etc/aisix/tls/redis-ca.pem" }   # for rediss://
-  #   # Seconds one Redis round trip, or the startup connection attempt,
-  #   # may take before it is abandoned and the limiter falls back to
-  #   # per-replica counting. Same field and same meaning as cache.redis
+  #   # Seconds one Redis round trip, or the startup connection, may take
+  #   # before it is abandoned and the limiter falls back to per-replica
+  #   # counting. Same field and same meaning as cache.redis
   #   # above; without it an unreachable Redis blocks every rate-limited
   #   # request — and the whole boot — for minutes instead of degrading.
   #   # Must be >= 1.

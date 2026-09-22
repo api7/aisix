@@ -733,11 +733,40 @@ pub async fn connect_bounded(
     cfg: &RedisConnConfig,
     policy: &FailurePolicy,
 ) -> RedisResult<RedisConn> {
-    let budget = policy.0.timeout;
+    let budget = connect_budget(cfg, policy.0.timeout);
     match tokio::time::timeout(budget, connect_with(cfg, policy)).await {
         Ok(r) => r,
         Err(_) => Err(timed_out_error(budget)),
     }
+}
+
+/// What a whole boot connect may spend, which is NOT one command budget
+/// in every topology.
+///
+/// `cluster` and `sentinel` discovery walk their configured lists
+/// **serially**, and a list whose first entry is unreachable is the
+/// normal case those topologies exist for — one budget for the whole
+/// call would fail a boot that is working exactly as designed, and it
+/// would fail it in the one deployment shape built to survive a dead
+/// node. So each configured endpoint gets a budget, plus one for the
+/// connection the walk ends in. `sentinel` already applies this same
+/// product to its own discovery inside [`connect_with`], so there the
+/// outer bound is never the one that fires.
+///
+/// The worst case an operator sees is therefore
+/// `timeout_secs × (endpoints + 1)` of closed listeners, not the
+/// driver's own schedule, and it is derived entirely from what they
+/// configured.
+fn connect_budget(cfg: &RedisConnConfig, per_attempt: Duration) -> Duration {
+    let endpoints = match cfg.mode {
+        RedisMode::Single => 0,
+        RedisMode::Cluster => cfg.nodes.len(),
+        RedisMode::Sentinel => cfg.sentinels.len(),
+    };
+    let budgets = u32::try_from(endpoints)
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    per_attempt.saturating_mul(budgets)
 }
 
 /// The backend's address with the scheme, any userinfo and any path
@@ -1671,7 +1700,7 @@ mod probe_tests {
 }
 
 #[cfg(test)]
-mod endpoint_label_tests {
+mod boot_connect_tests {
     use super::*;
 
     fn single(url: &str) -> RedisConnConfig {
@@ -1706,6 +1735,39 @@ mod endpoint_label_tests {
             endpoint_label(&single("redis://10.0.0.1:6379/#insecure")),
             "10.0.0.1:6379"
         );
+    }
+
+    // A one-budget bound would cut sentinel and cluster discovery short
+    // in exactly the deployment those modes exist for — the one with a
+    // dead node at the front of the list. The sentinel figure must also
+    // match the budget `connect_with` already applies to its own
+    // discovery, or the outer bound would pre-empt it.
+    #[test]
+    fn the_boot_budget_covers_a_serial_walk_of_the_configured_endpoints() {
+        let per_attempt = Duration::from_secs(5);
+        assert_eq!(
+            connect_budget(&single("redis://10.0.0.1:6379"), per_attempt),
+            per_attempt
+        );
+
+        let cluster = RedisConnConfig {
+            mode: RedisMode::Cluster,
+            nodes: vec!["redis://a:6379".into(), "redis://b:6379".into()],
+            ..Default::default()
+        };
+        assert_eq!(connect_budget(&cluster, per_attempt), per_attempt * 3);
+
+        let sentinel = RedisConnConfig {
+            mode: RedisMode::Sentinel,
+            master_name: Some("mymaster".into()),
+            sentinels: vec![
+                "redis://s1:26379".into(),
+                "redis://s2:26379".into(),
+                "redis://s3:26379".into(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(connect_budget(&sentinel, per_attempt), per_attempt * 4);
     }
 
     #[test]
