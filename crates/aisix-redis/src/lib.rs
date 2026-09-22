@@ -827,10 +827,14 @@ pub async fn connect_bounded(
 
 /// How many endpoints a connect may have to pay for before it lands.
 fn configured_endpoints(cfg: &RedisConnConfig) -> usize {
+    // Trimmed-empty entries are what `validate` tolerates and what
+    // `connect_with` then filters out, so they are never dialled and must
+    // not each buy a budget the walk will not spend.
+    let live = |urls: &[String]| urls.iter().filter(|u| !u.trim().is_empty()).count();
     match cfg.mode {
         RedisMode::Single => 0,
-        RedisMode::Cluster => cfg.nodes.len(),
-        RedisMode::Sentinel => cfg.sentinels.len(),
+        RedisMode::Cluster => live(&cfg.nodes),
+        RedisMode::Sentinel => live(&cfg.sentinels),
     }
 }
 
@@ -869,14 +873,55 @@ fn discovery_budget(endpoints: usize, per_attempt: Duration) -> Duration {
 /// configured URL itself must never be logged — it carries the password
 /// in `redis://user:pass@host` form.
 pub fn endpoint_label(cfg: &RedisConnConfig) -> String {
+    /// What a label says when the text it was given is not a URL whose
+    /// host can be identified. Never echo the input: the thing that makes
+    /// it unparseable is usually an unescaped character in the password.
+    const UNPARSEABLE: &str = "<unparseable redis endpoint>";
+
     fn host(url: &str) -> &str {
         let rest = url.split_once("://").map_or(url, |(_, r)| r);
-        // Authority first: an `@` can appear after the host too (a query
-        // value), and only the one inside the authority is userinfo.
+        // Authority first: an `@` can appear after the host too (in a
+        // path or a query), and only the one inside the authority is
+        // userinfo.
         let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
         // Then the LAST `@` of the authority, so a password containing
         // one cannot leave a fragment of itself in front of the host.
-        authority.rsplit_once('@').map_or(authority, |(_, r)| r)
+        let candidate = authority.rsplit_once('@').map_or(authority, |(_, r)| r);
+        // And finally a shape check, because the two steps above trust
+        // the input to be well formed and a password is exactly what is
+        // most likely to make it not be. `redis://user:pw/x@host:6379`
+        // has authority `user:pw` by RFC 3986 — the `@` is in the path —
+        // so slicing alone would print the password. Emitting only text
+        // that looks like `host[:port]` makes that impossible whatever
+        // the input.
+        if is_host_port(candidate) {
+            candidate
+        } else {
+            UNPARSEABLE
+        }
+    }
+
+    /// `host`, `host:port`, or `[v6]:port` — nothing else.
+    fn is_host_port(s: &str) -> bool {
+        let (host, port) = match s.rsplit_once(':') {
+            Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => (h, Some(p)),
+            _ => (s, None),
+        };
+        let host = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+            // An IPv6 literal: hex groups and separators only.
+            Some(v6) => {
+                return !v6.is_empty()
+                    && v6
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+                    && port.is_none_or(|p| p.len() <= 5);
+            }
+            None => host,
+        };
+        !host.is_empty()
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
     }
     fn hosts(urls: &[String]) -> String {
         urls.iter().map(|u| host(u)).collect::<Vec<_>>().join(",")
@@ -1876,6 +1921,63 @@ mod boot_connect_tests {
         let msg = format!("{err}");
         assert!(msg.contains("no connection within 20s"), "{msg}");
         assert!(msg.contains("redis.timeout_secs = 5s"), "{msg}");
+    }
+
+    // The label goes into a log line, and the thing most likely to make
+    // a redis URL unparseable is an unescaped character in the password.
+    // So the rule is not "slice carefully" — it is "emit nothing that is
+    // not shaped like a host", whatever the input.
+    #[test]
+    fn a_url_it_cannot_read_yields_no_text_from_the_url() {
+        // RFC 3986 puts the authority at `user:secret` here — the `@` is
+        // inside the path — so slicing alone prints the password.
+        assert_eq!(
+            endpoint_label(&single("redis://user:secret/extra@redis.internal:6379")),
+            "<unparseable redis endpoint>"
+        );
+        assert_eq!(
+            endpoint_label(&single("redis://user:secret?x@redis.internal:6379")),
+            "<unparseable redis endpoint>"
+        );
+        assert_eq!(
+            endpoint_label(&single("redis://user:secret#x@redis.internal:6379")),
+            "<unparseable redis endpoint>"
+        );
+        assert_eq!(endpoint_label(&single("")), "<unparseable redis endpoint>");
+        // A port that is not a number is not a port, so the whole thing
+        // fails the shape check rather than being printed as a host.
+        assert_eq!(
+            endpoint_label(&single("redis://host:not-a-port")),
+            "<unparseable redis endpoint>"
+        );
+    }
+
+    #[test]
+    fn an_ipv6_literal_survives_the_shape_check() {
+        assert_eq!(
+            endpoint_label(&single("redis://[2001:db8::1]:6379")),
+            "[2001:db8::1]:6379"
+        );
+        assert_eq!(
+            endpoint_label(&single("redis://user:pw@[::1]:6379")),
+            "[::1]:6379"
+        );
+    }
+
+    // An entry `validate` tolerates and `connect_with` then filters out
+    // must not buy a budget the walk will never spend.
+    #[test]
+    fn a_blank_endpoint_buys_no_budget() {
+        let per_attempt = Duration::from_secs(5);
+        let cluster = RedisConnConfig {
+            mode: RedisMode::Cluster,
+            nodes: vec!["redis://a:6379".into(), "  ".into(), String::new()],
+            ..Default::default()
+        };
+        assert_eq!(
+            discovery_budget(configured_endpoints(&cluster), per_attempt),
+            per_attempt * 2
+        );
     }
 
     #[test]
