@@ -985,6 +985,15 @@ fn responses_tool_choice_to_chat(tc: &Value) -> Option<Value> {
         Value::Object(o) => match o.get("type").and_then(|v| v.as_str())? {
             "function" | "custom" | "tool" => {
                 let name = o.get("name").and_then(|v| v.as_str())?;
+                // A namespace sub-tool was offered under its flattened name.
+                let name = match o
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .filter(|ns| !ns.is_empty())
+                {
+                    Some(namespace) => namespace_chat_tool_name(namespace, name),
+                    None => name.to_string(),
+                };
                 Some(json!({"type": "function", "function": {"name": name}}))
             }
             "any" => Some(Value::String("required".to_string())),
@@ -1553,6 +1562,8 @@ pub struct ResponsesSseEncoder {
     tool_calls: std::collections::BTreeMap<u64, ToolCallState>,
     /// What the request declared (see [`ResponsesReplyContext`]).
     reply: ResponsesReplyContext,
+    /// Serialized size of the request echo every Response object carries.
+    echo_len: usize,
     /// Withheld terminal status + incomplete reason while waiting on a
     /// trailing usage frame.
     pending_status: Option<&'static str>,
@@ -1579,6 +1590,7 @@ impl ResponsesSseEncoder {
         reply: ResponsesReplyContext,
     ) -> Self {
         Self {
+            echo_len: serde_json::to_string(&reply.echo).map_or(0, |s| s.len()),
             reply,
             response_id: response_id.into(),
             model_display_name: model_display_name.into(),
@@ -1817,14 +1829,9 @@ impl ResponsesSseEncoder {
 
         if !self.sent_created && (has_content || has_tools || has_reasoning || has_finish) {
             self.sent_created = true;
-            events.push(self.event(
-                "response.created",
-                json!({"response": self.response_object("in_progress", false, None, None)}),
-            ));
-            events.push(self.event(
-                "response.in_progress",
-                json!({"response": self.response_object("in_progress", false, None, None)}),
-            ));
+            let response = self.response_object("in_progress", false, None, None);
+            events.push(self.event("response.created", json!({"response": response.clone()})));
+            events.push(self.event("response.in_progress", json!({"response": response})));
         }
 
         // ── Reasoning ──
@@ -2189,6 +2196,20 @@ impl ResponsesSseEncoder {
         self.finished
     }
 
+    /// What one encoded event costs against an output guardrail's
+    /// hold-back budget. A lifecycle event repeats the request's own
+    /// settings (`instructions`, `tools`, …); those are bounded by the
+    /// request, not by what the model generated, and an agent client's run
+    /// to tens of kilobytes — so they are not charged, or every guarded
+    /// stream would fail closed on a fraction of the output it used to.
+    pub fn buffer_cost(&self, event: &ResponsesSseEvent, encoded_len: usize) -> usize {
+        if event.data.get("response").is_some() {
+            encoded_len.saturating_sub(self.echo_len)
+        } else {
+            encoded_len
+        }
+    }
+
     /// Whether any chunk so far carried something a response is made of —
     /// content, reasoning, a tool call, or a finish reason. A stream that
     /// ends before one did produced no response at all: a bare `[DONE]`, or
@@ -2465,7 +2486,7 @@ pub fn build_responses_bridge_stream(
                     for ev in encoder.next_events(&chunk) {
                         let b = bytes::Bytes::from(ev.to_sse_string());
                         if buffering {
-                            held_bytes += b.len();
+                            held_bytes += encoder.buffer_cost(&ev, b.len());
                             if held_bytes > max_buffer_bytes {
                                 overflowed = true;
                                 break;
@@ -2491,10 +2512,10 @@ pub fn build_responses_bridge_stream(
                         break;
                     }
                     let message = e.to_string();
-                    let terminal_sent = !buffering && encoder.is_finished();
+                    // The loop stops at the terminal event, so none went out.
                     yield Ok(failure_frames(
                         &mut encoder,
-                        terminal_sent,
+                        false,
                         e.error_type(),
                         upstream_failed_code(&e),
                         &message,
@@ -2554,7 +2575,7 @@ pub fn build_responses_bridge_stream(
             for ev in encoder.force_finish() {
                 let b = bytes::Bytes::from(ev.to_sse_string());
                 if buffering {
-                    held_bytes += b.len();
+                    held_bytes += encoder.buffer_cost(&ev, b.len());
                     if held_bytes > max_buffer_bytes {
                         overflowed = true;
                         break;
@@ -4927,6 +4948,52 @@ mod tests {
             chat.messages[0].extra["tool_calls"][0]["function"]["name"],
             "multi_agent_v1__spawn_agent"
         );
+    }
+
+    /// A forced choice of a namespace sub-tool names the tool the model
+    /// was actually offered.
+    #[test]
+    fn a_forced_namespace_choice_names_the_flattened_tool() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({"input": "go", "tools": [multi_agent_namespace()],
+                    "tool_choice": {"type": "function", "name": "spawn_agent", "namespace": "multi_agent_v1"}}),
+        );
+        assert_eq!(
+            chat.extra["tool_choice"],
+            json!({"type": "function", "function": {"name": "multi_agent_v1__spawn_agent"}})
+        );
+    }
+
+    /// The request echo on a lifecycle event is not charged against an
+    /// output guardrail's hold-back budget: an agent's instructions and
+    /// tools are tens of kilobytes, repeated on three events per stream.
+    #[test]
+    fn the_request_echo_is_not_charged_to_the_hold_back_budget() {
+        let cost_of_created = |request: Value| {
+            let mut enc = ResponsesSseEncoder::new(
+                "resp_1",
+                "m",
+                0,
+                ResponsesReplyContext::from_request(&request),
+            );
+            let events = enc.next_events(&content_chunk("hi"));
+            let created = &events[0];
+            assert_eq!(created.event_type, "response.created");
+            enc.buffer_cost(created, created.to_sse_string().len())
+        };
+        let small = cost_of_created(json!({}));
+        let large = cost_of_created(json!({"instructions": "x".repeat(50_000)}));
+        assert_eq!(small, large);
+        // An output event is charged in full.
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
+        let events = enc.next_events(&content_chunk("hi"));
+        let delta = events
+            .iter()
+            .find(|e| e.event_type == "response.output_text.delta")
+            .unwrap();
+        let len = delta.to_sse_string().len();
+        assert_eq!(enc.buffer_cost(delta, len), len);
     }
 
     fn namespace_reply() -> ResponsesReplyContext {
