@@ -202,6 +202,11 @@ const MODELS: Record<string, Seeded> = {
   "sf-transcribe-cut": { upstream: TRANSCRIPT_CUT, kind: "chat" },
   "sf-speech-cut": { upstream: SPEECH_CUT, kind: "chat" },
   "sf-speech-trickle": { upstream: SPEECH_TRICKLE, kind: "chat" },
+  // A whole audio file with its Content-Length, as TTS providers answer.
+  "sf-speech-sized": {
+    upstream: { rawBody: "ID3-a-whole-audio-file", rawContentType: "audio/mpeg" },
+    kind: "chat",
+  },
 };
 const ENSEMBLE = "sf-ensemble";
 
@@ -523,6 +528,18 @@ describe("usage status of a stream that fails after its 200 headers", () => {
     expect(row.get("status_code")).toBe("200");
     expect(row.get("error_class") ?? "").toBe("");
   }, 30_000);
+
+  test("audio speech: a sized audio file read to its last byte is a 200", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const res = await speech("sf-speech-sized");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-length")).toBe("22");
+    const requestId = res.headers.get("x-aisix-request-id") ?? "";
+    expect(Buffer.from(await res.arrayBuffer()).toString()).toBe("ID3-a-whole-audio-file");
+    const row = await usageRow(requestId);
+    expect(row.get("status_code")).toBe("200");
+    expect(row.get("error_class") ?? "").toBe("");
+  });
 
   test("passthrough route: a stream that loses its upstream is a 502", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();

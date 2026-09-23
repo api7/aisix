@@ -571,7 +571,12 @@ pub async fn speech(
             let request_id_c = request_id.clone();
             let api_key_id_c = api_key_id.clone();
             let model_name_c = model_name.clone();
-            let relayed = speech_relay(body, read_timeout, move |outcome| {
+            let expected_len = response
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            let relayed = speech_relay(body, read_timeout, expected_len, move |outcome| {
                 // A stream can outlive several config generations, so the
                 // emit reads a FRESH snapshot (#941).
                 let snap = state_c.snapshot.load();
@@ -759,6 +764,10 @@ impl<F: FnOnce(StreamedTranscript)> Drop for TranscriptGuard<F> {
 fn speech_relay<S, F>(
     upstream: S,
     read_timeout: crate::stream_timeout::ReadTimeoutSignal,
+    // The `Content-Length` relayed to the caller, if any. The server stops
+    // polling a sized body once that many bytes are written, so the relay
+    // never sees its own end: reaching the length IS the end.
+    expected_len: Option<u64>,
     on_complete: F,
 ) -> impl futures::Stream<Item = reqwest::Result<Bytes>> + Send
 where
@@ -776,12 +785,19 @@ where
             slot: Some((on_complete, StreamedTranscript::default())),
         };
         futures::pin_mut!(upstream);
+        let mut relayed: u64 = 0;
         while let Some(item) = upstream.next().await {
-            if let Err(e) = &item {
-                crate::attempt::StreamFailure::record(
+            match &item {
+                Ok(bytes) => {
+                    relayed += bytes.len() as u64;
+                    if expected_len.is_some_and(|len| relayed >= len) {
+                        guard.observed().reached_end = true;
+                    }
+                }
+                Err(e) => crate::attempt::StreamFailure::record(
                     &mut guard.observed().failure,
                     &crate::dispatch::reqwest_error_to_bridge(e, started),
-                );
+                ),
             }
             yield item;
         }
