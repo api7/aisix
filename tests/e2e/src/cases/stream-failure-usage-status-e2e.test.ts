@@ -140,6 +140,18 @@ const TRANSCRIPT_CUT: OpenAiUpstreamOptions = {
   eventDelayMs: 50,
 };
 
+// Synthesized audio relayed in chunks: one that loses its connection after
+// the first, and one slow enough for the caller to read a chunk and leave.
+const SPEECH_CUT: OpenAiUpstreamOptions = {
+  rawStreamFrames: ["ID3-chunk-1", "chunk-2", "chunk-3"],
+  disconnectAfterEvents: 1,
+  eventDelayMs: 50,
+};
+const SPEECH_TRICKLE: OpenAiUpstreamOptions = {
+  rawStreamFrames: ["ID3-chunk-1", "chunk-2", "chunk-3", "chunk-4"],
+  eventDelayMs: 500,
+};
+
 const ROUTE = "sf-route";
 const ROUTE_PREFIX = "/passthrough/sf";
 const ERROR_ROUTE = "sf-route-in-band";
@@ -188,6 +200,8 @@ const MODELS: Record<string, Seeded> = {
   },
   "sf-ens-judge": { upstream: TRICKLE, kind: "chat" },
   "sf-transcribe-cut": { upstream: TRANSCRIPT_CUT, kind: "chat" },
+  "sf-speech-cut": { upstream: SPEECH_CUT, kind: "chat" },
+  "sf-speech-trickle": { upstream: SPEECH_TRICKLE, kind: "chat" },
 };
 const ENSEMBLE = "sf-ensemble";
 
@@ -460,6 +474,55 @@ describe("usage status of a stream that fails after its 200 headers", () => {
     await res.text().catch(() => undefined);
     expectUpstreamFailure(await usageRow(requestId), "502");
   });
+
+  async function speech(model: string, signal?: AbortSignal): Promise<Response> {
+    return fetch(`${app!.proxyUrl}/v1/audio/speech`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLER_PLAINTEXT}`, "content-type": "application/json" },
+      body: JSON.stringify({ model, input: "hello", voice: "alloy" }),
+      signal,
+    });
+  }
+
+  test("audio speech: audio that loses its upstream part-way is a 502 with its error", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const res = await speech("sf-speech-cut");
+    expect(res.status).toBe(200);
+    const requestId = res.headers.get("x-aisix-request-id") ?? "";
+    expect(requestId).not.toBe("");
+    await res.arrayBuffer().catch(() => undefined);
+    expectUpstreamFailure(await usageRow(requestId), "502");
+  });
+
+  test("audio speech: a caller that leaves part-way is a 499", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const controller = new AbortController();
+    const res = await speech("sf-speech-trickle", controller.signal);
+    expect(res.status).toBe(200);
+    const requestId = res.headers.get("x-aisix-request-id") ?? "";
+    expect(requestId).not.toBe("");
+    const reader = res.body!.getReader();
+    const first = await reader.read();
+    expect(first.done, "the audio delivered nothing to abandon").toBe(false);
+    controller.abort();
+    await reader.cancel().catch((err: unknown) => {
+      if (!(err instanceof Error) || err.name !== "AbortError") throw err;
+    });
+    const row = await usageRow(requestId);
+    expect(row.get("status_code")).toBe("499");
+    expect(row.get("error_class")).toBe("client_disconnected");
+  }, 30_000);
+
+  test("audio speech: audio that streams to its end is still a 200", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const res = await speech("sf-speech-trickle");
+    expect(res.status).toBe(200);
+    const requestId = res.headers.get("x-aisix-request-id") ?? "";
+    expect(Buffer.from(await res.arrayBuffer()).toString()).toBe("ID3-chunk-1chunk-2chunk-3chunk-4");
+    const row = await usageRow(requestId);
+    expect(row.get("status_code")).toBe("200");
+    expect(row.get("error_class") ?? "").toBe("");
+  }, 30_000);
 
   test("passthrough route: a stream that loses its upstream is a 502", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
