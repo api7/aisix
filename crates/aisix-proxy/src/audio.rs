@@ -3361,6 +3361,34 @@ mod tests {
         assert_eq!(observed.text(), "日本");
     }
 
+    /// An error envelope inside a transcription stream is the upstream's
+    /// failure, recorded with the status its own code maps to; the
+    /// ordinary transcript events never are one.
+    #[test]
+    fn an_in_band_error_envelope_is_recorded_as_the_stream_s_failure() {
+        let mut observed = super::StreamedTranscript::default();
+        let events = [
+            r#"{"type":"transcript.text.delta","delta":"hel"}"#,
+            r#"{"type":"error","error":{"message":"slow down","type":"rate_limit_error","code":429}}"#,
+        ]
+        .map(|p| aisix_gateway::SseEvent::Data(p.to_string()));
+        super::observe_transcript_events(&mut observed, &events, 1024);
+        let failure = observed.failure.clone().expect("the error envelope is a failure");
+        assert_eq!(failure.status, 429);
+        assert_eq!(failure.error_class, "upstream_in_band");
+        assert!(failure.error_message.contains("slow down"));
+        assert_eq!(observed.text(), "hel");
+
+        let mut clean = super::StreamedTranscript::default();
+        let events = [
+            r#"{"type":"transcript.text.delta","delta":"hi"}"#,
+            r#"{"type":"transcript.text.done","text":"hi","error":null}"#,
+        ]
+        .map(|p| aisix_gateway::SseEvent::Data(p.to_string()));
+        super::observe_transcript_events(&mut clean, &events, 1024);
+        assert!(clean.failure.is_none());
+    }
+
     /// The SSE read is content-type gated: a `srt`/`vtt` transcript is
     /// `text/plain` and may legitimately contain a line starting with
     /// `data:`, which must never be decoded as a usage-bearing event.

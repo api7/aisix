@@ -3032,7 +3032,7 @@ fn drain_responses_sse_frames(
 /// `response.failed`, whose Response carries `error: {code, message}`. Read
 /// the way an in-band error on any other wire is, so a code that names no
 /// HTTP status maps as one with none.
-fn responses_in_band_error(event: &Value) -> Option<aisix_gateway::BridgeError> {
+pub(crate) fn responses_in_band_error(event: &Value) -> Option<aisix_gateway::BridgeError> {
     let error = match event.get("type").and_then(Value::as_str)? {
         "error" => serde_json::json!({
             "message": event.get("message"),

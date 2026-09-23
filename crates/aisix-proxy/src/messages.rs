@@ -4338,6 +4338,42 @@ fn emit_access_log(
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod stream_failure_tests {
+    use super::*;
+
+    /// Anthropic's in-band `error` event is the stream's failure, at the
+    /// status its error type documents; one whose body does not parse is
+    /// still one, just without a status of its own.
+    #[test]
+    fn an_in_band_error_event_is_recorded_even_when_its_body_does_not_parse() {
+        let mut first_token_seen = false;
+        let mut typed = AnthropicStreamUsage::default();
+        let event = serde_json::json!({
+            "type": "error",
+            "error": {"type": "rate_limit_error", "message": "slow down"},
+        });
+        update_anthropic_usage(&mut typed, &event, Instant::now(), &mut first_token_seen);
+        let failure = typed.failure.expect("a typed error event is a failure");
+        assert_eq!(failure.status, 429);
+        assert!(failure.error_message.contains("slow down"));
+
+        let mut malformed = AnthropicStreamUsage::default();
+        let event = serde_json::json!({"type": "error", "error": "not an object"});
+        update_anthropic_usage(
+            &mut malformed,
+            &event,
+            Instant::now(),
+            &mut first_token_seen,
+        );
+        let failure = malformed
+            .failure
+            .expect("a malformed error event is still a failure");
+        assert_eq!(failure.status, 502);
+        assert_eq!(failure.error_class, "upstream_in_band");
+    }
+}
+
+#[cfg(test)]
 mod tests {
 
     use aisix_core::resource::ResourceEntry;

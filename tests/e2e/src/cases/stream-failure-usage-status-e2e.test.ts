@@ -142,6 +142,8 @@ const TRANSCRIPT_CUT: OpenAiUpstreamOptions = {
 
 const ROUTE = "sf-route";
 const ROUTE_PREFIX = "/passthrough/sf";
+const ERROR_ROUTE = "sf-route-in-band";
+const ERROR_ROUTE_PREFIX = "/passthrough/sf-in-band";
 
 interface Seeded {
   upstream: OpenAiUpstreamOptions;
@@ -276,6 +278,20 @@ describe("usage status of a stream that fails after its 200 headers", () => {
       path_prefix: ROUTE_PREFIX,
       target_url: routeUpstream.baseUrl,
       provider_key_id: routePk.id,
+    });
+    // And one onto an Anthropic upstream that reports a failure in-band.
+    const errorRouteUpstream = await startOpenAiUpstream({ rawStreamFrames: ANTHROPIC_IN_BAND_ERROR_FRAMES });
+    upstreams.push(errorRouteUpstream);
+    const errorRoutePk = await seed.createProviderKey({
+      display_name: "sf-route-in-band-pk",
+      secret: "sk-ant-mock",
+      api_base: errorRouteUpstream.baseUrl,
+    });
+    await seed.createPassthroughRoute({
+      name: ERROR_ROUTE,
+      path_prefix: ERROR_ROUTE_PREFIX,
+      target_url: errorRouteUpstream.baseUrl,
+      provider_key_id: errorRoutePk.id,
     });
     await seed.createModel({
       display_name: ENSEMBLE,
@@ -457,6 +473,28 @@ describe("usage status of a stream that fails after its 200 headers", () => {
     expect(requestId).not.toBe("");
     await res.text().catch(() => undefined);
     expectUpstreamFailure(await usageRow(requestId), "502");
+  });
+
+  test("passthrough route: an in-band upstream error records the status it maps to", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const res = await fetch(`${app.proxyUrl}${ERROR_ROUTE_PREFIX}/v1/messages`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLER_PLAINTEXT}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-3-5-haiku-20241022",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const requestId = res.headers.get("x-aisix-request-id") ?? "";
+    expect(requestId).not.toBe("");
+    // The caller still receives the upstream's own error event.
+    expect(await res.text()).toContain("rate_limit_error");
+    const row = await usageRow(requestId);
+    expectUpstreamFailure(row, "429");
+    expect(row.get("error_message")).toContain("exceeded your rate limit");
   });
 
   // ── The caller leaving ─────────────────────────────────────────────
