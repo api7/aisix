@@ -2293,6 +2293,10 @@ pub struct ResponsesStreamCompletion {
     /// the non-streaming path so the dashboard's Blocked tab + budget ledger
     /// see it.
     pub guardrail_blocked: bool,
+    /// The upstream failure that ended the stream — a mid-stream error, or
+    /// a stream that carried no response. The usage event reports it
+    /// instead of a `200`.
+    pub failure: Option<crate::attempt::StreamFailure>,
     /// Per-detector PII mask counts applied to the held stream at release
     /// (#932). Merged with the input-side counts by the on_complete emit.
     pub redacted_entity_counts: crate::redact::RedactionCounts,
@@ -2529,6 +2533,7 @@ pub fn build_responses_bridge_stream(
                         break;
                     }
                     let message = e.to_string();
+                    crate::attempt::StreamFailure::record(&mut guard.comp().failure, &e);
                     // The loop stops at the terminal event, so none went out.
                     yield Ok(failure_frames(
                         &mut encoder,
@@ -2553,6 +2558,14 @@ pub fn build_responses_bridge_stream(
                 model = %model_label,
                 "streaming /v1/responses (cross-provider) upstream returned an empty stream",
             );
+            // Recorded as what the same empty stream is before the headers
+            // go out — an aborted stream — with its own message.
+            guard.comp().failure = Some(crate::attempt::StreamFailure {
+                error_message: EMPTY_STREAM_MESSAGE.to_string(),
+                ..crate::attempt::StreamFailure::from_bridge(
+                    &aisix_gateway::BridgeError::StreamAborted,
+                )
+            });
             yield Ok(failure_frames(
                 &mut encoder,
                 sent_downstream,
