@@ -342,6 +342,13 @@ pub fn split_system<'a>(
     let mut seen_non_system = false;
 
     for m in &req.messages {
+        // Nothing on this wire carries replayed reasoning, so a turn that
+        // holds only that would become an empty text block, which the
+        // upstream rejects. The user turns it separated fold together
+        // below.
+        if m.is_reasoning_only() {
+            continue;
+        }
         match m.role {
             Role::System => {
                 if seen_non_system {
@@ -3180,6 +3187,46 @@ mod tests {
         assert_eq!(msgs[2].content[0]["type"], "tool_result");
         assert_eq!(msgs[2].content[0]["tool_use_id"], "toolu_abc");
         assert_eq!(msgs[2].content[0]["content"], "72F, sunny");
+    }
+
+    /// A replayed turn that holds only `reasoning_content` has no
+    /// Anthropic rendering: it is skipped rather than sent as an empty
+    /// text block, and the user turns it separated fold into one. An
+    /// assistant turn carrying reasoning beside its text keeps the text.
+    #[test]
+    fn a_reasoning_only_assistant_turn_is_skipped() {
+        let reasoning_only: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant", "content": null, "reasoning_content": "thinking",
+        }))
+        .unwrap();
+        let answered: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant", "content": "done", "reasoning_content": "thinking",
+        }))
+        .unwrap();
+        let req = ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::user("q1"),
+                reasoning_only,
+                ChatMessage::user("q2"),
+                answered,
+            ],
+        );
+        let (_system, msgs) = split_system(&req).unwrap();
+        let roles: Vec<&str> = msgs.iter().map(|m| m.role).collect();
+        assert_eq!(roles, ["user", "assistant"]);
+        assert_eq!(msgs[0].content.len(), 2, "the two user turns fold together");
+        assert_eq!(
+            msgs[1].content,
+            vec![serde_json::json!({"type": "text", "text": "done"})]
+        );
+        // An empty assistant turn with no reasoning is untouched.
+        let req = ChatFormat::new(
+            "m",
+            vec![ChatMessage::user("q"), ChatMessage::assistant("")],
+        );
+        let (_system, msgs) = split_system(&req).unwrap();
+        assert_eq!(msgs.len(), 2);
     }
 
     /// Build an assistant ChatMessage replaying a single tool call, the
