@@ -2853,7 +2853,9 @@ fn responses_error_frame(seq: u64, code: &str, message: &str) -> String {
 /// withheld — is preceded by `response.created` and
 /// `response.in_progress`: a stream that does not open with
 /// `response.created` is one the OpenAI SDKs' `responses.stream()` helper
-/// rejects with its own error, and the caller never sees this one.
+/// rejects with its own error, and the caller never sees this one. The
+/// numbering then starts at 0: events a held-back stream withheld were
+/// numbered, but the client never saw them.
 fn failure_frames(
     encoder: &mut ResponsesSseEncoder,
     sent_downstream: bool,
@@ -2864,6 +2866,7 @@ fn failure_frames(
 ) -> bytes::Bytes {
     let mut frames = String::new();
     if !sent_downstream {
+        encoder.sequence_number = 0;
         for ev in encoder.opening_events() {
             frames.push_str(&ev.to_sse_string());
         }
