@@ -40,6 +40,7 @@ Behavioral guidelines to reduce common LLM coding mistakes. Bias toward caution 
 **Define success criteria. Loop until verified.**
 
 - Turn tasks into verifiable goals: "add validation" → write tests for invalid inputs, then pass them; "fix the bug" → write a reproducing test first; "refactor X" → tests pass before and after.
+- For multi-step tasks, state a brief plan as `step → verify: check` lines.
 - Strong criteria let you loop independently; weak criteria ("make it work") require constant clarification.
 
 ## 5. Testing Discipline
@@ -85,7 +86,7 @@ The rule:
 
 **Every PR pushed must be reviewed by an independent audit agent. Merge is blocked until all HIGH/MEDIUM findings are resolved or explicitly justified.**
 
-Before merge, get an independent review from a reviewer with no shared context, briefed cold with the PR URL and the contract the PR claims to pin. Where the `aigw-review` merge gate is installed, that gate is this review (`/code-review <PR> high` plus a fresh `aigw-reviewer`) — do not run a second, built-in `general-purpose` reviewer on top of it. Treat each angle as blocking:
+After every `gh pr create` or force-push, spawn a fresh `general-purpose` Agent with no shared context. Brief it cold with the PR URL and the contract the PR claims to pin. Treat each angle as blocking:
 
 - **Correctness** — does it do what the description claims? Would a real regression fail the assertions?
 - **Reliability** — races, error handling, retry/timeout, propagation timing on slow CI.
