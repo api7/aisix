@@ -861,9 +861,8 @@ impl Drop for ClientCancelGuard {
         // any less complete. `cancel::emit` refuses to double the EVENT on
         // its own, but the line and the counter below have no such check —
         // and an open-ended body does not tell the two apart, because a
-        // family may relay one while metering at its own tail
-        // (`/v1/audio/speech`, billed per character, emits before the bytes
-        // flow).
+        // family may relay one while metering at its own tail, before the
+        // bytes flow.
         if matches!(phase, cancel::Phase::BeforeBody) && cancel_ctx.emitted_terminal {
             return;
         }
@@ -8886,6 +8885,7 @@ data: [DONE]\n\n",
         Router,
         tokio::sync::mpsc::Receiver<aisix_obs::UsageEvent>,
         MockServer,
+        std::sync::Arc<aisix_obs::Metrics>,
     ) {
         use aisix_obs::UsageSink;
 
@@ -8905,7 +8905,8 @@ data: [DONE]\n\n",
             .insert(passthrough_route_entry(&upstream.uri()));
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
-        (build_router(state), rx, upstream)
+        let metrics = state.metrics.clone();
+        (build_router(state), rx, upstream, metrics)
     }
 
     fn passthrough_sse_request() -> Request<Body> {
@@ -8928,7 +8929,7 @@ data: [DONE]\n\n",
     /// second `499` row behind it (AISIX-Cloud#1571).
     #[tokio::test]
     async fn a_delivered_relay_stream_files_one_row() {
-        let (app, mut rx, _upstream) = passthrough_sse_app().await;
+        let (app, mut rx, _upstream, _metrics) = passthrough_sse_app().await;
 
         let response = app.oneshot(passthrough_sse_request()).await.unwrap();
         assert_eq!(
@@ -8960,7 +8961,7 @@ data: [DONE]\n\n",
     /// guard that drops a moment later.
     #[tokio::test]
     async fn an_unpolled_relay_stream_is_filed_once_by_the_route_itself() {
-        let (app, mut rx, _upstream) = passthrough_sse_app().await;
+        let (app, mut rx, _upstream, metrics) = passthrough_sse_app().await;
 
         let response = app.oneshot(passthrough_sse_request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -8973,6 +8974,12 @@ data: [DONE]\n\n",
             rx.try_recv().is_err(),
             "the route's own stream guard already filed this request — a second row would \
              contradict it",
+        );
+        // The cancel counter and its line share the guard's branch, so the
+        // route's own filing must keep the guard from counting it again.
+        assert!(
+            !metrics.render().contains(CANCEL_METRIC),
+            "a request the route already filed was counted again as a client cancel",
         );
     }
 
@@ -9250,18 +9257,13 @@ data: [DONE]\n\n",
         }
     }
 
-    /// A relayed body the caller never reads, on a family that meters at
-    /// its own tail and streams the bytes afterwards (`/v1/audio/speech`,
-    /// billed per input character).
-    ///
-    /// The body is open-ended, so the guard rides it exactly as it does for
-    /// the families whose telemetry IS deferred to theirs — and must still
-    /// stand down, because this request's record was written before the
-    /// first byte flowed. `cancel::emit` refuses to double the event on its
-    /// own; the `499` line and the cancel counter, which share one branch,
-    /// are what this pins.
+    /// A relayed speech body the caller never reads. `/v1/audio/speech`
+    /// files its usage when the audio ends, from a guard built inside the
+    /// relay, so a body dropped before its first poll is the same window
+    /// every streaming family has: the request's cancel guard files it,
+    /// once, as a body-phase cancel.
     #[tokio::test]
-    async fn a_relayed_body_left_unread_is_not_a_cancel_when_the_handler_metered() {
+    async fn a_speech_body_left_unread_is_filed_once_as_a_body_phase_cancel() {
         use aisix_obs::UsageSink;
 
         let upstream = MockServer::start().await;
@@ -9279,7 +9281,6 @@ data: [DONE]\n\n",
         let snap = seed_snapshot("my-tts", &["my-tts"], &upstream.uri());
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
-        let metrics = state.metrics.clone();
         let app = build_router(state);
 
         let req = Request::builder()
@@ -9293,21 +9294,16 @@ data: [DONE]\n\n",
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-
-        let event = next_event(&mut rx).await;
-        assert_eq!(event.status_code, 200, "premise: the handler metered it");
-        assert_eq!(event.operation, "speech");
+        assert!(
+            rx.try_recv().is_err(),
+            "the handler no longer meters: the audio has not streamed yet",
+        );
 
         drop_body_unpolled(response);
 
-        // The counter is the non-vacuous half: `client_cancel_before_\
-        // response_head_is_recorded` pins that the guard DOES raise it, so
-        // its absence here is a decision, not an empty probe. The `499`
-        // line rides the same branch.
-        assert!(
-            !metrics.render().contains(CANCEL_METRIC),
-            "a completed request was counted — and logged — as a client cancel",
-        );
+        let event = next_event(&mut rx).await;
+        assert_body_phase_cancel(&event);
+        assert_eq!(event.operation, "speech");
         assert!(rx.try_recv().is_err(), "one request, one row");
     }
 

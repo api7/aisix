@@ -886,6 +886,7 @@ async fn dispatch(
         streaming: false,
         error_class: String::new(),
         error_message: String::new(),
+        failure_status: None,
         monitor_hits,
         audit: audit_out.clone(),
         captured_prompt,
@@ -1676,6 +1677,42 @@ fn is_usage_labelled_frame(frame_text: &str) -> bool {
 ///
 /// Frames accumulate field-wise (see [`PassthroughUsage::merge`]) at the
 /// call site, so a partial report never truncates an earlier one.
+/// The upstream failure an SSE frame reports in-band, read with the same
+/// mappings the typed endpoints use for the protocol the route carries. An
+/// opaque (`Raw`) stream has no error envelope the gateway could recognise.
+fn frame_in_band_error(
+    protocol: PassthroughProtocol,
+    frame: &[u8],
+) -> Option<aisix_gateway::BridgeError> {
+    if matches!(protocol, PassthroughProtocol::Raw) {
+        return None;
+    }
+    let payload = crate::redact::frame_payload(frame)?;
+    let payload = payload.trim();
+    let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    match protocol {
+        PassthroughProtocol::Raw => None,
+        PassthroughProtocol::OpenaiResponses => crate::responses::responses_in_band_error(&value),
+        // The chat envelope carries Anthropic Messages traffic too, whose
+        // in-band failure is a `type: "error"` event.
+        PassthroughProtocol::OpenaiChat | PassthroughProtocol::OpenaiCompletions => {
+            if value.get("type").and_then(|t| t.as_str()) == Some("error") {
+                if let Some(body) = value.get("error").and_then(|e| {
+                    serde_json::from_value::<
+                            aisix_provider_anthropic::wire::AnthropicStreamErrorBody,
+                        >(e.clone())
+                        .ok()
+                }) {
+                    return Some(
+                        aisix_provider_anthropic::wire::stream_error_into_bridge_error(&body),
+                    );
+                }
+            }
+            aisix_gateway::capture_in_band_error(payload, aisix_gateway::UpstreamWire::OpenAI)
+        }
+    }
+}
+
 fn frame_delta(protocol: PassthroughProtocol, frame: &[u8]) -> (String, Option<PassthroughUsage>) {
     let frame_text = String::from_utf8_lossy(frame);
     let usage_labelled = matches!(protocol, PassthroughProtocol::Raw)
@@ -1853,9 +1890,7 @@ fn stream_response(
                     // no status left to carry the failure — record it on the
                     // event instead of ending as a silent success.
                     let bridge = crate::dispatch::reqwest_error_to_bridge(&err, telemetry.started);
-                    telemetry.error_class =
-                        crate::attempt::routing_error_class(&bridge).to_string();
-                    telemetry.error_message = crate::attempt::attempt_error_message(&bridge);
+                    telemetry.record_failure(&bridge);
                     tracing::warn!(
                         route = %route_name,
                         error = %telemetry.error_message,
@@ -1875,6 +1910,9 @@ fn stream_response(
                     .min(u32::MAX as u128) as u32;
             }
             for frame in splitter.push(&chunk) {
+                if let Some(err) = frame_in_band_error(protocol, &frame) {
+                    telemetry.record_failure(&err);
+                }
                 let (delta, usage) = frame_delta(protocol, &frame);
                 if let Some(u) = usage {
                     telemetry.usage.merge(u);
@@ -2167,6 +2205,11 @@ struct RouteTelemetry {
     /// the response head is already on the wire.
     error_class: String,
     error_message: String,
+    /// The status that same failure gets before the response head
+    /// ([`aisix_gateway::BridgeError::http_status`]). The emit records it in
+    /// place of the upstream's `200`: the caller's response line cannot
+    /// change any more, but the record of what happened can.
+    failure_status: Option<u16>,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// The request's ENFORCE-mode audit handle (AISIX-Cloud#1330). Held
     /// rather than snapshotted at construction: this struct's emit runs
@@ -2181,6 +2224,19 @@ struct RouteTelemetry {
 }
 
 impl RouteTelemetry {
+    /// Record the upstream failure that ended a streamed relay after its
+    /// head went out. The first one is the cause; later ones do not replace
+    /// it.
+    fn record_failure(&mut self, err: &aisix_gateway::BridgeError) {
+        if self.failure_status.is_some() {
+            return;
+        }
+        let failure = crate::attempt::StreamFailure::from_bridge(err);
+        self.error_class = failure.error_class.to_string();
+        self.error_message = failure.error_message;
+        self.failure_status = Some(failure.status);
+    }
+
     /// Stamp the caller's wait at the first RELAYED frame handed
     /// downstream.
     ///
@@ -2210,8 +2266,14 @@ impl RouteTelemetry {
         // generator's end. The upstream status is then not what happened
         // to the request, so record the same 499 the typed streaming
         // endpoints do rather than a success the caller never received.
-        if self.streaming && !self.stream_reached_end {
-            self.status = crate::CLIENT_CLOSED_REQUEST;
+        // One an upstream failure ended records that failure's status
+        // instead, unless a guardrail refused it.
+        if self.streaming {
+            match self.failure_status.filter(|_| !self.guardrail_blocked) {
+                Some(status) => self.status = status,
+                None if !self.stream_reached_end => self.status = crate::CLIENT_CLOSED_REQUEST,
+                None => {}
+            }
         }
         let elapsed = self.started.elapsed();
         let snapshot = self.state.snapshot.load();
@@ -2846,6 +2908,30 @@ mod tests {
         let frames = s.push(b"data: x\r\n\r\nrest");
         assert_eq!(frames.len(), 1);
         assert_eq!(s.take_rest(), b"rest");
+    }
+
+    #[test]
+    fn frame_in_band_error_reads_the_protocol_s_own_failure_events() {
+        let anthropic = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n";
+        let err = frame_in_band_error(PassthroughProtocol::OpenaiChat, anthropic).unwrap();
+        // Anthropic documents 529 for overloaded; not a 4xx, so it maps to 502.
+        assert_eq!(err.http_status(), 502);
+        let openai =
+            br#"data: {"error":{"message":"slow down","type":"rate_limit_error","code":429}}
+
+"#;
+        let err = frame_in_band_error(PassthroughProtocol::OpenaiCompletions, openai).unwrap();
+        assert_eq!(err.http_status(), 429);
+        let responses = br#"data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"x"}}}
+
+"#;
+        assert!(frame_in_band_error(PassthroughProtocol::OpenaiResponses, responses).is_some());
+        // An opaque stream is never read for one, and ordinary frames are not one.
+        assert!(frame_in_band_error(PassthroughProtocol::Raw, openai).is_none());
+        let delta = br#"data: {"choices":[{"delta":{"content":"hel"}}]}
+
+"#;
+        assert!(frame_in_band_error(PassthroughProtocol::OpenaiChat, delta).is_none());
     }
 
     #[test]

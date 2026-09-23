@@ -31,7 +31,12 @@ import type { OpenAiUpstreamOptions } from "../harness/upstream-openai.js";
 //
 // 3. An upstream stream that carries nothing (a bare `[DONE]`, a usage-only
 //    frame) fails with a retryable code instead of completing with an empty
-//    output that the client takes as a finished turn.
+//    output that the client takes as a finished turn. A failure that is the
+//    first thing the client receives — that one, a connection dropped before
+//    the first chunk, a held-back output blocked by a guardrail — still
+//    opens the stream with `response.created` and `response.in_progress`:
+//    the OpenAI SDKs' `responses.stream()` helper rejects a stream that
+//    does not, and its caller never sees the real error.
 //
 // 4. Replayed `reasoning` items reach the upstream as `reasoning_content` on
 //    the assistant message they belong to. They used to be dropped.
@@ -149,6 +154,13 @@ const UPSTREAMS: Record<string, OpenAiUpstreamOptions> = {
     ],
   },
   "parity-empty-stream": { streamEvents: ["[DONE]"] },
+  // Headers, then the connection drops before the first chunk.
+  "parity-cut-before-first-chunk": {
+    streamEvents: [chunk({ content: "never sent" }), chunk({}, "stop", USAGE), "[DONE]"],
+    disconnectAfterEvents: 0,
+    // Lets the headers reach the socket before the connection is destroyed.
+    firstEventDelayMs: 50,
+  },
   "parity-usage-only-stream": { streamEvents: [chunk({}, null, USAGE), "[DONE]"] },
   "parity-output-blocked": {
     streamEvents: [chunk({ content: `this carries ${FORBIDDEN_OUTPUT}` }), chunk({}, "stop", USAGE), "[DONE]"],
@@ -199,6 +211,26 @@ function parseSse(text: string): SseFrame[] {
 function expectFullResponse(r: Record<string, any>): void {
   const missing = RESPONSE_MEMBERS.filter((k) => !(k in r));
   expect(missing, `Response object lacks ${missing.join(", ")}`).toEqual([]);
+}
+
+const FAILED_BEFORE_ANY_OUTPUT = ["response.created", "response.in_progress", "error", "response.failed"];
+
+/** A stream whose failure was the first thing to reach the client: opened,
+ *  then failed, one Response throughout, numbered from zero. */
+function expectOpenedThenFailed(frames: SseFrame[]): [Record<string, any>, Record<string, any>] {
+  expect(frames.map((f) => f.data.type)).toEqual(FAILED_BEFORE_ANY_OUTPUT);
+  expect(frames.map((f) => f.event)).toEqual(FAILED_BEFORE_ANY_OUTPUT);
+  expect(frames.map((f) => f.data.sequence_number)).toEqual([0, 1, 2, 3]);
+  const [created, inProgress, error, failed] = frames.map((f) => f.data);
+  for (const opening of [created!, inProgress!]) {
+    expectFullResponse(opening.response);
+    expect(opening.response.status).toBe("in_progress");
+    expect(opening.response.output).toEqual([]);
+  }
+  expect(failed!.response.id).toBe(created!.response.id);
+  expect(failed!.response.status).toBe("failed");
+  expect(failed!.response.error.message).toBe(error!.message);
+  return [error!, failed!];
 }
 
 describe("/v1/responses bridge: what an agent client needs from a non-OpenAI model", () => {
@@ -359,12 +391,10 @@ describe("/v1/responses bridge: what an agent client needs from a non-OpenAI mod
   test("an output-guardrail block ends with response.failed carrying invalid_prompt", async (ctx) => {
     if (!etcdReachable || !app) return void ctx.skip();
     const frames = await streamFrames("parity-output-blocked");
-    // Held back and never released: nothing but the two failure events.
-    expect(frames.map((f) => f.data.type)).toEqual(["error", "response.failed"]);
-    const [error, failed] = frames.map((f) => f.data);
-    expect(error!.code).toBe("content_filter");
-    expect(failed!.response.error.code).toBe("invalid_prompt");
-    expect(failed!.response.error.message).toBe(error!.message);
+    // Held back and never released: the stream is opened, then fails.
+    const [error, failed] = expectOpenedThenFailed(frames);
+    expect(error.code).toBe("content_filter");
+    expect(failed.response.error.code).toBe("invalid_prompt");
     expect(JSON.stringify(frames)).not.toContain(FORBIDDEN_OUTPUT);
   });
 
@@ -387,14 +417,20 @@ describe("/v1/responses bridge: what an agent client needs from a non-OpenAI mod
     test(`${model}: a stream that carried nothing fails with a retryable code`, async (ctx) => {
       if (!etcdReachable || !app) return void ctx.skip();
       const frames = await streamFrames(model);
-      expect(frames.map((f) => f.data.type)).toEqual(["error", "response.failed"]);
-      const [error, failed] = frames.map((f) => f.data);
-      expect(error!.code).toBe("upstream_error");
-      expect(error!.message).toContain("empty stream");
-      expect(failed!.response.status).toBe("failed");
-      expect(failed!.response.error.code).toBe("upstream_error");
+      const [error, failed] = expectOpenedThenFailed(frames);
+      expect(error.code).toBe("upstream_error");
+      expect(error.message).toContain("empty stream");
+      expect(failed.response.error.code).toBe("upstream_error");
     });
   }
+
+  test("a connection dropped before the first chunk opens the stream, then fails", async (ctx) => {
+    if (!etcdReachable || !app) return void ctx.skip();
+    const frames = await streamFrames("parity-cut-before-first-chunk");
+    const [error, failed] = expectOpenedThenFailed(frames);
+    expect(error.code).toBe("transport_error");
+    expect(failed.response.error.code).toBe("transport_error");
+  });
 
   // ── 4. Replayed reasoning ───────────────────────────────────────────
 

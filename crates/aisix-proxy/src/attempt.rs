@@ -307,6 +307,58 @@ pub(crate) fn attempt_error_message(err: &BridgeError) -> String {
     sanitize_error_message(&err.to_string())
 }
 
+/// An upstream-side failure that ended a stream after its `200` headers
+/// had gone out: a mid-stream upstream, transport, decode or timeout error,
+/// an in-band upstream error, or a stream that carried no response.
+///
+/// The terminal usage event records the status the same error would have
+/// produced had it arrived before the headers ([`BridgeError::http_status`]),
+/// and the error itself as its `error_class` / `error_message` — not the
+/// `200` the client's response line says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamFailure {
+    pub status: u16,
+    pub error_class: &'static str,
+    pub error_message: String,
+}
+
+impl StreamFailure {
+    pub fn from_bridge(err: &BridgeError) -> Self {
+        Self {
+            status: err.http_status(),
+            error_class: routing_error_class(err),
+            error_message: attempt_error_message(err),
+        }
+    }
+
+    /// Record `err` unless an earlier failure already ended the stream: the
+    /// first one is the cause, whatever the relay reported after it.
+    pub fn record(slot: &mut Option<Self>, err: &BridgeError) {
+        if slot.is_none() {
+            *slot = Some(Self::from_bridge(err));
+        }
+    }
+
+    /// Stamp this failure onto an attempt record bound for a usage event.
+    pub fn apply_to(&self, attempt: &mut AttemptInfo) {
+        attempt.error_class = self.error_class.to_string();
+        attempt.error_message = self.error_message.clone();
+    }
+}
+
+/// The usage-event status of a stream no guardrail refused: its upstream
+/// failure's status if it had one, `499` if the caller went away first,
+/// otherwise `200`. A failure outranks the disconnect: a relay that passes
+/// a transport error on aborts the connection, which reads as the caller
+/// leaving, and the failure is what ended the stream.
+pub(crate) fn stream_status(reached_end: bool, failure: Option<&StreamFailure>) -> u16 {
+    match failure {
+        Some(f) => f.status,
+        None if reached_end => 200,
+        None => crate::CLIENT_CLOSED_REQUEST,
+    }
+}
+
 /// Failure class + reason for the access log's `error_kind` / `error`
 /// fields.
 ///
@@ -595,5 +647,34 @@ mod tests {
     fn control_chars_are_stripped() {
         let got = attempt_error_message(&upstream_status("line one\nline\ttwo"));
         assert!(got.ends_with("line onelinetwo"), "got: {got}");
+    }
+
+    /// An upstream failure outranks a lost caller: a relay that passes a
+    /// transport error on aborts the connection, which is indistinguishable
+    /// from the caller leaving. Without one, a stream that did not reach its
+    /// end is the caller's `499`.
+    #[test]
+    fn stream_status_prefers_the_upstream_failure_to_the_disconnect() {
+        let failure = StreamFailure::from_bridge(&BridgeError::Timeout {
+            elapsed_ms: 10,
+            cause: String::new(),
+        });
+        assert_eq!(stream_status(false, Some(&failure)), 504);
+        assert_eq!(stream_status(true, Some(&failure)), 504);
+        assert_eq!(stream_status(false, None), crate::CLIENT_CLOSED_REQUEST);
+        assert_eq!(stream_status(true, None), 200);
+        assert_eq!(failure.error_class, "timeout");
+    }
+
+    /// The first failure is the cause; what the relay reports after it does
+    /// not replace it.
+    #[test]
+    fn the_first_stream_failure_is_kept() {
+        let mut slot = None;
+        StreamFailure::record(&mut slot, &upstream_status("first"));
+        StreamFailure::record(&mut slot, &BridgeError::Transport("second".into()));
+        let kept = slot.unwrap();
+        assert_eq!(kept.error_class, "upstream_status");
+        assert!(kept.error_message.contains("first"), "{kept:?}");
     }
 }

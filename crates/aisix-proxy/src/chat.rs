@@ -2286,14 +2286,10 @@ async fn dispatch(
                     &model_for_metrics,
                     &api_key_id_for_telem,
                     // A stream the consumer abandoned mid-flight is reported
-                    // as 499, matching what LiteLLM records for the same
-                    // event. The upstream work still happened, so the event
+                    // as 499, one an upstream error ended as that error's
+                    // status. The upstream work still happened, so the event
                     // is emitted either way — only its outcome differs.
-                    if comp.reached_end {
-                        200
-                    } else {
-                        crate::CLIENT_CLOSED_REQUEST
-                    },
+                    stream_terminal_status(&comp),
                     // Scoped to the winning attempt, not the request: the
                     // failed attempts before it emit their own events and
                     // `started` would double-count them (plus the pre-dispatch
@@ -2341,8 +2337,16 @@ async fn dispatch(
                         attempt_index: winner_idx,
                         attempt_kind: winner_kind.to_string(),
                         attempt_model: attempt_model_for_telem.clone(),
-                        error_class: String::new(),
-                        error_message: String::new(),
+                        error_class: comp
+                            .failure
+                            .as_ref()
+                            .map(|f| f.error_class.to_string())
+                            .unwrap_or_default(),
+                        error_message: comp
+                            .failure
+                            .as_ref()
+                            .map(|f| f.error_message.clone())
+                            .unwrap_or_default(),
                         applied_guardrails: applied_guardrails_for_telem.clone(),
                         redacted_entity_counts: {
                             let mut merged = input_redactions_for_telem.clone();
@@ -4195,7 +4199,9 @@ async fn dispatch_ensemble(
                     &judge_model_id,
                     &client_model_for_telem,
                     &api_key_id_for_telem,
-                    200,
+                    // The judge's stream is the one the caller reads: its
+                    // abandonment or upstream failure is the request's.
+                    stream_terminal_status(&comp),
                     started.elapsed(),
                     comp.prompt_tokens,
                     comp.completion_tokens,
@@ -4223,6 +4229,16 @@ async fn dispatch_ensemble(
                         attempt_index: judge_attempt_index,
                         attempt_kind: "judge".to_string(),
                         attempt_model: judge_attempt_model.clone(),
+                        error_class: comp
+                            .failure
+                            .as_ref()
+                            .map(|f| f.error_class.to_string())
+                            .unwrap_or_default(),
+                        error_message: comp
+                            .failure
+                            .as_ref()
+                            .map(|f| f.error_message.clone())
+                            .unwrap_or_default(),
                         applied_guardrails: applied_guardrails_for_telem.clone(),
                         redacted_entity_counts: {
                             let mut merged = input_redactions_for_telem.clone();
@@ -5342,6 +5358,20 @@ struct StreamCompletion {
     /// still be abandoned midway, and a zero-chunk stream can still
     /// legitimately reach its end (an immediate error frame).
     reached_end: bool,
+    /// The upstream error that ended the stream after its `200` went out,
+    /// if one did. The terminal usage event reports it instead of a `200`.
+    failure: Option<crate::attempt::StreamFailure>,
+}
+
+/// The terminal usage-event status of a chat stream. A guardrail block keeps
+/// what it recorded before upstream failures were told apart: `200` once the
+/// stream ran to its end, `499` if the caller left first.
+fn stream_terminal_status(comp: &StreamCompletion) -> u16 {
+    if comp.guardrail_blocked {
+        crate::attempt::stream_status(comp.reached_end, None)
+    } else {
+        crate::attempt::stream_status(comp.reached_end, comp.failure.as_ref())
+    }
 }
 
 /// Parameters needed to run output-guardrail evaluation at
@@ -5769,6 +5799,7 @@ where
                 }
                 Err(err) => {
                     errored = true;
+                    crate::attempt::StreamFailure::record(&mut guard.comp().failure, &err);
                     let etype = err.error_type();
                     yield Ok::<_, Infallible>(
                         Event::default()

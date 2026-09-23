@@ -1630,6 +1630,17 @@ impl ResponsesSseEncoder {
         seq
     }
 
+    /// `response.created` then `response.in_progress`, each carrying the
+    /// Response object with `status: "in_progress"`: the two events every
+    /// stream opens with, a failed one included.
+    fn opening_events(&mut self) -> [ResponsesSseEvent; 2] {
+        let response = self.response_object("in_progress", false, None, None);
+        [
+            self.event("response.created", json!({"response": response.clone()})),
+            self.event("response.in_progress", json!({"response": response})),
+        ]
+    }
+
     /// Build one event, stamping `type` + `sequence_number`.
     fn event(&mut self, event_type: &'static str, mut data: Value) -> ResponsesSseEvent {
         let seq = self.sequence_number;
@@ -1829,9 +1840,7 @@ impl ResponsesSseEncoder {
 
         if !self.sent_created && (has_content || has_tools || has_reasoning || has_finish) {
             self.sent_created = true;
-            let response = self.response_object("in_progress", false, None, None);
-            events.push(self.event("response.created", json!({"response": response.clone()})));
-            events.push(self.event("response.in_progress", json!({"response": response})));
+            events.extend(self.opening_events());
         }
 
         // ── Reasoning ──
@@ -2284,6 +2293,10 @@ pub struct ResponsesStreamCompletion {
     /// the non-streaming path so the dashboard's Blocked tab + budget ledger
     /// see it.
     pub guardrail_blocked: bool,
+    /// The upstream failure that ended the stream — a mid-stream error, or
+    /// a stream that carried no response. The usage event reports it
+    /// instead of a `200`.
+    pub failure: Option<crate::attempt::StreamFailure>,
     /// Per-detector PII mask counts applied to the held stream at release
     /// (#932). Merged with the input-side counts by the on_complete emit.
     pub redacted_entity_counts: crate::redact::RedactionCounts,
@@ -2393,10 +2406,18 @@ pub fn build_responses_bridge_stream(
             slot: Some((on_complete, ResponsesStreamCompletion::default())),
             estimator,
         };
+        // Whether any event has left for the client yet; a failure that
+        // would be the first one opens the stream itself.
+        let mut sent_downstream = false;
         // Stamped on the first bytes that actually leave for the client —
         // under hold-back that is the release, not the upstream chunk.
         macro_rules! downstream_mark {
             () => {
+                // Dead after the final release, which no failure follows.
+                #[allow(unused_assignments)]
+                {
+                    sent_downstream = true;
+                }
                 if guard.comp().downstream_latency_ms == 0 {
                     guard.comp().downstream_latency_ms =
                         started.elapsed().as_millis().min(u32::MAX as u128) as u32;
@@ -2512,9 +2533,11 @@ pub fn build_responses_bridge_stream(
                         break;
                     }
                     let message = e.to_string();
+                    crate::attempt::StreamFailure::record(&mut guard.comp().failure, &e);
                     // The loop stops at the terminal event, so none went out.
                     yield Ok(failure_frames(
                         &mut encoder,
+                        sent_downstream,
                         false,
                         e.error_type(),
                         upstream_failed_code(&e),
@@ -2535,8 +2558,17 @@ pub fn build_responses_bridge_stream(
                 model = %model_label,
                 "streaming /v1/responses (cross-provider) upstream returned an empty stream",
             );
+            // Recorded as what the same empty stream is before the headers
+            // go out — an aborted stream — with its own message.
+            guard.comp().failure = Some(crate::attempt::StreamFailure {
+                error_message: EMPTY_STREAM_MESSAGE.to_string(),
+                ..crate::attempt::StreamFailure::from_bridge(
+                    &aisix_gateway::BridgeError::StreamAborted,
+                )
+            });
             yield Ok(failure_frames(
                 &mut encoder,
+                sent_downstream,
                 false,
                 EMPTY_STREAM_CODE,
                 EMPTY_STREAM_CODE,
@@ -2609,6 +2641,7 @@ pub fn build_responses_bridge_stream(
             guard.comp().guardrail_blocked = true;
             yield Ok(guardrail_failure_frames(
                 &mut encoder,
+                sent_downstream,
                 // Only a held-back stream can overflow: nothing was sent.
                 false,
                 None,
@@ -2740,6 +2773,7 @@ pub fn build_responses_bridge_stream(
                 let terminal_sent = !buffering && encoder.is_finished();
                 yield Ok(guardrail_failure_frames(
                     &mut encoder,
+                    sent_downstream,
                     terminal_sent,
                     guardrail_name.as_deref(),
                     unavailable.as_deref(),
@@ -2830,14 +2864,35 @@ fn responses_error_frame(seq: u64, code: &str, message: &str) -> String {
 /// The two carry the same message; `frame_code` is the flat event's code,
 /// `failed_code` the Response object's `error.code`, which clients map to a
 /// retry decision.
+///
+/// A failure that is the first thing the client receives — the upstream
+/// failed or ended before producing anything, or a held-back stream was
+/// withheld — is preceded by `response.created` and
+/// `response.in_progress`: a stream that does not open with
+/// `response.created` is one the OpenAI SDKs' `responses.stream()` helper
+/// rejects with its own error, and the caller never sees this one. The
+/// numbering then starts at 0: events a held-back stream withheld were
+/// numbered, but the client never saw them.
 fn failure_frames(
     encoder: &mut ResponsesSseEncoder,
+    sent_downstream: bool,
     terminal_sent: bool,
     frame_code: &str,
     failed_code: &str,
     message: &str,
 ) -> bytes::Bytes {
-    let mut frames = responses_error_frame(encoder.take_sequence_number(), frame_code, message);
+    let mut frames = String::new();
+    if !sent_downstream {
+        encoder.sequence_number = 0;
+        for ev in encoder.opening_events() {
+            frames.push_str(&ev.to_sse_string());
+        }
+    }
+    frames.push_str(&responses_error_frame(
+        encoder.take_sequence_number(),
+        frame_code,
+        message,
+    ));
     if !terminal_sent {
         frames.push_str(&encoder.failed_event(failed_code, message).to_sse_string());
     }
@@ -2853,12 +2908,14 @@ fn failure_frames(
 /// that will not succeed on retry, and show its message.
 fn guardrail_failure_frames(
     encoder: &mut ResponsesSseEncoder,
+    sent_downstream: bool,
     terminal_sent: bool,
     guardrail_name: Option<&str>,
     unavailable: Option<&str>,
 ) -> bytes::Bytes {
     failure_frames(
         encoder,
+        sent_downstream,
         terminal_sent,
         "content_filter",
         "invalid_prompt",
@@ -4299,6 +4356,7 @@ mod tests {
         let block = sse_events(&guardrail_failure_frames(
             &mut enc,
             true,
+            true,
             Some("gr-block"),
             None,
         ));
@@ -4315,6 +4373,7 @@ mod tests {
         // message is JSON-escaped through serde rather than interpolated.
         let upstream = sse_events(&failure_frames(
             &mut enc,
+            true,
             true,
             "upstream_error",
             "upstream_error",
@@ -4351,6 +4410,7 @@ mod tests {
         let _ = enc.next_events(&content_chunk("partial"));
         let events = sse_events(&guardrail_failure_frames(
             &mut enc,
+            true,
             false,
             Some("gr-block"),
             None,
@@ -5252,7 +5312,8 @@ mod tests {
 
     /// A stream that ends before carrying any piece of a response — here a
     /// usage-only frame — fails with a retryable code instead of completing
-    /// with an empty output.
+    /// with an empty output. Nothing went out before the failure, so it
+    /// opens the stream with `response.created` + `response.in_progress`.
     #[tokio::test]
     async fn an_empty_upstream_stream_fails_instead_of_completing() {
         let usage_only = ChatChunk {
@@ -5263,17 +5324,54 @@ mod tests {
             usage: Some(UsageStats::new(10, 0)),
         };
         let (events, comp) = relay(vec![Ok(usage_only)]).await;
-        assert_eq!(event_names(&events), ["error", "response.failed"]);
-        assert_eq!(events[0].1["code"], "upstream_error");
-        let failed = &events[1].1["response"];
+        assert_eq!(event_names(&events), FAILED_BEFORE_ANY_OUTPUT);
+        assert_opened_then_failed(&events);
+        assert_eq!(events[2].1["code"], "upstream_error");
+        let failed = &events[3].1["response"];
         assert_eq!(failed["status"], "failed");
         assert_eq!(failed["error"]["code"], "upstream_error");
-        assert_eq!(failed["error"]["message"], events[0].1["message"]);
+        assert_eq!(failed["error"]["message"], events[2].1["message"]);
         // Accounted like any upstream failure mid-relay.
         assert!(!comp.reached_end);
 
         let (events, _) = relay(Vec::new()).await;
-        assert_eq!(event_names(&events), ["error", "response.failed"]);
+        assert_eq!(event_names(&events), FAILED_BEFORE_ANY_OUTPUT);
+        assert_opened_then_failed(&events);
+    }
+
+    const FAILED_BEFORE_ANY_OUTPUT: [&str; 4] = [
+        "response.created",
+        "response.in_progress",
+        "error",
+        "response.failed",
+    ];
+
+    /// The opening pair carries the same in-progress Response the failure
+    /// then ends, and the sequence runs 0..n without a gap.
+    fn assert_opened_then_failed(events: &[(String, Value)]) {
+        for (i, (_, data)) in events.iter().enumerate() {
+            assert_eq!(data["sequence_number"], i as u64);
+        }
+        for (_, data) in &events[..2] {
+            assert_eq!(data["response"]["id"], "resp_1");
+            assert_eq!(data["response"]["status"], "in_progress");
+            assert_eq!(data["response"]["output"], json!([]));
+        }
+        assert_eq!(events[3].1["response"]["id"], "resp_1");
+        assert_eq!(events[3].1["response"]["status"], "failed");
+    }
+
+    /// An upstream failure before the first chunk is also the first thing
+    /// the client receives, so it opens the stream the same way.
+    #[tokio::test]
+    async fn a_transport_error_before_any_chunk_opens_the_stream_then_fails() {
+        let (events, _) = relay(vec![Err(aisix_gateway::BridgeError::Transport(
+            "connection reset".into(),
+        ))])
+        .await;
+        assert_eq!(event_names(&events), FAILED_BEFORE_ANY_OUTPUT);
+        assert_opened_then_failed(&events);
+        assert_eq!(events[2].1["code"], "transport_error");
     }
 
     /// A stream that produced content and then simply ended keeps
@@ -5318,6 +5416,11 @@ mod tests {
         .await;
         let names = event_names(&events);
         assert_eq!(&names[names.len() - 2..], ["error", "response.failed"]);
+        // Already opened by the content chunk: not opened a second time.
+        assert_eq!(
+            names.iter().filter(|n| **n == "response.created").count(),
+            1
+        );
         let (error, failed) = (&events[events.len() - 2].1, &events[events.len() - 1].1);
         assert_eq!(error["code"], "transport_error");
         assert_eq!(failed["response"]["error"]["code"], "transport_error");
