@@ -2227,10 +2227,11 @@ async fn responses_cross_provider_to_target(
     let outbound_body = crate::effort_mapping::responses_request(body, model);
     let chat =
         crate::responses_bridge::responses_request_to_chat(requested_model, outbound_body.as_ref());
-    // A `custom` tool travels upstream as a function tool, so only the
-    // request's own tool list can tell the reply translators which of the
-    // model's calls the caller is waiting for as a `custom_tool_call` item.
-    let custom_tools = crate::responses_bridge::custom_tool_names(outbound_body.as_ref());
+    // `custom` tools and namespace sub-tools travel upstream as plain
+    // function tools, so only the request's own tool list can tell the
+    // reply translators which item each of the model's calls goes back as;
+    // the request also supplies the settings every Response object echoes.
+    let reply = crate::responses_bridge::ResponsesReplyContext::from_request(body);
 
     let is_stream = chat.is_streaming();
     let mut ctx = crate::dispatch::bridge_ctx(
@@ -2320,7 +2321,7 @@ async fn responses_cross_provider_to_target(
             response_id,
             requested_model,
             created_at,
-            custom_tools,
+            reply,
         );
         // Only an output-hook guardrail needs the streamed response text.
         // When attached with a hold-back policy (Window/BufferFull — any
@@ -2677,7 +2678,7 @@ async fn responses_cross_provider_to_target(
         &resp,
         requested_model,
         created_at,
-        &custom_tools,
+        &reply,
     );
     // Content capture (AISIX-Cloud#947): the client-visible Responses JSON
     // (post-redaction) is the source, so the exported text matches what the

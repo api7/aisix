@@ -235,6 +235,29 @@ impl ChatMessage {
     pub fn content_str(&self) -> &str {
         self.content.as_deref().unwrap_or("")
     }
+
+    /// An assistant turn whose only payload is `reasoning_content`: no
+    /// text, no content blocks, no tool calls. A client replaying a
+    /// model's earlier chain-of-thought that no answer followed sends one
+    /// (the `/v1/responses` bridge builds it from such a `reasoning`
+    /// item). A bridge whose wire has no slot for replayed reasoning must
+    /// skip it rather than render an empty assistant turn, which those
+    /// upstreams reject.
+    pub fn is_reasoning_only(&self) -> bool {
+        matches!(self.role, Role::Assistant)
+            && self.content.as_deref().is_none_or(str::is_empty)
+            && self.content_blocks.as_ref().is_none_or(Vec::is_empty)
+            && self
+                .extra
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+            && self
+                .extra
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+    }
 }
 
 /// Normalised chat completion request.

@@ -1212,6 +1212,13 @@ fn build_converse_inputs(
     let mut pending_tool_results: Vec<ContentBlock> = Vec::new();
 
     for msg in &req.messages {
+        // Converse has no slot for replayed reasoning, and a turn that
+        // holds only that would become a blank text block, which Converse
+        // rejects. Skipped before the flush below, so tool results on
+        // either side of it still coalesce as if it were not there.
+        if msg.is_reasoning_only() {
+            continue;
+        }
         // Flush buffered tool results as one user message before any
         // non-tool message opens.
         if !matches!(msg.role, Role::Tool) && !pending_tool_results.is_empty() {
@@ -4761,6 +4768,42 @@ mod tests {
             .unwrap();
         assert_eq!(chat.usage.cache_read_tokens, 0);
         assert_eq!(chat.usage.cache_creation_tokens, 0);
+    }
+
+    /// A replayed turn that holds only `reasoning_content` is skipped
+    /// rather than sent as a blank text block, which leaves the history
+    /// alternating the way Converse requires.
+    #[test]
+    fn build_converse_inputs_skips_a_reasoning_only_assistant_turn() {
+        let req: ChatFormat = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather in Paris?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "15C"},
+                {"role": "assistant", "content": null, "reasoning_content": "it is mild"},
+                {"role": "assistant", "content": "15C in Paris."}
+            ]
+        }))
+        .unwrap();
+        let (_systems, messages) = build_converse_inputs(&req).unwrap();
+        let roles: Vec<ConversationRole> = messages.iter().map(|m| m.role().clone()).collect();
+        assert_eq!(
+            roles,
+            [
+                ConversationRole::User,
+                ConversationRole::Assistant,
+                ConversationRole::User,
+                ConversationRole::Assistant,
+            ]
+        );
+        assert!(matches!(
+            messages[3].content(),
+            [ContentBlock::Text(t)] if t == "15C in Paris."
+        ));
     }
 
     #[test]

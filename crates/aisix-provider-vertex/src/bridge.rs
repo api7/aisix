@@ -2112,6 +2112,11 @@ fn build_gemini_request(req: &ChatFormat, upstream_model: &str) -> GeminiGenerat
     let mut system_parts: Vec<String> = Vec::new();
     let mut contents: Vec<GeminiContent> = Vec::new();
     for m in &req.messages {
+        // `generateContent` has no slot for replayed reasoning; a turn that
+        // holds only that would become an empty `model` turn.
+        if m.is_reasoning_only() {
+            continue;
+        }
         match m.role {
             Role::System => system_parts.push(m.content_str().to_string()),
             Role::User | Role::Tool => contents.push(GeminiContent {
@@ -2918,6 +2923,29 @@ mod tests {
         assert_eq!(body.contents[0].role, "user");
         // Gemini uses `model`, NOT `assistant`.
         assert_eq!(body.contents[1].role, "model");
+    }
+
+    /// A replayed turn that holds only `reasoning_content` is skipped
+    /// rather than sent as an empty `model` turn.
+    #[test]
+    fn build_gemini_request_skips_a_reasoning_only_assistant_turn() {
+        let reasoning_only: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant", "content": null, "reasoning_content": "thinking",
+        }))
+        .unwrap();
+        let req = ChatFormat::new(
+            "my-gemini",
+            vec![
+                ChatMessage::user("q1"),
+                reasoning_only,
+                ChatMessage::user("q2"),
+                ChatMessage::assistant("a"),
+            ],
+        );
+        let body = build_gemini_request(&req, "gemini-2.0-flash");
+        let roles: Vec<&str> = body.contents.iter().map(|c| c.role).collect();
+        assert_eq!(roles, ["user", "user", "model"]);
+        assert!(body.contents.iter().all(|c| !c.parts[0].text.is_empty()));
     }
 
     #[test]
