@@ -2409,7 +2409,11 @@ pub fn build_responses_bridge_stream(
         // under hold-back that is the release, not the upstream chunk.
         macro_rules! downstream_mark {
             () => {
-                sent_downstream = true;
+                // Dead after the final release, which no failure follows.
+                #[allow(unused_assignments)]
+                {
+                    sent_downstream = true;
+                }
                 if guard.comp().downstream_latency_ms == 0 {
                     guard.comp().downstream_latency_ms =
                         started.elapsed().as_millis().min(u32::MAX as u128) as u32;
