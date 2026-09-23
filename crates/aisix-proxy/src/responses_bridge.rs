@@ -5400,7 +5400,10 @@ mod tests {
         let names = event_names(&events);
         assert_eq!(&names[names.len() - 2..], ["error", "response.failed"]);
         // Already opened by the content chunk: not opened a second time.
-        assert_eq!(names.iter().filter(|n| **n == "response.created").count(), 1);
+        assert_eq!(
+            names.iter().filter(|n| **n == "response.created").count(),
+            1
+        );
         let (error, failed) = (&events[events.len() - 2].1, &events[events.len() - 1].1);
         assert_eq!(error["code"], "transport_error");
         assert_eq!(failed["response"]["error"]["code"], "transport_error");
