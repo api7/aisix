@@ -130,6 +130,8 @@ const RESPONSES_FAILED_FRAMES = [
 
 interface Seeded {
   upstream: OpenAiUpstreamOptions;
+  /** Attach a blocking output guardrail, so the response is held back. */
+  holdBack?: boolean;
   /** `chat` models are OpenAI-wire; `responses-bridge` ones declare no
    *  `/v1/responses`, so that surface is translated through chat. */
   kind: "chat" | "responses-bridge" | "responses-native" | "anthropic";
@@ -148,6 +150,11 @@ const MODELS: Record<string, Seeded> = {
   "sf-responses-native-failed": {
     upstream: { rawStreamFrames: RESPONSES_FAILED_FRAMES },
     kind: "responses-native",
+  },
+  "sf-responses-native-failed-held": {
+    upstream: { rawStreamFrames: RESPONSES_FAILED_FRAMES },
+    kind: "responses-native",
+    holdBack: true,
   },
   "sf-ens-member": {
     upstream: {
@@ -194,7 +201,7 @@ describe("usage status of a stream that fails after its 200 headers", () => {
       credential_ref: CREDENTIAL_REF,
       content_mode: "metadata_only",
     });
-    for (const [model, { upstream: opts, kind }] of Object.entries(MODELS)) {
+    for (const [model, { upstream: opts, kind, holdBack }] of Object.entries(MODELS)) {
       const upstream = await startOpenAiUpstream(opts);
       upstreams.push(upstream);
       if (kind === "anthropic") {
@@ -220,12 +227,25 @@ describe("usage status of a stream that fails after its 200 headers", () => {
         api_base: `${upstream.baseUrl}/v1`,
         ...(kind === "responses-bridge" ? { apis: {} } : {}),
       });
-      await seed.createModel({
+      const created = await seed.createModel({
         display_name: model,
         provider: "openai",
         model_name: "relay-compat-x",
         provider_key_id: pk.id,
       });
+      if (holdBack) {
+        const guardrail = await seed.createGuardrail(
+          {
+            name: `${model}-output-block`,
+            enabled: true,
+            hook_point: "output",
+            kind: "keyword",
+            patterns: [{ kind: "literal", value: "a phrase the upstream never says" }],
+          },
+          { attach: false },
+        );
+        await seed.attachGuardrailToModel(guardrail.id, created.id);
+      }
     }
     await seed.createModel({
       display_name: ENSEMBLE,
@@ -357,6 +377,15 @@ describe("usage status of a stream that fails after its 200 headers", () => {
     const row = await usageRow(requestId);
     expectUpstreamFailure(row, "502");
     expect(row.get("error_message")).toContain("failed partway through the response");
+  });
+
+  test("responses (native, held back by an output guardrail): an upstream response.failed is still a 502", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const requestId = await streamToEnd("/v1/responses", "sf-responses-native-failed-held");
+    const row = await usageRow(requestId);
+    expectUpstreamFailure(row, "502");
+    expect(row.get("error_message")).toContain("failed partway through the response");
+    expect(row.get("guardrail_blocked") ?? "false").toBe("false");
   });
 
   test("responses (translated): an upstream stream that carried nothing is a 502", async (ctx) => {

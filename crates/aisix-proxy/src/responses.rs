@@ -364,7 +364,22 @@ pub async fn responses(
                     // Winning-attempt classification (#655). Direct models
                     // have no recorded attempt → AttemptInfo defaults.
                     let winner = success.routing.winner();
-                    let attempt = winner.map(AttemptInfo::from_record).unwrap_or_default();
+                    let mut attempt = winner.map(AttemptInfo::from_record).unwrap_or_default();
+                    // A held-back stream the upstream failed in-band went out
+                    // as a 200 carrying the failure; the usage records the
+                    // failure, as the live relay does. A guardrail refusal
+                    // keeps its own status.
+                    let failure = usage
+                        .failure
+                        .as_ref()
+                        .filter(|_| !success.guardrail_blocked);
+                    let usage_status = match failure {
+                        Some(f) => {
+                            f.apply_to(&mut attempt);
+                            f.status
+                        }
+                        None => status,
+                    };
                     // `latency_ms` is scoped to the winning attempt — the
                     // failed ones before it emitted their own events, so
                     // `elapsed` would double-count them. Access log keeps the
@@ -383,7 +398,7 @@ pub async fn responses(
                         crate::request_metrics::Caller::new(&auth),
                         &success.provider,
                         &success.upstream_model,
-                        status,
+                        usage_status,
                         winner_latency,
                         &usage,
                         &client,
@@ -2846,7 +2861,8 @@ fn has_complete_responses_sse_event(bytes: &[u8]) -> bool {
 /// already holds the whole response. Returns `None` (skip emission, matching
 /// the non-streaming gate) when no terminal event carried a usage block.
 fn responses_sse_usage(bytes: &[u8]) -> Option<ResponseUsage> {
-    let mut usage = None;
+    let mut usage: Option<ResponseUsage> = None;
+    let mut failure = None;
     // Per frame, like the scan and the redaction pass (#1100): a terminal
     // event written over several `data:` lines parses only once they are
     // joined, and reading one line at a time would bill it from the token
@@ -2860,7 +2876,15 @@ fn responses_sse_usage(bytes: &[u8]) -> Option<ResponseUsage> {
             if let Some(u) = parse_responses_terminal_usage(&json) {
                 usage = Some(u);
             }
+            if let Some(err) = responses_in_band_error(&json) {
+                crate::attempt::StreamFailure::record(&mut failure, &err);
+            }
         }
+    }
+    // A held-back response that failed in-band is sent as a 200 carrying the
+    // failure event, like the live relay's; its usage records the failure.
+    if failure.is_some() {
+        usage.get_or_insert_with(Default::default).failure = failure;
     }
     usage
 }
