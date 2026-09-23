@@ -327,12 +327,12 @@ fn replayed_reasoning_text(item: &Value) -> Option<String> {
             .collect();
         (!texts.is_empty()).then(|| texts.join("\n"))
     };
-    let from_content = match item.get("content") {
-        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
-        Some(parts) => parts_text(parts, true),
-        None => None,
-    };
-    from_content.or_else(|| item.get("summary").and_then(|s| parts_text(s, false)))
+    // Parts arrays only, the shape the API defines: they are also the only
+    // shape the input mask rewrites, so a bare-string `content` would reach
+    // the upstream past a Mask rule that reported a hit on it.
+    item.get("content")
+        .and_then(|c| parts_text(c, true))
+        .or_else(|| item.get("summary").and_then(|s| parts_text(s, false)))
 }
 
 /// Fold each reasoning-only assistant message onto the assistant message
@@ -4824,6 +4824,20 @@ mod tests {
         assert!(!serde_json::to_string(&chat.messages)
             .unwrap()
             .contains("ciphertext"));
+    }
+
+    /// A bare-string `content` is not a shape the input mask rewrites, so it
+    /// is never replayed; the summary is used instead.
+    #[test]
+    fn a_bare_string_reasoning_content_is_not_replayed() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({"input": [
+                {"type": "reasoning", "content": "raw a@x.com", "summary": [{"type": "summary_text", "text": "masked"}]},
+                {"role": "assistant", "content": "done"},
+            ]}),
+        );
+        assert_eq!(reasoning_of(&chat.messages[0]), Some("masked"));
     }
 
     /// Reasoning that no assistant message follows is still passed back, as
