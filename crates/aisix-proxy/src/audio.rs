@@ -574,6 +574,7 @@ pub async fn speech(
                 /* guardrail_blocked */ false,
                 success.captured_content.as_ref(),
                 &audit,
+                /* failure */ None,
             );
             success.response
         }
@@ -669,6 +670,9 @@ struct StreamedTranscript {
     terminal: Option<String>,
     /// False when the caller disconnected before the upstream ended.
     reached_end: bool,
+    /// The upstream failure that ended the stream after its `200` went out:
+    /// a transport error, a read timeout, or an in-band error envelope.
+    failure: Option<crate::attempt::StreamFailure>,
     /// End-of-stream monitor observations (AISIX-Cloud#1010).
     output_hits: Vec<aisix_core::GuardrailMonitorHit>,
 }
@@ -734,6 +738,8 @@ impl<F: FnOnce(StreamedTranscript)> Drop for TranscriptGuard<F> {
 /// consumer sees past its own limit.
 fn transcription_relay<S, F>(
     upstream: S,
+    // Set when `upstream` ended on a read timeout rather than its own end.
+    read_timeout: crate::stream_timeout::ReadTimeoutSignal,
     content_cap: Option<u32>,
     eos_scan: Option<crate::guardrail_stream::EosOutputScan>,
     on_complete: F,
@@ -744,6 +750,8 @@ where
 {
     use futures::StreamExt as _;
 
+    // Anchors a timed-out read's reported elapsed time.
+    let started = std::time::Instant::now();
     let text_cap = content_cap
         .map(|cap| cap as usize)
         .unwrap_or(0)
@@ -788,7 +796,16 @@ where
                     decoder = None;
                 }
             }
+            if let Err(e) = &item {
+                crate::attempt::StreamFailure::record(
+                    &mut guard.observed().failure,
+                    &crate::dispatch::reqwest_error_to_bridge(e, started),
+                );
+            }
             yield item;
+        }
+        if let Some(e) = read_timeout.fired() {
+            crate::attempt::StreamFailure::record(&mut guard.observed().failure, &e);
         }
         if let Some(mut d) = decoder.take() {
             observe_transcript_events(
@@ -836,6 +853,12 @@ fn observe_transcript_events(
         let Ok(value) = serde_json::from_str::<Value>(payload) else {
             continue;
         };
+        if let Some(err) =
+            aisix_gateway::capture_in_band_error(payload, aisix_gateway::UpstreamWire::OpenAI)
+        {
+            crate::attempt::StreamFailure::record(&mut observed.failure, &err);
+            continue;
+        }
         if let Some(usage) = extract_token_usage(&value) {
             observed.usage = Some(usage);
         }
@@ -1353,8 +1376,14 @@ async fn multipart_dispatch(
             let client_c = client_ctx.clone();
             let captured_prompt_c = captured_prompt.clone();
 
+            let read_timeout = crate::stream_timeout::ReadTimeoutSignal::default();
             let relayed = transcription_relay(
-                crate::stream_timeout::with_read_timeout_bytes(resp.bytes_stream(), stream_budget),
+                crate::stream_timeout::with_read_timeout_bytes_signalled(
+                    resp.bytes_stream(),
+                    stream_budget,
+                    read_timeout.clone(),
+                ),
+                read_timeout,
                 content_cap,
                 eos_scan,
                 move |outcome| {
@@ -1391,14 +1420,14 @@ async fn multipart_dispatch(
                         &upstream_model_c,
                         &applied_c,
                         // A caller that walked away mid-transcript is
-                        // reported as 499, matching the other streaming
+                        // reported as 499, an upstream failure as that
+                        // failure's status, matching the other streaming
                         // surfaces — the upstream work still happened, so
                         // the event is emitted either way.
-                        if outcome.reached_end {
-                            200
-                        } else {
-                            crate::CLIENT_CLOSED_REQUEST
-                        },
+                        crate::attempt::stream_status(
+                            outcome.reached_end,
+                            outcome.failure.as_ref(),
+                        ),
                         dispatch_started.elapsed(),
                         prompt_tokens,
                         completion_tokens,
@@ -1409,6 +1438,7 @@ async fn multipart_dispatch(
                         /* guardrail_blocked */ false,
                         captured_content.as_ref(),
                         &audit_c,
+                        outcome.failure.as_ref(),
                     );
                 },
             );
@@ -2143,6 +2173,7 @@ fn emit_audio_usage(
         success.guardrail_blocked,
         success.captured_content.as_ref(),
         audit,
+        /* failure */ None,
     );
 }
 
@@ -2195,6 +2226,9 @@ fn emit_usage_event(
     // so the held-back relay's end-of-stream emit reports the output-hook
     // mask that ran after the handler frame was already gone.
     audit: &crate::usage_attr::GuardrailAudit,
+    // The upstream failure that ended a streamed transcript after its
+    // `200`; its class and message are the event's error fields.
+    failure: Option<&crate::attempt::StreamFailure>,
 ) {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -2220,6 +2254,10 @@ fn emit_usage_event(
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(audit),
         guardrail_scores: crate::usage_attr::guardrail_scores(audit),
         guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),
+        error_class: failure
+            .map(|f| f.error_class.to_string())
+            .unwrap_or_default(),
+        error_message: failure.map(|f| f.error_message.clone()).unwrap_or_default(),
         ..Default::default()
     };
     // Per-PK telemetry attribution, same lookup as chat / messages /

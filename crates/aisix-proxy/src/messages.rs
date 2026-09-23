@@ -3505,17 +3505,22 @@ fn update_anthropic_usage(
         // Anthropic reports a failure inside a committed stream as an
         // in-band `error` event, forwarded to the caller as-is.
         Some("error") => {
-            if let Some(body) = json.get("error").and_then(|e| {
+            let err = match json.get("error").and_then(|e| {
                 serde_json::from_value::<aisix_provider_anthropic::wire::AnthropicStreamErrorBody>(
                     e.clone(),
                 )
                 .ok()
             }) {
-                crate::attempt::StreamFailure::record(
-                    &mut acc.failure,
-                    &aisix_provider_anthropic::wire::stream_error_into_bridge_error(&body),
-                );
-            }
+                Some(body) => aisix_provider_anthropic::wire::stream_error_into_bridge_error(&body),
+                // An error event whose body does not parse is still one.
+                None => aisix_gateway::BridgeError::UpstreamInBand {
+                    status: None,
+                    message: "upstream reported an in-band stream error".to_string(),
+                    parsed: None,
+                    wire: aisix_gateway::UpstreamWire::Anthropic,
+                },
+            };
+            crate::attempt::StreamFailure::record(&mut acc.failure, &err);
         }
         Some("message_start") => {
             let msg = json.get("message");

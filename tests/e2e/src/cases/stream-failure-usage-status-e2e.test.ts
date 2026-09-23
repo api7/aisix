@@ -128,6 +128,21 @@ const RESPONSES_FAILED_FRAMES = [
   }),
 ];
 
+// A streamed transcription that delivers one delta, then loses its
+// connection.
+const TRANSCRIPT_CUT: OpenAiUpstreamOptions = {
+  rawStreamFrames: [
+    `data: ${JSON.stringify({ type: "transcript.text.delta", delta: "hello" })}\n\n`,
+    `data: ${JSON.stringify({ type: "transcript.text.delta", delta: " world" })}\n\n`,
+    "data: [DONE]\n\n",
+  ],
+  disconnectAfterEvents: 1,
+  eventDelayMs: 50,
+};
+
+const ROUTE = "sf-route";
+const ROUTE_PREFIX = "/passthrough/sf";
+
 interface Seeded {
   upstream: OpenAiUpstreamOptions;
   /** Attach a blocking output guardrail, so the response is held back. */
@@ -170,6 +185,7 @@ const MODELS: Record<string, Seeded> = {
     kind: "chat",
   },
   "sf-ens-judge": { upstream: TRICKLE, kind: "chat" },
+  "sf-transcribe-cut": { upstream: TRANSCRIPT_CUT, kind: "chat" },
 };
 const ENSEMBLE = "sf-ensemble";
 
@@ -247,6 +263,20 @@ describe("usage status of a stream that fails after its 200 headers", () => {
         await seed.attachGuardrailToModel(guardrail.id, created.id);
       }
     }
+    // A passthrough route onto an upstream that drops its stream part-way.
+    const routeUpstream = await startOpenAiUpstream(CUT_AFTER_CONTENT);
+    upstreams.push(routeUpstream);
+    const routePk = await seed.createProviderKey({
+      display_name: "sf-route-pk",
+      secret: "sk-mock",
+      api_base: `${routeUpstream.baseUrl}/v1`,
+    });
+    await seed.createPassthroughRoute({
+      name: ROUTE,
+      path_prefix: ROUTE_PREFIX,
+      target_url: routeUpstream.baseUrl,
+      provider_key_id: routePk.id,
+    });
     await seed.createModel({
       display_name: ENSEMBLE,
       ensemble: {
@@ -260,6 +290,7 @@ describe("usage status of a stream that fails after its 200 headers", () => {
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: [...Object.keys(MODELS), ENSEMBLE],
+      allowed_routes: ["*"],
     });
     const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
     await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
@@ -394,6 +425,38 @@ describe("usage status of a stream that fails after its 200 headers", () => {
     const row = await usageRow(requestId);
     expectUpstreamFailure(row, "502");
     expect(row.get("error_message")).toContain("empty stream");
+  });
+
+  test("audio transcriptions: a stream that loses its upstream is a 502, not the caller leaving", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const form = new FormData();
+    form.set("model", "sf-transcribe-cut");
+    form.set("stream", "true");
+    form.set("file", new Blob([new Uint8Array([0x49, 0x44, 0x33])], { type: "audio/mpeg" }), "a.mp3");
+    const res = await fetch(`${app.proxyUrl}/v1/audio/transcriptions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      body: form,
+    });
+    expect(res.status).toBe(200);
+    const requestId = res.headers.get("x-aisix-request-id") ?? "";
+    expect(requestId).not.toBe("");
+    await res.text().catch(() => undefined);
+    expectUpstreamFailure(await usageRow(requestId), "502");
+  });
+
+  test("passthrough route: a stream that loses its upstream is a 502", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const res = await fetch(`${app.proxyUrl}${ROUTE_PREFIX}/v1/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLER_PLAINTEXT}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "relay-compat-x", messages: [{ role: "user", content: "hi" }], stream: true }),
+    });
+    expect(res.status).toBe(200);
+    const requestId = res.headers.get("x-aisix-request-id") ?? "";
+    expect(requestId).not.toBe("");
+    await res.text().catch(() => undefined);
+    expectUpstreamFailure(await usageRow(requestId), "502");
   });
 
   // ── The caller leaving ─────────────────────────────────────────────

@@ -886,6 +886,7 @@ async fn dispatch(
         streaming: false,
         error_class: String::new(),
         error_message: String::new(),
+        failure_status: None,
         monitor_hits,
         audit: audit_out.clone(),
         captured_prompt,
@@ -1856,6 +1857,7 @@ fn stream_response(
                     telemetry.error_class =
                         crate::attempt::routing_error_class(&bridge).to_string();
                     telemetry.error_message = crate::attempt::attempt_error_message(&bridge);
+                    telemetry.failure_status = Some(bridge.http_status());
                     tracing::warn!(
                         route = %route_name,
                         error = %telemetry.error_message,
@@ -2167,6 +2169,11 @@ struct RouteTelemetry {
     /// the response head is already on the wire.
     error_class: String,
     error_message: String,
+    /// The status that same failure gets before the response head
+    /// ([`aisix_gateway::BridgeError::http_status`]). The emit records it in
+    /// place of the upstream's `200`: the caller's response line cannot
+    /// change any more, but the record of what happened can.
+    failure_status: Option<u16>,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// The request's ENFORCE-mode audit handle (AISIX-Cloud#1330). Held
     /// rather than snapshotted at construction: this struct's emit runs
@@ -2210,8 +2217,14 @@ impl RouteTelemetry {
         // generator's end. The upstream status is then not what happened
         // to the request, so record the same 499 the typed streaming
         // endpoints do rather than a success the caller never received.
-        if self.streaming && !self.stream_reached_end {
-            self.status = crate::CLIENT_CLOSED_REQUEST;
+        // One an upstream failure ended records that failure's status
+        // instead, unless a guardrail refused it.
+        if self.streaming {
+            match self.failure_status.filter(|_| !self.guardrail_blocked) {
+                Some(status) => self.status = status,
+                None if !self.stream_reached_end => self.status = crate::CLIENT_CLOSED_REQUEST,
+                None => {}
+            }
         }
         let elapsed = self.started.elapsed();
         let snapshot = self.state.snapshot.load();
