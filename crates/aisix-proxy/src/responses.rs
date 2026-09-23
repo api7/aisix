@@ -3147,6 +3147,7 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)> Dro
 /// `eos_scan`). Bytes forward unchanged apart from the caller-facing
 /// `model` on the snapshot frames — the client sees the exact upstream
 /// SSE wire shape.
+#[allow(clippy::too_many_arguments)]
 fn build_responses_passthrough_stream<S, F>(
     upstream: S,
     // Set when `upstream` ended on a read timeout rather than its own end.
