@@ -673,6 +673,7 @@ async fn dispatch(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_access_log(
     model: &str,
     provider: &str,
