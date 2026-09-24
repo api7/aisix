@@ -240,10 +240,7 @@ fn count_chat_prompt(bpe: &CoreBPE, req: &aisix_gateway::chat::ChatFormat) -> u3
     let mut has_system = false;
     for m in &req.messages {
         let role = role_label(&m.role);
-        if matches!(
-            m.role,
-            aisix_gateway::chat::Role::System | aisix_gateway::chat::Role::Developer
-        ) {
+        if m.role.is_instruction() {
             has_system = true;
         }
         n = n.saturating_add(TOKENS_PER_MESSAGE);
