@@ -603,6 +603,142 @@ pub(crate) fn emit_error_usage_event(
     );
 }
 
+/// Emit one zero-token `UsageEvent` per FAILED attempt a single-shot
+/// dispatch recorded (`routing::dispatch_with_failover`) — the #655 shape
+/// chat / messages / responses already have, for completions, embeddings,
+/// rerank, images, audio and video submits.
+///
+/// Every event names the target it actually hit (`model_id`, ProviderKey,
+/// `attempt_*`) and carries no tokens and no cost: a failed attempt bills
+/// nothing, exactly as on chat. The winner, if any, is the handler's own
+/// event. When there is none, pass `terminal_last` and the LAST failed
+/// attempt in `attempts` becomes the request's terminal event — the one carrying the
+/// request-scoped guardrail attribution (`guardrail_blocked`, the enforced
+/// hits, scores, `monitor_hits`, `redactions`), which the superseded
+/// attempts never repeat. No-op when nothing failed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_failed_attempts(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    surface: Surface,
+    request_id: &str,
+    requested_model: &str,
+    api_key_id: &str,
+    client: &ClientContext,
+    applied_guardrails: &[aisix_core::AppliedGuardrail],
+    attempts: &[crate::attempt::AttemptRecord],
+    terminal_last: bool,
+    guardrail_blocked: bool,
+    mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    mut redactions: crate::redact::RedactionCounts,
+    audit: &GuardrailAudit,
+) {
+    let last_failed = attempts.iter().rposition(|a| !a.success);
+    let usage_model = usage_event_model_label(snap, requested_model).into_owned();
+    for (i, rec) in attempts.iter().enumerate().filter(|(_, a)| !a.success) {
+        let terminal = terminal_last && Some(i) == last_failed;
+        let mut event = UsageEvent {
+            request_id: request_id.to_string(),
+            occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            model_id: rec.target_model_id.clone(),
+            api_key_id: api_key_id.to_string(),
+            requested_model: requested_model.to_string(),
+            upstream_latency_ms: rec.latency_ms,
+            status_code: rec.status,
+            inbound_protocol: "openai".to_string(),
+            applied_guardrails: applied_guardrails.to_vec(),
+            client_source_ip: client.source_ip.clone(),
+            client_user_agent: client.user_agent.clone(),
+            guardrail_blocked: terminal && guardrail_blocked,
+            guardrail_monitor_hits: if terminal {
+                std::mem::take(&mut monitor_hits)
+            } else {
+                Vec::new()
+            },
+            redacted_entity_counts: if terminal {
+                std::mem::take(&mut redactions)
+            } else {
+                crate::redact::RedactionCounts::new()
+            },
+            guardrail_enforced_hits: terminal_enforced_hits(terminal, audit),
+            guardrail_scores: terminal_guardrail_scores(terminal, audit),
+            // Request-scoped, and every attempt of a request that failed
+            // open went upstream unscreened — the same rule chat applies.
+            guardrail_bypassed_reason: bypass_reason(audit),
+            attempt_index: rec.index,
+            attempt_kind: rec.kind.to_string(),
+            attempt_model: rec.target_model.clone(),
+            error_class: rec.error_class.clone(),
+            error_message: rec.error_message.clone(),
+            ..Default::default()
+        };
+        let pk = ResolvedPk::resolve(snap, &rec.provider_key_id);
+        apply_pk_telemetry(&mut event, &pk);
+        apply_caller_identity(
+            &mut event,
+            client.jwt.as_ref(),
+            client.caller.user_id.as_deref(),
+            client.caller.user_name.as_deref(),
+        );
+        emit_usage(
+            state,
+            snap,
+            surface,
+            event,
+            usage_event_labels(&usage_model, &pk),
+            None,
+            client.trace.as_ref(),
+            terminal,
+            // The record's own network-boundary fact: a rate-limit-refused
+            // attempt, or a route's own 501, never reached an upstream.
+            rec.dispatched,
+        );
+    }
+}
+
+/// Whether a single-shot request's attempts already produced its terminal
+/// usage event: some attempt was made and none succeeded, so
+/// [`emit_failed_attempts`] marks the last one terminal and the handler must
+/// not emit another.
+pub(crate) fn failed_attempts_are_terminal(routing: &crate::attempt::RoutingTelemetry) -> bool {
+    !routing.attempts.is_empty() && routing.winner().is_none()
+}
+
+/// A single-shot success branch's attempts, split for emission: the ones
+/// [`emit_failed_attempts`] owns, and whether the request was answered by
+/// the route's own 501 for a provider lacking the capability — the LAST
+/// record, failed and never dispatched. That refusal keeps its own
+/// handler-emitted event, gated as it always was (no event unless a
+/// guardrail decision needs recording), so it is left out of the slice;
+/// when that gate stays shut the last superseded attempt, if any, is the
+/// terminal event instead.
+pub(crate) fn split_route_refusal(
+    routing: &crate::attempt::RoutingTelemetry,
+) -> (&[crate::attempt::AttemptRecord], bool) {
+    if failed_attempts_are_terminal(routing) {
+        (&routing.attempts[..routing.attempts.len() - 1], true)
+    } else {
+        (&routing.attempts, false)
+    }
+}
+
+/// Stamp the attempt that answered onto a single-shot handler's success
+/// event: its index / kind / target, and its own upstream latency — the
+/// failed attempts before it emitted their own events, so the whole
+/// request's elapsed time would count them twice. `None` (nothing was
+/// dispatched) leaves the event as built.
+pub(crate) fn apply_winning_attempt(
+    event: &mut UsageEvent,
+    winner: Option<&crate::attempt::AttemptRecord>,
+) {
+    if let Some(w) = winner {
+        event.attempt_index = w.index;
+        event.attempt_kind = w.kind.to_string();
+        event.attempt_model = w.target_model.clone();
+        event.upstream_latency_ms = w.latency_ms;
+    }
+}
+
 /// The [`emit_error_usage_event`] event without the emission, for a caller
 /// that attributes handler-specific fields (e.g. the passthrough route name)
 /// before handing it to [`emit_prepared_usage_event`].

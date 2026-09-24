@@ -128,6 +128,8 @@ pub async fn transcriptions(
     // branch — where a guardrail block lands — stamps the enforced hits
     // too (AISIX-Cloud#1330 / #1024).
     let mut audit = crate::usage_attr::GuardrailAudit::default();
+    // Every upstream attempt, filled by the dispatch (#655).
+    let mut routing = crate::attempt::RoutingTelemetry::default();
 
     match multipart_dispatch(
         &state,
@@ -140,6 +142,7 @@ pub async fn transcriptions(
         &request_id,
         &client,
         &mut audit,
+        &mut routing,
     )
     .await
     {
@@ -195,6 +198,25 @@ pub async fn transcriptions(
                 &success,
                 status,
                 elapsed,
+                routing.fallback_count() > 0,
+            );
+            // One zero-token event per attempt that failed before the
+            // winner (#655); a live relay's own event is the winner's.
+            crate::usage_attr::emit_failed_attempts(
+                &state,
+                &snapshot,
+                crate::operation::TRANSCRIPTION,
+                &request_id,
+                &success.model_name,
+                &api_key_id,
+                &client,
+                &success.applied_guardrails,
+                &routing.attempts,
+                /* terminal_last */ false,
+                false,
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
             );
             // #998: the streamed relay's Drop guard emits the event once
             // the terminal `transcript.text.done` has been parsed off the
@@ -214,6 +236,7 @@ pub async fn transcriptions(
                     elapsed,
                     &client,
                     &audit,
+                    routing.winner(),
                 );
             }
             success.response
@@ -249,29 +272,52 @@ pub async fn transcriptions(
                 &state,
                 "/v1/audio/transcriptions",
                 crate::request_metrics::Caller::new(&auth),
-                last_target.upstream(metric_model.as_ref(), false, false),
+                last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs. The model
             // isn't extracted from the multipart form on this error path, so
             // requested_model is empty; status + error class still identify it.
-            crate::usage_attr::emit_error_usage_event(
+            // Per #655: one zero-token event per failed upstream attempt,
+            // the last of them terminal when every attempt failed.
+            let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
+            crate::usage_attr::emit_failed_attempts(
                 &state,
                 &snapshot,
                 crate::operation::TRANSCRIPTION,
-                "openai",
                 &request_id,
-                "",
+                &attributed.requested_model,
                 &api_key_id,
-                status,
-                err.kind(),
-                err.is_guardrail_block(),
                 &client,
-                crate::usage_attr::enforced_hits(&audit),
-                crate::usage_attr::guardrail_scores(&audit),
-                crate::usage_attr::bypass_reason(&audit),
+                &[],
+                &routing.attempts,
+                failed_terminal,
+                err.is_guardrail_block(),
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
             );
+            // A failure no attempt answers for — pre-dispatch, or after the
+            // winner — is one zero-token terminal event.
+            if !failed_terminal {
+                crate::usage_attr::emit_error_usage_event(
+                    &state,
+                    &snapshot,
+                    crate::operation::TRANSCRIPTION,
+                    "openai",
+                    &request_id,
+                    "",
+                    &api_key_id,
+                    status,
+                    err.kind(),
+                    err.is_guardrail_block(),
+                    &client,
+                    crate::usage_attr::enforced_hits(&audit),
+                    crate::usage_attr::guardrail_scores(&audit),
+                    crate::usage_attr::bypass_reason(&audit),
+                );
+            }
             err.into_response()
         }
     }
@@ -316,6 +362,8 @@ pub async fn translations(
     // branch — where a guardrail block lands — stamps the enforced hits
     // too (AISIX-Cloud#1330 / #1024).
     let mut audit = crate::usage_attr::GuardrailAudit::default();
+    // Every upstream attempt, filled by the dispatch (#655).
+    let mut routing = crate::attempt::RoutingTelemetry::default();
 
     match multipart_dispatch(
         &state,
@@ -328,6 +376,7 @@ pub async fn translations(
         &request_id,
         &client,
         &mut audit,
+        &mut routing,
     )
     .await
     {
@@ -376,6 +425,25 @@ pub async fn translations(
                 &success,
                 status,
                 elapsed,
+                routing.fallback_count() > 0,
+            );
+            // One zero-token event per attempt that failed before the
+            // winner (#655); a live relay's own event is the winner's.
+            crate::usage_attr::emit_failed_attempts(
+                &state,
+                &snapshot,
+                crate::operation::TRANSLATION,
+                &request_id,
+                &success.model_name,
+                &api_key_id,
+                &client,
+                &success.applied_guardrails,
+                &routing.attempts,
+                /* terminal_last */ false,
+                false,
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
             );
             // #998: the streamed relay's Drop guard emits the event once
             // the terminal `transcript.text.done` has been parsed off the
@@ -395,6 +463,7 @@ pub async fn translations(
                     elapsed,
                     &client,
                     &audit,
+                    routing.winner(),
                 );
             }
             success.response
@@ -430,28 +499,51 @@ pub async fn translations(
                 &state,
                 "/v1/audio/translations",
                 crate::request_metrics::Caller::new(&auth),
-                last_target.upstream(metric_model.as_ref(), false, false),
+                last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs (model not
             // extracted on the multipart error path → empty requested_model).
-            crate::usage_attr::emit_error_usage_event(
+            // Per #655: one zero-token event per failed upstream attempt,
+            // the last of them terminal when every attempt failed.
+            let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
+            crate::usage_attr::emit_failed_attempts(
                 &state,
                 &snapshot,
                 crate::operation::TRANSLATION,
-                "openai",
                 &request_id,
-                "",
+                &attributed.requested_model,
                 &api_key_id,
-                status,
-                err.kind(),
-                err.is_guardrail_block(),
                 &client,
-                crate::usage_attr::enforced_hits(&audit),
-                crate::usage_attr::guardrail_scores(&audit),
-                crate::usage_attr::bypass_reason(&audit),
+                &[],
+                &routing.attempts,
+                failed_terminal,
+                err.is_guardrail_block(),
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
             );
+            // A failure no attempt answers for — pre-dispatch, or after the
+            // winner — is one zero-token terminal event.
+            if !failed_terminal {
+                crate::usage_attr::emit_error_usage_event(
+                    &state,
+                    &snapshot,
+                    crate::operation::TRANSLATION,
+                    "openai",
+                    &request_id,
+                    "",
+                    &api_key_id,
+                    status,
+                    err.kind(),
+                    err.is_guardrail_block(),
+                    &client,
+                    crate::usage_attr::enforced_hits(&audit),
+                    crate::usage_attr::guardrail_scores(&audit),
+                    crate::usage_attr::bypass_reason(&audit),
+                );
+            }
             err.into_response()
         }
     }
@@ -501,6 +593,8 @@ pub async fn speech(
     // branch — where a guardrail block lands — stamps the enforced hits
     // too (AISIX-Cloud#1330 / #1024).
     let mut audit = crate::usage_attr::GuardrailAudit::default();
+    // Every upstream attempt, filled by the dispatch (#655).
+    let mut routing = crate::attempt::RoutingTelemetry::default();
     match speech_dispatch(
         &state,
         &snapshot,
@@ -509,6 +603,7 @@ pub async fn speech(
         &request_id,
         &client,
         &mut audit,
+        &mut routing,
     )
     .await
     {
@@ -541,10 +636,29 @@ pub async fn speech(
                     model: &model_name,
                     upstream_model: &success.upstream_model,
                     pk: pk.labels(),
+                    is_fallback: routing.fallback_count() > 0,
                     ..Default::default()
                 },
                 status,
                 elapsed,
+            );
+            // One zero-token event per attempt that failed before the
+            // winner (#655); the relay's own event is the winner's.
+            crate::usage_attr::emit_failed_attempts(
+                &state,
+                &snapshot,
+                crate::operation::SPEECH,
+                &request_id,
+                &model_name,
+                &api_key_id,
+                &client,
+                &success.applied_guardrails,
+                &routing.attempts,
+                /* terminal_last */ false,
+                false,
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
             );
             // Issue #406: /v1/audio/speech (TTS) returns binary audio
             // with no usage block — emit a zero-token UsageEvent so the
@@ -565,7 +679,11 @@ pub async fn speech(
                 redactions,
                 monitor_hits,
                 captured_content,
+                attempt_started,
             } = success;
+            // The winner's event measures its own attempt, to the end of
+            // the audio — not the attempts that failed before it.
+            let winner = routing.winner().cloned();
             let state_c = state.clone();
             let client_c = client.clone();
             let request_id_c = request_id.clone();
@@ -581,6 +699,10 @@ pub async fn speech(
                 // emit reads a FRESH snapshot (#941).
                 let snap = state_c.snapshot.load();
                 let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &provider_key_id);
+                let winner = winner.map(|mut w| {
+                    w.latency_ms = crate::attempt::ms_since(attempt_started);
+                    w
+                });
                 emit_usage_event(
                     &state_c,
                     &snap,
@@ -608,6 +730,7 @@ pub async fn speech(
                     captured_content.as_ref(),
                     &audit,
                     outcome.failure.as_ref(),
+                    winner.as_ref(),
                 );
             });
             *response.body_mut() = axum::body::Body::from_stream(relayed);
@@ -638,28 +761,51 @@ pub async fn speech(
                 &state,
                 "/v1/audio/speech",
                 crate::request_metrics::Caller::new(&auth),
-                last_target.upstream(metric_model.as_ref(), false, false),
+                last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs with a
             // zero-token event (status + error class).
-            crate::usage_attr::emit_error_usage_event(
+            // Per #655: one zero-token event per failed upstream attempt,
+            // the last of them terminal when every attempt failed.
+            let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
+            crate::usage_attr::emit_failed_attempts(
                 &state,
                 &snapshot,
                 crate::operation::SPEECH,
-                "openai",
                 &request_id,
                 &model_name,
                 &api_key_id,
-                status,
-                err.kind(),
-                err.is_guardrail_block(),
                 &client,
-                crate::usage_attr::enforced_hits(&audit),
-                crate::usage_attr::guardrail_scores(&audit),
-                crate::usage_attr::bypass_reason(&audit),
+                &[],
+                &routing.attempts,
+                failed_terminal,
+                err.is_guardrail_block(),
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
             );
+            // A failure no attempt answers for — pre-dispatch, or after the
+            // winner — is one zero-token terminal event.
+            if !failed_terminal {
+                crate::usage_attr::emit_error_usage_event(
+                    &state,
+                    &snapshot,
+                    crate::operation::SPEECH,
+                    "openai",
+                    &request_id,
+                    &model_name,
+                    &api_key_id,
+                    status,
+                    err.kind(),
+                    err.is_guardrail_block(),
+                    &client,
+                    crate::usage_attr::enforced_hits(&audit),
+                    crate::usage_attr::guardrail_scores(&audit),
+                    crate::usage_attr::bypass_reason(&audit),
+                );
+            }
             err.into_response()
         }
     }
@@ -984,6 +1130,7 @@ async fn multipart_dispatch(
     request_id: &str,
     client_ctx: &ClientContext,
     audit_out: &mut crate::usage_attr::GuardrailAudit,
+    routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<AudioDispatchSuccess, ProxyError> {
     // The request clock for the streamed relay's end-of-stream emit
     // (#998): the handler has long returned by the time it fires, so it
@@ -1203,6 +1350,8 @@ async fn multipart_dispatch(
     // A Model Group walks its targets (AISIX-Cloud#1111); every per-target
     // input — provider, key, URL, upstream id, deadlines — comes from the
     // target.
+    *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
+        .with_trace(client_ctx.trace.clone());
     let dispatched = crate::routing::dispatch_with_failover(
         state,
         snapshot,
@@ -1210,7 +1359,9 @@ async fn multipart_dispatch(
         client_ctx,
         &model_name,
         &model_entry,
+        routing_out,
         |_| true,
+        |_| None,
         |target, timeouts| {
             let fields = &fields;
             async move {
@@ -1435,6 +1586,7 @@ async fn multipart_dispatch(
         value:
             (upstream_headers, upstream_body, provider_label, pk_id, upstream_model, stream_budget),
         target,
+        attempt_started,
         member_reservation,
     } = match dispatched {
         Ok(d) => d,
@@ -1512,6 +1664,9 @@ async fn multipart_dispatch(
             let input_monitor_hits = monitor_hits.clone();
             let client_c = client_ctx.clone();
             let captured_prompt_c = captured_prompt.clone();
+            // The winner's event measures its own attempt, to the end of the
+            // stream — not the attempts that failed before it (#655).
+            let winner_c = routing_out.winner().cloned();
 
             let read_timeout = crate::stream_timeout::ReadTimeoutSignal::default();
             let relayed = transcription_relay(
@@ -1543,6 +1698,10 @@ async fn multipart_dispatch(
                     };
                     let mut monitor_hits = input_monitor_hits;
                     monitor_hits.extend(outcome.output_hits);
+                    let winner = winner_c.map(|mut w| {
+                        w.latency_ms = crate::attempt::ms_since(attempt_started);
+                        w
+                    });
                     emit_usage_event(
                         &state_c,
                         &snap,
@@ -1576,6 +1735,7 @@ async fn multipart_dispatch(
                         captured_content.as_ref(),
                         &audit_c,
                         outcome.failure.as_ref(),
+                        winner.as_ref(),
                     );
                 },
             );
@@ -1866,8 +2026,11 @@ struct SpeechDispatchSuccess {
     redactions: crate::redact::RedactionCounts,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     captured_content: Option<CapturedContent>,
+    /// When the attempt that answered began (#655).
+    attempt_started: Instant,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn speech_dispatch(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
@@ -1876,6 +2039,7 @@ async fn speech_dispatch(
     request_id: &str,
     client_ctx: &ClientContext,
     audit_out: &mut crate::usage_attr::GuardrailAudit,
+    routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<SpeechDispatchSuccess, ProxyError> {
     let model_name = body
         .get("model")
@@ -1969,6 +2133,8 @@ async fn speech_dispatch(
     // rewrites its own copy of the body — the `model` field and the PK's
     // `request.*` overrides belong to the target it is sent to.
     let base_body = &body;
+    *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
+        .with_trace(client_ctx.trace.clone());
     let dispatched = crate::routing::dispatch_with_failover(
         state,
         snapshot,
@@ -1976,7 +2142,9 @@ async fn speech_dispatch(
         client_ctx,
         &model_name,
         &model_entry,
+        routing_out,
         |_| true,
+        |_| None,
         |target, timeouts| async move {
             let model = &target.model;
             let mut attempt_body = base_body.clone();
@@ -2131,6 +2299,7 @@ async fn speech_dispatch(
     let crate::routing::Dispatched {
         value: (upstream_resp, provider_label, pk_id, upstream_model, stream_budget),
         target,
+        attempt_started,
         member_reservation,
     } = match dispatched {
         Ok(d) => d,
@@ -2192,6 +2361,7 @@ async fn speech_dispatch(
         redactions,
         monitor_hits,
         captured_content,
+        attempt_started,
     })
 }
 
@@ -2292,6 +2462,7 @@ fn probe_audio_duration_seconds(audio: &[u8]) -> Option<f64> {
 /// Terminal request-metric emit for the two transcription-shaped routes,
 /// which share `AudioDispatchSuccess` and would otherwise repeat the same
 /// label set twice.
+#[allow(clippy::too_many_arguments)]
 fn record_audio_metrics(
     state: &ProxyState,
     pk: &crate::usage_attr::ResolvedPk<'_>,
@@ -2300,6 +2471,7 @@ fn record_audio_metrics(
     success: &AudioDispatchSuccess,
     status: u16,
     elapsed: Duration,
+    is_fallback: bool,
 ) {
     crate::request_metrics::record(
         state,
@@ -2314,7 +2486,7 @@ fn record_audio_metrics(
             // moves the usage emit into the stream is the same condition
             // that makes this a streamed response.
             stream: success.usage_handled_by_stream,
-            ..Default::default()
+            is_fallback,
         },
         status,
         elapsed,
@@ -2338,6 +2510,7 @@ fn emit_audio_usage(
     elapsed: Duration,
     client: &ClientContext,
     audit: &crate::usage_attr::GuardrailAudit,
+    winner: Option<&crate::attempt::AttemptRecord>,
 ) {
     let (prompt_tokens, completion_tokens) = success.usage.unwrap_or((0, 0));
     emit_usage_event(
@@ -2365,6 +2538,7 @@ fn emit_audio_usage(
         success.captured_content.as_ref(),
         audit,
         /* failure */ None,
+        winner,
     );
 }
 
@@ -2420,6 +2594,8 @@ fn emit_usage_event(
     // The upstream failure that ended a streamed transcript after its
     // `200`; its class and message are the event's error fields.
     failure: Option<&crate::attempt::StreamFailure>,
+    // The attempt that answered (#655).
+    winner: Option<&crate::attempt::AttemptRecord>,
 ) {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -2430,8 +2606,9 @@ fn emit_usage_event(
         prompt_tokens,
         completion_tokens,
         audio_duration_seconds,
-        // Single-attempt endpoint: the attempt spans the whole request, so
-        // the upstream figure and what the caller waited for coincide.
+        // Narrowed to the winning attempt's own latency below
+        // (`apply_winning_attempt`) once a failover put earlier attempts
+        // in front of it; they emitted their own events.
         upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
@@ -2454,6 +2631,7 @@ fn emit_usage_event(
     // Per-PK telemetry attribution, same lookup as chat / messages /
     // responses (AISIX-Cloud#867 parity).
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);
+    crate::usage_attr::apply_winning_attempt(&mut event, winner);
     // Handler label "audio" — bucketed prometheus counter (#408).
     crate::usage_attr::apply_caller_identity(
         &mut event,
@@ -3789,10 +3967,26 @@ mod tests {
             !ev.error_class.is_empty(),
             "error_class must classify the failure"
         );
+        // One event per upstream attempt (#655): each of the direct
+        // model's own retries fails the same way and leaves its own row,
+        // none of them billed.
+        let mut events = vec![ev];
+        while let Ok(more) = rx.try_recv() {
+            events.push(more);
+        }
+        let hits = upstream.received_requests().await.unwrap_or_default().len();
         assert!(
-            rx.try_recv().is_err(),
-            "exactly one event per failed request"
+            hits > 1,
+            "the direct model's retry budget should replay a 5xx"
         );
+        assert_eq!(events.len(), hits, "exactly one event per upstream attempt");
+        for (i, ev) in events.iter().enumerate() {
+            assert_eq!(ev.attempt_index, i as u32);
+            assert_eq!(ev.attempt_kind, if i == 0 { "initial" } else { "retry" });
+            assert_eq!(ev.status_code, events[0].status_code);
+            assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
+            assert_eq!(ev.cost_usd, 0.0);
+        }
     }
 
     /// AISIX-Cloud#867: `/v1/audio/speech` (JSON body) must apply the PK's

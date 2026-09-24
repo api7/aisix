@@ -1472,6 +1472,19 @@ struct Telemetry<'a> {
 
 impl Telemetry<'_> {
     fn finish(&self, status: u16, provider: &str, model_label: &str, error: Option<&ProxyError>) {
+        self.finish_routed(status, provider, model_label, error, false);
+    }
+
+    /// [`Self::finish`] for the submit, whose dispatch can fail over to
+    /// another Model Group target (`is_fallback` on the request series).
+    fn finish_routed(
+        &self,
+        status: u16,
+        provider: &str,
+        model_label: &str,
+        error: Option<&ProxyError>,
+        is_fallback: bool,
+    ) {
         let elapsed = self.started.elapsed();
         let (error_kind, error) = match error {
             Some(e) => {
@@ -1530,7 +1543,7 @@ impl Telemetry<'_> {
             crate::request_metrics::Caller::new(self.auth),
             crate::request_metrics::Upstream {
                 provider,
-                ..last_target.upstream(model_label, false, false)
+                ..last_target.upstream(model_label, false, is_fallback)
             },
             status,
             elapsed,
@@ -1582,7 +1595,19 @@ pub async fn create_video(
     // branch — where a guardrail block lands — stamps the enforced hits
     // too (AISIX-Cloud#1330 / #1024).
     let mut audit = crate::usage_attr::GuardrailAudit::default();
-    match dispatch_create(&state, &snapshot, &auth, body, &client, &mut audit).await {
+    // Every upstream attempt, filled by the dispatch (#655).
+    let mut routing = crate::attempt::RoutingTelemetry::default();
+    match dispatch_create(
+        &state,
+        &snapshot,
+        &auth,
+        body,
+        &client,
+        &mut audit,
+        &mut routing,
+    )
+    .await
+    {
         Ok(success) => {
             let status = success.response.status().as_u16();
             // Label by the RESOLVED entry's display_name, not the requested
@@ -1596,14 +1621,41 @@ pub async fn create_video(
                 .get_by_id(&success.model_id)
                 .map(|e| e.value.display_name.clone())
                 .unwrap_or_else(|| crate::usage_attr::UNRESOLVED_MODEL_LABEL.to_string());
-            telemetry.finish(status, &success.provider, &model_label, None);
+            telemetry.finish_routed(
+                status,
+                &success.provider,
+                &model_label,
+                None,
+                routing.fallback_count() > 0,
+            );
+            // One zero-token event per attempt that failed first (#655).
+            // The route's own 501 keeps its gated event below; when that
+            // stays silent the last failed attempt is the terminal one.
+            let (superseded, refused) = crate::usage_attr::split_route_refusal(&routing);
+            let answered = success.upstream_called;
+            crate::usage_attr::emit_failed_attempts(
+                &state,
+                &snapshot,
+                crate::operation::VIDEO_GENERATION,
+                &client.request_id,
+                &model_name,
+                &auth.entry.id,
+                &client,
+                &success.applied_guardrails,
+                superseded,
+                refused && !answered,
+                false,
+                success.monitor_hits.clone(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
+            );
             // One zero-token UsageEvent per accepted submit — visible in
             // /logs and the budget ledger like every other endpoint.
             // Per-second cost is computed control-plane-side once the
             // per-second cost schema lands (AISIX-Cloud#1118 decision 2);
             // token fields stay zero. Skipped when no upstream call
             // happened (the 501 unsupported-provider branch).
-            if success.upstream_called {
+            if answered {
                 emit_submit_usage_event(
                     &state,
                     &snapshot,
@@ -1617,6 +1669,7 @@ pub async fn create_video(
                     status,
                     started.elapsed(),
                     &audit,
+                    routing.attempts.last(),
                 );
             }
             success.response
@@ -1624,25 +1677,54 @@ pub async fn create_video(
         Err(err) => {
             let status = err.status().as_u16();
             let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
-            telemetry.finish(status, "unknown", metric_model.as_ref(), Some(&err));
+            telemetry.finish_routed(
+                status,
+                "unknown",
+                metric_model.as_ref(),
+                Some(&err),
+                routing.fallback_count() > 0,
+            );
             // #655 parity: failed submits surface in Logs as zero-token
             // events instead of vanishing.
-            crate::usage_attr::emit_error_usage_event(
+            // Per #655: one zero-token event per failed upstream attempt,
+            // the last of them terminal when every attempt failed.
+            let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
+            crate::usage_attr::emit_failed_attempts(
                 &state,
                 &snapshot,
                 crate::operation::VIDEO_GENERATION,
-                "openai",
                 &client.request_id,
                 &model_name,
                 &auth.entry.id,
-                status,
-                err.kind(),
-                err.is_guardrail_block(),
                 &client,
-                crate::usage_attr::enforced_hits(&audit),
-                crate::usage_attr::guardrail_scores(&audit),
-                crate::usage_attr::bypass_reason(&audit),
+                &[],
+                &routing.attempts,
+                failed_terminal,
+                err.is_guardrail_block(),
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
             );
+            // A failure no attempt answers for — pre-dispatch, or after the
+            // winner — is one zero-token terminal event.
+            if !failed_terminal {
+                crate::usage_attr::emit_error_usage_event(
+                    &state,
+                    &snapshot,
+                    crate::operation::VIDEO_GENERATION,
+                    "openai",
+                    &client.request_id,
+                    &model_name,
+                    &auth.entry.id,
+                    status,
+                    err.kind(),
+                    err.is_guardrail_block(),
+                    &client,
+                    crate::usage_attr::enforced_hits(&audit),
+                    crate::usage_attr::guardrail_scores(&audit),
+                    crate::usage_attr::bypass_reason(&audit),
+                );
+            }
             err.into_response()
         }
     }
@@ -1667,6 +1749,7 @@ async fn dispatch_create(
     body: VideoCreateBody,
     client: &ClientContext,
     audit_out: &mut crate::usage_attr::GuardrailAudit,
+    routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<CreateSuccess, ProxyError> {
     let model_entry = crate::model_resolve::resolve_model(snapshot, &body.model)
         .ok_or_else(|| ProxyError::ModelNotFound(body.model.clone()))?;
@@ -1767,6 +1850,8 @@ async fn dispatch_create(
         Accepted(Box<VideoTarget>, serde_json::Value),
         Unsupported(Response),
     }
+    *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
+        .with_trace(client.trace.clone());
     let dispatched = crate::routing::dispatch_with_failover(
         state,
         snapshot,
@@ -1774,7 +1859,12 @@ async fn dispatch_create(
         client,
         &body.model,
         &model_entry,
+        routing_out,
         |e| retry_permit(&reqwest::Method::POST, e),
+        |submitted: &Submitted| {
+            matches!(submitted, Submitted::Unsupported(_))
+                .then(|| "provider is not yet supported on /v1/videos".to_string())
+        },
         |attempt, timeouts| {
             let (body, revision) = (&body, model_entry.revision);
             async move {
@@ -2137,6 +2227,8 @@ fn emit_submit_usage_event(
     elapsed: Duration,
     // The request's enforced-guardrail audit handle (AISIX-Cloud#1330).
     audit: &crate::usage_attr::GuardrailAudit,
+    // The attempt that answered (#655).
+    winner: Option<&crate::attempt::AttemptRecord>,
 ) {
     let mut event = UsageEvent {
         request_id: client.request_id.clone(),
@@ -2145,8 +2237,9 @@ fn emit_submit_usage_event(
         api_key_id: api_key_id.to_string(),
         requested_model: requested_model.to_string(),
         status_code,
-        // Single-attempt endpoint: the attempt spans the whole request, so
-        // the upstream figure and what the caller waited for coincide.
+        // Narrowed to the winning attempt's own latency below
+        // (`apply_winning_attempt`) once a failover put earlier attempts
+        // in front of it; they emitted their own events.
         upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         inbound_protocol: "openai".to_string(),
@@ -2161,6 +2254,7 @@ fn emit_submit_usage_event(
     };
     let pk = crate::usage_attr::ResolvedPk::resolve(snap, provider_key_id);
     crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
+    crate::usage_attr::apply_winning_attempt(&mut event, winner);
     crate::usage_attr::apply_caller_identity(
         &mut event,
         client.jwt.as_ref(),

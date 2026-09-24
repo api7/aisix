@@ -495,13 +495,18 @@ where
 }
 
 /// What [`dispatch_with_failover`] hands back on success: the call's own
-/// value, the concrete target that produced it, and that target's
-/// model-layer rate-limit reservation (`None` for a direct model), which
-/// the caller merges into its request reservation before committing
-/// tokens so the member's TPM/TPD is billed too (AISIX-Cloud#1087).
+/// value, the concrete target that produced it, when that attempt began,
+/// and that target's model-layer rate-limit reservation (`None` for a
+/// direct model), which the caller merges into its request reservation
+/// before committing tokens so the member's TPM/TPD is billed too
+/// (AISIX-Cloud#1087).
 pub(crate) struct Dispatched<T> {
     pub value: T,
     pub target: AttemptModel,
+    /// Start of the attempt that produced `value` — what a relayed
+    /// response's end-of-stream usage event measures its latency from, so
+    /// the failed attempts before it are not counted twice.
+    pub attempt_started: std::time::Instant,
     pub member_reservation: Option<aisix_ratelimit::MultiReservation>,
 }
 
@@ -521,25 +526,39 @@ pub(crate) struct Dispatched<T> {
 /// retry/fail-over budget on a failure after which a replay would duplicate
 /// a non-idempotent upstream write (see [`retrying_dispatch_gated`]).
 ///
+/// Every attempt is recorded on `telemetry` — the same
+/// [`crate::attempt::RoutingTelemetry`] chat, messages and responses use —
+/// so the per-attempt usage events and the `aisix_deployment_*` /
+/// `aisix_routing_*_fallbacks_total` metrics come out of the one
+/// chokepoint (#655). `unsupported` names an `Ok` value that is really the
+/// route's own 501 for a provider that lacks the capability: that attempt
+/// ends the dispatch like any non-retryable refusal and is recorded as a
+/// failed, never-dispatched one rather than as a success.
+///
 /// The one chokepoint for the single-shot endpoint family — completions,
 /// embeddings, rerank, images, audio, videos — so they dispatch Model
 /// Groups identically (AISIX-Cloud#1111).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn dispatch_with_failover<T, P, F, Fut>(
+pub(crate) async fn dispatch_with_failover<T, P, U, F, Fut>(
     state: &crate::ProxyState,
     snapshot: &AisixSnapshot,
     auth: &crate::auth::AuthenticatedKey,
     client: &crate::client_ip::ClientContext,
     requested_name: &str,
     entry: &aisix_core::ResourceEntry<Model>,
+    telemetry: &mut crate::attempt::RoutingTelemetry,
     permit: P,
+    unsupported: U,
     mut call: F,
 ) -> Result<Dispatched<T>, ProxyError>
 where
     P: Fn(&BridgeError) -> bool,
+    U: Fn(&T) -> Option<String>,
     F: FnMut(AttemptModel, TimeoutBudget) -> Fut,
     Fut: std::future::Future<Output = Result<T, ProxyError>>,
 {
+    use crate::attempt::{AttemptRecord, AttemptTarget};
+
     let attempt_models = resolve_attempt_models(
         &state.routing,
         &state.runtime_status,
@@ -563,6 +582,23 @@ where
     let n = attempt_models.len();
     let mut last_err: Option<ProxyError> = None;
     for (i, target) in attempt_models.into_iter().enumerate() {
+        let pk_id = crate::dispatch::resolve_provider_key(snapshot, &target.model)
+            .map(|e| e.id.clone())
+            .unwrap_or_default();
+        // The routing target's name on the attempt record; empty for a
+        // direct model, whose `model_id` already identifies it.
+        let target_model = if routing.is_some() {
+            target.model.display_name.clone()
+        } else {
+            String::new()
+        };
+        let begin = |telemetry: &mut crate::attempt::RoutingTelemetry| {
+            telemetry.begin_attempt(AttemptTarget {
+                display_name: &target.model.display_name,
+                target_model: &target_model,
+                model_id: &target.id,
+            })
+        };
         let member_reservation = match crate::quota::reserve_routing_target(
             state,
             snapshot,
@@ -579,6 +615,26 @@ where
         {
             Ok(r) => r,
             Err(e) => {
+                // A target over its own limits is an attempt that never
+                // reached an upstream — recorded, as chat records it, so the
+                // failover it forced is visible.
+                let (index, kind) = begin(telemetry);
+                telemetry.record(
+                    state,
+                    AttemptRecord {
+                        index,
+                        kind,
+                        target_model: target_model.clone(),
+                        target_model_id: target.id.clone(),
+                        provider_key_id: pk_id.clone(),
+                        status: 429,
+                        success: false,
+                        error_class: "rate_limit_exceeded".to_string(),
+                        error_message: e.to_string(),
+                        latency_ms: 0,
+                        dispatched: false,
+                    },
+                );
                 last_err = Some(e);
                 continue;
             }
@@ -599,13 +655,42 @@ where
                 });
                 tokio::time::sleep(retry_backoff(attempt_idx as u32, hint)).await;
             }
+            let (index, kind) = begin(telemetry);
+            let attempt_started = std::time::Instant::now();
             match call(target.clone(), timeouts).await {
                 Ok(value) => {
+                    let refusal = unsupported(&value);
+                    // The route answered its own 501 without contacting the
+                    // provider, so it is no evidence of upstream health.
+                    let dispatched = refusal.is_none();
+                    telemetry.record(
+                        state,
+                        AttemptRecord {
+                            index,
+                            kind,
+                            target_model: target_model.clone(),
+                            target_model_id: target.id.clone(),
+                            provider_key_id: pk_id.clone(),
+                            status: if refusal.is_some() { 501 } else { 200 },
+                            success: refusal.is_none(),
+                            // The class `BridgeError::UnsupportedCapability`
+                            // reports (`attempt::routing_error_class`).
+                            error_class: if refusal.is_some() {
+                                "config".to_string()
+                            } else {
+                                String::new()
+                            },
+                            error_message: refusal.unwrap_or_default(),
+                            latency_ms: crate::attempt::ms_since(attempt_started),
+                            dispatched,
+                        },
+                    );
                     return Ok(Dispatched {
                         value,
                         target,
+                        attempt_started,
                         member_reservation,
-                    })
+                    });
                 }
                 Err(e) => {
                     let (retryable, budget_covers) = match &e {
@@ -624,6 +709,23 @@ where
                             fallback_statuses,
                         );
                     }
+                    let (error_class, error_message) = crate::attempt::attempt_error_from_proxy(&e);
+                    telemetry.record(
+                        state,
+                        AttemptRecord {
+                            index,
+                            kind,
+                            target_model: target_model.clone(),
+                            target_model_id: target.id.clone(),
+                            provider_key_id: pk_id.clone(),
+                            status: e.status().as_u16(),
+                            success: false,
+                            error_class,
+                            error_message,
+                            latency_ms: crate::attempt::ms_since(attempt_started),
+                            dispatched: crate::attempt::attempt_reached_upstream(&e),
+                        },
+                    );
                     if !retryable {
                         return Err(e);
                     }

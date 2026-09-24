@@ -110,6 +110,8 @@ pub async fn image_edits(
     // where a guardrail block lands — stamps the enforced hits too
     // (AISIX-Cloud#1330 / #1024).
     let mut audit = crate::usage_attr::GuardrailAudit::default();
+    // Every upstream attempt, filled by the dispatch (#655).
+    let mut routing = crate::attempt::RoutingTelemetry::default();
 
     match dispatch(
         &state,
@@ -119,6 +121,7 @@ pub async fn image_edits(
         &request_id,
         &client,
         &mut audit,
+        &mut routing,
     )
     .await
     {
@@ -147,10 +150,29 @@ pub async fn image_edits(
                     model: &success.model_name,
                     upstream_model: &success.upstream_model,
                     pk: pk.labels(),
+                    is_fallback: routing.fallback_count() > 0,
                     ..Default::default()
                 },
                 status,
                 elapsed,
+            );
+            // One zero-token event per attempt that failed before the
+            // winner (#655).
+            crate::usage_attr::emit_failed_attempts(
+                &state,
+                &snapshot,
+                crate::operation::IMAGE_EDIT,
+                &request_id,
+                &success.model_name,
+                &api_key_id,
+                &client,
+                &success.applied_guardrails,
+                &routing.attempts,
+                /* terminal_last */ false,
+                false,
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
             );
             let (prompt_tokens, completion_tokens) = success.usage.unwrap_or((0, 0));
             crate::images::emit_usage_event(
@@ -176,6 +198,7 @@ pub async fn image_edits(
                 success.captured_content.as_ref(),
                 &audit,
                 true,
+                routing.winner(),
             );
             success.response
         }
@@ -206,7 +229,7 @@ pub async fn image_edits(
                 &state,
                 ENDPOINT,
                 crate::request_metrics::Caller::new(&auth),
-                last_target.upstream(metric_model.as_ref(), false, false),
+                last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
                 elapsed,
             );
@@ -215,22 +238,45 @@ pub async fn image_edits(
             // failure past model resolution (a guardrail 422, a provider
             // 400); earlier failures leave it empty — status + error
             // class still identify those.
-            crate::usage_attr::emit_error_usage_event(
+            // Per #655: one zero-token event per failed upstream attempt,
+            // the last of them terminal when every attempt failed.
+            let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
+            crate::usage_attr::emit_failed_attempts(
                 &state,
                 &snapshot,
                 crate::operation::IMAGE_EDIT,
-                "openai",
                 &request_id,
                 &attributed.requested_model,
                 &api_key_id,
-                status,
-                err.kind(),
-                err.is_guardrail_block(),
                 &client,
-                crate::usage_attr::enforced_hits(&audit),
-                crate::usage_attr::guardrail_scores(&audit),
-                crate::usage_attr::bypass_reason(&audit),
+                &[],
+                &routing.attempts,
+                failed_terminal,
+                err.is_guardrail_block(),
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
             );
+            // A failure no attempt answers for — pre-dispatch, or after the
+            // winner — is one zero-token terminal event.
+            if !failed_terminal {
+                crate::usage_attr::emit_error_usage_event(
+                    &state,
+                    &snapshot,
+                    crate::operation::IMAGE_EDIT,
+                    "openai",
+                    &request_id,
+                    &attributed.requested_model,
+                    &api_key_id,
+                    status,
+                    err.kind(),
+                    err.is_guardrail_block(),
+                    &client,
+                    crate::usage_attr::enforced_hits(&audit),
+                    crate::usage_attr::guardrail_scores(&audit),
+                    crate::usage_attr::bypass_reason(&audit),
+                );
+            }
             err.into_response()
         }
     }
@@ -239,6 +285,7 @@ pub async fn image_edits(
 /// Collect all multipart fields, resolve the model, swap in the upstream
 /// model id, then rebuild and forward the multipart form. See audio's
 /// `multipart_dispatch` for the pattern this follows (minus streaming).
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &ProxyState,
     // Out-param: the snapshot is loaded HERE, once the upload has been
@@ -250,6 +297,7 @@ async fn dispatch(
     request_id: &str,
     client_ctx: &ClientContext,
     audit_out: &mut crate::usage_attr::GuardrailAudit,
+    routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<EditsDispatchSuccess, ProxyError> {
     // Collect all fields first so we can find `model` before building the
     // outgoing reqwest multipart.
@@ -446,6 +494,8 @@ async fn dispatch(
     // A Model Group walks its targets (AISIX-Cloud#1111); every per-target
     // input — provider gate, key, URL, upstream id, deadline — comes from
     // the target.
+    *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
+        .with_trace(client_ctx.trace.clone());
     let dispatched = crate::routing::dispatch_with_failover(
         state,
         snapshot,
@@ -453,7 +503,9 @@ async fn dispatch(
         client_ctx,
         &model_name,
         &model_entry,
+        routing_out,
         |_| true,
+        |_| None,
         |target, timeouts| {
             let (model_name, fields) = (&model_name, &fields);
             async move {
@@ -633,6 +685,7 @@ async fn dispatch(
         value: (body_bytes, provider_label, pk_id, upstream_model),
         target,
         member_reservation,
+        ..
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
