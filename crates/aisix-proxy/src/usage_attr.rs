@@ -639,7 +639,7 @@ pub(crate) fn emit_failed_attempts(
         let terminal = terminal_last && Some(i) == last_failed;
         let mut event = UsageEvent {
             request_id: request_id.to_string(),
-            occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
             model_id: rec.target_model_id.clone(),
             api_key_id: api_key_id.to_string(),
             requested_model: requested_model.to_string(),
@@ -760,7 +760,7 @@ pub(crate) fn build_error_usage_event(
 ) -> UsageEvent {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
-        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         api_key_id: api_key_id.to_string(),
         requested_model: requested_model.to_string(),
         status_code,
@@ -1252,24 +1252,7 @@ mod tests {
         let mut blocks = 0usize;
         let mut missing = Vec::new();
 
-        // Recursive: `src/` is flat today, and a refactor that moved a
-        // handler into a subdirectory would otherwise take its emitter out
-        // of scope while this still reported green.
-        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            let entries = std::fs::read_dir(dir).expect("the crate's own src/ must be readable");
-            for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
-                if path.is_dir() {
-                    rs_files(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    out.push(path);
-                }
-            }
-        }
-        let mut files = Vec::new();
-        rs_files(&src_dir, &mut files);
-        files.sort();
-
-        for path in files {
+        for path in crate_rs_files(&src_dir) {
             let src = std::fs::read_to_string(&path).expect("source must read");
             let name = path
                 .strip_prefix(&src_dir)
@@ -1323,6 +1306,65 @@ mod tests {
              `{EXEMPT} <why>` comment saying they have no guardrail chain: {missing:?}\n\
              An unset field reports a screened request, so an emitter that skips it makes the \
              field unusable as a negative answer.",
+        );
+    }
+
+    /// Every `.rs` file under `dir`, sorted. Recursive: `src/` is flat
+    /// today, and a refactor that moved a handler into a subdirectory would
+    /// otherwise take its emitter out of scope while a scan stayed green.
+    fn crate_rs_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let entries = std::fs::read_dir(dir).expect("the crate's own src/ must be readable");
+            for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(dir, &mut files);
+        files.sort();
+        files
+    }
+
+    /// Every `occurred_at` this crate stamps goes through
+    /// `UsageEvent::occurred_at_now`, so the whole emitter family writes one
+    /// format (millisecond RFC 3339, AISIX-Cloud#1368). A hand-rolled
+    /// `to_rfc3339_opts` at one site would put a second-precision stamp back
+    /// on that surface, and nothing downstream rejects it: it still parses,
+    /// it just ties with every other row of the same second.
+    #[test]
+    fn every_occurred_at_is_stamped_by_the_shared_helper() {
+        const HELPER: &str = "occurred_at: aisix_obs::UsageEvent::occurred_at_now()";
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stamped = 0usize;
+        let mut hand_rolled = Vec::new();
+        for path in crate_rs_files(&src_dir) {
+            let src = std::fs::read_to_string(&path).expect("source must read");
+            let code = code_mask(&src);
+            for (idx, _) in src.match_indices("occurred_at:") {
+                if !code[idx] {
+                    continue;
+                }
+                if src[idx..].starts_with(HELPER) {
+                    stamped += 1;
+                } else {
+                    let line = src[..idx].lines().count();
+                    hand_rolled.push(format!("{}:{line}", path.display()));
+                }
+            }
+        }
+        // The crate's real count is twenty; a floor keeps the scan from
+        // passing vacuously if it stops matching.
+        assert!(
+            stamped >= 20,
+            "the occurred_at scan found only {stamped} stamps"
+        );
+        assert!(
+            hand_rolled.is_empty(),
+            "these sites set occurred_at without UsageEvent::occurred_at_now: {hand_rolled:?}",
         );
     }
 

@@ -1337,7 +1337,7 @@ fn emit_tool_call_usage(
 ) {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
-        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         api_key_id: auth.entry.id.clone(),
         status_code,
         redacted_entity_counts,

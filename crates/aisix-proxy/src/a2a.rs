@@ -916,7 +916,7 @@ fn emit_a2a_usage(
     let completion_tokens = crate::token_estimate::count_text("", &response_text);
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
-        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         api_key_id: auth.entry.id.clone(),
         status_code,
         // Single-attempt endpoint: the attempt spans the whole request, so

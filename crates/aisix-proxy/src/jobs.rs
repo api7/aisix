@@ -644,7 +644,7 @@ fn emit_job_usage_event(
 ) {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
-        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         model_id: target.model_entry.id.clone(),
         api_key_id: auth.entry.id.clone(),
         requested_model: target.display_name().to_string(),
@@ -2040,7 +2040,7 @@ async fn attribute_batch_usage(
             // provider did inside a batch. There is no request here, so no
             // chain was ever resolved and nothing could have been bypassed.
             request_id,
-            occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
             model_id: model_id.to_string(),
             api_key_id: api_key_id.to_string(),
             requested_model: display_name.to_string(),

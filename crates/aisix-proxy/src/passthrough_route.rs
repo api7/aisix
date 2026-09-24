@@ -2449,7 +2449,7 @@ impl RouteTelemetry {
 
         let mut event = aisix_obs::UsageEvent {
             request_id: self.request_id.clone(),
-            occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
             api_key_id: self.api_key_id.clone(),
             status_code: self.status,
             requested_model: self.requested_model.clone(),

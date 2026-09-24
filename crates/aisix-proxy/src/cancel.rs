@@ -306,7 +306,7 @@ fn base_event(
         // to avoid. A cancelled request therefore reports no guardrail
         // attribution at all rather than a wrong one.
         request_id: request_id.to_string(),
-        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         api_key_id: ctx.api_key_id.clone(),
         // The name the CALLER addressed — the group for a routing request,
         // matching every other event of the same request.
