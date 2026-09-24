@@ -5625,6 +5625,9 @@ where
         // the truncated response as a successful one.
         let mut errored = false;
         let mut first_chunk_seen = false;
+        let mut stream_usage: Option<aisix_gateway::chat::UsageStats> = None;
+        let fold_base = base_usage != aisix_gateway::chat::UsageStats::default();
+        let mut held_usage_chunk: Option<aisix_gateway::ChatChunk> = None;
         // Render + serialise one held/live chunk into an SSE Event.
         // Serialisation of these plain structs can't realistically fail;
         // the Err arm mirrors the pre-hold-back defensive error frame.
@@ -5655,7 +5658,7 @@ where
         }
         while let Some(item) = upstream.next().await {
             let maybe_chunk = match item {
-                Ok(mut chunk) => {
+                Ok(chunk) => {
                     // Record TTFT on the first upstream chunk of ANY type,
                     // role-only preambles included — the industry convention
                     // (LiteLLM, caller-side gateways), so the figure matches
@@ -5748,29 +5751,19 @@ where
                         }
                     }
                     if let Some(u) = chunk.usage.as_ref() {
-                        if u.prompt_tokens > comp.prompt_tokens {
-                            comp.prompt_tokens = u.prompt_tokens;
-                        }
-                        if u.completion_tokens > comp.completion_tokens {
-                            comp.completion_tokens = u.completion_tokens;
-                        }
-                        let t = u.total_tokens as u64;
-                        if t > comp.total_tokens {
-                            comp.total_tokens = t;
-                        }
-                        comp.cache_write_tokens = comp.cache_write_tokens.max(u.cache_write_tokens);
-                        if u.cached_prompt_tokens > comp.cached_prompt_tokens {
-                            comp.cached_prompt_tokens = u.cached_prompt_tokens;
-                        }
-                        if u.reasoning_tokens > comp.reasoning_tokens {
-                            comp.reasoning_tokens = u.reasoning_tokens;
-                        }
-                        if u.cache_creation_tokens > comp.cache_creation_tokens {
-                            comp.cache_creation_tokens = u.cache_creation_tokens;
-                        }
-                        if u.cache_read_tokens > comp.cache_read_tokens {
-                            comp.cache_read_tokens = u.cache_read_tokens;
-                        }
+                        let acc = match stream_usage.as_ref() {
+                            Some(prev) => prev.max_fieldwise(u),
+                            None => u.clone(),
+                        };
+                        comp.prompt_tokens = acc.prompt_tokens;
+                        comp.completion_tokens = acc.completion_tokens;
+                        comp.total_tokens = acc.total_tokens as u64;
+                        comp.cache_write_tokens = acc.cache_write_tokens;
+                        comp.cached_prompt_tokens = acc.cached_prompt_tokens;
+                        comp.reasoning_tokens = acc.reasoning_tokens;
+                        comp.cache_creation_tokens = acc.cache_creation_tokens;
+                        comp.cache_read_tokens = acc.cache_read_tokens;
+                        stream_usage = Some(acc);
                     }
                     // #790: a usage-only terminal chunk (no delta payload, no
                     // finish_reason) exists because the gateway injected
@@ -5787,25 +5780,29 @@ where
                     {
                         continue;
                     }
-                    // #614: fold the ensemble panel's usage (`base_usage`) into
-                    // the client-facing usage frame, AFTER `comp` captured the
-                    // stream-only counts above. No-op when `base_usage` is zero
-                    // (every single-upstream caller).
-                    //
-                    // Assumes the judge emits `usage` on a SINGLE terminal frame
-                    // (true for the OpenAI/Anthropic/DeepSeek bridges via the
-                    // injected include_usage, so the panel sum lands exactly
-                    // once). A judge that stamps usage on multiple chunks
-                    // (Gemini/Vertex) would add the panel sum more than once —
-                    // tracked in #617 (fix: synthesize one terminal usage frame
-                    // from `comp + base_usage`).
-                    if let Some(u) = chunk.usage.as_mut() {
-                        *u = u.saturating_add(&base_usage);
+                    // #614/#617: the ensemble panel's usage (`base_usage`) is
+                    // folded into the LAST usage-bearing frame only — a judge
+                    // may stamp usage on every chunk (Gemini/Vertex), and a
+                    // per-frame fold would bill the panel once per frame to a
+                    // client summing across them. So each usage-bearing chunk
+                    // is held until the next one arrives and then forwarded
+                    // with the judge's own usage; the one still held at EOF is
+                    // the terminal frame and carries `stream_usage + base`.
+                    // Single-upstream callers (`base_usage` zero) never hold.
+                    if fold_base && chunk.usage.is_some() {
+                        held_usage_chunk.replace(chunk)
+                    } else {
+                        Some(chunk)
                     }
-                    Some(chunk)
                 }
                 Err(err) => {
                     errored = true;
+                    if let Some(chunk) = held_usage_chunk.take() {
+                        if !hold_back || cap_released {
+                            let ev = chunk_event!(chunk);
+                            yield Ok::<_, Infallible>(ev);
+                        }
+                    }
                     crate::attempt::StreamFailure::record(&mut guard.comp().failure, &err);
                     let etype = err.error_type();
                     yield Ok::<_, Infallible>(
@@ -5988,6 +5985,22 @@ where
         // body only when the consumer pulls again. Same placement as the
         // sibling streams in messages.rs and responses_bridge.rs.
         guard.comp().reached_end = true;
+        if let Some(mut chunk) = held_usage_chunk.take() {
+            if !errored {
+                chunk.usage = Some(
+                    stream_usage
+                        .clone()
+                        .unwrap_or_default()
+                        .saturating_add(&base_usage),
+                );
+                if !hold_back || cap_released {
+                    let ev = chunk_event!(chunk);
+                    yield Ok::<_, Infallible>(ev);
+                } else {
+                    pending.push(chunk);
+                }
+            }
+        }
         // Per #204: run the output guardrail on the accumulated
         // assistant content BEFORE emitting `[DONE]`. Buffer-then-
         // check is the right cadence for a blocking guardrail:
