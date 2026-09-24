@@ -304,6 +304,18 @@ impl GuardrailChain {
         }
     }
 
+    /// Whether an output member that answers through the segment pass wants
+    /// a streamed response held back. That member judges the held body, so
+    /// a relay that forwards live leaves it nothing to judge before the
+    /// content is out — whatever policy the chain folds to.
+    pub fn holds_back_for_segment_member(&self) -> bool {
+        self.members.iter().any(|m| {
+            m.guardrail.runs_on_output()
+                && m.guardrail.moderates_segments()
+                && m.guardrail.stream_output_policy().holds_back()
+        })
+    }
+
     /// The request's audit log handle, for a caller that outlives the
     /// chain value: a streaming emitter running inside a `move` closure
     /// after the handler frame is gone, or a handler whose chain is
